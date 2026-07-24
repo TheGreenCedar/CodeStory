@@ -87,13 +87,14 @@ cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
-behavior changed. Intermediate commits do not append telemetry.
-Use the coordinator's explicit `none` scope for that final integration when
-only the hosted source and repo-scale gates are required; it deliberately skips
-package, release-evidence, and protected-hardware jobs.
+behavior changed. It is standalone telemetry, not a platform-release gate, and
+intermediate commits do not append it. Use the coordinator's explicit `none`
+scope when final integration requires source proof without package or protected
+hardware jobs.
 Use the explicit `linux` scope when the same exact final-dev integration should
-also build and exercise the Linux x64 candidate on its server-behavior-only
-boundary without scheduling Mac or Windows protected runners.
+also build, install, and exercise the Linux x64 Vulkan candidate on its
+single-project server-behavior boundary without scheduling Mac or Windows
+protected runners.
 
 Semantic document allocation changes use focused runtime proof before the
 broad gate. Cover shared-file path cardinality, byte-identical and
@@ -201,11 +202,18 @@ commit and tree, executable digest, server protocol, accepted constant set, and
 measurement protocol. `--version-only` proves package structure, version, and
 help; it does not prove a running server.
 
-Runtime proof uses the ordinary plugin launcher with two independently started
-host processes and different repositories. `--proof-tier calibration` may
-collect draft measurements, but cannot satisfy a package, hardware, installed,
-or release claim. A higher tier requires a frozen constant set and a retained
-qualification record. `--produce-qualification-evidence` requires the separate
+Full calibration and qualification use the ordinary plugin launcher with two
+independently started host processes and different repositories.
+`--server-behavior-only` is the smaller release path: one host grounds one
+project, waits for search readiness in that same project, and verifies the
+resident engine and server against the package manifest. It rejects
+calibration and quality inputs and makes no two-host or broader lifecycle
+claim.
+
+`--proof-tier calibration` may collect draft measurements, but cannot satisfy a
+package, hardware, installed, or release claim. A higher qualification tier
+requires a frozen constant set and a retained qualification record.
+`--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through
 `--cli`; the driver orchestrates private nonce-gated worker calls without
@@ -216,9 +224,10 @@ fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship the runtime executable and native modules in one immutable generation
-selected by the public launcher through a single atomic pointer. Hosted Linux
-proof does not install a Vulkan loader before help, stdio initialization, or
-explicit diagnostic CPU execution. It cannot replace protected Vulkan proof.
+selected by the public launcher through a single atomic pointer. Optional
+hosted Linux calibration and quality proof does not install a Vulkan loader
+before help, stdio initialization, or explicit diagnostic CPU execution. It
+cannot replace the protected Vulkan release proof.
 
 Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
 to make the claim explicit. Protected and installed tiers additionally name
@@ -490,16 +499,19 @@ the frozen exact-head producer manifests and does not upgrade source or package
 proof into installed, protected-hardware, or live-behavior proof.
 
 Pre-publish authorization deliberately uses candidate-managed installations
-because a marketplace-catalog-resolved package cannot exist before publication. These receipts
-must come from isolated installs of the exact candidate archive, initialize
-MCP, start the bundled local runtime, and complete one real `ground` request.
-They do not replace the two marketplace-catalog-resolved post-publish receipts.
-For v0.16, `check-packaged-agent-proof.py --ground-only` is the fail-closed
-receipt mode for that claim. It retains exact archive, source, plugin, managed
-binary, isolated data-root, and project-bound MCP evidence while deliberately
-skipping search, snippet, packet, shared-server, lifecycle, accelerator,
-accuracy, and performance claims. Omit `--ground-only` to run the broader
-qualification contract.
+because a marketplace-catalog-resolved package cannot exist before publication.
+These receipts must come from isolated installs of the exact candidate archive
+on Apple Silicon, Windows x64, and Linux x64. Each initializes MCP, completes
+one real project-bound `ground`, waits for same-project search readiness, and
+verifies the expected Metal or Vulkan engine and package identity. They do not
+replace the three marketplace-catalog-resolved post-publish receipts.
+
+For v0.16, `check-packaged-agent-proof.py --server-behavior-only` is the
+fail-closed receipt mode for that claim. It deliberately skips multi-host
+sharing, broader server lifecycle, accuracy, and performance claims.
+`--ground-only` remains a lower-tier launcher and provenance check: it stops
+after the project-bound ground request and cannot claim search readiness,
+server identity, or accelerator execution.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply

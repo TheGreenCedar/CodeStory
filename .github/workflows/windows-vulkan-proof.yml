@@ -30,12 +30,7 @@ on:
         default: ""
         type: string
       candidate_installed_proof:
-        description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_only:
-        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Vulkan execution.
+        description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
         default: false
         type: boolean
@@ -76,12 +71,7 @@ on:
         default: ""
         type: string
       candidate_installed_proof:
-        description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_only:
-        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Vulkan execution.
+        description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
         default: false
         type: boolean
@@ -132,15 +122,12 @@ jobs:
             Select-Object Name, AdapterCompatibility, DriverVersion, VideoMemoryType |
             Format-List | Out-File -Append target/windows-vulkan-proof/host.txt
 
-      - name: Validate candidate-installed-only mode
-        if: inputs.candidate_installed_only
+      - name: Validate candidate-installed mode
+        if: inputs.candidate_installed_proof
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          if (
-            "${{ inputs.candidate_installed_proof }}" -ne "true" -or
-            "${{ inputs.server_behavior_only }}" -ne "true"
-          ) {
-            throw "candidate_installed_only requires candidate_installed_proof and server_behavior_only"
+          if ("${{ inputs.server_behavior_only }}" -ne "true") {
+            throw "candidate_installed_proof requires server_behavior_only"
           }
 
       - name: Capture source build tool evidence
@@ -236,8 +223,8 @@ jobs:
           run-id: ${{ inputs.calibration_bundle_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Prove offline Vulkan and multi-repository reuse
-        if: ${{ !inputs.candidate_installed_only }}
+      - name: Prove protected Windows Vulkan runtime
+        if: ${{ !inputs.candidate_installed_proof }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
@@ -295,7 +282,7 @@ jobs:
             --out-dir target/windows-vulkan-proof/packaged-agent
 
       - name: Stage isolated candidate-managed Windows install
-        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+        if: inputs.candidate_installed_proof
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -348,12 +335,12 @@ jobs:
             --candidate-producer-run-attempt $env:GITHUB_RUN_ATTEMPT `
             --candidate-artifact-name (Split-Path -Leaf $archive)
 
-      - name: Prove two-host candidate-installed Windows runtime
-        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+      - name: Prove candidate-installed Windows Vulkan runtime
+        if: inputs.candidate_installed_proof
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
-          CODESTORY_EMBED_ALLOW_CPU: "1"
+          CODESTORY_EMBED_ALLOW_CPU: "0"
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -361,33 +348,6 @@ jobs:
           $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
           $sourceSha = (git rev-parse HEAD).Trim()
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
-          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
-          $claimArgs = @()
-          $calibrationArgs = @()
-          if ("${{ inputs.server_behavior_only }}" -eq "true") {
-            $claimArgs = @("--ground-only")
-          } else {
-            $calibrationBundles = @(
-              Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
-            )
-            if ($calibrationBundles.Count -ne 1) {
-              throw "expected exactly one frozen calibration-bundle.json"
-            }
-            if (-not (Test-Path $qualityPath)) {
-              throw "candidate-installed Windows proof requires exact-head quality evidence"
-            }
-            $claimArgs = @(
-              "--produce-qualification-evidence",
-              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
-              "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
-              "--retrieval-quality-evidence", $qualityPath
-            )
-            $calibrationArgs = @(
-              "--calibration-bundle", $calibrationBundles[0].FullName,
-              "--calibration-producer-run-id", "${{ inputs.calibration_bundle_run_id }}",
-              "--calibration-producer-artifact", "${{ inputs.calibration_bundle_artifact }}"
-            )
-          }
           $pluginRoot = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "plugin"
           $pluginData = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "data"
           python .github/scripts/check-packaged-agent-proof.py `
@@ -397,13 +357,11 @@ jobs:
             --project $env:GITHUB_WORKSPACE `
             --plugin-root $pluginRoot `
             --plugin-handoff `
-            --engine-policy cpu_explicit `
-            --expected-backend CPU `
+            --engine-policy accelerated `
+            --expected-backend Vulkan `
             --offline `
             --proof-tier installed_runtime `
-            --qualification-matrix-cell candidate_installed_windows_x64_cpu `
-            @claimArgs `
-            @calibrationArgs `
+            --server-behavior-only `
             --installed-plugin-attestation target/candidate-installed-windows/install-attestation-v2.json `
             --installed-plugin-data $pluginData `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
@@ -417,7 +375,7 @@ jobs:
             --out-dir target/candidate-installed-windows/proof
 
       - name: Upload candidate-installed Windows proof
-        if: always() && inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '')
+        if: always() && inputs.candidate_installed_proof
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}
@@ -426,7 +384,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Vulkan release cell
-        if: inputs.emit_release_cells && !inputs.candidate_installed_only
+        if: inputs.emit_release_cells
         shell: bash
         run: |
           set -euo pipefail
@@ -451,7 +409,7 @@ jobs:
             --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
 
       - name: Upload authenticated Vulkan release cell
-        if: success() && inputs.emit_release_cells && !inputs.candidate_installed_only
+        if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
@@ -460,7 +418,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Windows retrieval-readiness release cell
-        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.candidate_installed_only
+        if: inputs.emit_release_cells && inputs.server_behavior_only
         shell: bash
         run: |
           set -euo pipefail
@@ -480,7 +438,7 @@ jobs:
             --out target/release-cells/retrieval_readiness-windows-x64.json
 
       - name: Upload authenticated Windows retrieval-readiness release cell
-        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.candidate_installed_only
+        if: success() && inputs.emit_release_cells && inputs.server_behavior_only
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-postpublish-retrieval-windows-x64-attempt-${{ github.run_attempt }}

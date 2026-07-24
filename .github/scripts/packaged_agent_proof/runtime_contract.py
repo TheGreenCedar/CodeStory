@@ -7,8 +7,11 @@ from pathlib import Path
 
 from .contract_primitives import require_nonempty_string, sha256
 from .foundation import require
-from .ground_proof import prove_ground_only_runtime
-from .native_contract_identity import verify_runtime_against_manifest
+from .ground_proof import prove_single_project_runtime
+from .native_contract_identity import (
+    verify_engine_identities_against_manifest,
+    verify_runtime_against_manifest,
+)
 from .qualification_workflow import produce_qualification_evidence
 from .runtime_bootstrap import prove_runtime
 from .server_cleanup import wait_for_final_temporary_package_server
@@ -28,14 +31,15 @@ def run_runtime_proof(
     runtime_error = None
     runtime_traceback = None
     try:
-        if args.ground_only:
-            runtime = prove_ground_only_runtime(
+        if args.ground_only or args.server_behavior_only:
+            runtime = prove_single_project_runtime(
                 args,
                 cli,
                 env,
                 root,
                 args.out_dir,
                 manifest,
+                server_cleanup_control,
             )
         else:
             runtime = prove_runtime(
@@ -143,6 +147,19 @@ def record_runtime_contract(
             "installed_ground"
             if args.proof_tier == "installed_runtime"
             else "packaged_ground"
+        )
+        return
+    if args.server_behavior_only:
+        installed_provenance = installed_runtime_provenance_is_proven(args, runtime)
+        if args.proof_tier == "installed_runtime":
+            require(
+                installed_provenance,
+                "installed server proof omitted exact plugin or managed runtime provenance",
+            )
+        package_contract["runtime_evidence"] = verify_engine_identities_against_manifest(
+            manifest,
+            [("single-project plugin host", runtime.get("identity"))],
+            args.engine_policy,
         )
         return
     package_contract["runtime_evidence"] = verify_runtime_against_manifest(

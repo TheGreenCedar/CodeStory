@@ -157,28 +157,24 @@ executable it claims; it rejects
 `CODESTORY_CLI`, a repository-source plugin root, and a direct unpacked binary
 override.
 
-v0.16 release proof has candidate-installed lanes for Windows x64 and Apple
-Silicon. Each copies the exact source plugin into an isolated private
-installation root beneath the canonical runner temp directory and outside the
-source checkout, stages the exact packaged archive as the managed runtime, and
-binds both to the trusted coordinator run. These lanes cannot stand in for the
-two post-publish marketplace proofs.
+v0.16 release proof has candidate-installed lanes for Apple Silicon, Windows
+x64, and Linux x64. Each copies the exact source plugin into an isolated private
+installation root outside the source checkout, stages the exact packaged
+archive as the managed runtime, and binds both to the trusted coordinator run.
+These lanes cannot stand in for the three post-publish marketplace proofs.
 
-The coordinator's `server` scope is narrower than qualification. It runs the
-Linux package, protected Apple Silicon package, and both candidate-installed
-two-host paths with the frozen calibration bundle, but intentionally does not
-consume retrieval-quality evidence. The verifier records
-`claim_scope=server_behavior_only` and rejects qualification inputs in that
-mode. It may support server lifecycle, package identity, accelerator execution,
-and candidate-managed runtime provenance claims; it cannot support retrieval
-quality, answer quality, performance, or physical accelerator claims.
+The standard release path is narrower than qualification. On each protected
+host, `--server-behavior-only` initializes one plugin host, grounds one real
+project, waits for search readiness in that same project, and verifies the
+installed engine, server, package, and expected Metal or Vulkan backend
+identity. It rejects calibration and retrieval-quality inputs and makes no
+two-host sharing, answer-quality, performance, or broader lifecycle claim.
 
-The explicit `linux` coordinator scope runs the existing Linux x64 package and
-candidate-installed proof without scheduling Mac or Windows protected jobs. It
-uses the same server-behavior-only claim boundary as `server`; it does not
-assert retrieval quality or satisfy separate protected-platform cells.
-It is valid for either an accepted platform-proof PR or an exact live
-`dev/codestory-next` integration dispatch.
+The explicit `linux` coordinator scope runs that protected Linux x64 Vulkan
+package and candidate-installed proof without scheduling Mac or Windows
+protected jobs. It has the same single-project claim boundary as the standard
+release path and is valid for either an accepted platform-proof PR or an exact
+live `dev/codestory-next` integration dispatch.
 
 Frozen calibration bundles are accepted only from a successful
 `workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every
@@ -194,11 +190,9 @@ Platform proof boundaries:
   backend-observed execution, and full layer offload.
 - Windows x64 requires the exact package, CPU disallowed, physical Vulkan,
   software-adapter rejection, and backend-observed execution.
-- Linux proves same-user UDS, explicit CPU, offline behavior, full retrieval,
-  and server lifecycle. It makes no GPU claim without a separate protected
-  Vulkan lane.
+- Linux x64 requires the exact package, CPU disallowed, physical Vulkan,
+  software-adapter rejection, and backend-observed execution.
 
-Answer quality, release readiness, cross-user sharing, stronger cross-session
-sharing, whole-server automatic takeover, bounded bulk starvation, and Linux
-GPU execution remain nonclaims unless their own named evidence tier proves
-them.
+Answer quality, performance, cross-user sharing, stronger cross-session
+sharing, whole-server automatic takeover, and bounded bulk starvation remain
+nonclaims unless their own named evidence tier proves them.

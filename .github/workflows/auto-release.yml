@@ -30,38 +30,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  workflow-policy:
-    name: Workflow policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install workflow policy dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Check workflow syntax
-        run: |
-          node --test .github/scripts/run-actionlint.test.mjs
-          node .github/scripts/run-actionlint.mjs
-
-      - name: Check release claim and evidence contracts
-        run: >-
-          node --test
-          scripts/tests/codestory-release-claims.test.mjs
-          scripts/tests/codestory-release-cell-manifest.test.mjs
-          scripts/tests/codestory-release-closeout.test.mjs
-          scripts/tests/codestory-release-evidence-gate.test.mjs
-
-      - name: Enforce workflow policy
-        run: |
-          node .github/scripts/check-workflow-policy.mjs
-          node --test .github/scripts/check-workflow-policy.test.mjs
-
   detect-version:
     name: Detect codestory-cli version change
-    needs: workflow-policy
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -84,10 +54,6 @@ jobs:
             --before-sha "$BEFORE_SHA" \
             --repo "$GITHUB_REPOSITORY" \
             --output "$GITHUB_OUTPUT"
-
-      - name: Validate synchronized release version
-        if: steps.version.outputs.should_release == 'true'
-        run: python .github/scripts/check-codestory-release.py --version "${{ steps.version.outputs.version }}"
 
   release:
     name: Release

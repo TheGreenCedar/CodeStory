@@ -657,7 +657,6 @@ export function validateReleaseClaimGraph(graph) {
   nonEmptyText(promotion.proof_run_sha_expression, "workflow_policy.promotion.proof_run_sha_expression");
   nonEmptyText(promotion.manual_pr_ref_hint, "workflow_policy.promotion.manual_pr_ref_hint");
   nonEmptyText(promotion.source_cache_namespace, "workflow_policy.promotion.source_cache_namespace");
-  nonEmptyText(promotion.macos_source_cache_namespace, "workflow_policy.promotion.macos_source_cache_namespace");
   nonEmptyText(promotion.packaged_cache_namespace, "workflow_policy.promotion.packaged_cache_namespace");
   stringArray(promotion.label_routed_workflows, "workflow_policy.promotion.label_routed_workflows", { nonEmpty: true });
   stringArray(promotion.required_events, "workflow_policy.promotion.required_events", { nonEmpty: true });

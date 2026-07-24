@@ -142,7 +142,7 @@ def run_archive_proof(args: argparse.Namespace) -> None:
             args.expected_version,
         )
         verify_package_source(args, manifest)
-        require_frozen = not args.version_only and args.proof_tier != "calibration"
+        require_frozen = requires_calibration_bundle(args)
         require(
             not args.enforce_calibration_freeze_lineage or require_frozen,
             "calibration freeze lineage is valid only for the immediate frozen proof",
@@ -161,7 +161,7 @@ def run_archive_proof(args: argparse.Namespace) -> None:
             args,
             manifest,
             measurement_contract,
-            required=requires_calibration_bundle(args),
+            required=require_frozen,
         )
         env = isolated_environment(root, args.engine_policy, args.offline)
         summary = package_summary(

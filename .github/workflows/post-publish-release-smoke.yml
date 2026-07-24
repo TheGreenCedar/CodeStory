@@ -53,20 +53,27 @@ env:
 jobs:
   smoke:
     name: Published ${{ matrix.asset_target }} smoke
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    environment: ${{ matrix.environment }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            asset_target: windows-x64
+          - asset_target: windows-x64
+            runs_on: '["self-hosted","Windows","X64","codestory-vulkan"]'
+            environment: windows-vulkan-proof
+            backend: Vulkan
             extension: zip
-          - os: macos-15
-            asset_target: macos-arm64
+          - asset_target: macos-arm64
+            runs_on: '["self-hosted","macOS","ARM64","codestory-metal"]'
+            environment: macos-metal-release
+            backend: Metal
             extension: tar.gz
-          - os: ubuntu-latest
-            asset_target: linux-x64
+          - asset_target: linux-x64
+            runs_on: '["self-hosted","Linux","X64","codestory-linux-vulkan"]'
+            environment: linux-vulkan-proof
+            backend: Vulkan
             extension: tar.gz
     steps:
       - name: Normalize release version
@@ -88,6 +95,13 @@ jobs:
         with:
           ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+        env:
+          PSExecutionPolicyPreference: Bypass
 
       - name: Download accepted pre-publish closeout
         if: inputs.emit_release_cells
@@ -177,8 +191,8 @@ jobs:
 
       - name: Run Windows installer ownership self-test
         if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
-        run: pwsh -File scripts/install-codestory.ps1 -SelfTest
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: "& scripts/install-codestory.ps1 -SelfTest"
 
       - name: Resolve the published plugin through the marketplace catalog
         id: installed
@@ -207,16 +221,14 @@ jobs:
             --attestation "$install_root/install-attestation-v2.json" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Qualify the catalog-resolved published runtime
+      - name: Prove the catalog-resolved published runtime
         env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
+          CODESTORY_EMBED_ALLOW_CPU: "0"
         shell: bash
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
-          matrix_cell="installed_${{ matrix.asset_target }}_cpu"
-          matrix_cell="${matrix_cell//-/_}"
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "${{ steps.asset.outputs.archive }}" \
             --checksum-file "${{ steps.asset.outputs.checksum }}" \
@@ -224,11 +236,10 @@ jobs:
             --project "${{ github.workspace }}" \
             --plugin-root "${{ steps.installed.outputs.plugin_root }}" \
             --plugin-handoff \
-            --engine-policy cpu_explicit \
-            --expected-backend CPU \
+            --engine-policy accelerated \
+            --expected-backend "${{ matrix.backend }}" \
             --proof-tier installed_runtime \
-            --qualification-matrix-cell "$matrix_cell" \
-            --ground-only \
+            --server-behavior-only \
             --installed-plugin-attestation "${{ steps.installed.outputs.attestation }}" \
             --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
             --expected-source-sha "$source_sha" \

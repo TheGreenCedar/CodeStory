@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from .archive_proof import claim_scope, load_calibration_bundle, requires_calibration_bundle
-from .cli import _installed_proof_source, _resolve_optional_paths
+from .cli import _resolve_optional_paths
 from .contract_primitives import write_json
 from .foundation import ProofFailure, require
 from .qualification_recording import record_calibration_qualification
@@ -42,10 +42,6 @@ def run_cli_self_tests() -> None:
         require(
             args.installed_plugin_attestation == attestation.resolve(),
             "CLI optional path resolution changed",
-        )
-        require(
-            _installed_proof_source(args) == "candidate",
-            "candidate installation source was not retained",
         )
         require(
             claim_scope(args) == "installed_ground",
@@ -95,14 +91,6 @@ def run_cli_self_tests() -> None:
         )
         args.enforce_calibration_freeze_lineage = False
         args.server_behavior_only = False
-
-        write_json(attestation, {"installation_source": "unsupported"})
-        try:
-            _installed_proof_source(args)
-        except ProofFailure:
-            pass
-        else:
-            raise ProofFailure("unsupported installation source was accepted")
 
         calibration = root / "calibration.json"
         write_json(

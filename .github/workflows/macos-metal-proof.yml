@@ -42,12 +42,7 @@ on:
         default: false
         type: boolean
       candidate_installed_proof:
-        description: Stage and qualify the exact PR package through the private candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_only:
-        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Metal execution.
+        description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
         default: false
         type: boolean
@@ -100,12 +95,7 @@ on:
         default: false
         type: boolean
       candidate_installed_proof:
-        description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_only:
-        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Metal execution.
+        description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
         default: false
         type: boolean
@@ -161,12 +151,12 @@ jobs:
           macos_major="$(sw_vers -productVersion | cut -d. -f1)"
           test "$macos_major" -ge 15
 
-      - name: Validate candidate-installed-only mode
-        if: inputs.candidate_installed_only
+      - name: Validate candidate-installed mode
+        if: inputs.candidate_installed_proof
         shell: bash
         run: |
-          test "${{ inputs.candidate_installed_proof }}" = true
           test "${{ inputs.server_behavior_only }}" = true
+          test "${{ inputs.calibration_mode }}" = false
 
       - name: Install pinned Rust
         if: ${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}
@@ -245,8 +235,8 @@ jobs:
           run-id: ${{ inputs.calibration_bundle_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Prove cold and warm Metal, offline packaging, and multi-repository reuse
-        if: ${{ !inputs.calibration_mode && !inputs.candidate_installed_only }}
+      - name: Prove protected Metal runtime
+        if: ${{ !inputs.calibration_mode && !inputs.candidate_installed_proof }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
@@ -342,7 +332,7 @@ jobs:
           done
 
       - name: Stage isolated candidate-managed macOS install
-        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -384,40 +374,19 @@ jobs:
             --candidate-producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --candidate-artifact-name "$(basename "$archive")"
 
-      - name: Prove two-host candidate-installed macOS runtime
-        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+      - name: Prove candidate-installed macOS Metal runtime
+        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-          CODESTORY_EMBED_ALLOW_CPU: "1"
+          CODESTORY_EMBED_ALLOW_CPU: "0"
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
           archive="target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz"
-          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
-          claim_args=()
-          calibration_args=()
-          if [ "${{ inputs.server_behavior_only }}" = true ]; then
-            claim_args=(--ground-only)
-          else
-            calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-            test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-            test -f "$quality_path"
-            claim_args=(
-              --produce-qualification-evidence
-              --qualification-driver target/release/codestory_embedding_qualification
-              --qualification-evidence target/candidate-installed-macos/qualification.json
-              --retrieval-quality-evidence "$quality_path"
-            )
-            calibration_args=(
-              --calibration-bundle "$calibration_bundle"
-              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
-              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
-            )
-          fi
           python3 .github/scripts/check-packaged-agent-proof.py \
             --archive "$archive" \
             --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
@@ -425,13 +394,11 @@ jobs:
             --project "${{ github.workspace }}" \
             --plugin-root "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin" \
             --plugin-handoff \
-            --engine-policy cpu_explicit \
-            --expected-backend CPU \
+            --engine-policy accelerated \
+            --expected-backend Metal \
             --offline \
             --proof-tier installed_runtime \
-            --qualification-matrix-cell candidate_installed_macos_arm64_cpu \
-            "${claim_args[@]}" \
-            "${calibration_args[@]}" \
+            --server-behavior-only \
             --installed-plugin-attestation target/candidate-installed-macos/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_MACOS_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
@@ -455,7 +422,7 @@ jobs:
           overwrite: true
 
       - name: Upload candidate-installed macOS proof
-        if: always() && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '')
+        if: always() && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-macos-${{ inputs.version }}-attempt-${{ github.run_attempt }}
@@ -464,7 +431,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Metal release cell
-        if: inputs.emit_release_cells && !inputs.calibration_mode && !inputs.candidate_installed_only
+        if: inputs.emit_release_cells && !inputs.calibration_mode
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
@@ -490,7 +457,7 @@ jobs:
             --out target/release-cells/accelerator_execution-macos-arm64-metal.json
 
       - name: Upload authenticated Metal release cell
-        if: success() && inputs.emit_release_cells && !inputs.calibration_mode && !inputs.candidate_installed_only
+        if: success() && inputs.emit_release_cells && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
@@ -499,7 +466,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated macOS retrieval-readiness release cell
-        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode && !inputs.candidate_installed_only
+        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
@@ -520,7 +487,7 @@ jobs:
             --out target/release-cells/retrieval_readiness-macos-arm64.json
 
       - name: Upload authenticated macOS retrieval-readiness release cell
-        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode && !inputs.candidate_installed_only
+        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-postpublish-retrieval-macos-arm64-attempt-${{ github.run_attempt }}

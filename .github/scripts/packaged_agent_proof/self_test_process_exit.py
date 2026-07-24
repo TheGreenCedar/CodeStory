@@ -12,6 +12,7 @@ from pathlib import Path
 from .foundation import ProofFailure, require
 from .process_identity import ExactProcessExitWaiter, process_start_identity
 from .server_cleanup import (
+    cleanup_projects,
     native_server_exit_wait_budget,
     native_server_exit_wait_required,
     remaining_native_server_exit_wait_ms,
@@ -80,6 +81,23 @@ def _exit_budget_tests() -> dict[str, int]:
     else:
         raise ProofFailure("expired native server shared exit-wait deadline passed")
     return budget
+
+
+def _cleanup_project_tests() -> None:
+    project = str(Path.cwd().resolve())
+    require(
+        cleanup_projects({"projects": [project]}) == [Path(project)]
+        and cleanup_projects({"projects": [project, project]})
+        == [Path(project), Path(project)],
+        "one- and two-project cleanup contexts were rejected",
+    )
+    for projects in ([], [project, project, project], ["relative"], [1]):
+        try:
+            cleanup_projects({"projects": projects})
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(f"invalid cleanup projects were accepted: {projects!r}")
 
 
 def _retained_exit_tests(budget: dict[str, int]) -> None:
@@ -228,5 +246,6 @@ def run_process_exit_self_tests() -> None:
     target_os = _target_os()
     _observed_exit_test(target_os)
     _retained_exit_tests(_exit_budget_tests())
+    _cleanup_project_tests()
     _windows_exit_tests(target_os)
     _exit_timeout_test(target_os)

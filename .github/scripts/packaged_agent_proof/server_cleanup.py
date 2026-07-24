@@ -176,6 +176,20 @@ def _cleanup_environment(env: dict[str, str], control: dict) -> dict[str, str]:
     return cleanup_env
 
 
+def cleanup_projects(control: dict) -> list[Path]:
+    projects = control.get("projects")
+    require(
+        isinstance(projects, list)
+        and len(projects) in {1, 2}
+        and all(
+            isinstance(project, str) and Path(project).is_absolute()
+            for project in projects
+        ),
+        "runtime proof supplied invalid final server cleanup projects",
+    )
+    return [Path(project).resolve() for project in projects]
+
+
 def _observe_final_server(
     args: argparse.Namespace,
     env: dict[str, str],
@@ -191,14 +205,12 @@ def _observe_final_server(
     host_close_error = None
     try:
         qualification_cli = Path(control["qualification_cli"]).resolve()
-        projects = control["projects"]
+        projects = cleanup_projects(control)
         require(
-            qualification_cli.is_file()
-            and isinstance(projects, list)
-            and len(projects) == 2,
+            qualification_cli.is_file(),
             "runtime proof supplied invalid final server cleanup context",
         )
-        project = Path(projects[0]).resolve()
+        project = projects[0]
         host = McpProcess(
             [
                 str(qualification_cli),

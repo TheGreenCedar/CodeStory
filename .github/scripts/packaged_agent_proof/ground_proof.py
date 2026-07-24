@@ -1,4 +1,4 @@
-"""One-project packaged and installed ground proof."""
+"""One-project packaged ground and retrieval-readiness proof."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ from .foundation import LOWER_TIER_NONCLAIMS, require
 from .installation_support import assert_no_legacy_state, qualification_environment
 from .installed_identity import installed_plugin_identity
 from .managed_runtime import verify_managed_runtime_status
+from .server_engine_identity import engine_identity
+from .server_identity import server_snapshot
 from .subprocess_control import McpProcess
 
 
@@ -37,7 +39,7 @@ def _qualification_environment(
         return qualified
     require(
         args.installed_plugin_data is not None,
-        "installed ground-only proof requires --installed-plugin-data",
+        "installed single-project proof requires --installed-plugin-data",
     )
     qualified["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
     if provenance["installation_source"] == "candidate_archive":
@@ -137,6 +139,34 @@ def _run_ground(
     return ground_attempts, managed_runtime, managed_binary
 
 
+def _prove_server_readiness(
+    args: argparse.Namespace,
+    host: McpProcess,
+    project: Path,
+    manifest: dict,
+) -> dict:
+    _, search_attempts = host.search_until_ready(
+        {"project": str(project), "query": args.query, "why": True},
+        "server-readiness-search",
+    )
+    diagnostics = host.engine_diagnostics(project, "server-readiness-diagnostics")
+    identity = engine_identity(
+        diagnostics,
+        args.engine_policy,
+        args.expected_backend,
+    )
+    return {
+        "search": {
+            "status": "pass",
+            "attempts": search_attempts,
+            "project_bound": True,
+            "retrieval_ready": True,
+        },
+        "identity": identity,
+        "snapshot": server_snapshot(diagnostics, manifest, require_resident=True),
+    }
+
+
 def _ground_result(
     *,
     attempts: int,
@@ -175,33 +205,36 @@ def _ground_result(
         "nonclaims": {
             claim: {
                 "claimed": False,
-                "reason": "installed ground proof does not establish this claim",
+                "reason": "single-project ground proof does not establish this claim",
             }
             for claim in sorted(LOWER_TIER_NONCLAIMS)
         },
     }
 
 
-def prove_ground_only_runtime(
+def prove_single_project_runtime(
     args: argparse.Namespace,
     cli: Path,
     env: dict[str, str],
     root: Path,
     out_dir: Path,
     manifest: dict,
+    cleanup_control: dict,
 ) -> dict:
     require(
         args.plugin_handoff,
-        "ground-only proof requires the ordinary packaged plugin handoff",
+        "single-project proof requires the ordinary packaged plugin handoff",
     )
     require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
-    require(args.project is not None, "--project is required for ground-only proof")
+    require(args.project is not None, "--project is required for single-project proof")
     require(
         not args.additional_project and not args.additional_query,
-        "ground-only proof accepts exactly one project",
+        "single-project proof accepts exactly one project",
     )
     project = args.project.resolve()
-    require(project.is_dir(), f"ground-only proof repository does not exist: {project}")
+    require(
+        project.is_dir(), f"single-project proof repository does not exist: {project}"
+    )
     plugin_root = args.plugin_root.resolve()
     provenance = (
         installed_plugin_identity(args, plugin_root, manifest)
@@ -242,18 +275,50 @@ def prove_ground_only_runtime(
             root=root,
             qualified_env=qualified_env,
         )
+        if args.server_behavior_only:
+            result.update(_prove_server_readiness(args, host, project, manifest))
+            result["nonclaims"].pop("release_readiness", None)
+            if manifest["asset_target"] == "linux-x64":
+                result["nonclaims"].pop("linux_gpu_execution", None)
+            result["_qualification_forbidden_values"].append(args.query)
+            cleanup_control.update(
+                {
+                    "qualification_cli": str(
+                        managed_binary.resolve()
+                        if managed_binary is not None
+                        else cli.resolve()
+                    ),
+                    "qualification_directory": qualified_env[
+                        "CODESTORY_EMBED_QUALIFICATION_DIR"
+                    ],
+                    "qualification_nonce": qualified_env[
+                        "CODESTORY_EMBED_QUALIFICATION_NONCE"
+                    ],
+                    "plugin_cli_archive_sha256": None,
+                    "projects": [str(project)],
+                }
+            )
     finally:
+        transcript_name = (
+            "plugin-server-mcp.json"
+            if args.server_behavior_only
+            else "plugin-ground-mcp.json"
+        )
         write_json(
-            out_dir / "plugin-ground-mcp.json",
+            out_dir / transcript_name,
             retained_mcp_transcript(host.transcript),
         )
         host.close()
     assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
-    public_runtime_evidence = out_dir / "installed-ground-proof.json"
+    public_runtime_evidence = out_dir / (
+        "single-project-server-proof.json"
+        if args.server_behavior_only
+        else "installed-ground-proof.json"
+    )
     write_json(public_runtime_evidence, retained_runtime_evidence(result))
     forbidden_values = result.get("_qualification_forbidden_values", [])
     for public_artifact in (
-        out_dir / "plugin-ground-mcp.json",
+        out_dir / transcript_name,
         public_runtime_evidence,
     ):
         assert_retained_json_privacy(public_artifact, forbidden_values)

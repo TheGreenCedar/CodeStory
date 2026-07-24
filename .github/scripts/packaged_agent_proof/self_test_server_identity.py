@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 
 from .foundation import ProofFailure, require
-from .native_contract_identity import verify_runtime_against_manifest
+from .native_contract_identity import (
+    verify_engine_identities_against_manifest,
+    verify_runtime_against_manifest,
+)
 from .qualification_scenario_assertions import derive_scenario_assertions
 from .self_test_full_stack_types import FullStackFixture, ServerIdentityFixture
 from .server_engine_identity import engine_identity
@@ -48,6 +51,21 @@ def _engine_runtime_test(fixture: FullStackFixture) -> dict:
         evidence["execution"] == "proven_by_live_runtime",
         "runtime contract proof failed",
     )
+    single_host = verify_engine_identities_against_manifest(
+        manifest,
+        [("ground plugin host", valid)],
+        "accelerated",
+    )
+    require(
+        single_host == evidence,
+        "single-project server proof lost native runtime contract evidence",
+    )
+    try:
+        verify_engine_identities_against_manifest(manifest, [], "accelerated")
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("empty runtime observations were accepted")
     return valid
 
 

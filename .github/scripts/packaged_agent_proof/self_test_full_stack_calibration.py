@@ -12,7 +12,6 @@ from .contract_primitives import canonical_sha256, write_json
 from .foundation import ProofFailure, require
 from .measurement_samples import selected_qualification_matrix_cell
 from .package_contracts import verify_package_server_contracts
-from .qualification_artifacts import require_candidate_matrix_installation_source
 from .self_test_full_stack_types import CalibrationFixture, FullStackFixture
 
 
@@ -24,72 +23,56 @@ def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
         self_measurement_protocol,
         require_frozen=False,
     )
-    windows_candidate_cell_id = "candidate_installed_windows_x64_cpu"
-    windows_candidate_cell = selected_qualification_matrix_cell(
+    windows_cell_id = "protected_windows_x64_vulkan"
+    windows_cell = selected_qualification_matrix_cell(
         measurement_contract["measurement_protocol"],
-        cell_id=windows_candidate_cell_id,
+        cell_id=windows_cell_id,
         target="windows-x64",
-        proof_tier="installed_runtime",
-        expected_policy="cpu_explicit",
-        expected_backend="CPU",
+        proof_tier="protected_hardware",
+        expected_policy="accelerated",
+        expected_backend="Vulkan",
     )
     require(
-        windows_candidate_cell
+        windows_cell
         == {
             "asset_target": "windows-x64",
-            "proof_tier": "installed_runtime",
-            "host_class": "premerge_candidate_windows_x64",
-            "policy": "cpu_explicit",
-            "backend": "cpu",
+            "proof_tier": "protected_hardware",
+            "host_class": "protected_self_hosted_windows_x64",
+            "policy": "accelerated",
+            "backend": "vulkan",
             "cache_state": "reused",
             "residency_state": "resident",
-            "accelerator_claim": "none",
+            "accelerator_claim": "vulkan",
         },
-        "Windows candidate-installed alias changed its exact identity",
+        "protected Windows cell changed its exact identity",
     )
-    require_candidate_matrix_installation_source(
-        windows_candidate_cell_id,
-        "candidate",
-    )
-    try:
-        require_candidate_matrix_installation_source(
-            windows_candidate_cell_id,
-            "marketplace",
-        )
-    except ProofFailure:
-        pass
-    else:
-        raise ProofFailure(
-            "Windows candidate-installed alias accepted marketplace provenance"
-        )
-    hostile_windows_alias_values = {
+    hostile_windows_values = {
         "asset_target": "linux-x64",
-        "proof_tier": "protected_hardware",
-        "policy": "accelerated",
-        "backend": "vulkan",
-        "accelerator_claim": "vulkan",
+        "proof_tier": "installed_runtime",
+        "policy": "cpu_explicit",
+        "backend": "cpu",
     }
-    for field, hostile_value in hostile_windows_alias_values.items():
+    for field, hostile_value in hostile_windows_values.items():
         hostile_protocol = json.loads(
             json.dumps(measurement_contract["measurement_protocol"])
         )
-        hostile_protocol["host_package_matrix"]["installed_windows_x64_cpu"][field] = (
+        hostile_protocol["host_package_matrix"][windows_cell_id][field] = (
             hostile_value
         )
         try:
             selected_qualification_matrix_cell(
                 hostile_protocol,
-                cell_id=windows_candidate_cell_id,
+                cell_id=windows_cell_id,
                 target="windows-x64",
-                proof_tier="installed_runtime",
-                expected_policy="cpu_explicit",
-                expected_backend="CPU",
+                proof_tier="protected_hardware",
+                expected_policy="accelerated",
+                expected_backend="Vulkan",
             )
         except ProofFailure:
             pass
         else:
             raise ProofFailure(
-                f"Windows candidate-installed alias accepted changed {field}"
+                f"protected Windows cell accepted changed {field}"
             )
     return measurement_contract
 
