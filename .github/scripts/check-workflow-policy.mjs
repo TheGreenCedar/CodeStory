@@ -1870,6 +1870,19 @@ function validatePackagedProof(workflows, violations, graph) {
   requireStepRun(violations, file, job, "Install Linux Vulkan build dependencies", [
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
   ]);
+  const windowsNativeStagingTest = namedStep(job, "Test immutable native staging on Windows");
+  add(
+    violations,
+    windowsNativeStagingTest?.if === "runner.os == 'Windows'",
+    `${file} immutable native staging regression must run on Windows`,
+  );
+  requireStepRun(violations, file, job, "Test immutable native staging on Windows", [
+    "cargo test --release --locked",
+    "-p codestory-llama-sys",
+    "--test native_staging",
+    '--target "${{ matrix.rust_target }}"',
+    "stages_complete_immutable_native_seeds",
+  ]);
   requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
     ".github/docker/linux-glibc-build.Dockerfile",
     "cargo build --release --locked -p codestory-cli",
