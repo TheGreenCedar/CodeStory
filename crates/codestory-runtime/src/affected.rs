@@ -5,8 +5,8 @@ use super::{
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, ApiError, AppController, FileInfo,
     GraphNode, GraphNodeId, IndexFreshnessDto, IndexFreshnessStatusDto, IndexedFileRoleDto, NodeId,
-    NodeKind, OperationPathIdentityResolver, PathIdentityUnavailable, Store, WorkspacePathIdentity,
-    clamp_usize_to_u32, edge_certainty_label,
+    NodeKind, OperationPathIdentityResolver, PathIdentityUnavailable, ReadStorage, Store,
+    WorkspacePathIdentity, clamp_usize_to_u32, edge_certainty_label,
     index_freshness_observation_from_storage_with_identities, indexable_source_path_in_workspace,
     indexable_source_path_with_root, indexed_file_role, normalize_path_key, path_role_from_key,
     runtime_relative_path,
@@ -330,7 +330,6 @@ struct AffectedIdentityMatches {
     graph_seeded_record_flags: Vec<bool>,
     previous_record_index_by_file_id: HashMap<GraphNodeId, usize>,
     current_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
-    previous_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
     current_identity_error_by_record: Vec<Option<String>>,
     previous_identity_error_by_record: Vec<Option<String>>,
     indexed_identity_by_file_id: HashMap<GraphNodeId, WorkspacePathIdentity>,
@@ -381,7 +380,6 @@ where
     let mut current_buckets = AffectedOrderedIdentityBuckets::default();
     let mut previous_buckets = AffectedOrderedIdentityBuckets::default();
     let mut current_identity_by_record = Vec::with_capacity(change_records.len());
-    let mut previous_identity_by_record = Vec::with_capacity(change_records.len());
     let mut current_identity_error_by_record = Vec::with_capacity(change_records.len());
     let mut previous_identity_error_by_record = Vec::with_capacity(change_records.len());
     for (record_index, record) in change_records.iter().enumerate() {
@@ -408,16 +406,13 @@ where
             match path_identities.resolve(&previous_path) {
                 Ok(identity) => {
                     previous_buckets.push(identity.clone(), record_index);
-                    previous_identity_by_record.push(Some(identity));
                     previous_identity_error_by_record.push(None);
                 }
                 Err(error) => {
-                    previous_identity_by_record.push(None);
                     previous_identity_error_by_record.push(Some(error.to_string()));
                 }
             }
         } else {
-            previous_identity_by_record.push(None);
             previous_identity_error_by_record.push(None);
         }
     }
@@ -529,7 +524,6 @@ where
         graph_seeded_record_flags,
         previous_record_index_by_file_id,
         current_identity_by_record,
-        previous_identity_by_record,
         current_identity_error_by_record,
         previous_identity_error_by_record,
         indexed_identity_by_file_id,
@@ -1447,6 +1441,258 @@ struct AffectedGraphIndex {
     node_ids_by_file: HashMap<GraphNodeId, Vec<GraphNodeId>>,
 }
 
+struct AffectedClassifiedInputs {
+    matched_files: Vec<AffectedMatchedFileDto>,
+    unmatched_paths: Vec<AffectedUnmatchedPathDto>,
+    uncovered_inputs: Vec<AffectedUncoveredInputDto>,
+    matched_file_ids: HashSet<GraphNodeId>,
+    matched_record_flags: Vec<bool>,
+    graph_seeded_record_flags: Vec<bool>,
+    current_identity_errors: Vec<Option<String>>,
+    previous_identity_errors: Vec<Option<String>>,
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<String>,
+    freshness_evidence_affects_requested_claim: bool,
+    previous_identity_seed_evidence: BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    graph_seed_file_ids: BTreeSet<GraphNodeId>,
+}
+
+fn previous_identity_seed_evidence(
+    records: &[AffectedChangeRecordDto],
+    previous_record_index_by_file_id: HashMap<GraphNodeId, usize>,
+) -> BTreeMap<GraphNodeId, AffectedGraphEvidence> {
+    previous_record_index_by_file_id
+        .into_iter()
+        .map(|(file_id, record_index)| {
+            let record = &records[record_index];
+            (
+                file_id,
+                AffectedGraphEvidence::seed(
+                    file_id,
+                    format!(
+                        "previous indexed identity {} proxy-seeded graph evidence for current {} path {}",
+                        record.previous_path.as_deref().unwrap_or_default(),
+                        match &record.kind {
+                            AffectedChangeKindDto::Renamed => "renamed",
+                            AffectedChangeKindDto::Copied => "copied",
+                            _ => unreachable!("previous identity seeds are rename/copy only"),
+                        },
+                        record.path,
+                    ),
+                    AffectedConfidenceFloor::bounded(),
+                    true,
+                ),
+            )
+        })
+        .collect()
+}
+
+struct AffectedMatchedClassification {
+    files: Vec<AffectedMatchedFileDto>,
+    uncovered: Vec<AffectedUncoveredInputDto>,
+    freshness_unavailable: bool,
+}
+
+fn classify_matched_affected_files(
+    root: &Path,
+    records: &[AffectedChangeRecordDto],
+    files: &[FileInfo],
+    errors_by_file: &HashMap<i64, u32>,
+    freshness: &IndexFreshnessObservation,
+    matched_file_ids: &HashSet<GraphNodeId>,
+    matched_record_index_by_file_id: &HashMap<GraphNodeId, usize>,
+    indexed_identity_by_file_id: &HashMap<GraphNodeId, WorkspacePathIdentity>,
+) -> AffectedMatchedClassification {
+    let mut matched = files
+        .iter()
+        .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
+        .map(|file| {
+            let file_id = codestory_contracts::graph::NodeId(file.id);
+            let record = matched_record_index_by_file_id
+                .get(&file_id)
+                .map(|record_index| &records[*record_index]);
+            (
+                file_id,
+                AffectedMatchedFileDto {
+                    path: runtime_relative_path(root, &file.path),
+                    role: indexed_file_role(&file.path),
+                    indexed: file.indexed,
+                    complete: file.complete,
+                    change_kind: record.map(|record| record.kind.clone()),
+                    change_status: record.map(|record| record.status.clone()),
+                    previous_path: record.and_then(|record| record.previous_path.clone()),
+                    error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by(|left, right| left.1.path.cmp(&right.1.path).then(left.0.cmp(&right.0)));
+    let mut uncovered = Vec::new();
+    let mut freshness_unavailable = false;
+    for (file_id, file) in &matched {
+        let stale = indexed_identity_by_file_id
+            .get(file_id)
+            .is_some_and(|identity| freshness.identity_is_stale(identity));
+        freshness_unavailable |= !stale && file.error_count == 0 && !freshness.inventory_complete;
+        if let Some((classification, reason, evidence)) = classify_matched_affected_input(
+            file,
+            stale,
+            freshness.inventory_complete
+                && freshness.freshness.status != IndexFreshnessStatusDto::NotChecked,
+        ) {
+            uncovered.push(AffectedUncoveredInputDto {
+                path: file.path.clone(),
+                classification,
+                reason,
+                evidence,
+            });
+        }
+    }
+    AffectedMatchedClassification {
+        files: matched.into_iter().map(|(_, file)| file).collect(),
+        uncovered,
+        freshness_unavailable,
+    }
+}
+
+fn classify_unmatched_affected_paths(
+    root: &Path,
+    records: &[AffectedChangeRecordDto],
+    resolved_inputs: &[AffectedResolvedInput],
+    freshness: &IndexFreshnessObservation,
+    matched_record_flags: &[bool],
+    graph_seeded_record_flags: &[bool],
+    current_identity_by_record: &[Option<WorkspacePathIdentity>],
+    current_identity_errors: &[Option<String>],
+    previous_identity_errors: &[Option<String>],
+) -> (Vec<AffectedUnmatchedPathDto>, bool) {
+    let mut freshness_unavailable = false;
+    let paths = records
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !matched_record_flags[*index])
+        .map(|(index, record)| {
+            let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
+                Some(root),
+                record,
+                &resolved_inputs[index],
+                freshness,
+                current_identity_by_record[index].as_ref(),
+                current_identity_errors[index].as_deref(),
+                previous_identity_errors[index].as_deref(),
+            );
+            freshness_unavailable |= matches!(
+                affected_path_metadata(&resolved_inputs[index].current),
+                AffectedPathMetadataObservation::RegularFile
+            ) && indexable_source_path_in_workspace(root, &resolved_inputs[index].current)
+                && current_identity_errors[index].is_none()
+                && current_identity_by_record[index]
+                    .as_ref()
+                    .is_some_and(|identity| !freshness.identity_is_stale(identity))
+                && !freshness.inventory_complete;
+            if graph_seeded_record_flags[index] {
+                evidence.push(format!(
+                    "previous indexed identity {} supplied bounded proxy graph evidence",
+                    record.previous_path.as_deref().unwrap_or_default()
+                ));
+                if classification == AffectedInputClassificationDto::RenameUnresolved {
+                    reason = "current rename/copy path remains unresolved; the previous indexed identity supplies bounded graph evidence but does not establish current-path coverage"
+                        .to_string();
+                }
+            }
+            AffectedUnmatchedPathDto {
+                path: record.path.clone(),
+                classification,
+                reason,
+                evidence,
+                change_kind: Some(record.kind.clone()),
+                change_status: Some(record.status.clone()),
+                previous_path: record.previous_path.clone(),
+            }
+        })
+        .collect();
+    (paths, freshness_unavailable)
+}
+
+fn classify_affected_inputs(
+    root: &Path,
+    records: &[AffectedChangeRecordDto],
+    resolved_inputs: &[AffectedResolvedInput],
+    files: &[FileInfo],
+    errors_by_file: &HashMap<i64, u32>,
+    freshness: &IndexFreshnessObservation,
+    matches: AffectedIdentityMatches,
+) -> AffectedClassifiedInputs {
+    let AffectedIdentityMatches {
+        matched_file_ids,
+        matched_record_flags,
+        matched_record_index_by_file_id,
+        graph_seeded_record_flags,
+        previous_record_index_by_file_id,
+        current_identity_by_record,
+        current_identity_error_by_record,
+        previous_identity_error_by_record,
+        indexed_identity_by_file_id,
+        unavailable_indexed_identity_count,
+        unavailable_indexed_identity_sample,
+        work: _,
+    } = matches;
+    let previous_identity_seed_evidence =
+        previous_identity_seed_evidence(records, previous_record_index_by_file_id);
+    let graph_seed_file_ids = matched_file_ids
+        .iter()
+        .copied()
+        .chain(previous_identity_seed_evidence.keys().copied())
+        .collect();
+    let matched = classify_matched_affected_files(
+        root,
+        records,
+        files,
+        errors_by_file,
+        freshness,
+        &matched_file_ids,
+        &matched_record_index_by_file_id,
+        &indexed_identity_by_file_id,
+    );
+    let (unmatched_paths, unmatched_freshness_unavailable) = classify_unmatched_affected_paths(
+        root,
+        records,
+        resolved_inputs,
+        freshness,
+        &matched_record_flags,
+        &graph_seeded_record_flags,
+        &current_identity_by_record,
+        &current_identity_error_by_record,
+        &previous_identity_error_by_record,
+    );
+    let mut uncovered_inputs = unmatched_paths
+        .iter()
+        .map(|input| AffectedUncoveredInputDto {
+            path: input.path.clone(),
+            classification: input.classification.clone(),
+            reason: input.reason.clone(),
+            evidence: input.evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    uncovered_inputs.extend(matched.uncovered);
+    AffectedClassifiedInputs {
+        matched_files: matched.files,
+        unmatched_paths,
+        uncovered_inputs,
+        matched_file_ids,
+        matched_record_flags,
+        graph_seeded_record_flags,
+        current_identity_errors: current_identity_error_by_record,
+        previous_identity_errors: previous_identity_error_by_record,
+        unavailable_indexed_identity_count,
+        unavailable_indexed_identity_sample,
+        freshness_evidence_affects_requested_claim: unmatched_freshness_unavailable
+            || matched.freshness_unavailable,
+        previous_identity_seed_evidence,
+        graph_seed_file_ids,
+    }
+}
+
 fn affected_graph_index(
     controller: &AppController,
     root: &Path,
@@ -1667,7 +1913,322 @@ struct AffectedRouteImpacts {
     truncated: bool,
 }
 
+struct PreparedAffectedRequest {
+    root: PathBuf,
+    depth: u32,
+    filter: Option<String>,
+    changed_paths: Vec<String>,
+    change_records: Vec<AffectedChangeRecordDto>,
+    resolved_inputs: Vec<AffectedResolvedInput>,
+}
+
+struct AffectedStoredState {
+    storage: ReadStorage,
+    files: Vec<FileInfo>,
+    nodes: Vec<GraphNode>,
+    edges: Vec<codestory_contracts::graph::Edge>,
+    errors_by_file: HashMap<i64, u32>,
+    freshness: IndexFreshnessObservation,
+    identity_matches: AffectedIdentityMatches,
+}
+
+struct AffectedCompletionInput<'a> {
+    root: &'a Path,
+    resolved_inputs: &'a [AffectedResolvedInput],
+    matched_record_flags: &'a [bool],
+    graph_seeded_record_flags: &'a [bool],
+    current_identity_errors: &'a [Option<String>],
+    previous_identity_errors: &'a [Option<String>],
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<&'a str>,
+    freshness: &'a IndexFreshnessObservation,
+    freshness_affects_claim: bool,
+    uncovered_inputs: &'a [AffectedUncoveredInputDto],
+    matched_file_count: usize,
+    graph_seed_file_count: usize,
+    change_record_count: usize,
+    matched_files: &'a [AffectedMatchedFileDto],
+    impacted_routes: &'a [AffectedRouteDto],
+    impacted_tests: &'a [AffectedTestFileDto],
+    impacted_symbol_total: usize,
+    impacted_symbols_truncated: bool,
+    impacted_route_total: usize,
+    impacted_routes_truncated: bool,
+    direct_impact_count: usize,
+    propagated_impact_count: usize,
+    depth: u32,
+    visited_node_count: usize,
+    visited_edge_count: usize,
+}
+
+struct AffectedCompletion {
+    project: String,
+    bounds: AffectedAnalysisBoundsDto,
+    completeness: AffectedAnalysisCompletenessDto,
+    blind_spots: Vec<String>,
+    follow_ups: Vec<AffectedFollowUpDto>,
+    notes: Vec<String>,
+}
+
+fn affected_freshness_diagnostic(
+    freshness: &IndexFreshnessObservation,
+    freshness_affects_claim: bool,
+) -> Option<String> {
+    freshness_affects_claim.then(|| {
+        freshness
+            .freshness
+            .reason
+            .as_deref()
+            .map(|reason| {
+                format!(
+                    "inspect observational freshness because requested-path evidence was unavailable: {reason}"
+                )
+            })
+            .unwrap_or_else(|| {
+                "inspect observational freshness because requested-path refresh-plan identity evidence was unavailable"
+                    .to_string()
+            })
+    })
+}
+
+fn complete_affected_analysis(input: AffectedCompletionInput<'_>) -> AffectedCompletion {
+    let mut notes = Vec::new();
+    let mut blind_spots = Vec::new();
+    let relevant_evidence_gaps =
+        affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: Some(input.root),
+            resolved_inputs: input.resolved_inputs,
+            matched_record_flags: input.matched_record_flags,
+            current_identity_errors: input.current_identity_errors,
+            previous_identity_errors: input.previous_identity_errors,
+            unavailable_indexed_identity_count: input.unavailable_indexed_identity_count,
+            unavailable_indexed_identity_sample: input.unavailable_indexed_identity_sample,
+            freshness_evidence_affects_requested_claim: input.freshness_affects_claim,
+            freshness_identity_gap_count: input.freshness.identity_gap_count,
+            freshness_identity_gap_sample: input.freshness.identity_gap_sample.as_deref(),
+        });
+    let unavailable_input_count = input
+        .uncovered_inputs
+        .iter()
+        .filter(|item| item.classification == AffectedInputClassificationDto::UnavailableEvidence)
+        .count();
+    let gap_composition =
+        compose_affected_evidence_gaps(unavailable_input_count, &relevant_evidence_gaps);
+    if input.matched_file_count == 0 {
+        let note = "no current input paths matched indexed file identity; inspect the typed uncovered-input evidence"
+            .to_string();
+        notes.push(note.clone());
+        if input.graph_seed_file_count == 0 {
+            blind_spots.push(note);
+        }
+    } else {
+        notes.push(format!(
+            "matched {} indexed files by current path; dependency walk expanded files into contained symbols",
+            input.matched_file_count
+        ));
+    }
+    let graph_seeded_input_count = input
+        .graph_seeded_record_flags
+        .iter()
+        .filter(|seeded| **seeded)
+        .count();
+    let graph_unseeded_input_count = input
+        .change_record_count
+        .saturating_sub(graph_seeded_input_count);
+    if graph_unseeded_input_count > 0 {
+        blind_spots.push(format!(
+            "{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal"
+        ));
+    }
+    let previous_only_seed_count = input
+        .graph_seeded_record_flags
+        .iter()
+        .zip(input.matched_record_flags)
+        .filter(|(seeded, matched)| **seeded && !**matched)
+        .count();
+    if previous_only_seed_count > 0 {
+        notes.push(format!(
+            "{previous_only_seed_count} current input paths were classified separately while their previous indexed identities seeded graph traversal"
+        ));
+    }
+    blind_spots.extend(gap_composition.blind_spots.iter().cloned());
+    if input
+        .matched_files
+        .iter()
+        .any(|file| !file.complete || file.error_count > 0)
+    {
+        blind_spots
+            .push("one or more matched files are incomplete or have recorded index errors".into());
+    }
+    if input.impacted_routes.is_empty() {
+        blind_spots.push("no route/endpoint evidence found for matched files or dependents".into());
+    }
+    if input.impacted_tests.is_empty() {
+        notes.push("no impacted test-like files found in the indexed graph".into());
+    }
+    let mut truncation_reasons = Vec::new();
+    if input.impacted_symbols_truncated {
+        truncation_reasons.push(format!(
+            "impacted_symbols retained 200 of {} results",
+            input.impacted_symbol_total
+        ));
+    }
+    if input.impacted_routes_truncated {
+        truncation_reasons.push(format!(
+            "impacted_routes retained 100 of {} results",
+            input.impacted_route_total
+        ));
+    }
+    blind_spots.extend(truncation_reasons.iter().cloned());
+    if input.freshness.freshness.status == IndexFreshnessStatusDto::Stale
+        && !input
+            .uncovered_inputs
+            .iter()
+            .any(|item| item.classification == AffectedInputClassificationDto::StaleIndex)
+    {
+        blind_spots.push(
+            "the workspace has unrelated stale index state, but no requested input was classified stale"
+                .into(),
+        );
+    }
+    let project = input.root.to_string_lossy().to_string();
+    let freshness_diagnostic =
+        affected_freshness_diagnostic(input.freshness, input.freshness_affects_claim);
+    if freshness_diagnostic.is_some() {
+        blind_spots.push(
+            "bounded index freshness evidence was unavailable for a requested indexable path; no complete no-impact claim is possible"
+                .into(),
+        );
+    }
+    let follow_ups = affected_follow_ups(
+        &project,
+        input.uncovered_inputs,
+        freshness_diagnostic.as_deref(),
+    );
+    let completeness = compose_affected_completeness(AffectedCompletenessInput {
+        uncovered_input_count: input.uncovered_inputs.len(),
+        direct_impact_count: input.direct_impact_count,
+        propagated_impact_count: input.propagated_impact_count,
+        candidate_test_count: input.impacted_tests.len(),
+        freshness_evidence_affects_requested_claim: input.freshness_affects_claim,
+        gap_composition,
+        truncation_reasons,
+    });
+    AffectedCompletion {
+        project,
+        bounds: AffectedAnalysisBoundsDto {
+            requested_depth: input.depth,
+            maximum_depth: 8,
+            visited_node_count: clamp_usize_to_u32(input.visited_node_count),
+            visited_edge_count: clamp_usize_to_u32(input.visited_edge_count),
+            impacted_symbol_limit: 200,
+            impacted_route_limit: 100,
+        },
+        completeness,
+        blind_spots,
+        follow_ups,
+        notes,
+    }
+}
+
 impl AppController {
+    fn prepare_affected_request(
+        &self,
+        req: AffectedAnalysisRequest,
+    ) -> Result<PreparedAffectedRequest, ApiError> {
+        self.ensure_consistent_read_state("Affected analysis")?;
+        let root = self.require_project_root()?;
+        let depth = req.depth.unwrap_or(2).clamp(1, 8);
+        let filter = req.filter.as_deref().map(normalize_path_key);
+        let (changed_paths, change_records) = normalized_affected_input(&req.input)?;
+        let resolved_inputs = change_records
+            .iter()
+            .map(|record| {
+                let current = self.resolve_project_file_path(&record.path, true)?;
+                let previous = record
+                    .previous_path
+                    .as_deref()
+                    .map(|path| self.resolve_project_file_path(path, true))
+                    .transpose()?;
+                Ok(AffectedResolvedInput { current, previous })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(PreparedAffectedRequest {
+            root,
+            depth,
+            filter,
+            changed_paths,
+            change_records,
+            resolved_inputs,
+        })
+    }
+
+    fn load_affected_state(
+        &self,
+        root: &Path,
+        change_records: &[AffectedChangeRecordDto],
+    ) -> Result<AffectedStoredState, ApiError> {
+        let storage = self.open_storage_read_only()?;
+        let files = storage.get_files().map_err(|error| {
+            ApiError::internal(format!("Failed to load indexed files: {error}"))
+        })?;
+        let nodes = storage
+            .get_nodes()
+            .map_err(|error| ApiError::internal(format!("Failed to load graph nodes: {error}")))?;
+        let edges = storage
+            .get_edges()
+            .map_err(|error| ApiError::internal(format!("Failed to load graph edges: {error}")))?;
+        let errors = storage
+            .get_errors(None)
+            .map_err(|error| ApiError::internal(format!("Failed to load index errors: {error}")))?;
+        let mut errors_by_file = HashMap::<i64, u32>::new();
+        for error in errors {
+            if let Some(file_id) = error.file_id {
+                *errors_by_file.entry(file_id.0).or_default() += 1;
+            }
+        }
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(root, &storage_path)
+            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        let mut path_identities = AffectedOperationIdentityIndex::native();
+        let freshness = index_freshness_observation_from_storage_with_identities(
+            root,
+            &workspace,
+            &storage,
+            &self.source_index_policy,
+            &mut path_identities,
+        );
+        let identity_matches = match_affected_file_identities(
+            root,
+            change_records,
+            files.iter().map(|file| {
+                (
+                    codestory_contracts::graph::NodeId(file.id),
+                    file.path.as_path(),
+                )
+            }),
+            &mut path_identities,
+        );
+        tracing::debug!(
+            record_visits = identity_matches.work.record_visits,
+            indexed_file_visits = identity_matches.work.indexed_file_visits,
+            current_identity_bucket_visits = identity_matches.work.current_identity_bucket_visits,
+            previous_identity_bucket_visits = identity_matches.work.previous_identity_bucket_visits,
+            bucket_record_visits = identity_matches.work.bucket_record_visits,
+            indexed_bucket_file_visits = identity_matches.work.indexed_bucket_file_visits,
+            "affected identity matching work"
+        );
+        Ok(AffectedStoredState {
+            storage,
+            files,
+            nodes,
+            edges,
+            errors_by_file,
+            freshness,
+            identity_matches,
+        })
+    }
+
     fn affected_route_impacts(
         &self,
         storage: &Store,
@@ -1751,227 +2312,46 @@ impl AppController {
         &self,
         req: AffectedAnalysisRequest,
     ) -> Result<AffectedAnalysisDto, ApiError> {
-        self.ensure_consistent_read_state("Affected analysis")?;
-        let root = self.require_project_root()?;
-        let depth = req.depth.unwrap_or(2).clamp(1, 8);
-        let filter = req.filter.as_deref().map(normalize_path_key);
-        let (changed_paths, change_records) = normalized_affected_input(&req.input)?;
-        let resolved_inputs = change_records
-            .iter()
-            .map(|record| {
-                let current = self.resolve_project_file_path(&record.path, true)?;
-                let previous = record
-                    .previous_path
-                    .as_deref()
-                    .map(|path| self.resolve_project_file_path(path, true))
-                    .transpose()?;
-                Ok(AffectedResolvedInput { current, previous })
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        let storage = self.open_storage_read_only()?;
-        let files = storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
-        let nodes = storage
-            .get_nodes()
-            .map_err(|e| ApiError::internal(format!("Failed to load graph nodes: {e}")))?;
-        let edges = storage
-            .get_edges()
-            .map_err(|e| ApiError::internal(format!("Failed to load graph edges: {e}")))?;
-        let errors = storage
-            .get_errors(None)
-            .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
-        let mut errors_by_file = HashMap::<i64, u32>::new();
-        for error in errors {
-            if let Some(file_id) = error.file_id {
-                *errors_by_file.entry(file_id.0).or_default() += 1;
-            }
-        }
-
-        let storage_path = self.require_storage_path()?;
-        let workspace = runtime_workspace_manifest(&root, &storage_path)
-            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
-        let mut path_identities = AffectedOperationIdentityIndex::native();
-        let freshness_observation = index_freshness_observation_from_storage_with_identities(
-            &root,
-            &workspace,
-            &storage,
-            &self.source_index_policy,
-            &mut path_identities,
-        );
-        let freshness = &freshness_observation.freshness;
-        let identity_matches = match_affected_file_identities(
-            &root,
-            &change_records,
-            files.iter().map(|file| {
-                (
-                    codestory_contracts::graph::NodeId(file.id),
-                    file.path.as_path(),
-                )
-            }),
-            &mut path_identities,
-        );
-        let AffectedIdentityMatches {
+        let PreparedAffectedRequest {
+            root,
+            depth,
+            filter,
+            changed_paths,
+            change_records,
+            resolved_inputs,
+        } = self.prepare_affected_request(req)?;
+        let AffectedStoredState {
+            storage,
+            files,
+            nodes,
+            edges,
+            errors_by_file,
+            freshness: freshness_observation,
+            identity_matches,
+        } = self.load_affected_state(&root, &change_records)?;
+        let AffectedClassifiedInputs {
+            matched_files,
+            unmatched_paths,
+            uncovered_inputs,
             matched_file_ids: current_matched_file_ids,
             matched_record_flags: current_matched_record_flags,
-            matched_record_index_by_file_id,
             graph_seeded_record_flags,
-            previous_record_index_by_file_id,
-            current_identity_by_record,
-            previous_identity_by_record: _previous_identity_by_record,
-            current_identity_error_by_record,
-            previous_identity_error_by_record,
-            indexed_identity_by_file_id,
+            current_identity_errors: current_identity_error_by_record,
+            previous_identity_errors: previous_identity_error_by_record,
             unavailable_indexed_identity_count,
             unavailable_indexed_identity_sample,
-            work: identity_match_work,
-        } = identity_matches;
-        tracing::debug!(
-            record_visits = identity_match_work.record_visits,
-            indexed_file_visits = identity_match_work.indexed_file_visits,
-            current_identity_bucket_visits = identity_match_work.current_identity_bucket_visits,
-            previous_identity_bucket_visits = identity_match_work.previous_identity_bucket_visits,
-            bucket_record_visits = identity_match_work.bucket_record_visits,
-            indexed_bucket_file_visits = identity_match_work.indexed_bucket_file_visits,
-            "affected identity matching work"
+            freshness_evidence_affects_requested_claim,
+            previous_identity_seed_evidence,
+            graph_seed_file_ids,
+        } = classify_affected_inputs(
+            &root,
+            &change_records,
+            &resolved_inputs,
+            &files,
+            &errors_by_file,
+            &freshness_observation,
+            identity_matches,
         );
-        let previous_identity_seed_evidence = previous_record_index_by_file_id
-            .into_iter()
-            .map(|(file_id, record_index)| {
-                let record = &change_records[record_index];
-                (
-                    file_id,
-                    AffectedGraphEvidence::seed(
-                        file_id,
-                        format!(
-                            "previous indexed identity {} proxy-seeded graph evidence for current {} path {}",
-                            record.previous_path.as_deref().unwrap_or_default(),
-                            match &record.kind {
-                                AffectedChangeKindDto::Renamed => "renamed",
-                                AffectedChangeKindDto::Copied => "copied",
-                                _ => unreachable!("previous identity seeds are rename/copy only"),
-                            },
-                            record.path,
-                        ),
-                        AffectedConfidenceFloor::bounded(),
-                        true,
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let graph_seed_file_ids = current_matched_file_ids
-            .iter()
-            .copied()
-            .chain(previous_identity_seed_evidence.keys().copied())
-            .collect::<BTreeSet<_>>();
-        let mut matched_files = files
-            .iter()
-            .filter(|file| {
-                current_matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id))
-            })
-            .map(|file| {
-                let file_id = codestory_contracts::graph::NodeId(file.id);
-                let record = matched_record_index_by_file_id
-                    .get(&file_id)
-                    .map(|record_index| &change_records[*record_index]);
-                (
-                    file_id,
-                    AffectedMatchedFileDto {
-                        path: runtime_relative_path(&root, &file.path),
-                        role: indexed_file_role(&file.path),
-                        indexed: file.indexed,
-                        complete: file.complete,
-                        change_kind: record.map(|record| record.kind.clone()),
-                        change_status: record.map(|record| record.status.clone()),
-                        previous_path: record.and_then(|record| record.previous_path.clone()),
-                        error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        matched_files
-            .sort_by(|left, right| left.1.path.cmp(&right.1.path).then(left.0.cmp(&right.0)));
-        let mut unmatched_freshness_unavailable = false;
-        let unmatched_paths = change_records
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !current_matched_record_flags[*index])
-            .map(|(index, record)| {
-                let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
-                    Some(&root),
-                    record,
-                    &resolved_inputs[index],
-                    &freshness_observation,
-                    current_identity_by_record[index].as_ref(),
-                    current_identity_error_by_record[index].as_deref(),
-                    previous_identity_error_by_record[index].as_deref(),
-                );
-                unmatched_freshness_unavailable |= matches!(
-                    affected_path_metadata(&resolved_inputs[index].current),
-                    AffectedPathMetadataObservation::RegularFile
-                ) && indexable_source_path_in_workspace(&root, &resolved_inputs[index].current)
-                    && current_identity_error_by_record[index].is_none()
-                    && current_identity_by_record[index]
-                        .as_ref()
-                        .is_some_and(|identity| !freshness_observation.identity_is_stale(identity))
-                    && !freshness_observation.inventory_complete;
-                if graph_seeded_record_flags[index] {
-                    evidence.push(format!(
-                        "previous indexed identity {} supplied bounded proxy graph evidence",
-                        record.previous_path.as_deref().unwrap_or_default()
-                    ));
-                    if classification == AffectedInputClassificationDto::RenameUnresolved {
-                        reason = "current rename/copy path remains unresolved; the previous indexed identity supplies bounded graph evidence but does not establish current-path coverage"
-                            .to_string();
-                    }
-                }
-                AffectedUnmatchedPathDto {
-                    path: record.path.clone(),
-                    classification,
-                    reason,
-                    evidence,
-                    change_kind: Some(record.kind.clone()),
-                    change_status: Some(record.status.clone()),
-                    previous_path: record.previous_path.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut uncovered_inputs = unmatched_paths
-            .iter()
-            .map(|input| AffectedUncoveredInputDto {
-                path: input.path.clone(),
-                classification: input.classification.clone(),
-                reason: input.reason.clone(),
-                evidence: input.evidence.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut matched_freshness_unavailable = false;
-        for (file_id, file) in &matched_files {
-            let stale = indexed_identity_by_file_id
-                .get(file_id)
-                .is_some_and(|identity| freshness_observation.identity_is_stale(identity));
-            matched_freshness_unavailable |=
-                !stale && file.error_count == 0 && !freshness_observation.inventory_complete;
-            let Some((classification, reason, evidence)) = classify_matched_affected_input(
-                file,
-                stale,
-                freshness_observation.inventory_complete
-                    && freshness.status != IndexFreshnessStatusDto::NotChecked,
-            ) else {
-                continue;
-            };
-            uncovered_inputs.push(AffectedUncoveredInputDto {
-                path: file.path.clone(),
-                classification,
-                reason,
-                evidence,
-            });
-        }
-        let matched_files = matched_files
-            .into_iter()
-            .map(|(_, file)| file)
-            .collect::<Vec<_>>();
-
         let graph = affected_graph_index(self, &root, &files, &nodes);
 
         let seed_evidence = affected_graph_seeds(
@@ -2000,151 +2380,41 @@ impl AppController {
         let impacted_routes_truncated = route_impacts.truncated;
         let impacted_tests = affected_test_impacts(&impacted_symbols);
 
-        let mut notes = Vec::new();
-        let mut blind_spots = Vec::new();
-        let freshness_evidence_affects_requested_claim =
-            unmatched_freshness_unavailable || matched_freshness_unavailable;
-        let relevant_evidence_gaps =
-            affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
-                workspace_root: Some(&root),
-                resolved_inputs: &resolved_inputs,
-                matched_record_flags: &current_matched_record_flags,
-                current_identity_errors: &current_identity_error_by_record,
-                previous_identity_errors: &previous_identity_error_by_record,
-                unavailable_indexed_identity_count,
-                unavailable_indexed_identity_sample: unavailable_indexed_identity_sample.as_deref(),
-                freshness_evidence_affects_requested_claim,
-                freshness_identity_gap_count: freshness_observation.identity_gap_count,
-                freshness_identity_gap_sample: freshness_observation.identity_gap_sample.as_deref(),
-            });
-        let unavailable_input_count = uncovered_inputs
-            .iter()
-            .filter(|input| {
-                input.classification == AffectedInputClassificationDto::UnavailableEvidence
-            })
-            .count();
-        let gap_composition =
-            compose_affected_evidence_gaps(unavailable_input_count, &relevant_evidence_gaps);
-        if current_matched_file_ids.is_empty() {
-            let note = "no current input paths matched indexed file identity; inspect the typed uncovered-input evidence"
-                .to_string();
-            notes.push(note.clone());
-            if graph_seed_file_ids.is_empty() {
-                blind_spots.push(note);
-            }
-        } else {
-            notes.push(format!(
-                "matched {} indexed files by current path; dependency walk expanded files into contained symbols",
-                current_matched_file_ids.len()
-            ));
-        }
-        let graph_seeded_input_count = graph_seeded_record_flags
-            .iter()
-            .filter(|seeded| **seeded)
-            .count();
-        let graph_unseeded_input_count = change_records
-            .len()
-            .saturating_sub(graph_seeded_input_count);
-        if graph_unseeded_input_count > 0 {
-            blind_spots.push(format!(
-                "{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal"
-            ));
-        }
-        let previous_only_seed_count = graph_seeded_record_flags
-            .iter()
-            .zip(&current_matched_record_flags)
-            .filter(|(seeded, matched)| **seeded && !**matched)
-            .count();
-        if previous_only_seed_count > 0 {
-            notes.push(format!(
-                "{previous_only_seed_count} current input paths were classified separately while their previous indexed identities seeded graph traversal"
-            ));
-        }
-        blind_spots.extend(gap_composition.blind_spots.iter().cloned());
-        if matched_files
-            .iter()
-            .any(|file| !file.complete || file.error_count > 0)
-        {
-            blind_spots.push(
-                "one or more matched files are incomplete or have recorded index errors"
-                    .to_string(),
-            );
-        }
-        if impacted_routes.is_empty() {
-            blind_spots.push(
-                "no route/endpoint evidence found for matched files or dependents".to_string(),
-            );
-        }
-        if impacted_tests.is_empty() {
-            notes.push("no impacted test-like files found in the indexed graph".to_string());
-        }
-        let mut truncation_reasons = Vec::new();
-        if impacted_symbols_truncated {
-            truncation_reasons.push(format!(
-                "impacted_symbols retained 200 of {impacted_symbol_total} results"
-            ));
-        }
-        if impacted_routes_truncated {
-            truncation_reasons.push(format!(
-                "impacted_routes retained 100 of {impacted_route_total} results"
-            ));
-        }
-        let truncated = !truncation_reasons.is_empty();
-        if truncated {
-            blind_spots.extend(truncation_reasons.iter().cloned());
-        }
-
-        let project = root.to_string_lossy().to_string();
-        if freshness.status == IndexFreshnessStatusDto::Stale
-            && !uncovered_inputs
-                .iter()
-                .any(|input| input.classification == AffectedInputClassificationDto::StaleIndex)
-        {
-            blind_spots.push(
-                "the workspace has unrelated stale index state, but no requested input was classified stale"
-                    .to_string(),
-            );
-        }
-        let freshness_diagnostic = freshness_evidence_affects_requested_claim.then(|| {
-            freshness
-                .reason
-                .as_deref()
-                .map(|reason| {
-                    format!(
-                        "inspect observational freshness because requested-path evidence was unavailable: {reason}"
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "inspect observational freshness because requested-path refresh-plan identity evidence was unavailable"
-                        .to_string()
-                })
-        });
-        if freshness_diagnostic.is_some() {
-            blind_spots.push(
-                "bounded index freshness evidence was unavailable for a requested indexable path; no complete no-impact claim is possible"
-                    .to_string(),
-            );
-        }
-        let follow_ups =
-            affected_follow_ups(&project, &uncovered_inputs, freshness_diagnostic.as_deref());
-        let completeness = compose_affected_completeness(AffectedCompletenessInput {
-            uncovered_input_count: uncovered_inputs.len(),
+        let AffectedCompletion {
+            project,
+            bounds,
+            completeness,
+            blind_spots,
+            follow_ups,
+            notes,
+        } = complete_affected_analysis(AffectedCompletionInput {
+            root: &root,
+            resolved_inputs: &resolved_inputs,
+            matched_record_flags: &current_matched_record_flags,
+            graph_seeded_record_flags: &graph_seeded_record_flags,
+            current_identity_errors: &current_identity_error_by_record,
+            previous_identity_errors: &previous_identity_error_by_record,
+            unavailable_indexed_identity_count,
+            unavailable_indexed_identity_sample: unavailable_indexed_identity_sample.as_deref(),
+            freshness: &freshness_observation,
+            freshness_affects_claim: freshness_evidence_affects_requested_claim,
+            uncovered_inputs: &uncovered_inputs,
+            matched_file_count: current_matched_file_ids.len(),
+            graph_seed_file_count: graph_seed_file_ids.len(),
+            change_record_count: change_records.len(),
+            matched_files: &matched_files,
+            impacted_routes: &impacted_routes,
+            impacted_tests: &impacted_tests,
+            impacted_symbol_total,
+            impacted_symbols_truncated,
+            impacted_route_total,
+            impacted_routes_truncated,
             direct_impact_count,
             propagated_impact_count,
-            candidate_test_count: impacted_tests.len(),
-            freshness_evidence_affects_requested_claim,
-            gap_composition,
-            truncation_reasons,
+            depth,
+            visited_node_count: distances.len(),
+            visited_edge_count,
         });
-        let bounds = AffectedAnalysisBoundsDto {
-            requested_depth: depth,
-            maximum_depth: 8,
-            visited_node_count: clamp_usize_to_u32(distances.len()),
-            visited_edge_count: clamp_usize_to_u32(visited_edge_count),
-            impacted_symbol_limit: 200,
-            impacted_route_limit: 100,
-        };
-
         Ok(AffectedAnalysisDto {
             project_root: project,
             changed_paths,
