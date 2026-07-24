@@ -8,7 +8,6 @@ import json
 import math
 import os
 import re
-import secrets
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,7 +16,6 @@ from pathlib import Path
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
     REQUIRED_SERVER_SCENARIOS,
-    RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
     TARGET_CONTRACTS,
     ProofFailure,
     require,
@@ -46,15 +44,15 @@ from .process import (
 )
 from .runtime import (
     metric_passes,
-    produce_product_publication_fault_evidence,
     retain_five_process_memory_evidence,
-    verify_fault_recovery_consistency_raw_evidence,
-    verify_publication_fault_raw_evidence,
-    verify_retrieval_quality_raw_evidence,
 )
 from .qualification import (
     qualification_artifact,
     qualification_measurement_artifact,
+)
+from .qualification_production import (
+    collect_qualification_external_evidence,
+    prepare_qualification_producer,
 )
 
 def verify_calibration_source_lineage(
@@ -1125,97 +1123,29 @@ def produce_qualification_evidence(
     measurement_contract: dict,
     server_cleanup_control: dict,
 ) -> dict:
-    require(
-        args.qualification_evidence is not None,
-        "--produce-qualification-evidence requires --qualification-evidence",
+    context = prepare_qualification_producer(
+        args,
+        qualification_cli,
+        env,
+        root,
+        runtime,
+        manifest,
+        archive_sha256,
+        measurement_contract,
+        server_cleanup_control,
     )
-    require(
-        qualification_cli.is_file(),
-        f"qualification executable is missing: {qualification_cli}",
-    )
-    require(
-        sha256(qualification_cli) == manifest["binary"]["sha256"],
-        "qualification executable does not match the packaged executable",
-    )
-    private_root = root / "qualification-suite"
-    artifact_root = private_root / "artifacts"
-    private_root.mkdir(mode=0o700)
-    artifact_root.mkdir(mode=0o700)
-    nonce = secrets.token_hex(32)
-    nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
-    projects = runtime.get("_qualification_projects")
-    require(
-        isinstance(projects, list)
-        and len(projects) == 2
-        and all(isinstance(project, str) and Path(project).is_absolute() for project in projects),
-        "runtime proof omitted its two qualification projects",
-    )
-    contracts = {
-        "protocol_sha256": measurement_contract["protocol_sha256"],
-        "constant_set_sha256": measurement_contract["constant_set_sha256"],
-        "measurement_protocol_sha256": measurement_contract["measurement_protocol_sha256"],
-    }
-    package = {
-        "archive_sha256": archive_sha256,
-        "executable_sha256": manifest["binary"]["sha256"],
-        "asset_target": manifest["asset_target"],
-        "release_version": manifest["release_version"],
-    }
-    qualification_env = dict(env)
-    qualification_env.pop("CODESTORY_CLI", None)
-    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
-    qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
-    qualification_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = archive_sha256
-    server_cleanup_control.update(
-        {
-            "qualification_cli": str(qualification_cli.resolve()),
-            "qualification_directory": str(private_root.resolve()),
-            "qualification_nonce": nonce,
-            "plugin_cli_archive_sha256": archive_sha256,
-            "projects": list(projects),
-        }
-    )
-    fault_recovery_consistency_evidence = None
-    if args.publication_fault_evidence is None:
-        (
-            args.publication_fault_evidence,
-            consistency_path,
-        ) = produce_product_publication_fault_evidence(
-            qualification_cli,
-            qualification_env,
-            private_root,
-            artifact_root,
-            nonce,
-            source=manifest["source"],
-            package=package,
-            contracts=contracts,
-            timeout=args.timeout_secs,
-        )
-        fault_recovery_consistency_evidence = (
-            verify_fault_recovery_consistency_raw_evidence(
-                consistency_path,
-                source=manifest["source"],
-                package=package,
-                contracts=contracts,
-            )
-        )
-    publication_fault_evidence = verify_publication_fault_raw_evidence(
-        args.publication_fault_evidence,
-        source=manifest["source"],
-        package=package,
-        contracts=contracts,
-    )
-    retrieval_quality_evidence = None
-    if args.retrieval_quality_evidence is not None:
-        retrieval_quality_evidence = verify_retrieval_quality_raw_evidence(
-            args.retrieval_quality_evidence,
-            source=manifest["source"],
-        )
-    elif args.proof_tier != "calibration":
-        raise ProofFailure(
-            f"{args.proof_tier} qualification requires --retrieval-quality-evidence "
-            f"from {RETRIEVAL_QUALITY_EVIDENCE_CONTRACT}"
-        )
+    external = collect_qualification_external_evidence(context)
+    private_root = context.private_root
+    artifact_root = context.artifact_root
+    nonce = context.nonce
+    nonce_sha256 = context.nonce_sha256
+    projects = list(context.projects)
+    contracts = context.contracts
+    package = context.package
+    qualification_env = context.qualification_env
+    publication_fault_evidence = external.publication_fault
+    fault_recovery_consistency_evidence = external.fault_recovery_consistency
+    retrieval_quality_evidence = external.retrieval_quality
     identity = runtime["identity"]
     expected_backend = args.expected_backend or require_nonempty_string(
         identity.get("embedding_backend"),
