@@ -639,8 +639,9 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::stage_windows_runtime_file;
+    use super::{prepare_runtime_copy, publish_all_with, replace_file, stage_windows_runtime_file};
     use std::fs;
+    use std::io;
 
     #[test]
     fn replaces_a_source_hard_link_with_an_independent_runtime_copy() {
@@ -655,6 +656,42 @@ mod windows_tests {
 
         assert_eq!(fs::read(&source).expect("source DLL"), b"native");
         assert_eq!(fs::read(&destination).expect("staged DLL"), b"staged");
+    }
+
+    #[test]
+    fn late_publication_failure_restores_every_previous_dll() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let first_source = temp.path().join("first-source.dll");
+        let second_source = temp.path().join("second-source.dll");
+        let first_destination = temp.path().join("first.dll");
+        let second_destination = temp.path().join("second.dll");
+        fs::write(&first_source, b"new-first").expect("first source");
+        fs::write(&second_source, b"new-second").expect("second source");
+        fs::write(&first_destination, b"old-first").expect("first destination");
+        fs::write(&second_destination, b"old-second").expect("second destination");
+        let first =
+            prepare_runtime_copy(&first_source, &first_destination).expect("first replacement");
+        let second =
+            prepare_runtime_copy(&second_source, &second_destination).expect("second replacement");
+        let mut attempt = 0;
+
+        publish_all_with(vec![first, second], |source, destination| {
+            attempt += 1;
+            if attempt == 2 {
+                return Err(io::Error::other("injected late publication failure"));
+            }
+            replace_file(source, destination)
+        })
+        .expect_err("second publication must fail");
+
+        assert_eq!(
+            fs::read(first_destination).expect("restored first DLL"),
+            b"old-first"
+        );
+        assert_eq!(
+            fs::read(second_destination).expect("unchanged second DLL"),
+            b"old-second"
+        );
     }
 }
 
