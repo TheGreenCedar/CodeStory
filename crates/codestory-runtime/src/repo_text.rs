@@ -135,6 +135,10 @@ impl AppController {
                 path_string,
                 line,
                 score,
+                contents
+                    .lines()
+                    .nth(line.saturating_sub(1) as usize)
+                    .map(str::to_string),
             ));
         }
 
@@ -287,6 +291,7 @@ impl AppController {
         path_string: String,
         line: u32,
         score: f32,
+        source_excerpt: Option<String>,
     ) -> SearchHit {
         SearchHit {
             node_id,
@@ -306,6 +311,8 @@ impl AppController {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }
     }

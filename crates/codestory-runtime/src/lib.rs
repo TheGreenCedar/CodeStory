@@ -75,6 +75,7 @@ mod index_timings;
 mod publication;
 mod repo_text;
 mod route_coverage;
+mod search_evidence;
 mod search_intent;
 mod search_plan;
 mod search_publication;

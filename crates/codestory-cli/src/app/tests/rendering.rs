@@ -6,7 +6,6 @@ use crate::app::artifacts::{CONTEXT_BUNDLE_OUTPUT_BYTE_CAP, write_context_bundle
 use crate::app::drill::drill_search_hit_from_packet_citation;
 use crate::app::rendering::{
     RepoTextOutputConfig, SearchOutputParts, build_query_resolution_output, build_search_output,
-    implementation_counterpart_targets_for_hit, interface_implementation_targets_for_hit,
 };
 use crate::app::resolution::quote_command_value;
 use crate::app::source_commands::append_symbol_workflow_nodes;
@@ -199,6 +198,8 @@ fn build_search_output_preserves_separate_provenance_groups() {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -212,6 +213,8 @@ fn build_search_output_preserves_separate_provenance_groups() {
         origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
         match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
         resolvable: false,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -403,6 +406,8 @@ fn build_search_output_marks_repo_text_why_as_diagnostic_navigation() {
         origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
         match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
         resolvable: false,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -546,6 +551,8 @@ fn build_search_output_adds_stable_node_ref_when_location_is_known() {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -590,6 +597,8 @@ fn build_search_output_adds_occurrence_quality_and_verification_targets() {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -654,90 +663,73 @@ fn build_search_output_adds_occurrence_quality_and_verification_targets() {
 }
 
 #[test]
-fn header_member_hits_include_sibling_implementation_verification_target() {
+fn renderer_uses_operation_bound_excerpt_after_source_mutation() {
     let temp = tempdir().expect("tempdir");
-    let src_dir = temp.path().join("src/lib/project");
-    fs::create_dir_all(&src_dir).expect("mkdir");
+    let source = temp.path().join("src/Project.h");
+    let implementation = temp.path().join("src/Project.cpp");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("create source parent");
+    fs::write(&source, "class Project { void buildIndex(); };\n").expect("write indexed source");
     fs::write(
-        src_dir.join("Project.h"),
-        "class Project { void buildIndex(); };\n",
-    )
-    .expect("write header");
-    fs::write(
-        src_dir.join("Project.cpp"),
+        &implementation,
         "#include \"Project.h\"\n\nvoid Project::buildIndex() {}\n",
     )
-    .expect("write impl");
+    .expect("write indexed implementation");
+    let hit = SearchHit {
+        node_id: NodeId("text-1".to_string()),
+        display_name: "Project::buildIndex".to_string(),
+        kind: NodeKind::FILE,
+        file_path: Some(source.to_string_lossy().into_owned()),
+        line: Some(1),
+        score: 500.0,
+        origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+        match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
+        resolvable: false,
+        source_excerpt: Some("class Project { void buildIndex(); };".to_string()),
+        verification_targets: vec![codestory_contracts::api::SearchVerificationTargetDto {
+            role: "definition".to_string(),
+            file_path: implementation.to_string_lossy().into_owned(),
+            line: 3,
+            display_name: "Project::buildIndex".to_string(),
+            reason: "sibling implementation location for a C/C++ header hit".to_string(),
+        }],
+        ..test_search_hit_defaults()
+    };
 
-    let targets = implementation_counterpart_targets_for_hit(
-        temp.path(),
-        "Project::buildIndex",
-        Some("src/lib/project/Project.h"),
-    );
+    fs::write(&source, "class Replacement {};\n").expect("mutate source after result");
+    fs::write(&implementation, "void unrelated() {}\n")
+        .expect("mutate implementation after result");
+    let output = build_search_output(SearchOutputParts {
+        project_root: temp.path(),
+        query: "value",
+        retrieval: &sample_retrieval(),
+        retrieval_shadow: None,
+        freshness: None,
+        symbol_hits: &[],
+        repo_text_hits: &[hit],
+        repo_text_stats: None,
+        query_assessment: None,
+        search_plan: None,
+        suggestions: &[],
+        occurrences_by_node: &HashMap::new(),
+        limit_per_source: 5,
+        repo_text: RepoTextOutputConfig {
+            mode: RepoTextMode::On,
+            enabled: true,
+        },
+        explain: false,
+    });
 
-    assert!(
-        targets.iter().any(|target| {
-            target.path == "src/lib/project/Project.cpp"
-                && target.line == 3
-                && target.role == "definition"
-        }),
-        "expected sibling implementation target in {targets:#?}"
+    assert_eq!(
+        output.repo_text_hits[0].excerpt.as_deref(),
+        Some("class Project { void buildIndex(); };")
     );
-}
-
-#[test]
-fn abstract_interface_hits_include_concrete_implementation_verification_targets() {
-    let temp = tempdir().expect("tempdir");
-    let src_dir = temp.path().join("src/lib/data/storage");
-    fs::create_dir_all(&src_dir).expect("mkdir");
-    fs::write(
-        src_dir.join("StorageAccess.h"),
-        "class StorageAccess {\npublic:\n virtual TextAccess getFileContent() const = 0;\n};\n",
-    )
-    .expect("write interface");
-    fs::write(
-        src_dir.join("PersistentStorage.h"),
-        "class PersistentStorage\n    : public StorageAccess\n{\n};\n",
-    )
-    .expect("write implementation header");
-    fs::write(
-            src_dir.join("PersistentStorage.cpp"),
-            "#include \"PersistentStorage.h\"\n\nTextAccess PersistentStorage::getFileContent() const {}\n",
-        )
-        .expect("write implementation");
-    fs::write(
-        src_dir.join("StorageCache.cpp"),
-        "TextAccess StorageCache::getFileContent() const {}\n",
-    )
-    .expect("write unrelated implementation");
-
-    let targets = interface_implementation_targets_for_hit(
-        temp.path(),
-        "StorageAccess::getFileContent",
-        Some("src/lib/data/storage/StorageAccess.h"),
+    assert_eq!(
+        output.repo_text_hits[0].verification_targets[0].path,
+        "src/Project.cpp"
     );
-
-    assert!(
-        targets.iter().any(|target| {
-            target.path == "src/lib/data/storage/PersistentStorage.h"
-                && target.line == 1
-                && target.role == "declaration"
-        }),
-        "expected concrete implementation class declaration in {targets:#?}"
-    );
-    assert!(
-        targets.iter().any(|target| {
-            target.path == "src/lib/data/storage/PersistentStorage.cpp"
-                && target.line == 3
-                && target.role == "definition"
-        }),
-        "expected concrete implementation method definition in {targets:#?}"
-    );
-    assert!(
-        !targets
-            .iter()
-            .any(|target| target.path == "src/lib/data/storage/StorageCache.cpp"),
-        "unrelated same-name methods should not be verification targets: {targets:#?}"
+    assert_eq!(
+        output.repo_text_hits[0].verification_targets[0].line, 3,
+        "rendering must not relocate a pinned target from newer source bytes"
     );
 }
 
@@ -754,6 +746,8 @@ fn build_search_output_marks_repo_text_duplicates_of_indexed_symbols() {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -767,6 +761,8 @@ fn build_search_output_marks_repo_text_duplicates_of_indexed_symbols() {
         origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
         match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
         resolvable: false,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }];
@@ -1099,6 +1095,8 @@ fn build_search_output_includes_why_when_requested() {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: Some(codestory_contracts::api::RetrievalScoreBreakdownDto {
             lexical: 0.7,
             semantic: 0.2,

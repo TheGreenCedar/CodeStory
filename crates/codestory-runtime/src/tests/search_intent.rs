@@ -50,6 +50,8 @@ fn search_intent_filters_hits_by_kind_path_name_and_language() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }
     }

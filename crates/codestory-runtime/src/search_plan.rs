@@ -1618,7 +1618,7 @@ impl AppController {
         let retrieval = retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config)?;
         let freshness = self.index_freshness().ok();
         let mut repo_text_hits = Vec::new();
-        let suggestions = Vec::new();
+        let mut suggestions = Vec::new();
         let query_assessment = search_query_assessment(
             &query,
             &indexed_symbol_hits,
@@ -1698,6 +1698,16 @@ impl AppController {
         );
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        crate::search_evidence::attach_pinned_search_evidence(
+            &storage,
+            project_root.as_deref(),
+            &mut indexed_symbol_hits,
+        );
+        crate::search_evidence::attach_pinned_search_evidence(
+            &storage,
+            project_root.as_deref(),
+            &mut suggestions,
+        );
         let hits = indexed_symbol_hits.clone();
         let retrieval_shadow = Some(
             agent::retrieval_primary::shadow_from_query_result_with_candidate_admission_diagnostics(

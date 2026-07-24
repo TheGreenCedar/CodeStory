@@ -1634,6 +1634,8 @@ fn search_plan_test_hit(
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
     }
 }
@@ -5130,6 +5132,8 @@ fn embedded_exact_symbol_terms_count_and_annotate_exact_hits() {
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
     };
     let query = "exact symbol first semantic ranking search_hybrid_with_scores";

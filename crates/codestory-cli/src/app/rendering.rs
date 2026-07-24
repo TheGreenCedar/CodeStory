@@ -7,7 +7,6 @@ use codestory_contracts::api::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     path::Path,
 };
 
@@ -222,16 +221,16 @@ pub(crate) fn build_search_hit_output(
     };
     let mut verification_targets =
         verification_targets_for_hit(project_root, &hit.display_name, occurrences);
-    verification_targets.extend(implementation_counterpart_targets_for_hit(
-        project_root,
-        &hit.display_name,
-        hit.file_path.as_deref(),
-    ));
-    verification_targets.extend(interface_implementation_targets_for_hit(
-        project_root,
-        &hit.display_name,
-        hit.file_path.as_deref(),
-    ));
+    verification_targets.extend(hit.verification_targets.iter().map(|target| {
+        let path = crate::display::relative_path(project_root, &target.file_path);
+        VerificationTargetOutput {
+            role: target.role.clone(),
+            path: path.clone(),
+            line: target.line,
+            node_ref: Some(format!("{path}:{}:{}", target.line, target.display_name)),
+            reason: target.reason.clone(),
+        }
+    }));
     dedupe_verification_targets(&mut verification_targets);
     let primary_occurrence_kind =
         primary_occurrence(occurrences).map(|occurrence| occurrence.kind.clone());
@@ -271,7 +270,13 @@ pub(crate) fn build_search_hit_output(
         eligible_for_sufficiency: hit.eligible_for_sufficiency,
         score_breakdown,
         duplicate_of: None,
-        excerpt: repo_text_excerpt(project_root, hit),
+        excerpt: if hit.is_text_match() {
+            hit.source_excerpt
+                .as_deref()
+                .map(|excerpt| compact_excerpt(excerpt.trim(), 140))
+        } else {
+            None
+        },
         primary_occurrence_kind,
         symbol_role,
         paired_refs,
@@ -438,187 +443,6 @@ pub(super) fn verification_targets_for_hit(
         }
     }
     targets
-}
-
-pub(super) fn implementation_counterpart_targets_for_hit(
-    project_root: &std::path::Path,
-    display_name: &str,
-    file_path: Option<&str>,
-) -> Vec<VerificationTargetOutput> {
-    let Some(file_path) = file_path else {
-        return Vec::new();
-    };
-    if !display_name.contains("::") || !is_cxx_header_path(file_path) {
-        return Vec::new();
-    }
-    let hit_path = std::path::Path::new(file_path);
-    let absolute_header = if hit_path.is_absolute() {
-        hit_path.to_path_buf()
-    } else {
-        project_root.join(hit_path)
-    };
-    let Some(stem) = absolute_header.file_stem().and_then(|stem| stem.to_str()) else {
-        return Vec::new();
-    };
-    let Some(parent) = absolute_header.parent() else {
-        return Vec::new();
-    };
-    [".cpp", ".cc", ".cxx", ".c"]
-        .into_iter()
-        .filter_map(|extension| {
-            let candidate = parent.join(format!("{stem}{extension}"));
-            let content = fs::read_to_string(&candidate).ok()?;
-            let line_index = content
-                .lines()
-                .position(|line| line.contains(display_name))?;
-            let path =
-                crate::display::relative_path(project_root, candidate.to_string_lossy().as_ref());
-            let line = (line_index + 1) as u32;
-            Some(VerificationTargetOutput {
-                role: "definition".to_string(),
-                path: path.clone(),
-                line,
-                node_ref: Some(format!("{path}:{line}:{display_name}")),
-                reason: "sibling implementation location for a C/C++ header hit".to_string(),
-            })
-        })
-        .collect()
-}
-
-pub(super) fn interface_implementation_targets_for_hit(
-    project_root: &std::path::Path,
-    display_name: &str,
-    file_path: Option<&str>,
-) -> Vec<VerificationTargetOutput> {
-    let Some(file_path) = file_path else {
-        return Vec::new();
-    };
-    if !is_cxx_header_path(file_path) {
-        return Vec::new();
-    }
-    let Some((interface_name, member_name)) = split_qualified_member(display_name) else {
-        return Vec::new();
-    };
-    let hit_path = std::path::Path::new(file_path);
-    let absolute_header = if hit_path.is_absolute() {
-        hit_path.to_path_buf()
-    } else {
-        project_root.join(hit_path)
-    };
-    let Ok(interface_content) = fs::read_to_string(&absolute_header) else {
-        return Vec::new();
-    };
-    if !abstract_header_declares_member(&interface_content, interface_name, member_name) {
-        return Vec::new();
-    }
-    let Some(parent) = absolute_header.parent() else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return Vec::new();
-    };
-    let mut headers = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path != &absolute_header && is_cxx_header_path(&path.to_string_lossy()))
-        .collect::<Vec<_>>();
-    headers.sort();
-
-    let mut targets = Vec::new();
-    for header in headers {
-        let Some(class_name) = header.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Ok(header_content) = fs::read_to_string(&header) else {
-            continue;
-        };
-        if !header_declares_public_base(&header_content, class_name, interface_name) {
-            continue;
-        }
-        let declaration_line =
-            line_containing(&header_content, &format!("class {class_name}")).unwrap_or(1);
-        let header_path = crate::display::relative_path(project_root, &header.to_string_lossy());
-        targets.push(VerificationTargetOutput {
-            role: "declaration".to_string(),
-            path: header_path.clone(),
-            line: declaration_line,
-            node_ref: Some(format!("{header_path}:{declaration_line}:{class_name}")),
-            reason: "C/C++ implementation class declaration for an abstract interface hit"
-                .to_string(),
-        });
-
-        for extension in [".cpp", ".cc", ".cxx", ".c"] {
-            let implementation = parent.join(format!("{class_name}{extension}"));
-            let Ok(implementation_content) = fs::read_to_string(&implementation) else {
-                continue;
-            };
-            let definition_pattern = format!("{class_name}::{member_name}");
-            let Some(definition_line) =
-                line_containing(&implementation_content, &definition_pattern)
-            else {
-                continue;
-            };
-            let path =
-                crate::display::relative_path(project_root, &implementation.to_string_lossy());
-            targets.push(VerificationTargetOutput {
-                role: "definition".to_string(),
-                path: path.clone(),
-                line: definition_line,
-                node_ref: Some(format!("{path}:{definition_line}:{definition_pattern}")),
-                reason: "C/C++ implementation method for an abstract interface hit".to_string(),
-            });
-            break;
-        }
-        if targets.len() >= 4 {
-            break;
-        }
-    }
-    targets
-}
-
-pub(super) fn split_qualified_member(display_name: &str) -> Option<(&str, &str)> {
-    let (owner, member) = display_name.rsplit_once("::")?;
-    let owner = owner.rsplit("::").next()?.trim();
-    let member = member
-        .split_once('(')
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(member)
-        .trim();
-    (!owner.is_empty() && !member.is_empty()).then_some((owner, member))
-}
-
-pub(super) fn abstract_header_declares_member(
-    content: &str,
-    interface_name: &str,
-    member_name: &str,
-) -> bool {
-    content.contains(&format!("class {interface_name}"))
-        && content.contains(member_name)
-        && content.contains("= 0")
-}
-
-pub(super) fn header_declares_public_base(
-    content: &str,
-    class_name: &str,
-    base_name: &str,
-) -> bool {
-    content.contains(&format!("class {class_name}"))
-        && content.contains(&format!("public {base_name}"))
-}
-
-pub(super) fn line_containing(content: &str, pattern: &str) -> Option<u32> {
-    content
-        .lines()
-        .position(|line| line.contains(pattern))
-        .map(|index| (index + 1) as u32)
-}
-
-pub(super) fn is_cxx_header_path(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.ends_with(".h")
-        || path.ends_with(".hpp")
-        || path.ends_with(".hh")
-        || path.ends_with(".hxx")
 }
 
 pub(super) fn paired_occurrence_targets(
@@ -882,25 +706,6 @@ pub(super) fn is_runtime_bridge_edge(kind: codestory_contracts::api::EdgeKind) -
         kind,
         codestory_contracts::api::EdgeKind::CALL | codestory_contracts::api::EdgeKind::MACRO_USAGE
     )
-}
-
-pub(super) fn repo_text_excerpt(project_root: &std::path::Path, hit: &SearchHit) -> Option<String> {
-    if !hit.is_text_match() {
-        return None;
-    }
-    let path = std::path::Path::new(hit.file_path.as_deref()?);
-    let line = hit.line?;
-    let resolved_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    };
-    let contents = fs::read_to_string(resolved_path).ok()?;
-    let source_line = contents
-        .lines()
-        .nth(line.saturating_sub(1) as usize)?
-        .trim();
-    Some(compact_excerpt(source_line, 140))
 }
 
 pub(super) fn compact_excerpt(line: &str, max_len: usize) -> String {

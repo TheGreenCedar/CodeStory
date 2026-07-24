@@ -6346,6 +6346,8 @@ version = "0.11.20"
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(false),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         };
         let result = codestory_contracts::api::SearchResultsDto {

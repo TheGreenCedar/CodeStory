@@ -224,6 +224,8 @@ fn sample_runtime_hit(
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
         ..test_search_hit_defaults()
     }
