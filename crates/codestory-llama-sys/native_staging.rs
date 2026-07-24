@@ -296,6 +296,7 @@ fn acquire_profile_staging_lock(profile_dir: &Path) -> io::Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(profile_dir.join(".codestory-native-staging.lock"))?;
     FileExt::lock_exclusive(&lock)?;
     Ok(lock)
