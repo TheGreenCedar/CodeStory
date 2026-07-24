@@ -67,6 +67,17 @@ fn source_tree_contains(dir: &str, needle: &str) -> bool {
     })
 }
 
+fn read_source_tree(dir: &str) -> String {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join(dir), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("read source"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source.find(start).expect("start marker exists");
     let tail = &source[start_index..];
@@ -266,18 +277,12 @@ fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
-    let cli_app = read("crates/codestory-cli/src/app.rs");
-    let cli_drill = read("crates/codestory-cli/src/app/drill.rs");
-    let cli_rendering = read("crates/codestory-cli/src/app/rendering.rs");
-    let cli_source_commands = read("crates/codestory-cli/src/app/source_commands.rs");
+    let cli_app = read_source_tree("crates/codestory-cli/src/app");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let explore = read("crates/codestory-cli/src/explore.rs");
     let cli_browser_surfaces = [
         cli_app.as_str(),
-        cli_drill.as_str(),
-        cli_rendering.as_str(),
-        cli_source_commands.as_str(),
         http_transport.as_str(),
         stdio_transport.as_str(),
         explore.as_str(),
