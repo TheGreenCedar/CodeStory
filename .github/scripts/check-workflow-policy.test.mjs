@@ -1431,9 +1431,9 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["candidate CPU opt-in removed", protectedFile, workflow => {
       candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
     }, /explicit CPU execution/u],
-    ["candidate provenance removed", protectedFile, workflow => {
+    ["candidate attestation removed", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--installed-plugin-provenance", "--untrusted-plugin-provenance");
+        .replace("--installed-plugin-attestation", "--untrusted-plugin-attestation");
     }, /Prove two-host candidate-installed Windows runtime/u],
     ["candidate artifact loses attempt identity", protectedFile, workflow => {
       candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
@@ -1445,6 +1445,51 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
+test("post-publish proof uses an immutable real Codex marketplace install", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "post-publish-release-smoke.yml";
+  const installStep = workflow => workflow.jobs.smoke.steps.find(
+    ({ name }) => name === "Resolve the published plugin through the marketplace catalog",
+  );
+  const proofStep = workflow => workflow.jobs.smoke.steps.find(
+    ({ name }) => name === "Qualify the catalog-resolved published runtime",
+  );
+  const mutations = [
+    ["Codex CLI pin drifts", workflow => {
+      workflow.env.CODEX_CLI_VERSION = "latest";
+    }, /pin the Codex CLI/u],
+    ["marketplace revision becomes mutable", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace('--marketplace-revision "$marketplace_revision"', "--marketplace-revision main");
+    }, /Resolve the published plugin through the marketplace catalog/u],
+    ["real installer helper is bypassed", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace(
+          "install-codestory-marketplace-proof.mjs",
+          "copy-codestory-marketplace-proof.mjs",
+        );
+    }, /Resolve the published plugin through the marketplace catalog/u],
+    ["source archive is substituted for installation", workflow => {
+      installStep(workflow).run += "\ngit archive HEAD:plugins/codestory";
+    }, /must not fabricate installation with git archive/u],
+    ["single v2 attestation is removed", workflow => {
+      proofStep(workflow).run = proofStep(workflow).run
+        .replace("--installed-plugin-attestation", "--installed-plugin-provenance");
+    }, /installed runtime proof must run --installed-plugin-attestation/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
     await t.test(name, () => {
       const workflows = loadWorkflows();
       mutate(workflows.get(file));

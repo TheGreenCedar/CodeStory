@@ -327,7 +327,7 @@ jobs:
             --plugin-root plugins/codestory `
             --candidate-plugin-root-output (Join-Path $candidateRoot "plugin") `
             --candidate-plugin-data-output (Join-Path $candidateRoot "data") `
-            --installed-plugin-provenance-output target/candidate-installed-windows/provenance.json `
+            --installed-plugin-attestation-output target/candidate-installed-windows/install-attestation-v2.json `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
             --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `
             --candidate-producer-run-id $env:GITHUB_RUN_ID `
@@ -385,8 +385,7 @@ jobs:
             --calibration-bundle $calibrationBundles[0].FullName `
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
-            --installed-plugin-source candidate `
-            --installed-plugin-provenance target/candidate-installed-windows/provenance.json `
+            --installed-plugin-attestation target/candidate-installed-windows/install-attestation-v2.json `
             --installed-plugin-data $pluginData `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
             --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `

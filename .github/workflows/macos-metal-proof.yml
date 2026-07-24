@@ -364,7 +364,7 @@ jobs:
             --plugin-root plugins/codestory \
             --candidate-plugin-root-output "$candidate_root/plugin" \
             --candidate-plugin-data-output "$candidate_root/data" \
-            --installed-plugin-provenance-output target/candidate-installed-macos/provenance.json \
+            --installed-plugin-attestation-output target/candidate-installed-macos/install-attestation-v2.json \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path "$CANDIDATE_PRODUCER_WORKFLOW_PATH" \
             --candidate-producer-run-id "$GITHUB_RUN_ID" \
@@ -413,8 +413,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --installed-plugin-source candidate \
-            --installed-plugin-provenance target/candidate-installed-macos/provenance.json \
+            --installed-plugin-attestation target/candidate-installed-macos/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_MACOS_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path "$CANDIDATE_PRODUCER_WORKFLOW_PATH" \

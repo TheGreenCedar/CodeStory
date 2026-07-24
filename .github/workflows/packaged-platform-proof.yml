@@ -673,7 +673,7 @@ jobs:
             --plugin-root plugins/codestory \
             --candidate-plugin-root-output "$candidate_root/plugin" \
             --candidate-plugin-data-output "$candidate_root/data" \
-            --installed-plugin-provenance-output target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation-output target/candidate-installed-linux/install-attestation-v2.json \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
             --candidate-producer-run-id "$GITHUB_RUN_ID" \
@@ -725,8 +725,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --installed-plugin-source candidate \
-            --installed-plugin-provenance target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation target/candidate-installed-linux/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \

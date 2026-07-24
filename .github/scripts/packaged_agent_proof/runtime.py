@@ -38,7 +38,7 @@ from .process import (
 from .installation import (
     assert_no_legacy_state,
     create_second_repository,
-    installed_plugin_provenance,
+    installed_plugin_identity,
     qualification_environment,
     run_parallel,
     verify_managed_runtime_status,
@@ -278,7 +278,7 @@ def prove_runtime(
 
     plugin_root = args.plugin_root.resolve()
     provenance = (
-        installed_plugin_provenance(args, plugin_root, manifest)
+        installed_plugin_identity(args, plugin_root, manifest)
         if args.proof_tier == "installed_runtime"
         else None
     )
@@ -291,7 +291,7 @@ def prove_runtime(
     target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
     if args.proof_tier == "installed_runtime":
         qualified_env["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
-        if args.installed_plugin_source == "candidate":
+        if provenance["installation_source"] == "candidate_archive":
             candidate_archive_sha256 = sha256(args.archive)
             qualified_env[
                 "CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256"
@@ -514,7 +514,7 @@ def prove_runtime(
                 == managed_runtime,
                 "independent installed plugin hosts reported different managed runtime provenance",
             )
-            if args.installed_plugin_source == "candidate":
+            if provenance["installation_source"] == "candidate_archive":
                 require(
                     managed_runtime["build_source"] == "candidate_archive"
                     and managed_runtime["repo_ref"]

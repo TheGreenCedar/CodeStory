@@ -65,15 +65,19 @@ def verify_retained_qualification(
         require(isinstance(retained_runtime, dict), "installed evidence omitted managed runtime provenance")
         installation_source = retained_plugin.get("installation_source")
         require(
-            installation_source in {"marketplace", "candidate_archive"}
+            retained_plugin.get("schema_version") == 2
+            and installation_source
+            in {"codex_marketplace_install", "candidate_archive"}
             and retained_plugin.get("plugin_id") == "codestory"
             and retained_plugin.get("plugin_version") == manifest["release_version"],
             "installed evidence has invalid plugin provenance",
         )
-        if installation_source == "marketplace":
+        if installation_source == "codex_marketplace_install":
             require(
                 retained_plugin.get("marketplace_repository")
                 == "TheGreenCedar/AgentPluginMarketplace"
+                and retained_plugin.get("codex_cli_version")
+                == PINNED_CODEX_CLI_VERSION
                 and retained_runtime.get("build_source") == "github_release"
                 and retained_runtime.get("repo_ref")
                 == f"v{manifest['release_version']}",

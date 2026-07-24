@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import tomllib
 import zipfile
 from pathlib import Path, PureWindowsPath
 from urllib.parse import quote, unquote
@@ -74,6 +75,7 @@ CANDIDATE_PRODUCER_WORKFLOW_PATHS = {
     ".github/workflows/release.yml",
     ".github/workflows/windows-vulkan-proof.yml",
 }
+PINNED_CODEX_CLI_VERSION = "0.144.5"
 
 
 def project_resource_uri(base_uri: str, project: Path) -> str:

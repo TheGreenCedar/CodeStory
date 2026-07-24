@@ -39,6 +39,268 @@ def directory_contract_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def git_output(repository: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    require(
+        completed.returncode == 0,
+        f"Git identity probe failed: {completed.stderr.strip()}",
+    )
+    return completed.stdout.strip()
+
+
+def remote_main_commit(repository_url: str) -> str:
+    completed = subprocess.run(
+        ["git", "ls-remote", repository_url, "refs/heads/main"],
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    require(
+        completed.returncode == 0,
+        f"remote source identity probe failed: {completed.stderr.strip()}",
+    )
+    fields = completed.stdout.split()
+    require(
+        len(fields) == 2
+        and re.fullmatch(r"[0-9a-f]{40}", fields[0]) is not None
+        and fields[1] == "refs/heads/main",
+        "remote source main did not resolve to one immutable commit",
+    )
+    return fields[0]
+
+
+def marketplace_installed_plugin_identity(
+    attestation: dict,
+    installed_plugin_data: Path,
+    plugin_root: Path,
+    manifest: dict,
+) -> dict:
+    require_exact_keys(
+        attestation,
+        {
+            "schema_version",
+            "installation_source",
+            "installation",
+            "plugin",
+            "marketplace",
+        },
+        "marketplace install attestation",
+    )
+    installation = attestation["installation"]
+    plugin = attestation["plugin"]
+    marketplace = attestation["marketplace"]
+    require_exact_keys(
+        installation,
+        {"codex_home", "plugin_root", "plugin_data"},
+        "marketplace installation paths",
+    )
+    require_exact_keys(
+        plugin,
+        {
+            "id",
+            "version",
+            "source_commit",
+            "source_tree",
+            "package_sha256",
+        },
+        "marketplace installed plugin",
+    )
+    require_exact_keys(
+        marketplace,
+        {
+            "repository",
+            "revision",
+            "codex_cli_version",
+            "add_result",
+            "list_result",
+            "plugin_add_result",
+            "plugin_list_result",
+        },
+        "marketplace install producer",
+    )
+    codex_home = Path(installation["codex_home"]).resolve()
+    require(
+        attestation["schema_version"] == 2
+        and attestation["installation_source"] == "codex_marketplace_install"
+        and codex_home.is_dir()
+        and Path(installation["plugin_root"]).resolve() == plugin_root
+        and Path(installation["plugin_data"]).resolve() == installed_plugin_data
+        and installed_plugin_data.is_relative_to(codex_home)
+        and plugin_root
+        == codex_home
+        / "plugins"
+        / "cache"
+        / "TheGreenCedar"
+        / "codestory"
+        / manifest["release_version"],
+        "marketplace attestation does not identify the exact isolated Codex cache",
+    )
+
+    marketplace_add = marketplace["add_result"]
+    plugin_add = marketplace["plugin_add_result"]
+    marketplace_list = marketplace["list_result"]
+    plugin_list = marketplace["plugin_list_result"]
+    require(
+        marketplace["repository"]
+        == "TheGreenCedar/AgentPluginMarketplace"
+        and marketplace["codex_cli_version"]
+        == f"codex-cli {PINNED_CODEX_CLI_VERSION}"
+        and isinstance(marketplace["revision"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", marketplace["revision"]) is not None
+        and isinstance(marketplace_add, dict)
+        and marketplace_add.get("marketplaceName") == "TheGreenCedar"
+        and marketplace_add.get("alreadyAdded") is False,
+        "marketplace attestation has an invalid pinned Codex producer",
+    )
+    marketplace_root_raw = marketplace_add.get("installedRoot")
+    require(
+        isinstance(marketplace_root_raw, str),
+        "Codex marketplace add result omitted installedRoot",
+    )
+    marketplace_root = Path(marketplace_root_raw).resolve()
+    require(
+        marketplace_root.is_dir()
+        and marketplace_root.is_relative_to(codex_home)
+        and marketplace_root == codex_home / ".tmp" / "marketplaces" / "TheGreenCedar",
+        "Codex marketplace root is outside its isolated home",
+    )
+    require(
+        marketplace_list
+        == {
+            "marketplaces": [
+                {
+                    "name": "TheGreenCedar",
+                    "root": str(marketplace_root),
+                    "marketplaceSource": {
+                        "sourceType": "git",
+                        "source": (
+                            "https://github.com/"
+                            "TheGreenCedar/AgentPluginMarketplace.git"
+                        ),
+                    },
+                }
+            ]
+        },
+        "Codex marketplace list does not match the configured Git snapshot",
+    )
+    require(
+        plugin_add
+        == {
+            "pluginId": "codestory@TheGreenCedar",
+            "name": "codestory",
+            "marketplaceName": "TheGreenCedar",
+            "version": manifest["release_version"],
+            "installedPath": str(plugin_root),
+            "authPolicy": "ON_INSTALL",
+        },
+        "Codex plugin add result does not identify the installed release plugin",
+    )
+    expected_source = {
+        "source": "git-subdir",
+        "url": "https://github.com/TheGreenCedar/CodeStory.git",
+        "path": "plugins/codestory",
+    }
+    expected_marketplace_source = {
+        "sourceType": "git",
+        "source": "https://github.com/TheGreenCedar/AgentPluginMarketplace.git",
+    }
+    require(
+        plugin_list
+        == {
+            "installed": [
+                {
+                    "pluginId": "codestory@TheGreenCedar",
+                    "name": "codestory",
+                    "marketplaceName": "TheGreenCedar",
+                    "version": manifest["release_version"],
+                    "installed": True,
+                    "enabled": True,
+                    "source": expected_source,
+                    "marketplaceSource": expected_marketplace_source,
+                    "installPolicy": "AVAILABLE",
+                    "authPolicy": "ON_INSTALL",
+                }
+            ],
+            "available": [],
+        },
+        "Codex plugin list does not contain exactly the enabled installed plugin",
+    )
+
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    marketplace_config = config.get("marketplaces", {}).get("TheGreenCedar")
+    plugin_config = config.get("plugins", {}).get("codestory@TheGreenCedar")
+    require(
+        isinstance(marketplace_config, dict)
+        and marketplace_config.get("source_type") == "git"
+        and marketplace_config.get("source")
+        == "https://github.com/TheGreenCedar/AgentPluginMarketplace.git"
+        and marketplace_config.get("ref") == marketplace["revision"]
+        and plugin_config == {"enabled": True},
+        "isolated Codex config does not pin the immutable marketplace revision",
+    )
+    marketplace_commit = git_output(marketplace_root, "rev-parse", "HEAD")
+    require(
+        marketplace_commit == marketplace["revision"]
+        and git_output(marketplace_root, "status", "--porcelain") == ""
+        and git_output(marketplace_root, "remote", "get-url", "origin")
+        == "https://github.com/TheGreenCedar/AgentPluginMarketplace.git",
+        "Codex marketplace checkout has invalid or mutable Git identity",
+    )
+    catalog = json.loads(
+        (marketplace_root / ".agents" / "plugins" / "marketplace.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    matches = [
+        plugin
+        for plugin in catalog.get("plugins", [])
+        if plugin.get("name") == "codestory"
+    ]
+    require(
+        len(matches) == 1 and matches[0].get("source") == expected_source,
+        "Codex marketplace catalog does not resolve CodeStory through the release repository",
+    )
+
+    source_plugin_root = REPOSITORY_ROOT / "plugins" / "codestory"
+    require(
+        plugin == {
+            "id": "codestory",
+            "version": manifest["release_version"],
+            "source_commit": manifest["source"]["commit"],
+            "source_tree": manifest["source"]["tree"],
+            "package_sha256": directory_contract_sha256(plugin_root),
+        }
+        and git_output(REPOSITORY_ROOT, "rev-parse", "HEAD")
+        == manifest["source"]["commit"]
+        and git_output(REPOSITORY_ROOT, "rev-parse", "HEAD^{tree}")
+        == manifest["source"]["tree"]
+        and remote_main_commit(expected_source["url"])
+        == manifest["source"]["commit"],
+        "marketplace source main is not the exact packaged release commit",
+    )
+    package_sha256 = directory_contract_sha256(plugin_root)
+    require(
+        package_sha256 == directory_contract_sha256(source_plugin_root),
+        "Codex-installed plugin bytes differ from the packaged release source tree",
+    )
+    return {
+        "schema_version": 2,
+        "installation_source": "codex_marketplace_install",
+        "codex_cli_version": PINNED_CODEX_CLI_VERSION,
+        "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
+        "marketplace_commit": marketplace_commit,
+        "plugin_id": "codestory",
+        "plugin_version": manifest["release_version"],
+        "plugin_source_commit": manifest["source"]["commit"],
+        "plugin_package_sha256": package_sha256,
+    }
+
+
 def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
     require(
         args.archive is not None
@@ -47,16 +309,16 @@ def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
         and args.plugin_root is not None
         and args.candidate_plugin_root_output is not None
         and args.candidate_plugin_data_output is not None
-        and args.installed_plugin_provenance_output is not None,
+        and args.installed_plugin_attestation_output is not None,
         "candidate install preparation requires archive, checksum, version, plugin source, "
-        "plugin/data outputs, and provenance output",
+        "plugin/data outputs, and attestation output",
     )
     archive = args.archive.resolve()
     checksum = args.checksum_file.resolve()
     source_plugin = args.plugin_root.resolve()
     plugin_output = args.candidate_plugin_root_output.resolve()
     data_output = args.candidate_plugin_data_output.resolve()
-    provenance_output = args.installed_plugin_provenance_output.resolve()
+    attestation_output = args.installed_plugin_attestation_output.resolve()
     producer = {
         "repository": args.candidate_producer_repository,
         "workflow_path": args.candidate_producer_workflow_path,
@@ -82,7 +344,7 @@ def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
         source_plugin.is_dir()
         and not plugin_output.exists()
         and not data_output.exists()
-        and not provenance_output.exists(),
+        and not attestation_output.exists(),
         "candidate install outputs must be absent and the source plugin must exist",
     )
     with tempfile.TemporaryDirectory(prefix="codestory-candidate-install-") as raw:
@@ -149,45 +411,52 @@ def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
             "provisioned_at": f"candidate-proof:{manifest['source']['commit']}",
         }
         write_json(version_root / "manifest.json", managed_manifest)
-    provenance = {
-        "schema_version": 1,
+    attestation = {
+        "schema_version": 2,
         "installation_source": "candidate_archive",
-        "plugin_id": "codestory",
-        "plugin_version": args.expected_version,
-        "plugin_source_commit": manifest["source"]["commit"],
-        "plugin_source_tree": manifest["source"]["tree"],
-        "plugin_package_sha256": directory_contract_sha256(plugin_output),
-        "candidate_archive_sha256": sha256(archive),
-        "candidate_asset_target": manifest["asset_target"],
-        "producer": producer,
+        "installation": {
+            "plugin_root": str(plugin_output),
+            "plugin_data": str(data_output),
+        },
+        "plugin": {
+            "id": "codestory",
+            "version": args.expected_version,
+            "source_commit": manifest["source"]["commit"],
+            "source_tree": manifest["source"]["tree"],
+            "package_sha256": directory_contract_sha256(plugin_output),
+        },
+        "candidate": {
+            "archive_sha256": sha256(archive),
+            "asset_target": manifest["asset_target"],
+            "producer": producer,
+        },
     }
-    write_json(provenance_output, provenance)
+    write_json(attestation_output, attestation)
     return {
         "plugin_root": str(plugin_output),
         "plugin_data": str(data_output),
-        "provenance": str(provenance_output),
+        "attestation": str(attestation_output),
         "source": manifest["source"],
         "archive_sha256": sha256(archive),
         "asset_target": manifest["asset_target"],
     }
 
 
-def installed_plugin_provenance(
+def installed_plugin_identity(
     args: argparse.Namespace,
     plugin_root: Path,
     manifest: dict,
 ) -> dict:
     require(
         args.proof_tier == "installed_runtime",
-        "installed plugin provenance is valid only at installed_runtime tier",
+        "installed plugin identity is valid only at installed_runtime tier",
     )
     require(
-        args.installed_plugin_provenance is not None,
-        "installed_runtime proof requires --installed-plugin-provenance",
-    )
-    require(
-        args.installed_plugin_data is not None and args.installed_plugin_data.is_dir(),
-        "installed_runtime proof requires an existing --installed-plugin-data directory",
+        args.installed_plugin_attestation is not None
+        and args.installed_plugin_attestation.is_file()
+        and args.installed_plugin_data is not None
+        and args.installed_plugin_data.is_dir(),
+        "installed_runtime proof requires one attestation and its plugin data directory",
     )
     source_plugin_root = REPOSITORY_ROOT / "plugins" / "codestory"
     require(
@@ -207,105 +476,99 @@ def installed_plugin_provenance(
             "installed_runtime proof rejects a plugin launched from a CodeStory source checkout",
         )
     try:
-        provenance = json.loads(
-            args.installed_plugin_provenance.read_text(encoding="utf-8")
+        attestation = json.loads(
+            args.installed_plugin_attestation.read_text(encoding="utf-8")
         )
     except json.JSONDecodeError as exc:
-        raise ProofFailure(f"installed plugin provenance is not valid JSON: {exc}") from exc
-    require(isinstance(provenance, dict), "installed plugin provenance must be an object")
-    require(provenance.get("schema_version") == 1, "installed plugin provenance schema is unsupported")
-    installation_source = args.installed_plugin_source
-    if installation_source == "candidate":
-        require_exact_keys(
-            provenance,
-            {
-                "schema_version",
-                "installation_source",
-                "plugin_id",
-                "plugin_version",
-                "plugin_source_commit",
-                "plugin_source_tree",
-                "plugin_package_sha256",
-                "candidate_archive_sha256",
-                "candidate_asset_target",
-                "producer",
-            },
-            "candidate installed plugin provenance",
+        raise ProofFailure(
+            f"installed plugin attestation is not valid JSON: {exc}"
+        ) from exc
+    require(
+        isinstance(attestation, dict) and attestation.get("schema_version") == 2,
+        "installed plugin attestation schema is unsupported",
+    )
+    if attestation.get("installation_source") == "codex_marketplace_install":
+        return marketplace_installed_plugin_identity(
+            attestation,
+            args.installed_plugin_data,
+            plugin_root,
+            manifest,
         )
-        require(
-            provenance["installation_source"] == "candidate_archive"
-            and provenance["candidate_archive_sha256"] == sha256(args.archive)
-            and provenance["candidate_asset_target"] == manifest["asset_target"]
-            and provenance["plugin_source_tree"] == manifest["source"]["tree"]
-            and provenance["producer"]
-            == {
+    require_exact_keys(
+        attestation,
+        {
+            "schema_version",
+            "installation_source",
+            "installation",
+            "plugin",
+            "candidate",
+        },
+        "candidate install attestation",
+    )
+    installation = attestation["installation"]
+    plugin = attestation["plugin"]
+    candidate = attestation["candidate"]
+    require_exact_keys(
+        installation,
+        {"plugin_root", "plugin_data"},
+        "candidate installation paths",
+    )
+    require_exact_keys(
+        plugin,
+        {
+            "id",
+            "version",
+            "source_commit",
+            "source_tree",
+            "package_sha256",
+        },
+        "candidate installed plugin",
+    )
+    require_exact_keys(
+        candidate,
+        {"archive_sha256", "asset_target", "producer"},
+        "candidate install producer",
+    )
+    package_sha256 = directory_contract_sha256(plugin_root)
+    require(
+        attestation["installation_source"] == "candidate_archive"
+        and Path(installation["plugin_root"]).resolve() == plugin_root
+        and Path(installation["plugin_data"]).resolve()
+        == args.installed_plugin_data
+        and plugin
+        == {
+            "id": "codestory",
+            "version": manifest["release_version"],
+            "source_commit": manifest["source"]["commit"],
+            "source_tree": manifest["source"]["tree"],
+            "package_sha256": package_sha256,
+        }
+        and candidate
+        == {
+            "archive_sha256": sha256(args.archive),
+            "asset_target": manifest["asset_target"],
+            "producer": {
                 "repository": args.candidate_producer_repository,
                 "workflow_path": args.candidate_producer_workflow_path,
                 "run_id": args.candidate_producer_run_id,
                 "run_attempt": args.candidate_producer_run_attempt,
                 "artifact_name": args.candidate_artifact_name,
             },
-            "candidate installed plugin provenance does not match the exact archive and source tree",
-        )
-    else:
-        require(
-            installation_source == "marketplace"
-            and provenance.get("marketplace_repository")
-            == "TheGreenCedar/AgentPluginMarketplace",
-            "installed plugin provenance names the wrong marketplace",
-        )
-    marketplace_commit = provenance.get("marketplace_commit")
-    if installation_source == "marketplace":
-        require(
-            isinstance(marketplace_commit, str)
-            and re.fullmatch(r"[0-9a-f]{40}", marketplace_commit) is not None,
-            "installed plugin provenance has an invalid marketplace commit",
-        )
-    require(provenance.get("plugin_id") == "codestory", "installed plugin provenance names the wrong plugin")
-    require(
-        provenance.get("plugin_version") == manifest["release_version"],
-        "installed plugin version does not match the package",
+        },
+        "candidate attestation does not bind the exact archive and source tree",
     )
-    require(
-        provenance.get("plugin_source_commit") == manifest["source"]["commit"],
-        "installed plugin source commit does not match the packaged source commit",
-    )
-    package_sha256 = directory_contract_sha256(plugin_root)
-    require(
-        provenance.get("plugin_package_sha256") == package_sha256,
-        "installed plugin package bytes do not match their provenance",
-    )
-    retained = {
-        "schema_version": 1,
-        "installation_source": (
-            "candidate_archive"
-            if installation_source == "candidate"
-            else "marketplace"
-        ),
+    return {
+        "schema_version": 2,
+        "installation_source": "candidate_archive",
         "plugin_id": "codestory",
-        "plugin_version": provenance["plugin_version"],
-        "plugin_source_commit": provenance["plugin_source_commit"],
+        "plugin_version": plugin["version"],
+        "plugin_source_commit": plugin["source_commit"],
         "plugin_package_sha256": package_sha256,
+        "plugin_source_tree": plugin["source_tree"],
+        "candidate_archive_sha256": candidate["archive_sha256"],
+        "candidate_asset_target": candidate["asset_target"],
+        "producer": candidate["producer"],
     }
-    if installation_source == "candidate":
-        retained.update(
-            {
-                "plugin_source_tree": provenance["plugin_source_tree"],
-                "candidate_archive_sha256": provenance[
-                    "candidate_archive_sha256"
-                ],
-                "candidate_asset_target": provenance["candidate_asset_target"],
-                "producer": provenance["producer"],
-            }
-        )
-    else:
-        retained.update(
-            {
-                "marketplace_repository": provenance["marketplace_repository"],
-                "marketplace_commit": marketplace_commit,
-            }
-        )
-    return retained
 
 
 def verify_managed_runtime_status(
@@ -480,7 +743,7 @@ def prove_ground_only_runtime(
 
     plugin_root = args.plugin_root.resolve()
     provenance = (
-        installed_plugin_provenance(args, plugin_root, manifest)
+        installed_plugin_identity(args, plugin_root, manifest)
         if args.proof_tier == "installed_runtime"
         else None
     )
@@ -496,7 +759,7 @@ def prove_ground_only_runtime(
             "installed ground-only proof requires --installed-plugin-data",
         )
         qualified_env["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
-        if args.installed_plugin_source == "candidate":
+        if provenance["installation_source"] == "candidate_archive":
             candidate_archive_sha256 = sha256(args.archive)
             qualified_env[
                 "CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256"
@@ -549,7 +812,7 @@ def prove_ground_only_runtime(
                 manifest=manifest,
                 archive_sha256=sha256(args.archive),
             )
-            if args.installed_plugin_source == "candidate":
+            if provenance["installation_source"] == "candidate_archive":
                 require(
                     managed_runtime["build_source"] == "candidate_archive"
                     and managed_runtime["repo_ref"] == manifest["source"]["commit"],

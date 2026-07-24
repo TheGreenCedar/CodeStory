@@ -1363,8 +1363,9 @@ def run_full_stack_self_tests() -> None:
                 "unplanned_suspend": False,
             },
             "installed_plugin": {
-                "schema_version": 1,
-                "installation_source": "marketplace",
+                "schema_version": 2,
+                "installation_source": "codex_marketplace_install",
+                "codex_cli_version": PINNED_CODEX_CLI_VERSION,
                 "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
                 "marketplace_commit": "d" * 40,
                 "plugin_id": "codestory",

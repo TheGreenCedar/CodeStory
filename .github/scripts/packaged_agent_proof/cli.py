@@ -90,17 +90,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-producer-run-id")
     parser.add_argument("--calibration-producer-run-attempt")
     parser.add_argument("--calibration-producer-artifact")
-    parser.add_argument("--installed-plugin-provenance", type=Path)
+    parser.add_argument("--installed-plugin-attestation", type=Path)
     parser.add_argument("--installed-plugin-data", type=Path)
-    parser.add_argument(
-        "--installed-plugin-source",
-        choices=("marketplace", "candidate"),
-        default="marketplace",
-    )
     parser.add_argument("--prepare-candidate-installed-proof", action="store_true")
     parser.add_argument("--candidate-plugin-root-output", type=Path)
     parser.add_argument("--candidate-plugin-data-output", type=Path)
-    parser.add_argument("--installed-plugin-provenance-output", type=Path)
+    parser.add_argument("--installed-plugin-attestation-output", type=Path)
     parser.add_argument("--candidate-producer-repository")
     parser.add_argument("--candidate-producer-workflow-path")
     parser.add_argument("--candidate-producer-run-id")
@@ -127,10 +122,6 @@ def main() -> int:
         result = prepare_candidate_installed_proof(args)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    require_candidate_matrix_installation_source(
-        args.qualification_matrix_cell,
-        args.installed_plugin_source,
-    )
     require(args.archive and args.checksum_file and args.expected_version, "archive, checksum, and expected version are required")
     args.archive = args.archive.resolve()
     args.checksum_file = args.checksum_file.resolve()
@@ -154,10 +145,33 @@ def main() -> int:
         args.calibration_run_output is None or args.proof_tier == "calibration",
         "calibration run output is valid only for the calibration proof tier",
     )
-    if args.installed_plugin_provenance is not None:
-        args.installed_plugin_provenance = args.installed_plugin_provenance.resolve()
+    if args.installed_plugin_attestation is not None:
+        args.installed_plugin_attestation = (
+            args.installed_plugin_attestation.resolve()
+        )
     if args.installed_plugin_data is not None:
         args.installed_plugin_data = args.installed_plugin_data.resolve()
+    installation_source = "marketplace"
+    if args.installed_plugin_attestation is not None:
+        attestation = json.loads(
+            args.installed_plugin_attestation.read_text(encoding="utf-8")
+        )
+        require(
+            isinstance(attestation, dict),
+            "installed plugin attestation must be an object",
+        )
+        installation_source = {
+            "candidate_archive": "candidate",
+            "codex_marketplace_install": "marketplace",
+        }.get(attestation.get("installation_source"))
+        require(
+            installation_source is not None,
+            "installed plugin attestation has an invalid installation source",
+        )
+    require_candidate_matrix_installation_source(
+        args.qualification_matrix_cell,
+        installation_source,
+    )
     validate_runtime_claim_scope(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(sha256(args.archive) == expected_archive_digest(args.checksum_file, args.archive), "archive checksum mismatch")

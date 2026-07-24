@@ -1144,6 +1144,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "plugins/codestory/**",
       ".github/scripts/check-workflow-policy.mjs",
       ".github/scripts/check-workflow-policy.test.mjs",
+      ".github/scripts/install-codestory-marketplace-proof.mjs",
+      ".github/scripts/install-codestory-marketplace-proof.test.mjs",
       ".github/scripts/fixtures/workflow-policy-invalid.json",
       ".github/scripts/fixtures/actionlint-invalid.yml",
       ".github/scripts/run-actionlint.mjs",
@@ -1208,6 +1210,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
     requireStepRun(violations, pluginFile, job, "Check packaged proof harness", ["python .github/scripts/check-packaged-agent-proof.py --self-test"]);
+    requireStepRun(violations, pluginFile, job, "Check real Codex marketplace installation", [
+      "node --test .github/scripts/install-codestory-marketplace-proof.test.mjs",
+    ]);
   }
 
   const rustFile = "rust-ci.yml";
@@ -1956,7 +1961,7 @@ function validatePackagedProof(workflows, violations, graph) {
     "--prepare-candidate-installed-proof",
     "--candidate-plugin-root-output",
     "--candidate-plugin-data-output",
-    "--installed-plugin-provenance-output",
+    "--installed-plugin-attestation-output",
     "--candidate-producer-workflow-path",
     "$RUNNER_TEMP/codestory-candidate-installed-linux.",
     'candidate_root="$(cd "$candidate_root" && pwd -P)"',
@@ -1974,8 +1979,7 @@ function validatePackagedProof(workflows, violations, graph) {
   requireStepRun(violations, file, job, "Prove two-host candidate-installed Linux runtime", [
     "--proof-tier installed_runtime",
     "--qualification-matrix-cell candidate_installed_linux_x64_cpu",
-    "--installed-plugin-source candidate",
-    "--installed-plugin-provenance",
+    "--installed-plugin-attestation",
     "--installed-plugin-data",
     "--calibration-producer-run-id",
     "--calibration-producer-artifact",
@@ -2030,14 +2034,29 @@ function validatePostPublish(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "smoke");
   const expected = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
   add(violations, JSON.stringify(at(job, "strategy", "matrix", "include")) === JSON.stringify(expected), `${file} must smoke exactly the two desktop release assets`);
+  add(
+    violations,
+    object(workflow.env).CODEX_CLI_VERSION === "0.144.5",
+    `${file} must pin the Codex CLI used for marketplace installation`,
+  );
   const resolveInstalled = namedStep(job, "Resolve the published plugin through the marketplace catalog");
   requireStepRun(violations, file, job, "Resolve the published plugin through the marketplace catalog", [
-    "TheGreenCedar/AgentPluginMarketplace",
+    "git ls-remote",
     "refs/heads/main",
-    "Marketplace source main is not the exact published release commit",
-    "plugin_source_commit",
-    "plugin_package_sha256",
+    '"@openai/codex@$CODEX_CLI_VERSION"',
+    "install-codestory-marketplace-proof.mjs",
+    "TheGreenCedar/AgentPluginMarketplace",
+    '--marketplace-revision "$marketplace_revision"',
+    "install-attestation-v2.json",
   ]);
+  const resolveRun = executableRunText(String(resolveInstalled?.run ?? ""));
+  for (const forbidden of ["git archive", "git clone", "plugin_package_sha256"]) {
+    add(
+      violations,
+      !resolveRun.includes(forbidden),
+      `${file} marketplace install must not fabricate installation with ${forbidden}`,
+    );
+  }
   add(
     violations,
     resolveInstalled?.if === undefined
@@ -2066,14 +2085,13 @@ function validatePostPublish(workflows, violations, graph) {
     "--expected-backend CPU",
     "--proof-tier installed_runtime",
     "--ground-only",
-    "--installed-plugin-provenance",
+    "--installed-plugin-attestation",
     "--installed-plugin-data",
     "--expected-source-sha",
     "--expected-source-tree",
     '--calibration-bundle "$calibration_bundle"',
     "--calibration-producer-run-id",
     "--calibration-producer-artifact",
-    "--installed-plugin-source marketplace",
   ]) {
     add(
       violations,
@@ -2609,7 +2627,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "--prepare-candidate-installed-proof",
       "--candidate-plugin-root-output",
       "--candidate-plugin-data-output",
-      "--installed-plugin-provenance-output",
+      "--installed-plugin-attestation-output",
       "--candidate-producer-workflow-path",
       "gh api",
       ".head_repository.full_name",
@@ -2632,8 +2650,7 @@ function validateRemainingWorkflows(workflows, violations) {
     requireStepRun(violations, metalFile, job, "Prove two-host candidate-installed macOS runtime", [
       "--proof-tier installed_runtime",
       "--qualification-matrix-cell candidate_installed_macos_arm64_cpu",
-      "--installed-plugin-source candidate",
-      "--installed-plugin-provenance",
+      "--installed-plugin-attestation",
       "--installed-plugin-data",
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
@@ -2829,7 +2846,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "--prepare-candidate-installed-proof",
       "--candidate-plugin-root-output",
       "--candidate-plugin-data-output",
-      "--installed-plugin-provenance-output",
+      "--installed-plugin-attestation-output",
       "--candidate-producer-workflow-path",
       "gh api",
       "$run.head_repository.full_name",
@@ -2856,8 +2873,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "--qualification-matrix-cell candidate_installed_windows_x64_cpu",
       "--engine-policy cpu_explicit",
       "--expected-backend CPU",
-      "--installed-plugin-source candidate",
-      "--installed-plugin-provenance",
+      "--installed-plugin-attestation",
       "--installed-plugin-data",
       "--candidate-producer-workflow-path",
       "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
