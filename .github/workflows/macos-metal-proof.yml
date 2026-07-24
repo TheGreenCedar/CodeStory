@@ -167,7 +167,6 @@ jobs:
           test "${{ inputs.server_behavior_only }}" = true
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -198,6 +197,10 @@ jobs:
         with:
           name: codestory-cli-macos-arm64
           path: target/release-dist
+
+      - name: Build qualification driver
+        shell: bash
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -265,6 +268,7 @@ jobs:
             quality_args=(--retrieval-quality-evidence "$quality_path")
             qualification_args=(
               --produce-qualification-evidence
+              --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/macos-metal-proof/qualification.json
             )
           fi
@@ -319,6 +323,7 @@ jobs:
               --proof-tier calibration \
               --qualification-matrix-cell protected_macos_arm64_metal \
               --produce-qualification-evidence \
+              --qualification-driver target/release/codestory_embedding_qualification \
               --qualification-evidence "target/calibration-runs/macos/qualification-${run_index}.json" \
               --calibration-run-index "$run_index" \
               --calibration-run-output "target/calibration-runs/macos/run-${run_index}.json" \
@@ -393,6 +398,7 @@ jobs:
             test -f "$quality_path"
             claim_args=(
               --produce-qualification-evidence
+              --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/candidate-installed-macos/qualification.json
               --retrieval-quality-evidence "$quality_path"
             )

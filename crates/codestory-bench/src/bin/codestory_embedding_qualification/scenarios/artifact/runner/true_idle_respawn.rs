@@ -8,7 +8,6 @@ use super::process::{query_parameters, require_protocol_success, require_worker_
 use anyhow::{Result, bail};
 use codestory_retrieval::{
     EmbeddingQualificationParameters, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
-    PerUserEmbeddingClient,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -124,11 +123,10 @@ impl<'a> ScenarioRunner<'a> {
                 bail!("embedding_qualification_true_idle_owner_changed");
             }
             diagnostic_count = diagnostic_count.saturating_add(1);
-            last_diagnostic_client_elapsed_ns =
-                elapsed(self.clock.as_ref(), client_idle_observed_ns)
-                    .as_nanos()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
+            last_diagnostic_client_elapsed_ns = elapsed(&self.clock, client_idle_observed_ns)
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX);
             let observer = self.spawn_worker("observe", query_parameters(1), None)?;
             let observer_output = self.finish_worker(observer, SNAPSHOT_TIMEOUT)?;
             require_worker_success(&observer_output, "true_idle_observe")?;
@@ -139,7 +137,7 @@ impl<'a> ScenarioRunner<'a> {
             }
             idle_connection_close_count = idle_connection_close_count.saturating_add(1);
             last_idle_connection_close_client_elapsed_ns =
-                elapsed(self.clock.as_ref(), client_idle_observed_ns)
+                elapsed(&self.clock, client_idle_observed_ns)
                     .as_nanos()
                     .try_into()
                     .unwrap_or(u64::MAX);
@@ -169,10 +167,10 @@ impl<'a> ScenarioRunner<'a> {
             Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS);
         let client_wait_required = contract_idle_timeout.saturating_sub(final_server_idle_elapsed);
         let client_wait_origin_ns = self.clock.now_ns();
-        while elapsed(self.clock.as_ref(), client_wait_origin_ns) < client_wait_required {
+        while elapsed(&self.clock, client_wait_origin_ns) < client_wait_required {
             self.clock.sleep(POLL);
         }
-        let client_wait_elapsed = elapsed(self.clock.as_ref(), client_wait_origin_ns);
+        let client_wait_elapsed = elapsed(&self.clock, client_wait_origin_ns);
         self.wait_for_absence(
             "true_idle_after_wait",
             Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS / 2)
@@ -236,8 +234,11 @@ impl<'a> ScenarioRunner<'a> {
         let after_engine = after.engine.as_ref().ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_true_idle_respawn_engine_missing")
         })?;
-        let respawn_identity =
-            PerUserEmbeddingClient::for_runtime(self.primary_runtime())?.ensure_resident()?;
+        let identity_worker = self.spawn_worker("resident_identity", query_parameters(1), None)?;
+        let identity_output = self.finish_worker(identity_worker, SNAPSHOT_TIMEOUT)?;
+        let respawn_identity = identity_output.engine_identity.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_true_idle_respawn_identity_missing")
+        })?;
         if respawn_identity.server_instance_id != after.process.server_instance_id
             || respawn_identity.load_generation != after_engine.load_generation
             || respawn_identity.model_load_count != after_engine.model_load_count

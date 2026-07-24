@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qualification-matrix-cell")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--qualification-evidence", type=Path)
+    parser.add_argument("--qualification-driver", type=Path)
     parser.add_argument("--produce-qualification-evidence", action="store_true")
     parser.add_argument("--server-behavior-only", action="store_true")
     parser.add_argument("--ground-only", action="store_true")
@@ -100,6 +101,7 @@ def _print_json(result: object) -> None:
 def _resolve_optional_paths(args: argparse.Namespace) -> None:
     for field in (
         "qualification_evidence",
+        "qualification_driver",
         "publication_fault_evidence",
         "retrieval_quality_evidence",
         "calibration_bundle",

@@ -7,6 +7,7 @@ use self::gate::{
 };
 use self::operations::{
     run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load, run_queue_load,
+    wait_for_owner_absence,
 };
 use self::protocol::run_raw_protocol_exchange;
 use crate::args::InternalEmbeddingQualificationCommand;
@@ -77,7 +78,12 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
         return run_dead_client_load(&runtime, request.parameters, clock.as_ref());
     }
     let (result, protocol_exchange, queue_operations, engine_identity, error) =
-        if request.operation == "resident_identity" {
+        if request.operation == "wait_for_absence" {
+            match wait_for_owner_absence(&runtime, clock.as_ref()) {
+                Ok(result) => (Some(result), None, None, None, None),
+                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+            }
+        } else if request.operation == "resident_identity" {
             match PerUserEmbeddingClient::for_runtime(&runtime)
                 .and_then(|client| client.ensure_resident())
             {

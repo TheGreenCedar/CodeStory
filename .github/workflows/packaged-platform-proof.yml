@@ -217,6 +217,10 @@ jobs:
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt" \
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
 
+      - name: Build qualification driver
+        if: matrix.asset_target == 'linux-x64'
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
+
       - name: Prove clean-cache Node-absent network-denied offline release build
         if: matrix.asset_target == 'linux-x64'
         shell: bash
@@ -574,6 +578,7 @@ jobs:
                 "${common_args[@]}" \
                 --proof-tier calibration \
                 --produce-qualification-evidence \
+                --qualification-driver target/release/codestory_embedding_qualification \
                 --calibration-run-index "$run_index" \
                 --calibration-run-output "target/calibration-runs/linux/run-${run_index}.json" \
                 --qualification-evidence "target/calibration-runs/linux/qualification-${run_index}.json" \
@@ -610,6 +615,7 @@ jobs:
               quality_args=(--retrieval-quality-evidence "$quality_path")
               qualification_args=(
                 --produce-qualification-evidence
+                --qualification-driver target/release/codestory_embedding_qualification
                 --qualification-evidence target/packaged-agent-proof/qualification.json
               )
             fi
@@ -705,6 +711,7 @@ jobs:
             test -f "$quality_path"
             claim_args=(
               --produce-qualification-evidence
+              --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/candidate-installed-linux/qualification.json
               --retrieval-quality-evidence "$quality_path"
             )

@@ -497,10 +497,6 @@ pub(crate) fn inclusive_now_ns() -> Result<u64> {
     platform::inclusive_now_ns()
 }
 
-pub(crate) fn qualification_clock() -> Result<Arc<dyn codestory_retrieval::AwakeMonotonicClock>> {
-    Ok(Arc::new(NativeAwakeClock::capture()?))
-}
-
 #[derive(Debug)]
 struct NativeAwakeClock {
     snapshot: codestory_retrieval::EmbeddingServerClockSnapshot,

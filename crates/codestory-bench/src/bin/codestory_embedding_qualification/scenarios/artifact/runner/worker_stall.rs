@@ -70,7 +70,7 @@ impl<'a> ScenarioRunner<'a> {
             .as_ref()
             .and_then(|result| (result.operations.len() == 1).then(|| &result.operations[0]))
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_stall_operation_missing"))?;
-        wait_for_process_exit(&*self.clock, before.process.pid, SNAPSHOT_TIMEOUT)?;
+        wait_for_process_exit(&self.clock, before.process.pid, SNAPSHOT_TIMEOUT)?;
         let (watchdog_marker, watchdog_marker_sha256) = consume_watchdog_marker(
             self.context.output_directory,
             self.context.nonce_sha256,

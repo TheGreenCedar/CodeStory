@@ -150,7 +150,6 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -181,6 +180,10 @@ jobs:
         with:
           name: codestory-cli-windows-x64
           path: target/release-dist
+
+      - name: Build qualification driver
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -255,6 +258,7 @@ jobs:
             }
             $claimArgs = @(
               "--produce-qualification-evidence",
+              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
             )
@@ -363,6 +367,7 @@ jobs:
             }
             $claimArgs = @(
               "--produce-qualification-evidence",
+              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
             )

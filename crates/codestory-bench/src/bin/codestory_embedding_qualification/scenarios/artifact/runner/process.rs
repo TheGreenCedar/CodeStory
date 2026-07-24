@@ -4,8 +4,8 @@ use super::{ProcessInvocation, RunningWorker, WorkerOutput};
 use crate::qualification::request::QUALIFICATION_NONCE_ENV;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters,
-    EmbeddingResult, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, ProcessStartProbe,
+    EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters, EmbeddingResult,
+    PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, ProcessStartProbe,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ pub(super) fn qualification_nonce() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_gate_closed"))
 }
 
-pub(super) fn wait_for_process_start(clock: &dyn AwakeMonotonicClock, pid: u32) -> Result<String> {
+pub(super) fn wait_for_process_start(clock: &super::CoordinatorClock, pid: u32) -> Result<String> {
     let started = clock.now_ns();
     loop {
         match codestory_retrieval::probe_process_start_identity(pid) {
@@ -62,18 +62,8 @@ pub(super) fn wait_for_process_start(clock: &dyn AwakeMonotonicClock, pid: u32) 
     }
 }
 
-pub(super) fn current_process_start_identity() -> Result<String> {
-    match codestory_retrieval::probe_process_start_identity(std::process::id()) {
-        ProcessStartProbe::Running { start_identity } => Ok(start_identity),
-        ProcessStartProbe::NotRunning => bail!("embedding_qualification_worker_not_running"),
-        ProcessStartProbe::Unknown { reason } => {
-            bail!("embedding_qualification_worker_identity_unknown:{reason}")
-        }
-    }
-}
-
 pub(super) fn wait_for_process_exit(
-    clock: &dyn AwakeMonotonicClock,
+    clock: &super::CoordinatorClock,
     pid: u32,
     timeout: Duration,
 ) -> Result<()> {
@@ -93,7 +83,7 @@ pub(super) fn wait_for_process_exit(
 }
 
 pub(super) fn wait_for_child(
-    clock: &dyn AwakeMonotonicClock,
+    clock: &super::CoordinatorClock,
     child: &mut Child,
     timeout: Duration,
 ) -> Result<ExitStatus> {

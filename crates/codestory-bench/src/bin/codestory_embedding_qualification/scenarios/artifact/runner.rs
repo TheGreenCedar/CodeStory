@@ -5,16 +5,15 @@ use super::{
 use crate::qualification::request::{QualificationExecutable, sha256_bytes};
 use anyhow::{Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingCapacityPressureWire, EmbeddingProtocolResponse,
-    EmbeddingQualificationParameters, EmbeddingQualificationResult, EmbeddingServerSnapshot,
-    EmbeddingTransportIdentity,
+    EmbeddingCapacityPressureWire, EmbeddingProtocolResponse, EmbeddingQualificationParameters,
+    EmbeddingQualificationResult, EmbeddingServerSnapshot, EmbeddingTransportIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod analysis;
 mod client_death;
@@ -172,13 +171,37 @@ impl Drop for RunningWorker {
 struct ScenarioRunner<'a> {
     context: ScenarioContext<'a>,
     executable: QualificationExecutable,
-    clock: Arc<dyn AwakeMonotonicClock>,
+    clock: CoordinatorClock,
     artifact: ScenarioArtifact,
     evidence: ScenarioEvidence,
     active_controls: BTreeSet<String>,
     active_gates: BTreeSet<PathBuf>,
     next_sequence: u64,
     next_worker: u64,
+}
+
+struct CoordinatorClock {
+    origin: Instant,
+}
+
+impl CoordinatorClock {
+    fn capture() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.origin
+            .elapsed()
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 pub(in crate::qualification) fn run_scenario(
@@ -266,7 +289,7 @@ impl<'a> ScenarioRunner<'a> {
         {
             bail!("embedding_qualification_scenario_projects_invalid");
         }
-        let clock = codestory_cli::native_embedding_qualification_clock()?;
+        let clock = CoordinatorClock::capture();
         let started_ns = clock.now_ns();
         let next_sequence = existing_control_events(context.output_directory)?
             .iter()

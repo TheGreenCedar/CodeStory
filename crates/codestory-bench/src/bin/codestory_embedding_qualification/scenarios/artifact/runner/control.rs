@@ -7,10 +7,10 @@ use super::process::{
     existing_control_events, qualification_command_path, qualification_nonce, query_parameters,
     require_worker_success,
 };
-use super::{ControlCommand, ControlCommandParameters, ScenarioRunner};
+use super::{ControlCommand, ControlCommandParameters, ScenarioRunner, WorkerOutput};
 use crate::qualification::output::write_atomic_json;
 use anyhow::{Context, Result, bail};
-use codestory_retrieval::{EmbeddingServerSnapshot, PerUserEmbeddingClient};
+use codestory_retrieval::EmbeddingServerSnapshot;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -44,7 +44,7 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     pub(super) fn observe(&mut self, phase: &str) -> Result<Option<EmbeddingServerSnapshot>> {
-        let snapshot = PerUserEmbeddingClient::for_runtime(self.primary_runtime())?.observe()?;
+        let snapshot = self.observe_worker()?;
         self.artifact
             .process_observations
             .push(ProcessObservation::from_snapshot(
@@ -63,8 +63,7 @@ impl<'a> ScenarioRunner<'a> {
     ) -> Result<EmbeddingServerSnapshot> {
         let started = self.clock.now_ns();
         loop {
-            if let Some(snapshot) =
-                PerUserEmbeddingClient::for_runtime(self.primary_runtime())?.observe()?
+            if let Some(snapshot) = self.observe_worker()?
                 && predicate(&snapshot)
             {
                 self.artifact
@@ -76,7 +75,7 @@ impl<'a> ScenarioRunner<'a> {
                     ));
                 return Ok(snapshot);
             }
-            if elapsed(self.clock.as_ref(), started) >= timeout {
+            if elapsed(&self.clock, started) >= timeout {
                 bail!("embedding_qualification_snapshot_timeout:{phase}");
             }
             self.clock.sleep(POLL);
@@ -103,7 +102,7 @@ impl<'a> ScenarioRunner<'a> {
                     ));
                 return Ok(snapshot);
             }
-            if elapsed(self.clock.as_ref(), started) >= timeout {
+            if elapsed(&self.clock, started) >= timeout {
                 bail!("embedding_qualification_control_snapshot_timeout:{phase}");
             }
             self.clock.sleep(POLL);
@@ -134,7 +133,7 @@ impl<'a> ScenarioRunner<'a> {
                     ));
                 return Ok((snapshot.clone(), idle_epoch_ns, event));
             }
-            if elapsed(self.clock.as_ref(), started) >= timeout {
+            if elapsed(&self.clock, started) >= timeout {
                 bail!("embedding_qualification_idle_epoch_timeout:{phase}");
             }
             self.clock.sleep(POLL);
@@ -175,31 +174,29 @@ impl<'a> ScenarioRunner<'a> {
 
             let remaining = target.saturating_sub(server_elapsed);
             let client_wait_origin_ns = self.clock.now_ns();
-            while elapsed(self.clock.as_ref(), client_wait_origin_ns) < remaining {
+            while elapsed(&self.clock, client_wait_origin_ns) < remaining {
                 self.clock.sleep(POLL);
             }
         }
     }
 
     pub(super) fn wait_for_absence(&mut self, phase: &str, timeout: Duration) -> Result<()> {
-        let started = self.clock.now_ns();
-        loop {
-            if let Ok(None) = PerUserEmbeddingClient::for_runtime(self.primary_runtime())?.observe()
-            {
-                self.artifact
-                    .process_observations
-                    .push(ProcessObservation::from_snapshot(
-                        phase,
-                        self.clock.now_ns(),
-                        None,
-                    ));
-                return Ok(());
-            }
-            if elapsed(self.clock.as_ref(), started) >= timeout {
-                bail!("embedding_qualification_owner_exit_timeout:{phase}");
-            }
-            self.clock.sleep(POLL);
+        let output = self.wait_for_absence_output(timeout)?;
+        if output
+            .result
+            .as_ref()
+            .is_none_or(|result| result.final_snapshot.is_some())
+        {
+            bail!("embedding_qualification_owner_exit_missing:{phase}");
         }
+        self.artifact
+            .process_observations
+            .push(ProcessObservation::from_snapshot(
+                phase,
+                self.clock.now_ns(),
+                None,
+            ));
+        Ok(())
     }
 
     pub(super) fn ensure_owner(&mut self, phase: &str) -> Result<EmbeddingServerSnapshot> {
@@ -209,7 +206,7 @@ impl<'a> ScenarioRunner<'a> {
         let worker = self.spawn_worker("query", query_parameters(1), None)?;
         let output = self.finish_worker(worker, NORMAL_WORKER_TIMEOUT)?;
         require_worker_success(&output, "ensure_owner")?;
-        self.wait_for_snapshot(phase, SNAPSHOT_TIMEOUT, |_| true)
+        self.record_worker_snapshot(phase, &output)
     }
 
     pub(super) fn reset_owner(&mut self, phase: &str) -> Result<()> {
@@ -219,12 +216,29 @@ impl<'a> ScenarioRunner<'a> {
         self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)
     }
 
+    pub(super) fn wait_for_absence_output(&mut self, timeout: Duration) -> Result<WorkerOutput> {
+        let worker = self.spawn_worker("wait_for_absence", query_parameters(1), None)?;
+        let output = self.finish_worker(worker, timeout)?;
+        require_worker_success(&output, "wait_for_absence")?;
+        Ok(output)
+    }
+
+    fn observe_worker(&mut self) -> Result<Option<EmbeddingServerSnapshot>> {
+        let worker = self.spawn_worker("observe", query_parameters(1), None)?;
+        let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
+        require_worker_success(&output, "observe")?;
+        Ok(output
+            .result
+            .as_ref()
+            .and_then(|result| result.final_snapshot.clone()))
+    }
+
     pub(super) fn control(&mut self, action: &str, class: Option<&str>) -> Result<ControlEvent> {
         let command_path =
             qualification_command_path(self.context.output_directory, &qualification_nonce()?);
         let wait_started = self.clock.now_ns();
         while command_path.exists() {
-            if elapsed(self.clock.as_ref(), wait_started) >= CONTROL_TIMEOUT {
+            if elapsed(&self.clock, wait_started) >= CONTROL_TIMEOUT {
                 bail!("embedding_qualification_control_slot_busy");
             }
             self.clock.sleep(POLL);
@@ -249,7 +263,7 @@ impl<'a> ScenarioRunner<'a> {
                 {
                     return Ok(event);
                 }
-                if elapsed(self.clock.as_ref(), started) >= CONTROL_TIMEOUT {
+                if elapsed(&self.clock, started) >= CONTROL_TIMEOUT {
                     bail!("embedding_qualification_control_event_timeout:{action}");
                 }
                 self.clock.sleep(POLL);

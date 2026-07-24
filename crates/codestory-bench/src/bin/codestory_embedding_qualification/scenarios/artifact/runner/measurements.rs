@@ -3,7 +3,8 @@ use super::super::{
     RawMetricProcess, RawMetricSampleInput, SNAPSHOT_TIMEOUT, successful_operation_operands,
 };
 use super::analysis::{
-    accelerator_operands, raw_server_identity, snapshot_has_resident_generation,
+    accelerator_operands, completed_token_count, raw_server_identity,
+    snapshot_has_resident_generation,
 };
 use super::process::{query_parameters, require_worker_success};
 use super::{ScenarioRunner, WorkerOutput, push_metric};
@@ -23,7 +24,8 @@ impl<'a> ScenarioRunner<'a> {
 
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_spawn_no_owner_{repeat}"))?;
-            let (interval, snapshot) = self.run_measurement_worker("query", query_parameters(1))?;
+            let (interval, snapshot, _) =
+                self.run_measurement_worker("query", query_parameters(1))?;
             self.record_metric(
                 &mut metrics,
                 "spawn_convergence",
@@ -36,7 +38,7 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot) =
+            let (interval, snapshot, _) =
                 self.run_measurement_worker("observe", query_parameters(1))?;
             self.record_metric(
                 &mut metrics,
@@ -51,7 +53,7 @@ impl<'a> ScenarioRunner<'a> {
 
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_cold_no_owner_{repeat}"))?;
-            let (interval, snapshot) =
+            let (interval, snapshot, _) =
                 self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
             let operands = successful_operation_operands(&interval);
             self.record_metric(
@@ -66,7 +68,7 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot) =
+            let (interval, snapshot, _) =
                 self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
             let operands = successful_operation_operands(&interval);
             self.record_metric(
@@ -81,7 +83,7 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot) =
+            let (interval, snapshot, _) =
                 self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
             let operands = successful_operation_operands(&interval);
             self.record_metric(
@@ -96,7 +98,7 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot) =
+            let (interval, snapshot, _) =
                 self.run_measurement_worker("bulk", measurement_parameters(0, 1, 64, 256))?;
             let operands = successful_operation_operands(&interval);
             self.record_metric(
@@ -111,8 +113,19 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot) =
+            let (interval, snapshot, output) =
                 self.run_measurement_worker("bulk", measurement_parameters(0, 1, 256, 256))?;
+            let request_id = output
+                .result
+                .as_ref()
+                .and_then(|result| result.operations.as_slice().first())
+                .and_then(|operation| operation.attempts.last())
+                .map(|attempt| attempt.request_id.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("embedding_qualification_bulk_request_id_missing")
+                })?;
+            let completed_tokens =
+                completed_token_count(self.context.output_directory, request_id)?;
             let duration_ns = interval
                 .awake_finished_ns
                 .saturating_sub(interval.awake_started_ns);
@@ -139,7 +152,7 @@ impl<'a> ScenarioRunner<'a> {
                 interval,
                 snapshot,
                 BTreeMap::from([
-                    ("input_bytes".into(), json!(256_u64 * 256)),
+                    ("completed_tokens".into(), json!(completed_tokens)),
                     (
                         "successful_operation_duration_ns".into(),
                         json!(duration_ns),
@@ -155,7 +168,7 @@ impl<'a> ScenarioRunner<'a> {
             .engine_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_residency_identity_missing"))?;
-        let (_, residency_snapshot) =
+        let (_, residency_snapshot, _) =
             self.run_measurement_worker("observe", query_parameters(1))?;
         self.record_metric(
             &mut metrics,
@@ -189,17 +202,20 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        let (_, idle_owner) = self.run_measurement_worker("query", query_parameters(1))?;
+        let (_, idle_owner, _) = self.run_measurement_worker("query", query_parameters(1))?;
         if !snapshot_has_resident_generation(&idle_owner) {
             bail!("embedding_qualification_true_idle_owner_not_resident");
         }
-        let idle_start = self.begin_measurement()?;
-        self.wait_for_absence(
-            "measurement_true_idle_absent",
-            Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
-                .saturating_add(IDLE_EXIT_GRACE),
-        )?;
-        let idle_interval = self.finish_measurement(idle_start)?;
+        let idle_timeout = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
+            .saturating_add(IDLE_EXIT_GRACE)
+            .saturating_add(Duration::from_secs(30));
+        let idle_output = self.wait_for_absence_output(idle_timeout)?;
+        let idle_interval = measurement_interval(&idle_output)?;
+        if idle_output.result.as_ref().is_none_or(|result| {
+            result.initial_snapshot.is_none() || result.final_snapshot.is_some()
+        }) {
+            bail!("embedding_qualification_true_idle_worker_witness_invalid");
+        }
         self.record_metric(
             &mut metrics,
             "true_idle_exit",
@@ -228,13 +244,13 @@ impl<'a> ScenarioRunner<'a> {
         &mut self,
         operation: &str,
         parameters: EmbeddingQualificationParameters,
-    ) -> Result<(MeasurementInterval, EmbeddingServerSnapshot)> {
+    ) -> Result<(MeasurementInterval, EmbeddingServerSnapshot, WorkerOutput)> {
         let worker = self.spawn_worker(operation, parameters, None)?;
         let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
         require_worker_success(&output, operation)?;
         let interval = measurement_interval(&output)?;
         let snapshot = self.record_worker_snapshot("measurement_worker", &output)?;
-        Ok((interval, snapshot))
+        Ok((interval, snapshot, output))
     }
 
     fn record_metric(
@@ -268,46 +284,6 @@ impl<'a> ScenarioRunner<'a> {
             repeat,
         )
     }
-
-    pub(super) fn begin_measurement(&self) -> Result<super::super::MeasurementSpanStart> {
-        let process_start_id = super::process::current_process_start_identity()?;
-        let snapshot = self.clock.snapshot();
-        let boot_id_started = codestory_cli::native_embedding_qualification_boot_id()?;
-        let inclusive_started_ns =
-            codestory_cli::native_embedding_qualification_inclusive_now_ns()?;
-        Ok(super::super::MeasurementSpanStart {
-            process: RawMetricProcess {
-                pid: std::process::id(),
-                process_start_id,
-            },
-            clock: RawMetricClock {
-                domain: snapshot.domain,
-                api: snapshot.api,
-                boot_id: snapshot.boot_id,
-                resolution_ns: snapshot.resolution_ns,
-            },
-            awake_started_ns: self.clock.now_ns(),
-            inclusive_started_ns,
-            boot_id_started,
-        })
-    }
-
-    pub(super) fn finish_measurement(
-        &self,
-        start: super::super::MeasurementSpanStart,
-    ) -> Result<MeasurementInterval> {
-        Ok(MeasurementInterval {
-            process: start.process,
-            clock: start.clock,
-            awake_started_ns: start.awake_started_ns,
-            awake_finished_ns: self.clock.now_ns(),
-            inclusive_started_ns: start.inclusive_started_ns,
-            inclusive_finished_ns: codestory_cli::native_embedding_qualification_inclusive_now_ns(
-            )?,
-            boot_id_started: start.boot_id_started,
-            boot_id_finished: codestory_cli::native_embedding_qualification_boot_id()?,
-        })
-    }
 }
 
 fn measurement_interval(output: &WorkerOutput) -> Result<MeasurementInterval> {
@@ -331,6 +307,7 @@ fn measurement_interval(output: &WorkerOutput) -> Result<MeasurementInterval> {
         },
         awake_started_ns: output.started_ns,
         awake_finished_ns: output.finished_ns,
+        inclusive_clock_api: output.inclusive_clock_api.clone(),
         inclusive_started_ns: output.inclusive_started_ns,
         inclusive_finished_ns: output.inclusive_finished_ns,
         boot_id_started: output.boot_id_started.clone(),

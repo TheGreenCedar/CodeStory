@@ -109,7 +109,7 @@ function marketplaceRevisionAt(root) {
   return revision;
 }
 
-export function installMarketplaceProof(rawArgs) {
+function prepareInstallation(rawArgs) {
   const args = parseArgs(rawArgs);
   const codexPackageRoot = path.resolve(required(args, "codex_package_root"));
   const codexExecutable = path.join(
@@ -140,12 +140,28 @@ export function installMarketplaceProof(rawArgs) {
   for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
     if (!/^[0-9a-f]{40}$/u.test(value)) fail(`${label} must be an immutable Git identity`);
   }
+  return {
+    args,
+    codexExecutable,
+    codexHome,
+    pluginData,
+    marketplaceSource,
+    marketplaceName,
+    marketplaceRevision,
+    expectedVersion,
+    sourceCommit,
+    sourceTree,
+  };
+}
 
-  const env = { ...process.env, CODEX_HOME: codexHome };
-  const codex = (...command) => run(codexExecutable, command, { env });
+function installMarketplace(setup) {
+  const env = { ...process.env, CODEX_HOME: setup.codexHome };
+  const codex = (...command) => run(setup.codexExecutable, command, { env });
   const codexVersion = codex("--version");
-  const addArguments = ["plugin", "marketplace", "add", marketplaceSource];
-  if (args.local_fixture !== "true") addArguments.push("--ref", marketplaceRevision);
+  const addArguments = ["plugin", "marketplace", "add", setup.marketplaceSource];
+  if (setup.args.local_fixture !== "true") {
+    addArguments.push("--ref", setup.marketplaceRevision);
+  }
   addArguments.push("--json");
   const marketplaceAdd = parseJson("marketplace add", codex(...addArguments));
   const marketplaceList = parseJson(
@@ -154,98 +170,117 @@ export function installMarketplaceProof(rawArgs) {
   );
   const pluginAdd = parseJson(
     "plugin add",
-    codex("plugin", "add", `codestory@${marketplaceName}`, "--json"),
+    codex("plugin", "add", `codestory@${setup.marketplaceName}`, "--json"),
   );
   const pluginList = parseJson("plugin list", codex("plugin", "list", "--json"));
+  return { codexVersion, marketplaceAdd, marketplaceList, pluginAdd, pluginList };
+}
 
-  const pluginRoot = realpathSync(pluginAdd.installedPath);
+function verifyInstallation(setup, installed) {
+  const pluginRoot = realpathSync(installed.pluginAdd.installedPath);
   const expectedPluginRoot = realpathSync(
     path.join(
-      codexHome,
+      setup.codexHome,
       "plugins",
       "cache",
-      marketplaceName,
+      setup.marketplaceName,
       "codestory",
-      expectedVersion,
+      setup.expectedVersion,
     ),
   );
   if (pluginRoot !== expectedPluginRoot) {
     fail(`Codex installed the plugin at an unexpected cache path: ${pluginRoot}`);
   }
-  containedPath(codexHome, pluginRoot, "installed plugin");
+  containedPath(setup.codexHome, pluginRoot, "installed plugin");
   if (
-    marketplaceAdd.marketplaceName !== marketplaceName
-    || marketplaceAdd.alreadyAdded !== false
-    || pluginAdd.pluginId !== `codestory@${marketplaceName}`
-    || pluginAdd.version !== expectedVersion
+    installed.marketplaceAdd.marketplaceName !== setup.marketplaceName
+    || installed.marketplaceAdd.alreadyAdded !== false
+    || installed.pluginAdd.pluginId !== `codestory@${setup.marketplaceName}`
+    || installed.pluginAdd.version !== setup.expectedVersion
   ) {
     fail("Codex marketplace or plugin add result has an unexpected identity");
   }
-  const marketplaceListEntry = marketplaceList.marketplaces?.find(
-    ({ name }) => name === marketplaceName,
+  const marketplaceListEntry = installed.marketplaceList.marketplaces?.find(
+    ({ name }) => name === setup.marketplaceName,
   );
   if (!marketplaceListEntry) fail("Codex marketplace list omitted the installed marketplace");
-  const marketplaceAddRoot = realpathSync(marketplaceAdd.installedRoot);
+  const marketplaceAddRoot = realpathSync(installed.marketplaceAdd.installedRoot);
   const marketplaceListRoot = realpathSync(marketplaceListEntry.root);
   const marketplaceAddRevision = marketplaceRevisionAt(marketplaceAddRoot);
   const marketplaceListRevision = marketplaceRevisionAt(marketplaceListRoot);
   if (
     marketplaceAddRoot !== marketplaceListRoot
-    || marketplaceAddRevision !== marketplaceRevision
-    || marketplaceListRevision !== marketplaceRevision
+    || marketplaceAddRevision !== setup.marketplaceRevision
+    || marketplaceListRevision !== setup.marketplaceRevision
   ) {
     fail("Codex marketplace provenance does not match the requested immutable revision");
   }
+  return {
+    pluginRoot,
+    marketplaceAddRoot,
+    marketplaceListRoot,
+    marketplaceAddRevision,
+    marketplaceListRevision,
+  };
+}
 
+function attestInstallation(setup, installed, verified) {
   const attestation = {
     schema_version: 2,
     installation_source: "codex_marketplace_install",
     installation: {
-      codex_home: codexHome,
-      plugin_root: pluginRoot,
-      plugin_data: pluginData,
+      codex_home: setup.codexHome,
+      plugin_root: verified.pluginRoot,
+      plugin_data: setup.pluginData,
     },
     plugin: {
       id: "codestory",
-      version: expectedVersion,
-      source_commit: sourceCommit,
-      source_tree: sourceTree,
-      package_sha256: directoryDigest(pluginRoot),
+      version: setup.expectedVersion,
+      source_commit: setup.sourceCommit,
+      source_tree: setup.sourceTree,
+      package_sha256: directoryDigest(verified.pluginRoot),
     },
     marketplace: {
-      repository: marketplaceSource,
-      revision: marketplaceRevision,
+      repository: setup.marketplaceSource,
+      revision: setup.marketplaceRevision,
       provenance: {
         add: {
-          root: marketplaceAddRoot,
-          revision: marketplaceAddRevision,
+          root: verified.marketplaceAddRoot,
+          revision: verified.marketplaceAddRevision,
         },
         list: {
-          root: marketplaceListRoot,
-          revision: marketplaceListRevision,
+          root: verified.marketplaceListRoot,
+          revision: verified.marketplaceListRevision,
         },
       },
-      codex_cli_version: codexVersion,
-      add_result: marketplaceAdd,
-      list_result: marketplaceList,
-      plugin_add_result: pluginAdd,
-      plugin_list_result: pluginList,
+      codex_cli_version: installed.codexVersion,
+      add_result: installed.marketplaceAdd,
+      list_result: installed.marketplaceList,
+      plugin_add_result: installed.pluginAdd,
+      plugin_list_result: installed.pluginList,
     },
   };
-  const attestationPath = path.resolve(required(args, "attestation"));
+  const attestationPath = path.resolve(required(setup.args, "attestation"));
   writeFileSync(attestationPath, `${JSON.stringify(attestation, null, 2)}\n`);
-  if (args.github_output) {
+  if (setup.args.github_output) {
     appendFileSync(
-      path.resolve(args.github_output),
+      path.resolve(setup.args.github_output),
       [
-        `plugin_root=${pluginRoot}`,
-        `plugin_data=${pluginData}`,
+        `plugin_root=${verified.pluginRoot}`,
+        `plugin_data=${setup.pluginData}`,
         `attestation=${attestationPath}`,
         "",
       ].join("\n"),
     );
   }
   return attestation;
+}
+
+export function installMarketplaceProof(rawArgs) {
+  const setup = prepareInstallation(rawArgs);
+  const installed = installMarketplace(setup);
+  const verified = verifyInstallation(setup, installed);
+  return attestInstallation(setup, installed, verified);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

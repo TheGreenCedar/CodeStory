@@ -1,7 +1,5 @@
 use crate::app::embedding_client_transport_mode;
-use crate::args;
 use crate::args::{Cli, Command};
-use crate::runtime;
 use crate::{embedding_server_transport, sidecar_runtime};
 use anyhow::Result;
 use clap::Parser;
@@ -57,11 +55,11 @@ fn embedding_client_transport_startup_keeps_embedding_capable_commands() {
         &["retrieval", "query", "RuntimeContext"][..],
         &["serve"][..],
         &[
-            "internal-embedding-qualification",
+            "internal-embedding-qualification-worker",
             "--request",
-            "/private/request.json",
+            "/private/worker-request.json",
             "--output",
-            "/private/output.json",
+            "/private/worker-output.json",
         ][..],
     ] {
         assert_eq!(
@@ -70,6 +68,19 @@ fn embedding_client_transport_startup_keeps_embedding_capable_commands() {
             "{args:?} should retain exact executable identity capture"
         );
     }
+}
+
+#[test]
+fn production_cli_rejects_the_removed_qualification_suite() {
+    let result = Cli::try_parse_from([
+        "codestory-cli",
+        "internal-embedding-qualification",
+        "--request",
+        "/private/request.json",
+        "--output",
+        "/private/output.json",
+    ]);
+    assert!(result.is_err());
 }
 
 #[test]

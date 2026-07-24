@@ -10,6 +10,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class QualificationProducerContext:
     args: argparse.Namespace
+    qualification_driver: Path
     qualification_cli: Path
     root: Path
     runtime: dict

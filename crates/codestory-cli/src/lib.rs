@@ -54,28 +54,3 @@ pub fn install_native_embedding_client_transport() -> Result<()> {
 pub fn run_native_embedding_server() -> Result<()> {
     embedding_server_transport::run_internal_embedding_server()
 }
-
-/// Capture the platform clock shared by native embedding client/server proof.
-#[doc(hidden)]
-pub fn native_embedding_qualification_clock()
--> Result<std::sync::Arc<dyn codestory_retrieval::AwakeMonotonicClock>> {
-    embedding_server_transport::qualification_clock()
-}
-
-/// Read the suspend-inclusive monotonic clock used by qualification evidence.
-#[doc(hidden)]
-pub fn native_embedding_qualification_inclusive_now_ns() -> Result<u64> {
-    embedding_server_transport::inclusive_now_ns()
-}
-
-/// Name the suspend-inclusive clock API used by qualification evidence.
-#[doc(hidden)]
-pub fn native_embedding_qualification_inclusive_clock_api() -> &'static str {
-    embedding_server_transport::inclusive_clock_api()
-}
-
-/// Read the platform boot identity used to correlate qualification clocks.
-#[doc(hidden)]
-pub fn native_embedding_qualification_boot_id() -> Result<String> {
-    embedding_server_transport::boot_id()
-}

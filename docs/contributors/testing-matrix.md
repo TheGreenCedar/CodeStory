@@ -205,8 +205,11 @@ Runtime proof uses the ordinary plugin launcher with two independently started
 host processes and different repositories. `--proof-tier calibration` may
 collect draft measurements, but cannot satisfy a package, hardware, installed,
 or release claim. A higher tier requires a frozen constant set and a retained
-qualification record. `--produce-qualification-evidence` runs the private,
-nonce-gated scenario orchestrator and writes the path passed to
+qualification record. `--produce-qualification-evidence` requires the separate
+`codestory-embedding-qualification` driver through `--qualification-driver`.
+The harness passes the exact packaged executable to that driver through
+`--cli`; the driver orchestrates private nonce-gated worker calls without
+shipping the suite inside `codestory-cli`. It writes the path passed to
 `--qualification-evidence`; without the producer flag, the harness verifies an
 existing record. Missing, stale, partial, self-selected, or wrong-tier evidence
 fails.

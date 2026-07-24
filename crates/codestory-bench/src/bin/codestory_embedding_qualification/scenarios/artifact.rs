@@ -275,20 +275,13 @@ struct SuspendWitness {
     boot_id_finished: String,
 }
 
-struct MeasurementSpanStart {
-    process: RawMetricProcess,
-    clock: RawMetricClock,
-    awake_started_ns: u64,
-    inclusive_started_ns: u64,
-    boot_id_started: String,
-}
-
 #[derive(Clone)]
 struct MeasurementInterval {
     process: RawMetricProcess,
     clock: RawMetricClock,
     awake_started_ns: u64,
     awake_finished_ns: u64,
+    inclusive_clock_api: String,
     inclusive_started_ns: u64,
     inclusive_finished_ns: u64,
     boot_id_started: String,
@@ -330,8 +323,7 @@ impl MeasurementInterval {
             suspend_witness: SuspendWitness {
                 awake_started_ns: self.awake_started_ns,
                 awake_finished_ns: self.awake_finished_ns,
-                inclusive_clock_api:
-                    codestory_cli::native_embedding_qualification_inclusive_clock_api().into(),
+                inclusive_clock_api: self.inclusive_clock_api.clone(),
                 inclusive_started_ns: self.inclusive_started_ns,
                 inclusive_finished_ns: self.inclusive_finished_ns,
                 boot_id_started: self.boot_id_started.clone(),

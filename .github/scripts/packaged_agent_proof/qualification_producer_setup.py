@@ -37,6 +37,11 @@ def prepare_qualification_producer(
         "--produce-qualification-evidence requires --qualification-evidence",
     )
     require(
+        args.qualification_driver is not None
+        and args.qualification_driver.is_file(),
+        "--produce-qualification-evidence requires an existing --qualification-driver",
+    )
+    require(
         qualification_cli.is_file(),
         f"qualification executable is missing: {qualification_cli}",
     )
@@ -88,6 +93,7 @@ def prepare_qualification_producer(
     )
     return QualificationProducerContext(
         args=args,
+        qualification_driver=args.qualification_driver,
         qualification_cli=qualification_cli,
         root=root,
         runtime=runtime,

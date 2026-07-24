@@ -7,9 +7,9 @@ use super::{ControlEvent, WorkerQueueOperation};
 use crate::qualification::request::{read_private_request, sha256_bytes, validate_direct_child};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingEngineIdentity, EmbeddingQualificationWatchdogMarker,
-    EmbeddingServerSnapshot, PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS,
-    PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS, SidecarRuntimeConfig,
+    EmbeddingEngineIdentity, EmbeddingQualificationWatchdogMarker, EmbeddingServerSnapshot,
+    PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS, PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS,
+    SidecarRuntimeConfig,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +39,31 @@ pub(super) fn scheduler_values(snapshot: &EmbeddingServerSnapshot) -> BTreeMap<S
             ),
         ),
     ])
+}
+
+pub(super) fn completed_token_count(directory: &Path, request_id: &str) -> Result<u64> {
+    existing_control_events(directory)?
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            (event.action == "completed_tokens"
+                && event.status == "completed"
+                && event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("request_id"))
+                    .is_some_and(|observed| observed == request_id))
+            .then(|| {
+                event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("completed_tokens"))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .flatten()
+        })
+        .filter(|count| *count > 0)
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_completed_tokens_missing"))
 }
 
 pub(super) struct QueueAnalysis {
@@ -422,7 +447,7 @@ pub(super) fn project_identity_sha256(runtime: &SidecarRuntimeConfig) -> String 
     sha256_bytes(seed.as_bytes())
 }
 
-pub(super) fn elapsed(clock: &dyn AwakeMonotonicClock, started_ns: u64) -> Duration {
+pub(super) fn elapsed(clock: &super::CoordinatorClock, started_ns: u64) -> Duration {
     Duration::from_nanos(clock.now_ns().saturating_sub(started_ns))
 }
 

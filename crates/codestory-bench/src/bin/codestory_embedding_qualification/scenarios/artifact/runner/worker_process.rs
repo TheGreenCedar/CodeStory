@@ -10,9 +10,7 @@ use super::{RunningWorker, ScenarioRunner, WorkerOutput, WorkerRequest};
 use crate::qualification::output::write_atomic_json;
 use crate::qualification::request::read_private_request;
 use anyhow::{Context, Result, bail};
-use codestory_retrieval::{
-    EmbeddingQualificationParameters, EmbeddingServerSnapshot, SidecarRuntimeConfig,
-};
+use codestory_retrieval::{EmbeddingQualificationParameters, EmbeddingServerSnapshot};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -96,7 +94,7 @@ impl<'a> ScenarioRunner<'a> {
             .spawn()
             .with_context(|| format!("spawn qualification worker {invocation_id}"))?;
         let pid = child.id();
-        let process_start_id = wait_for_process_start(&*self.clock, pid)?;
+        let process_start_id = wait_for_process_start(&self.clock, pid)?;
         let invocation_index = self.artifact.orchestration.process_invocations.len();
         self.artifact
             .orchestration
@@ -131,16 +129,12 @@ impl<'a> ScenarioRunner<'a> {
         self.active_gates.remove(gate);
     }
 
-    pub(super) fn primary_runtime(&self) -> &SidecarRuntimeConfig {
-        &self.context.runtimes[self.context.primary_index]
-    }
-
     pub(super) fn finish_worker(
         &mut self,
         mut worker: RunningWorker,
         timeout: Duration,
     ) -> Result<WorkerOutput> {
-        let status = wait_for_child(&*self.clock, &mut worker.child, timeout)?;
+        let status = wait_for_child(&self.clock, &mut worker.child, timeout)?;
         self.finish_invocation(worker.invocation_index, status, "exited");
         if !status.success() {
             cleanup_worker_files(&worker);

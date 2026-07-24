@@ -5,6 +5,9 @@
 - Fail closed when runtime evidence is insufficient, capture source-index policy once at startup, and keep embedding work bounded under sustained queue pressure.
 - Bound the v0.16 package matrix, public support claims, release assets, and
   Metal/Vulkan closeout to one validated release graph.
+- Move release qualification orchestration out of the shipped CLI into a
+  separate proof driver that exercises the exact packaged CLI through private
+  worker calls.
 
 ## 0.16.0
 

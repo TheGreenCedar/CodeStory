@@ -23,6 +23,7 @@ def run_cli_self_tests() -> None:
         )
         args = argparse.Namespace(
             qualification_evidence=None,
+            qualification_driver=None,
             publication_fault_evidence=None,
             retrieval_quality_evidence=None,
             calibration_bundle=None,

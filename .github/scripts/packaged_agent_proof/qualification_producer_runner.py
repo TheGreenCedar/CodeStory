@@ -157,8 +157,9 @@ def run_qualification_producer(
     write_private_json(request_path, request)
     run(
         [
+            str(context.qualification_driver),
+            "--cli",
             str(context.qualification_cli),
-            "internal-embedding-qualification",
             "--request",
             str(request_path),
             "--output",
