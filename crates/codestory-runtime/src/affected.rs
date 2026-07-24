@@ -1493,12 +1493,16 @@ struct AffectedMatchedClassification {
     freshness_unavailable: bool,
 }
 
+struct AffectedInputClassificationContext<'a> {
+    root: &'a Path,
+    records: &'a [AffectedChangeRecordDto],
+    freshness: &'a IndexFreshnessObservation,
+}
+
 fn classify_matched_affected_files(
-    root: &Path,
-    records: &[AffectedChangeRecordDto],
+    context: &AffectedInputClassificationContext<'_>,
     files: &[FileInfo],
     errors_by_file: &HashMap<i64, u32>,
-    freshness: &IndexFreshnessObservation,
     matched_file_ids: &HashSet<GraphNodeId>,
     matched_record_index_by_file_id: &HashMap<GraphNodeId, usize>,
     indexed_identity_by_file_id: &HashMap<GraphNodeId, WorkspacePathIdentity>,
@@ -1510,11 +1514,11 @@ fn classify_matched_affected_files(
             let file_id = codestory_contracts::graph::NodeId(file.id);
             let record = matched_record_index_by_file_id
                 .get(&file_id)
-                .map(|record_index| &records[*record_index]);
+                .map(|record_index| &context.records[*record_index]);
             (
                 file_id,
                 AffectedMatchedFileDto {
-                    path: runtime_relative_path(root, &file.path),
+                    path: runtime_relative_path(context.root, &file.path),
                     role: indexed_file_role(&file.path),
                     indexed: file.indexed,
                     complete: file.complete,
@@ -1532,13 +1536,14 @@ fn classify_matched_affected_files(
     for (file_id, file) in &matched {
         let stale = indexed_identity_by_file_id
             .get(file_id)
-            .is_some_and(|identity| freshness.identity_is_stale(identity));
-        freshness_unavailable |= !stale && file.error_count == 0 && !freshness.inventory_complete;
+            .is_some_and(|identity| context.freshness.identity_is_stale(identity));
+        freshness_unavailable |=
+            !stale && file.error_count == 0 && !context.freshness.inventory_complete;
         if let Some((classification, reason, evidence)) = classify_matched_affected_input(
             file,
             stale,
-            freshness.inventory_complete
-                && freshness.freshness.status != IndexFreshnessStatusDto::NotChecked,
+            context.freshness.inventory_complete
+                && context.freshness.freshness.status != IndexFreshnessStatusDto::NotChecked,
         ) {
             uncovered.push(AffectedUncoveredInputDto {
                 path: file.path.clone(),
@@ -1556,10 +1561,8 @@ fn classify_matched_affected_files(
 }
 
 fn classify_unmatched_affected_paths(
-    root: &Path,
-    records: &[AffectedChangeRecordDto],
+    context: &AffectedInputClassificationContext<'_>,
     resolved_inputs: &[AffectedResolvedInput],
-    freshness: &IndexFreshnessObservation,
     matched_record_flags: &[bool],
     graph_seeded_record_flags: &[bool],
     current_identity_by_record: &[Option<WorkspacePathIdentity>],
@@ -1567,16 +1570,17 @@ fn classify_unmatched_affected_paths(
     previous_identity_errors: &[Option<String>],
 ) -> (Vec<AffectedUnmatchedPathDto>, bool) {
     let mut freshness_unavailable = false;
-    let paths = records
+    let paths = context
+        .records
         .iter()
         .enumerate()
         .filter(|(index, _)| !matched_record_flags[*index])
         .map(|(index, record)| {
             let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
-                Some(root),
+                Some(context.root),
                 record,
                 &resolved_inputs[index],
-                freshness,
+                context.freshness,
                 current_identity_by_record[index].as_ref(),
                 current_identity_errors[index].as_deref(),
                 previous_identity_errors[index].as_deref(),
@@ -1584,12 +1588,12 @@ fn classify_unmatched_affected_paths(
             freshness_unavailable |= matches!(
                 affected_path_metadata(&resolved_inputs[index].current),
                 AffectedPathMetadataObservation::RegularFile
-            ) && indexable_source_path_in_workspace(root, &resolved_inputs[index].current)
+            ) && indexable_source_path_in_workspace(context.root, &resolved_inputs[index].current)
                 && current_identity_errors[index].is_none()
                 && current_identity_by_record[index]
                     .as_ref()
-                    .is_some_and(|identity| !freshness.identity_is_stale(identity))
-                && !freshness.inventory_complete;
+                    .is_some_and(|identity| !context.freshness.identity_is_stale(identity))
+                && !context.freshness.inventory_complete;
             if graph_seeded_record_flags[index] {
                 evidence.push(format!(
                     "previous indexed identity {} supplied bounded proxy graph evidence",
@@ -1644,21 +1648,22 @@ fn classify_affected_inputs(
         .copied()
         .chain(previous_identity_seed_evidence.keys().copied())
         .collect();
-    let matched = classify_matched_affected_files(
+    let classification_context = AffectedInputClassificationContext {
         root,
         records,
+        freshness,
+    };
+    let matched = classify_matched_affected_files(
+        &classification_context,
         files,
         errors_by_file,
-        freshness,
         &matched_file_ids,
         &matched_record_index_by_file_id,
         &indexed_identity_by_file_id,
     );
     let (unmatched_paths, unmatched_freshness_unavailable) = classify_unmatched_affected_paths(
-        root,
-        records,
+        &classification_context,
         resolved_inputs,
-        freshness,
         &matched_record_flags,
         &graph_seeded_record_flags,
         &current_identity_by_record,

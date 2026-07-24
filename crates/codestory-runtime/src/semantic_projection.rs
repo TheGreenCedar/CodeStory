@@ -3307,7 +3307,7 @@ fn load_full_semantic_page_docs(
 ) -> Result<Option<HashMap<GraphNodeId, SymbolSearchDoc>>, ApiError> {
     let stored_docs = if context.document_source == SemanticProjectionDocumentSource::StoredCore {
         let docs = storage
-            .get_symbol_search_docs_for_node_ids(&semantic_node_ids)
+            .get_symbol_search_docs_for_node_ids(semantic_node_ids)
             .map_err(|error| {
                 ApiError::internal(format!("Failed to load pinned semantic documents: {error}"))
             })?;

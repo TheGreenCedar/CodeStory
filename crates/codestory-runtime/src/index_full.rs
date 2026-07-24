@@ -292,17 +292,30 @@ struct FullRefreshIndexingOutput {
     policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
 }
 
+struct FullRefreshIndexerContext<'a> {
+    root: &'a Path,
+    storage_path: &'a Path,
+    events_tx: &'a Sender<AppEventPayload>,
+    cancel_token: Option<&'a CancellationToken>,
+    source_index_policy: &'a SourceIndexPolicy,
+    execution_plan: &'a RefreshExecutionPlan,
+    live_state: &'a FullIndexLiveState,
+}
+
 fn run_full_refresh_indexer(
-    root: &Path,
-    storage_path: &Path,
-    events_tx: &Sender<AppEventPayload>,
-    cancel_token: Option<&CancellationToken>,
-    source_index_policy: &SourceIndexPolicy,
-    execution_plan: &RefreshExecutionPlan,
+    context: FullRefreshIndexerContext<'_>,
     mut policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
-    live_state: &FullIndexLiveState,
     wall_durations: &mut FullRefreshWallDurations,
 ) -> Result<FullRefreshIndexingOutput, ApiError> {
+    let FullRefreshIndexerContext {
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        source_index_policy,
+        execution_plan,
+        live_state,
+    } = context;
     let stage_started = Instant::now();
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
@@ -412,14 +425,16 @@ fn prepare_full_refresh(
         full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
     wall_durations.source_discovery = discovery_started.elapsed();
     let output = run_full_refresh_indexer(
-        root,
-        storage_path,
-        events_tx,
-        cancel_token,
-        source_index_policy,
-        &execution_plan,
+        FullRefreshIndexerContext {
+            root,
+            storage_path,
+            events_tx,
+            cancel_token,
+            source_index_policy,
+            execution_plan: &execution_plan,
+            live_state: &live_state,
+        },
         policy_exclusions,
-        &live_state,
         &mut wall_durations,
     )?;
     let mut preparation = StagedPreparation::new(output.staged);
@@ -511,14 +526,14 @@ pub(super) fn index_full_for_runtime(
         Ok(state) => state,
         Err(error) => {
             let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
+            discard_unpublished_search_generation(storage_path, publication);
             return Err(error);
         }
     };
     if is_indexing_cancelled(cancel_token) {
         drop(prepared_search_state);
         let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
+        discard_unpublished_search_generation(storage_path, publication);
         return Err(indexing_cancelled_error());
     }
     wall_durations.search_generation = wall_stage_started.elapsed();

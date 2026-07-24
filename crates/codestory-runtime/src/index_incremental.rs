@@ -343,16 +343,27 @@ fn plan_incremental_semantics(
     })
 }
 
+struct IncrementalIndexerContext<'a> {
+    root: &'a Path,
+    events_tx: &'a Sender<AppEventPayload>,
+    cancel_token: Option<&'a CancellationToken>,
+    source_index_policy: &'a SourceIndexPolicy,
+    execution_plan: &'a RefreshExecutionPlan,
+}
+
 fn run_incremental_indexer(
     staged: &mut StagedSnapshot,
-    root: &Path,
-    events_tx: &Sender<AppEventPayload>,
-    cancel_token: Option<&CancellationToken>,
-    source_index_policy: &SourceIndexPolicy,
-    execution_plan: &RefreshExecutionPlan,
+    context: IncrementalIndexerContext<'_>,
     semantic_plan: &mut IncrementalSemanticPlan,
     policy_exclusions: &mut Vec<OversizedSourceExclusionCandidate>,
 ) -> Result<IncrementalIndexingStats, ApiError> {
+    let IncrementalIndexerContext {
+        root,
+        events_tx,
+        cancel_token,
+        source_index_policy,
+        execution_plan,
+    } = context;
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
         file_count: total_files,
@@ -557,11 +568,13 @@ fn prepare_incremental_refresh(
         plan_incremental_semantics(preparation.staged_mut(), root, &execution_plan)?;
     let stats = run_incremental_indexer(
         preparation.staged_mut(),
-        root,
-        events_tx,
-        cancel_token,
-        source_index_policy,
-        &execution_plan,
+        IncrementalIndexerContext {
+            root,
+            events_tx,
+            cancel_token,
+            source_index_policy,
+            execution_plan: &execution_plan,
+        },
         &mut semantic_plan,
         &mut policy_exclusions,
     )?;
