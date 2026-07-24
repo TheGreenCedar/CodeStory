@@ -471,7 +471,8 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::*;
+    use super::stage_windows_runtime_file;
+    use std::fs;
 
     #[test]
     fn replaces_a_source_hard_link_with_an_independent_runtime_copy() {
@@ -491,8 +492,14 @@ mod windows_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
+    use super::{
+        acquire_profile_staging_lock, prepare_real_hard_link, publish_all,
+        stage_linux_shared_libraries,
+    };
+    use std::fs;
+    use std::io;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
 
     #[test]
     fn replaces_dangling_links_in_every_cargo_runtime_directory() {

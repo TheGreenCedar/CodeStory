@@ -1,83 +1,29 @@
-"""Self Test for packaged CodeStory proof."""
+"""MCP installation and readiness self-tests."""
 
 from __future__ import annotations
 
 import json
 
 from .foundation import ProofFailure, REPOSITORY_ROOT, require
-from .contracts import (
-    assert_retained_json_privacy,
-    canonical_sha256,
-    load_holdout_task_contracts,
-    require_sha256,
-    selected_qualification_matrix_cell,
-    sha256,
-    validate_runtime_claim_scope,
-    verify_package_server_contracts,
-    write_json,
-)
-from .archive import (
-    embedding_contract_digest,
-    expected_archive_digest,
-    find_cli,
-    load_native_manifest,
-    parse_server_proof_identity,
-    unpack_archive,
-    verify_runtime_against_manifest,
-)
-from .process import (
-    ExactProcessExitWaiter,
-    FailurePreservingTemporaryDirectory,
-    McpProcess,
-    engine_identity,
-    extract_resource,
-    live_process_executable_sha256,
-    native_server_exit_wait_budget,
-    native_server_exit_wait_required,
-    parse_byte_quantity,
-    process_start_identity,
-    remaining_native_server_exit_wait_ms,
-    require_native_process_start_identity,
-    retained_final_native_server_exit_evidence,
-    run,
-    server_snapshot,
-    shared_server_identity,
-    verified_live_executable,
-)
-from .installation import (
-    run_parallel,
-)
-from .runtime import (
-    publication_identity_from_status,
-    verify_fault_recovery_consistency_raw_evidence,
-    verify_publication_fault_raw_evidence,
-    verify_retrieval_quality_raw_evidence,
-)
-from .qualification import (
-    derive_scenario_assertions,
-    require_candidate_matrix_installation_source,
-    verify_retained_qualification,
-)
-from .calibration import (
-    assemble_calibration_bundle,
-    build_calibration_self_test_bundle,
-    verify_calibration_bundle,
-)
+from .process import McpProcess
 
-def run_installation_self_tests() -> None:
-    class ScriptedMcpProcess(McpProcess):
-        def __init__(self, responses: list[dict]):
-            self.timeout = 1
-            self.responses = iter(responses)
-            self.calls: list[tuple[str, dict, str]] = []
-            self.tool_attempt_counts: dict[str, int] = {}
 
-        def tool(self, name: str, arguments: dict, request_id: str) -> dict:
-            self.calls.append((name, arguments, request_id))
-            try:
-                return next(self.responses)
-            except StopIteration as exc:
-                raise ProofFailure("scripted MCP response sequence was exhausted") from exc
+class ScriptedMcpProcess(McpProcess):
+    def __init__(self, responses: list[dict]):
+        self.timeout = 1
+        self.responses = iter(responses)
+        self.calls: list[tuple[str, dict, str]] = []
+        self.tool_attempt_counts: dict[str, int] = {}
+
+    def tool(self, name: str, arguments: dict, request_id: str) -> dict:
+        self.calls.append((name, arguments, request_id))
+        try:
+            return next(self.responses)
+        except StopIteration as exc:
+            raise ProofFailure("scripted MCP response sequence was exhausted") from exc
+
+
+def _ready_retrieval_fixture() -> dict:
 
     projection_fixture_path = (
         REPOSITORY_ROOT
@@ -98,7 +44,10 @@ def run_installation_self_tests() -> None:
         f"installed search projection fixture is missing projected retrieval: {projection_fixture!r}",
     )
 
-    query = "scripted-search"
+    return ready_retrieval
+
+
+def _readiness_convergence_test(query: str, ready_retrieval: dict) -> None:
     preparing = {
         "result": {
             "isError": True,
@@ -127,18 +76,22 @@ def run_installation_self_tests() -> None:
         "preparing search attempt count was not retained",
     )
 
-    unavailable = ScriptedMcpProcess([
-        {
-            "result": {
-                "isError": True,
-                "structuredContent": {
-                    "code": "codestory_unavailable",
-                    "state": "unavailable",
-                    "message": "hostile terminal response",
-                },
+
+def _terminal_unavailable_test(query: str) -> None:
+    unavailable = ScriptedMcpProcess(
+        [
+            {
+                "result": {
+                    "isError": True,
+                    "structuredContent": {
+                        "code": "codestory_unavailable",
+                        "state": "unavailable",
+                        "message": "hostile terminal response",
+                    },
+                }
             }
-        }
-    ])
+        ]
+    )
     try:
         unavailable.search_until_ready({"query": query}, "self-test-unavailable")
     except ProofFailure as exc:
@@ -150,6 +103,8 @@ def run_installation_self_tests() -> None:
         raise ProofFailure("terminal MCP unavailable response was retried or accepted")
     require(len(unavailable.calls) == 1, "terminal MCP unavailable response was retried")
 
+
+def _hostile_result_tests(query: str, ready_retrieval: dict) -> None:
     hostile_search_results = [
         (
             "legacy mode=full",
@@ -186,3 +141,11 @@ def run_installation_self_tests() -> None:
         else:
             raise ProofFailure(f"{label} search result was accepted")
         require(len(hostile.calls) == 1, f"{label} search result was retried")
+
+
+def run_installation_self_tests() -> None:
+    query = "scripted-search"
+    ready_retrieval = _ready_retrieval_fixture()
+    _readiness_convergence_test(query, ready_retrieval)
+    _terminal_unavailable_test(query)
+    _hostile_result_tests(query, ready_retrieval)
