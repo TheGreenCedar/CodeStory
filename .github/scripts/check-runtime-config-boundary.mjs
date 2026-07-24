@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const roots = [
   "crates/codestory-cli/src",
@@ -26,43 +27,71 @@ function isOutOfLineTestSource(file) {
   const components = file.split(path.sep);
   const sourceIndex = components.lastIndexOf("src");
   if (sourceIndex < 0) return false;
-  return components
-    .slice(sourceIndex + 1)
-    .some((component) => component === "tests" || component === "tests.rs");
+  const sourceRelative = components.slice(sourceIndex + 1);
+  const testIndex = sourceRelative.findIndex(
+    (component) => component === "tests" || component === "tests.rs",
+  );
+  if (testIndex < 0) return false;
+
+  const sourceRoot = components.slice(0, sourceIndex + 1).join(path.sep);
+  const modulePath = sourceRelative.slice(0, testIndex);
+  const owners = modulePath.length
+    ? [
+        path.join(sourceRoot, ...modulePath) + ".rs",
+        path.join(sourceRoot, ...modulePath, "mod.rs"),
+      ]
+    : fs
+        .readdirSync(sourceRoot, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".rs") && entry.name !== "tests.rs")
+        .map((entry) => path.join(sourceRoot, entry.name));
+  const guardedTestModule = /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*;/u;
+  return owners.some(
+    (owner) => fs.existsSync(owner) && guardedTestModule.test(fs.readFileSync(owner, "utf8")),
+  );
 }
 
-const violations = [];
-for (const file of roots.flatMap(rustFiles)) {
-  if (isOutOfLineTestSource(file)) continue;
-  const source = fs.readFileSync(file, "utf8");
-  const production = source.split(/\r?\n#\[cfg\(test\)\]\r?\nmod tests\s*\{/u, 1)[0];
-  for (const token of forbidden) {
-    if (production.includes(token)) violations.push(`${file}: ${token}`);
+function main() {
+  const violations = [];
+  for (const file of roots.flatMap(rustFiles)) {
+    if (isOutOfLineTestSource(file)) continue;
+    const source = fs.readFileSync(file, "utf8");
+    const production = source.split(/\r?\n#\[cfg\(test\)\]\r?\nmod tests\s*\{/u, 1)[0];
+    for (const token of forbidden) {
+      if (production.includes(token)) violations.push(`${file}: ${token}`);
+    }
   }
-}
 
-for (const file of [
-  "crates/codestory-cli/src/runtime.rs",
-  "crates/codestory-cli/src/stdio_transport.rs",
-]) {
-  const source = fs.readFileSync(file, "utf8");
-  for (const token of lateStartupReads) {
-    if (source.includes(token)) violations.push(`${file}: late startup read ${token}`);
+  for (const file of [
+    "crates/codestory-cli/src/runtime.rs",
+    "crates/codestory-cli/src/stdio_transport.rs",
+  ]) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const token of lateStartupReads) {
+      if (source.includes(token)) violations.push(`${file}: late startup read ${token}`);
+    }
   }
-}
 
-const runtimeSource = fs.readFileSync("crates/codestory-cli/src/runtime.rs", "utf8");
-const runtimeSelection = runtimeSource
-  .split("fn new_with_startup", 2)[1]
-  ?.split("/// Open project", 1)[0];
-for (const token of ["user_cache_root()", "for_project_auto_with_defaults("]) {
-  if (runtimeSelection?.includes(token)) {
-    violations.push(`crates/codestory-cli/src/runtime.rs: project selection ${token}`);
+  const runtimeSource = fs.readFileSync("crates/codestory-cli/src/runtime.rs", "utf8");
+  const runtimeSelection = runtimeSource
+    .split("fn new_with_startup", 2)[1]
+    ?.split("/// Open project", 1)[0];
+  for (const token of ["user_cache_root()", "for_project_auto_with_defaults("]) {
+    if (runtimeSelection?.includes(token)) {
+      violations.push(`crates/codestory-cli/src/runtime.rs: project selection ${token}`);
+    }
   }
+
+  if (violations.length) {
+    console.error(
+      "Production runtime configuration must remain immutable:\n" + violations.join("\n"),
+    );
+    process.exit(1);
+  }
+  console.log("runtime config boundary ok");
 }
 
-if (violations.length) {
-  console.error("Production runtime configuration must remain immutable:\n" + violations.join("\n"));
-  process.exit(1);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
 }
-console.log("runtime config boundary ok");
+
+export { isOutOfLineTestSource };

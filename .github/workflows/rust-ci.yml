@@ -7,6 +7,7 @@ on:
       - Cargo.toml
       - crates/**
       - .github/scripts/check-runtime-config-boundary.mjs
+      - .github/scripts/check-runtime-config-boundary.test.mjs
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/route-ci-proof.mjs
@@ -66,7 +67,9 @@ jobs:
         run: cargo fmt --check
 
       - name: Check immutable runtime configuration boundary
-        run: node .github/scripts/check-runtime-config-boundary.mjs
+        run: |
+          node --test .github/scripts/check-runtime-config-boundary.test.mjs
+          node .github/scripts/check-runtime-config-boundary.mjs
 
       - name: Check the workspace
         run: cargo check --workspace --locked

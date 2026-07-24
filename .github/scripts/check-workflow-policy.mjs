@@ -237,6 +237,7 @@ const draftWorkflowPaths = [
   "Cargo.toml",
   "crates/**",
   ".github/scripts/check-runtime-config-boundary.mjs",
+  ".github/scripts/check-runtime-config-boundary.test.mjs",
   ".github/scripts/install-linux-vulkan-build-deps.sh",
   ".github/scripts/check-workflow-policy.mjs",
   ".github/scripts/route-ci-proof.mjs",
@@ -351,6 +352,7 @@ const draftRunCommands = new Map([
   ]],
   ["Check formatting", ["cargo fmt --check"]],
   ["Check immutable runtime configuration boundary", [
+    "node --test .github/scripts/check-runtime-config-boundary.test.mjs",
     "node .github/scripts/check-runtime-config-boundary.mjs",
   ]],
   ["Check the workspace", ["cargo check --workspace --locked"]],
