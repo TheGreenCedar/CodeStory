@@ -12,6 +12,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [build-dependencies]
+fs4 = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
@@ -26,6 +27,9 @@ llama-cpp-2 = { workspace = true, features = ["dynamic-backends", "vulkan"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))'.dependencies]
 llama-cpp-2 = { workspace = true }

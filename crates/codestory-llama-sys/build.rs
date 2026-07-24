@@ -2,7 +2,7 @@ mod model_staging;
 mod native_staging;
 
 use model_staging::{ExpectedModel, stage_model, verify_model};
-use native_staging::{stage_linux_shared_libraries, stage_windows_runtime_file};
+use native_staging::{stage_linux_shared_libraries, stage_windows_runtime_files};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -437,14 +437,20 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
     }
     runtime_files.sort_by_key(|entry| entry.0.to_lowercase());
     if target_os == "windows" {
-        for (name, source, _) in &runtime_files {
-            stage_windows_runtime_file(source, &profile_dir.join(name)).unwrap_or_else(|error| {
-                panic!(
-                    "failed to stage native runtime artifact {}: {error}",
-                    source.display()
-                )
-            });
-        }
+        let destinations = runtime_files
+            .iter()
+            .map(|(name, source, _)| (source.as_path(), profile_dir.join(name)))
+            .collect::<Vec<_>>();
+        let entries = destinations
+            .iter()
+            .map(|(source, destination)| (*source, destination.as_path()))
+            .collect::<Vec<_>>();
+        stage_windows_runtime_files(&entries).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage native runtime artifacts from {}: {error}",
+                native_out.display()
+            )
+        });
     } else {
         let runtime_sources = runtime_files
             .iter()
