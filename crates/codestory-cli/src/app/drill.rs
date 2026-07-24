@@ -32,11 +32,10 @@ use crate::{
     runtime::{self, RuntimeContext, map_api_error, refresh_label},
 };
 
+use super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use super::{
-    OpenedAgentSurface,
     artifacts::ensure_dot_only_for_trail,
-    drill_read_only_jobs, elapsed_ms, from_api_repo_text_mode, open_agent_surface,
-    packet_sufficiency_label,
+    drill_read_only_jobs, elapsed_ms, from_api_repo_text_mode, packet_sufficiency_label,
     rendering::{
         RepoTextOutputConfig, SearchOutputParts, build_search_output,
         collect_search_hit_occurrences, dedupe_verification_targets,

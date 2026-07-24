@@ -9,7 +9,7 @@ use crate::{
     http_transport, stdio_transport,
 };
 
-use super::new_agent_surface_runtime;
+use super::lifecycle::new_agent_surface_runtime;
 
 pub(super) async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if !cmd.stdio {

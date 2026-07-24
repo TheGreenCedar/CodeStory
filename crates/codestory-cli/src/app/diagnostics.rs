@@ -12,7 +12,7 @@ use crate::{
     runtime::RuntimeContext,
 };
 
-use super::doctor_sidecar_status_is_live_ready;
+use super::readiness_commands::doctor_sidecar_status_is_live_ready;
 #[cfg(test)]
 use super::resolution::quote_command_path;
 
