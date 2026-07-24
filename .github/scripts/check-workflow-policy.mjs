@@ -11,6 +11,9 @@ const retrievalFile = "retrieval-engine-smoke.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
+const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
+const sccacheVersion = "v0.16.0";
+const sccacheCacheSize = "1G";
 
 export { retrievalFile };
 
@@ -137,22 +140,28 @@ function requireExactResolverContract(violations, file, job, expectedDigest) {
   );
 }
 
-function requireUniqueCacheSaveLast(violations, file, job, cacheName, finalStepDescription) {
-  const steps = list(job?.steps).map(object);
-  const saves = steps.filter(
-    step => typeof step.uses === "string"
-      && step.uses.toLowerCase().startsWith("actions/cache/save@"),
-  );
-  add(
-    violations,
-    saves.length === 1,
-    `${file} ${cacheName} must contain exactly one actions/cache/save action`,
-  );
-  add(
-    violations,
-    saves.length === 1 && steps.at(-1) === saves[0],
-    `${file} ${cacheName} unique cache save must run after every ${finalStepDescription}`,
-  );
+function stepIndex(job, name) {
+  return list(job?.steps).map(object).findIndex(step => step.name === name);
+}
+
+function cacheSteps(job) {
+  return list(job?.steps)
+    .map(object)
+    .filter(step => typeof step.uses === "string"
+      && /^actions\/cache\/(?:restore|save)@/iu.test(step.uses));
+}
+
+function cachePaths(step) {
+  return String(object(step?.with).path ?? "")
+    .split(/\r?\n/u)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function cachePathsExcludeExactOutputs(job) {
+  const forbidden = /(^|[/\\])target($|[/\\])|release-dist|native-seeds|embedded-model|notarization|qualification|proof|\.tar\.gz$|\.zip$|sha256/iu;
+  return cacheSteps(job).every(step =>
+    cachePaths(step).every(cachePath => !forbidden.test(cachePath)));
 }
 
 function requireStepUses(violations, file, job, name, expected) {
@@ -217,7 +226,7 @@ const draftCachePaths = [
   "target",
 ];
 const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
-const platformResolverContractDigest = "331ee01b021f17d3221c7bc482d256ba36314116284a6bc22a2df87bd7487843";
+const platformResolverContractDigest = "12f5e887eb236625eec5e9718edd305ba625ab06f9a1467ed1146a8a80db0f74";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -1135,6 +1144,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "plugins/codestory/**",
       ".github/scripts/check-workflow-policy.mjs",
       ".github/scripts/check-workflow-policy.test.mjs",
+      ".github/scripts/cargo-cache-contract.mjs",
+      ".github/scripts/cargo-cache-contract.test.mjs",
       ".github/scripts/install-codestory-marketplace-proof.mjs",
       ".github/scripts/install-codestory-marketplace-proof.test.mjs",
       ".github/scripts/fixtures/workflow-policy-invalid.json",
@@ -1184,6 +1195,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     requireStepRun(violations, pluginFile, job, "Check workflow policy", [
       "node .github/scripts/check-workflow-policy.mjs",
       "node --test .github/scripts/check-workflow-policy.test.mjs",
+      "node --test .github/scripts/cargo-cache-contract.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
@@ -1285,35 +1297,162 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
-    const restore = namedStep(full, "Restore Cargo inputs and output");
-    const restoreWith = object(restore?.with);
-    const expectedSourceKey = [
-      "${{ runner.os }}-",
-      promotion.source_cache_namespace,
-      "-${{ needs.resolve.outputs.ref }}-${{ steps.rust-cache-key.outputs.version }}-",
-      "${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}",
-    ].join("");
     add(
       violations,
-      restore?.uses === "actions/cache/restore@v5"
-        && restore?.["continue-on-error"] === true
-        && restoreWith.key === expectedSourceKey,
-      `${sourceFile} source cache must use the versioned exact-SHA namespace`,
+      object(source.env).SCCACHE_VERSION === sccacheVersion
+        && object(source.env).SCCACHE_CACHE_SIZE === sccacheCacheSize
+        && object(source.env).CARGO_DEPENDENCY_CACHE_MAX_BYTES === "1073741824",
+      `${sourceFile} must pin bounded compiler and dependency caches`,
+    );
+    const sccacheSetup = namedStep(full, "Install pinned sccache");
+    add(
+      violations,
+      sccacheSetup?.uses === sccacheAction
+        && object(sccacheSetup?.with).version === "${{ env.SCCACHE_VERSION }}",
+      `${sourceFile} must install the pinned sccache action and binary`,
+    );
+    requireStepRun(violations, sourceFile, full, "Configure bounded compiler cache", [
+      "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo",
+      "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache",
+      "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
+      "RUSTC_WRAPPER=sccache",
+      "CARGO_INCREMENTAL=0",
+      "CMAKE_C_COMPILER_LAUNCHER=sccache",
+      "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
+    ]);
+    const identity = namedStep(full, "Capture reusable build cache contract");
+    const identityRun = executableRunText(String(identity?.run ?? ""));
+    add(
+      violations,
+      identity?.id === "build-cache"
+        && identity?.shell === "bash"
+        && identityRun.includes(`--namespace ${promotion.source_cache_namespace}`)
+        && identityRun.includes('--exact-sha "$EXACT_SHA"')
+        && identityRun.includes('--os "$RUNNER_OS"')
+        && identityRun.includes('--target "$target"')
+        && identityRun.includes('--rust-version "$rust_version"')
+        && identityRun.includes("--features workspace-test-default-and-clippy-all-targets-all-features")
+        && identityRun.includes('--native-toolchain "$native_toolchain"')
+        && identityRun.includes("--generator unix-makefiles")
+        && identityRun.includes('--cmake-version "$cmake_version"')
+        && identityRun.includes('--ninja-version "$ninja_version"')
+        && identityRun.includes("--lock-file Cargo.lock")
+        && identityRun.includes("--cargo-config .cargo/config.toml")
+        && identityRun.includes("--sccache-version \"$SCCACHE_VERSION\"")
+        && identityRun.includes(".cargo/llama-dynamic-backends.cmake")
+        && identityRun.includes("git ls-files '*Cargo.toml'")
+        && identityRun.includes("model-contract.json")
+        && identityRun.includes("--identity cargo_incremental=0"),
+      `${sourceFile} must compute one reusable compiler compatibility contract`,
+    );
+    const dependencyRestore = namedStep(full, "Restore Cargo dependency inputs");
+    const dependencyRestoreWith = object(dependencyRestore?.with);
+    add(
+      violations,
+      dependencyRestore?.uses === "actions/cache/restore@v5"
+        && dependencyRestore?.["continue-on-error"] === true
+        && sameMembers(cachePaths(dependencyRestore), [
+          "${{ runner.temp }}/codestory-source-cargo/registry",
+          "${{ runner.temp }}/codestory-source-cargo/git",
+        ])
+        && dependencyRestoreWith.key === "${{ steps.build-cache.outputs.dependency-key }}"
+        && dependencyRestoreWith["restore-keys"] === undefined,
+      `${sourceFile} dependency cache must be exact-input-only and exclude compiler output`,
+    );
+    const compilerRestore = namedStep(full, "Restore compatible compiler objects");
+    const compilerRestoreWith = object(compilerRestore?.with);
+    add(
+      violations,
+      compilerRestore?.uses === "actions/cache/restore@v5"
+        && compilerRestore?.["continue-on-error"] === true
+        && sameMembers(cachePaths(compilerRestore), ["${{ runner.temp }}/codestory-source-sccache"])
+        && compilerRestoreWith.key === "${{ steps.build-cache.outputs.compiler-key }}"
+        && String(compilerRestoreWith["restore-keys"] ?? "").trim()
+          === "${{ steps.build-cache.outputs.compiler-prefix }}",
+      `${sourceFile} compiler cache must restore the newest compatible prior candidate`,
+    );
+    const dependencySave = namedStep(full, "Save Cargo dependency inputs");
+    const compilerSave = namedStep(full, "Save compiler objects after compilation");
+    requireStepRun(violations, sourceFile, full, "Bound Cargo dependency cache", [
+      "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
+      "--path \"$CARGO_HOME/registry\"",
+      "--path \"$CARGO_HOME/git\"",
+    ]);
+    add(
+      violations,
+      dependencySave?.uses === "actions/cache/save@v5"
+        && String(dependencySave?.if ?? "").includes("always()")
+        && String(dependencySave?.if ?? "").includes("steps.compile-workspace.outcome == 'success'")
+        && String(dependencySave?.if ?? "")
+          .includes("steps.cargo-dependency-cache-size.outputs.within-limit == 'true'")
+        && object(dependencySave?.with).key
+          === "${{ steps.cargo-dependency-cache.outputs.cache-primary-key }}"
+        && sameMembers(cachePaths(dependencySave), [
+          "${{ runner.temp }}/codestory-source-cargo/registry",
+          "${{ runner.temp }}/codestory-source-cargo/git",
+        ]),
+      `${sourceFile} dependency cache must save immediately after successful compilation`,
     );
     add(
       violations,
-      restoreWith["restore-keys"] === undefined,
-      `${sourceFile} source cache must not use fallback restore keys`,
+      compilerSave?.uses === "actions/cache/save@v5"
+        && String(compilerSave?.if ?? "").includes("always()")
+        && String(compilerSave?.if ?? "").includes("steps.compile-workspace.outcome == 'success'")
+        && object(compilerSave?.with).key
+          === "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}"
+        && sameMembers(cachePaths(compilerSave), ["${{ runner.temp }}/codestory-source-sccache"]),
+      `${sourceFile} compiler cache must save a new exact-SHA suffix after successful compilation`,
     );
-    const save = namedStep(full, "Save Cargo inputs and output");
     add(
       violations,
-      save?.uses === "actions/cache/save@v5"
-        && save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
-        && object(save?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
-      `${sourceFile} source cache must save only a successful exact miss`,
+      cachePathsExcludeExactOutputs(full),
+      `${sourceFile} cache paths must exclude Cargo target and exact proof outputs`,
     );
-    requireUniqueCacheSaveLast(violations, sourceFile, full, "source cache", "proof step");
+    const compilerSaveIndex = stepIndex(full, "Save compiler objects after compilation");
+    add(
+      violations,
+      compilerSaveIndex > stepIndex(full, "Lint every workspace target and feature once")
+        && stepIndex(full, "Stop compilation clock")
+          > stepIndex(full, "Lint every workspace target and feature once")
+        && stepIndex(full, "Stop compilation clock") < compilerSaveIndex
+        && stepIndex(full, "Start compiler cache save clock")
+          > stepIndex(full, "Save Cargo dependency inputs")
+        && stepIndex(full, "Start compiler cache save clock") < compilerSaveIndex
+        && compilerSaveIndex < stepIndex(full, "Test the complete workspace once")
+        && compilerSaveIndex < stepIndex(full, "Emit authenticated source release cell"),
+      `${sourceFile} compiler cache must save before test execution or release-cell failure`,
+    );
+    requireStepRun(violations, sourceFile, full, "Compile the complete workspace test suite", [
+      "cargo test --workspace --locked --no-run",
+    ]);
+    requireStepRun(violations, sourceFile, full, "Report compiler cache restore", [
+      "--requested-key",
+      "--matched-key",
+      "--compatibility-prefix",
+      "--cache-hit",
+      "--path \"$SCCACHE_DIR\"",
+    ]);
+    requireStepRun(violations, sourceFile, full, "Report compiler cache save", [
+      "--restored-bytes",
+      "--started-ms",
+      "--ended-ms",
+      "--save-started-ms",
+      "--save-result",
+      "--path \"$SCCACHE_DIR\"",
+    ]);
+    requireStepRun(violations, sourceFile, full, "Require successful source compilation", [
+      'test "$COMPILE_OUTCOME" = success',
+      'test "$LINT_OUTCOME" = success',
+    ]);
+    const compile = namedStep(full, "Compile the complete workspace test suite");
+    const lint = namedStep(full, "Lint every workspace target and feature once");
+    add(
+      violations,
+      compile?.["continue-on-error"] === true
+        && lint?.["continue-on-error"] === true
+        && lint?.if === "steps.compile-workspace.outcome == 'success'",
+      `${sourceFile} compilation and lint must preserve cache state before reporting failure`,
+    );
     requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
     requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
@@ -1460,6 +1599,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
   add(violations, object(packaged.with).emit_release_cells === true, `${releaseFile} packaged-proof must emit all package release cells`);
+  add(
+    violations,
+    object(packaged.with).hermetic_linux === false,
+    `${releaseFile} main release must not repeat frozen-candidate Linux qualification`,
+  );
   add(
     violations,
     object(packaged.with).scope === "full",
@@ -1774,53 +1918,46 @@ function validatePackagedProof(workflows, violations, graph) {
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
   const packageSteps = list(job.steps).map(object);
-  const nativeIdentitySteps = packageSteps.filter(step => step.name === "Capture Rust cache key");
-  const nativeIdentity = nativeIdentitySteps[0];
-  const nativeIdentityRun = executableRunText(String(nativeIdentity?.run ?? ""));
   add(
     violations,
-    nativeIdentitySteps.length === 1
-      && hasExactKeys(nativeIdentity, ["name", "id", "shell", "run"])
-      && nativeIdentity?.id === "rust-cache-key"
-      && nativeIdentity?.shell === "bash",
-    `${file} native build identity must be unique, unconditional, and keep its exact Bash output boundary`,
+    object(workflow.env).SCCACHE_VERSION === sccacheVersion
+      && object(workflow.env).SCCACHE_CACHE_SIZE === sccacheCacheSize
+      && object(workflow.env).CARGO_DEPENDENCY_CACHE_MAX_BYTES === "1073741824",
+    `${file} must pin bounded compiler and dependency caches`,
   );
-  for (const fragment of [
-    'cmake=$(cmake --version',
-    'if [ "$RUNNER_OS" = Windows ]',
-    'generator=ninja',
-    'ninja=$(ninja --version)',
-    'CMAKE_GENERATOR=Ninja',
-    'generator=platform-default',
-    'ninja=not-applicable',
-  ]) {
-    add(
-      violations,
-      nativeIdentityRun.includes(fragment),
-      `${file} native build identity must include ${fragment}`,
-    );
-  }
-  const packageRestore = namedStep(job, "Restore Cargo registry, git sources, and build output");
+  const hermeticInput = object(at(workflow, "on", "workflow_call", "inputs", "hermetic_linux"));
+  add(
+    violations,
+    hermeticInput.required === false
+      && hermeticInput.default === false
+      && hermeticInput.type === "boolean",
+    `${file} frozen Linux qualification must be explicit and off by default`,
+  );
   const shortWindowsTarget = namedStep(job, "Configure short Windows Cargo target");
-  const installRustIndex = packageSteps.findIndex(step => step.name === "Install pinned Rust");
-  const nativeIdentityIndex = packageSteps.findIndex(step => step.name === "Capture Rust cache key");
-  const shortWindowsTargetIndex = packageSteps.findIndex(step => step.name === "Configure short Windows Cargo target");
-  const packageRestoreIndex = packageSteps.findIndex(step => step.name === "Restore Cargo registry, git sources, and build output");
-  const packageBuildIndex = packageSteps.findIndex(step => step.name === "Build codestory-cli");
-  const linuxBuildIndex = packageSteps.findIndex(step => step.name === "Build Linux x64 at the glibc 2.31 baseline");
+  const checkout = namedStep(job, "Checkout");
   add(
     violations,
-    nativeIdentityIndex === installRustIndex + 1
-      && shortWindowsTargetIndex === nativeIdentityIndex + 1
-      && packageRestoreIndex === shortWindowsTargetIndex + 1
-      && nativeIdentityIndex < packageBuildIndex
-      && nativeIdentityIndex < linuxBuildIndex,
-    `${file} native build identity must run immediately after Rust selection and before cache restore or any native build`,
+    checkout?.uses === "actions/checkout@v5"
+      && object(checkout?.with).ref === "${{ inputs.ref }}",
+    `${file} package jobs must checkout only the requested exact SHA`,
   );
+  requireStepRun(violations, file, job, "Require exact source identity", [
+    '[[ "$EXACT_SHA" =~ ^[0-9a-f]{40}$ ]]',
+    'head_sha="$(git rev-parse HEAD)"',
+    "source_tree=\"$(git rev-parse 'HEAD^{tree}')\"",
+    'test "$head_sha" = "$EXACT_SHA"',
+  ]);
   add(
     violations,
     shortWindowsTarget?.if === "runner.os == 'Windows'" && shortWindowsTarget?.shell === "pwsh",
     `${file} short Cargo target must be Windows-only PowerShell setup`,
+  );
+  const sccacheSetup = namedStep(job, "Install pinned sccache");
+  add(
+    violations,
+    sccacheSetup?.uses === sccacheAction
+      && object(sccacheSetup?.with).version === "${{ env.SCCACHE_VERSION }}",
+    `${file} must install the pinned sccache action and binary`,
   );
   requireStepRun(violations, file, job, "Configure short Windows Cargo target", [
     '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
@@ -1830,29 +1967,196 @@ function validatePackagedProof(workflows, violations, graph) {
     "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
     '"CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV',
   ]);
-  const expectedPackageKey = [
-    "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-",
-    "${{ matrix.rust_target }}-",
-    graph.workflow_policy.promotion.packaged_cache_namespace,
-    "-${{ inputs.ref }}-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-",
-    "ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-",
-    "${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}",
-  ].join("");
+  requireStepRun(violations, file, job, "Configure bounded compiler cache", [
+    "CARGO_HOME=$RUNNER_TEMP/codestory-release-cargo",
+    "SCCACHE_DIR=$RUNNER_TEMP/codestory-release-sccache",
+    "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
+    "RUSTC_WRAPPER=sccache",
+    "CARGO_INCREMENTAL=0",
+    "CMAKE_C_COMPILER_LAUNCHER=sccache",
+    "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
+    "CMAKE_GENERATOR=Ninja",
+  ]);
+  const nativeIdentity = namedStep(job, "Capture reusable build cache contract");
+  const nativeIdentityRun = executableRunText(String(nativeIdentity?.run ?? ""));
   add(
     violations,
-    object(packageRestore?.with).key === expectedPackageKey
-      && object(packageRestore?.with)["restore-keys"] === undefined,
-    `${file} native build cache must bind generator, CMake, Ninja, target, features, lock identity, and exact SHA/versioned namespace without fallbacks`,
+    nativeIdentity?.id === "build-cache"
+      && nativeIdentity?.shell === "bash"
+      && object(nativeIdentity?.env).CALIBRATION_MODE === "${{ inputs.calibration_mode }}"
+      && object(nativeIdentity?.env).QUALITY_EVIDENCE_ARTIFACT
+        === "${{ inputs.quality_evidence_artifact }}"
+      && nativeIdentityRun.includes(`--namespace ${graph.workflow_policy.promotion.packaged_cache_namespace}`)
+      && nativeIdentityRun.includes('--exact-sha "$EXACT_SHA"')
+      && nativeIdentityRun.includes('--os "$RUNNER_OS"')
+      && nativeIdentityRun.includes('--target "${{ matrix.rust_target }}"')
+      && nativeIdentityRun.includes('--rust-version "$rust_version"')
+      && nativeIdentityRun.includes("--features codestory-cli-default-features")
+      && nativeIdentityRun.includes("--native-toolchain")
+      && nativeIdentityRun.includes("--generator")
+      && nativeIdentityRun.includes("--cmake-version")
+      && nativeIdentityRun.includes("--ninja-version")
+      && nativeIdentityRun.includes("--sccache-version \"$SCCACHE_VERSION\"")
+      && nativeIdentityRun.includes("--lock-file Cargo.lock")
+      && nativeIdentityRun.includes("--cargo-config .cargo/config.toml")
+      && nativeIdentityRun.includes("--identity cargo_incremental=0")
+      && nativeIdentityRun.includes("qualification_driver=disabled")
+      && nativeIdentityRun.includes("qualification_driver=enabled")
+      && nativeIdentityRun.includes('--identity "qualification_driver=$qualification_driver"')
+      && nativeIdentityRun.includes(".cargo/llama-dynamic-backends.cmake")
+      && nativeIdentityRun.includes("git ls-files '*Cargo.toml'")
+      && nativeIdentityRun.includes("model-contract.json")
+      && nativeIdentityRun.includes("install-windows-vulkan-sdk.ps1")
+      && nativeIdentityRun.includes("linux-glibc-build.Dockerfile")
+      && nativeIdentityRun.includes(".github/docker/glslc")
+      && nativeIdentityRun.includes("--identity cxxflags=-std=c++17")
+      && nativeIdentityRun.includes("LINUX_GLIBC_BUILD_IMAGE")
+      && nativeIdentityRun.includes("LINUX_GLSLC_IMAGE"),
+    `${file} must compute one complete reusable compiler compatibility contract`,
   );
-  const packageSave = namedStep(job, "Save Cargo registry, git sources, and build output");
+  const dependencyRestore = namedStep(job, "Restore Cargo dependency inputs");
+  const dependencyRestoreWith = object(dependencyRestore?.with);
   add(
     violations,
-    packageSave?.uses === "actions/cache/save@v5"
-      && packageSave?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
-      && object(packageSave?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
-    `${file} native build cache must save only a successful exact miss`,
+    dependencyRestore?.uses === "actions/cache/restore@v5"
+      && sameMembers(cachePaths(dependencyRestore), [
+        "${{ runner.temp }}/codestory-release-cargo/registry",
+        "${{ runner.temp }}/codestory-release-cargo/git",
+      ])
+      && dependencyRestoreWith.key === "${{ steps.build-cache.outputs.dependency-key }}"
+      && dependencyRestoreWith["restore-keys"] === undefined,
+    `${file} dependency cache must be exact-input-only and exclude compiler output`,
   );
-  requireUniqueCacheSaveLast(violations, file, job, "native build cache", "proof and cleanup step");
+  const compilerRestore = namedStep(job, "Restore compatible compiler objects");
+  const compilerRestoreWith = object(compilerRestore?.with);
+  add(
+    violations,
+    compilerRestore?.uses === "actions/cache/restore@v5"
+      && sameMembers(cachePaths(compilerRestore), ["${{ runner.temp }}/codestory-release-sccache"])
+      && compilerRestoreWith.key === "${{ steps.build-cache.outputs.compiler-key }}"
+      && String(compilerRestoreWith["restore-keys"] ?? "").trim()
+        === "${{ steps.build-cache.outputs.compiler-prefix }}",
+    `${file} compiler cache must restore the newest compatible prior candidate`,
+  );
+  const dependencySave = namedStep(job, "Save Cargo dependency inputs");
+  const compilerSave = namedStep(job, "Save compiler objects after compilation");
+  requireStepRun(violations, file, job, "Bound Cargo dependency cache", [
+    "--max-bytes \"$CARGO_DEPENDENCY_CACHE_MAX_BYTES\"",
+    "--path \"$CARGO_HOME/registry\"",
+    "--path \"$CARGO_HOME/git\"",
+  ]);
+  add(
+    violations,
+    dependencySave?.uses === "actions/cache/save@v5"
+      && String(dependencySave?.if ?? "").includes("always()")
+      && String(dependencySave?.if ?? "").includes("steps.linux-build.outcome == 'success'")
+      && String(dependencySave?.if ?? "").includes("steps.package-build.outcome == 'success'")
+      && String(dependencySave?.if ?? "")
+        .includes("steps.cargo-dependency-cache-size.outputs.within-limit == 'true'")
+      && object(dependencySave?.with).key
+        === "${{ steps.cargo-dependency-cache.outputs.cache-primary-key }}"
+      && sameMembers(cachePaths(dependencySave), [
+        "${{ runner.temp }}/codestory-release-cargo/registry",
+        "${{ runner.temp }}/codestory-release-cargo/git",
+      ]),
+    `${file} dependency cache must save immediately after successful compilation`,
+  );
+  add(
+    violations,
+    compilerSave?.uses === "actions/cache/save@v5"
+      && String(compilerSave?.if ?? "").includes("always()")
+      && String(compilerSave?.if ?? "").includes("steps.linux-build.outcome == 'success'")
+      && String(compilerSave?.if ?? "").includes("steps.package-build.outcome == 'success'")
+      && object(compilerSave?.with).key
+        === "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}"
+      && sameMembers(cachePaths(compilerSave), ["${{ runner.temp }}/codestory-release-sccache"]),
+    `${file} compiler cache must save a new exact-SHA suffix after successful compilation`,
+  );
+  add(
+    violations,
+    cachePathsExcludeExactOutputs(job),
+    `${file} cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives`,
+  );
+  const compilerSaveIndex = stepIndex(job, "Save compiler objects after compilation");
+  for (const lateStep of [
+    "Prove native workspace path identity",
+    "Test immutable native staging on Windows",
+    "Sign and notarize macOS CLI",
+    "Package release asset",
+    "Package release asset on Windows",
+    "Smoke packaged release asset",
+    "Smoke packaged release asset on Windows",
+    "Upload release asset",
+  ]) {
+    add(
+      violations,
+      compilerSaveIndex >= 0 && compilerSaveIndex < stepIndex(job, lateStep),
+      `${file} compiler cache must save before late ${lateStep} failure`,
+    );
+  }
+  requireStepRun(violations, file, job, "Report compiler cache restore", [
+    "--requested-key",
+    "--matched-key",
+    "--compatibility-prefix",
+    "--cache-hit",
+    "--path \"$SCCACHE_DIR\"",
+  ]);
+  requireStepRun(violations, file, job, "Report compiler cache save", [
+    "--restored-bytes",
+    "--started-ms",
+    "--ended-ms",
+    "--save-started-ms",
+    "--save-result",
+    "--path \"$SCCACHE_DIR\"",
+  ]);
+  requireStepRun(violations, file, job, "Compile immutable native staging regression on Windows", [
+    "cargo test --release --locked",
+    "--test native_staging",
+    "--no-run",
+  ]);
+  requireStepRun(violations, file, job, "Compile native workspace path regression on Windows", [
+    "cargo test --locked -p codestory-workspace repository_identity --no-run",
+  ]);
+  requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
+    'mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"',
+    "RUSTC_WRAPPER=/sccache/sccache",
+    "SCCACHE_DIR=/sccache/cache",
+    "CMAKE_C_COMPILER_LAUNCHER=/sccache/sccache",
+    "CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache",
+    "$SCCACHE_PATH:/sccache/sccache:ro",
+    "$SCCACHE_DIR:/sccache/cache",
+    "/sccache/sccache --stop-server",
+  ]);
+  const finalizeCompilerObjects = namedStep(job, "Finalize compiler objects");
+  add(
+    violations,
+    String(finalizeCompilerObjects?.if ?? "")
+      .includes("steps.linux-build.outcome == 'success'")
+      && String(finalizeCompilerObjects?.if ?? "")
+        .includes("steps.qualification-driver.outcome != 'skipped'")
+      && String(finalizeCompilerObjects?.if ?? "")
+        .includes("steps.package-build.outcome == 'success'"),
+    `${file} must stop the compiler server that performed each selected build`,
+  );
+  add(
+    violations,
+    compilerSaveIndex > stepIndex(job, "Build codestory-cli")
+      && compilerSaveIndex > stepIndex(job, "Build Linux x64 at the glibc 2.31 baseline")
+      && compilerSaveIndex > stepIndex(job, "Build qualification driver"),
+    `${file} compiler cache must save after every selected compilation step`,
+  );
+  add(
+    violations,
+    stepIndex(job, "Build pinned Linux toolchain image")
+      < stepIndex(job, "Start compilation clock")
+      && stepIndex(job, "Stop compilation clock")
+        > stepIndex(job, "Build qualification driver")
+      && stepIndex(job, "Stop compilation clock") < compilerSaveIndex
+      && stepIndex(job, "Start compiler cache save clock")
+        > stepIndex(job, "Save Cargo dependency inputs")
+      && stepIndex(job, "Start compiler cache save clock") < compilerSaveIndex,
+    `${file} compile and compiler-cache-save timings must cover only their named stages`,
+  );
   const linuxBuildDockerfile = fs.readFileSync(
     path.join(repositoryRoot, ".github", "docker", "linux-glibc-build.Dockerfile"),
     "utf8",
@@ -1906,17 +2210,66 @@ function validatePackagedProof(workflows, violations, graph) {
     '--target "${{ matrix.rust_target }}"',
     "stages_complete_immutable_native_seeds",
   ]);
-  requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
+  requireStepRun(violations, file, job, "Build pinned Linux toolchain image", [
     ".github/docker/linux-glibc-build.Dockerfile",
+    "LINUX_GLIBC_BUILD_IMAGE",
+    "LINUX_GLSLC_IMAGE",
+  ]);
+  requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
     "cargo build --release --locked -p codestory-cli",
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     "CXXFLAGS=-std=c++17",
   ]);
+  for (const smokeStep of [
+    "Smoke packaged release asset",
+    "Smoke packaged release asset on Windows",
+  ]) {
+    requireStepRun(violations, file, job, smokeStep, [
+      '--expected-source-sha "${{ steps.source-identity.outputs.sha }}"',
+      '--expected-source-tree "${{ steps.source-identity.outputs.tree }}"',
+    ]);
+  }
+  requireStepRun(violations, file, job, "Report fresh package identity", [
+    "archive_sha256=",
+    "Source SHA:",
+    "Source tree:",
+    "Archive SHA-256:",
+  ]);
+  add(
+    violations,
+    stepIndex(job, "Report fresh package identity")
+      > stepIndex(job, "Smoke packaged release asset")
+      && stepIndex(job, "Report fresh package identity")
+        > stepIndex(job, "Smoke packaged release asset on Windows")
+      && stepIndex(job, "Report fresh package identity")
+        < stepIndex(job, "Upload release asset"),
+    `${file} must report a verified fresh archive identity before upload`,
+  );
+  add(
+    violations,
+    namedStep(job, "Prove fresh-target Node-absent network-denied Cargo release boundary") === undefined,
+    `${file} matrix package jobs must not repeat the frozen Linux Cargo boundary`,
+  );
+  const frozenLinux = requireJob(violations, file, workflow, "frozen-linux-qualification");
+  add(
+    violations,
+    frozenLinux.if === "inputs.hermetic_linux"
+      && sameMembers(needs(frozenLinux), ["build"])
+      && frozenLinux["runs-on"] === "ubuntu-latest",
+    `${file} frozen Linux Cargo boundary must be one explicit post-package job`,
+  );
+  const frozenCheckout = namedStep(frozenLinux, "Checkout frozen candidate");
+  add(
+    violations,
+    frozenCheckout?.uses === "actions/checkout@v5"
+      && object(frozenCheckout?.with).ref === "${{ inputs.ref }}",
+    `${file} frozen Linux qualification must checkout the exact candidate`,
+  );
   requireStepRun(
     violations,
     file,
-    job,
-    "Prove clean-cache Node-absent network-denied offline release build",
+    frozenLinux,
+    "Prove fresh-target Node-absent network-denied Cargo release boundary",
     [
       "CARGO_HOME=\"$proof_root/cargo\"",
       "cargo fetch --locked",
@@ -1927,6 +2280,11 @@ function validatePackagedProof(workflows, violations, graph) {
       "cargo check --release --locked --offline -p codestory-llama-sys",
       "cargo build --release --locked --offline -p codestory-llama-sys",
     ],
+  );
+  add(
+    violations,
+    cacheSteps(frozenLinux).length === 0,
+    `${file} frozen Linux fresh-target qualification must not restore compiler output`,
   );
   const signing = namedStep(job, "Sign and notarize macOS CLI");
   add(violations, signing !== undefined, `${file} must sign and notarize Mac binaries`);
@@ -2279,7 +2637,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(
       at(workflow, "on", "workflow_dispatch", "inputs", "mode", "options"),
-      ["platform", "calibration", "release-evidence", "integration"],
+      ["package", "platform", "qualification", "calibration", "release-evidence", "integration"],
     ),
     `${file} dispatch modes changed`,
   );
@@ -2320,6 +2678,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
     'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
+    'elif [ "${{ steps.resolve.outputs.mode }}" = "package" ]; then',
+    'test "$REQUESTED_SCOPE" != none',
+    'if [ "$REQUESTED_SCOPE" = auto ]; then',
+    'elif [ "${{ steps.resolve.outputs.mode }}" = "qualification" ]; then',
+    'test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full',
     'scope="$REQUESTED_SCOPE"',
     "scope=full",
     "node .github/scripts/route-ci-proof.mjs --stdin",
@@ -2354,7 +2717,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(
     violations,
     calibrationLinux.uses === "./.github/workflows/packaged-platform-proof.yml"
-      && object(calibrationLinux.with).calibration_mode === true,
+      && object(calibrationLinux.with).calibration_mode === true
+      && object(calibrationLinux.with).hermetic_linux === undefined,
     `${file} hosted Linux calibration must call packaged proof in calibration mode`,
   );
   const calibrationMacos = requireJob(violations, file, workflow, "calibration-macos");
@@ -2416,6 +2780,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   const packaged = requireJob(violations, file, workflow, "packaged-proof");
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${file} must call packaged proof`);
+  add(
+    violations,
+    String(packaged.if ?? "").includes("needs.route.outputs.mode == 'package'")
+      && String(packaged.if ?? "").includes("needs.route.outputs.mode == 'platform'")
+      && String(packaged.if ?? "").includes("needs.route.outputs.mode == 'qualification'")
+      && object(packaged.with).hermetic_linux
+        === "${{ needs.route.outputs.mode == 'qualification' }}",
+    `${file} package and platform modes must build fresh archives while only qualification runs the cold Linux boundary`,
+  );
   for (const key of [
     "candidate_installed_proof",
     "candidate_installed_only",
@@ -2442,6 +2815,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     sameMembers(needs(metal), ["route", "packaged-proof"]),
     `${file} Metal proof must wait only for routing and package proof`,
   );
+  add(
+    violations,
+    String(metal.if ?? "").includes("needs.route.outputs.mode != 'package'"),
+    `${file} package-only mode must skip protected Metal proof`,
+  );
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
   add(
     violations,
@@ -2459,6 +2837,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(needs(vulkan), ["route", "packaged-proof"]),
     `${file} Vulkan proof must wait only for routing and package proof`,
+  );
+  add(
+    violations,
+    String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'"),
+    `${file} package-only mode must skip protected Windows proof`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   add(
@@ -2481,6 +2864,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(needs(linuxVulkan), ["route", "packaged-proof"]),
     `${file} Linux Vulkan proof must wait only for routing and package proof`,
+  );
+  add(
+    violations,
+    String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'"),
+    `${file} package-only mode must skip protected Linux proof`,
   );
   add(
     violations,
@@ -2521,6 +2909,9 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} normal closeout must not depend on optional release evidence`,
   );
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
+    'if [ "$MODE" = package ]',
+    'require_result "$PACKAGE_RESULT" success packaged-proof',
+    'require_result "$METAL_RESULT" skipped macos-metal-proof',
     'if [ "$SCOPE" = none ]',
     '[ "$SCOPE" = linux ]',
     "WINDOWS_VULKAN_RESULT",

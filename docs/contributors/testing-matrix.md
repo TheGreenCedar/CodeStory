@@ -169,14 +169,19 @@ used by `build.rs`; it proves partial bytes are never published and a racing
 destination is never replaced. Protected package and hardware lanes remain
 responsible for proving the real release model and accelerator runtime.
 
-The Linux x64 packaged-platform job additionally runs the named
-`Prove clean-cache Node-absent network-denied offline release build` lane. It
+The manually dispatched `qualification` mode runs the named
+`Prove fresh-target Node-absent network-denied Cargo release boundary` once,
+after all selected packages succeed. Corrective package-only iterations,
+ordinary platform reruns, calibration, integration, and the later main release
+do not repeat it. The job
 seeds a new isolated Cargo home, mounts the source read-only into the pinned
 build image, removes Node from the execution contract, denies container network
 access, and runs both `cargo check --release --locked --offline` and
 `cargo build --release --locked --offline` from a fresh target. The container's
 `--network none` boundary is the network-denial proof; Cargo's offline flag
-alone is not treated as OS-level denial.
+alone is not treated as OS-level denial. This proves the Cargo release boundary,
+not that the separately packaged Linux archive was produced by that discarded
+fresh-target build.
 
 Hosted source/package jobs may set:
 

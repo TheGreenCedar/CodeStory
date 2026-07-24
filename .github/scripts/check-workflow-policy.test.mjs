@@ -54,22 +54,13 @@ function draftStep(job, name) {
   return matches[0];
 }
 
-function moveNamedStepBefore(job, movedName, beforeName) {
+function moveNamedStepAfter(job, movedName, afterName) {
   const movedIndex = job.steps.findIndex(step => step.name === movedName);
   assert.notEqual(movedIndex, -1, `missing ${movedName}`);
   const [moved] = job.steps.splice(movedIndex, 1);
-  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
-  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
-  job.steps.splice(beforeIndex, 0, moved);
-}
-
-function cloneCacheSaveBefore(job, sourceName, beforeName, uses) {
-  const clone = structuredClone(draftStep(job, sourceName));
-  clone.name = `${sourceName} clone`;
-  if (uses !== undefined) clone.uses = uses;
-  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
-  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
-  job.steps.splice(beforeIndex, 0, clone);
+  const afterIndex = job.steps.findIndex(step => step.name === afterName);
+  assert.notEqual(afterIndex, -1, `missing ${afterName}`);
+  job.steps.splice(afterIndex + 1, 0, moved);
 }
 
 function runResolver(file, jobName, environment) {
@@ -464,7 +455,7 @@ test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before 
   });
 });
 
-test("exact proof policy rejects trigger, identity, and cache downgrades", async (t) => {
+test("exact proof policy rejects trigger and identity downgrades", async (t) => {
   const sourceFile = "source-proof.yml";
   const packagedCoordinatorFile = "packaged-platform-pr.yml";
   const packagedProofFile = "packaged-platform-proof.yml";
@@ -635,73 +626,272 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         type: "boolean",
       };
     }, /package-only workflow must not define candidate_installed_proof/u],
-    ["source unversioned cache", sourceFile, workflow => {
-      const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
-      restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
-    }, /versioned exact-SHA namespace/u],
-    ["source broad cache fallback", sourceFile, workflow => {
-      draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output")
-        .with["restore-keys"] = "Linux-source-proof-";
-    }, /must not use fallback restore keys/u],
-    ["source cache always-save", sourceFile, workflow => {
-      draftStep(workflow.jobs["full-source-gate"], "Save Cargo inputs and output").if
-        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
-    }, /save only a successful exact miss/u],
-    ["source cache save before final proof", sourceFile, workflow => {
-      moveNamedStepBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-      );
-    }, /source cache unique cache save must run after every proof step/u],
-    ["source cache clone before proof", sourceFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-      );
-    }, /source cache must contain exactly one actions\/cache\/save action/u],
-    ["source mixed-case cache clone before proof", sourceFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-        "Actions/Cache/Save@v5",
-      );
-    }, /source cache must contain exactly one actions\/cache\/save action/u],
-    ["packaged cache loses exact SHA", packagedProofFile, workflow => {
-      const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
-      restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
-    }, /native build cache.*exact SHA/u],
-    ["packaged cache always-save", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Save Cargo registry, git sources, and build output").if
-        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
-    }, /save only a successful exact miss/u],
-    ["packaged cache save before final proof", packagedProofFile, workflow => {
-      moveNamedStepBefore(
-        workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
-      );
-    }, /native build cache unique cache save must run after every proof and cleanup step/u],
-    ["packaged cache clone before proof", packagedProofFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
-      );
-    }, /native build cache must contain exactly one actions\/cache\/save action/u],
-    ["packaged mixed-case cache clone before proof", packagedProofFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
-        "Actions/Cache/Save@v5",
-      );
-    }, /native build cache must contain exactly one actions\/cache\/save action/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
+test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const sourceFile = "source-proof.yml";
+  const packagedFile = "packaged-platform-proof.yml";
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const releaseFile = "release.yml";
+  const sourceJob = workflow => workflow.jobs["full-source-gate"];
+  const packagedJob = workflow => workflow.jobs.build;
+  const sourceIdentity = workflow =>
+    draftStep(sourceJob(workflow), "Capture reusable build cache contract");
+  const packagedIdentity = workflow =>
+    draftStep(packagedJob(workflow), "Capture reusable build cache contract");
+
+  const mutations = [
+    ["source compiler restore becomes exact-SHA-only", sourceFile, workflow => {
+      draftStep(sourceJob(workflow), "Restore compatible compiler objects")
+        .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";
+    }, /source-proof\.yml compiler cache must restore the newest compatible prior candidate/u],
+    ["packaged compiler restore becomes exact-SHA-only", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore compatible compiler objects")
+        .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";
+    }, /packaged-platform-proof\.yml compiler cache must restore the newest compatible prior candidate/u],
+    ["packaged dependency restore accepts stale inputs", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore Cargo dependency inputs")
+        .with["restore-keys"] = "codestory-release-dependencies-";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["source dependency cache escapes isolation", sourceFile, workflow => {
+      draftStep(sourceJob(workflow), "Restore Cargo dependency inputs")
+        .with.path = "~/.cargo/registry\n~/.cargo/git";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["packaged dependency cache escapes isolation", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore Cargo dependency inputs")
+        .with.path = "~/.cargo/registry\n~/.cargo/git";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["packaged dependency cache loses its bound", packagedFile, workflow => {
+      delete workflow.env.CARGO_DEPENDENCY_CACHE_MAX_BYTES;
+    }, /must pin bounded compiler and dependency caches/u],
+    ["source invalidation loses Cargo.lock", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("--lock-file Cargo.lock", "--lock-file Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses Cargo config", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("--cargo-config .cargo/config.toml", "--cargo-config Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses feature set", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace(
+          "--features workspace-test-default-and-clippy-all-targets-all-features",
+          "--features default",
+        );
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses workspace manifests", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("git ls-files '*Cargo.toml'", "printf '%s\\n' Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Rust version", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--rust-version "$rust_version"', "--rust-release ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses target", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--target "${{ matrix.rust_target }}"', "--architecture ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses feature set", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--features codestory-cli-default-features", "--features default");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses native toolchain", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--native-toolchain "$native_toolchain"', "--toolchain ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses generator", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--generator "$generator"', "--build-system ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses CMake", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--cmake-version "$cmake_version"', "--cmake ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Ninja", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--ninja-version "$ninja_version"', "--ninja ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Cargo.lock", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--lock-file Cargo.lock", "--lock-file Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Cargo config", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--cargo-config .cargo/config.toml", "--cargo-config Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses workspace manifests", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("git ls-files '*Cargo.toml'", "printf '%s\\n' Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Windows native installer", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/scripts/install-windows-vulkan-sdk.ps1", "ignored-windows-input");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux Dockerfile", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/docker/linux-glibc-build.Dockerfile", ".github/docker/ignored.Dockerfile");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux glslc inputs", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/docker/glslc", ".github/docker/ignored-glslc");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux build image", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("LINUX_GLIBC_BUILD_IMAGE", "UNPINNED_BUILD_IMAGE");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux glslc image", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("LINUX_GLSLC_IMAGE", "UNPINNED_GLSLC_IMAGE");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged workload variants collide", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--identity "qualification_driver=$qualification_driver"', "--workload ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["source compiler cache waits for tests", sourceFile, workflow => {
+      moveNamedStepAfter(
+        sourceJob(workflow),
+        "Save compiler objects after compilation",
+        "Test the complete workspace once",
+      );
+    }, /source-proof\.yml compiler cache must save before test execution or release-cell failure/u],
+    ["packaged compiler cache waits for protected regression", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Test immutable native staging on Windows",
+      );
+    }, /compiler cache must save before late Test immutable native staging on Windows failure/u],
+    ["packaged compiler cache waits for signing", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Sign and notarize macOS CLI",
+      );
+    }, /compiler cache must save before late Sign and notarize macOS CLI failure/u],
+    ["packaged compiler cache waits for packaging", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Package release asset",
+      );
+    }, /compiler cache must save before late Package release asset failure/u],
+    ["packaged compile timer includes cache uploads", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Stop compilation clock",
+        "Save compiler objects after compilation",
+      );
+    }, /compile and compiler-cache-save timings must cover only their named stages/u],
+    ["source compile telemetry omits its end boundary", sourceFile, workflow => {
+      const report = draftStep(sourceJob(workflow), "Report compiler cache save");
+      report.run = report.run.replace('--ended-ms "$ENDED_MS" \\\n', "");
+    }, /step Report compiler cache save must run --ended-ms/u],
+    ["source cache restores Cargo target output", sourceFile, workflow => {
+      const restore = draftStep(sourceJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\ntarget";
+    }, /source-proof\.yml cache paths must exclude Cargo target and exact proof outputs/u],
+    ["packaged cache restores release-dist", packagedFile, workflow => {
+      const restore = draftStep(packagedJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\nrelease-dist";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["packaged cache restores an exact archive", packagedFile, workflow => {
+      const restore = draftStep(packagedJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\n/tmp/codestory-linux-x64.tar.gz";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["packaged cache saves proof output", packagedFile, workflow => {
+      const save = draftStep(packagedJob(workflow), "Save compiler objects after compilation");
+      save.with.path += "\ntarget/notarization-proof";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["package dispatch mode is removed", coordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.mode.options
+        = workflow.on.workflow_dispatch.inputs.mode.options.filter(mode => mode !== "package");
+    }, /packaged-platform-pr\.yml dispatch modes changed/u],
+    ["package mode skips archive construction", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].if = workflow.jobs["packaged-proof"].if
+        .replace("needs.route.outputs.mode == 'package' || ", "");
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["package mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = true;
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["qualification mode disables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = false;
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["platform mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux
+        = "${{ needs.route.outputs.mode == 'platform' }}";
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["package mode enables protected Metal proof", coordinatorFile, workflow => {
+      workflow.jobs["macos-metal-proof"].if = workflow.jobs["macos-metal-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Metal proof/u],
+    ["package mode enables protected Windows proof", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].if = workflow.jobs["windows-vulkan-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Windows proof/u],
+    ["package mode enables protected Linux proof", coordinatorFile, workflow => {
+      workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Linux proof/u],
+    ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["calibration-linux"].with.hermetic_linux = true;
+    }, /hosted Linux calibration must call packaged proof in calibration mode/u],
+    ["package matrix repeats frozen Linux qualification", packagedFile, workflow => {
+      packagedJob(workflow).steps.push(structuredClone(draftStep(
+        workflow.jobs["frozen-linux-qualification"],
+        "Prove fresh-target Node-absent network-denied Cargo release boundary",
+      )));
+    }, /matrix package jobs must not repeat the frozen Linux Cargo boundary/u],
+    ["frozen Linux qualification becomes unconditional", packagedFile, workflow => {
+      workflow.jobs["frozen-linux-qualification"].if = "always()";
+    }, /frozen Linux Cargo boundary must be one explicit post-package job/u],
+    ["frozen Linux qualification restores exact archives", packagedFile, workflow => {
+      workflow.jobs["frozen-linux-qualification"].steps.push({
+        name: "Restore exact package archive",
+        uses: "actions/cache/restore@v5",
+        with: {
+          path: "release-dist/codestory-linux-x64.tar.gz",
+          key: "forbidden-exact-archive",
+        },
+      });
+    }, /frozen Linux fresh-target qualification must not restore compiler output/u],
+    ["Linux compiler cache exits with an active server", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace("/sccache/sccache --stop-server", "true");
+    }, /step Build Linux x64 at the glibc 2\.31 baseline must run \/sccache\/sccache --stop-server/u],
+    ["package checkout accepts a fallback SHA", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Checkout").with.ref = "${{ inputs.ref || github.sha }}";
+    }, /package jobs must checkout only the requested exact SHA/u],
+    ["package smoke loses source identity", packagedFile, workflow => {
+      const smoke = draftStep(packagedJob(workflow), "Smoke packaged release asset");
+      smoke.run = smoke.run.replace(
+        '--expected-source-sha "${{ steps.source-identity.outputs.sha }}" \\\n',
+        "",
+      );
+    }, /step Smoke packaged release asset must run --expected-source-sha/u],
+    ["fresh package identity is reported after upload", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Report fresh package identity",
+        "Upload release asset",
+      );
+    }, /must report a verified fresh archive identity before upload/u],
+    ["release repeats frozen Linux qualification", releaseFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = true;
+    }, /release\.yml main release must not repeat frozen-candidate Linux qualification/u],
+  ];
+
   for (const [name, file, mutate, expectedReason] of mutations) {
     await t.test(name, () => {
       const workflows = loadWorkflows();
@@ -1197,10 +1387,13 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
 
   const packagedFile = "packaged-platform-proof.yml";
   const protectedFile = "windows-vulkan-proof.yml";
-  const packagedIdentity = workflow => draftStep(workflow.jobs.build, "Capture Rust cache key");
-  const packagedCache = workflow => draftStep(
+  const packagedIdentity = workflow => draftStep(
     workflow.jobs.build,
-    "Restore Cargo registry, git sources, and build output",
+    "Capture reusable build cache contract",
+  );
+  const packagedCacheSetup = workflow => draftStep(
+    workflow.jobs.build,
+    "Configure bounded compiler cache",
   );
   const packagedBuild = workflow => draftStep(workflow.jobs.build, "Build codestory-cli");
   const packagedShortTarget = workflow => draftStep(
@@ -1231,16 +1424,16 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
   const mutations = [
     ["packaged CMake identity removed", packagedFile, workflow => {
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
-        .replace(/.*cmake --version.*\n/u, "");
-    }, /native build identity must include cmake/u],
+        .replace('--cmake-version "$cmake_version"', "--cmake ignored");
+    }, /must compute one complete reusable compiler compatibility contract/u],
     ["packaged Ninja identity removed", packagedFile, workflow => {
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
-        .replace(/.*ninja --version.*\n/u, "");
-    }, /native build identity must include ninja/u],
+        .replace('--ninja-version "$ninja_version"', "--ninja ignored");
+    }, /must compute one complete reusable compiler compatibility contract/u],
     ["packaged Ninja selection removed", packagedFile, workflow => {
-      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+      packagedCacheSetup(workflow).run = packagedCacheSetup(workflow).run
         .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
-    }, /native build identity must include CMAKE_GENERATOR=Ninja/u],
+    }, /Configure bounded compiler cache/u],
     ["packaged short Windows target made cross-platform", packagedFile, workflow => {
       packagedShortTarget(workflow).if = "runner.os != 'Windows'";
     }, /short Cargo target must be Windows-only/u],
@@ -1266,34 +1459,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     ["packaged native staging regression removed", packagedFile, workflow => {
       packagedNativeStaging(workflow).run = "cargo test --release --locked";
     }, /Test immutable native staging on Windows/u],
-    ["packaged identity made conditional", packagedFile, workflow => {
-      packagedIdentity(workflow).if = "runner.os != 'Windows'";
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity made optional", packagedFile, workflow => {
-      packagedIdentity(workflow)["continue-on-error"] = true;
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity cloned", packagedFile, workflow => {
-      workflow.jobs.build.steps.push(structuredClone(packagedIdentity(workflow)));
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity moved after build", packagedFile, workflow => {
-      const steps = workflow.jobs.build.steps;
-      const identityIndex = steps.findIndex(step => step.name === "Capture Rust cache key");
-      const [identity] = steps.splice(identityIndex, 1);
-      const buildIndex = steps.findIndex(step => step.name === "Build codestory-cli");
-      steps.splice(buildIndex + 1, 0, identity);
-    }, /native build identity must run immediately after Rust selection/u],
-    ["packaged generator-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-${{ steps.rust-cache-key.outputs.generator }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
-    ["packaged CMake-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-cmake-${{ steps.rust-cache-key.outputs.cmake }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
-    ["packaged Ninja-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-ninja-${{ steps.rust-cache-key.outputs.ninja }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
     ["packaged build overrides generator", packagedFile, workflow => {
       packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
     }, /native package build must not override the selected generator/u],

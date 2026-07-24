@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Prove an accepted PR head, collect pre-freeze calibration, run release evidence, or prove current dev.
+        description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, run release evidence, or prove current dev.
         required: true
         default: platform
         type: choice
-        options: [platform, calibration, release-evidence, integration]
+        options: [package, platform, qualification, calibration, release-evidence, integration]
       pr_number:
         description: Same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>.
         required: false
@@ -100,7 +100,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          test "$mode" = "platform" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
+          test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
           test -n "$pr_number"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
@@ -134,7 +134,7 @@ jobs:
               exit 1
             }
           fi
-          if [ "$mode" = "release-evidence" ] || [ "$mode" = "calibration" ]; then
+          if [ "$mode" = "release-evidence" ] || [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
             test "$base_ref" = "dev/codestory-next" || {
               echo "::error::$mode requires a PR into dev/codestory-next, not $base_ref."
@@ -233,6 +233,16 @@ jobs:
             else
               scope=full
             fi
+          elif [ "${{ steps.resolve.outputs.mode }}" = "package" ]; then
+            test "$REQUESTED_SCOPE" != none
+            if [ "$REQUESTED_SCOPE" = auto ]; then
+              scope=full
+            else
+              scope="$REQUESTED_SCOPE"
+            fi
+          elif [ "${{ steps.resolve.outputs.mode }}" = "qualification" ]; then
+            test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full
+            scope=full
           elif [ "${{ steps.resolve.outputs.mode }}" = "calibration" ]; then
             scope=none
           elif [ "${{ steps.resolve.outputs.mode }}" = "release-evidence" ]; then
@@ -389,7 +399,10 @@ jobs:
       always() &&
       needs.route.result == 'success' &&
       needs.route.outputs.scope != 'none' &&
-      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped'))
+      (
+        needs.source-proof.result == 'success' ||
+        ((needs.route.outputs.mode == 'package' || needs.route.outputs.mode == 'platform' || needs.route.outputs.mode == 'qualification') && needs.source-proof.result == 'skipped')
+      )
     needs:
       - route
       - source-proof
@@ -400,6 +413,7 @@ jobs:
       scope: ${{ needs.route.outputs.scope }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
+      hermetic_linux: ${{ needs.route.outputs.mode == 'qualification' }}
       quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
@@ -409,6 +423,7 @@ jobs:
       always() &&
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
+      needs.route.outputs.mode != 'package' &&
       (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full')
     needs:
       - route
@@ -431,6 +446,7 @@ jobs:
       always() &&
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
+      needs.route.outputs.mode != 'package' &&
       (needs.route.outputs.scope == 'windows' || needs.route.outputs.scope == 'full')
     needs:
       - route
@@ -453,6 +469,7 @@ jobs:
       always() &&
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
+      needs.route.outputs.mode != 'package' &&
       (needs.route.outputs.scope == 'linux' || needs.route.outputs.scope == 'full')
     needs:
       - route
@@ -508,7 +525,12 @@ jobs:
           else
             require_result "$SOURCE_RESULT" skipped source-proof
           fi
-          if [ "$SCOPE" = none ]; then
+          if [ "$MODE" = package ]; then
+            require_result "$PACKAGE_RESULT" success packaged-proof
+            require_result "$METAL_RESULT" skipped macos-metal-proof
+            require_result "$WINDOWS_VULKAN_RESULT" skipped windows-vulkan-proof
+            require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+          elif [ "$SCOPE" = none ]; then
             require_result "$PACKAGE_RESULT" skipped packaged-proof
             require_result "$METAL_RESULT" skipped macos-metal-proof
             require_result "$WINDOWS_VULKAN_RESULT" skipped windows-vulkan-proof

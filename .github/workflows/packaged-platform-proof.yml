@@ -51,6 +51,11 @@ on:
         required: false
         default: false
         type: boolean
+      hermetic_linux:
+        description: Run the deliberately cold Linux network-denied build once for a frozen candidate.
+        required: false
+        default: false
+        type: boolean
     secrets:
       APPLE_DEVELOPER_ID_P12_BASE64:
         required: false
@@ -79,6 +84,9 @@ env:
   LINUX_GLSLC_IMAGE: "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
   LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
   APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
+  SCCACHE_VERSION: "v0.16.0"
+  SCCACHE_CACHE_SIZE: "1G"
+  CARGO_DEPENDENCY_CACHE_MAX_BYTES: "1073741824"
 
 jobs:
   build:
@@ -98,29 +106,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
+
+      - name: Require exact source identity
+        id: source-identity
+        shell: bash
+        env:
+          EXACT_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$EXACT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          head_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          test "$head_sha" = "$EXACT_SHA"
+          {
+            echo "sha=$head_sha"
+            echo "tree=$source_tree"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install pinned Rust
         run: |
           rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
           rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
           rustup target add "${{ matrix.rust_target }}"
-
-      - name: Capture Rust cache key
-        id: rust-cache-key
-        shell: bash
-        run: |
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-          echo "cmake=$(cmake --version | sed -n 's/^cmake version //p')" >> "$GITHUB_OUTPUT"
-          if [ "$RUNNER_OS" = Windows ]; then
-            echo "generator=ninja" >> "$GITHUB_OUTPUT"
-            echo "ninja=$(ninja --version)" >> "$GITHUB_OUTPUT"
-            echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
-          else
-            echo "generator=platform-default" >> "$GITHUB_OUTPUT"
-            echo "ninja=not-applicable" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Configure short Windows Cargo target
         if: runner.os == 'Windows'
@@ -139,21 +148,6 @@ jobs:
           New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget | Out-Null
           "CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Restore Cargo registry, git sources, and build output
-        id: cargo-cache-restore
-        uses: actions/cache/restore@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v4-${{ inputs.ref }}-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}
-
-      - name: Prove native workspace path identity
-        if: runner.os == 'Windows'
-        run: cargo test --locked -p codestory-workspace repository_identity
-
       - name: Prepare checksum-pinned embedded model
         run: node scripts/prepare-embedded-model.mjs
 
@@ -166,40 +160,221 @@ jobs:
         if: runner.os == 'Linux'
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
 
-      - name: Test immutable native staging on Windows
-        if: runner.os == 'Windows'
-        run: >-
-          cargo test --release --locked
-          -p codestory-llama-sys
-          --test native_staging
-          --target "${{ matrix.rust_target }}"
-          stages_complete_immutable_native_seeds
+      - name: Install pinned sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+          disable_annotations: true
 
-      - name: Build codestory-cli
-        if: matrix.asset_target != 'linux-x64'
-        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
-
-      - name: Build Linux x64 at the glibc 2.31 baseline
-        if: matrix.asset_target == 'linux-x64'
+      - name: Configure bounded compiler cache
+        shell: bash
         run: |
-          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/codestory-release-cargo"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-release-sccache"
+            echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          fi
+
+      - name: Capture reusable build cache contract
+        id: build-cache
+        shell: bash
+        env:
+          EXACT_SHA: ${{ inputs.ref }}
+          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          QUALITY_EVIDENCE_ARTIFACT: ${{ inputs.quality_evidence_artifact }}
+        run: |
+          set -euo pipefail
+          rust_version="$(rustc -Vv | sed -n 's/^release: //p')"
+          generator=unix-makefiles
+          cmake_version="$(cmake --version | sed -n 's/^cmake version //p')"
+          ninja_version=not-applicable
+          relevant_inputs=(
+            --relevant-input .cargo/llama-dynamic-backends.cmake
+            --relevant-input crates/codestory-llama-sys/build.rs
+            --relevant-input crates/codestory-llama-sys/model-contract.json
+            --relevant-input scripts/prepare-embedded-model.mjs
+          )
+          qualification_driver=disabled
+          if [ "$CALIBRATION_MODE" = true ] || [ -n "$QUALITY_EVIDENCE_ARTIFACT" ]; then
+            qualification_driver=enabled
+          fi
+          extra_identity=(
+            --identity cargo_incremental=0
+            --identity "qualification_driver=$qualification_driver"
+          )
+          while IFS= read -r manifest; do
+            relevant_inputs+=(--relevant-input "$manifest")
+          done < <(git ls-files '*Cargo.toml')
+          if [ "$RUNNER_OS" = Windows ]; then
+            generator=ninja
+            ninja_version="$(ninja --version)"
+            # shellcheck disable=SC2016
+            native_toolchain="$(
+              pwsh -NoProfile -Command '
+                $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+                $root = & $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+                Get-Content (Join-Path $root "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
+              ' | tr -d '\r\n'
+            )"
+            native_toolchain="msvc-$native_toolchain"
+            relevant_inputs+=(--relevant-input .github/scripts/install-windows-vulkan-sdk.ps1)
+          elif [ "$RUNNER_OS" = macOS ]; then
+            native_toolchain="$(xcrun clang --version | head -n 1 | tr -d '\r')-sdk-$(xcrun --sdk macosx --show-sdk-version)"
+          else
+            native_toolchain=clang-13-bullseye
+            cmake_version=dockerfile-pinned
+            relevant_inputs+=(
+              --relevant-input .github/docker/linux-glibc-build.Dockerfile
+              --relevant-input .github/docker/glslc
+              --relevant-input .github/scripts/install-linux-vulkan-build-deps.sh
+            )
+            extra_identity+=(
+              --identity cxxflags=-std=c++17
+              --identity "linux_glibc_build_image=$LINUX_GLIBC_BUILD_IMAGE"
+              --identity "linux_glslc_image=$LINUX_GLSLC_IMAGE"
+            )
+          fi
+          node .github/scripts/cargo-cache-contract.mjs identity \
+            --namespace codestory-cli-native-v4 \
+            --exact-sha "$EXACT_SHA" \
+            --os "$RUNNER_OS" \
+            --target "${{ matrix.rust_target }}" \
+            --rust-version "$rust_version" \
+            --features codestory-cli-default-features \
+            --native-toolchain "$native_toolchain" \
+            --generator "$generator" \
+            --cmake-version "$cmake_version" \
+            --ninja-version "$ninja_version" \
+            --sccache-version "$SCCACHE_VERSION" \
+            --lock-file Cargo.lock \
+            --cargo-config .cargo/config.toml \
+            "${relevant_inputs[@]}" \
+            "${extra_identity[@]}"
+
+      - name: Restore Cargo dependency inputs
+        id: cargo-dependency-cache
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/codestory-release-cargo/registry
+            ${{ runner.temp }}/codestory-release-cargo/git
+          key: ${{ steps.build-cache.outputs.dependency-key }}
+
+      - name: Report Cargo dependency cache restore
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cargo-dependency-cache.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.cargo-dependency-cache.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.dependency-key }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs restore \
+            --kind dependencies \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --cache-hit "${CACHE_HIT:-false}" \
+            --path "$CARGO_HOME/registry" \
+            --path "$CARGO_HOME/git"
+
+      - name: Restore compatible compiler objects
+        id: compiler-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-release-sccache
+          key: ${{ steps.build-cache.outputs.compiler-key }}
+          restore-keys: |
+            ${{ steps.build-cache.outputs.compiler-prefix }}
+
+      - name: Report compiler cache restore
+        id: compiler-cache-report
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.compiler-cache-restore.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.compiler-cache-restore.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.compiler-key }}
+          COMPATIBILITY_PREFIX: ${{ steps.build-cache.outputs.compiler-prefix }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs restore \
+            --kind compiler \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --compatibility-prefix "$COMPATIBILITY_PREFIX" \
+            --cache-hit "${CACHE_HIT:-false}" \
+            --path "$SCCACHE_DIR"
+
+      - name: Build pinned Linux toolchain image
+        if: matrix.asset_target == 'linux-x64'
+        shell: bash
+        run: |
           docker build --platform linux/amd64 \
             --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
             --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
             --file .github/docker/linux-glibc-build.Dockerfile \
             --tag codestory-linux-glibc-build \
             .github/docker
+
+      - name: Start compilation clock
+        id: compile-clock
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
+      - name: Compile native workspace path regression on Windows
+        id: windows-workspace-compile
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p codestory-workspace repository_identity --no-run
+
+      - name: Compile immutable native staging regression on Windows
+        id: windows-native-compile
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --release --locked
+          -p codestory-llama-sys
+          --test native_staging
+          --target "${{ matrix.rust_target }}"
+          --no-run
+
+      - name: Build codestory-cli
+        id: package-build
+        if: matrix.asset_target != 'linux-x64'
+        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+
+      - name: Build Linux x64 at the glibc 2.31 baseline
+        id: linux-build
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          test -x "$SCCACHE_PATH"
+          mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"
+          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
           docker run --rm --platform linux/amd64 \
             --user "$(id -u):$(id -g)" \
             --env CARGO_HOME=/cargo \
             --env CARGO_TARGET_DIR=/workspace/target/glibc-2.31 \
             --env CODESTORY_EMBED_MODEL_SOURCE="/workspace/$model_relative" \
             --env CXXFLAGS=-std=c++17 \
-            --volume "$HOME/.cargo:/cargo" \
+            --env RUSTC_WRAPPER=/sccache/sccache \
+            --env SCCACHE_DIR=/sccache/cache \
+            --env SCCACHE_CACHE_SIZE="$SCCACHE_CACHE_SIZE" \
+            --env CMAKE_C_COMPILER_LAUNCHER=/sccache/sccache \
+            --env CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache \
+            --volume "$CARGO_HOME:/cargo" \
             --volume "$PWD:/workspace" \
+            --volume "$SCCACHE_PATH:/sccache/sccache:ro" \
+            --volume "$SCCACHE_DIR:/sccache/cache" \
             --workdir /workspace \
             codestory-linux-glibc-build \
-            cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+            sh -ceu '
+              cargo build --release --locked -p codestory-cli \
+                --target "${{ matrix.rust_target }}"
+              /sccache/sccache --show-stats
+              /sccache/sccache --stop-server
+            '
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
@@ -218,46 +393,141 @@ jobs:
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
 
       - name: Build qualification driver
+        id: qualification-driver
         if: matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')
         run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
-      - name: Prove clean-cache Node-absent network-denied offline release build
-        if: matrix.asset_target == 'linux-x64'
+      - name: Stop compilation clock
+        id: compile-clock-stop
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          )
+        run: node .github/scripts/cargo-cache-contract.mjs stop
+
+      - name: Finalize compiler objects
+        if: >-
+          always() &&
+          (
+            (
+              matrix.asset_target == 'linux-x64' &&
+              steps.linux-build.outcome == 'success' &&
+              steps.qualification-driver.outcome != 'skipped'
+            ) ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          )
         shell: bash
         run: |
-          set -euo pipefail
-          proof_root="$RUNNER_TEMP/codestory-hermetic-release"
-          rm -rf "$proof_root"
-          mkdir -p "$proof_root/cargo" "$proof_root/home"
-          CARGO_HOME="$proof_root/cargo" \
-            cargo fetch --locked --target "${{ matrix.rust_target }}"
-          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
-          docker run --rm --platform linux/amd64 \
-            --network none \
-            --read-only \
-            --user "$(id -u):$(id -g)" \
-            --env CARGO_HOME=/proof/cargo \
-            --env CARGO_NET_OFFLINE=true \
-            --env CARGO_TARGET_DIR=/proof/target \
-            --env CODESTORY_EMBED_MODEL_SOURCE="/workspace/$model_relative" \
-            --env CXXFLAGS=-std=c++17 \
-            --env HOME=/proof/home \
-            --tmpfs /tmp:rw,noexec,nosuid,size=1g \
-            --volume "$proof_root:/proof" \
-            --volume "$PWD:/workspace:ro" \
-            --workdir /workspace \
-            codestory-linux-glibc-build \
-            sh -ceu '
-              if command -v node >/dev/null 2>&1; then
-                echo "Node must be absent from the hermetic Cargo proof" >&2
-                exit 1
-              fi
-              test ! -e "$CARGO_TARGET_DIR"
-              cargo check --release --locked --offline -p codestory-llama-sys \
-                --target "${{ matrix.rust_target }}"
-              cargo build --release --locked --offline -p codestory-llama-sys \
-                --target "${{ matrix.rust_target }}"
-            '
+          sccache --show-stats
+          sccache --stop-server
+
+      - name: Bound Cargo dependency cache
+        id: cargo-dependency-cache-size
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          )
+        shell: bash
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs size \
+            --kind dependencies \
+            --max-bytes "$CARGO_DEPENDENCY_CACHE_MAX_BYTES" \
+            --path "$CARGO_HOME/registry" \
+            --path "$CARGO_HOME/git"
+
+      - name: Save Cargo dependency inputs
+        id: cargo-dependency-cache-save
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          ) &&
+          steps.cargo-dependency-cache-size.outputs.within-limit == 'true' &&
+          steps.cargo-dependency-cache.outputs.cache-hit != 'true' &&
+          steps.cargo-dependency-cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/codestory-release-cargo/registry
+            ${{ runner.temp }}/codestory-release-cargo/git
+          key: ${{ steps.cargo-dependency-cache.outputs.cache-primary-key }}
+
+      - name: Start compiler cache save clock
+        id: compiler-cache-save-clock
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          )
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
+      - name: Save compiler objects after compilation
+        id: compiler-cache-save
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          ) &&
+          steps.compiler-cache-restore.outputs.cache-hit != 'true' &&
+          steps.compiler-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-release-sccache
+          key: ${{ steps.compiler-cache-restore.outputs.cache-primary-key }}
+
+      - name: Report compiler cache save
+        if: >-
+          always() &&
+          (
+            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
+            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
+          )
+        shell: bash
+        env:
+          HIT_TYPE: ${{ steps.compiler-cache-report.outputs.hit-type }}
+          MATCHED_KEY: ${{ steps.compiler-cache-restore.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.compiler-key }}
+          COMPATIBILITY_PREFIX: ${{ steps.build-cache.outputs.compiler-prefix }}
+          RESTORED_BYTES: ${{ steps.compiler-cache-report.outputs.restored-bytes }}
+          SAVE_RESULT: ${{ steps.compiler-cache-save.outcome }}
+          STARTED_MS: ${{ steps.compile-clock.outputs.started-ms }}
+          ENDED_MS: ${{ steps.compile-clock-stop.outputs.ended-ms }}
+          SAVE_STARTED_MS: ${{ steps.compiler-cache-save-clock.outputs.started-ms }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs save \
+            --kind compiler \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --compatibility-prefix "$COMPATIBILITY_PREFIX" \
+            --hit-type "$HIT_TYPE" \
+            --restored-bytes "$RESTORED_BYTES" \
+            --started-ms "$STARTED_MS" \
+            --ended-ms "$ENDED_MS" \
+            --save-started-ms "$SAVE_STARTED_MS" \
+            --save-result "$SAVE_RESULT" \
+            --path "$SCCACHE_DIR"
+
+      - name: Prove native workspace path identity
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p codestory-workspace repository_identity
+
+      - name: Test immutable native staging on Windows
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --release --locked
+          -p codestory-llama-sys
+          --test native_staging
+          --target "${{ matrix.rust_target }}"
+          stages_complete_immutable_native_seeds
 
       - name: Sign and notarize macOS CLI
         if: runner.os == 'macOS' && inputs.sign_macos
@@ -503,6 +773,8 @@ jobs:
             --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz" \
             --checksum-file target/release-dist/SHA256SUMS.txt \
             --expected-version "${{ inputs.version }}" \
+            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" \
+            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" \
             --version-only \
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
@@ -653,8 +925,30 @@ jobs:
             --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.zip" `
             --checksum-file target/release-dist/SHA256SUMS.txt `
             --expected-version "${{ inputs.version }}" `
+            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" `
+            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" `
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
+
+      - name: Report fresh package identity
+        id: fresh-package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
+          archive_sha256="$(
+            python -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' \
+              "$archive"
+          )"
+          {
+            echo "### Fresh package identity"
+            echo
+            echo "- Source SHA: \`${{ steps.source-identity.outputs.sha }}\`"
+            echo "- Source tree: \`${{ steps.source-identity.outputs.tree }}\`"
+            echo "- Archive: \`$(basename "$archive")\`"
+            echo "- Archive SHA-256: \`$archive_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload packaged version proof
         if: always()
@@ -726,13 +1020,76 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/codestory-signing-${{ matrix.asset_target }}.keychain-db" || true
           rm -rf "$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
 
-      - name: Save Cargo registry, git sources, and build output
-        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v5
-        continue-on-error: true
+  frozen-linux-qualification:
+    name: Frozen Linux fresh-target Cargo boundary
+    if: inputs.hermetic_linux
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout frozen candidate
+        uses: actions/checkout@v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
+          ref: ${{ inputs.ref }}
+
+      - name: Require exact frozen source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ inputs.ref }}"
+          test -n "${{ inputs.version }}"
+
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
+          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Prepare checksum-pinned embedded model
+        run: node scripts/prepare-embedded-model.mjs
+
+      - name: Build pinned Linux toolchain image
+        shell: bash
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
+            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --file .github/docker/linux-glibc-build.Dockerfile \
+            --tag codestory-linux-glibc-build \
+            .github/docker
+
+      - name: Prove fresh-target Node-absent network-denied Cargo release boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_root="$RUNNER_TEMP/codestory-hermetic-release"
+          rm -rf "$proof_root"
+          mkdir -p "$proof_root/cargo" "$proof_root/home"
+          CARGO_HOME="$proof_root/cargo" \
+            cargo fetch --locked --target x86_64-unknown-linux-gnu
+          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
+          docker run --rm --platform linux/amd64 \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --env CARGO_HOME=/proof/cargo \
+            --env CARGO_NET_OFFLINE=true \
+            --env CARGO_TARGET_DIR=/proof/target \
+            --env CODESTORY_EMBED_MODEL_SOURCE="/workspace/$model_relative" \
+            --env CXXFLAGS=-std=c++17 \
+            --env HOME=/proof/home \
+            --tmpfs /tmp:rw,noexec,nosuid,size=1g \
+            --volume "$proof_root:/proof" \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            codestory-linux-glibc-build \
+            sh -ceu '
+              if command -v node >/dev/null 2>&1; then
+                echo "Node must be absent from the frozen Cargo proof" >&2
+                exit 1
+              fi
+              test ! -e "$CARGO_TARGET_DIR"
+              cargo check --release --locked --offline -p codestory-llama-sys \
+                --target x86_64-unknown-linux-gnu
+              cargo build --release --locked --offline -p codestory-llama-sys \
+                --target x86_64-unknown-linux-gnu
+            '

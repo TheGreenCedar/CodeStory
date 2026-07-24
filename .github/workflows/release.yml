@@ -205,6 +205,7 @@ jobs:
       scope: full
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
+      hermetic_linux: false
       emit_release_cells: true
     # Provision these names as environment secrets on macos-release-signing.
     # That protected environment is selected by the called macOS matrix jobs,
