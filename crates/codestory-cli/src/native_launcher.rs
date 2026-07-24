@@ -309,12 +309,14 @@ fn hard_link_or_copy(source: &Path, destination: &Path) -> io::Result<()> {
 
 fn copy_verified(source: &Path, destination: &Path) -> io::Result<()> {
     let expected = file_sha256(source)?;
+    let permissions = fs::metadata(source)?.permissions();
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
     io::copy(&mut input, &mut output)?;
+    fs::set_permissions(destination, permissions)?;
     output.sync_all()?;
     drop(output);
     if file_sha256(destination)? != expected {
@@ -488,6 +490,15 @@ mod tests {
             format!("codestory-native-runtime-seed-v1|id={seed_id}|end-v1"),
         )
         .expect("runtime candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&candidate)
+                .expect("runtime candidate metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&candidate, permissions).expect("executable runtime candidate");
+        }
 
         let first = prepare_runtime_at(root).expect("first activation");
         assert_eq!(
@@ -499,6 +510,19 @@ mod tests {
             .trim()
             .to_owned();
         assert!(first.starts_with(root.join(NATIVE_RUNTIME_GENERATIONS_DIR)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(&first)
+                    .expect("published runtime metadata")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0,
+                "published runtime remains executable"
+            );
+        }
 
         fs::write(
             &candidate,
