@@ -135,11 +135,15 @@ function prepareInstallation(rawArgs) {
     fail("marketplace revision must be an immutable commit");
   }
   const expectedVersion = required(args, "expected_version");
-  const sourceCommit = required(args, "source_commit");
-  const sourceTree = required(args, "source_tree");
+  const sourceRepository = realpathSync(path.resolve(required(args, "source_repository")));
+  const sourceCommit = run("git", ["-C", sourceRepository, "rev-parse", "HEAD"]);
+  const sourceTree = run("git", ["-C", sourceRepository, "rev-parse", "HEAD^{tree}"]);
   for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
     if (!/^[0-9a-f]{40}$/u.test(value)) fail(`${label} must be an immutable Git identity`);
   }
+  const sourcePluginRoot = realpathSync(
+    path.join(sourceRepository, "plugins", "codestory"),
+  );
   return {
     args,
     codexExecutable,
@@ -151,6 +155,7 @@ function prepareInstallation(rawArgs) {
     expectedVersion,
     sourceCommit,
     sourceTree,
+    expectedPackageSha256: directoryDigest(sourcePluginRoot),
   };
 }
 
@@ -215,8 +220,13 @@ function verifyInstallation(setup, installed) {
   ) {
     fail("Codex marketplace provenance does not match the requested immutable revision");
   }
+  const packageSha256 = directoryDigest(pluginRoot);
+  if (packageSha256 !== setup.expectedPackageSha256) {
+    fail("installed plugin bytes do not match the checked-out CodeStory package");
+  }
   return {
     pluginRoot,
+    packageSha256,
     marketplaceAddRoot,
     marketplaceListRoot,
     marketplaceAddRevision,
@@ -238,7 +248,7 @@ function attestInstallation(setup, installed, verified) {
       version: setup.expectedVersion,
       source_commit: setup.sourceCommit,
       source_tree: setup.sourceTree,
-      package_sha256: directoryDigest(verified.pluginRoot),
+      package_sha256: verified.packageSha256,
     },
     marketplace: {
       repository: setup.marketplaceSource,

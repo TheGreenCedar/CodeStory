@@ -40,9 +40,9 @@ def load_calibration_bundle(
     manifest: dict[str, object],
     measurement_contract: dict[str, object],
     *,
-    require_frozen: bool,
+    required: bool,
 ) -> dict[str, object] | None:
-    if not require_frozen:
+    if not required:
         return None
     require(
         args.calibration_bundle is not None,
@@ -61,6 +61,15 @@ def load_calibration_bundle(
         enforce_source_lineage=args.enforce_calibration_freeze_lineage,
         expected_producer_run_id=args.calibration_producer_run_id,
         expected_producer_artifact=args.calibration_producer_artifact,
+    )
+
+
+def requires_calibration_bundle(args: argparse.Namespace) -> bool:
+    return args.enforce_calibration_freeze_lineage or (
+        not args.version_only
+        and args.proof_tier != "calibration"
+        and not args.server_behavior_only
+        and not args.ground_only
     )
 
 
@@ -146,7 +155,7 @@ def run_archive_proof(args: argparse.Namespace) -> None:
             args,
             manifest,
             measurement_contract,
-            require_frozen=require_frozen,
+            required=requires_calibration_bundle(args),
         )
         env = isolated_environment(root, args.engine_policy, args.offline)
         summary = package_summary(

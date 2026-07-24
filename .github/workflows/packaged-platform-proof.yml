@@ -232,7 +232,7 @@ jobs:
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
 
       - name: Build qualification driver
-        if: matrix.asset_target == 'linux-x64'
+        if: matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')
         run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Prove clean-cache Node-absent network-denied offline release build
@@ -528,7 +528,10 @@ jobs:
           path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
-        if: matrix.asset_target == 'linux-x64' && inputs.calibration_bundle_artifact != '' && inputs.calibration_bundle_run_id != ''
+        if: >-
+          matrix.asset_target == 'linux-x64' &&
+          !inputs.calibration_mode &&
+          (inputs.quality_evidence_artifact != '' || inputs.enforce_calibration_freeze_lineage)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -551,7 +554,10 @@ jobs:
           test "$artifact_count" = 1
 
       - name: Download frozen calibration bundle
-        if: matrix.asset_target == 'linux-x64' && inputs.calibration_bundle_artifact != '' && inputs.calibration_bundle_run_id != ''
+        if: >-
+          matrix.asset_target == 'linux-x64' &&
+          !inputs.calibration_mode &&
+          (inputs.quality_evidence_artifact != '' || inputs.enforce_calibration_freeze_lineage)
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
@@ -605,7 +611,10 @@ jobs:
             proof_tier=hosted_package
           fi
           calibration_args=()
-          if [ "$proof_tier" = hosted_package ]; then
+          if [ "$proof_tier" = hosted_package ] && {
+            [ -n "${{ inputs.quality_evidence_artifact }}" ] ||
+              [ "${{ inputs.enforce_calibration_freeze_lineage }}" = true ]
+          }; then
             calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print 2>/dev/null || true)"
             test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
             calibration_args=(
@@ -666,9 +675,7 @@ jobs:
         if: >-
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
-          !inputs.calibration_mode &&
-          inputs.calibration_bundle_artifact != '' &&
-          inputs.calibration_bundle_run_id != ''
+          !inputs.calibration_mode
         shell: bash
         run: |
           set -euo pipefail
@@ -703,29 +710,34 @@ jobs:
         if: >-
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
-          !inputs.calibration_mode &&
-          inputs.calibration_bundle_artifact != '' &&
-          inputs.calibration_bundle_run_id != ''
+          !inputs.calibration_mode
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
         shell: bash
         run: |
           set -euo pipefail
           archive="target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
+          calibration_args=()
           if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
             claim_args=(--server-behavior-only)
           else
             test -f "$quality_path"
+            calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+            test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
             claim_args=(
               --produce-qualification-evidence
               --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/candidate-installed-linux/qualification.json
               --retrieval-quality-evidence "$quality_path"
+            )
+            calibration_args=(
+              --calibration-bundle "$calibration_bundle"
+              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
+              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
             )
           fi
           python .github/scripts/check-packaged-agent-proof.py \
@@ -741,9 +753,7 @@ jobs:
             --proof-tier installed_runtime \
             --qualification-matrix-cell candidate_installed_linux_x64_cpu \
             "${claim_args[@]}" \
-            --calibration-bundle "$calibration_bundle" \
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
+            "${calibration_args[@]}" \
             --installed-plugin-attestation target/candidate-installed-linux/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \

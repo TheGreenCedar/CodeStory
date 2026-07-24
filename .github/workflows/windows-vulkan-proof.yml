@@ -68,10 +68,12 @@ on:
         required: false
         type: string
       calibration_bundle_artifact:
-        required: true
+        required: false
+        default: ""
         type: string
       calibration_bundle_run_id:
-        required: true
+        required: false
+        default: ""
         type: string
       candidate_installed_proof:
         description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
@@ -150,6 +152,7 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
+        if: ${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -182,6 +185,7 @@ jobs:
           path: target/release-dist
 
       - name: Build qualification driver
+        if: ${{ !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
@@ -193,6 +197,7 @@ jobs:
           path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
+        if: ${{ !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -223,6 +228,7 @@ jobs:
           }
 
       - name: Download frozen calibration bundle
+        if: ${{ !inputs.server_behavior_only }}
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
@@ -242,17 +248,18 @@ jobs:
           $version = $env:VERSION.TrimStart('v')
           $sourceSha = (git rev-parse HEAD).Trim()
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
-          $calibrationBundles = @(
-            Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
-          )
-          if ($calibrationBundles.Count -ne 1) {
-            throw "expected exactly one frozen calibration-bundle.json"
-          }
           $claimArgs = @()
+          $calibrationArgs = @()
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
             $claimArgs = @("--server-behavior-only")
           } else {
+            $calibrationBundles = @(
+              Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
+            )
+            if ($calibrationBundles.Count -ne 1) {
+              throw "expected exactly one frozen calibration-bundle.json"
+            }
             if (-not (Test-Path $qualityPath)) {
               throw "protected Windows proof requires exact-head quality evidence"
             }
@@ -261,6 +268,11 @@ jobs:
               "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
+            )
+            $calibrationArgs = @(
+              "--calibration-bundle", $calibrationBundles[0].FullName,
+              "--calibration-producer-run-id", "${{ inputs.calibration_bundle_run_id }}",
+              "--calibration-producer-artifact", "${{ inputs.calibration_bundle_artifact }}"
             )
           }
           python .github/scripts/check-packaged-agent-proof.py `
@@ -276,9 +288,7 @@ jobs:
             --proof-tier protected_hardware `
             --qualification-matrix-cell protected_windows_x64_vulkan `
             @claimArgs `
-            --calibration-bundle $calibrationBundles[0].FullName `
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
+            @calibrationArgs `
             --expected-source-sha $sourceSha `
             --expected-source-tree $sourceTree `
             --timeout-secs 1800 `
@@ -351,17 +361,18 @@ jobs:
           $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
           $sourceSha = (git rev-parse HEAD).Trim()
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
-          $calibrationBundles = @(
-            Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
-          )
-          if ($calibrationBundles.Count -ne 1) {
-            throw "expected exactly one frozen calibration-bundle.json"
-          }
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           $claimArgs = @()
+          $calibrationArgs = @()
           if ("${{ inputs.server_behavior_only }}" -eq "true") {
             $claimArgs = @("--ground-only")
           } else {
+            $calibrationBundles = @(
+              Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
+            )
+            if ($calibrationBundles.Count -ne 1) {
+              throw "expected exactly one frozen calibration-bundle.json"
+            }
             if (-not (Test-Path $qualityPath)) {
               throw "candidate-installed Windows proof requires exact-head quality evidence"
             }
@@ -370,6 +381,11 @@ jobs:
               "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
+            )
+            $calibrationArgs = @(
+              "--calibration-bundle", $calibrationBundles[0].FullName,
+              "--calibration-producer-run-id", "${{ inputs.calibration_bundle_run_id }}",
+              "--calibration-producer-artifact", "${{ inputs.calibration_bundle_artifact }}"
             )
           }
           $pluginRoot = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "plugin"
@@ -387,9 +403,7 @@ jobs:
             --proof-tier installed_runtime `
             --qualification-matrix-cell candidate_installed_windows_x64_cpu `
             @claimArgs `
-            --calibration-bundle $calibrationBundles[0].FullName `
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
+            @calibrationArgs `
             --installed-plugin-attestation target/candidate-installed-windows/install-attestation-v2.json `
             --installed-plugin-data $pluginData `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
@@ -418,12 +432,9 @@ jobs:
           set -euo pipefail
           version="${{ inputs.version }}"
           version="${version#v}"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           jq -n \
             --arg native_engine coderank_q8_embedded \
-            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
-            '{native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            '{native_engine: $native_engine}' \
             > target/windows-vulkan-proof/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
@@ -484,14 +495,11 @@ jobs:
           set -euo pipefail
           version="${{ inputs.version }}"
           version="${version#v}"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           jq -n \
             --arg installer candidate_managed_plugin \
             --arg runtime_version "$version" \
             --arg native_engine coderank_q8_embedded \
-            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
-            '{installer: $installer, runtime_version: $runtime_version, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            '{installer: $installer, runtime_version: $runtime_version, native_engine: $native_engine}' \
             > target/candidate-installed-windows/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \

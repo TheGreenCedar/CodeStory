@@ -127,6 +127,19 @@ test("versioned claim graph has one deterministic digest and all declared contro
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
     ["linux-x64", "macos-arm64", "windows-x64"],
   );
+  assert.equal(graph.evidence_policy.identity_formats.calibration_sha256, undefined);
+  for (const cellId of [
+    "accelerator_execution",
+    "candidate_installed_behavior",
+    "installed_runtime_behavior",
+  ]) {
+    assert.ok(
+      !graph.closeout.cell_groups
+        .find(({ id }) => id === cellId)
+        .required_identity.includes("calibration_sha256"),
+      `${cellId} must not claim external calibration evidence`,
+    );
+  }
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
     [

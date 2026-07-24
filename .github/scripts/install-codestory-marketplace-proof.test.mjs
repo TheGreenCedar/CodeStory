@@ -97,12 +97,6 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       }, null, 2)}\n`,
     );
     const marketplaceRevision = commitFixture(marketplaceRoot);
-    const sourceCommit = run("git", ["rev-parse", "HEAD"], {
-      cwd: repositoryRoot,
-    });
-    const sourceTree = run("git", ["rev-parse", "HEAD^{tree}"], {
-      cwd: repositoryRoot,
-    });
     const pluginManifest = JSON.parse(
       readFileSync(
         path.join(repositoryRoot, "plugins", "codestory", ".codex-plugin", "plugin.json"),
@@ -129,10 +123,8 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       "true",
       "--expected-version",
       pluginManifest.version,
-      "--source-commit",
-      sourceCommit,
-      "--source-tree",
-      sourceTree,
+      "--source-repository",
+      repositoryRoot,
       "--attestation",
       attestationPath,
     ]);
@@ -149,6 +141,14 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     assert.equal(attestation.schema_version, 2);
     assert.equal(attestation.marketplace.codex_cli_version, `codex-cli ${codexVersion}`);
     assert.equal(attestation.marketplace.revision, marketplaceRevision);
+    assert.equal(
+      attestation.plugin.source_commit,
+      run("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot }),
+    );
+    assert.equal(
+      attestation.plugin.source_tree,
+      run("git", ["rev-parse", "HEAD^{tree}"], { cwd: repositoryRoot }),
+    );
     assert.equal(attestation.marketplace.provenance.add.revision, marketplaceRevision);
     assert.equal(attestation.marketplace.provenance.list.revision, marketplaceRevision);
     assert.equal(
@@ -165,6 +165,49 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     assert.match(config, /\[marketplaces\.Fixture\]/u);
     assert.match(config, /\[plugins\."codestory@Fixture"\]/u);
     assert.match(config, /enabled = true/u);
+
+    const mismatchedSource = path.join(root, "mismatched-source");
+    cpSync(
+      path.join(repositoryRoot, "plugins", "codestory"),
+      path.join(mismatchedSource, "plugins", "codestory"),
+      { recursive: true },
+    );
+    writeFileSync(
+      path.join(mismatchedSource, "plugins", "codestory", "mismatched.txt"),
+      "different package bytes\n",
+    );
+    commitFixture(mismatchedSource);
+    const mismatch = spawnSync(process.execPath, [
+      helper,
+      "--codex-package-root",
+      packageRoot,
+      "--codex-home",
+      path.join(root, "mismatch-codex-home"),
+      "--plugin-data",
+      path.join(root, "mismatch-codex-home", "plugin-data"),
+      "--marketplace-source",
+      marketplaceRoot,
+      "--marketplace-name",
+      "Fixture",
+      "--marketplace-revision",
+      marketplaceRevision,
+      "--local-fixture",
+      "true",
+      "--expected-version",
+      pluginManifest.version,
+      "--source-repository",
+      mismatchedSource,
+      "--attestation",
+      path.join(root, "mismatch-attestation.json"),
+    ], {
+      encoding: "utf8",
+      shell: process.platform === "win32",
+    });
+    assert.notEqual(mismatch.status, 0);
+    assert.match(
+      mismatch.stderr,
+      /installed plugin bytes do not match the checked-out CodeStory package/u,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

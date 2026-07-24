@@ -736,6 +736,103 @@ test("hosted Linux calibration keeps its bounded per-run timeout", async (t) => 
   }
 });
 
+test("standard release paths reject calibration plumbing without weakening qualification", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const mutations = [
+    ["auto-release forwards calibration", workflows => {
+      workflows.get("auto-release.yml").jobs.release.with.calibration_bundle_artifact
+        = "${{ vars.CODESTORY_CALIBRATION_BUNDLE_ARTIFACT }}";
+    }, /auto-release\.yml standard release path must not reference calibration/u],
+    ["release accepts calibration input", workflows => {
+      workflows.get("release.yml").on.workflow_call.inputs.calibration_bundle_artifact = {
+        required: true,
+        type: "string",
+      };
+    }, /release\.yml standard release path must not reference calibration/u],
+    ["release forwards calibration to package proof", workflows => {
+      workflows.get("release.yml").jobs["packaged-proof"].with.calibration_bundle_run_id
+        = "${{ inputs.calibration_bundle_run_id }}";
+    }, /release\.yml standard release path must not reference calibration/u],
+    ["post-publish ground proof receives calibration", workflows => {
+      const step = draftStep(
+        workflows.get("post-publish-release-smoke.yml").jobs.smoke,
+        "Qualify the catalog-resolved published runtime",
+      );
+      step.run += '\n--calibration-bundle "$calibration_bundle"';
+    }, /post-publish-release-smoke\.yml standard release path must not reference calibration/u],
+    ["packaged server proof passes calibration directly", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-proof.yml").jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      step.run = step.run.replace(
+        '"${calibration_args[@]}" \\\n',
+        '"${calibration_args[@]}" \\\n  --calibration-bundle "$calibration_bundle" \\\n',
+      );
+    }, /standard server-behavior proof must omit calibration/u],
+    ["packaged calibration download reaches standard mode", workflows => {
+      const job = workflows.get("packaged-platform-proof.yml").jobs.build;
+      draftStep(job, "Authenticate calibration bundle producer").if
+        = "matrix.asset_target == 'linux-x64'";
+      draftStep(job, "Download frozen calibration bundle").if
+        = "matrix.asset_target == 'linux-x64'";
+    }, /calibration authentication and download must run only for qualification or freeze lineage/u],
+    ["packaged qualification drops its bundle", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-proof.yml").jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      step.run = step.run.replace(
+        '--calibration-bundle "$calibration_bundle"',
+        "--qualification-without-bundle",
+      );
+    }, /must run --calibration-bundle|standard server-behavior proof must omit calibration while qualification and freeze lineage retain it/u],
+    ["Metal server proof passes calibration directly", workflows => {
+      const step = draftStep(
+        workflows.get("macos-metal-proof.yml").jobs["packaged-metal"],
+        "Prove cold and warm Metal, offline packaging, and multi-repository reuse",
+      );
+      step.run = step.run.replace(
+        '"${calibration_args[@]}" \\\n',
+        '"${calibration_args[@]}" \\\n  --calibration-bundle "$calibration_bundle" \\\n',
+      );
+    }, /server-behavior proof must omit calibration while qualification retains it/u],
+    ["Windows candidate ground passes calibration directly", workflows => {
+      const step = draftStep(
+        workflows.get("windows-vulkan-proof.yml").jobs["packaged-vulkan"],
+        "Prove two-host candidate-installed Windows runtime",
+      );
+      step.run = step.run.replace(
+        "@calibrationArgs `\n",
+        "@calibrationArgs `\n--calibration-bundle `$calibrationBundles[0].FullName `\n",
+      );
+    }, /candidate ground proof must omit calibration while qualification retains it/u],
+    ["Linux candidate ground passes calibration", workflows => {
+      const step = draftStep(
+        workflows.get("linux-vulkan-proof.yml").jobs["packaged-vulkan"],
+        "Prove candidate-installed Linux Vulkan runtime",
+      );
+      step.run += '\n--calibration-bundle "$calibration_bundle"';
+    }, /must not run calibration/u],
+    ["accelerator cell claims calibration identity", workflows => {
+      const step = draftStep(
+        workflows.get("macos-metal-proof.yml").jobs["packaged-metal"],
+        "Emit authenticated Metal release cell",
+      );
+      step.run += "\ncalibration_sha256=forged";
+    }, /must not run calibration/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
 test("Cargo lock policy reads executable step commands", () => {
   const workflow = parseWorkflow(`
 on: { workflow_dispatch: null }
@@ -1530,6 +1627,16 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
       installStep(workflow).run = installStep(workflow).run
         .replace('--marketplace-revision "$marketplace_revision"', "--marketplace-revision main");
     }, /Resolve the published plugin through the marketplace catalog/u],
+    ["marketplace revision is resolved again after publication", workflow => {
+      installStep(workflow).run += "\ngit ls-remote origin refs/heads/main";
+    }, /must not fabricate installation with git ls-remote/u],
+    ["checked-out package binding is removed", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace(
+          '--source-repository "$GITHUB_WORKSPACE"',
+          '--source-commit "$GITHUB_SHA"',
+        );
+    }, /Resolve the published plugin through the marketplace catalog/u],
     ["real installer helper is bypassed", workflow => {
       installStep(workflow).run = installStep(workflow).run
         .replace(
@@ -1904,6 +2011,14 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       workflows.get("release.yml").jobs.preflight.steps = workflows
         .get("release.yml").jobs.preflight.steps
         .filter(({ name }) => name !== "Refuse existing tag or release");
+    }],
+    ["public marketplace preflight", workflows => {
+      workflows.get("release.yml").jobs.preflight.steps = workflows
+        .get("release.yml").jobs.preflight.steps
+        .filter(({ name }) => name !== "Prove the public marketplace install path");
+    }],
+    ["post-publish marketplace revision handoff", workflows => {
+      workflows.get("release.yml").jobs["post-publish-smoke"].with.marketplace_revision = "main";
     }],
     ["publish replay guard", workflows => {
       const step = workflows.get("release.yml").jobs.publish.steps

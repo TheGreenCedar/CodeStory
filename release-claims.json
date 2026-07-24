@@ -110,7 +110,6 @@
       "producer_run_attempt": "positive_integer",
       "producer_artifact": "non_empty_text",
       "native_engine": "identifier",
-      "calibration_sha256": "sha256",
       "pre_publish_artifact_sha256": "sha256"
     }
   },
@@ -644,7 +643,6 @@
           "runner",
           "backend",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",
@@ -788,7 +786,6 @@
           "installer",
           "runtime_version",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",
@@ -897,7 +894,6 @@
           "installer",
           "runtime_version",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",

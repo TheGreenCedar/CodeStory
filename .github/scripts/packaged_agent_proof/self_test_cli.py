@@ -6,7 +6,7 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from .archive_proof import claim_scope
+from .archive_proof import claim_scope, load_calibration_bundle, requires_calibration_bundle
 from .cli import _installed_proof_source, _resolve_optional_paths
 from .contract_primitives import write_json
 from .foundation import ProofFailure, require
@@ -33,6 +33,10 @@ def run_cli_self_tests() -> None:
             proof_tier="installed_runtime",
             ground_only=True,
             server_behavior_only=False,
+            version_only=False,
+            enforce_calibration_freeze_lineage=False,
+            calibration_producer_run_id=None,
+            calibration_producer_artifact=None,
         )
         _resolve_optional_paths(args)
         require(
@@ -47,6 +51,42 @@ def run_cli_self_tests() -> None:
             claim_scope(args) == "installed_ground",
             "installed ground claim scope changed",
         )
+        require(
+            not requires_calibration_bundle(args),
+            "ground-only proof unexpectedly requires a calibration bundle",
+        )
+        require(
+            load_calibration_bundle(args, {}, {}, required=False) is None,
+            "ground-only proof unexpectedly loaded a calibration bundle",
+        )
+
+        args.ground_only = False
+        args.server_behavior_only = True
+        require(
+            not requires_calibration_bundle(args),
+            "server-behavior-only proof unexpectedly requires a calibration bundle",
+        )
+
+        args.server_behavior_only = False
+        require(
+            requires_calibration_bundle(args),
+            "qualification proof no longer requires a calibration bundle",
+        )
+        try:
+            load_calibration_bundle(args, {}, {}, required=True)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("qualification proof accepted a missing calibration bundle")
+
+        args.server_behavior_only = True
+        args.enforce_calibration_freeze_lineage = True
+        require(
+            requires_calibration_bundle(args),
+            "freeze-lineage proof no longer requires a calibration bundle",
+        )
+        args.enforce_calibration_freeze_lineage = False
+        args.server_behavior_only = False
 
         write_json(attestation, {"installation_source": "unsupported"})
         try:
