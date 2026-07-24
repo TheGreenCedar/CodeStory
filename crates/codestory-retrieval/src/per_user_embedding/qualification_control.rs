@@ -15,6 +15,19 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+mod server;
+
+pub(super) use server::{
+    ServerQualificationControl, ServerQualificationEvent, ServerQualificationEventClock,
+    poll_server_qualification_command, server_qualification_control_from_env,
+    sync_qualification_directory, validate_private_qualification_file_metadata,
+    write_server_qualification_event,
+};
+#[cfg(test)]
+pub(super) use server::{
+    read_server_qualification_command, server_qualification_control_from_values,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingQualificationRequest {
