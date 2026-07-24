@@ -6,10 +6,8 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,19 +34,13 @@ from .contracts import (
 from .archive import (
     normalized_backend,
 )
-from .runtime import (
-    metric_passes,
-    retain_five_process_memory_evidence,
-)
-from .qualification import (
-    qualification_measurement_artifact,
-)
 from .qualification_production import (
     collect_qualification_external_evidence,
     collect_qualification_scenarios,
     prepare_qualification_producer,
     run_qualification_producer,
 )
+from .qualification_metrics import collect_qualification_measurements
 
 def verify_calibration_source_lineage(
     calibration_source: dict,
@@ -1130,12 +1122,10 @@ def produce_qualification_evidence(
         server_cleanup_control,
     )
     external = collect_qualification_external_evidence(context)
-    artifact_root = context.artifact_root
     nonce = context.nonce
     projects = list(context.projects)
     contracts = context.contracts
     package = context.package
-    retrieval_quality_evidence = external.retrieval_quality
     runner = run_qualification_producer(context)
     identity = runtime["identity"]
     expected_backend = runner.expected_backend
@@ -1143,7 +1133,6 @@ def produce_qualification_evidence(
     matrix_cell = runner.matrix_cell
     output = runner.output
     expected_status = runner.expected_status
-    constants_frozen = measurement_contract["constant_set"]["status"] == "frozen"
     scenario_evidence = collect_qualification_scenarios(
         context,
         runner,
@@ -1152,74 +1141,15 @@ def produce_qualification_evidence(
     shared = scenario_evidence.shared_identity
     retained_scenarios = scenario_evidence.scenarios
     forbidden_values = [nonce, *projects]
-    measurement = qualification_measurement_artifact(
-        artifact_root,
-        output["measurements"],
-        contracts=contracts,
-        measurement_contract=measurement_contract,
-        target=manifest["asset_target"],
-        proof_tier=args.proof_tier,
-        matrix_cell_id=matrix_cell_id,
-        expected_policy=args.engine_policy,
-        expected_backend=expected_backend,
-        forbidden_values=forbidden_values,
+    measurements = collect_qualification_measurements(
+        context,
+        runner,
+        external,
     )
-    memory_evidence = retain_five_process_memory_evidence(
-        artifact_root,
-        runtime.get("_memory_observations"),
-        source=manifest["source"],
-        package=package,
-        contracts=contracts,
-        protocol=measurement_contract["measurement_protocol"],
-        target=manifest["asset_target"],
-        proof_tier=args.proof_tier,
-        matrix_cell_id=matrix_cell_id,
-        expected_policy=args.engine_policy,
-        expected_backend=expected_backend,
-        forbidden_values=forbidden_values,
-    )
-    timing = {
-        "clock_domain": "awake_monotonic",
-        "cross_process_timestamp_subtraction": False,
-        "unplanned_suspend": measurement["unplanned_suspend"],
-        "constants_frozen_before_run": constants_frozen,
-        "constant_set_sha256": contracts["constant_set_sha256"],
-    }
-    cache_state = (
-        "reused"
-        if runtime["materialization"]["reused_on_rejoin"] is True
-        else "materialized"
-    )
-    residency_state = require_nonempty_string(
-        identity["embedding_engine_residency"],
-        "runtime engine residency",
-    )
-    platform_label = (
-        f"{sys.platform}:{os.uname().machine}"
-        if hasattr(os, "uname")
-        else sys.platform
-    )
-    host = {
-        "fingerprint": canonical_sha256(
-            {
-                "platform": platform_label,
-                "target": manifest["asset_target"],
-                "account_id": runtime["same_account"]["account_id"],
-                "backend": normalized_backend(expected_backend),
-                "policy": args.engine_policy,
-            }
-        ),
-        "platform": platform_label,
-        "target": manifest["asset_target"],
-        "matrix_cell_id": matrix_cell_id,
-        "host_class": matrix_cell["host_class"],
-        "accelerator_claim": matrix_cell["accelerator_claim"],
-        "backend": identity["embedding_backend"],
-        "policy": args.engine_policy,
-        "cache_state": cache_state,
-        "residency_state": residency_state,
-        "unplanned_suspend": measurement["unplanned_suspend"],
-    }
+    measurement = measurements.measurement
+    memory_evidence = measurements.memory
+    timing = measurements.timing
+    host = measurements.host
     nonclaims = {
         claim: {
             "claimed": False,
@@ -1230,79 +1160,7 @@ def produce_qualification_evidence(
         for claim in sorted(LOWER_TIER_NONCLAIMS)
     }
 
-    required_metrics = set(measurement_contract["measurement_protocol"]["required_metrics"])
-    metric_contracts = measurement_contract["measurement_protocol"]["metric_contracts"]
-    thresholds = measurement_contract["constant_set"]["qualification_thresholds"]
-    retained_metrics: dict[str, dict] = {}
-    for metric in sorted(required_metrics):
-        unit = metric_contracts[metric]["unit"]
-        if metric == "retrieval_quality" and retrieval_quality_evidence is None:
-            require(
-                args.proof_tier == "calibration",
-                "qualification retrieval quality omitted publishable packet evidence",
-            )
-            retained_metrics[metric] = {
-                "status": "not_measured",
-                "unit": unit,
-                "value": None,
-                "reason": (
-                    "calibration omitted the separately produced exact-head publishable packet artifact"
-                ),
-            }
-            continue
-        value = (
-            retrieval_quality_evidence["publishable_packet_pass_rate"]
-            if metric == "retrieval_quality"
-            else (
-                memory_evidence["value"]
-                if metric == "total_codestory_process_memory"
-                else measurement["values"][metric]
-            )
-        )
-        require(
-            isinstance(value, (int, float)) and not isinstance(value, bool),
-            f"qualification metric {metric} is not numeric",
-        )
-        if args.proof_tier == "calibration":
-            retained_metrics[metric] = {
-                "status": "calibration",
-                "unit": unit,
-                "value": value,
-            }
-            if metric == "retrieval_quality":
-                retained_metrics[metric]["raw_evidence"] = retrieval_quality_evidence
-            elif metric == "total_codestory_process_memory":
-                retained_metrics[metric]["raw_evidence"] = memory_evidence["artifact"]
-            else:
-                retained_metrics[metric]["raw_evidence"] = measurement["artifact"]
-            continue
-        threshold = thresholds[metric]
-        require(
-            isinstance(threshold, (int, float)) and not isinstance(threshold, bool),
-            f"qualification metric {metric} has no frozen threshold",
-        )
-        comparison = metric_contracts[metric]["comparison"]
-        require(
-            metric_passes(value, threshold, comparison),
-            f"qualification metric {metric} failed its frozen threshold",
-        )
-        retained_metrics[metric] = {
-            "status": "pass",
-            "unit": unit,
-            "value": value,
-            "threshold": threshold,
-            "comparison": comparison,
-        }
-        if metric == "retrieval_quality":
-            require(
-                retrieval_quality_evidence is not None,
-                "qualification retrieval quality omitted publishable packet evidence",
-            )
-            retained_metrics[metric]["raw_evidence"] = retrieval_quality_evidence
-        elif metric == "total_codestory_process_memory":
-            retained_metrics[metric]["raw_evidence"] = memory_evidence["artifact"]
-        else:
-            retained_metrics[metric]["raw_evidence"] = measurement["artifact"]
+    retained_metrics = measurements.metrics
 
     retained = {
         "schema_version": 1,
