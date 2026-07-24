@@ -11,6 +11,7 @@ from .contract_primitives import (
     write_private_json,
 )
 from .foundation import LOWER_TIER_NONCLAIMS, require
+from .native_manifest import runtime_executable_sha256
 from .qualification_metrics import QualificationMeasurementEvidence
 from .qualification_production_types import (
     QualificationProducerContext,
@@ -90,7 +91,7 @@ def calibration_run_output(
     identity = context.runtime["identity"]
     package = {
         "archive_sha256": context.archive_sha256,
-        "executable_sha256": context.manifest["binary"]["sha256"],
+        "executable_sha256": runtime_executable_sha256(context.manifest),
         "asset_target": context.manifest["asset_target"],
         "release_version": context.manifest["release_version"],
         "model_sha256": identity["embedding_model_sha256"],

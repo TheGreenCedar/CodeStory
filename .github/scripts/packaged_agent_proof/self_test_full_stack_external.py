@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 from .contract_primitives import write_json
 from .foundation import (
@@ -17,6 +18,7 @@ from .foundation import (
     require,
 )
 from .measurement_protocol import load_holdout_task_contracts
+from .native_manifest import runtime_executable_sha256
 from .package_contracts import verify_package_server_contracts
 from .publication_consistency_verifier import (
     verify_fault_recovery_consistency_raw_evidence,
@@ -36,7 +38,7 @@ def _external_contracts(fixture: FullStackFixture) -> tuple[dict, dict]:
     return (
         {
             "archive_sha256": "b" * 64,
-            "executable_sha256": fixture.manifest["binary"]["sha256"],
+            "executable_sha256": runtime_executable_sha256(fixture.manifest),
             "asset_target": fixture.manifest["asset_target"],
             "release_version": fixture.manifest["release_version"],
         },
@@ -45,6 +47,18 @@ def _external_contracts(fixture: FullStackFixture) -> tuple[dict, dict]:
             "constant_set_sha256": fixture.constant_set_sha256,
             "measurement_protocol_sha256": fixture.measurement_protocol_sha256,
         },
+    )
+
+
+def _split_executable_contract_test(fixture: FullStackFixture) -> None:
+    manifest = json.loads(json.dumps(fixture.manifest))
+    runtime_digest = "e" * 64
+    manifest["runtime_executable"]["sha256"] = runtime_digest
+    package, _contracts = _external_contracts(replace(fixture, manifest=manifest))
+    require(
+        package["executable_sha256"] == runtime_digest
+        and package["executable_sha256"] != manifest["binary"]["sha256"],
+        "external evidence used the launcher digest for a split runtime package",
     )
 
 
@@ -511,6 +525,7 @@ def _quality_hostiles(
 def run_external_evidence_self_tests(
     fixture: FullStackFixture,
 ) -> ExternalEvidenceFixture:
+    _split_executable_contract_test(fixture)
     publication = _publication_fault_test(fixture)
     _publication_fault_hostile(fixture, publication)
     _server_crash_scenario_tests()

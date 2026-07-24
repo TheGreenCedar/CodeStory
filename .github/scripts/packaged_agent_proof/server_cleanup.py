@@ -18,6 +18,7 @@ from .foundation import (
     ProofFailure,
     require,
 )
+from .native_manifest import runtime_executable_sha256
 from .process_identity import (
     ExactProcessExitWaiter,
     require_native_process_start_identity,
@@ -54,7 +55,7 @@ def pin_temporary_package_server(
         pid=pid,
         process_start_id=process_start_id,
         reported_sha256=server_process["executable_sha256"],
-        expected_sha256=manifest["binary"]["sha256"],
+        expected_sha256=runtime_executable_sha256(manifest),
         target_os=target_os,
         label=label,
     )
@@ -173,6 +174,21 @@ def _cleanup_environment(env: dict[str, str], control: dict) -> dict[str, str]:
         )
     else:
         cleanup_env.pop("CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256", None)
+    manifest_path = control.get("plugin_cli_manifest_path")
+    if manifest_path is not None:
+        manifest_path = Path(
+            require_nonempty_string(
+                manifest_path,
+                "final server cleanup native manifest path",
+            )
+        )
+        require(
+            manifest_path.is_absolute() and manifest_path.is_file(),
+            "final server cleanup native manifest path is invalid",
+        )
+        cleanup_env["CODESTORY_PLUGIN_CLI_MANIFEST_PATH"] = str(manifest_path)
+    else:
+        cleanup_env.pop("CODESTORY_PLUGIN_CLI_MANIFEST_PATH", None)
     return cleanup_env
 
 

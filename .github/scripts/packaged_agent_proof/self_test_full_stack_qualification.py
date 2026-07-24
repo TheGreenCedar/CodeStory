@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
     ProofFailure,
+    require,
 )
+from .native_manifest import runtime_executable_sha256
 from .qualification_retained import verify_retained_qualification
 from .self_test_full_stack_types import (
     ExternalEvidenceFixture,
@@ -21,7 +24,7 @@ def _package_and_host_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:
     manifest = fixture.manifest
     package = {
         "archive_sha256": "b" * 64,
-        "executable_sha256": manifest["binary"]["sha256"],
+        "executable_sha256": runtime_executable_sha256(manifest),
         "asset_target": manifest["asset_target"],
         "release_version": manifest["release_version"],
         "model_sha256": manifest["model"]["sha256"],
@@ -243,6 +246,43 @@ def _engine_identity_hostiles(server: ServerIdentityFixture) -> None:
         raise ProofFailure("inferred accelerator execution was accepted")
 
 
+def _split_executable_retained_test(
+    fixture: FullStackFixture,
+    server: ServerIdentityFixture,
+    external: ExternalEvidenceFixture,
+    measurement_contract: dict,
+) -> None:
+    manifest = json.loads(json.dumps(fixture.manifest))
+    runtime_digest = "e" * 64
+    manifest["runtime_executable"]["sha256"] = runtime_digest
+    split_fixture = replace(fixture, manifest=manifest)
+    retained, qualification_contract = _build_retained_evidence(
+        split_fixture,
+        server,
+        external,
+        measurement_contract,
+    )
+    require(
+        retained["package"]["executable_sha256"] == runtime_digest,
+        "retained qualification used the launcher digest for a split runtime package",
+    )
+    _verify_retained(
+        retained,
+        split_fixture,
+        server,
+        qualification_contract,
+    )
+    launcher_bound = json.loads(json.dumps(retained))
+    launcher_bound["package"]["executable_sha256"] = manifest["binary"]["sha256"]
+    _expect_retained_rejected(
+        launcher_bound,
+        split_fixture,
+        server,
+        qualification_contract,
+        "retained qualification accepted the launcher digest as the runtime executable",
+    )
+
+
 def run_retained_qualification_self_tests(
     fixture: FullStackFixture,
     server: ServerIdentityFixture,
@@ -261,5 +301,11 @@ def run_retained_qualification_self_tests(
         fixture,
         server,
         qualification_contract,
+    )
+    _split_executable_retained_test(
+        fixture,
+        server,
+        external,
+        measurement_contract,
     )
     _engine_identity_hostiles(server)

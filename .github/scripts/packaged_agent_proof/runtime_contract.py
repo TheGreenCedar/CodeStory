@@ -6,12 +6,13 @@ import argparse
 from pathlib import Path
 
 from .contract_primitives import require_nonempty_string, sha256
-from .foundation import require
+from .foundation import NATIVE_MANIFEST_FILE, require
 from .ground_proof import prove_single_project_runtime
 from .native_contract_identity import (
     verify_engine_identities_against_manifest,
     verify_runtime_against_manifest,
 )
+from .native_manifest import runtime_executable_path
 from .qualification_workflow import produce_qualification_evidence
 from .runtime_bootstrap import prove_runtime
 from .server_cleanup import wait_for_final_temporary_package_server
@@ -52,16 +53,24 @@ def run_runtime_proof(
                 server_cleanup_control,
             )
         if args.produce_qualification_evidence:
-            qualification_cli = Path(
+            qualification_launcher = Path(
                 require_nonempty_string(
                     runtime.get("_qualification_cli_path"),
                     "runtime qualification executable",
                 )
             )
+            qualification_cli = runtime_executable_path(
+                qualification_launcher,
+                manifest,
+            )
+            qualification_env = dict(env)
+            qualification_env["CODESTORY_PLUGIN_CLI_MANIFEST_PATH"] = str(
+                qualification_launcher.resolve().parent / NATIVE_MANIFEST_FILE
+            )
             produce_qualification_evidence(
                 args,
                 qualification_cli,
-                env,
+                qualification_env,
                 root,
                 runtime,
                 manifest,

@@ -16,6 +16,7 @@ from .foundation import (
     PINNED_CODEX_CLI_VERSION,
     require,
 )
+from .native_manifest import runtime_executable_sha256
 from .qualification_retained_types import (
     RetainedPackageBinding,
     RetainedQualificationContract,
@@ -135,7 +136,11 @@ def _verify_source_and_package(
     )
     package_fields = (
         ("archive_sha256", contract.archive_sha256, "archive"),
-        ("executable_sha256", manifest["binary"]["sha256"], "executable"),
+        (
+            "executable_sha256",
+            runtime_executable_sha256(manifest),
+            "runtime executable",
+        ),
         ("asset_target", manifest["asset_target"], "package target"),
         ("release_version", manifest["release_version"], "release version"),
         ("model_sha256", manifest["model"]["sha256"], "model"),

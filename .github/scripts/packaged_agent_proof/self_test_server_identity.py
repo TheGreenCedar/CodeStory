@@ -72,7 +72,8 @@ def _engine_runtime_test(fixture: FullStackFixture) -> dict:
 def _shared_snapshot_test(
     fixture: FullStackFixture,
 ) -> tuple[dict, dict, dict]:
-    manifest = fixture.manifest
+    manifest = json.loads(json.dumps(fixture.manifest))
+    manifest["runtime_executable"]["sha256"] = "b" * 64
     protocol_sha256 = fixture.protocol_sha256
     constant_set_sha256 = fixture.constant_set_sha256
     measurement_protocol_sha256 = fixture.measurement_protocol_sha256
@@ -104,7 +105,7 @@ def _shared_snapshot_test(
                 "server_instance_id": "server-1",
                 "pid": 101,
                 "process_start_id": "boot-1:101",
-                "executable_sha256": manifest["binary"]["sha256"],
+                "executable_sha256": manifest["runtime_executable"]["sha256"],
                 "executable_version": "0.0.0",
             },
             "scheduler": {
@@ -133,6 +134,16 @@ def _shared_snapshot_test(
         manifest,
         require_resident=True,
     )
+    launcher_snapshot = json.loads(json.dumps(snapshot_payload))
+    launcher_snapshot["embedding_server"]["process"]["executable_sha256"] = manifest[
+        "binary"
+    ]["sha256"]
+    try:
+        server_snapshot(launcher_snapshot, manifest, require_resident=True)
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("launcher digest was accepted as the runtime process")
     shared = shared_server_identity(first_snapshot, second_snapshot)
     require(shared["model_load_count"] == 1, "shared server identity self-test failed")
     return snapshot_payload, first_snapshot, shared

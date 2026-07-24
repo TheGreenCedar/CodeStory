@@ -80,6 +80,7 @@ def _run_fault(
     fixture: PublicationFixture,
     commands: PublicationCommands,
     *,
+    executable_sha256: str,
     timeout: int,
 ) -> PublicationFaultRun:
     snapshot_before = send_server_qualification_control(
@@ -121,6 +122,7 @@ def _run_fault(
             fixture.project,
             private_root,
             nonce,
+            executable_sha256=executable_sha256,
             timeout=timeout,
         )
         snapshot_after = send_server_qualification_control(

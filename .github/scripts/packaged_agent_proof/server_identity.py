@@ -14,6 +14,7 @@ from .foundation import (
     SERVER_PROOF_SCHEMA_VERSION,
     require,
 )
+from .native_manifest import runtime_executable_sha256
 
 
 def find_value(value: object, key: str) -> object | None:
@@ -109,7 +110,7 @@ def _snapshot_authority_and_process(
         process.get("executable_sha256"), "embedding_server.process.executable_sha256"
     )
     require(
-        process["executable_sha256"] == manifest["binary"]["sha256"],
+        process["executable_sha256"] == runtime_executable_sha256(manifest),
         "embedding server process executable does not match the package manifest",
     )
     require(
