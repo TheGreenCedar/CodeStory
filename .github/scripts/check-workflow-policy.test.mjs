@@ -1881,6 +1881,7 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     ["post-publish smoke authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-smoke"].if; }],
     ["post-publish closeout authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-closeout"].if; }],
     ["trusted caller opt-in", workflows => { delete workflows.get("auto-release.yml").jobs.release.with.publish_release; }],
+    ["trusted caller secret handoff", workflows => { delete workflows.get("auto-release.yml").jobs.release.secrets; }],
     ["manual release source permissions", workflows => { delete workflows.get("release.yml").permissions["pull-requests"]; }],
     ["automatic release source permissions", workflows => { delete workflows.get("auto-release.yml").jobs.release.permissions["pull-requests"]; }],
     ["rogue release caller", workflows => {
