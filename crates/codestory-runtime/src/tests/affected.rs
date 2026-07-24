@@ -8,24 +8,27 @@ use super::{
     classify_unmatched_affected_input_with_metadata, compose_affected_completeness,
     compose_affected_evidence_gaps, match_affected_file_identities, normalized_affected_input,
 };
+use crate::route_coverage::{RouteHandlerCandidate, compare_route_handler_candidates};
 use crate::tests::assert_no_staged_publication_artifacts;
 use crate::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
     AffectedInputClassificationDto, AffectedMatchedFileDto, AffectedUncoveredInputDto, ApiError,
-    AppController, EventBus, FileCoverageReason, FileInfo, HashMap, IndexFreshnessChangeKindDto,
-    IndexFreshnessDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode,
-    IndexedFileRoleDto, OpenProjectRequest, PublicationTestAction, PublicationTestBoundary,
-    RefreshExecutionPlan, RefreshMode, RouteHandlerCandidate, SourceIndexPolicy, Storage, Uuid,
-    V2WorkspaceIndexer, WorkspaceManifest, arm_after_index_freshness_fence_test_hook,
-    arm_publication_test_fault, compare_optional_confidence_desc, compare_route_handler_candidates,
-    index_freshness_from_storage, indexable_source_path, indexable_source_path_in_workspace,
-    not_checked_index_freshness, process_env_test_lock, resolve_project_file_path_from_root,
-    stored_file_coverage_diagnostics,
+    AppController, FileInfo, HashMap, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexedFileRoleDto, PublicationTestAction,
+    PublicationTestBoundary, RefreshExecutionPlan, SourceIndexPolicy, Storage, Uuid,
+    WorkspaceManifest, arm_after_index_freshness_fence_test_hook, arm_publication_test_fault,
+    compare_optional_confidence_desc, index_freshness_from_storage, indexable_source_path,
+    indexable_source_path_in_workspace, not_checked_index_freshness, process_env_test_lock,
+    resolve_project_file_path_from_root, stored_file_coverage_diagnostics,
 };
+use codestory_contracts::api::{IndexMode, OpenProjectRequest};
+use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
-    Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
-    ResolutionCertainty, SourceLocation,
+    Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId as CoreNodeId, NodeKind, Occurrence,
+    OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
+use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
+use codestory_workspace::RefreshMode;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;

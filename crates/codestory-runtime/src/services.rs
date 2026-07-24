@@ -1815,6 +1815,9 @@ impl BookmarkService {
 mod activation_tests {
     use super::*;
     use crate::Runtime;
+    use crate::search_publication::{
+        read_search_generation_completion, search_index_path_for_publication,
+    };
     use std::fs;
     use std::process::Command;
 
@@ -2313,9 +2316,8 @@ mod activation_tests {
         let publication = Store::database_index_publication(&storage_path)
             .expect("read core publication")
             .expect("complete core publication");
-        let search_path =
-            crate::search_index_path_for_publication(&storage_path, Some(&publication))
-                .expect("search generation path");
+        let search_path = search_index_path_for_publication(&storage_path, Some(&publication))
+            .expect("search generation path");
         fs::remove_dir_all(&search_path).expect("remove completed search generation");
 
         let runtime = Runtime::new();
@@ -2335,8 +2337,7 @@ mod activation_tests {
             ActivationCapabilityState::Ready
         );
         assert!(
-            crate::read_search_generation_completion(&search_path, &publication.generation_id,)
-                .is_some(),
+            read_search_generation_completion(&search_path, &publication.generation_id).is_some(),
             "activation must publish a completion marker for the repaired generation"
         );
         runtime
@@ -2371,9 +2372,8 @@ mod activation_tests {
         let previous = Store::database_index_publication(&storage_path)
             .expect("read core publication")
             .expect("complete core publication");
-        let previous_search =
-            crate::search_index_path_for_publication(&storage_path, Some(&previous))
-                .expect("search generation path");
+        let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
+            .expect("search generation path");
         fs::remove_dir_all(previous_search).expect("remove completed search generation");
         Store::open(&storage_path)
             .expect("open migrated core")
@@ -2399,12 +2399,10 @@ mod activation_tests {
             current.mode,
             codestory_store::IndexPublicationMode::Incremental
         );
-        let current_search =
-            crate::search_index_path_for_publication(&storage_path, Some(&current))
-                .expect("repaired search generation path");
+        let current_search = search_index_path_for_publication(&storage_path, Some(&current))
+            .expect("repaired search generation path");
         assert!(
-            crate::read_search_generation_completion(&current_search, &current.generation_id)
-                .is_some(),
+            read_search_generation_completion(&current_search, &current.generation_id).is_some(),
             "incremental migration must publish the exact new search generation"
         );
         let storage = Store::open_read_only(&storage_path).expect("open repaired core");

@@ -1,9 +1,15 @@
+use crate::AppController;
 use crate::support::node_display_name;
-use crate::{AppController, parse_db_id};
 use codestory_contracts::api::{
     ApiError, BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest,
     CreateBookmarkRequest, NodeId, NodeKind, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
 };
+
+fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| ApiError::invalid_argument(format!("Invalid {field_name}: {raw}")))
+}
 
 impl AppController {
     pub fn list_bookmark_categories(&self) -> Result<Vec<BookmarkCategoryDto>, ApiError> {

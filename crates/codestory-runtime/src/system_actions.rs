@@ -1,8 +1,15 @@
-use super::{ApiError, SystemActionResponse, status_response};
+use super::{ApiError, SystemActionResponse};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+
+pub(crate) fn status_response(message: impl Into<String>) -> SystemActionResponse {
+    SystemActionResponse {
+        ok: true,
+        message: message.into(),
+    }
+}
 
 pub(super) fn expand_ide_template(
     template: &str,
