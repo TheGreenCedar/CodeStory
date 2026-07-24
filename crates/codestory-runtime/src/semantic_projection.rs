@@ -929,6 +929,236 @@ pub(super) fn semantic_graph_node<'a>(
         .or_else(|| endpoint_nodes.get(&node_id))
 }
 
+struct SemanticFullPageBuild<'a> {
+    page_nodes: HashMap<GraphNodeId, &'a GraphNode>,
+    summaries: HashMap<GraphNodeId, SemanticNodeGraphSummary>,
+    file_paths: HashMap<GraphNodeId, String>,
+    file_read_paths: HashMap<GraphNodeId, String>,
+    stats: SemanticDocGraphPageStats,
+}
+
+impl<'a> SemanticFullPageBuild<'a> {
+    fn prepare(
+        storage: &Storage,
+        semantic_nodes: &'a [GraphNode],
+        all_file_paths: &HashMap<GraphNodeId, String>,
+        all_file_read_paths: &HashMap<GraphNodeId, String>,
+    ) -> Result<Self, ApiError> {
+        let page_nodes = semantic_nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let context_file_ids = semantic_nodes
+            .iter()
+            .filter_map(|node| node.file_node_id)
+            .collect::<HashSet<_>>();
+        let mut file_paths = context_file_ids
+            .iter()
+            .filter_map(|file_id| {
+                all_file_paths
+                    .get(file_id)
+                    .cloned()
+                    .map(|path| (*file_id, path))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut file_read_paths = context_file_ids
+            .iter()
+            .filter_map(|file_id| {
+                all_file_read_paths
+                    .get(file_id)
+                    .cloned()
+                    .map(|path| (*file_id, path))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut stats = SemanticDocGraphPageStats {
+            lookup_entries: clamp_usize_to_u32(semantic_nodes.len()),
+            ..Default::default()
+        };
+
+        let mut missing_file_ids = context_file_ids
+            .iter()
+            .filter(|file_id| !all_file_paths.contains_key(file_id))
+            .copied()
+            .collect::<Vec<_>>();
+        missing_file_ids.sort_unstable_by_key(|node_id| node_id.0);
+        if !missing_file_ids.is_empty() {
+            let endpoint_load_started = Instant::now();
+            let file_lookup = storage
+                .get_nodes_by_ids_no_cache_for_build(&missing_file_ids)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load semantic file-node fallbacks: {e}"))
+                })?;
+            stats.endpoint_load_ms = clamp_u128_to_u32(endpoint_load_started.elapsed().as_millis());
+            stats.endpoint_rows = clamp_usize_to_u32(file_lookup.nodes.len());
+            stats.endpoint_query_batches = clamp_usize_to_u32(file_lookup.query_batches);
+            stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
+                semantic_nodes.len().saturating_add(file_lookup.nodes.len()),
+            ));
+            for (file_id, file_node) in file_lookup.nodes {
+                file_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+                file_read_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+            }
+        }
+
+        Ok(Self {
+            page_nodes,
+            summaries: semantic_nodes
+                .iter()
+                .map(|node| (node.id, SemanticNodeGraphSummary::default()))
+                .collect(),
+            file_paths,
+            file_read_paths,
+            stats,
+        })
+    }
+
+    fn observe_edge_page(
+        &mut self,
+        storage: &Storage,
+        edges: &[GraphEdge],
+        seed_node_id_set: &HashSet<GraphNodeId>,
+        scope: SemanticDocScope,
+    ) -> Result<(), ApiError> {
+        let mut endpoint_ids = HashSet::new();
+        for edge in edges {
+            let (source, target) = edge.effective_endpoints();
+            let mut assigned_node_ids = [None, None];
+            if seed_node_id_set.contains(&source) {
+                assigned_node_ids[0] = Some(source);
+            }
+            if target != source && seed_node_id_set.contains(&target) {
+                assigned_node_ids[1] = Some(target);
+            }
+            if assigned_node_ids.iter().all(Option::is_none) {
+                continue;
+            }
+            endpoint_ids.insert(source);
+            endpoint_ids.insert(target);
+            if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+                && assigned_node_ids.contains(&Some(edge.source))
+            {
+                endpoint_ids.insert(edge.target);
+            }
+        }
+        endpoint_ids.retain(|node_id| !self.page_nodes.contains_key(node_id));
+        let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
+        endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
+
+        let endpoint_load_started = Instant::now();
+        let endpoint_lookup = storage
+            .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load semantic endpoint nodes: {e}"))
+            })?;
+        self.stats.endpoint_load_ms =
+            self.stats
+                .endpoint_load_ms
+                .saturating_add(clamp_u128_to_u32(
+                    endpoint_load_started.elapsed().as_millis(),
+                ));
+        self.stats.endpoint_rows = self
+            .stats
+            .endpoint_rows
+            .saturating_add(clamp_usize_to_u32(endpoint_lookup.nodes.len()));
+        self.stats.endpoint_query_batches = self
+            .stats
+            .endpoint_query_batches
+            .saturating_add(clamp_usize_to_u32(endpoint_lookup.query_batches));
+        self.stats.lookup_entries = self.stats.lookup_entries.max(clamp_usize_to_u32(
+            self.page_nodes
+                .len()
+                .saturating_add(endpoint_lookup.nodes.len()),
+        ));
+
+        for edge in edges {
+            let (source, target) = edge.effective_endpoints();
+            if seed_node_id_set.contains(&source)
+                && let Some(node) = self.page_nodes.get(&source).copied()
+            {
+                self.summaries.entry(source).or_default().observe_edge(
+                    node,
+                    edge,
+                    &self.page_nodes,
+                    &endpoint_lookup.nodes,
+                    scope,
+                );
+            }
+            if target != source
+                && seed_node_id_set.contains(&target)
+                && let Some(node) = self.page_nodes.get(&target).copied()
+            {
+                self.summaries.entry(target).or_default().observe_edge(
+                    node,
+                    edge,
+                    &self.page_nodes,
+                    &endpoint_lookup.nodes,
+                    scope,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_edges(
+        &mut self,
+        storage: &Storage,
+        semantic_node_ids: &[GraphNodeId],
+        scope: SemanticDocScope,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<(), ApiError> {
+        for seed_node_ids in semantic_node_ids.chunks(BUILD_EDGE_SEED_BATCH_SIZE) {
+            let seed_node_id_set = seed_node_ids.iter().copied().collect::<HashSet<_>>();
+            let mut after_edge_id = None;
+            loop {
+                if is_indexing_cancelled(cancel_token) {
+                    return Err(indexing_cancelled_error());
+                }
+                let edges = storage
+                    .get_edges_for_node_ids_batch_after_for_build(
+                        seed_node_ids,
+                        after_edge_id,
+                        SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+                    )
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "Failed to stream semantic doc graph context: {e}"
+                        ))
+                    })?;
+                if edges.is_empty() {
+                    break;
+                }
+                after_edge_id = edges.last().map(|edge| edge.id);
+                self.observe_edge_page(storage, &edges, &seed_node_id_set, scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        semantic_nodes: &[GraphNode],
+    ) -> (SemanticDocGraphContext, SemanticDocGraphPageStats) {
+        let mut context = SemanticDocGraphContext {
+            file_paths: self.file_paths,
+            file_read_paths: self.file_read_paths,
+            ..Default::default()
+        };
+        for node in semantic_nodes {
+            let summary = self.summaries.remove(&node.id).unwrap_or_default();
+            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
+            context.child_labels.insert(node.id, child_labels);
+            context.referenced_labels.insert(node.id, referenced_labels);
+            context.edge_digests.insert(node.id, edge_digest);
+            context.centrality.insert(node.id, centrality);
+        }
+        (context, self.stats)
+    }
+}
+
 impl SemanticDocGraphContext {
     #[cfg(test)]
     pub(super) fn build(
@@ -1023,190 +1253,14 @@ impl SemanticDocGraphContext {
             .iter()
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        let page_nodes = semantic_nodes
-            .iter()
-            .map(|node| (node.id, node))
-            .collect::<HashMap<_, _>>();
-        let context_file_ids = semantic_nodes
-            .iter()
-            .filter_map(|node| node.file_node_id)
-            .collect::<HashSet<_>>();
-        let mut stats = SemanticDocGraphPageStats {
-            lookup_entries: clamp_usize_to_u32(semantic_nodes.len()),
-            ..Default::default()
-        };
-        let mut summaries = semantic_node_ids
-            .iter()
-            .copied()
-            .map(|node_id| (node_id, SemanticNodeGraphSummary::default()))
-            .collect::<HashMap<_, _>>();
-        let mut file_paths = context_file_ids
-            .iter()
-            .filter_map(|file_id| {
-                all_file_paths
-                    .get(file_id)
-                    .cloned()
-                    .map(|path| (*file_id, path))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut file_read_paths = context_file_ids
-            .iter()
-            .filter_map(|file_id| {
-                all_file_read_paths
-                    .get(file_id)
-                    .cloned()
-                    .map(|path| (*file_id, path))
-            })
-            .collect::<HashMap<_, _>>();
-
-        let mut missing_file_ids = context_file_ids
-            .iter()
-            .filter(|file_id| !all_file_paths.contains_key(file_id))
-            .copied()
-            .collect::<Vec<_>>();
-        missing_file_ids.sort_unstable_by_key(|node_id| node_id.0);
-        if !missing_file_ids.is_empty() {
-            let endpoint_load_started = Instant::now();
-            let file_lookup = storage
-                .get_nodes_by_ids_no_cache_for_build(&missing_file_ids)
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to load semantic file-node fallbacks: {e}"))
-                })?;
-            stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
-                endpoint_load_started.elapsed().as_millis(),
-            ));
-            stats.endpoint_rows = stats
-                .endpoint_rows
-                .saturating_add(clamp_usize_to_u32(file_lookup.nodes.len()));
-            stats.endpoint_query_batches = stats
-                .endpoint_query_batches
-                .saturating_add(clamp_usize_to_u32(file_lookup.query_batches));
-            stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
-                semantic_nodes.len().saturating_add(file_lookup.nodes.len()),
-            ));
-            for (file_id, file_node) in file_lookup.nodes {
-                file_paths
-                    .entry(file_id)
-                    .or_insert_with(|| file_node.serialized_name.clone());
-                file_read_paths
-                    .entry(file_id)
-                    .or_insert_with(|| file_node.serialized_name.clone());
-            }
-        }
-
-        for seed_node_ids in semantic_node_ids.chunks(BUILD_EDGE_SEED_BATCH_SIZE) {
-            let seed_node_id_set = seed_node_ids.iter().copied().collect::<HashSet<_>>();
-            let mut after_edge_id = None;
-            loop {
-                if is_indexing_cancelled(cancel_token) {
-                    return Err(indexing_cancelled_error());
-                }
-                let edges = storage
-                    .get_edges_for_node_ids_batch_after_for_build(
-                        seed_node_ids,
-                        after_edge_id,
-                        SEMANTIC_EDGE_STREAM_BATCH_SIZE,
-                    )
-                    .map_err(|e| {
-                        ApiError::internal(format!(
-                            "Failed to stream semantic doc graph context: {e}"
-                        ))
-                    })?;
-                if edges.is_empty() {
-                    break;
-                }
-                after_edge_id = edges.last().map(|edge| edge.id);
-
-                let mut endpoint_ids = HashSet::new();
-                for edge in &edges {
-                    let (source, target) = edge.effective_endpoints();
-                    let mut assigned_node_ids = [None, None];
-                    if seed_node_id_set.contains(&source) {
-                        assigned_node_ids[0] = Some(source);
-                    }
-                    if target != source && seed_node_id_set.contains(&target) {
-                        assigned_node_ids[1] = Some(target);
-                    }
-                    if assigned_node_ids.iter().all(Option::is_none) {
-                        continue;
-                    }
-                    endpoint_ids.insert(source);
-                    endpoint_ids.insert(target);
-                    if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
-                        && assigned_node_ids.contains(&Some(edge.source))
-                    {
-                        endpoint_ids.insert(edge.target);
-                    }
-                }
-                endpoint_ids.retain(|node_id| !page_nodes.contains_key(node_id));
-                let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
-                endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
-
-                let endpoint_load_started = Instant::now();
-                let endpoint_lookup = storage
-                    .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
-                    .map_err(|e| {
-                        ApiError::internal(format!("Failed to load semantic endpoint nodes: {e}"))
-                    })?;
-                stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
-                    endpoint_load_started.elapsed().as_millis(),
-                ));
-                stats.endpoint_rows = stats
-                    .endpoint_rows
-                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.nodes.len()));
-                stats.endpoint_query_batches = stats
-                    .endpoint_query_batches
-                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.query_batches));
-                stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
-                    semantic_nodes
-                        .len()
-                        .saturating_add(endpoint_lookup.nodes.len()),
-                ));
-
-                for edge in &edges {
-                    let (source, target) = edge.effective_endpoints();
-                    if seed_node_id_set.contains(&source)
-                        && let Some(node) = page_nodes.get(&source).copied()
-                    {
-                        summaries.entry(source).or_default().observe_edge(
-                            node,
-                            edge,
-                            &page_nodes,
-                            &endpoint_lookup.nodes,
-                            scope,
-                        );
-                    }
-                    if target != source
-                        && seed_node_id_set.contains(&target)
-                        && let Some(node) = page_nodes.get(&target).copied()
-                    {
-                        summaries.entry(target).or_default().observe_edge(
-                            node,
-                            edge,
-                            &page_nodes,
-                            &endpoint_lookup.nodes,
-                            scope,
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut context = Self {
-            file_paths,
-            file_read_paths,
-            ..Default::default()
-        };
-        for node in semantic_nodes {
-            let summary = summaries.remove(&node.id).unwrap_or_default();
-            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
-            context.child_labels.insert(node.id, child_labels);
-            context.referenced_labels.insert(node.id, referenced_labels);
-            context.edge_digests.insert(node.id, edge_digest);
-            context.centrality.insert(node.id, centrality);
-        }
-
-        Ok((context, stats))
+        let mut build = SemanticFullPageBuild::prepare(
+            storage,
+            semantic_nodes,
+            all_file_paths,
+            all_file_read_paths,
+        )?;
+        build.stream_edges(storage, &semantic_node_ids, scope, cancel_token)?;
+        Ok(build.finish(semantic_nodes))
     }
 
     pub(super) fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
@@ -2290,6 +2344,210 @@ pub(super) fn flush_pending_dense_anchor_inputs(
     Ok(())
 }
 
+struct SemanticNodeBuildContext<'a> {
+    graph_context: &'a SemanticDocGraphContext,
+    file_text_cache: &'a HashMap<String, Option<String>>,
+    stored_docs: Option<&'a HashMap<GraphNodeId, SymbolSearchDoc>>,
+    component_access: &'a HashMap<GraphNodeId, AccessKind>,
+    existing_docs: &'a HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+    updated_at_epoch_ms: i64,
+    semantic_alias_mode: SemanticDocAliasMode,
+    semantic_max_tokens: usize,
+}
+
+struct SemanticProjectionProgress<'a> {
+    stats: &'a mut SemanticProjectionStats,
+    doc_build_ns: &'a mut u128,
+    pending_docs: &'a mut Vec<PendingLlmSymbolDoc>,
+    seen_symbol_node_ids: &'a mut Vec<GraphNodeId>,
+    seen_dense_node_ids: &'a mut Vec<GraphNodeId>,
+}
+
+fn build_semantic_symbol_docs(
+    semantic_nodes: &[&GraphNode],
+    context: &SemanticNodeBuildContext<'_>,
+) -> Result<Vec<BuiltLlmSymbolDoc>, ApiError> {
+    semantic_nodes
+        .par_iter()
+        .map(|node| {
+            let display_name = node_display_name(node);
+            let file_path = context
+                .graph_context
+                .file_path_for_node(node)
+                .map(ToString::to_string);
+            let doc_text = if let Some(stored_docs) = context.stored_docs {
+                let stored = stored_docs.get(&node.id).ok_or_else(|| {
+                    ApiError::new(
+                        "semantic_projection_migration_required",
+                        format!(
+                            "Stored semantic document {} is missing from the pinned core",
+                            node.id.0
+                        ),
+                    )
+                })?;
+                if stored.file_node_id != node.file_node_id
+                    || stored.kind != node.kind
+                    || stored.display_name != display_name
+                    || stored.qualified_name != node.qualified_name
+                    || stored.file_path != file_path
+                    || stored.start_line != node.start_line
+                    || stored.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    || stored.source_provenance != SYMBOL_SEARCH_DOC_PROVENANCE
+                    || stored.doc_text.trim().is_empty()
+                    || stored.doc_hash
+                        != llm_symbol_doc_hash_with_alias(
+                            &stored.doc_text,
+                            context.semantic_alias_mode,
+                        )
+                {
+                    return Err(ApiError::new(
+                        "semantic_projection_migration_required",
+                        format!(
+                            "Stored semantic document {} does not match the pinned graph and current document contract",
+                            node.id.0
+                        ),
+                    ));
+                }
+                stored.doc_text.clone()
+            } else {
+                build_llm_symbol_doc_text_with_policy(
+                    context.graph_context,
+                    node,
+                    &display_name,
+                    file_path.as_deref(),
+                    context.file_text_cache,
+                    context.semantic_alias_mode,
+                    context.semantic_max_tokens,
+                )
+            };
+            let doc_hash =
+                llm_symbol_doc_hash_with_alias(&doc_text, context.semantic_alias_mode);
+            let dense_reason = dense_anchor_reason_for_node(
+                context.graph_context,
+                node,
+                &display_name,
+                file_path.as_deref(),
+                &doc_text,
+                context.component_access.get(&node.id).copied(),
+            );
+            let symbol_doc = SymbolSearchDoc {
+                node_id: node.id,
+                file_node_id: node.file_node_id,
+                kind: node.kind,
+                display_name: display_name.clone(),
+                qualified_name: node.qualified_name.clone(),
+                file_path: file_path.clone(),
+                start_line: node.start_line,
+                doc_text: doc_text.clone(),
+                doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                doc_hash: doc_hash.clone(),
+                policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                updated_at_epoch_ms: context.updated_at_epoch_ms,
+            };
+            let pending_with_reuse = dense_reason.map(|dense_reason| {
+                let reusable = context
+                    .existing_docs
+                    .get(&node.id)
+                    .is_some_and(|existing_doc| {
+                        existing_doc.document_hash == doc_hash
+                            && existing_doc.selection_reason == dense_reason.as_str()
+                            && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
+                    });
+                (
+                    PendingLlmSymbolDoc {
+                        node_id: node.id,
+                        file_node_id: node.file_node_id,
+                        kind: node.kind,
+                        display_name,
+                        qualified_name: node.qualified_name.clone(),
+                        file_path,
+                        start_line: node.start_line,
+                        end_line: node.end_line,
+                        doc_text,
+                        doc_hash,
+                        dense_reason,
+                    },
+                    reusable,
+                )
+            });
+            let (pending, reusable) = pending_with_reuse
+                .map(|(pending, reusable)| (Some(pending), reusable))
+                .unwrap_or((None, false));
+
+            Ok(BuiltLlmSymbolDoc {
+                symbol_doc,
+                pending,
+                reusable,
+            })
+        })
+        .collect()
+}
+
+fn publish_built_semantic_docs(
+    storage: &mut Storage,
+    built_docs: Vec<BuiltLlmSymbolDoc>,
+    source_identity: &str,
+    updated_at_epoch_ms: i64,
+    anchor_batch_size: usize,
+    cancel_token: Option<&CancellationToken>,
+    progress: &mut SemanticProjectionProgress<'_>,
+) -> Result<(), ApiError> {
+    let symbol_docs = built_docs
+        .iter()
+        .map(|built_doc| built_doc.symbol_doc.clone())
+        .collect::<Vec<_>>();
+    let symbol_upsert_started = Instant::now();
+    storage
+        .upsert_symbol_search_docs_batch(&symbol_docs)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
+    progress.stats.db_upsert_ms = progress
+        .stats
+        .db_upsert_ms
+        .saturating_add(clamp_u128_to_u32(
+            symbol_upsert_started.elapsed().as_millis(),
+        ));
+    progress.stats.symbol_search_docs_written = progress
+        .stats
+        .symbol_search_docs_written
+        .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
+
+    for built_doc in built_docs {
+        progress
+            .seen_symbol_node_ids
+            .push(built_doc.symbol_doc.node_id);
+        let Some(pending_doc) = built_doc.pending else {
+            progress.stats.dense_docs_skipped = progress.stats.dense_docs_skipped.saturating_add(1);
+            continue;
+        };
+        progress.seen_dense_node_ids.push(pending_doc.node_id);
+        observe_dense_anchor_reason(progress.stats, pending_doc.dense_reason);
+        if built_doc.reusable {
+            progress.stats.docs_reused = progress.stats.docs_reused.saturating_add(1);
+        } else {
+            progress.stats.docs_pending = progress.stats.docs_pending.saturating_add(1);
+        }
+        progress.pending_docs.push(pending_doc);
+    }
+
+    while progress.pending_docs.len() >= anchor_batch_size {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        sort_pending_dense_anchor_inputs(progress.pending_docs);
+        flush_pending_dense_anchor_inputs(
+            storage,
+            &progress.pending_docs[..anchor_batch_size],
+            source_identity,
+            updated_at_epoch_ms,
+            progress.stats,
+            cancel_token,
+        )?;
+        progress.pending_docs.drain(..anchor_batch_size);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_semantic_symbol_nodes(
     storage: &mut Storage,
@@ -2312,172 +2570,44 @@ pub(super) fn process_semantic_symbol_nodes(
     seen_symbol_node_ids: &mut Vec<GraphNodeId>,
     seen_dense_node_ids: &mut Vec<GraphNodeId>,
 ) -> Result<(), ApiError> {
+    let context = SemanticNodeBuildContext {
+        graph_context,
+        file_text_cache,
+        stored_docs,
+        component_access,
+        existing_docs,
+        updated_at_epoch_ms,
+        semantic_alias_mode,
+        semantic_max_tokens,
+    };
+    let mut progress = SemanticProjectionProgress {
+        stats,
+        doc_build_ns,
+        pending_docs,
+        seen_symbol_node_ids,
+        seen_dense_node_ids,
+    };
     for semantic_window in semantic_nodes.chunks(stream_sort_window_size.max(1)) {
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
         }
         let doc_build_started = Instant::now();
-        let built_docs = semantic_window
-            .par_iter()
-            .map(|node| {
-                let display_name = node_display_name(node);
-                let file_path = graph_context
-                    .file_path_for_node(node)
-                    .map(ToString::to_string);
-                let doc_text = if let Some(stored_docs) = stored_docs {
-                    let stored = stored_docs.get(&node.id).ok_or_else(|| {
-                        ApiError::new(
-                            "semantic_projection_migration_required",
-                            format!(
-                                "Stored semantic document {} is missing from the pinned core",
-                                node.id.0
-                            ),
-                        )
-                    })?;
-                    if stored.file_node_id != node.file_node_id
-                        || stored.kind != node.kind
-                        || stored.display_name != display_name
-                        || stored.qualified_name != node.qualified_name
-                        || stored.file_path != file_path
-                        || stored.start_line != node.start_line
-                        || stored.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
-                        || stored.source_provenance != SYMBOL_SEARCH_DOC_PROVENANCE
-                        || stored.doc_text.trim().is_empty()
-                        || stored.doc_hash
-                            != llm_symbol_doc_hash_with_alias(
-                                &stored.doc_text,
-                                semantic_alias_mode,
-                            )
-                    {
-                        return Err(ApiError::new(
-                            "semantic_projection_migration_required",
-                            format!(
-                                "Stored semantic document {} does not match the pinned graph and current document contract",
-                                node.id.0
-                            ),
-                        ));
-                    }
-                    stored.doc_text.clone()
-                } else {
-                    build_llm_symbol_doc_text_with_policy(
-                        graph_context,
-                        node,
-                        &display_name,
-                        file_path.as_deref(),
-                        file_text_cache,
-                        semantic_alias_mode,
-                        semantic_max_tokens,
-                    )
-                };
-                let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, semantic_alias_mode);
-                let dense_reason = dense_anchor_reason_for_node(
-                    graph_context,
-                    node,
-                    &display_name,
-                    file_path.as_deref(),
-                    &doc_text,
-                    component_access.get(&node.id).copied(),
-                );
-                let symbol_doc = SymbolSearchDoc {
-                    node_id: node.id,
-                    file_node_id: node.file_node_id,
-                    kind: node.kind,
-                    display_name: display_name.clone(),
-                    qualified_name: node.qualified_name.clone(),
-                    file_path: file_path.clone(),
-                    start_line: node.start_line,
-                    doc_text: doc_text.clone(),
-                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-                    doc_hash: doc_hash.clone(),
-                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
-                    updated_at_epoch_ms,
-                };
-                let pending_with_reuse = dense_reason.map(|dense_reason| {
-                    let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                        existing_doc.document_hash == doc_hash
-                            && existing_doc.selection_reason == dense_reason.as_str()
-                            && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
-                    });
-                    (
-                        PendingLlmSymbolDoc {
-                            node_id: node.id,
-                            file_node_id: node.file_node_id,
-                            kind: node.kind,
-                            display_name,
-                            qualified_name: node.qualified_name.clone(),
-                            file_path,
-                            start_line: node.start_line,
-                            end_line: node.end_line,
-                            doc_text,
-                            doc_hash,
-                            dense_reason,
-                        },
-                        reusable,
-                    )
-                });
-                let (pending, reusable) = pending_with_reuse
-                    .map(|(pending, reusable)| (Some(pending), reusable))
-                    .unwrap_or((None, false));
-
-                Ok(BuiltLlmSymbolDoc {
-                    symbol_doc,
-                    pending,
-                    reusable,
-                })
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        *doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
+        let built_docs = build_semantic_symbol_docs(semantic_window, &context)?;
+        *progress.doc_build_ns = progress
+            .doc_build_ns
+            .saturating_add(doc_build_started.elapsed().as_nanos());
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
         }
-
-        let symbol_docs = built_docs
-            .iter()
-            .map(|built_doc| built_doc.symbol_doc.clone())
-            .collect::<Vec<_>>();
-        let symbol_upsert_started = Instant::now();
-        storage
-            .upsert_symbol_search_docs_batch(&symbol_docs)
-            .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
-        stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
-            symbol_upsert_started.elapsed().as_millis(),
-        ));
-        stats.symbol_search_docs_written = stats
-            .symbol_search_docs_written
-            .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
-
-        for built_doc in built_docs {
-            seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
-            let Some(pending_doc) = built_doc.pending else {
-                stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
-                continue;
-            };
-            seen_dense_node_ids.push(pending_doc.node_id);
-            observe_dense_anchor_reason(stats, pending_doc.dense_reason);
-            if built_doc.reusable {
-                stats.docs_reused = stats.docs_reused.saturating_add(1);
-            } else {
-                stats.docs_pending = stats.docs_pending.saturating_add(1);
-            }
-            pending_docs.push(pending_doc);
-        }
-
-        while pending_docs.len() >= anchor_batch_size {
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            sort_pending_dense_anchor_inputs(pending_docs);
-            flush_pending_dense_anchor_inputs(
-                storage,
-                &pending_docs[..anchor_batch_size],
-                source_identity,
-                updated_at_epoch_ms,
-                stats,
-                cancel_token,
-            )?;
-            pending_docs.drain(..anchor_batch_size);
-        }
+        publish_built_semantic_docs(
+            storage,
+            built_docs,
+            source_identity,
+            updated_at_epoch_ms,
+            anchor_batch_size,
+            cancel_token,
+            &mut progress,
+        )?;
     }
     Ok(())
 }
@@ -2573,35 +2703,48 @@ pub(super) fn publish_component_report_docs(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn sync_llm_symbol_projection_for_runtime(
-    storage: &mut Storage,
-    nodes: &[codestory_contracts::graph::Node],
-    engine: &mut SearchEngine,
-    refresh_scope: SemanticRefreshScope<'_>,
-    hydrate_semantic_docs: bool,
-    source_identity: &str,
-    cancel_token: Option<&CancellationToken>,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Result<SemanticProjectionStats, ApiError> {
-    let mut stats = SemanticProjectionStats {
-        reported: true,
-        ..Default::default()
-    };
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
+#[derive(Clone, Copy)]
+struct SemanticRuntimePolicy {
+    updated_at_epoch_ms: i64,
+    anchor_batch_size: usize,
+    alias_mode: SemanticDocAliasMode,
+    max_tokens: usize,
+    stream_sort_window_size: usize,
+    scope: SemanticDocScope,
+}
+
+impl SemanticRuntimePolicy {
+    fn from_runtime(runtime: &codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
+        Self {
+            updated_at_epoch_ms: current_epoch_ms(),
+            anchor_batch_size,
+            alias_mode: semantic_doc_alias_mode_from_value(
+                &runtime.retrieval.semantic_doc_alias_mode,
+            ),
+            max_tokens: runtime.retrieval.semantic_doc_max_tokens,
+            stream_sort_window_size: anchor_batch_size
+                .saturating_mul(runtime.retrieval.stream_sort_window_batches)
+                .max(1),
+            scope: semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
+        }
     }
+}
 
-    let updated_at_epoch_ms = current_epoch_ms();
+struct IncrementalSemanticInputs<'a> {
+    semantic_nodes: Vec<&'a GraphNode>,
+    report_nodes: Vec<&'a GraphNode>,
+    context_nodes: Vec<&'a GraphNode>,
+    component_report_node_ids: Vec<GraphNodeId>,
+    dense_component_report_node_ids: Vec<GraphNodeId>,
+}
 
-    let existing_docs = storage
-        .get_dense_anchor_input_reuse_metadata()
-        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
-        .into_iter()
-        .map(|doc| (doc.node_id, doc))
-        .collect::<HashMap<_, _>>();
-
-    let graph_doc_contract_mismatch = refresh_scope.file_ids.is_some()
+fn effective_incremental_file_scope<'a>(
+    storage: &mut Storage,
+    requested_scope: Option<&'a HashSet<GraphNodeId>>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+) -> Result<(Option<&'a HashSet<GraphNodeId>>, bool), ApiError> {
+    let graph_doc_contract_mismatch = requested_scope.is_some()
         && storage
             .has_symbol_search_doc_contract_mismatch(
                 LLM_SYMBOL_DOC_SCHEMA_VERSION,
@@ -2612,94 +2755,85 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
                     "Failed to inspect graph-native semantic doc contract: {e}"
                 ))
             })?;
-    let dense_doc_contract_mismatch = refresh_scope.file_ids.is_some()
+    let dense_doc_contract_mismatch = requested_scope.is_some()
         && existing_docs
             .values()
             .any(|existing_doc| existing_doc.policy_version != SEMANTIC_POLICY_VERSION);
-    let expand_semantic_scope_for_contract_repair =
-        graph_doc_contract_mismatch || dense_doc_contract_mismatch;
-    if expand_semantic_scope_for_contract_repair {
+    let expand_for_contract_repair = graph_doc_contract_mismatch || dense_doc_contract_mismatch;
+    if expand_for_contract_repair {
         tracing::warn!(
             graph_doc_contract_mismatch,
             dense_doc_contract_mismatch,
             "Stored semantic-doc contract differs from the current schema or embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
         );
     }
-    let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
+    let effective_scope = if expand_for_contract_repair {
         None
     } else {
-        refresh_scope.file_ids
+        requested_scope
     };
-    let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
-    let semantic_alias_mode =
-        semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode);
-    let semantic_max_tokens = runtime.retrieval.semantic_doc_max_tokens;
-    let stream_sort_window_batches = runtime.retrieval.stream_sort_window_batches;
-    let stream_sort_window_size = anchor_batch_size.saturating_mul(stream_sort_window_batches);
-    tracing::debug!(
-        anchor_batch_size,
-        "Using dense anchor input publication batch size"
-    );
-    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
-    let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
-    let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
-    let mut component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
-    let mut dense_component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
-    let mut doc_build_ns = 0_u128;
-    let semantic_scope = semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope);
+    Ok((effective_scope, expand_for_contract_repair))
+}
+
+fn effective_component_report_scope(
+    refresh: Option<&ComponentReportRefreshScope>,
+    expand_for_contract_repair: bool,
+    file_scope: Option<&HashSet<GraphNodeId>>,
+    file_paths: &HashMap<GraphNodeId, String>,
+) -> Option<HashSet<String>> {
+    if expand_for_contract_repair {
+        return None;
+    }
+    let refresh = refresh?;
+    let normalization_changed = refresh
+        .previous_file_paths
+        .iter()
+        .any(|(file_id, old_path)| {
+            file_paths
+                .get(file_id)
+                .is_some_and(|new_path| new_path != old_path)
+        });
+    if normalization_changed {
+        tracing::warn!(
+            "Semantic file-path normalization changed; rebuilding all component reports"
+        );
+        return None;
+    }
+    let mut scope = refresh.removed_component_keys.clone();
+    if let Some(file_scope) = file_scope {
+        for file_id in file_scope {
+            if let Some(component_key) = file_paths
+                .get(file_id)
+                .and_then(|path| semantic_component_key_for_path(Some(path)))
+            {
+                scope.insert(component_key);
+            }
+        }
+    }
+    Some(scope)
+}
+
+fn select_incremental_semantic_inputs<'a>(
+    nodes: &'a [GraphNode],
+    semantic_scope: SemanticDocScope,
+    file_scope: Option<&HashSet<GraphNodeId>>,
+    component_scope: Option<&HashSet<String>>,
+    file_paths: &HashMap<GraphNodeId, String>,
+) -> IncrementalSemanticInputs<'a> {
     let semantic_nodes = nodes
         .iter()
         .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
         .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
-            effective_llm_refresh_file_scope
-                .map(|scope| {
-                    node.file_node_id
-                        .map(|file_node_id| scope.contains(&file_node_id))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true)
+            file_scope.is_none_or(|scope| {
+                node.file_node_id
+                    .is_some_and(|file_node_id| scope.contains(&file_node_id))
+            })
         })
         .collect::<Vec<_>>();
-    let files = storage
-        .get_files()
-        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
-    let effective_component_report_scope = if expand_semantic_scope_for_contract_repair {
-        None
-    } else if let Some(refresh) = refresh_scope.component_reports {
-        let normalization_changed =
-            refresh
-                .previous_file_paths
-                .iter()
-                .any(|(file_id, old_path)| {
-                    file_paths
-                        .get(file_id)
-                        .is_some_and(|new_path| new_path != old_path)
-                });
-        if normalization_changed {
-            tracing::warn!(
-                "Semantic file-path normalization changed; rebuilding all component reports"
-            );
-            None
-        } else {
-            let mut scope = refresh.removed_component_keys.clone();
-            if let Some(file_scope) = effective_llm_refresh_file_scope {
-                for file_id in file_scope {
-                    if let Some(component_key) = file_paths
-                        .get(file_id)
-                        .and_then(|path| semantic_component_key_for_path(Some(path)))
-                    {
-                        scope.insert(component_key);
-                    }
-                }
-            }
-            Some(scope)
-        }
-    } else {
-        None
-    };
-    if let Some(scope) = effective_component_report_scope.as_ref() {
+    let mut component_report_node_ids = Vec::new();
+    let mut dense_component_report_node_ids = Vec::new();
+    if let Some(scope) = component_scope {
         for node in nodes.iter().filter(|node| is_retrieval_artifact_node(node)) {
             let component_key = node
                 .serialized_name
@@ -2716,8 +2850,7 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
         .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
         .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
-            effective_component_report_scope
-                .as_ref()
+            component_scope
                 .map(|scope| {
                     node.file_node_id
                         .and_then(|file_node_id| file_paths.get(&file_node_id))
@@ -2737,7 +2870,33 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
             context_nodes.push(*node);
         }
     }
-    let semantic_node_ids = semantic_nodes
+    IncrementalSemanticInputs {
+        semantic_nodes,
+        report_nodes: report_semantic_nodes,
+        context_nodes,
+        component_report_node_ids,
+        dense_component_report_node_ids,
+    }
+}
+
+struct PreparedIncrementalSemanticContext {
+    graph: SemanticDocGraphContext,
+    file_text_cache: HashMap<String, Option<String>>,
+    component_access: HashMap<GraphNodeId, AccessKind>,
+    file_cache_build_ns: u128,
+}
+
+fn prepare_incremental_semantic_context(
+    storage: &Storage,
+    nodes: &[GraphNode],
+    inputs: &IncrementalSemanticInputs<'_>,
+    policy: SemanticRuntimePolicy,
+    file_paths: HashMap<GraphNodeId, String>,
+    file_read_paths: HashMap<GraphNodeId, String>,
+    stats: &mut SemanticProjectionStats,
+) -> Result<PreparedIncrementalSemanticContext, ApiError> {
+    let semantic_node_ids = inputs
+        .semantic_nodes
         .iter()
         .map(|node| node.id)
         .collect::<Vec<_>>();
@@ -2747,14 +2906,14 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
     let context_started = Instant::now();
     let graph_context = SemanticDocGraphContext::build_for_scope(
         storage,
-        &context_nodes,
+        &inputs.context_nodes,
         nodes,
-        semantic_scope,
+        policy.scope,
         file_paths,
         file_read_paths,
     )?;
     stats.context_ms = clamp_u128_to_u32(context_started.elapsed().as_millis());
-    stats.selected_nodes = clamp_usize_to_u32(semantic_nodes.len());
+    stats.selected_nodes = clamp_usize_to_u32(inputs.semantic_nodes.len());
     stats.context_file_count = clamp_usize_to_u32(graph_context.file_paths.len());
     stats.context_path_bytes = clamp_usize_to_u32(
         graph_context
@@ -2766,103 +2925,157 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
     );
     stats.node_lookup_entries = clamp_usize_to_u32(nodes.len());
     let file_cache_started = Instant::now();
-    let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
-    doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
+    let file_text_cache = build_semantic_file_text_cache(&graph_context, &inputs.semantic_nodes);
+    Ok(PreparedIncrementalSemanticContext {
+        graph: graph_context,
+        file_text_cache,
+        component_access,
+        file_cache_build_ns: file_cache_started.elapsed().as_nanos(),
+    })
+}
 
-    process_semantic_symbol_nodes(
-        storage,
-        &semantic_nodes,
-        &graph_context,
-        &file_text_cache,
-        None,
-        &component_access,
-        &existing_docs,
-        updated_at_epoch_ms,
-        semantic_alias_mode,
-        semantic_max_tokens,
-        stream_sort_window_size,
-        anchor_batch_size,
-        source_identity,
-        cancel_token,
-        &mut stats,
-        &mut doc_build_ns,
-        &mut pending_docs,
-        &mut seen_symbol_node_ids,
-        &mut seen_dense_node_ids,
-    )?;
+struct SemanticPublicationContext<'a> {
+    source_identity: &'a str,
+    cancel_token: Option<&'a CancellationToken>,
+    policy: SemanticRuntimePolicy,
+    existing_docs: &'a HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+}
 
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
-    let report_build_started = Instant::now();
-    let built_reports = build_component_report_docs_with_policy(
-        &graph_context,
-        &report_semantic_nodes,
-        &existing_docs,
-        updated_at_epoch_ms,
-        semantic_alias_mode,
-        semantic_max_tokens,
-    );
-    doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
-    publish_component_report_docs(
-        storage,
-        built_reports,
-        source_identity,
-        updated_at_epoch_ms,
-        anchor_batch_size,
-        cancel_token,
-        &mut stats,
-        &mut pending_docs,
-        &mut seen_symbol_node_ids,
-        &mut seen_dense_node_ids,
-        &mut component_report_node_ids,
-        &mut dense_component_report_node_ids,
-    )?;
-    stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
+#[derive(Default)]
+struct SemanticProjectionOutput {
+    pending_docs: Vec<PendingLlmSymbolDoc>,
+    seen_symbol_node_ids: Vec<GraphNodeId>,
+    seen_dense_node_ids: Vec<GraphNodeId>,
+    component_report_node_ids: Vec<GraphNodeId>,
+    dense_component_report_node_ids: Vec<GraphNodeId>,
+    doc_build_ns: u128,
+}
 
-    sort_pending_dense_anchor_inputs(&mut pending_docs);
-    for batch in pending_docs.chunks(anchor_batch_size) {
-        if is_indexing_cancelled(cancel_token) {
+fn flush_remaining_dense_anchor_inputs(
+    storage: &mut Storage,
+    output: &mut SemanticProjectionOutput,
+    publication: &SemanticPublicationContext<'_>,
+    stats: &mut SemanticProjectionStats,
+) -> Result<(), ApiError> {
+    sort_pending_dense_anchor_inputs(&mut output.pending_docs);
+    for batch in output
+        .pending_docs
+        .chunks(publication.policy.anchor_batch_size)
+    {
+        if is_indexing_cancelled(publication.cancel_token) {
             return Err(indexing_cancelled_error());
         }
         flush_pending_dense_anchor_inputs(
             storage,
             batch,
-            source_identity,
-            updated_at_epoch_ms,
-            &mut stats,
-            cancel_token,
+            publication.source_identity,
+            publication.policy.updated_at_epoch_ms,
+            stats,
+            publication.cancel_token,
         )?;
     }
+    Ok(())
+}
 
+fn publish_incremental_semantic_docs(
+    storage: &mut Storage,
+    inputs: &IncrementalSemanticInputs<'_>,
+    prepared: &PreparedIncrementalSemanticContext,
+    publication: &SemanticPublicationContext<'_>,
+    stats: &mut SemanticProjectionStats,
+    output: &mut SemanticProjectionOutput,
+) -> Result<(), ApiError> {
+    output.doc_build_ns = prepared.file_cache_build_ns;
+    process_semantic_symbol_nodes(
+        storage,
+        &inputs.semantic_nodes,
+        &prepared.graph,
+        &prepared.file_text_cache,
+        None,
+        &prepared.component_access,
+        publication.existing_docs,
+        publication.policy.updated_at_epoch_ms,
+        publication.policy.alias_mode,
+        publication.policy.max_tokens,
+        publication.policy.stream_sort_window_size,
+        publication.policy.anchor_batch_size,
+        publication.source_identity,
+        publication.cancel_token,
+        stats,
+        &mut output.doc_build_ns,
+        &mut output.pending_docs,
+        &mut output.seen_symbol_node_ids,
+        &mut output.seen_dense_node_ids,
+    )?;
+
+    if is_indexing_cancelled(publication.cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let report_build_started = Instant::now();
+    let built_reports = build_component_report_docs_with_policy(
+        &prepared.graph,
+        &inputs.report_nodes,
+        publication.existing_docs,
+        publication.policy.updated_at_epoch_ms,
+        publication.policy.alias_mode,
+        publication.policy.max_tokens,
+    );
+    output.doc_build_ns = output
+        .doc_build_ns
+        .saturating_add(report_build_started.elapsed().as_nanos());
+    publish_component_report_docs(
+        storage,
+        built_reports,
+        publication.source_identity,
+        publication.policy.updated_at_epoch_ms,
+        publication.policy.anchor_batch_size,
+        publication.cancel_token,
+        stats,
+        &mut output.pending_docs,
+        &mut output.seen_symbol_node_ids,
+        &mut output.seen_dense_node_ids,
+        &mut output.component_report_node_ids,
+        &mut output.dense_component_report_node_ids,
+    )?;
+    stats.doc_build_ms = clamp_u128_to_u32(output.doc_build_ns / 1_000_000);
+    flush_remaining_dense_anchor_inputs(storage, output, publication, stats)
+}
+
+fn prune_incremental_semantic_docs(
+    storage: &mut Storage,
+    file_scope: Option<&HashSet<GraphNodeId>>,
+    output: &SemanticProjectionOutput,
+    cancel_token: Option<&CancellationToken>,
+    stats: &mut SemanticProjectionStats,
+) -> Result<(), ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
     let prune_started = Instant::now();
-    let stale_symbol_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+    let stale_symbol_docs = if let Some(scope) = file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
             .delete_symbol_search_docs_for_files_except_node_ids(
                 &file_node_ids,
-                &seen_symbol_node_ids,
+                &output.seen_symbol_node_ids,
             )
             .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     } else {
         storage
-            .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
+            .prune_symbol_search_docs_to_node_ids(&output.seen_symbol_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     };
-    let stale_dense_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+    let stale_dense_docs = if let Some(scope) = file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
             .delete_dense_anchor_inputs_for_files_except_node_ids(
                 &file_node_ids,
-                &seen_dense_node_ids,
+                &output.seen_dense_node_ids,
             )
             .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     } else {
         storage
-            .prune_dense_anchor_inputs_to_node_ids(&seen_dense_node_ids)
+            .prune_dense_anchor_inputs_to_node_ids(&output.seen_dense_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     };
     let removed_legacy_vectors = storage
@@ -2870,8 +3083,8 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
         .map_err(|e| ApiError::internal(format!("Failed to remove legacy core vectors: {e}")))?;
     let stale_component_docs = storage
         .prune_retrieval_artifacts_to_node_ids(
-            &component_report_node_ids,
-            &dense_component_report_node_ids,
+            &output.component_report_node_ids,
+            &output.dense_component_report_node_ids,
         )
         .map_err(|e| ApiError::internal(format!("Failed to prune component reports: {e}")))?;
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
@@ -2881,11 +3094,95 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
             .saturating_add(stale_symbol_docs)
             .saturating_add(stale_component_docs),
     );
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sync_llm_symbol_projection_for_runtime(
+    storage: &mut Storage,
+    nodes: &[codestory_contracts::graph::Node],
+    engine: &mut SearchEngine,
+    refresh_scope: SemanticRefreshScope<'_>,
+    hydrate_semantic_docs: bool,
+    source_identity: &str,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<SemanticProjectionStats, ApiError> {
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let policy = SemanticRuntimePolicy::from_runtime(runtime);
+    tracing::debug!(
+        anchor_batch_size = policy.anchor_batch_size,
+        "Using dense anchor input publication batch size"
+    );
+    let existing_docs = storage
+        .get_dense_anchor_input_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
+        .into_iter()
+        .map(|doc| (doc.node_id, doc))
+        .collect::<HashMap<_, _>>();
+    let files = storage
+        .get_files()
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
+    let (effective_file_scope, expand_for_contract_repair) =
+        effective_incremental_file_scope(storage, refresh_scope.file_ids, &existing_docs)?;
+    let component_scope = effective_component_report_scope(
+        refresh_scope.component_reports,
+        expand_for_contract_repair,
+        effective_file_scope,
+        &file_paths,
+    );
+    let inputs = select_incremental_semantic_inputs(
+        nodes,
+        policy.scope,
+        effective_file_scope,
+        component_scope.as_ref(),
+        &file_paths,
+    );
+    let mut stats = SemanticProjectionStats {
+        reported: true,
+        ..Default::default()
+    };
+    let prepared = prepare_incremental_semantic_context(
+        storage,
+        nodes,
+        &inputs,
+        policy,
+        file_paths,
+        file_read_paths,
+        &mut stats,
+    )?;
+    let publication = SemanticPublicationContext {
+        source_identity,
+        cancel_token,
+        policy,
+        existing_docs: &existing_docs,
+    };
+    let mut output = SemanticProjectionOutput {
+        component_report_node_ids: inputs.component_report_node_ids.clone(),
+        dense_component_report_node_ids: inputs.dense_component_report_node_ids.clone(),
+        ..Default::default()
+    };
+    publish_incremental_semantic_docs(
+        storage,
+        &inputs,
+        &prepared,
+        &publication,
+        &mut stats,
+        &mut output,
+    )?;
+    prune_incremental_semantic_docs(
+        storage,
+        effective_file_scope,
+        &output,
+        cancel_token,
+        &mut stats,
+    )?;
     if hydrate_semantic_docs {
         engine.index_llm_symbol_docs(Vec::new());
     }
-
     Ok(stats)
 }
 
@@ -2895,38 +3192,24 @@ pub(super) enum SemanticProjectionDocumentSource {
     StoredCore,
 }
 
-pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
+struct PreparedFullSemanticStream {
+    semantic_kinds: &'static [codestory_contracts::graph::NodeKind],
+    file_paths: HashMap<GraphNodeId, String>,
+    file_read_paths: HashMap<GraphNodeId, String>,
+    file_text_cache: HashMap<String, Option<String>>,
+    file_cache_build_ns: u128,
+}
+
+fn prepare_full_semantic_stream(
     storage: &mut Storage,
-    source_identity: &str,
-    cancel_token: Option<&CancellationToken>,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    policy: SemanticRuntimePolicy,
     document_source: SemanticProjectionDocumentSource,
-) -> Result<SemanticProjectionStats, ApiError> {
+) -> Result<(PreparedFullSemanticStream, SemanticProjectionStats), ApiError> {
+    let semantic_kinds = llm_indexable_kinds_for_scope(policy.scope);
     let mut stats = SemanticProjectionStats {
         reported: true,
         ..Default::default()
     };
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
-
-    let updated_at_epoch_ms = current_epoch_ms();
-    let existing_docs = storage
-        .get_dense_anchor_input_reuse_metadata()
-        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
-        .into_iter()
-        .map(|doc| (doc.node_id, doc))
-        .collect::<HashMap<_, _>>();
-    let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
-    let semantic_alias_mode =
-        semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode);
-    let semantic_max_tokens = runtime.retrieval.semantic_doc_max_tokens;
-    let stream_sort_window_size = anchor_batch_size
-        .saturating_mul(runtime.retrieval.stream_sort_window_batches)
-        .max(1);
-    let semantic_scope = semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope);
-    let semantic_kinds = llm_indexable_kinds_for_scope(semantic_scope);
-
     let node_load_started = Instant::now();
     let semantic_file_ids = storage
         .get_node_file_ids_by_kinds_for_build(semantic_kinds)
@@ -2981,39 +3264,167 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
             .map(String::len)
             .sum(),
     );
-    let mut doc_build_ns = 0_u128;
-    let file_text_cache = if document_source == SemanticProjectionDocumentSource::SourceFiles {
-        let mut file_text_paths = HashMap::new();
-        for file_id in &semantic_file_ids {
-            let Some(display_path) = file_paths.get(file_id) else {
-                continue;
-            };
-            let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
-            file_text_paths.insert(display_path.clone(), read_path);
-        }
-        let file_cache_started = Instant::now();
-        let cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
-        doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
-        cache
-    } else {
-        HashMap::new()
-    };
+    let (file_text_cache, file_cache_build_ns) =
+        if document_source == SemanticProjectionDocumentSource::SourceFiles {
+            let mut file_text_paths = HashMap::new();
+            for file_id in &semantic_file_ids {
+                let Some(display_path) = file_paths.get(file_id) else {
+                    continue;
+                };
+                let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
+                file_text_paths.insert(display_path.clone(), read_path);
+            }
+            let file_cache_started = Instant::now();
+            let cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
+            (cache, file_cache_started.elapsed().as_nanos())
+        } else {
+            (HashMap::new(), 0)
+        };
+    Ok((
+        PreparedFullSemanticStream {
+            semantic_kinds,
+            file_paths,
+            file_read_paths,
+            file_text_cache,
+            file_cache_build_ns,
+        },
+        stats,
+    ))
+}
 
-    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
-    let mut seen_symbol_node_ids = Vec::<GraphNodeId>::new();
-    let mut seen_dense_node_ids = Vec::<GraphNodeId>::new();
-    let mut component_report_node_ids = Vec::<GraphNodeId>::new();
-    let mut dense_component_report_node_ids = Vec::<GraphNodeId>::new();
-    let mut component_reports = ComponentReportAccumulator::default();
+struct FullSemanticStreamContext<'a> {
+    prepared: &'a PreparedFullSemanticStream,
+    publication: &'a SemanticPublicationContext<'a>,
+    document_source: SemanticProjectionDocumentSource,
+}
+
+fn load_full_semantic_page_docs(
+    storage: &Storage,
+    semantic_node_ids: &[GraphNodeId],
+    context: &FullSemanticStreamContext<'_>,
+) -> Result<Option<HashMap<GraphNodeId, SymbolSearchDoc>>, ApiError> {
+    let stored_docs = if context.document_source == SemanticProjectionDocumentSource::StoredCore {
+        let docs = storage
+            .get_symbol_search_docs_for_node_ids(&semantic_node_ids)
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to load pinned semantic documents: {error}"))
+            })?;
+        if docs.len() != semantic_node_ids.len() {
+            return Err(ApiError::new(
+                "semantic_projection_migration_required",
+                format!(
+                    "Pinned core contains {} semantic nodes but only {} stored documents in this page",
+                    semantic_node_ids.len(),
+                    docs.len()
+                ),
+            ));
+        }
+        Some(
+            docs.into_iter()
+                .map(|doc| (doc.node_id, doc))
+                .collect::<HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if context.document_source == SemanticProjectionDocumentSource::StoredCore {
+        publication_test_checkpoint(
+            PublicationTestBoundary::SemanticStoredDocumentPage,
+            context.publication.cancel_token,
+        )?;
+        if is_indexing_cancelled(context.publication.cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+    }
+    Ok(stored_docs)
+}
+
+fn process_full_semantic_page(
+    storage: &mut Storage,
+    semantic_nodes: &[GraphNode],
+    context: &FullSemanticStreamContext<'_>,
+    stats: &mut SemanticProjectionStats,
+    output: &mut SemanticProjectionOutput,
+    component_reports: &mut ComponentReportAccumulator,
+) -> Result<(), ApiError> {
+    let semantic_node_ids = semantic_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let stored_docs = load_full_semantic_page_docs(storage, &semantic_node_ids, context)?;
+    let component_access = storage
+        .get_component_access_map_for_nodes(&semantic_node_ids)
+        .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
+    let context_started = Instant::now();
+    let (graph_context, page_stats) = SemanticDocGraphContext::build_for_full_page(
+        storage,
+        semantic_nodes,
+        context.publication.policy.scope,
+        &context.prepared.file_paths,
+        &context.prepared.file_read_paths,
+        context.publication.cancel_token,
+    )?;
+    #[cfg(test)]
+    publication_test_checkpoint(
+        PublicationTestBoundary::SemanticEndpointRead,
+        context.publication.cancel_token,
+    )?;
+    stats.context_ms = stats
+        .context_ms
+        .saturating_add(clamp_u128_to_u32(context_started.elapsed().as_millis()));
+    stats.endpoint_load_ms = stats
+        .endpoint_load_ms
+        .saturating_add(page_stats.endpoint_load_ms);
+    stats.endpoint_load_rows = stats
+        .endpoint_load_rows
+        .saturating_add(page_stats.endpoint_rows);
+    stats.endpoint_load_batches = stats
+        .endpoint_load_batches
+        .saturating_add(page_stats.endpoint_query_batches);
+    stats.node_lookup_entries = stats.node_lookup_entries.max(page_stats.lookup_entries);
+
+    let semantic_node_refs = semantic_nodes.iter().collect::<Vec<_>>();
+    component_reports.observe(&graph_context, &semantic_node_refs);
+    process_semantic_symbol_nodes(
+        storage,
+        &semantic_node_refs,
+        &graph_context,
+        &context.prepared.file_text_cache,
+        stored_docs.as_ref(),
+        &component_access,
+        context.publication.existing_docs,
+        context.publication.policy.updated_at_epoch_ms,
+        context.publication.policy.alias_mode,
+        context.publication.policy.max_tokens,
+        context.publication.policy.stream_sort_window_size,
+        context.publication.policy.anchor_batch_size,
+        context.publication.source_identity,
+        context.publication.cancel_token,
+        stats,
+        &mut output.doc_build_ns,
+        &mut output.pending_docs,
+        &mut output.seen_symbol_node_ids,
+        &mut output.seen_dense_node_ids,
+    )
+}
+
+fn stream_full_semantic_pages(
+    storage: &mut Storage,
+    context: &FullSemanticStreamContext<'_>,
+    stats: &mut SemanticProjectionStats,
+    output: &mut SemanticProjectionOutput,
+    component_reports: &mut ComponentReportAccumulator,
+) -> Result<(), ApiError> {
     let mut after_node_id = None;
     loop {
-        if is_indexing_cancelled(cancel_token) {
+        if is_indexing_cancelled(context.publication.cancel_token) {
             return Err(indexing_cancelled_error());
         }
         let page_load_started = Instant::now();
         let mut semantic_nodes = storage
             .get_nodes_by_kinds_batch_after_for_build(
-                semantic_kinds,
+                context.prepared.semantic_kinds,
                 after_node_id,
                 SEMANTIC_NODE_STREAM_BATCH_SIZE,
             )
@@ -3022,10 +3433,13 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
             .node_load_ms
             .saturating_add(clamp_u128_to_u32(page_load_started.elapsed().as_millis()));
         if semantic_nodes.is_empty() {
-            break;
+            return Ok(());
         }
         #[cfg(test)]
-        publication_test_checkpoint(PublicationTestBoundary::SemanticNodePage, cancel_token)?;
+        publication_test_checkpoint(
+            PublicationTestBoundary::SemanticNodePage,
+            context.publication.cancel_token,
+        )?;
         after_node_id = semantic_nodes.last().map(|node| node.id);
         stats.node_stream_batches = stats.node_stream_batches.saturating_add(1);
         stats.node_load_rows = stats
@@ -3035,171 +3449,106 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
         stats.selected_nodes = stats
             .selected_nodes
             .saturating_add(clamp_usize_to_u32(semantic_nodes.len()));
-        if semantic_nodes.is_empty() {
-            continue;
-        }
-
-        let semantic_node_ids = semantic_nodes
-            .iter()
-            .map(|node| node.id)
-            .collect::<Vec<_>>();
-        let stored_docs = if document_source == SemanticProjectionDocumentSource::StoredCore {
-            let docs = storage
-                .get_symbol_search_docs_for_node_ids(&semantic_node_ids)
-                .map_err(|error| {
-                    ApiError::internal(format!("Failed to load pinned semantic documents: {error}"))
-                })?;
-            if docs.len() != semantic_node_ids.len() {
-                return Err(ApiError::new(
-                    "semantic_projection_migration_required",
-                    format!(
-                        "Pinned core contains {} semantic nodes but only {} stored documents in this page",
-                        semantic_node_ids.len(),
-                        docs.len()
-                    ),
-                ));
-            }
-            Some(
-                docs.into_iter()
-                    .map(|doc| (doc.node_id, doc))
-                    .collect::<HashMap<_, _>>(),
-            )
-        } else {
-            None
-        };
-        #[cfg(test)]
-        if document_source == SemanticProjectionDocumentSource::StoredCore {
-            publication_test_checkpoint(
-                PublicationTestBoundary::SemanticStoredDocumentPage,
-                cancel_token,
+        if !semantic_nodes.is_empty() {
+            process_full_semantic_page(
+                storage,
+                &semantic_nodes,
+                context,
+                stats,
+                output,
+                component_reports,
             )?;
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
         }
-        let component_access = storage
-            .get_component_access_map_for_nodes(&semantic_node_ids)
-            .map_err(|e| {
-                ApiError::internal(format!("Failed to load symbol access metadata: {e}"))
-            })?;
-        let context_started = Instant::now();
-        let (graph_context, page_stats) = SemanticDocGraphContext::build_for_full_page(
-            storage,
-            &semantic_nodes,
-            semantic_scope,
-            &file_paths,
-            &file_read_paths,
-            cancel_token,
-        )?;
-        #[cfg(test)]
-        publication_test_checkpoint(PublicationTestBoundary::SemanticEndpointRead, cancel_token)?;
-        stats.context_ms = stats
-            .context_ms
-            .saturating_add(clamp_u128_to_u32(context_started.elapsed().as_millis()));
-        stats.endpoint_load_ms = stats
-            .endpoint_load_ms
-            .saturating_add(page_stats.endpoint_load_ms);
-        stats.endpoint_load_rows = stats
-            .endpoint_load_rows
-            .saturating_add(page_stats.endpoint_rows);
-        stats.endpoint_load_batches = stats
-            .endpoint_load_batches
-            .saturating_add(page_stats.endpoint_query_batches);
-        stats.node_lookup_entries = stats.node_lookup_entries.max(page_stats.lookup_entries);
-
-        let semantic_node_refs = semantic_nodes.iter().collect::<Vec<_>>();
-        component_reports.observe(&graph_context, &semantic_node_refs);
-        process_semantic_symbol_nodes(
-            storage,
-            &semantic_node_refs,
-            &graph_context,
-            &file_text_cache,
-            stored_docs.as_ref(),
-            &component_access,
-            &existing_docs,
-            updated_at_epoch_ms,
-            semantic_alias_mode,
-            semantic_max_tokens,
-            stream_sort_window_size,
-            anchor_batch_size,
-            source_identity,
-            cancel_token,
-            &mut stats,
-            &mut doc_build_ns,
-            &mut pending_docs,
-            &mut seen_symbol_node_ids,
-            &mut seen_dense_node_ids,
-        )?;
     }
+}
 
-    if is_indexing_cancelled(cancel_token) {
+fn publish_full_component_reports(
+    storage: &mut Storage,
+    component_reports: ComponentReportAccumulator,
+    publication: &SemanticPublicationContext<'_>,
+    stats: &mut SemanticProjectionStats,
+    output: &mut SemanticProjectionOutput,
+) -> Result<(), ApiError> {
+    if is_indexing_cancelled(publication.cancel_token) {
         return Err(indexing_cancelled_error());
     }
     let report_build_started = Instant::now();
     let built_reports = component_reports.build_docs(
-        &existing_docs,
-        updated_at_epoch_ms,
-        semantic_alias_mode,
-        semantic_max_tokens,
+        publication.existing_docs,
+        publication.policy.updated_at_epoch_ms,
+        publication.policy.alias_mode,
+        publication.policy.max_tokens,
     );
-    doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+    output.doc_build_ns = output
+        .doc_build_ns
+        .saturating_add(report_build_started.elapsed().as_nanos());
     publish_component_report_docs(
         storage,
         built_reports,
-        source_identity,
-        updated_at_epoch_ms,
-        anchor_batch_size,
-        cancel_token,
-        &mut stats,
-        &mut pending_docs,
-        &mut seen_symbol_node_ids,
-        &mut seen_dense_node_ids,
-        &mut component_report_node_ids,
-        &mut dense_component_report_node_ids,
+        publication.source_identity,
+        publication.policy.updated_at_epoch_ms,
+        publication.policy.anchor_batch_size,
+        publication.cancel_token,
+        stats,
+        &mut output.pending_docs,
+        &mut output.seen_symbol_node_ids,
+        &mut output.seen_dense_node_ids,
+        &mut output.component_report_node_ids,
+        &mut output.dense_component_report_node_ids,
     )?;
-    stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
+    stats.doc_build_ms = clamp_u128_to_u32(output.doc_build_ns / 1_000_000);
+    flush_remaining_dense_anchor_inputs(storage, output, publication, stats)
+}
 
-    sort_pending_dense_anchor_inputs(&mut pending_docs);
-    for batch in pending_docs.chunks(anchor_batch_size) {
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        flush_pending_dense_anchor_inputs(
-            storage,
-            batch,
-            source_identity,
-            updated_at_epoch_ms,
-            &mut stats,
-            cancel_token,
-        )?;
-    }
-
+pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
+    storage: &mut Storage,
+    source_identity: &str,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    document_source: SemanticProjectionDocumentSource,
+) -> Result<SemanticProjectionStats, ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    let prune_started = Instant::now();
-    let stale_symbol_docs = storage
-        .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
-        .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?;
-    let stale_dense_docs = storage
-        .prune_dense_anchor_inputs_to_node_ids(&seen_dense_node_ids)
-        .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?;
-    let removed_legacy_vectors = storage
-        .clear_llm_symbol_docs()
-        .map_err(|e| ApiError::internal(format!("Failed to remove legacy core vectors: {e}")))?;
-    let stale_component_docs = storage
-        .prune_retrieval_artifacts_to_node_ids(
-            &component_report_node_ids,
-            &dense_component_report_node_ids,
-        )
-        .map_err(|e| ApiError::internal(format!("Failed to prune component reports: {e}")))?;
-    stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
-    stats.docs_stale = clamp_usize_to_u32(
-        stale_dense_docs
-            .saturating_add(removed_legacy_vectors)
-            .saturating_add(stale_symbol_docs)
-            .saturating_add(stale_component_docs),
-    );
+    let policy = SemanticRuntimePolicy::from_runtime(runtime);
+    let existing_docs = storage
+        .get_dense_anchor_input_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
+        .into_iter()
+        .map(|doc| (doc.node_id, doc))
+        .collect::<HashMap<_, _>>();
+    let (prepared, mut stats) = prepare_full_semantic_stream(storage, policy, document_source)?;
+    let publication = SemanticPublicationContext {
+        source_identity,
+        cancel_token,
+        policy,
+        existing_docs: &existing_docs,
+    };
+    let context = FullSemanticStreamContext {
+        prepared: &prepared,
+        publication: &publication,
+        document_source,
+    };
+    let mut output = SemanticProjectionOutput {
+        doc_build_ns: prepared.file_cache_build_ns,
+        ..Default::default()
+    };
+    let mut component_reports = ComponentReportAccumulator::default();
+    stream_full_semantic_pages(
+        storage,
+        &context,
+        &mut stats,
+        &mut output,
+        &mut component_reports,
+    )?;
+    publish_full_component_reports(
+        storage,
+        component_reports,
+        &publication,
+        &mut stats,
+        &mut output,
+    )?;
+    prune_incremental_semantic_docs(storage, None, &output, cancel_token, &mut stats)?;
     Ok(stats)
 }
 
