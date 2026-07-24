@@ -945,33 +945,18 @@ def verify_calibration_bundle(
     }
 
 
-def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
+def _calibration_run_documents(
+    paths: list[Path],
+    *,
+    expected_count: int,
+) -> list[dict]:
+    resolved = [path.resolve() for path in paths]
     require(
-        args.calibration_bundle_output is not None
-        and args.frozen_constant_set_output is not None
-        and args.freeze_selected_at is not None,
-        "calibration assembly requires bundle output, frozen constant-set output, and selected-at",
-    )
-    measurement_contract = load_server_measurement_contract(
-        args.measurement_protocol
-    )
-    constant_set = measurement_contract["constant_set"]
-    require(
-        constant_set.get("status") == "unfrozen"
-        and constant_set.get("freeze_record") is None,
-        "calibration assembly requires the exact unfrozen input constant set",
-    )
-    expected_run_count = (
-        len(measurement_contract["measurement_protocol"]["calibration_matrix"]) * 3
-    )
-    run_paths = [path.resolve() for path in args.calibration_run]
-    require(
-        len(run_paths) == expected_run_count
-        and len(set(run_paths)) == expected_run_count,
-        f"calibration assembly requires exactly {expected_run_count} distinct run artifacts",
+        len(resolved) == expected_count and len(set(resolved)) == expected_count,
+        f"calibration assembly requires exactly {expected_count} distinct run artifacts",
     )
     runs = []
-    for position, path in enumerate(run_paths):
+    for position, path in enumerate(resolved):
         require(
             path.is_file() and not path.is_symlink(),
             f"calibration run artifact {position} is missing or unsafe: {path}",
@@ -987,30 +972,103 @@ def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
             f"calibration run artifact {position} must be an object",
         )
         runs.append(run)
-    first = runs[0]
-    source = first.get("source")
-    contracts = first.get("contracts")
+    return runs
+
+
+def _unfrozen_calibration_bundle(
+    args: argparse.Namespace,
+    measurement_contract: dict,
+    runs: list[dict],
+) -> tuple[dict, dict, dict]:
+    constant_set = measurement_contract["constant_set"]
+    require(
+        constant_set.get("status") == "unfrozen"
+        and constant_set.get("freeze_record") is None,
+        "calibration assembly requires the exact unfrozen input constant set",
+    )
+    source = runs[0].get("source")
+    contracts = runs[0].get("contracts")
     require(
         isinstance(source, dict) and isinstance(contracts, dict),
         "first calibration run omitted source or contract identity",
     )
-    producer = {
-        "repository": args.calibration_producer_repository,
-        "workflow_path": args.calibration_producer_workflow_path,
-        "run_id": args.calibration_producer_run_id,
-        "run_attempt": args.calibration_producer_run_attempt,
-        "artifact_name": args.calibration_producer_artifact,
-        "source_head_sha": source.get("commit"),
+    return (
+        {
+            "schema_version": 1,
+            "selection_protocol": constant_set["selection_protocol"],
+            "source": source,
+            "producer": {
+                "repository": args.calibration_producer_repository,
+                "workflow_path": args.calibration_producer_workflow_path,
+                "run_id": args.calibration_producer_run_id,
+                "run_attempt": args.calibration_producer_run_attempt,
+                "artifact_name": args.calibration_producer_artifact,
+                "source_head_sha": source.get("commit"),
+            },
+            "contracts": contracts,
+            "runs": runs,
+            "freeze_digest": "",
+        },
+        source,
+        contracts,
+    )
+
+
+def _frozen_calibration_constant_set(
+    constant_set: dict,
+    *,
+    source: dict,
+    contracts: dict,
+    selection: dict,
+    bundle_output: Path,
+    selected_at: object,
+) -> dict:
+    frozen = json.loads(json.dumps(constant_set))
+    frozen["status"] = "frozen"
+    frozen["calibration_required_values"] = selection[
+        "calibration_required_values"
+    ]
+    frozen["qualification_thresholds"] = selection["qualification_thresholds"]
+    frozen["freeze_record"] = {
+        "selection_source_commit": source["commit"],
+        "selection_source_tree": source["tree"],
+        "measurement_protocol_sha256": contracts["measurement_protocol_sha256"],
+        "protocol_sha256": contracts["protocol_sha256"],
+        "input_constant_set_sha256": contracts["input_constant_set_sha256"],
+        "calibration_bundle_sha256": sha256(bundle_output),
+        "calibration_freeze_digest": selection["freeze_digest"],
+        "run_artifact_sha256s": selection["run_artifact_sha256s"],
+        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+        "selected_at": require_nonempty_string(
+            selected_at,
+            "--freeze-selected-at",
+        ),
     }
-    bundle = {
-        "schema_version": 1,
-        "selection_protocol": constant_set["selection_protocol"],
-        "source": source,
-        "producer": producer,
-        "contracts": contracts,
-        "runs": runs,
-        "freeze_digest": "",
-    }
+    return frozen
+
+
+def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
+    require(
+        args.calibration_bundle_output is not None
+        and args.frozen_constant_set_output is not None
+        and args.freeze_selected_at is not None,
+        "calibration assembly requires bundle output, frozen constant-set output, and selected-at",
+    )
+    measurement_contract = load_server_measurement_contract(
+        args.measurement_protocol
+    )
+    expected_run_count = (
+        len(measurement_contract["measurement_protocol"]["calibration_matrix"]) * 3
+    )
+    runs = _calibration_run_documents(
+        args.calibration_run,
+        expected_count=expected_run_count,
+    )
+    bundle, source, contracts = _unfrozen_calibration_bundle(
+        args,
+        measurement_contract,
+        runs,
+    )
     bundle_output = args.calibration_bundle_output.resolve()
     constant_output = args.frozen_constant_set_output.resolve()
     require(
@@ -1026,29 +1084,14 @@ def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
     bundle["freeze_digest"] = selection["freeze_digest"]
     write_json(bundle_output, bundle)
 
-    frozen_constant_set = json.loads(json.dumps(constant_set))
-    frozen_constant_set["status"] = "frozen"
-    frozen_constant_set["calibration_required_values"] = selection[
-        "calibration_required_values"
-    ]
-    frozen_constant_set["qualification_thresholds"] = selection[
-        "qualification_thresholds"
-    ]
-    frozen_constant_set["freeze_record"] = {
-        "selection_source_commit": source["commit"],
-        "selection_source_tree": source["tree"],
-        "measurement_protocol_sha256": contracts["measurement_protocol_sha256"],
-        "protocol_sha256": contracts["protocol_sha256"],
-        "input_constant_set_sha256": contracts["input_constant_set_sha256"],
-        "calibration_bundle_sha256": sha256(bundle_output),
-        "calibration_freeze_digest": selection["freeze_digest"],
-        "run_artifact_sha256s": selection["run_artifact_sha256s"],
-        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
-        "selected_at": require_nonempty_string(
-            args.freeze_selected_at,
-            "--freeze-selected-at",
-        ),
-    }
+    frozen_constant_set = _frozen_calibration_constant_set(
+        measurement_contract["constant_set"],
+        source=source,
+        contracts=contracts,
+        selection=selection,
+        bundle_output=bundle_output,
+        selected_at=args.freeze_selected_at,
+    )
     write_json(constant_output, frozen_constant_set)
     frozen_contract = json.loads(json.dumps(measurement_contract))
     frozen_contract["constant_set"] = frozen_constant_set
