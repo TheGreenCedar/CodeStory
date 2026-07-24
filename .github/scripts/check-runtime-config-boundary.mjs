@@ -26,8 +26,9 @@ function isOutOfLineTestSource(file) {
   const components = file.split(path.sep);
   const sourceIndex = components.lastIndexOf("src");
   if (sourceIndex < 0) return false;
-  const sourceChild = components[sourceIndex + 1];
-  return sourceChild === "tests" || sourceChild === "tests.rs";
+  return components
+    .slice(sourceIndex + 1)
+    .some((component) => component === "tests" || component === "tests.rs");
 }
 
 const violations = [];
