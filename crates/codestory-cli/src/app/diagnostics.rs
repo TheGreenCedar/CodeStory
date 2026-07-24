@@ -1,4 +1,20 @@
-use super::*;
+use codestory_contracts::api::{
+    IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessStatusDto,
+    RetrievalFallbackReasonDto,
+};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::path::Path;
+
+use crate::{
+    args::{DoctorCheckOutput, DoctorOutput, ReadinessLaneOutput, RetrievalStatusOutput},
+    display, embedding_config, readiness,
+    runtime::RuntimeContext,
+};
+
+use super::doctor_sidecar_status_is_live_ready;
+#[cfg(test)]
+use super::resolution::quote_command_path;
 
 pub(super) fn build_doctor_output(
     runtime: &RuntimeContext,

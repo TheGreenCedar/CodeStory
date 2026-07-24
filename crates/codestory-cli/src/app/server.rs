@@ -1,4 +1,15 @@
-use super::*;
+use anyhow::{Context, Result, bail};
+use clap::CommandFactory;
+use clap_complete::{Shell, generate};
+use std::net::{TcpListener, ToSocketAddrs};
+
+use crate::runtime::ensure_index_ready;
+use crate::{
+    args::{Cli, CompletionShell, GenerateCompletionsCommand, ServeCommand},
+    http_transport, stdio_transport,
+};
+
+use super::new_agent_surface_runtime;
 
 pub(super) async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if !cmd.stdio {

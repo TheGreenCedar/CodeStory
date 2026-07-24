@@ -1,4 +1,126 @@
-use super::*;
+use anyhow::Result;
+use codestory_contracts::api::{
+    ApiError, ApiErrorDetails, CommandFailureEnvelope, SearchMatchQualityDto,
+};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    args::{self, SearchHitOutput},
+    display,
+    runtime::{self, AmbiguousTargetError, RuntimeContext, resolve_source_target, resolve_target},
+};
+
+use super::rendering::build_numbered_search_hit_output;
+
+#[derive(Debug)]
+pub(super) struct StructuredCommandFailure {
+    pub(super) envelope: CommandFailureEnvelope,
+    pub(super) output_file: Option<PathBuf>,
+    pub(super) markdown: Option<String>,
+}
+
+impl std::fmt::Display for StructuredCommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.envelope.error.message)
+    }
+}
+
+impl std::error::Error for StructuredCommandFailure {}
+
+pub(super) fn command_failure_envelope(
+    code: impl Into<String>,
+    failed_layer: impl Into<String>,
+    message: impl Into<String>,
+    context: serde_json::Value,
+) -> CommandFailureEnvelope {
+    CommandFailureEnvelope::new(ApiError::with_details(
+        code,
+        message,
+        ApiErrorDetails {
+            cause_code: None,
+            failed_layer: Some(failed_layer.into()),
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
+        },
+    ))
+    .with_context(context)
+}
+
+pub(super) fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
+    command_failure_envelope(
+        "command_failed",
+        "command",
+        error.to_string(),
+        serde_json::json!({
+            "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
+        }),
+    )
+}
+
+pub(super) fn command_failure_message(error: &anyhow::Error) -> String {
+    if runtime::api_error_in_chain(error).is_some() {
+        format!("{error:#}")
+    } else {
+        error.to_string()
+    }
+}
+
+pub(super) fn json_output_requested(args: &[OsString]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
+        || args.iter().any(|arg| arg == OsStr::new("--format=json"))
+}
+
+pub(super) fn requested_output_file(args: &[OsString]) -> Option<&Path> {
+    args.iter()
+        .find_map(|arg| {
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("--output-file="))
+                .filter(|path| !path.is_empty())
+                .map(Path::new)
+        })
+        .or_else(|| {
+            args.windows(2).find_map(|pair| {
+                (pair[0] == OsStr::new("--output-file")
+                    && !pair[1].to_string_lossy().starts_with('-'))
+                .then(|| Path::new(&pair[1]))
+            })
+        })
+}
+
+pub(super) fn emit_command_failure(envelope: &CommandFailureEnvelope, output_file: Option<&Path>) {
+    let json = serde_json::to_string_pretty(envelope)
+        .expect("the command failure envelope is always JSON-serializable");
+    if let Some(path) = output_file
+        && fs::write(path, format!("{json}\n")).is_ok()
+    {
+        return;
+    }
+    println!("{json}");
+}
+
+pub(super) fn quote_command_path(path: &Path) -> String {
+    display::quote_command_path(path)
+}
+
+pub(super) fn quote_command_value(value: &str) -> String {
+    display::quote_command_value(value)
+}
+
+pub(super) fn quote_command_argument_value(value: &str) -> String {
+    display::quote_command_argument_value(value)
+}
 
 #[derive(serde::Serialize)]
 pub(crate) struct CliErrorOutput {

@@ -1,10 +1,32 @@
 """Installation for packaged CodeStory proof."""
 
-from .foundation import *
-from .contracts import (
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+import threading
+import tomllib
+from pathlib import Path
+
+from .foundation import (
+    CANDIDATE_PRODUCER_WORKFLOW_PATHS,
+    LEGACY_TOKENS,
+    LOWER_TIER_NONCLAIMS,
+    PINNED_CODEX_CLI_VERSION,
+    QUALIFICATION_SCHEMA_VERSION,
+    REPOSITORY_ROOT,
     ProofFailure,
-    assert_retained_json_privacy,
     require,
+)
+from .contracts import (
+    assert_retained_json_privacy,
     require_exact_keys,
     require_nonempty_string,
     retained_mcp_transcript,
@@ -115,6 +137,7 @@ def marketplace_installed_plugin_identity(
         {
             "repository",
             "revision",
+            "provenance",
             "codex_cli_version",
             "add_result",
             "list_result",
@@ -145,6 +168,18 @@ def marketplace_installed_plugin_identity(
     plugin_add = marketplace["plugin_add_result"]
     marketplace_list = marketplace["list_result"]
     plugin_list = marketplace["plugin_list_result"]
+    provenance = marketplace["provenance"]
+    require_exact_keys(provenance, {"add", "list"}, "marketplace provenance")
+    require_exact_keys(
+        provenance["add"],
+        {"root", "revision"},
+        "marketplace add provenance",
+    )
+    require_exact_keys(
+        provenance["list"],
+        {"root", "revision"},
+        "marketplace list provenance",
+    )
     require(
         marketplace["repository"]
         == "TheGreenCedar/AgentPluginMarketplace"
@@ -168,6 +203,13 @@ def marketplace_installed_plugin_identity(
         and marketplace_root.is_relative_to(codex_home)
         and marketplace_root == codex_home / ".tmp" / "marketplaces" / "TheGreenCedar",
         "Codex marketplace root is outside its isolated home",
+    )
+    require(
+        Path(provenance["add"]["root"]).resolve() == marketplace_root
+        and Path(provenance["list"]["root"]).resolve() == marketplace_root
+        and provenance["add"]["revision"] == marketplace["revision"]
+        and provenance["list"]["revision"] == marketplace["revision"],
+        "Codex marketplace add/list provenance does not report the pinned revision",
     )
     require(
         marketplace_list

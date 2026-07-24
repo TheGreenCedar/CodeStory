@@ -1,12 +1,21 @@
 """Self Test for packaged CodeStory proof."""
 
-from .foundation import *
-from .contracts import (
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .foundation import (
     ProofFailure,
+    project_node_resource_uri,
+    require,
+    resource_uri_matches,
+)
+from .contracts import (
     assert_retained_json_privacy,
     canonical_sha256,
     load_holdout_task_contracts,
-    require,
     require_sha256,
     selected_qualification_matrix_cell,
     sha256,

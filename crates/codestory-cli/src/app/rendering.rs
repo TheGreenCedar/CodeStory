@@ -1,4 +1,29 @@
-use super::*;
+#[cfg(test)]
+use codestory_contracts::api::TrailContextDto;
+use codestory_contracts::api::{
+    IndexFreshnessDto, NodeId, NodeKind, NodeOccurrencesRequest, RepoTextScanStatsDto,
+    RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SourceOccurrenceDto,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
+
+use crate::{
+    args::{
+        QueryResolutionOutput, RepoTextMode, SearchHitOutput, SearchOutput,
+        VerificationTargetOutput,
+    },
+    runtime::{self, RuntimeContext},
+};
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RepoTextOutputConfig {
+    pub(super) mode: RepoTextMode,
+    pub(super) enabled: bool,
+}
 
 pub(super) struct SearchOutputParts<'a> {
     pub(super) project_root: &'a std::path::Path,
@@ -88,6 +113,18 @@ pub(super) fn build_search_output(parts: SearchOutputParts<'_>) -> SearchOutput 
         repo_text_hits,
         repo_text_stats: parts.repo_text_stats.cloned(),
     }
+}
+
+pub(super) fn dedupe_verification_targets(targets: &mut Vec<VerificationTargetOutput>) {
+    let mut seen = HashSet::new();
+    targets.retain(|target| {
+        seen.insert((
+            target.role.clone(),
+            target.path.clone(),
+            target.line,
+            target.reason.clone(),
+        ))
+    });
 }
 
 pub(crate) fn build_query_resolution_output(

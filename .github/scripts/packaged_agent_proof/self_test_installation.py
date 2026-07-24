@@ -1,12 +1,14 @@
 """Self Test for packaged CodeStory proof."""
 
-from .foundation import *
+from __future__ import annotations
+
+import json
+
+from .foundation import ProofFailure, REPOSITORY_ROOT, require
 from .contracts import (
-    ProofFailure,
     assert_retained_json_privacy,
     canonical_sha256,
     load_holdout_task_contracts,
-    require,
     require_sha256,
     selected_qualification_matrix_cell,
     sha256,

@@ -138,6 +138,13 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     );
     assert.equal(attestation.schema_version, 2);
     assert.equal(attestation.marketplace.codex_cli_version, `codex-cli ${codexVersion}`);
+    assert.equal(attestation.marketplace.revision, marketplaceRevision);
+    assert.equal(attestation.marketplace.provenance.add.revision, marketplaceRevision);
+    assert.equal(attestation.marketplace.provenance.list.revision, marketplaceRevision);
+    assert.equal(
+      attestation.marketplace.provenance.add.root,
+      attestation.marketplace.provenance.list.root,
+    );
     assert.equal(attestation.installation.plugin_root, expectedPluginRoot);
     assert.equal(attestation.marketplace.plugin_add_result.installedPath, expectedPluginRoot);
     assert.deepEqual(

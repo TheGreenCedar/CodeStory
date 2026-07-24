@@ -1,9 +1,22 @@
 """Cli for packaged CodeStory proof."""
 
-from .foundation import *
-from .contracts import (
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+from .foundation import (
+    DEFAULT_QUERY,
+    DEFAULT_QUESTION,
+    LEGACY_HELP_TOKENS,
+    MEASUREMENT_PROTOCOL,
+    REPOSITORY_ROOT,
     ProofFailure,
     require,
+)
+from .contracts import (
     require_nonempty_string,
     selected_qualification_matrix_cell,
     sha256,

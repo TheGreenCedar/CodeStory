@@ -1,5 +1,38 @@
-use super::test_support::*;
-use super::*;
+use super::test_support::{sample_retrieval, sample_task_brief_packet, summary_with_files};
+use crate::app::diagnostics::{
+    agent_readiness_sidecar_runtime, build_summary_readiness, index_next_commands,
+    readiness_lane_output, semantic_contract_check,
+};
+use crate::app::resolution::command_failure_message;
+use crate::app::server::ensure_http_serve_bind_allowed;
+use crate::app::source_commands::{
+    UnsupportedNonUtf8Path, parse_git_name_status_records_z, render_files_markdown,
+    unsupported_non_utf8_path_envelope,
+};
+use crate::app::{
+    build_agent_preflight_output, classify_local_refresh_failure_state,
+    embedding_client_transport_mode, local_freshness_needs_refresh, map_api_error,
+    open_agent_surface, packet_budget_mode_label, packet_task_class_label, render_packet_markdown,
+};
+use crate::args::{self, Cli, Command, ProjectArgs, RetrievalStatusOutput};
+use crate::embedding_server_transport;
+use crate::output::REPO_CONTENT_BOUNDARY_LINE;
+use crate::readiness;
+use crate::runtime::{self, RuntimeContext};
+use crate::sidecar_runtime;
+use anyhow::Result;
+use clap::Parser;
+use codestory_contracts::api::{
+    AffectedChangeKindDto, ApiError, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
+    IndexedFilesSummaryDto, PacketBudgetModeDto, PacketTaskClassDto, ReadinessGoalDto,
+    ReadinessStatusDto, RetrievalFallbackReasonDto, SearchHitOrigin, SourcePolicyExclusionDto,
+    StorageStatsDto,
+};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
 
 fn parsed_command(args: &[&str]) -> Command {
     Cli::try_parse_from(std::iter::once("codestory-cli").chain(args.iter().copied()))

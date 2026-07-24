@@ -1,12 +1,35 @@
 """Self Test for packaged CodeStory proof."""
 
-from .foundation import *
-from .contracts import (
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import struct
+import tempfile
+import zipfile
+from pathlib import Path
+
+from .foundation import (
+    FAULT_RECOVERY_CONSISTENCY_CASES,
+    FAULT_RECOVERY_CONSISTENCY_CONTRACT,
+    LOWER_TIER_NONCLAIMS,
+    MEASUREMENT_PROTOCOL,
+    MIN_RETRIEVAL_QUALITY_REPEATS,
+    NATIVE_MANIFEST_FILE,
+    PINNED_CODEX_CLI_VERSION,
+    PUBLICATION_FAULT_EVIDENCE_CONTRACT,
+    RELEASE_QUALITY_CORPUS_ID,
+    RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+    SERVER_CONSTANT_SET,
+    SERVER_PROTOCOL,
     ProofFailure,
+    require,
+)
+from .contracts import (
     assert_retained_json_privacy,
     canonical_sha256,
     load_holdout_task_contracts,
-    require,
     require_sha256,
     selected_qualification_matrix_cell,
     sha256,

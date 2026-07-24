@@ -1,5 +1,23 @@
-use super::test_support::*;
-use super::*;
+use super::test_support::{
+    sample_graph_edge, sample_graph_node, sample_node_details, test_search_hit_defaults,
+};
+use crate::app::artifacts::ensure_dot_only_for_trail;
+use crate::app::rendering::hide_speculative_trail_edges;
+use crate::app::resolution::{quote_command_path, quote_command_value};
+use crate::app::source_commands::render_affected_invocation;
+use crate::app::{
+    map_embedding_preflight_error, stdio_prompts_list_json, stdio_resource_templates_list_json,
+    stdio_resources_list_json, stdio_tools_list_json, validate_index_watch_output_file,
+};
+use crate::args::{self, IndexCommand, QuerySelectorOutput};
+use crate::display::{clean_path_string, quote_command_argument_value, relative_path};
+use crate::runtime::{self, cache_root_for_project};
+use codestory_contracts::api::{
+    AffectedFollowUpInvocationDto, GraphResponse, NodeId, NodeKind, SearchHit, TrailContextDto,
+};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
 
 #[test]
 fn command_quoting_single_quotes_shell_sensitive_values() {

@@ -1,4 +1,41 @@
-use super::*;
+use anyhow::{Context, Result, bail};
+use codestory_contracts::api::{
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpInvocationDto, CommandFailureEnvelope, FrameworkRouteCoverageDto,
+    IndexedFilesRequest, TrailContextDto,
+};
+use std::{
+    fmt::Write as _,
+    io::{IsTerminal, Read},
+};
+
+use crate::{
+    args::{
+        self, AffectedChangeSource, AffectedCommand, AffectedStdinFormat, CliDirection,
+        CliTrailMode, FilesCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
+        SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand,
+        TrailCommand, TrailJsonOutput, build_trail_request,
+    },
+    explore,
+    output::{
+        RenderedPublicOutput, emit_public_operation, render_query_markdown,
+        render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
+        render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
+    },
+    runtime::{self, AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error},
+};
+
+use super::{
+    artifacts::{ensure_dot_only_for_trail, preflight_output_file},
+    rendering::{
+        build_query_resolution_output_from_occurrences, build_query_resolution_output_with_runtime,
+    },
+    resolution::{
+        StructuredCommandFailure, command_failure_envelope, quote_command_argument_value,
+        quote_command_value, resolve_source_target_or_emit_ambiguity,
+        resolve_target_or_emit_ambiguity, structured_ambiguous_target_failure,
+    },
+};
 
 pub(super) fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "symbol")?;

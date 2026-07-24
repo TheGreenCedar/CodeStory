@@ -101,6 +101,14 @@ function containedPath(root, candidate, label) {
   }
 }
 
+function marketplaceRevisionAt(root) {
+  const revision = run("git", ["-C", root, "rev-parse", "HEAD"]);
+  if (!/^[0-9a-f]{40}$/u.test(revision)) {
+    fail(`marketplace checkout has invalid Git identity: ${revision}`);
+  }
+  return revision;
+}
+
 export function installMarketplaceProof(rawArgs) {
   const args = parseArgs(rawArgs);
   const codexPackageRoot = path.resolve(required(args, "codex_package_root"));
@@ -151,13 +159,15 @@ export function installMarketplaceProof(rawArgs) {
   const pluginList = parseJson("plugin list", codex("plugin", "list", "--json"));
 
   const pluginRoot = realpathSync(pluginAdd.installedPath);
-  const expectedPluginRoot = path.join(
-    codexHome,
-    "plugins",
-    "cache",
-    marketplaceName,
-    "codestory",
-    expectedVersion,
+  const expectedPluginRoot = realpathSync(
+    path.join(
+      codexHome,
+      "plugins",
+      "cache",
+      marketplaceName,
+      "codestory",
+      expectedVersion,
+    ),
   );
   if (pluginRoot !== expectedPluginRoot) {
     fail(`Codex installed the plugin at an unexpected cache path: ${pluginRoot}`);
@@ -170,6 +180,21 @@ export function installMarketplaceProof(rawArgs) {
     || pluginAdd.version !== expectedVersion
   ) {
     fail("Codex marketplace or plugin add result has an unexpected identity");
+  }
+  const marketplaceListEntry = marketplaceList.marketplaces?.find(
+    ({ name }) => name === marketplaceName,
+  );
+  if (!marketplaceListEntry) fail("Codex marketplace list omitted the installed marketplace");
+  const marketplaceAddRoot = realpathSync(marketplaceAdd.installedRoot);
+  const marketplaceListRoot = realpathSync(marketplaceListEntry.root);
+  const marketplaceAddRevision = marketplaceRevisionAt(marketplaceAddRoot);
+  const marketplaceListRevision = marketplaceRevisionAt(marketplaceListRoot);
+  if (
+    marketplaceAddRoot !== marketplaceListRoot
+    || marketplaceAddRevision !== marketplaceRevision
+    || marketplaceListRevision !== marketplaceRevision
+  ) {
+    fail("Codex marketplace provenance does not match the requested immutable revision");
   }
 
   const attestation = {
@@ -190,6 +215,16 @@ export function installMarketplaceProof(rawArgs) {
     marketplace: {
       repository: marketplaceSource,
       revision: marketplaceRevision,
+      provenance: {
+        add: {
+          root: marketplaceAddRoot,
+          revision: marketplaceAddRevision,
+        },
+        list: {
+          root: marketplaceListRoot,
+          revision: marketplaceListRevision,
+        },
+      },
       codex_cli_version: codexVersion,
       add_result: marketplaceAdd,
       list_result: marketplaceList,

@@ -1,5 +1,20 @@
-use super::test_support::*;
-use super::*;
+use super::test_support::{sample_retrieval, sample_task_brief_citation, sample_task_brief_packet};
+use crate::app::drill::{
+    drill_packet_anchors, drill_packet_bridges, drill_packet_citation_is_typed_resolvable,
+    drill_packet_citations, drill_packet_claim_readiness, drill_packet_verification_targets,
+    drill_search_hit_from_packet_citation, execute_drill_packet, write_drill_outputs,
+};
+use crate::args::{
+    self, DrillCommandStatusOutput, DrillExecutionBoundaryOutput, DrillMechanicalOutput,
+    DrillOutput, DrillRuntimeTimingsOutput,
+};
+use codestory_contracts::api::{
+    AgentPacketRequestDto, ClaimReadinessDto, EdgeId, NodeKind, PacketBudgetModeDto,
+    PacketPlanQueryDto,
+};
+use std::fs;
+use std::path::Path;
+use tempfile::tempdir;
 
 #[test]
 fn drill_packet_adapter_reuses_packet_citations_and_sufficiency() {

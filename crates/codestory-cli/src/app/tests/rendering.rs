@@ -1,5 +1,30 @@
-use super::test_support::*;
-use super::*;
+use super::test_support::{
+    sample_agent_answer_with_graph, sample_phase_timings, sample_retrieval,
+    sample_task_brief_packet, summary_with_files, test_search_hit_defaults,
+};
+use crate::app::artifacts::{CONTEXT_BUNDLE_OUTPUT_BYTE_CAP, write_context_bundle};
+use crate::app::drill::drill_search_hit_from_packet_citation;
+use crate::app::rendering::{
+    RepoTextOutputConfig, SearchOutputParts, build_query_resolution_output, build_search_output,
+    implementation_counterpart_targets_for_hit, interface_implementation_targets_for_hit,
+};
+use crate::app::resolution::quote_command_value;
+use crate::app::source_commands::append_symbol_workflow_nodes;
+use crate::app::{build_task_brief_output, render_task_brief_markdown};
+use crate::args::{Cli, IndexDryRunOutput, IndexOutput, QuerySelectorOutput, RepoTextMode};
+use crate::explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
+use crate::http_transport::search_repo_text_mode_param;
+use crate::output::{render_index_dry_run_markdown, render_index_markdown, render_search_markdown};
+use crate::runtime::{self, fnv1a_hex};
+use clap::Parser;
+use codestory_contracts::api::{
+    AgentCitationDto, GraphArtifactDto, IndexDryRunDto, IndexMode, NodeId, NodeKind, SearchHit,
+    SearchRepoTextMode, SourceOccurrenceDto,
+};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use tempfile::tempdir;
 
 #[test]
 fn symbol_workflow_renderer_keeps_caller_shape() {

@@ -1,4 +1,48 @@
-use super::*;
+use anyhow::{Context, Result, bail};
+use codestory_contracts::api::{
+    AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ClaimReadinessDto,
+    IndexFreshnessDto, IndexFreshnessStatusDto, IndexingPhaseTimings, NodeKind,
+    PacketBudgetModeDto, PacketProofStatusDto, PacketSufficiencyStatusDto, SearchMatchQualityDto,
+    StorageStatsDto,
+};
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Write as _,
+    fs,
+    time::Instant,
+};
+
+use crate::{
+    args::{
+        self, DrillAnchorOutput, DrillAnchorTimingsOutput, DrillBridgeEvidenceOutput,
+        DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput, DrillExecutionBoundaryOutput,
+        DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput, DrillSuiteCommand,
+        DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
+        DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput,
+        DrillSummaryAnchorsOutput, DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput,
+        DrillSummaryMechanicalOutput, DrillSummaryOpenGapsOutput, DrillSummaryOutput,
+        DrillSummarySourceTruthOutput, DrillSummarySourceTruthTargetOutput,
+        DrillSummaryStatsOutput, DrillSummaryVerdictOutput, ProjectArgs, SearchHitOutput,
+        SearchOutput, VerificationTargetOutput,
+    },
+    display, drill_targeting,
+    output::render_drill_markdown,
+    retrieval,
+    runtime::{self, RuntimeContext, map_api_error, refresh_label},
+};
+
+use super::{
+    OpenedAgentSurface,
+    artifacts::ensure_dot_only_for_trail,
+    drill_read_only_jobs, elapsed_ms, from_api_repo_text_mode, open_agent_surface,
+    packet_sufficiency_label,
+    rendering::{
+        RepoTextOutputConfig, SearchOutputParts, build_search_output,
+        collect_search_hit_occurrences, dedupe_verification_targets,
+    },
+    resolution::quote_command_path,
+};
 
 pub(super) fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
@@ -8,11 +52,18 @@ pub(super) fn run_drill(cmd: DrillCommand) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn execute_drill(
-    cmd: &DrillCommand,
-) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
-    let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
-    let total_timer = Instant::now();
+struct PreparedDrill {
+    runtime: RuntimeContext,
+    before_stats: Option<StorageStatsDto>,
+    before_unavailable_reason: Option<String>,
+    refresh: String,
+    phase_timings: Option<IndexingPhaseTimings>,
+    setup_ms: u64,
+    anchors: Vec<String>,
+    packet_request: AgentPacketRequestDto,
+}
+
+fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
     let setup_timer = Instant::now();
     validate_drill_output_dir(&cmd.output_dir)?;
     let OpenedAgentSurface {
@@ -30,31 +81,53 @@ pub(super) fn execute_drill(
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }
-    let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
-    let before_stats = before.as_ref().map(|summary| &summary.stats);
     let before_unavailable_reason = before.is_none().then(|| {
         opened
             .refresh_reason
             .clone()
             .unwrap_or_else(|| "pre_refresh_summary_unavailable".to_string())
     });
-    let setup_ms = elapsed_ms(setup_timer);
-
-    let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
+    let anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
     let question = cmd
         .question
         .clone()
-        .unwrap_or_else(|| format!("Investigate anchors: {}", drill_anchors.join(", ")));
+        .unwrap_or_else(|| format!("Investigate anchors: {}", anchors.join(", ")));
+    Ok(PreparedDrill {
+        runtime,
+        before_stats: before.map(|summary| summary.stats),
+        before_unavailable_reason,
+        refresh: refresh_label(cmd.refresh, opened.refresh_mode),
+        phase_timings: opened.phase_timings,
+        setup_ms: elapsed_ms(setup_timer),
+        packet_request: AgentPacketRequestDto {
+            question,
+            budget: PacketBudgetModeDto::Standard,
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: anchors.clone(),
+            include_evidence: true,
+            latency_budget_ms: None,
+        },
+        anchors,
+    })
+}
+
+pub(super) fn execute_drill(
+    cmd: &DrillCommand,
+) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
+    let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
+    let total_timer = Instant::now();
+    let PreparedDrill {
+        runtime,
+        before_stats,
+        before_unavailable_reason,
+        refresh,
+        phase_timings,
+        setup_ms,
+        anchors: drill_anchors,
+        packet_request,
+    } = prepare_drill(cmd)?;
     let packet_timer = Instant::now();
-    let packet_request = AgentPacketRequestDto {
-        question,
-        budget: PacketBudgetModeDto::Standard,
-        task_class: None,
-        probes: Vec::new(),
-        extra_probes: drill_anchors.clone(),
-        include_evidence: true,
-        latency_budget_ms: None,
-    };
     runtime.run_public_operation("drill", || {
         let pinned_summary = runtime.active_project_summary()?;
         let pinned_publication = runtime
@@ -102,10 +175,10 @@ pub(super) fn execute_drill(
             question: cmd.question.clone(),
             output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
             mechanical: DrillMechanicalOutput {
-                before_files: before_stats.map(|stats| stats.file_count),
-                before_nodes: before_stats.map(|stats| stats.node_count),
-                before_edges: before_stats.map(|stats| stats.edge_count),
-                before_errors: before_stats.map(|stats| stats.error_count),
+                before_files: before_stats.as_ref().map(|stats| stats.file_count),
+                before_nodes: before_stats.as_ref().map(|stats| stats.node_count),
+                before_edges: before_stats.as_ref().map(|stats| stats.edge_count),
+                before_errors: before_stats.as_ref().map(|stats| stats.error_count),
                 before_unavailable_reason: before_unavailable_reason.clone(),
                 after_files: pinned_summary.stats.file_count,
                 after_nodes: pinned_summary.stats.node_count,
@@ -115,30 +188,34 @@ pub(super) fn execute_drill(
                 retrieval: pinned_summary.retrieval.clone(),
                 sidecar_retrieval_mode,
                 freshness: pinned_summary.freshness.clone(),
-                phase_timings: opened.phase_timings.clone(),
+                phase_timings: phase_timings.clone(),
                 drill_timings,
             },
             question_search,
             question_supplemental_searches: Vec::new(),
             anchors: anchor_outputs,
             bridges: bridge_outputs,
-            execution_boundaries: vec![DrillExecutionBoundaryOutput {
-                command: "packet".to_string(),
-                flow: vec![
-                    "plan question and explicit anchor probes".to_string(),
-                    "execute one bounded batch retrieval".to_string(),
-                    "adapt citations and sufficiency into drill reports".to_string(),
-                ],
-                source_files: vec![
-                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
-                    "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
-                ],
-            }],
+            execution_boundaries: drill_execution_boundaries(),
             verification_targets: all_verification_targets,
             evidence_packet,
             next_commands,
         })
     })
+}
+
+fn drill_execution_boundaries() -> Vec<DrillExecutionBoundaryOutput> {
+    vec![DrillExecutionBoundaryOutput {
+        command: "packet".to_string(),
+        flow: vec![
+            "plan question and explicit anchor probes".to_string(),
+            "execute one bounded batch retrieval".to_string(),
+            "adapt citations and sufficiency into drill reports".to_string(),
+        ],
+        source_files: vec![
+            "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+            "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
+        ],
+    }]
 }
 
 pub(super) fn execute_drill_packet(
@@ -827,8 +904,25 @@ pub(super) fn blocked_drill_suite_repo_output(
 ) -> DrillSuiteRepoOutput {
     let project = display::clean_path_string(&case.project_root.to_string_lossy());
     let output_dir = display::clean_path_string(&repo_output_dir.to_string_lossy());
-    let anchor_statuses = case
-        .anchors
+    let next_action = format!(
+        "Fix or skip this case, then rerun `drill-suite`; blocked before evidence artifacts were written: {}",
+        error.replace('|', "\\|")
+    );
+
+    DrillSuiteRepoOutput {
+        slug: case.slug.clone(),
+        project: project.clone(),
+        question: case.question.clone(),
+        anchors: case.anchors.clone(),
+        output_dir: output_dir.clone(),
+        artifact_extension: drill_artifact_extension(format).to_string(),
+        summary: blocked_drill_summary(case, project, output_dir, refresh, error, next_action),
+        expectations: case.expectations.clone(),
+    }
+}
+
+fn blocked_drill_anchor_statuses(case: &DrillSuiteCase) -> Vec<DrillSummaryAnchorStatusOutput> {
+    case.anchors
         .iter()
         .map(|anchor| DrillSummaryAnchorStatusOutput {
             anchor: anchor.clone(),
@@ -853,88 +947,84 @@ pub(super) fn blocked_drill_suite_repo_output(
             slowest_command_ms: 0,
             source_truth_target_count: 0,
         })
-        .collect::<Vec<_>>();
-    let next_action = format!(
-        "Fix or skip this case, then rerun `drill-suite`; blocked before evidence artifacts were written: {}",
-        error.replace('|', "\\|")
-    );
+        .collect()
+}
 
-    DrillSuiteRepoOutput {
-        slug: case.slug.clone(),
-        project: project.clone(),
-        question: case.question.clone(),
-        anchors: case.anchors.clone(),
+fn blocked_drill_summary(
+    case: &DrillSuiteCase,
+    project: String,
+    output_dir: String,
+    refresh: args::RefreshMode,
+    error: &str,
+    next_action: String,
+) -> DrillSummaryOutput {
+    DrillSummaryOutput {
+        summary_version: 1,
+        project,
+        label: Some(case.slug.clone()),
+        question: Some(case.question.clone()),
         output_dir: output_dir.clone(),
-        artifact_extension: drill_artifact_extension(format).to_string(),
-        summary: DrillSummaryOutput {
-            summary_version: 1,
-            project,
-            label: Some(case.slug.clone()),
-            question: Some(case.question.clone()),
-            output_dir: output_dir.clone(),
-            full_report_json: String::new(),
-            full_report_markdown: String::new(),
-            mechanical: DrillSummaryMechanicalOutput {
-                refresh: refresh_label(refresh, None),
-                before: Some(drill_summary_stats(0, 0, 0, 0)),
-                before_unavailable_reason: None,
-                after: drill_summary_stats(0, 0, 0, 1),
-                index_ready: false,
-                error_delta: Some(1),
-                retrieval_status: None,
-                freshness_status: Some("unknown".to_string()),
-                stale_file_count: 0,
-                freshness_samples: Vec::new(),
-                phase_timing_available: false,
-                drill_timings: DrillRuntimeTimingsOutput::default(),
-            },
-            anchors: DrillSummaryAnchorsOutput {
-                requested: case.anchors.len(),
-                resolved: 0,
-                unresolved: case.anchors.len(),
-                failed_command_count: 1,
-                statuses: anchor_statuses,
-            },
-            bridges: DrillSummaryBridgesOutput {
-                total: 0,
-                graph_path: 0,
-                partial: 0,
-                unresolved_or_error: 0,
-                statuses: Vec::new(),
-            },
-            source_truth: DrillSummarySourceTruthOutput {
-                required: false,
-                check_count: 0,
-                pending_check_count: 0,
-                verified_check_count: 0,
-                target_file_count: 0,
-                target_files: Vec::new(),
-                target_file_details: Vec::new(),
-                checklist_item_count: 0,
-                claim_count: 0,
-                pending_claim_count: 0,
-                verified_claim_count: 0,
-            },
-            open_gaps: DrillSummaryOpenGapsOutput {
-                overall_status: ClaimReadinessDto::NeedsSourceRead,
-                answer_quality_status: "blocked_before_evidence".to_string(),
-                safe_to_say_count: 0,
-                inferred_claim_count: 0,
-                needs_verification_count: 1,
-                needs_verification_claim_count: 0,
-                pending_claim_count: 0,
-                pending_source_truth_check_count: 0,
-                next_command_count: 1,
-                open_gap_friendly: true,
-                status: "blocked".to_string(),
-            },
-            verdict: DrillSummaryVerdictOutput {
-                status: "blocked".to_string(),
-                reason: format!("drill failed before evidence collection: {error}"),
-                next_action,
-            },
+        full_report_json: String::new(),
+        full_report_markdown: String::new(),
+        mechanical: DrillSummaryMechanicalOutput {
+            refresh: refresh_label(refresh, None),
+            before: Some(drill_summary_stats(0, 0, 0, 0)),
+            before_unavailable_reason: None,
+            after: drill_summary_stats(0, 0, 0, 1),
+            index_ready: false,
+            error_delta: Some(1),
+            retrieval_status: None,
+            freshness_status: Some("unknown".to_string()),
+            stale_file_count: 0,
+            freshness_samples: Vec::new(),
+            phase_timing_available: false,
+            drill_timings: DrillRuntimeTimingsOutput::default(),
         },
-        expectations: case.expectations.clone(),
+        anchors: DrillSummaryAnchorsOutput {
+            requested: case.anchors.len(),
+            resolved: 0,
+            unresolved: case.anchors.len(),
+            failed_command_count: 1,
+            statuses: blocked_drill_anchor_statuses(case),
+        },
+        bridges: DrillSummaryBridgesOutput {
+            total: 0,
+            graph_path: 0,
+            partial: 0,
+            unresolved_or_error: 0,
+            statuses: Vec::new(),
+        },
+        source_truth: DrillSummarySourceTruthOutput {
+            required: false,
+            check_count: 0,
+            pending_check_count: 0,
+            verified_check_count: 0,
+            target_file_count: 0,
+            target_files: Vec::new(),
+            target_file_details: Vec::new(),
+            checklist_item_count: 0,
+            claim_count: 0,
+            pending_claim_count: 0,
+            verified_claim_count: 0,
+        },
+        open_gaps: DrillSummaryOpenGapsOutput {
+            overall_status: ClaimReadinessDto::NeedsSourceRead,
+            answer_quality_status: "blocked_before_evidence".to_string(),
+            safe_to_say_count: 0,
+            inferred_claim_count: 0,
+            needs_verification_count: 1,
+            needs_verification_claim_count: 0,
+            pending_claim_count: 0,
+            pending_source_truth_check_count: 0,
+            next_command_count: 1,
+            open_gap_friendly: true,
+            status: "blocked".to_string(),
+        },
+        verdict: DrillSummaryVerdictOutput {
+            status: "blocked".to_string(),
+            reason: format!("drill failed before evidence collection: {error}"),
+            next_action,
+        },
     }
 }
 
@@ -1238,7 +1328,44 @@ pub(super) fn write_drill_report_file(path: &std::path::Path, content: &str) -> 
 }
 
 pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
-    let sufficiency = &output.evidence_packet.sufficiency;
+    let anchors = drill_summary_anchors(output);
+    let bridges = drill_summary_bridges(output);
+    let source_truth = drill_summary_source_truth(output);
+    let stale_freshness = output
+        .mechanical
+        .freshness
+        .as_ref()
+        .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
+    let open_gaps = drill_summary_open_gaps(output, &source_truth, stale_freshness);
+    let verdict = drill_summary_verdict(
+        output,
+        anchors.resolved,
+        bridges.graph_path,
+        bridges.partial,
+        bridges.unresolved_or_error,
+        source_truth.required,
+        open_gaps.open_gap_friendly,
+        stale_freshness,
+    );
+
+    DrillSummaryOutput {
+        summary_version: 1,
+        project: output.project.clone(),
+        label: output.label.clone(),
+        question: output.question.clone(),
+        output_dir: output.output_dir.clone(),
+        full_report_json: "drill-report.json".to_string(),
+        full_report_markdown: "drill-report.md".to_string(),
+        mechanical: drill_summary_mechanical(output),
+        anchors,
+        bridges,
+        source_truth,
+        open_gaps,
+        verdict,
+    }
+}
+
+fn drill_summary_mechanical(output: &DrillOutput) -> DrillSummaryMechanicalOutput {
     let before_stats = match (
         output.mechanical.before_files,
         output.mechanical.before_nodes,
@@ -1250,75 +1377,58 @@ pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         }
         _ => None,
     };
+    DrillSummaryMechanicalOutput {
+        refresh: output.mechanical.refresh.clone(),
+        before: before_stats,
+        before_unavailable_reason: output.mechanical.before_unavailable_reason.clone(),
+        after: drill_summary_stats(
+            output.mechanical.after_files,
+            output.mechanical.after_nodes,
+            output.mechanical.after_edges,
+            output.mechanical.after_errors,
+        ),
+        index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
+        error_delta: output.mechanical.before_errors.map(|before_errors| {
+            i64::from(output.mechanical.after_errors) - i64::from(before_errors)
+        }),
+        retrieval_status: output
+            .mechanical
+            .retrieval
+            .as_ref()
+            .map(|retrieval| {
+                drill_summary_retrieval_status(
+                    retrieval,
+                    output.mechanical.sidecar_retrieval_mode.as_deref(),
+                )
+            })
+            .or_else(|| output.mechanical.sidecar_retrieval_mode.clone()),
+        freshness_status: output
+            .mechanical
+            .freshness
+            .as_ref()
+            .map(drill_summary_freshness_status),
+        stale_file_count: output
+            .mechanical
+            .freshness
+            .as_ref()
+            .map(drill_summary_stale_file_count)
+            .unwrap_or_default(),
+        freshness_samples: output
+            .mechanical
+            .freshness
+            .as_ref()
+            .map(drill_summary_freshness_samples)
+            .unwrap_or_default(),
+        phase_timing_available: output.mechanical.phase_timings.is_some(),
+        drill_timings: output.mechanical.drill_timings.clone(),
+    }
+}
+
+fn drill_summary_anchors(output: &DrillOutput) -> DrillSummaryAnchorsOutput {
     let anchor_statuses: Vec<_> = output
         .anchors
         .iter()
-        .map(|anchor| {
-            let failed_command_count = anchor
-                .commands
-                .iter()
-                .filter(|command| command.status != "ok")
-                .count();
-            let command_duration_ms = anchor
-                .commands
-                .iter()
-                .map(|command| command.duration_ms)
-                .sum();
-            let slowest = anchor
-                .commands
-                .iter()
-                .max_by_key(|command| command.duration_ms);
-            DrillSummaryAnchorStatusOutput {
-                anchor: anchor.anchor.clone(),
-                status: if anchor.chosen_anchor.is_some() {
-                    "resolved".to_string()
-                } else {
-                    "unresolved".to_string()
-                },
-                typed_hit_count: anchor.typed_hit_count,
-                selected: anchor
-                    .chosen_anchor
-                    .as_ref()
-                    .map(|hit| hit.display_name.clone()),
-                selected_node_id: anchor.chosen_anchor.as_ref().map(|hit| hit.node_id.clone()),
-                selected_node_ref: anchor
-                    .chosen_anchor
-                    .as_ref()
-                    .and_then(|hit| hit.node_ref.clone()),
-                selected_kind: anchor.chosen_anchor.as_ref().map(|hit| hit.kind),
-                selected_file_path: anchor
-                    .chosen_anchor
-                    .as_ref()
-                    .and_then(|hit| hit.file_path.clone()),
-                selected_line: anchor.chosen_anchor.as_ref().and_then(|hit| hit.line),
-                caller_count: anchor
-                    .consumer_summary
-                    .as_ref()
-                    .map(|summary| summary.caller_count)
-                    .unwrap_or_default(),
-                consumer_count: anchor
-                    .consumer_summary
-                    .as_ref()
-                    .map(|summary| summary.consumer_count)
-                    .unwrap_or_default(),
-                text_hint_count: anchor
-                    .consumer_summary
-                    .as_ref()
-                    .map(|summary| summary.text_hint_count)
-                    .unwrap_or_default(),
-                command_count: anchor.commands.len(),
-                failed_command_count,
-                command_duration_ms,
-                total_duration_ms: anchor.timings.total_ms,
-                resolution_duration_ms: anchor.timings.resolution_ms,
-                consumer_summary_duration_ms: anchor.timings.consumer_summary_ms,
-                slowest_command: slowest.map(|command| command.command.clone()),
-                slowest_command_ms: slowest
-                    .map(|command| command.duration_ms)
-                    .unwrap_or_default(),
-                source_truth_target_count: anchor.verification_targets.len(),
-            }
-        })
+        .map(drill_summary_anchor_status)
         .collect();
     let resolved = anchor_statuses
         .iter()
@@ -1328,7 +1438,83 @@ pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         .iter()
         .map(|anchor| anchor.failed_command_count)
         .sum();
+    DrillSummaryAnchorsOutput {
+        requested: output.anchors.len(),
+        resolved,
+        unresolved: output.anchors.len().saturating_sub(resolved),
+        failed_command_count: failed_anchor_commands,
+        statuses: anchor_statuses,
+    }
+}
 
+fn drill_summary_anchor_status(anchor: &DrillAnchorOutput) -> DrillSummaryAnchorStatusOutput {
+    let failed_command_count = anchor
+        .commands
+        .iter()
+        .filter(|command| command.status != "ok")
+        .count();
+    let command_duration_ms = anchor
+        .commands
+        .iter()
+        .map(|command| command.duration_ms)
+        .sum();
+    let slowest = anchor
+        .commands
+        .iter()
+        .max_by_key(|command| command.duration_ms);
+    DrillSummaryAnchorStatusOutput {
+        anchor: anchor.anchor.clone(),
+        status: if anchor.chosen_anchor.is_some() {
+            "resolved".to_string()
+        } else {
+            "unresolved".to_string()
+        },
+        typed_hit_count: anchor.typed_hit_count,
+        selected: anchor
+            .chosen_anchor
+            .as_ref()
+            .map(|hit| hit.display_name.clone()),
+        selected_node_id: anchor.chosen_anchor.as_ref().map(|hit| hit.node_id.clone()),
+        selected_node_ref: anchor
+            .chosen_anchor
+            .as_ref()
+            .and_then(|hit| hit.node_ref.clone()),
+        selected_kind: anchor.chosen_anchor.as_ref().map(|hit| hit.kind),
+        selected_file_path: anchor
+            .chosen_anchor
+            .as_ref()
+            .and_then(|hit| hit.file_path.clone()),
+        selected_line: anchor.chosen_anchor.as_ref().and_then(|hit| hit.line),
+        caller_count: anchor
+            .consumer_summary
+            .as_ref()
+            .map(|summary| summary.caller_count)
+            .unwrap_or_default(),
+        consumer_count: anchor
+            .consumer_summary
+            .as_ref()
+            .map(|summary| summary.consumer_count)
+            .unwrap_or_default(),
+        text_hint_count: anchor
+            .consumer_summary
+            .as_ref()
+            .map(|summary| summary.text_hint_count)
+            .unwrap_or_default(),
+        command_count: anchor.commands.len(),
+        failed_command_count,
+        command_duration_ms,
+        total_duration_ms: anchor.timings.total_ms,
+        resolution_duration_ms: anchor.timings.resolution_ms,
+        consumer_summary_duration_ms: anchor.timings.consumer_summary_ms,
+        slowest_command: slowest.map(|command| command.command.clone()),
+        slowest_command_ms: slowest
+            .map(|command| command.duration_ms)
+            .unwrap_or_default(),
+        source_truth_target_count: anchor.verification_targets.len(),
+    }
+}
+
+fn drill_summary_bridges(output: &DrillOutput) -> DrillSummaryBridgesOutput {
     let bridge_statuses: Vec<_> = output
         .bridges
         .iter()
@@ -1355,7 +1541,17 @@ pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
             drill_bridge_status_is_unresolved(&bridge.status) || bridge.command_status != "ok"
         })
         .count();
+    DrillSummaryBridgesOutput {
+        total: output.bridges.len(),
+        graph_path,
+        partial,
+        unresolved_or_error,
+        statuses: bridge_statuses,
+    }
+}
 
+fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOutput {
+    let sufficiency = &output.evidence_packet.sufficiency;
     let mut target_files: Vec<_> = output
         .verification_targets
         .iter()
@@ -1365,146 +1561,69 @@ pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let target_file_count = target_files.len();
     let target_file_details =
         drill_summary_source_truth_target_details(&target_files, &output.verification_targets);
-
     let has_source_truth_checks = !target_files.is_empty();
     let needs_source_truth = sufficiency.status != PacketSufficiencyStatusDto::Sufficient;
-    let stale_freshness = output
-        .mechanical
-        .freshness
-        .as_ref()
-        .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
+    DrillSummarySourceTruthOutput {
+        required: needs_source_truth,
+        check_count: target_file_count,
+        pending_check_count: if has_source_truth_checks {
+            usize::from(needs_source_truth) * target_file_count
+        } else {
+            0
+        },
+        verified_check_count: if needs_source_truth {
+            0
+        } else {
+            target_file_count
+        },
+        target_file_count,
+        target_files,
+        target_file_details,
+        checklist_item_count: 0,
+        claim_count: sufficiency.covered_claims.len(),
+        pending_claim_count: sufficiency.gaps.len(),
+        verified_claim_count: sufficiency.covered_claims.len(),
+    }
+}
+
+fn drill_summary_open_gaps(
+    output: &DrillOutput,
+    source_truth: &DrillSummarySourceTruthOutput,
+    stale_freshness: bool,
+) -> DrillSummaryOpenGapsOutput {
+    let sufficiency = &output.evidence_packet.sufficiency;
     let open_gap_friendly = !sufficiency.gaps.is_empty()
         || !sufficiency.open_next.is_empty()
-        || needs_source_truth
+        || source_truth.required
         || stale_freshness;
-
-    DrillSummaryOutput {
-        summary_version: 1,
-        project: output.project.clone(),
-        label: output.label.clone(),
-        question: output.question.clone(),
-        output_dir: output.output_dir.clone(),
-        full_report_json: "drill-report.json".to_string(),
-        full_report_markdown: "drill-report.md".to_string(),
-        mechanical: DrillSummaryMechanicalOutput {
-            refresh: output.mechanical.refresh.clone(),
-            before: before_stats,
-            before_unavailable_reason: output.mechanical.before_unavailable_reason.clone(),
-            after: drill_summary_stats(
-                output.mechanical.after_files,
-                output.mechanical.after_nodes,
-                output.mechanical.after_edges,
-                output.mechanical.after_errors,
-            ),
-            index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
-            error_delta: output.mechanical.before_errors.map(|before_errors| {
-                i64::from(output.mechanical.after_errors) - i64::from(before_errors)
-            }),
-            retrieval_status: output
-                .mechanical
-                .retrieval
-                .as_ref()
-                .map(|retrieval| {
-                    drill_summary_retrieval_status(
-                        retrieval,
-                        output.mechanical.sidecar_retrieval_mode.as_deref(),
-                    )
-                })
-                .or_else(|| output.mechanical.sidecar_retrieval_mode.clone()),
-            freshness_status: output
-                .mechanical
-                .freshness
-                .as_ref()
-                .map(drill_summary_freshness_status),
-            stale_file_count: output
-                .mechanical
-                .freshness
-                .as_ref()
-                .map(drill_summary_stale_file_count)
-                .unwrap_or_default(),
-            freshness_samples: output
-                .mechanical
-                .freshness
-                .as_ref()
-                .map(drill_summary_freshness_samples)
-                .unwrap_or_default(),
-            phase_timing_available: output.mechanical.phase_timings.is_some(),
-            drill_timings: output.mechanical.drill_timings.clone(),
+    DrillSummaryOpenGapsOutput {
+        overall_status: drill_packet_claim_readiness(sufficiency.status),
+        answer_quality_status: packet_sufficiency_label(sufficiency.status).to_string(),
+        safe_to_say_count: sufficiency.covered_claims.len(),
+        inferred_claim_count: sufficiency
+            .covered_claims
+            .iter()
+            .filter(|claim| claim.proof_status != Some(PacketProofStatusDto::Proven))
+            .count(),
+        needs_verification_count: sufficiency.gaps.len(),
+        needs_verification_claim_count: sufficiency.gaps.len(),
+        pending_claim_count: if source_truth.required {
+            sufficiency.gaps.len()
+        } else {
+            0
         },
-        anchors: DrillSummaryAnchorsOutput {
-            requested: output.anchors.len(),
-            resolved,
-            unresolved: output.anchors.len().saturating_sub(resolved),
-            failed_command_count: failed_anchor_commands,
-            statuses: anchor_statuses,
+        pending_source_truth_check_count: if source_truth.required {
+            source_truth.target_file_count
+        } else {
+            0
         },
-        bridges: DrillSummaryBridgesOutput {
-            total: output.bridges.len(),
-            graph_path,
-            partial,
-            unresolved_or_error,
-            statuses: bridge_statuses,
+        next_command_count: sufficiency.follow_up_commands.len(),
+        open_gap_friendly,
+        status: if open_gap_friendly {
+            "open_gaps_explicit".to_string()
+        } else {
+            "no_open_gaps_reported".to_string()
         },
-        source_truth: DrillSummarySourceTruthOutput {
-            required: needs_source_truth,
-            check_count: target_file_count,
-            pending_check_count: if has_source_truth_checks {
-                usize::from(needs_source_truth) * target_file_count
-            } else {
-                0
-            },
-            verified_check_count: if needs_source_truth {
-                0
-            } else {
-                target_file_count
-            },
-            target_file_count,
-            target_files,
-            target_file_details,
-            checklist_item_count: 0,
-            claim_count: sufficiency.covered_claims.len(),
-            pending_claim_count: sufficiency.gaps.len(),
-            verified_claim_count: sufficiency.covered_claims.len(),
-        },
-        open_gaps: DrillSummaryOpenGapsOutput {
-            overall_status: drill_packet_claim_readiness(sufficiency.status),
-            answer_quality_status: packet_sufficiency_label(sufficiency.status).to_string(),
-            safe_to_say_count: sufficiency.covered_claims.len(),
-            inferred_claim_count: sufficiency
-                .covered_claims
-                .iter()
-                .filter(|claim| claim.proof_status != Some(PacketProofStatusDto::Proven))
-                .count(),
-            needs_verification_count: sufficiency.gaps.len(),
-            needs_verification_claim_count: sufficiency.gaps.len(),
-            pending_claim_count: if needs_source_truth {
-                sufficiency.gaps.len()
-            } else {
-                0
-            },
-            pending_source_truth_check_count: if needs_source_truth {
-                target_file_count
-            } else {
-                0
-            },
-            next_command_count: sufficiency.follow_up_commands.len(),
-            open_gap_friendly,
-            status: if open_gap_friendly {
-                "open_gaps_explicit".to_string()
-            } else {
-                "no_open_gaps_reported".to_string()
-            },
-        },
-        verdict: drill_summary_verdict(
-            output,
-            resolved,
-            graph_path,
-            partial,
-            unresolved_or_error,
-            needs_source_truth,
-            open_gap_friendly,
-            stale_freshness,
-        ),
     }
 }
 
@@ -1884,18 +2003,6 @@ pub(super) fn output_slug(value: &str) -> String {
     } else {
         slug.to_string()
     }
-}
-
-pub(super) fn dedupe_verification_targets(targets: &mut Vec<VerificationTargetOutput>) {
-    let mut seen = HashSet::new();
-    targets.retain(|target| {
-        seen.insert((
-            target.role.clone(),
-            target.path.clone(),
-            target.line,
-            target.reason.clone(),
-        ))
-    });
 }
 
 pub(super) fn dedupe_and_rank_drill_files(files: &mut Vec<String>) {

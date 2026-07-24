@@ -1,41 +1,31 @@
 //! Command-line integration entry point for CodeStory.
 //!
-//! This binary keeps command parsing, runtime setup, and output emission in one
-//! place so extension work has a single dispatch boundary. Subcommands should
-//! parse into types from `args`, open project state through `RuntimeContext`,
-//! and emit through `output` helpers so markdown, JSON, DOT, stdout, and
-//! `--output-file` behavior stays consistent.
+//! This module is the thin command dispatch and shared lifecycle facade.
+//! Command owners live in focused sibling modules; they parse types from
+//! `args`, open project state through `RuntimeContext`, and emit through
+//! `output` helpers so markdown, JSON, DOT, stdout, and `--output-file`
+//! behavior stays consistent.
 //!
 //! User-facing command usage belongs in CLI help and external docs. Rustdoc in
 //! this crate documents the code contracts that command handlers, output DTOs,
 //! and local integration transports rely on.
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser};
-use clap_complete::{Shell, generate};
+use clap::Parser;
 use codestory_contracts::api::{
-    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
-    AffectedFollowUpInvocationDto, AgentAnswerDto, AgentAskRequest, AgentCitationDto,
-    AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
-    AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails, AppEventPayload,
-    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, FrameworkRouteCoverageDto,
-    GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
-    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
-    PacketProofStatusDto, PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary,
-    ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    TrailContextDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AgentAnswerDto,
+    AgentAskRequest, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, CommandFailureEnvelope,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
+    IndexFreshnessStatusDto, IndexMode, NodeId, NodeKind, PacketBudgetModeDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
+    ReadinessStatusDto, SearchRepoTextMode, SearchRequest,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ffi::{OsStr, OsString},
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
-    io::{IsTerminal, Read},
-    net::{TcpListener, ToSocketAddrs},
-    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -47,51 +37,30 @@ use std::{
 };
 
 use crate::{
-    display, drill_targeting, embedding_config, embedding_qualification,
-    embedding_server_transport, explore, http_transport, local_refresh_status, readiness, report,
-    retrieval, stdio_transport,
+    display, embedding_qualification, embedding_server_transport, explore, local_refresh_status,
+    readiness, report, retrieval,
 };
 
 const AGENT_PREFLIGHT_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 
 use crate::args::{
-    self, AffectedChangeSource, AffectedCommand, AffectedStdinFormat, BookmarkAction,
-    BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand, BookmarkListCommand,
-    BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction,
-    CacheCommand, Cli, CliDirection, CliTrailMode, Command, CompletionShell, ContextCommand,
-    DoctorCheckOutput, DoctorCommand, DoctorOutput, DrillAnchorOutput, DrillAnchorTimingsOutput,
-    DrillBridgeEvidenceOutput, DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput,
-    DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
-    DrillSuiteCommand, DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
-    DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
-    DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
-    DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
-    DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
-    FilesCommand, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
-    IndexOutput, InternalOwnedDeleteCommand, PacketCommand, ProjectArgs, QueryCommand, QueryOutput,
-    QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput,
-    RepoTextMode, RetrievalStatusOutput, SearchCommand, SearchHitOutput, SearchOutput,
-    ServeCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand, TaskCommand,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    self, BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand,
+    BookmarkListCommand, BookmarkListOutput, BookmarkOutput, BookmarkRemoveCommand,
+    BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, Command, ContextCommand, DoctorCommand,
+    GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput, InternalOwnedDeleteCommand,
+    PacketCommand, ProjectArgs, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput,
+    ReadyCommand, ReadyOutput, RepoTextMode, RetrievalStatusOutput, SearchCommand, SmokeCommand,
+    SmokeProfile, TaskAction, TaskBriefCommand, TaskCommand,
 };
-#[cfg(test)]
-use crate::explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
-#[cfg(test)]
-use crate::http_transport::search_repo_text_mode_param;
 use crate::output::{
     REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, context_packet_json, emit,
     emit_public_operation, render_agent_citation, render_context_markdown, render_doctor_markdown,
-    render_drill_markdown, render_ground_markdown, render_index_dry_run_markdown,
-    render_index_markdown, render_query_markdown, render_ready_markdown, render_search_markdown,
-    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
-    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
-    validate_output_file_parent,
+    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_ready_markdown, render_search_markdown,
 };
 use crate::runtime::{
-    self, AmbiguousTargetError, RuntimeContext, annotate_refresh_error, ensure_index_ready,
-    index_mode_name, map_api_error, map_api_error_for_project, refresh_label, refresh_mode_name,
-    resolve_source_target, resolve_target,
+    self, RuntimeContext, annotate_refresh_error, ensure_index_ready, index_mode_name,
+    map_api_error, map_api_error_for_project, refresh_label, refresh_mode_name,
 };
 #[cfg(test)]
 use crate::stdio_catalog::{
@@ -99,18 +68,7 @@ use crate::stdio_catalog::{
     resource_templates_list_json as stdio_resource_templates_list_json,
     resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
 };
-use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy)]
-struct RepoTextOutputConfig {
-    mode: RepoTextMode,
-    enabled: bool,
-}
-
-const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
-const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
-const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
-    "\n\n... bundle content truncated by context bundle byte cap\n";
 const MAX_DRILL_JOBS: usize = 8;
 
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
@@ -295,99 +253,6 @@ fn run_internal_owned_delete(cmd: InternalOwnedDeleteCommand) -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-#[derive(Debug)]
-struct StructuredCommandFailure {
-    envelope: CommandFailureEnvelope,
-    output_file: Option<PathBuf>,
-    markdown: Option<String>,
-}
-
-impl std::fmt::Display for StructuredCommandFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.envelope.error.message)
-    }
-}
-
-impl std::error::Error for StructuredCommandFailure {}
-
-fn command_failure_envelope(
-    code: impl Into<String>,
-    failed_layer: impl Into<String>,
-    message: impl Into<String>,
-    context: serde_json::Value,
-) -> CommandFailureEnvelope {
-    CommandFailureEnvelope::new(ApiError::with_details(
-        code,
-        message,
-        ApiErrorDetails {
-            cause_code: None,
-            failed_layer: Some(failed_layer.into()),
-            project: None,
-            next_commands: Vec::new(),
-            minimum_next: Vec::new(),
-            full_repair: Vec::new(),
-            readiness: None,
-            embedding_capacity: None,
-            embedding_retry: None,
-            coverage_gaps: Vec::new(),
-        },
-    ))
-    .with_context(context)
-}
-
-fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
-    command_failure_envelope(
-        "command_failed",
-        "command",
-        error.to_string(),
-        serde_json::json!({
-            "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
-        }),
-    )
-}
-
-fn command_failure_message(error: &anyhow::Error) -> String {
-    if runtime::api_error_in_chain(error).is_some() {
-        format!("{error:#}")
-    } else {
-        error.to_string()
-    }
-}
-
-fn json_output_requested(args: &[OsString]) -> bool {
-    args.windows(2)
-        .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
-        || args.iter().any(|arg| arg == OsStr::new("--format=json"))
-}
-
-fn requested_output_file(args: &[OsString]) -> Option<&Path> {
-    args.iter()
-        .find_map(|arg| {
-            arg.to_str()
-                .and_then(|arg| arg.strip_prefix("--output-file="))
-                .filter(|path| !path.is_empty())
-                .map(Path::new)
-        })
-        .or_else(|| {
-            args.windows(2).find_map(|pair| {
-                (pair[0] == OsStr::new("--output-file")
-                    && !pair[1].to_string_lossy().starts_with('-'))
-                .then(|| Path::new(&pair[1]))
-            })
-        })
-}
-
-fn emit_command_failure(envelope: &CommandFailureEnvelope, output_file: Option<&Path>) {
-    let json = serde_json::to_string_pretty(envelope)
-        .expect("the command failure envelope is always JSON-serializable");
-    if let Some(path) = output_file
-        && fs::write(path, format!("{json}\n")).is_ok()
-    {
-        return;
-    }
-    println!("{json}");
 }
 
 fn new_agent_surface_runtime(
@@ -597,18 +462,6 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
     markdown
 }
 
-fn quote_command_path(path: &std::path::Path) -> String {
-    display::quote_command_path(path)
-}
-
-fn quote_command_value(value: &str) -> String {
-    display::quote_command_value(value)
-}
-
-fn quote_command_argument_value(value: &str) -> String {
-    display::quote_command_argument_value(value)
-}
-
 fn run_index(cmd: IndexCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "index")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -616,13 +469,6 @@ fn run_index(cmd: IndexCommand) -> Result<()> {
     run_index_once(&cmd)?;
     if cmd.watch {
         run_index_watch(cmd)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn preflight_output_file(output_file: Option<&std::path::Path>) -> Result<()> {
-    if let Some(path) = output_file {
-        validate_output_file_parent(path)?;
     }
     Ok(())
 }
@@ -2787,7 +2633,8 @@ pub(crate) mod diagnostics;
 use diagnostics::*;
 
 pub(crate) mod artifacts;
-use artifacts::*;
+pub(crate) use artifacts::preflight_output_file;
+use artifacts::{ensure_dot_only_for_trail, write_context_bundle};
 
 pub(crate) mod rendering;
 use rendering::*;

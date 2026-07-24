@@ -1,4 +1,13 @@
-use super::*;
+use anyhow::{Context, Result, bail};
+use codestory_contracts::api::GraphArtifactDto;
+use std::fs;
+
+use crate::{args, display, output::validate_output_file_parent};
+
+pub(super) const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
+const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
+const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
+    "\n\n... bundle content truncated by context bundle byte cap\n";
 
 pub(super) fn write_context_bundle<T: serde::Serialize>(
     bundle_dir: &std::path::Path,
@@ -210,6 +219,13 @@ pub(super) fn sanitize_artifact_name(value: &str) -> String {
 pub(crate) fn ensure_dot_only_for_trail(format: args::OutputFormat, command: &str) -> Result<()> {
     if format == args::OutputFormat::Dot {
         bail!("--format dot is only supported by `trail`; `{command}` supports markdown and json");
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_output_file(output_file: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = output_file {
+        validate_output_file_parent(path)?;
     }
     Ok(())
 }
