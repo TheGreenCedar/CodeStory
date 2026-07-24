@@ -12,13 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .foundation import (
-    LOWER_TIER_NONCLAIMS,
     TARGET_CONTRACTS,
     ProofFailure,
     require,
 )
 from .contracts import (
-    assert_retained_json_privacy,
     canonical_sha256,
     load_server_measurement_contract,
     qualification_measurement_sample_value,
@@ -41,6 +39,7 @@ from .qualification_production import (
     run_qualification_producer,
 )
 from .qualification_metrics import collect_qualification_measurements
+from .qualification_output import write_qualification_outputs
 
 def verify_calibration_source_lineage(
     calibration_source: dict,
@@ -1122,158 +1121,23 @@ def produce_qualification_evidence(
         server_cleanup_control,
     )
     external = collect_qualification_external_evidence(context)
-    nonce = context.nonce
-    projects = list(context.projects)
-    contracts = context.contracts
-    package = context.package
     runner = run_qualification_producer(context)
-    identity = runtime["identity"]
-    expected_backend = runner.expected_backend
-    matrix_cell_id = runner.matrix_cell_id
-    matrix_cell = runner.matrix_cell
-    output = runner.output
-    expected_status = runner.expected_status
-    scenario_evidence = collect_qualification_scenarios(
+    scenarios = collect_qualification_scenarios(
         context,
         runner,
         external,
     )
-    shared = scenario_evidence.shared_identity
-    retained_scenarios = scenario_evidence.scenarios
-    forbidden_values = [nonce, *projects]
     measurements = collect_qualification_measurements(
         context,
         runner,
         external,
     )
-    measurement = measurements.measurement
-    memory_evidence = measurements.memory
-    timing = measurements.timing
-    host = measurements.host
-    nonclaims = {
-        claim: {
-            "claimed": False,
-            "reason": (
-                "this exact-package qualification tier does not establish the broader claim"
-            ),
-        }
-        for claim in sorted(LOWER_TIER_NONCLAIMS)
-    }
-
-    retained_metrics = measurements.metrics
-
-    retained = {
-        "schema_version": 1,
-        "status": expected_status,
-        "tier": args.proof_tier,
-        "source": manifest["source"],
-        "package": {
-            **package,
-            **contracts,
-            "matrix_cell_id": matrix_cell_id,
-            "accelerator_claim": matrix_cell["accelerator_claim"],
-            "model_sha256": identity["embedding_model_sha256"],
-            "backend": identity["embedding_backend"],
-            "policy": identity["embedding_policy"],
-            "cache_state": host["cache_state"],
-            "residency_state": host["residency_state"],
-        },
-        "host": host,
-        "same_account": runtime["same_account"],
-        "shared_identity": shared,
-        "timing": timing,
-        "scenarios": retained_scenarios,
-        "lower_tier_nonclaims": nonclaims,
-        "metrics": retained_metrics,
-    }
-    if args.proof_tier == "installed_runtime":
-        retained["installed_plugin"] = runtime["installed_plugin"]
-        retained["managed_runtime"] = runtime["managed_runtime"]
-    write_json(args.qualification_evidence, retained)
-    assert_retained_json_privacy(
-        args.qualification_evidence,
-        [*forbidden_values, *runtime.get("_qualification_forbidden_values", [])],
+    return write_qualification_outputs(
+        context,
+        runner,
+        scenarios,
+        measurements,
     )
-    if args.proof_tier == "calibration" and args.calibration_run_output is not None:
-        run_index = require_positive_int(
-            args.calibration_run_index,
-            "--calibration-run-index",
-        )
-        require(
-            run_index <= 3,
-            "--calibration-run-index must be in the preregistered range 1..3",
-        )
-        normalized_package = {
-            "archive_sha256": archive_sha256,
-            "executable_sha256": manifest["binary"]["sha256"],
-            "asset_target": manifest["asset_target"],
-            "release_version": manifest["release_version"],
-            "model_sha256": identity["embedding_model_sha256"],
-            "policy": args.engine_policy,
-            "backend": expected_backend,
-        }
-        run_contracts = {
-            "protocol_sha256": measurement_contract["protocol_sha256"],
-            "measurement_protocol_sha256": measurement_contract[
-                "measurement_protocol_sha256"
-            ],
-            "input_constant_set_sha256": measurement_contract[
-                "constant_set_sha256"
-            ],
-        }
-        raw_metrics = json.loads(
-            json.dumps(measurement["payload"]["metrics"])
-        )
-        memory_samples = []
-        for sample in memory_evidence["payload"]["samples"]:
-            normalized_sample = json.loads(json.dumps(sample))
-            normalized_sample["process"] = normalized_sample.pop("producer_process")
-            memory_samples.append(normalized_sample)
-        raw_metrics["total_codestory_process_memory"] = {
-            "unit": "bytes",
-            "samples": memory_samples,
-        }
-        run_identity_seed = {
-            "source": manifest["source"],
-            "package": normalized_package,
-            "matrix_cell_id": matrix_cell_id,
-            "run_index": run_index,
-            "host_fingerprint": host["fingerprint"],
-            "measurement_artifact_sha256": measurement["artifact"]["sha256"],
-            "memory_artifact_sha256": memory_evidence["artifact"]["sha256"],
-        }
-        run_id = canonical_sha256(run_identity_seed)
-        raw_payload = {
-            "schema_version": 1,
-            "run_id_sha256": run_id,
-            "matrix_cell_id": matrix_cell_id,
-            "run_index": run_index,
-            "host_fingerprint": host["fingerprint"],
-            "source": manifest["source"],
-            "contracts": run_contracts,
-            "package": normalized_package,
-            "clean": manifest["source"]["tracked_dirty"] is False,
-            "unplanned_suspend": measurement["unplanned_suspend"],
-            "metrics": raw_metrics,
-        }
-        run_envelope = {
-            "run_id_sha256": run_id,
-            "matrix_cell_id": matrix_cell_id,
-            "run_index": run_index,
-            "host_fingerprint": host["fingerprint"],
-            "clean": raw_payload["clean"],
-            "unplanned_suspend": raw_payload["unplanned_suspend"],
-            "source": manifest["source"],
-            "contracts": run_contracts,
-            "package": normalized_package,
-            "raw_artifact": {
-                "name": "measurements.raw.json",
-                "sha256": canonical_sha256(raw_payload),
-                "payload": raw_payload,
-            },
-        }
-        write_json(args.calibration_run_output, run_envelope)
-    return retained
 
 
 def build_calibration_self_test_bundle(
