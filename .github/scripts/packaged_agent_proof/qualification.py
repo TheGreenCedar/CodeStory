@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from .foundation import (
@@ -494,6 +495,153 @@ def verify_retained_qualification(
     return evidence
 
 
+@dataclass(frozen=True)
+class RetryState:
+    code: str
+    message_head: str
+    retry_class: str
+    retry_after_ms: int
+    retry_condition: str
+    capacity: object | None
+
+
+def validate_retry_state(value: object, field: str) -> RetryState:
+    require(isinstance(value, dict), f"{field} is malformed")
+    expected = {
+        "code",
+        "message_head",
+        "retry_class",
+        "retry_after_ms",
+        "retry_condition",
+    }
+    if "capacity" in value:
+        expected.add("capacity")
+    require_exact_keys(value, expected, field)
+    code = require_nonempty_string(value["code"], f"{field}.code")
+    message_head = require_nonempty_string(
+        value["message_head"],
+        f"{field}.message_head",
+    )
+    retry_class = require_nonempty_string(
+        value["retry_class"],
+        f"{field}.retry_class",
+    )
+    retry_after_ms = require_nonnegative_int(
+        value["retry_after_ms"],
+        f"{field}.retry_after_ms",
+    )
+    retry_condition = require_nonempty_string(
+        value["retry_condition"],
+        f"{field}.retry_condition",
+    )
+    require(
+        retry_class
+        in {
+            "after_capacity_change",
+            "after_delay",
+            "after_owner_idle",
+            "after_server_change",
+            "none",
+            "same_rpc_once",
+            "terminal",
+        },
+        f"{field}.retry_class is outside the protocol contract",
+    )
+    return RetryState(
+        code=code,
+        message_head=message_head,
+        retry_class=retry_class,
+        retry_after_ms=retry_after_ms,
+        retry_condition=retry_condition,
+        capacity=value.get("capacity"),
+    )
+
+
+@dataclass(frozen=True)
+class ReplayAttempt:
+    ordinal: int
+    request_id: str
+    server_instance_id: str
+    submitted_ns: int
+    completed_ns: int
+    outcome: str
+
+
+def _validated_replay_attempt(value: object, index: int) -> ReplayAttempt:
+    require(isinstance(value, dict), "replay attempt is malformed")
+    require_exact_keys(
+        value,
+        {
+            "ordinal",
+            "request_id",
+            "server_instance_id",
+            "submitted_ns",
+            "completed_ns",
+            "outcome",
+        },
+        f"replay attempt {index}",
+    )
+    require(value["ordinal"] == index, "replay attempt ordinal is not exact")
+    request_id = require_nonempty_string(
+        value["request_id"],
+        "replay attempt request ID",
+    )
+    server_instance_id = require_nonempty_string(
+        value["server_instance_id"],
+        f"replay attempt {index} server_instance_id",
+    )
+    submitted_ns = require_nonnegative_int(
+        value["submitted_ns"],
+        f"replay attempt {index} submitted_ns",
+    )
+    completed_ns = require_nonnegative_int(
+        value["completed_ns"],
+        f"replay attempt {index} completed_ns",
+    )
+    require(completed_ns >= submitted_ns, "replay attempt clock moved backwards")
+    outcome = require_nonempty_string(
+        value["outcome"],
+        f"replay attempt {index} outcome",
+    )
+    return ReplayAttempt(
+        ordinal=index,
+        request_id=request_id,
+        server_instance_id=server_instance_id,
+        submitted_ns=submitted_ns,
+        completed_ns=completed_ns,
+        outcome=outcome,
+    )
+
+
+def validate_replay_attempts(
+    values: dict,
+    *,
+    old_server_instance_id: str,
+    new_server_instance_id: str,
+) -> tuple[ReplayAttempt, ReplayAttempt]:
+    raw_attempts = values["wire_attempts"]
+    require(
+        values["wire_attempt_count"] == 2
+        and isinstance(raw_attempts, list)
+        and len(raw_attempts) == 2,
+        "replay evidence must contain exactly the original RPC and one replay",
+    )
+    attempts = (
+        _validated_replay_attempt(raw_attempts[0], 1),
+        _validated_replay_attempt(raw_attempts[1], 2),
+    )
+    original, replay = attempts
+    require(
+        original.request_id != replay.request_id
+        and original.server_instance_id == old_server_instance_id
+        and original.outcome == "server_loss"
+        and replay.server_instance_id == new_server_instance_id
+        and replay.outcome == "completed",
+        "replay attempts do not bind the old loss and exact replacement completion",
+    )
+    return attempts
+
+
 def derive_scenario_assertions(
     scenario_id: str,
     *,
@@ -543,87 +691,6 @@ def derive_scenario_assertions(
             f"qualification transition {kind} has an invalid active request class",
         )
         return values
-
-    def replay_attempts(
-        values: dict,
-        *,
-        old_server_instance_id: str,
-        new_server_instance_id: str,
-    ) -> list[dict]:
-        attempts = values["wire_attempts"]
-        require(
-            values["wire_attempt_count"] == 2
-            and isinstance(attempts, list)
-            and len(attempts) == 2,
-            "replay evidence must contain exactly the original RPC and one replay",
-        )
-        for index, attempt in enumerate(attempts, start=1):
-            require(isinstance(attempt, dict), "replay attempt is malformed")
-            require_exact_keys(
-                attempt,
-                {
-                    "ordinal",
-                    "request_id",
-                    "server_instance_id",
-                    "submitted_ns",
-                    "completed_ns",
-                    "outcome",
-                },
-                f"replay attempt {index}",
-            )
-            require(attempt["ordinal"] == index, "replay attempt ordinal is not exact")
-            require(
-                isinstance(attempt["request_id"], str) and bool(attempt["request_id"]),
-                "replay attempt request ID is missing",
-            )
-            submitted = require_nonnegative_int(
-                attempt["submitted_ns"], f"replay attempt {index} submitted_ns"
-            )
-            completed = require_nonnegative_int(
-                attempt["completed_ns"], f"replay attempt {index} completed_ns"
-            )
-            require(completed >= submitted, "replay attempt clock moved backwards")
-        require(
-            attempts[0]["request_id"] != attempts[1]["request_id"]
-            and attempts[0]["server_instance_id"] == old_server_instance_id
-            and attempts[0]["outcome"] == "server_loss"
-            and attempts[1]["server_instance_id"] == new_server_instance_id
-            and attempts[1]["outcome"] == "completed",
-            "replay attempts do not bind the old loss and exact replacement completion",
-        )
-        return attempts
-
-    def retry_state(value: object, field: str) -> dict:
-        require(isinstance(value, dict), f"{field} is malformed")
-        expected = {
-            "code",
-            "message_head",
-            "retry_class",
-            "retry_after_ms",
-            "retry_condition",
-        }
-        if "capacity" in value:
-            expected.add("capacity")
-        require_exact_keys(value, expected, field)
-        require_nonempty_string(value["code"], f"{field}.code")
-        require_nonempty_string(value["message_head"], f"{field}.message_head")
-        require_nonempty_string(value["retry_class"], f"{field}.retry_class")
-        require_nonnegative_int(value["retry_after_ms"], f"{field}.retry_after_ms")
-        require_nonempty_string(value["retry_condition"], f"{field}.retry_condition")
-        require(
-            value["retry_class"]
-            in {
-                "after_capacity_change",
-                "after_delay",
-                "after_owner_idle",
-                "after_server_change",
-                "none",
-                "same_rpc_once",
-                "terminal",
-            },
-            f"{field}.retry_class is outside the protocol contract",
-        )
-        return value
 
     snapshots = [
         observation["snapshot"]
@@ -804,7 +871,7 @@ def derive_scenario_assertions(
         finished = require_nonnegative_int(bounded["finished_ns"], "frozen owner finished_ns")
         timeout_ms = require_positive_int(bounded["timeout_ms"], "frozen owner timeout_ms")
         stable_pid = require_positive_int(stable["pid"], "frozen owner stable pid")
-        retry = retry_state(bounded["retry"], "frozen owner retry")
+        retry = validate_retry_state(bounded["retry"], "frozen owner retry")
         stable_identity = (
             len(snapshot_instances) == 1
             and stable["server_instance_id"] == next(iter(snapshot_instances))
@@ -829,9 +896,9 @@ def derive_scenario_assertions(
                 and bounded["clock_domain"] == "awake_monotonic"
                 and bool(bounded["clock_boot_id"])
                 and bounded["error_code"] == "embedding_server_owner_unresponsive"
-                and retry["code"] == bounded["error_code"]
-                and retry["retry_class"] == "after_server_change"
-                and bool(retry["retry_condition"])
+                and retry.code == bounded["error_code"]
+                and retry.retry_class == "after_server_change"
+                and bool(retry.retry_condition)
             ),
             "authority_retained": stable_identity,
             "no_unlink": stable_identity,
@@ -860,26 +927,32 @@ def derive_scenario_assertions(
             }
             <= snapshot_instances
         )
-        active_retry = retry_state(active["retry"], "incompatible active retry")
-        idle_retry = retry_state(idle["retry"], "incompatible idle retry")
+        active_retry = validate_retry_state(
+            active["retry"],
+            "incompatible active retry",
+        )
+        idle_retry = validate_retry_state(
+            idle["retry"],
+            "incompatible idle retry",
+        )
         assertions = {
             "idle_owner_drains": (
                 idle["compatibility_evidence"] == "injected_contract_mismatch"
                 and idle["error_code"] == "embedding_server_draining"
-                and idle_retry["code"] == idle["error_code"]
-                and idle_retry["retry_class"] == "after_owner_idle"
-                and idle_retry["retry_after_ms"] == 0
-                and idle_retry["retry_condition"]
+                and idle_retry.code == idle["error_code"]
+                and idle_retry.retry_class == "after_owner_idle"
+                and idle_retry.retry_after_ms == 0
+                and idle_retry.retry_condition
                 == "the incompatible server exits while fully idle"
                 and replaced
             ),
             "active_owner_returns_typed_retry": (
                 active["compatibility_evidence"] == "injected_contract_mismatch"
                 and active["error_code"] == "embedding_server_incompatible_active_owner"
-                and active_retry["code"] == active["error_code"]
-                and active_retry["retry_class"] == "after_owner_idle"
-                and active_retry["retry_after_ms"] == 0
-                and active_retry["retry_condition"]
+                and active_retry.code == active["error_code"]
+                and active_retry.retry_class == "after_owner_idle"
+                and active_retry.retry_after_ms == 0
+                and active_retry.retry_condition
                 == "the incompatible server exits while fully idle"
             ),
             "one_authority": len(snapshot_authorities) <= 2 and replaced,
@@ -1009,7 +1082,7 @@ def derive_scenario_assertions(
                 "wire_attempts",
             },
         )
-        attempts = replay_attempts(
+        attempts = validate_replay_attempts(
             replay,
             old_server_instance_id=replacement["old_server_instance_id"],
             new_server_instance_id=replacement["new_server_instance_id"],
@@ -1019,7 +1092,7 @@ def derive_scenario_assertions(
                 active["active_request_class"] == "query"
                 and replacement["old_server_instance_id"]
                 != replacement["new_server_instance_id"]
-                and [attempt["server_instance_id"] for attempt in attempts]
+                and [attempt.server_instance_id for attempt in attempts]
                 == [
                     replacement["old_server_instance_id"],
                     replacement["new_server_instance_id"],
@@ -1028,7 +1101,7 @@ def derive_scenario_assertions(
             "pure_embedding_rpc_replayed_at_most_once": (
                 replay["logical_operation_count"] == 1
                 and replay["wire_attempt_count"] <= 2
-                and sum(attempt["outcome"] == "completed" for attempt in attempts) == 1
+                and sum(attempt.outcome == "completed" for attempt in attempts) == 1
             ),
         }
     elif scenario_id == "true_idle_respawn":
@@ -1286,7 +1359,7 @@ def derive_scenario_assertions(
             fail_stop["watchdog_progress_sequence"],
             "worker stall watchdog progress sequence",
         )
-        attempts = replay_attempts(
+        attempts = validate_replay_attempts(
             fail_stop,
             old_server_instance_id=fail_stop["old_server_instance_id"],
             new_server_instance_id=replacement["new_server_instance_id"],
@@ -1304,7 +1377,7 @@ def derive_scenario_assertions(
                 and watchdog_observed_ns - watchdog_last_progress_ns
                 >= hard_no_progress_ms * 1_000_000
                 and watchdog_cadence_ms < hard_no_progress_ms
-                and attempts[0]["outcome"] == "server_loss"
+                and attempts[0].outcome == "server_loss"
                 and replacement_observed
             ),
             "unrelated_process_survives": (
@@ -1325,7 +1398,7 @@ def derive_scenario_assertions(
             ),
             "pure_embedding_rpc_replayed_at_most_once": (
                 fail_stop["wire_attempt_count"] <= 2
-                and sum(attempt["outcome"] == "completed" for attempt in attempts) == 1
+                and sum(attempt.outcome == "completed" for attempt in attempts) == 1
             ),
         }
     failed = sorted(name for name, value in assertions.items() if value is not True)
