@@ -6,9 +6,9 @@ use codestory_contracts::api::{
     ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
 };
 use codestory_indexer::{ArtifactCacheFamilyStats, ArtifactCachePolicy, IncrementalIndexingStats};
-use codestory_store::{
-    IndexPublicationRecord, StagedSnapshotFinalizeStats, StagedSnapshotPublishStats,
-};
+#[cfg(test)]
+use codestory_store::IndexPublicationRecord;
+use codestory_store::{StagedSnapshotFinalizeStats, StagedSnapshotPublishStats};
 use std::collections::HashSet;
 use std::time::Duration;
 
