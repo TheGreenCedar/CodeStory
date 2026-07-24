@@ -31,16 +31,11 @@ from .contracts import (
     require_opaque_identifier,
     require_positive_int,
     require_sha256,
-    selected_qualification_matrix_cell,
     sha256,
     write_json,
-    write_private_json,
 )
 from .archive import (
     normalized_backend,
-)
-from .process import (
-    run,
 )
 from .runtime import (
     metric_passes,
@@ -53,6 +48,7 @@ from .qualification import (
 from .qualification_production import (
     collect_qualification_external_evidence,
     prepare_qualification_producer,
+    run_qualification_producer,
 )
 
 def verify_calibration_source_lineage(
@@ -1135,119 +1131,22 @@ def produce_qualification_evidence(
         server_cleanup_control,
     )
     external = collect_qualification_external_evidence(context)
-    private_root = context.private_root
     artifact_root = context.artifact_root
     nonce = context.nonce
     nonce_sha256 = context.nonce_sha256
     projects = list(context.projects)
     contracts = context.contracts
     package = context.package
-    qualification_env = context.qualification_env
     publication_fault_evidence = external.publication_fault
     fault_recovery_consistency_evidence = external.fault_recovery_consistency
     retrieval_quality_evidence = external.retrieval_quality
+    runner = run_qualification_producer(context)
     identity = runtime["identity"]
-    expected_backend = args.expected_backend or require_nonempty_string(
-        identity.get("embedding_backend"),
-        "runtime embedding backend",
-    )
-    matrix_cell_id = require_nonempty_string(
-        args.qualification_matrix_cell,
-        "--produce-qualification-evidence requires --qualification-matrix-cell",
-    )
-    matrix_cell = selected_qualification_matrix_cell(
-        measurement_contract["measurement_protocol"],
-        cell_id=matrix_cell_id,
-        target=manifest["asset_target"],
-        proof_tier=args.proof_tier,
-        expected_policy=args.engine_policy,
-        expected_backend=expected_backend,
-    )
-    request = {
-        "schema_version": 1,
-        "qualification_nonce": nonce,
-        "qualification_nonce_sha256": nonce_sha256,
-        "proof_tier": args.proof_tier,
-        "source": manifest["source"],
-        "package": package,
-        "contracts": contracts,
-        "runtime": {
-            "engine_policy": args.engine_policy,
-            "expected_backend": expected_backend,
-            "offline": args.offline,
-            "matrix_cell_id": matrix_cell_id,
-            "cache_state": matrix_cell["cache_state"],
-            "residency_state": matrix_cell["residency_state"],
-        },
-        "projects": projects,
-        "required_scenarios": sorted(REQUIRED_SERVER_SCENARIOS),
-        "required_metrics": sorted(
-            measurement_contract["measurement_protocol"]["required_metrics"]
-        ),
-        "output_directory": str(artifact_root.resolve()),
-    }
-    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(
-        artifact_root.resolve()
-    )
-    server_cleanup_control["qualification_directory"] = str(
-        artifact_root.resolve()
-    )
-    request_path = artifact_root / "request.json"
-    output_path = artifact_root / "output.json"
-    write_private_json(request_path, request)
-    run(
-        [
-            str(qualification_cli),
-            "internal-embedding-qualification",
-            "--request",
-            str(request_path),
-            "--output",
-            str(output_path),
-        ],
-        env=qualification_env,
-        cwd=root,
-        timeout=args.timeout_secs,
-    )
-    require(output_path.is_file() and not output_path.is_symlink(), "qualification runner omitted its output")
-    output_bytes = output_path.read_bytes()
-    for forbidden in [nonce, *projects]:
-        require(
-            forbidden.encode("utf-8") not in output_bytes,
-            "qualification runner output leaked private request material",
-        )
-    try:
-        output = json.loads(output_bytes)
-    except json.JSONDecodeError as exc:
-        raise ProofFailure(f"qualification runner output is not valid JSON: {exc}") from exc
-    require(isinstance(output, dict), "qualification runner output must be an object")
-    require_exact_keys(
-        output,
-        {
-            "schema_version",
-            "tier",
-            "source",
-            "package",
-            "contracts",
-            "runtime",
-            "request_sha256",
-            "scenarios",
-            "measurements",
-        },
-        "qualification runner output",
-    )
-    require(output["schema_version"] == 2, "qualification runner schema is unsupported")
-    require(output["tier"] == args.proof_tier, "qualification runner returned the wrong proof tier")
-    expected_status = "calibration" if args.proof_tier == "calibration" else "pass"
-    require(output["source"] == manifest["source"], "qualification runner source identity is stale")
-    require(output["package"] == package, "qualification runner package identity is stale")
-    require(output["contracts"] == contracts, "qualification runner contract identity is stale")
-    require(output["runtime"] == request["runtime"], "qualification runner runtime identity is stale")
-    expected_request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
-    require(
-        output["request_sha256"] == expected_request_sha256,
-        "qualification runner output is not bound to the exact private request",
-    )
-
+    expected_backend = runner.expected_backend
+    matrix_cell_id = runner.matrix_cell_id
+    matrix_cell = runner.matrix_cell
+    output = runner.output
+    expected_status = runner.expected_status
     constants_frozen = measurement_contract["constant_set"]["status"] == "frozen"
     shared = runtime["shared_identity"]
     require_exact_keys(
