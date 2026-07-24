@@ -6,14 +6,11 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from .cli import (
-    _claim_scope,
-    _installed_proof_source,
-    _record_calibration_qualification,
-    _resolve_optional_paths,
-)
+from .archive_proof import claim_scope
+from .cli import _installed_proof_source, _resolve_optional_paths
 from .contracts import write_json
 from .foundation import ProofFailure, require
+from .qualification_recording import record_calibration_qualification
 
 
 def run_cli_self_tests() -> None:
@@ -46,7 +43,7 @@ def run_cli_self_tests() -> None:
             "candidate installation source was not retained",
         )
         require(
-            _claim_scope(args) == "installed_ground",
+            claim_scope(args) == "installed_ground",
             "installed ground claim scope changed",
         )
 
@@ -69,7 +66,7 @@ def run_cli_self_tests() -> None:
         )
         args.qualification_evidence = calibration
         summary: dict[str, object] = {}
-        _record_calibration_qualification(args, summary)
+        record_calibration_qualification(args, summary)
         require(
             summary["qualification"]["status"] == "calibration",
             "calibration qualification was not recorded",
