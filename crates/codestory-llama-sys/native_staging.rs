@@ -13,7 +13,197 @@ use std::time::Duration;
 use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
 const UPSTREAM_BUILD_SUPPORT_LIBRARY_NAMES: &[&str] = &["libllama-common.so"];
+pub(crate) const NATIVE_SEEDS_DIR: &str = ".codestory-native-seeds";
+pub(crate) const NATIVE_RUNTIME_FILE_LIST: &str = "codestory-native-runtime-files-v1.txt";
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub(crate) struct StagedNativeGeneration {
+    pub(crate) id: String,
+    pub(crate) directory: PathBuf,
+    pub(crate) runtime_file_names: Vec<String>,
+}
+
+/// Stage the complete ABI-coupled runtime in an immutable directory.
+///
+/// This deliberately does not activate the generation. The final executable
+/// does not exist while this build script runs, so publishing here would expose
+/// an incomplete generation. The CLI launcher adds its matching runtime
+/// executable and atomically publishes the one generation pointer.
+pub(crate) fn stage_native_generation(
+    sources: &[&Path],
+    profile_dir: &Path,
+) -> io::Result<StagedNativeGeneration> {
+    let mut entries = sources
+        .iter()
+        .map(|source| {
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "native runtime file name is not UTF-8: {}",
+                            source.display()
+                        ),
+                    )
+                })?
+                .to_owned();
+            validate_runtime_file_name(&name)?;
+            let source = fs::canonicalize(source)?;
+            validate_regular_source(&source, "native runtime")?;
+            Ok((name, source))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.0.to_lowercase());
+    for pair in entries.windows(2) {
+        if pair[0].0.eq_ignore_ascii_case(&pair[1].0) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate native runtime artifact: {}", pair[0].0),
+            ));
+        }
+    }
+
+    let id = generation_id(&entries)?;
+    let seeds_dir = profile_dir.join(NATIVE_SEEDS_DIR);
+    let generation_dir = seeds_dir.join(&id);
+    fs::create_dir_all(&seeds_dir)?;
+    let _lock = acquire_profile_staging_lock(profile_dir)?;
+
+    if generation_dir.exists() {
+        verify_generation(&generation_dir, &entries)?;
+    } else {
+        let temporary = seeds_dir.join(format!(
+            ".{id}.codestory-stage-{}-{}.tmp",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&temporary)?;
+        let result = (|| {
+            for (name, source) in &entries {
+                copy_verified(source, &temporary.join(name))?;
+            }
+            write_runtime_file_list(
+                &temporary.join(NATIVE_RUNTIME_FILE_LIST),
+                entries.iter().map(|(name, _)| name.as_str()),
+            )?;
+            File::open(&temporary)?.sync_all()?;
+            match fs::rename(&temporary, &generation_dir) {
+                Ok(()) => sync_parent_directory(&generation_dir)?,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+                {
+                    fs::remove_dir_all(&temporary)?;
+                    verify_generation(&generation_dir, &entries)?;
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        result?;
+    }
+
+    Ok(StagedNativeGeneration {
+        id,
+        directory: generation_dir,
+        runtime_file_names: entries.into_iter().map(|(name, _)| name).collect(),
+    })
+}
+
+fn generation_id(entries: &[(String, PathBuf)]) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-native-generation-v1\0");
+    for (name, source) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(file_sha256(source)?);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_generation(generation_dir: &Path, entries: &[(String, PathBuf)]) -> io::Result<()> {
+    let names = fs::read_to_string(generation_dir.join(NATIVE_RUNTIME_FILE_LIST))?;
+    let expected = entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    if names.lines().collect::<Vec<_>>() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "native generation manifest differs from its content identity: {}",
+                generation_dir.display()
+            ),
+        ));
+    }
+    for (name, source) in entries {
+        let destination = generation_dir.join(name);
+        validate_regular_source(&destination, "staged native runtime")?;
+        if file_sha256(source)? != file_sha256(&destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "immutable native generation contains unexpected bytes: {}",
+                    destination.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_verified(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    if file_sha256(source)? != file_sha256(destination)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "native runtime copy differs from source: {}",
+                source.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_file_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.contains(['/', '\\'])
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe native runtime file name: {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn write_runtime_file_list<'a>(
+    destination: &Path,
+    names: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    let mut body = names.into_iter().collect::<Vec<_>>().join("\n");
+    body.push('\n');
+    fs::write(destination, body)?;
+    File::open(destination)?.sync_all()
+}
 
 /// Copy one Windows runtime DLL without exposing a missing or partial destination.
 #[cfg(test)]
@@ -697,13 +887,50 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        acquire_profile_staging_lock, prepare_real_hard_link, publish_all, publish_all_with,
-        stage_linux_shared_libraries,
+        NATIVE_RUNTIME_FILE_LIST, NATIVE_SEEDS_DIR, acquire_profile_staging_lock,
+        prepare_real_hard_link, publish_all, publish_all_with, stage_linux_shared_libraries,
+        stage_native_generation,
     };
     use std::fs;
     use std::io;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn stages_complete_immutable_native_seeds() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let sources = temp.path().join("sources");
+        let profile = temp.path().join("target/debug");
+        fs::create_dir_all(&sources).expect("source directory");
+        fs::write(sources.join("libggml.so"), b"generation-one").expect("first source");
+        fs::write(sources.join("libllama.so"), b"llama").expect("second source");
+        let paths = [sources.join("libggml.so"), sources.join("libllama.so")];
+        let refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+
+        let first = stage_native_generation(&refs, &profile).expect("first generation");
+        assert_eq!(
+            fs::read_to_string(first.directory.join(NATIVE_RUNTIME_FILE_LIST))
+                .expect("generation manifest"),
+            "libggml.so\nlibllama.so\n"
+        );
+        fs::write(&paths[0], b"generation-two").expect("replace source bytes");
+        let second = stage_native_generation(&refs, &profile).expect("second generation");
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            fs::read(first.directory.join("libggml.so")).expect("immutable first bytes"),
+            b"generation-one"
+        );
+        assert_eq!(
+            fs::read(second.directory.join("libggml.so")).expect("second bytes"),
+            b"generation-two"
+        );
+        assert_eq!(
+            fs::read_dir(profile.join(NATIVE_SEEDS_DIR))
+                .expect("seed inventory")
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn replaces_dangling_links_in_every_cargo_runtime_directory() {

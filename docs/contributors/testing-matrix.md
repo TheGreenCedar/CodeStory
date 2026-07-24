@@ -215,7 +215,8 @@ existing record. Missing, stale, partial, self-selected, or wrong-tier evidence
 fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
-ship runtime-loaded native modules beside the executable. Hosted Linux proof
+ship the runtime executable and native modules in one immutable generation
+selected by the public launcher through a single atomic pointer. Hosted Linux proof
 does not install a Vulkan loader before help, stdio initialization, or explicit
 CPU execution, and it makes no Linux acceleration claim.
 

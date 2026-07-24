@@ -8,6 +8,7 @@ from pathlib import Path
 
 from native_binary_contract import (
     NativeBinaryError,
+    inspect_binary,
     inspect_runtime_layout,
     runtime_artifact_role,
 )
@@ -32,6 +33,7 @@ from .native_contract_identity import (
 @dataclass(frozen=True)
 class ManifestParts:
     binary: dict
+    runtime_executable: dict
     source: dict
     engine: dict
     model: dict
@@ -45,6 +47,8 @@ class ManifestParts:
 @dataclass(frozen=True)
 class NativeInventory:
     cli_sha256: str
+    launcher_identity: dict
+    runtime_path: Path
     binary_identity: dict
     runtime_artifacts: list[dict]
 
@@ -95,6 +99,7 @@ def _manifest_parts(manifest: dict) -> ManifestParts:
         ("tokenizer_config", "tokenizer descriptor", dict),
         ("accelerator", "accelerator descriptor", dict),
         ("server_proof", "server proof descriptor", dict),
+        ("runtime_executable", "runtime executable descriptor", dict),
         ("runtime_artifacts", "runtime artifact set", list),
     )
     values = {}
@@ -107,6 +112,7 @@ def _manifest_parts(manifest: dict) -> ManifestParts:
         values[field] = value
     return ManifestParts(
         binary=binary,
+        runtime_executable=values["runtime_executable"],
         source=source,
         engine=values["engine"],
         model=values["model"],
@@ -119,7 +125,7 @@ def _manifest_parts(manifest: dict) -> ManifestParts:
 
 
 def _runtime_artifact_paths(
-    cli: Path,
+    directory: Path,
     descriptors: list[dict],
     target_os: str,
 ) -> list[Path]:
@@ -134,13 +140,13 @@ def _runtime_artifact_paths(
             isinstance(name, str) and name == Path(name).name,
             "native runtime artifact name is not a basename",
         )
-        path = cli.parent / name
+        path = directory / name
         require(path.is_file(), f"native runtime artifact is missing: {name}")
         paths.append(path)
     discovered = sorted(
         (
             path.name
-            for path in cli.parent.iterdir()
+            for path in directory.iterdir()
             if path.is_file()
             and runtime_artifact_role(path.name, target_os) is not None
         ),
@@ -151,6 +157,28 @@ def _runtime_artifact_paths(
         "archive native runtime artifacts do not match the manifest",
     )
     return paths
+
+
+def _runtime_path(cli: Path, parts: ManifestParts) -> tuple[Path, Path]:
+    generation_id = parts.runtime_executable.get("generation_id")
+    if generation_id is None:
+        return cli, cli.parent
+    require(
+        isinstance(generation_id, str)
+        and len(generation_id) == 64
+        and all(char in "0123456789abcdef" for char in generation_id),
+        "native runtime generation identity is invalid",
+    )
+    pointer = cli.parent / "codestory-native-current-generation-v1.txt"
+    require(pointer.is_file(), "native runtime generation pointer is missing")
+    require(
+        pointer.read_text(encoding="utf-8").strip() == generation_id,
+        "native runtime generation pointer contradicts the manifest",
+    )
+    directory = cli.parent / "codestory-native-generations" / generation_id
+    runtime = directory / str(parts.runtime_executable.get("name"))
+    require(runtime.is_file(), "native runtime executable is missing")
+    return runtime, directory
 
 
 def _native_inventory(
@@ -171,14 +199,15 @@ def _native_inventory(
         parts.binary.get("sha256") == cli_sha256,
         "packaged binary digest does not match native manifest",
     )
+    runtime, runtime_directory = _runtime_path(cli, parts)
     artifact_paths = _runtime_artifact_paths(
-        cli,
+        runtime_directory,
         parts.runtime_artifacts,
         target_contract["target_os"],
     )
     try:
         binary_identity, inspected_artifacts = inspect_runtime_layout(
-            cli,
+            runtime,
             artifact_paths,
             target_os=target_contract["target_os"],
             expected_format=target_contract["binary_format"],
@@ -191,7 +220,7 @@ def _native_inventory(
     inspected_artifacts = [
         {
             **descriptor,
-            "sha256": sha256(cli.parent / str(descriptor["name"])),
+            "sha256": sha256(runtime_directory / str(descriptor["name"])),
         }
         for descriptor in inspected_artifacts
     ]
@@ -199,7 +228,13 @@ def _native_inventory(
         parts.runtime_artifacts == inspected_artifacts,
         "native runtime artifact evidence is stale",
     )
-    return NativeInventory(cli_sha256, binary_identity, inspected_artifacts)
+    try:
+        launcher_identity = inspect_binary(cli)
+    except (OSError, NativeBinaryError) as exc:
+        raise ProofFailure(f"packaged launcher is invalid: {exc}") from exc
+    return NativeInventory(
+        cli_sha256, launcher_identity, runtime, binary_identity, inspected_artifacts
+    )
 
 
 def _verify_binary_descriptor(
@@ -208,7 +243,7 @@ def _verify_binary_descriptor(
     inventory: NativeInventory,
     target_contract: dict,
 ) -> None:
-    identity = inventory.binary_identity
+    identity = inventory.launcher_identity
     require(
         parts.binary
         == {
@@ -228,9 +263,22 @@ def _verify_binary_descriptor(
         identity["arch"] == target_contract["target_arch"],
         "packaged executable architecture does not match asset target",
     )
+    runtime_identity = inventory.binary_identity
+    require(
+        parts.runtime_executable
+        == {
+            "name": inventory.runtime_path.name,
+            "sha256": sha256(inventory.runtime_path),
+            "format": runtime_identity["format"],
+            "arch": runtime_identity["arch"],
+            "needed": runtime_identity["needed"],
+            "generation_id": parts.runtime_executable.get("generation_id"),
+        },
+        "native manifest runtime executable descriptor is stale",
+    )
 
 
-def _build_fields(cli: Path, parts: ManifestParts) -> dict[str, str]:
+def _build_fields(runtime: Path, parts: ManifestParts) -> dict[str, str]:
     require(
         parts.engine.get("build_contract_schema_version") == 2,
         "native engine build contract is unsupported",
@@ -244,10 +292,10 @@ def _build_fields(cli: Path, parts: ManifestParts) -> dict[str, str]:
     )
     build_fields = parse_native_build_identity(build_identity)
     require(
-        native_engine_markers(cli) == [build_identity],
+        native_engine_markers(runtime) == [build_identity],
         "packaged executable native engine marker does not match manifest",
     )
-    server_markers = server_proof_markers(cli)
+    server_markers = server_proof_markers(runtime)
     require(
         len(server_markers) == 1,
         "packaged executable must contain exactly one embedding server proof marker",
@@ -417,7 +465,7 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     parts = _manifest_parts(manifest)
     inventory = _native_inventory(cli, parts, target_contract)
     _verify_binary_descriptor(cli, parts, inventory, target_contract)
-    build_fields = _build_fields(cli, parts)
+    build_fields = _build_fields(inventory.runtime_path, parts)
     _verify_engine(parts, build_fields, target_contract)
     _verify_model(parts, build_fields, expected_version)
     _verify_accelerator(parts, target_contract)

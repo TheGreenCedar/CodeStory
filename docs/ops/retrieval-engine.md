@@ -45,9 +45,10 @@ persisted model, prefix, pooling, normalization, dimension, batching, fallback,
 and vector-schema evidence. The binding retains only the compiled compatibility
 facts needed to execute the model.
 
-macOS keeps Metal built in. The Windows release package and Linux non-release
-build artifacts place core, CPU, and Vulkan runtime modules beside the
-executable and load them at engine startup.
+macOS keeps Metal built in. Windows and Linux put the native runtime executable
+and its core, CPU, and Vulkan modules in one immutable generation. The public
+`codestory-cli` launcher reads one atomically replaced generation pointer and
+starts the executable from that pinned directory.
 The base executable does not depend on the Vulkan loader, so help, status, local
 navigation, and explicit CPU execution remain available when that loader is
 absent. Packaging verifies the actual PE import table, ELF `DT_NEEDED` entries,

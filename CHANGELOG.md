@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Publish the Windows and Linux native engine as one immutable executable-and-library generation so a starting process cannot observe a mixed llama.cpp ABI set.
 - Fail closed when runtime evidence is insufficient, capture source-index policy once at startup, and keep embedding work bounded under sustained queue pressure.
 - Bound the v0.16 package matrix, public support claims, release assets, and
   Metal/Vulkan closeout to one validated release graph.

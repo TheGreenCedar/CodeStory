@@ -208,6 +208,11 @@ jobs:
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
+          cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli-runtime" \
+            "target/${{ matrix.rust_target }}/release/codestory-cli-runtime"
+          rm -rf "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
+          cp -R "target/glibc-2.31/${{ matrix.rust_target }}/release/.codestory-native-seeds" \
+            "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
           find "target/${{ matrix.rust_target }}/release" -maxdepth 1 -type f \
             \( -name 'libllama.so*' -o -name 'libggml*.so*' \) -delete
           find "target/glibc-2.31/${{ matrix.rust_target }}/release" -maxdepth 1 \
