@@ -73,17 +73,17 @@ pub(in crate::embedding_qualification::worker) fn run_queue_load(
             let worker = std::thread::Builder::new()
                 .name(format!("codestory-queue-{class}-{ordinal}"))
                 .spawn(move || {
-                    run_queue_operation(
-                        &runtime,
+                    run_queue_operation(QueueOperation {
+                        runtime,
                         transport,
-                        worker_clock.as_ref(),
-                        &project_identity,
+                        clock: worker_clock,
+                        project_identity_sha256: project_identity,
                         class,
                         ordinal,
                         correlation_id,
-                        None,
+                        measured_input: None,
                         submitted_tx,
-                    )
+                    })
                 })?;
             submitted_rx
                 .recv_timeout(CONTROL_TIMEOUT)
@@ -147,17 +147,30 @@ fn wait_for_queue_admission(
     }
 }
 
-fn run_queue_operation(
-    runtime: &SidecarRuntimeConfig,
+struct QueueOperation {
+    runtime: SidecarRuntimeConfig,
     transport: crate::embedding_server_transport::NativeEmbeddingClientTransport,
-    clock: &dyn AwakeMonotonicClock,
-    project_identity_sha256: &str,
-    class: &str,
+    clock: Arc<dyn AwakeMonotonicClock>,
+    project_identity_sha256: String,
+    class: &'static str,
     ordinal: u32,
     correlation_id: String,
     measured_input: Option<String>,
     submitted_tx: std::sync::mpsc::SyncSender<u64>,
-) -> Result<WorkerQueueOperation> {
+}
+
+fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation> {
+    let QueueOperation {
+        runtime,
+        transport,
+        clock,
+        project_identity_sha256,
+        class,
+        ordinal,
+        correlation_id,
+        measured_input,
+        submitted_tx,
+    } = operation;
     let mut stream = match transport.connect(Duration::from_secs(2))? {
         crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
         crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
@@ -254,7 +267,7 @@ fn run_queue_operation(
     };
     Ok(WorkerQueueOperation {
         correlation_id,
-        project_identity_sha256: project_identity_sha256.into(),
+        project_identity_sha256,
         class: class.into(),
         ordinal,
         submission_batch: 0,

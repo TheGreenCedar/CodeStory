@@ -31,8 +31,7 @@ impl<'a> ScenarioRunner<'a> {
                 "spawn_convergence",
                 "compatible_query_absent_owner_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 BTreeMap::new(),
             )?;
         }
@@ -45,8 +44,7 @@ impl<'a> ScenarioRunner<'a> {
                 "existing_owner_connect",
                 "observe_existing_owner_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 BTreeMap::new(),
             )?;
         }
@@ -61,8 +59,7 @@ impl<'a> ScenarioRunner<'a> {
                 "cold_first_vector",
                 "cold_query_256b_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 operands,
             )?;
         }
@@ -76,8 +73,7 @@ impl<'a> ScenarioRunner<'a> {
                 "first_product_ready",
                 "product_query_256b_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 operands,
             )?;
         }
@@ -91,8 +87,7 @@ impl<'a> ScenarioRunner<'a> {
                 "warm_query_ipc",
                 "warm_query_256b_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 operands,
             )?;
         }
@@ -106,8 +101,7 @@ impl<'a> ScenarioRunner<'a> {
                 "warm_bulk_ipc",
                 "warm_bulk_64x256b_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 operands,
             )?;
         }
@@ -134,8 +128,7 @@ impl<'a> ScenarioRunner<'a> {
                 "bulk_documents_per_second",
                 "bulk_throughput_256x256b_v1",
                 repeat,
-                interval.clone(),
-                snapshot.clone(),
+                (interval.clone(), snapshot.clone()),
                 BTreeMap::from([
                     ("completed_documents".into(), json!(256)),
                     (
@@ -149,8 +142,7 @@ impl<'a> ScenarioRunner<'a> {
                 "bulk_tokens_per_second",
                 "bulk_throughput_256x256b_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 BTreeMap::from([
                     ("completed_tokens".into(), json!(completed_tokens)),
                     (
@@ -175,8 +167,7 @@ impl<'a> ScenarioRunner<'a> {
             "backend_observed_accelerator_residency",
             "resident_policy_identity_v1",
             1,
-            residency_interval,
-            residency_snapshot.clone(),
+            (residency_interval, residency_snapshot.clone()),
             accelerator_operands(identity),
         )?;
 
@@ -196,8 +187,7 @@ impl<'a> ScenarioRunner<'a> {
                 "busy_retry_usefulness",
                 "held_query_release_v1",
                 repeat,
-                interval,
-                snapshot,
+                (interval, snapshot),
                 BTreeMap::new(),
             )?;
         }
@@ -221,8 +211,7 @@ impl<'a> ScenarioRunner<'a> {
             "true_idle_exit",
             "true_idle_60000_awake_ms_v1",
             1,
-            idle_interval,
-            idle_owner,
+            (idle_interval, idle_owner),
             BTreeMap::new(),
         )?;
 
@@ -259,10 +248,10 @@ impl<'a> ScenarioRunner<'a> {
         metric: &str,
         workload_id: &str,
         repeat: u32,
-        interval: MeasurementInterval,
-        snapshot: EmbeddingServerSnapshot,
+        witness: (MeasurementInterval, EmbeddingServerSnapshot),
         operands: BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
+        let (interval, snapshot) = witness;
         let sample = interval.sample(RawMetricSampleInput {
             sample_id: &self.measurement_sample_id(metric, repeat),
             repeat,
