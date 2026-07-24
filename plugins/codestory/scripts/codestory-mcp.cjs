@@ -12,6 +12,7 @@ const { Transform, pipeline } = require('stream');
 const { TextDecoder } = require('util');
 const zlib = require('zlib');
 const {
+  sourceBuildTarget,
   validateDevCliReceipt,
 } = require('./codestory-dev-cli-contract.cjs');
 
@@ -215,6 +216,21 @@ function releaseAssetIdentity(version, platform = process.platform, arch = proce
   const target = assetTarget(platform, arch);
   if (!target) throw new Error(`unsupported_release_target:${platform}-${arch}`);
   return { target, asset: archiveName(version, target) };
+}
+
+function managedReleaseAssetIdentity(version, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const explicitSource = options.explicitSource ??
+    Boolean(process.env.CODESTORY_PLUGIN_RELEASE_DIR || process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL);
+  if (explicitSource) {
+    const target = sourceBuildTarget(platform, arch);
+    if (!target) {
+      throw new Error(`unsupported_package_target:${platform}-${arch}`);
+    }
+    return { target, asset: archiveName(version, target) };
+  }
+  return releaseAssetIdentity(version, platform, arch);
 }
 
 function expectedArchiveHash(sumsText, name) {
@@ -1260,7 +1276,7 @@ function releaseManagedCliLock(lock) {
 
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
-  const { target, asset } = releaseAssetIdentity(version);
+  const { target, asset } = managedReleaseAssetIdentity(version);
 
   const root = managedCliRoot(dataDir, true);
   const versionDir = path.join(root, version);
@@ -1346,7 +1362,7 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   if (!dataDir || !version) return null;
   let target;
   try {
-    target = releaseAssetIdentity(version).target;
+    target = managedReleaseAssetIdentity(version).target;
   } catch (error) {
     warnings.push(`managed_cli_unsupported_target:${managedCliFailureCode(error)}`);
     return null;
@@ -2837,6 +2853,7 @@ if (require.main === module) {
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
+      managedReleaseAssetIdentity,
       releaseAssetIdentity,
       isWindowsBatchCli,
       requireDirectCli,

@@ -55,6 +55,17 @@ test("managed release provisioning rejects unshipped targets before URL construc
       new RegExp(`^Error: unsupported_release_target:${platform}-${architecture}$`, "u"),
     );
   }
+  assert.deepEqual(
+    launcherTest.managedReleaseAssetIdentity("0.16.0", {
+      platform: "linux",
+      arch: "x64",
+      explicitSource: true,
+    }),
+    {
+      target: "linux-x64",
+      asset: "codestory-cli-v0.16.0-linux-x64.tar.gz",
+    },
+  );
 });
 
 test("development receipts identify source-build targets independently of release packaging", () => {
@@ -2669,7 +2680,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
   }
 });
 
-test("mcp launcher infers Codex managed data from installed cache without env", async () => {
+test("mcp launcher infers Codex managed data from installed cache without plugin-data env", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const codexHome = await mkdtemp(join(tmpdir(), "codestory-installed-cache-"));
@@ -2682,6 +2693,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
   const pathDir = await mkdtemp(join(tmpdir(), "codestory-stale-path-"));
   const staleCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
   const launcher = join(installRoot, "scripts", "codestory-mcp.cjs");
+  const privateReleaseBaseUrl = "https://private-packages.invalid";
 
   try {
     await mkdir(join(installRoot, "scripts"), { recursive: true });
@@ -2715,15 +2727,13 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
     const sha256 = createHash("sha256")
       .update(await readFile(cliPath))
       .digest("hex");
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
-        version,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-        sha256,
-      )),
-      "utf8",
+    const manifest = managedReleaseManifest(
+      version,
+      process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+      sha256,
     );
+    manifest.archive_url = `${privateReleaseBaseUrl}/${manifest.archive}`;
+    await writeFile(join(cliDir, "manifest.json"), JSON.stringify(manifest), "utf8");
     await writeFile(
       staleCli,
       process.platform === "win32"
@@ -2739,6 +2749,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         COPILOT_PLUGIN_DATA: "",
         TEST_OUT: outFile,
         TEST_CODESTORY_VERSION: version,
+        CODESTORY_PLUGIN_RELEASE_BASE_URL: privateReleaseBaseUrl,
         PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
