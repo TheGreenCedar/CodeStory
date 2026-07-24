@@ -64,7 +64,9 @@ pub(crate) fn stage_windows_runtime_files(entries: &[(&Path, &Path)]) -> io::Res
 /// also places a dangling `libllama-common.so` link in these directories. That
 /// build-support library remains outside CodeStory's package manifest; this
 /// helper refreshes its entry where upstream already created one so a reused
-/// target directory cannot retain bytes from an older dependency build.
+/// target directory cannot retain bytes from an older dependency build. All
+/// destinations are prepared first and published under one rollback-capable
+/// profile transaction.
 pub(crate) fn stage_linux_shared_libraries(
     runtime_sources: &[&Path],
     upstream_build_support_sources: &[&Path],
@@ -330,19 +332,25 @@ where
             return Err(transaction.rollback(index, error));
         }
     }
-    if let Err(error) = sync_destination_directories(&replacements) {
+    if let Err(error) = sync_destination_directories(
+        replacements
+            .iter()
+            .map(|replacement| replacement.destination.as_path()),
+    ) {
         return Err(transaction.rollback(replacements.len(), error));
     }
     Ok(())
 }
 
-fn sync_destination_directories(replacements: &[PreparedReplacement]) -> io::Result<()> {
+fn sync_destination_directories<'a>(
+    destinations: impl IntoIterator<Item = &'a Path>,
+) -> io::Result<()> {
     let mut directories = std::collections::HashSet::new();
-    for replacement in replacements {
-        if let Some(parent) = replacement.destination.parent() {
+    for destination in destinations {
+        if let Some(parent) = destination.parent() {
             let key = destination_key(parent);
             if directories.insert(key) {
-                sync_parent_directory(&replacement.destination)?;
+                sync_parent_directory(destination)?;
             }
         }
     }
@@ -413,7 +421,11 @@ impl PublicationTransaction {
                 rollback_errors.push(format!("{}: {error}", snapshot.destination.display()));
             }
         }
-        if let Err(error) = sync_snapshot_directories(&self.snapshots[..published_count]) {
+        if let Err(error) = sync_destination_directories(
+            self.snapshots[..published_count]
+                .iter()
+                .map(|snapshot| snapshot.destination.as_path()),
+        ) {
             rollback_errors.push(format!("sync restored directories: {error}"));
         }
         if rollback_errors.is_empty() {
@@ -514,19 +526,6 @@ fn create_unique_symlink(target: &Path, destination: &Path) -> io::Result<PathBu
             Err(error) => return Err(error),
         }
     }
-}
-
-fn sync_snapshot_directories(snapshots: &[DestinationSnapshot]) -> io::Result<()> {
-    let mut directories = std::collections::HashSet::new();
-    for snapshot in snapshots {
-        if let Some(parent) = snapshot.destination.parent() {
-            let key = destination_key(parent);
-            if directories.insert(key) {
-                sync_parent_directory(&snapshot.destination)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(not(windows))]

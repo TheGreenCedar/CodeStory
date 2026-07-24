@@ -46,15 +46,7 @@ pub(in crate::app::diagnostics) fn readiness_sidecar_input(
 }
 
 pub(crate) fn doctor_sidecar_status(runtime: &RuntimeContext) -> RetrievalStatusOutput {
-    let sidecar = runtime.sidecar.clone();
-    match codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar.clone(),
-    ) {
-        Ok(report) => doctor_sidecar_status_from_report(report, Some(&sidecar)),
-        Err(error) => doctor_sidecar_status_error(error, Some(&sidecar)),
-    }
+    doctor_sidecar_status_for_runtime(runtime, runtime.sidecar.clone())
 }
 
 pub(in crate::app::diagnostics) fn doctor_sidecar_status_for_runtime(

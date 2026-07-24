@@ -40,6 +40,20 @@ pub(super) fn connect_until(
     }
 }
 
+fn connect_required_owner(
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+) -> Result<crate::embedding_server_transport::NativeEmbeddingStream> {
+    match transport.connect(Duration::from_secs(2))? {
+        crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => Ok(stream),
+        crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
+            bail!("embedding_server_absent")
+        }
+        crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
+            bail!("embedding_server_owner_unresponsive")
+        }
+    }
+}
+
 pub(super) fn validated_hello(
     stream: &mut crate::embedding_server_transport::NativeEmbeddingStream,
     transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
@@ -124,15 +138,7 @@ pub(super) fn run_raw_protocol_exchange_with_input(
     measured_input: Option<String>,
 ) -> Result<WorkerProtocolExchange> {
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
-    let stream = match transport.connect(Duration::from_secs(2))? {
-        crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
-        crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
-            bail!("embedding_server_absent")
-        }
-        crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
-            bail!("embedding_server_owner_unresponsive")
-        }
-    };
+    let stream = connect_required_owner(&transport)?;
     run_protocol_exchange_on_stream(
         runtime,
         clock,
@@ -241,15 +247,7 @@ pub(super) fn run_protocol_exchange_on_stream(
             .is_some_and(|response| response.error.is_none())
     {
         drop(stream);
-        let mut snapshot_stream = match transport.connect(Duration::from_secs(2))? {
-            crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
-            crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
-                bail!("embedding_server_absent")
-            }
-            crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
-                bail!("embedding_server_owner_unresponsive")
-            }
-        };
+        let mut snapshot_stream = connect_required_owner(transport)?;
         let snapshot = validated_hello(&mut snapshot_stream, transport, runtime, clock)?;
         if !same_server_authority(&hello_snapshot, &snapshot) {
             bail!("embedding_qualification_protocol_owner_changed");

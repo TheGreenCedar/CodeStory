@@ -10,29 +10,7 @@ pub(crate) fn build_query_resolution_output(
     project_root: &std::path::Path,
     target: &runtime::ResolvedTarget,
 ) -> QueryResolutionOutput {
-    QueryResolutionOutput {
-        selector: target.selector,
-        requested: target.requested.clone(),
-        file_filter: target
-            .file_filter
-            .as_deref()
-            .map(crate::display::clean_path_string),
-        resolved: build_search_hit_output(
-            project_root,
-            &target.selected,
-            Some(&target.requested),
-            false,
-            &[],
-        ),
-        alternatives: target
-            .alternatives
-            .iter()
-            .skip(1)
-            .map(|hit| {
-                build_search_hit_output(project_root, hit, Some(&target.requested), false, &[])
-            })
-            .collect(),
-    }
+    build_query_resolution_output_from_occurrences(project_root, target, &HashMap::new())
 }
 
 pub(in crate::app) fn build_query_resolution_output_with_runtime(

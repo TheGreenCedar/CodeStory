@@ -29,55 +29,49 @@ pub(in crate::embedding_qualification::worker) fn run_dead_client_load(
         .collect::<Vec<_>>();
     let mut workers = Vec::new();
     for _ in 0..parameters.query_count {
-        let runtime = runtime.clone();
-        let input = input.clone();
-        workers.push(
-            std::thread::Builder::new()
-                .name("codestory-dead-client-query".into())
-                .spawn(move || {
-                    // Keep an admitted request alive until this process is
-                    // terminated. The product client's short deadline would
-                    // otherwise start cancellation watchers and make their
-                    // retry traffic the pressure under test.
-                    let transport = match crate::embedding_server_transport::NativeEmbeddingClientTransport::capture() {
-                        Ok(transport) => transport,
-                        Err(_) => return,
-                    };
-                    let clock = EmbeddingClientTransport::clock(&transport);
-                    let _ = run_raw_protocol_exchange_with_input(
-                        &runtime,
-                        clock.as_ref(),
-                        "query",
-                        ANTI_IDLE_PROTOCOL_DEADLINE_MS,
-                        Some(input),
-                    );
-                })?,
-        );
+        workers.push(spawn_dead_client_request(
+            runtime.clone(),
+            "query",
+            input.clone(),
+        )?);
     }
+    let bulk_input = documents.join("\n");
     for _ in 0..parameters.bulk_count {
-        let runtime = runtime.clone();
-        let input = documents.join("\n");
-        workers.push(
-            std::thread::Builder::new()
-                .name("codestory-dead-client-bulk".into())
-                .spawn(move || {
-                    let transport = match crate::embedding_server_transport::NativeEmbeddingClientTransport::capture() {
-                        Ok(transport) => transport,
-                        Err(_) => return,
-                    };
-                    let clock = EmbeddingClientTransport::clock(&transport);
-                    let _ = run_raw_protocol_exchange_with_input(
-                        &runtime,
-                        clock.as_ref(),
-                        "bulk",
-                        ANTI_IDLE_PROTOCOL_DEADLINE_MS,
-                        Some(input),
-                    );
-                })?,
-        );
+        workers.push(spawn_dead_client_request(
+            runtime.clone(),
+            "bulk",
+            bulk_input.clone(),
+        )?);
     }
     loop {
         std::hint::black_box(&workers);
         clock.sleep(Duration::from_secs(1));
     }
+}
+
+fn spawn_dead_client_request(
+    runtime: SidecarRuntimeConfig,
+    class: &'static str,
+    input: String,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("codestory-dead-client-{class}"))
+        .spawn(move || {
+            // Keep an admitted request alive until this process is terminated.
+            // Product deadlines would add cancellation retries to the pressure
+            // this worker is intended to measure.
+            let transport =
+                match crate::embedding_server_transport::NativeEmbeddingClientTransport::capture() {
+                    Ok(transport) => transport,
+                    Err(_) => return,
+                };
+            let clock = EmbeddingClientTransport::clock(&transport);
+            let _ = run_raw_protocol_exchange_with_input(
+                &runtime,
+                clock.as_ref(),
+                class,
+                ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+                Some(input),
+            );
+        })
 }

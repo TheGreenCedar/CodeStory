@@ -20,20 +20,12 @@ pub(crate) fn resolve_target_or_emit_ambiguity(
     format: args::OutputFormat,
     output_file: Option<&std::path::Path>,
 ) -> Result<runtime::ResolvedTarget> {
-    match resolve_target(runtime, target, file_filter) {
-        Ok(target) => Ok(target),
-        Err(error) => {
-            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
-                return structured_ambiguous_target_failure(
-                    runtime,
-                    ambiguous.clone(),
-                    format,
-                    output_file,
-                );
-            }
-            Err(error)
-        }
-    }
+    resolve_or_emit_ambiguity(
+        runtime,
+        resolve_target(runtime, target, file_filter),
+        format,
+        output_file,
+    )
 }
 
 pub(in crate::app) fn resolve_source_target_or_emit_ambiguity(
@@ -43,7 +35,21 @@ pub(in crate::app) fn resolve_source_target_or_emit_ambiguity(
     format: args::OutputFormat,
     output_file: Option<&std::path::Path>,
 ) -> Result<runtime::ResolvedTarget> {
-    match resolve_source_target(runtime, target, file_filter) {
+    resolve_or_emit_ambiguity(
+        runtime,
+        resolve_source_target(runtime, target, file_filter),
+        format,
+        output_file,
+    )
+}
+
+fn resolve_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    resolved: Result<runtime::ResolvedTarget>,
+    format: args::OutputFormat,
+    output_file: Option<&Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolved {
         Ok(target) => Ok(target),
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
