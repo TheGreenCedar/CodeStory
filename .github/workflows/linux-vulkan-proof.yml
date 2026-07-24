@@ -19,10 +19,12 @@ on:
         default: ""
         type: string
       calibration_bundle_artifact:
-        required: true
+        required: false
+        default: ""
         type: string
       calibration_bundle_run_id:
-        required: true
+        required: false
+        default: ""
         type: string
       candidate_installed_proof:
         description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
@@ -59,10 +61,12 @@ on:
         required: true
         type: string
       calibration_bundle_artifact:
-        required: true
+        required: false
+        default: ""
         type: string
       calibration_bundle_run_id:
-        required: true
+        required: false
+        default: ""
         type: string
       candidate_installed_proof:
         description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
@@ -129,6 +133,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Authenticate calibration bundle producer
+        if: ${{ !inputs.server_behavior_only }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -151,6 +156,7 @@ jobs:
           test "$artifact_count" = 1
 
       - name: Download frozen calibration bundle
+        if: ${{ !inputs.server_behavior_only }}
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
@@ -167,13 +173,20 @@ jobs:
           version="${{ inputs.version }}"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
+          calibration_args=()
           if [ "${{ inputs.server_behavior_only }}" = true ]; then
             claim_args=(--server-behavior-only)
+          else
+            calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+            test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+            calibration_args=(
+              --calibration-bundle "$calibration_bundle"
+              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
+              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
+            )
           fi
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "$archive" \
@@ -188,9 +201,7 @@ jobs:
             --proof-tier protected_hardware \
             --qualification-matrix-cell protected_linux_x64_vulkan \
             "${claim_args[@]}" \
-            --calibration-bundle "$calibration_bundle" \
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
+            "${calibration_args[@]}" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
             --timeout-secs 1800 \
@@ -254,8 +265,6 @@ jobs:
           version="${{ inputs.version }}"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "$archive" \
             --checksum-file target/release-dist/SHA256SUMS.txt \
@@ -269,9 +278,6 @@ jobs:
             --proof-tier installed_runtime \
             --qualification-matrix-cell candidate_installed_linux_x64_vulkan \
             --ground-only \
-            --calibration-bundle "$calibration_bundle" \
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
             --installed-plugin-attestation target/candidate-installed-linux/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
@@ -301,13 +307,10 @@ jobs:
           version="${{ inputs.version }}"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
-          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
-          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           mkdir -p target/release-cells
           jq -n \
             --arg native_engine coderank_q8_embedded \
-            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
-            '{native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            '{native_engine: $native_engine}' \
             > target/linux-vulkan-proof/release-cell-identity.json
           common=(
             --repo "$GITHUB_WORKSPACE"
@@ -336,8 +339,7 @@ jobs:
               --arg installer candidate_managed_plugin \
               --arg runtime_version "$version" \
               --arg native_engine coderank_q8_embedded \
-              --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
-              '{installer: $installer, runtime_version: $runtime_version, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+              '{installer: $installer, runtime_version: $runtime_version, native_engine: $native_engine}' \
               > target/candidate-installed-linux/release-cell-identity.json
             node scripts/codestory-release-cell-manifest.mjs produce \
               "${common[@]}" \

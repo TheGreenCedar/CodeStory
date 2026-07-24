@@ -33,32 +33,12 @@ def _git_output(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def _remote_main_commit(repository_url: str) -> str:
-    completed = subprocess.run(
-        ["git", "ls-remote", repository_url, "refs/heads/main"],
-        text=True,
-        capture_output=True,
-        timeout=60,
-    )
-    require(
-        completed.returncode == 0,
-        f"remote source identity probe failed: {completed.stderr.strip()}",
-    )
-    fields = completed.stdout.split()
-    require(
-        len(fields) == 2
-        and re.fullmatch(r"[0-9a-f]{40}", fields[0]) is not None
-        and fields[1] == "refs/heads/main",
-        "remote source main did not resolve to one immutable commit",
-    )
-    return fields[0]
-
-
-def _marketplace_source() -> dict[str, str]:
+def _marketplace_source(source_sha: str) -> dict[str, str]:
     return {
         "source": "git-subdir",
         "url": "https://github.com/TheGreenCedar/CodeStory.git",
         "path": "plugins/codestory",
+        "sha": source_sha,
     }
 
 
@@ -119,7 +99,7 @@ def _validate_marketplace_results(
     codex_home: Path,
     plugin_root: Path,
     manifest: dict,
-) -> Path:
+) -> tuple[Path, str]:
     require_exact_keys(
         marketplace,
         {
@@ -160,8 +140,8 @@ def _validate_marketplace_results(
         "Codex marketplace root is outside its isolated home",
     )
     _validate_marketplace_list(marketplace, marketplace_root)
-    _validate_plugin_results(marketplace, plugin_root, manifest)
-    return marketplace_root
+    plugin_source_sha = _validate_plugin_results(marketplace, plugin_root, manifest)
+    return marketplace_root, plugin_source_sha
 
 
 def _validate_marketplace_list(marketplace: dict, marketplace_root: Path) -> None:
@@ -200,7 +180,17 @@ def _validate_plugin_results(
     marketplace: dict,
     plugin_root: Path,
     manifest: dict,
-) -> None:
+) -> str:
+    plugin_list = marketplace["plugin_list_result"]
+    installed = plugin_list.get("installed") if isinstance(plugin_list, dict) else None
+    source = installed[0].get("source") if isinstance(installed, list) and len(installed) == 1 else None
+    source_sha = source.get("sha") if isinstance(source, dict) else None
+    require(
+        isinstance(source_sha, str)
+        and re.fullmatch(r"[0-9a-f]{40}", source_sha) is not None
+        and source == _marketplace_source(source_sha),
+        "Codex plugin source is not pinned to one immutable CodeStory commit",
+    )
     require(
         marketplace["plugin_add_result"]
         == {
@@ -224,7 +214,7 @@ def _validate_plugin_results(
                     "version": manifest["release_version"],
                     "installed": True,
                     "enabled": True,
-                    "source": _marketplace_source(),
+                    "source": _marketplace_source(source_sha),
                     "marketplaceSource": {
                         "sourceType": "git",
                         "source": _MARKETPLACE_URL,
@@ -237,12 +227,14 @@ def _validate_plugin_results(
         },
         "Codex plugin list does not contain exactly the enabled installed plugin",
     )
+    return source_sha
 
 
 def _validate_marketplace_checkout(
     codex_home: Path,
     marketplace_root: Path,
     marketplace: dict,
+    plugin_source_sha: str,
 ) -> str:
     config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
     marketplace_config = config.get("marketplaces", {}).get(_MARKETPLACE_NAME)
@@ -274,7 +266,8 @@ def _validate_marketplace_checkout(
         if plugin.get("name") == "codestory"
     ]
     require(
-        len(matches) == 1 and matches[0].get("source") == _marketplace_source(),
+        len(matches) == 1
+        and matches[0].get("source") == _marketplace_source(plugin_source_sha),
         "Codex marketplace catalog does not resolve CodeStory through the release repository",
     )
     return marketplace_commit
@@ -282,22 +275,23 @@ def _validate_marketplace_checkout(
 
 def _validate_release_source(plugin: dict, plugin_root: Path, manifest: dict) -> str:
     package_sha256 = directory_contract_sha256(plugin_root)
+    source_commit = plugin["source_commit"]
     require(
-        plugin
-        == {
-            "id": "codestory",
-            "version": manifest["release_version"],
-            "source_commit": manifest["source"]["commit"],
-            "source_tree": manifest["source"]["tree"],
-            "package_sha256": package_sha256,
-        }
+        plugin["id"] == "codestory"
+        and plugin["version"] == manifest["release_version"]
+        and plugin["source_tree"] == manifest["source"]["tree"]
+        and plugin["package_sha256"] == package_sha256
+        and isinstance(source_commit, str)
+        and re.fullmatch(r"[0-9a-f]{40}", source_commit) is not None
+        and _git_output(REPOSITORY_ROOT, "rev-parse", f"{source_commit}^{{commit}}")
+        == source_commit
+        and _git_output(REPOSITORY_ROOT, "rev-parse", f"{source_commit}^{{tree}}")
+        == manifest["source"]["tree"]
         and _git_output(REPOSITORY_ROOT, "rev-parse", "HEAD")
         == manifest["source"]["commit"]
         and _git_output(REPOSITORY_ROOT, "rev-parse", "HEAD^{tree}")
-        == manifest["source"]["tree"]
-        and _remote_main_commit(_marketplace_source()["url"])
-        == manifest["source"]["commit"],
-        "marketplace source main is not the exact packaged release commit",
+        == manifest["source"]["tree"],
+        "marketplace install is not bound to the exact packaged release source",
     )
     source_plugin_root = REPOSITORY_ROOT / "plugins" / "codestory"
     require(
@@ -319,7 +313,7 @@ def marketplace_installed_plugin_identity(
         plugin_root,
         manifest,
     )
-    marketplace_root = _validate_marketplace_results(
+    marketplace_root, plugin_source_sha = _validate_marketplace_results(
         marketplace,
         codex_home,
         plugin_root,
@@ -329,6 +323,11 @@ def marketplace_installed_plugin_identity(
         codex_home,
         marketplace_root,
         marketplace,
+        plugin_source_sha,
+    )
+    require(
+        plugin["source_commit"] == plugin_source_sha,
+        "marketplace attestation source does not match the catalog pin",
     )
     package_sha256 = _validate_release_source(plugin, plugin_root, manifest)
     return {
@@ -339,6 +338,7 @@ def marketplace_installed_plugin_identity(
         "marketplace_commit": marketplace_commit,
         "plugin_id": "codestory",
         "plugin_version": manifest["release_version"],
-        "plugin_source_commit": manifest["source"]["commit"],
+        "plugin_source_commit": plugin["source_commit"],
+        "plugin_source_tree": plugin["source_tree"],
         "plugin_package_sha256": package_sha256,
     }

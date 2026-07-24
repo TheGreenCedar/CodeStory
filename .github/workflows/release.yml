@@ -7,14 +7,6 @@ on:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
-      calibration_bundle_artifact:
-        description: "Frozen calibration bundle artifact name"
-        required: true
-        type: string
-      calibration_bundle_run_id:
-        description: "Workflow run that produced the frozen calibration bundle artifact"
-        required: true
-        type: string
       expected_head_sha:
         description: "Optional exact head required by proof-only callers"
         required: false
@@ -33,14 +25,6 @@ on:
         type: string
       expected_head_sha:
         description: "Exact dev/codestory-next head to authenticate without publishing"
-        required: true
-        type: string
-      calibration_bundle_artifact:
-        description: "Frozen calibration bundle artifact name"
-        required: true
-        type: string
-      calibration_bundle_run_id:
-        description: "Workflow run that produced the frozen calibration bundle artifact"
         required: true
         type: string
 
@@ -91,6 +75,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -167,6 +152,41 @@ jobs:
             exit 1
           fi
 
+      - name: Prove the public marketplace install path
+        if: inputs.publish_release
+        id: marketplace
+        env:
+          CODEX_CLI_VERSION: "0.144.5"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-marketplace-preflight"
+          codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          marketplace_revision="$(
+            git ls-remote \
+              https://github.com/TheGreenCedar/AgentPluginMarketplace.git \
+              refs/heads/main | awk '{print $1}'
+          )"
+          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          rm -rf "$install_root"
+          npm install \
+            --prefix "$codex_package_root" \
+            --no-audit \
+            --no-fund \
+            "@openai/codex@$CODEX_CLI_VERSION"
+          node .github/scripts/install-codestory-marketplace-proof.mjs \
+            --codex-package-root "$codex_package_root" \
+            --codex-home "$install_root/codex-home" \
+            --plugin-data "$install_root/codex-home/plugin-data" \
+            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-name TheGreenCedar \
+            --marketplace-revision "$marketplace_revision" \
+            --expected-version "$VERSION" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --attestation "$install_root/install-attestation-v2.json" \
+            --github-output "$GITHUB_OUTPUT"
+
   source-proof:
     needs: preflight
     uses: ./.github/workflows/source-proof.yml
@@ -186,8 +206,6 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
       emit_release_cells: true
-      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
-      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
     # Provision these names as environment secrets on macos-release-signing.
     # That protected environment is selected by the called macOS matrix jobs,
     # and its values take precedence over caller/repository secrets.
@@ -209,8 +227,6 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
-      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
-      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
       server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
@@ -226,8 +242,6 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
-      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
-      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
       server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
@@ -242,8 +256,6 @@ jobs:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
-      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
-      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
       server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
@@ -459,8 +471,7 @@ jobs:
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
-      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      marketplace_revision: ${{ needs.preflight.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true
     permissions:
