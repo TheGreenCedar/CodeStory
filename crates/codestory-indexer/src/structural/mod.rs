@@ -324,6 +324,9 @@ pub(crate) fn index_structural_source_with_unit_cap(
             source.len() as u64
         ));
     }
+    if matches!(structural_extension(path).as_deref(), Some("yml" | "yaml")) {
+        validate_yaml_syntax(source)?;
+    }
     let mut storage = IntermediateStorage::default();
     let (file_node, _file_name, file_id) = crate::file_node_from_source(path, source);
     storage.files.push(codestory_store::FileInfo {
@@ -388,6 +391,15 @@ pub(crate) fn index_structural_source_with_unit_cap(
         &storage.occurrences,
     );
     Ok(storage)
+}
+
+fn validate_yaml_syntax(source: &str) -> Result<(), StructuralCollectionError> {
+    for event in saphyr_parser::Parser::new_from_str(source) {
+        event.map_err(|error| {
+            StructuralCollectionError::Malformed(format!("invalid YAML syntax: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 fn structural_extension(path: &Path) -> Option<String> {
@@ -789,6 +801,30 @@ mod tests {
     }
 
     #[test]
+    fn generic_yaml_accepts_anchors_aliases_and_multiple_documents() {
+        let source = concat!(
+            "defaults: &defaults\n",
+            "  retries: 3\n",
+            "service:\n",
+            "  <<: *defaults\n",
+            "---\n",
+            "next: true\n",
+        );
+        let storage = index_structural_source(Path::new("metadata.yaml"), source)
+            .expect("valid YAML documents should collect");
+
+        for expected in ["defaults", "retries", "service", "next"] {
+            assert!(
+                storage
+                    .nodes
+                    .iter()
+                    .any(|node| node.serialized_name == expected),
+                "missing YAML mapping-key anchor {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_json_accepts_complete_value_streams() {
         let source = "{\"first\":1}\n{\"second\":2}\n";
         let storage = index_structural_source(Path::new("events.json"), source)
@@ -812,6 +848,10 @@ mod tests {
             ("unterminated-flow.yaml", "items: [one, two\n"),
             ("unmatched-flow.yaml", "items: ]\n"),
             ("tab-indentation.yaml", "root:\n\tchild: value\n"),
+            (
+                "inconsistent-indentation.yaml",
+                "root:\n  child: value\n sibling: value\n",
+            ),
             ("empty.json", "  \n"),
             ("truncated.json", "{\"missing_value\":\n"),
             ("trailing-invalid.json", "{\"valid\":true}\n{invalid}\n"),
@@ -822,6 +862,25 @@ mod tests {
                     Err(StructuralCollectionError::Malformed(_))
                 ),
                 "{path} should remain malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_yaml_is_rejected_before_specialized_routing() {
+        let source = "root:\n  child: value\n sibling: value\n";
+
+        for path in [
+            "metadata.yaml",
+            ".github/workflows/ci.yml",
+            "docker-compose.yml",
+        ] {
+            assert!(
+                matches!(
+                    index_structural_source(Path::new(path), source),
+                    Err(StructuralCollectionError::Malformed(_))
+                ),
+                "{path} must reject malformed YAML before collector dispatch"
             );
         }
     }

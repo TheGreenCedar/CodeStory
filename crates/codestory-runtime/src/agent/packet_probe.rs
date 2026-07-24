@@ -297,6 +297,9 @@ fn resolve_exact_path_probe(
                 .and_then(|storage| storage.get_files().ok())
                 .is_some_and(|files| {
                     files.into_iter().any(|file| {
+                        if !file.indexed || !file.complete {
+                            return false;
+                        }
                         let candidate = if file.path.is_absolute() {
                             file.path
                         } else {
@@ -928,6 +931,63 @@ mod tests {
             Some("packet_exact_path_probe")
         );
         assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn exact_path_requires_complete_indexed_file_state() {
+        for (indexed, complete, expected) in [
+            (true, true, PacketProbeResolutionStatusDto::ExactPath),
+            (
+                true,
+                false,
+                PacketProbeResolutionStatusDto::ValidUncoveredPath,
+            ),
+            (
+                false,
+                true,
+                PacketProbeResolutionStatusDto::ValidUncoveredPath,
+            ),
+            (
+                false,
+                false,
+                PacketProbeResolutionStatusDto::ValidUncoveredPath,
+            ),
+        ] {
+            let project = TempDir::new().expect("project");
+            let source_path = project.path().join("src/lib.rs");
+            std::fs::create_dir_all(source_path.parent().expect("source parent"))
+                .expect("create source parent");
+            std::fs::write(&source_path, "pub fn target() {}\n").expect("write source");
+            let controller = controller_with_empty_store(&project);
+            let storage_path = project.path().join(".cache/codestory.db");
+            let storage = Store::open(&storage_path).expect("open store");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: PathBuf::from("src/lib.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed,
+                    complete,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert file state");
+            drop(storage);
+
+            let resolution = resolve_packet_probes(
+                &controller,
+                vec![PacketProbeDto::ExactPath {
+                    path: "src/lib.rs".into(),
+                }],
+            )
+            .remove(0);
+
+            assert_eq!(
+                resolution.status, expected,
+                "indexed={indexed} complete={complete}"
+            );
+        }
     }
 
     #[test]

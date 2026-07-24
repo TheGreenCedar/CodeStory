@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fail closed when runtime evidence is insufficient, capture source-index policy once at startup, and keep embedding work bounded under sustained queue pressure.
+
 ## 0.16.0
 
 CodeStory 0.16 is the release where the machinery disappears.

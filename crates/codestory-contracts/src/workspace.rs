@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 /// Versioned policy that permits a verified bounded source to remain outside scheduling.
 pub const OVERSIZED_SOURCE_POLICY_VERSION: &str = "bounded-source-exclusion-v2";
@@ -8,9 +7,6 @@ pub const OVERSIZED_SOURCE_POLICY_VERSION: &str = "bounded-source-exclusion-v2";
 pub const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
 /// Structural-unit bound shared by the structural collector and exclusion publication.
 pub const DEFAULT_STRUCTURAL_UNIT_CAP: u64 = 2_048;
-/// Process-start override for the parser input and verified exclusion boundary.
-pub const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
-
 /// Immutable source-index policy shared by planning, parsing, publication, and reads.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SourceIndexPolicy {
@@ -27,27 +23,12 @@ impl SourceIndexPolicy {
             structural_unit_cap: DEFAULT_STRUCTURAL_UNIT_CAP,
         }
     }
-
-    fn from_process_env() -> Self {
-        let byte_cap = std::env::var(SOURCE_FILE_BYTE_CAP_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .filter(|cap| *cap > 0)
-            .unwrap_or(DEFAULT_SOURCE_FILE_BYTE_CAP);
-        Self::oversized(byte_cap)
-    }
 }
 
 impl Default for SourceIndexPolicy {
     fn default() -> Self {
         Self::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP)
     }
-}
-
-/// Return the source-index policy captured once for this process.
-pub fn process_source_index_policy() -> &'static SourceIndexPolicy {
-    static POLICY: OnceLock<SourceIndexPolicy> = OnceLock::new();
-    POLICY.get_or_init(SourceIndexPolicy::from_process_env)
 }
 
 /// Content-verified oversized source classified before parser scheduling.

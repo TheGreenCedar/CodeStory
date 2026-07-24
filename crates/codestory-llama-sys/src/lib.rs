@@ -816,16 +816,18 @@ struct CancellableRequestQueue {
     requests: Mutex<VecDeque<EmbeddingRequest>>,
     signal_sender: Sender<()>,
     signal_receiver: Receiver<()>,
+    admission: Arc<EmbeddingAdmissionTracker>,
 }
 
 impl CancellableRequestQueue {
-    fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize, admission: Arc<EmbeddingAdmissionTracker>) -> Arc<Self> {
         let (signal_sender, signal_receiver) = bounded(1);
         Arc::new(Self {
             capacity,
             requests: Mutex::new(VecDeque::with_capacity(capacity)),
             signal_sender,
             signal_receiver,
+            admission,
         })
     }
 
@@ -834,7 +836,7 @@ impl CancellableRequestQueue {
             .requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_cancelled(&mut requests);
+        self.prune_cancelled(&mut requests);
         if requests.len() >= self.capacity {
             return Err(request);
         }
@@ -848,7 +850,7 @@ impl CancellableRequestQueue {
             .requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_cancelled(&mut requests);
+        self.prune_cancelled(&mut requests);
         let request = requests.pop_front();
         if !requests.is_empty() {
             let _ = self.signal_sender.try_send(());
@@ -856,23 +858,24 @@ impl CancellableRequestQueue {
         request
     }
 
-    fn len(&self) -> usize {
-        let mut requests = self
-            .requests
+    fn depth(&self) -> usize {
+        self.requests
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_cancelled(&mut requests);
-        requests.len()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|request| !request.context.is_cancelled())
+            .count()
     }
 
     fn signal(&self) -> &Receiver<()> {
         &self.signal_receiver
     }
 
-    fn prune_cancelled(requests: &mut VecDeque<EmbeddingRequest>) {
+    fn prune_cancelled(&self, requests: &mut VecDeque<EmbeddingRequest>) {
         let mut retained = VecDeque::with_capacity(requests.capacity());
         while let Some(request) = requests.pop_front() {
             if request.context.is_cancelled() {
+                self.admission.cancelled();
                 let _ = request.response.send(Err(EngineError::Cancelled));
             } else {
                 retained.push_back(request);
@@ -893,10 +896,62 @@ enum Control {
     ReleaseLease,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestPriority {
     Query,
     Bulk,
+}
+
+impl RequestPriority {
+    fn request_class(self) -> EmbeddingRequestClass {
+        match self {
+            Self::Query => EmbeddingRequestClass::Query,
+            Self::Bulk => EmbeddingRequestClass::Bulk,
+        }
+    }
+}
+
+struct FairRequestScheduler {
+    next_when_both_ready: RequestPriority,
+}
+
+impl Default for FairRequestScheduler {
+    fn default() -> Self {
+        Self {
+            next_when_both_ready: RequestPriority::Query,
+        }
+    }
+}
+
+impl FairRequestScheduler {
+    fn record_served(&mut self, priority: RequestPriority) {
+        self.next_when_both_ready = match priority {
+            RequestPriority::Query => RequestPriority::Bulk,
+            RequestPriority::Bulk => RequestPriority::Query,
+        };
+    }
+
+    fn try_pop(
+        &mut self,
+        query: &CancellableRequestQueue,
+        bulk: &CancellableRequestQueue,
+    ) -> Option<(EmbeddingRequest, RequestPriority)> {
+        let priorities = match self.next_when_both_ready {
+            RequestPriority::Query => [RequestPriority::Query, RequestPriority::Bulk],
+            RequestPriority::Bulk => [RequestPriority::Bulk, RequestPriority::Query],
+        };
+        for priority in priorities {
+            let request = match priority {
+                RequestPriority::Query => query.try_pop(),
+                RequestPriority::Bulk => bulk.try_pop(),
+            };
+            if let Some(request) = request {
+                self.record_served(priority);
+                return Some((request, priority));
+            }
+        }
+        None
+    }
 }
 
 impl EmbeddingEngine {
@@ -905,12 +960,14 @@ impl EmbeddingEngine {
         config: EmbeddingEngineConfig,
     ) -> Result<Self, EngineError> {
         validate_engine_config(&config)?;
-        let query_queue = CancellableRequestQueue::new(EMBEDDING_QUERY_QUEUE_CAPACITY);
-        let bulk_queue = CancellableRequestQueue::new(EMBEDDING_BULK_QUEUE_CAPACITY);
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query_queue =
+            CancellableRequestQueue::new(EMBEDDING_QUERY_QUEUE_CAPACITY, Arc::clone(&admission));
+        let bulk_queue =
+            CancellableRequestQueue::new(EMBEDDING_BULK_QUEUE_CAPACITY, Arc::clone(&admission));
         let (control_sender, control_receiver) = unbounded();
         let (startup_sender, startup_receiver) = bounded(1);
         let lifecycle = Arc::new(Mutex::new(None));
-        let admission = Arc::new(EmbeddingAdmissionTracker::default());
         let worker_lifecycle = lifecycle.clone();
         let worker_admission = Arc::clone(&admission);
         let worker_query_queue = Arc::clone(&query_queue);
@@ -1041,9 +1098,10 @@ impl EmbeddingEngine {
     }
 
     pub fn admission_snapshot(&self) -> EmbeddingAdmissionSnapshot {
-        self.shared
-            .admission
-            .snapshot(self.shared.query_queue.len(), self.shared.bulk_queue.len())
+        self.shared.admission.snapshot(
+            self.shared.query_queue.depth(),
+            self.shared.bulk_queue.depth(),
+        )
     }
 
     pub fn begin_draining_if_idle(&self) -> bool {
@@ -1096,8 +1154,8 @@ impl EmbeddingEngine {
                     pressure: self.shared.admission.pressure(
                         EmbeddingCapacityReason::QueueFull,
                         request_class,
-                        self.shared.query_queue.len(),
-                        self.shared.bulk_queue.len(),
+                        self.shared.query_queue.depth(),
+                        self.shared.bulk_queue.depth(),
                         context.retry_after_ms(),
                         "a queued request completes, is cancelled, or the server instance changes",
                     ),
@@ -1468,16 +1526,30 @@ fn serve_resident_generation(
     mut handle: impl FnMut(EmbeddingRequest, RequestPriority),
 ) -> ResidentRunResult {
     let mut tracker = ResidencyTracker::new(idle_timeout, Instant::now());
+    let mut scheduler = FairRequestScheduler::default();
+    match channels.control.try_recv() {
+        Ok(control) => {
+            if let Some(result) = handle_resident_control(control, snapshot, &mut tracker) {
+                return result;
+            }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            return ResidentRunResult::Shutdown(snapshot.clone());
+        }
+    }
     match wake {
         WakeReason::Startup => {
             let _ = channels.startup.send(Ok(snapshot.clone()));
         }
         WakeReason::Query(request) => {
             handle(request, RequestPriority::Query);
+            scheduler.record_served(RequestPriority::Query);
             tracker.complete_activity(Instant::now());
         }
         WakeReason::Bulk(request) => {
             handle(request, RequestPriority::Bulk);
+            scheduler.record_served(RequestPriority::Bulk);
             tracker.complete_activity(Instant::now());
         }
         WakeReason::EnsureResident(response) => {
@@ -1490,46 +1562,76 @@ fn serve_resident_generation(
     }
 
     loop {
+        match channels.control.try_recv() {
+            Ok(control) => {
+                if let Some(result) = handle_resident_control(control, snapshot, &mut tracker) {
+                    return result;
+                }
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                return ResidentRunResult::Shutdown(snapshot.clone());
+            }
+        }
+        if let Some((request, priority)) = scheduler.try_pop(channels.query, channels.bulk) {
+            handle(request, priority);
+            tracker.complete_activity(Instant::now());
+            continue;
+        }
+
         let idle = after(tracker.remaining(Instant::now()));
         select_biased! {
-            recv(channels.control) -> control => match control {
-                Ok(Control::Shutdown) | Err(_) => {
+            recv(channels.control) -> control => {
+                match control {
+                    Ok(control) => {
+                        if let Some(result) =
+                            handle_resident_control(control, snapshot, &mut tracker)
+                        {
+                            return result;
+                        }
+                    }
+                    Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
+                }
+            },
+            recv(channels.query.signal()) -> signal => {
+                if signal.is_err() {
                     return ResidentRunResult::Shutdown(snapshot.clone());
                 }
-                Ok(Control::EnsureResident { response }) => {
-                    tracker.complete_activity(Instant::now());
-                    let _ = response.send(Ok(snapshot.clone()));
-                }
-                Ok(Control::AcquireLease { response }) => {
-                    grant_residency_lease(response, snapshot, &mut tracker);
-                }
-                Ok(Control::ReleaseLease) => tracker.release_lease(Instant::now()),
             },
-            recv(channels.query.signal()) -> signal => match signal {
-                Ok(()) => {
-                    let Some(request) = channels.query.try_pop() else {
-                        continue;
-                    };
-                    handle(request, RequestPriority::Query);
-                    tracker.complete_activity(Instant::now());
+            recv(channels.bulk.signal()) -> signal => {
+                if signal.is_err() {
+                    return ResidentRunResult::Shutdown(snapshot.clone());
                 }
-                Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
-            },
-            recv(channels.bulk.signal()) -> signal => match signal {
-                Ok(()) => {
-                    let Some(request) = channels.bulk.try_pop() else {
-                        continue;
-                    };
-                    handle(request, RequestPriority::Bulk);
-                    tracker.complete_activity(Instant::now());
-                }
-                Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
             },
             recv(idle) -> _ => {
                 if tracker.should_sleep(Instant::now()) {
                     return ResidentRunResult::Sleeping(snapshot.clone());
                 }
             },
+        }
+    }
+}
+
+fn handle_resident_control(
+    control: Control,
+    snapshot: &EngineLifecycleSnapshot,
+    tracker: &mut ResidencyTracker,
+) -> Option<ResidentRunResult> {
+    match control {
+        Control::Shutdown => Some(ResidentRunResult::Shutdown(snapshot.clone())),
+        Control::EnsureResident { response } => {
+            tracker.complete_activity(Instant::now());
+            let _ = response.send(Ok(snapshot.clone()));
+            None
+        }
+        Control::AcquireLease { response } => {
+            grant_residency_lease(response, snapshot, tracker);
+            None
+        }
+        Control::ReleaseLease => {
+            tracker.release_lease(Instant::now());
+            None
         }
     }
 }
@@ -1647,7 +1749,7 @@ fn handle_request(
     }
     while embedding_qualification_request_held(request_class) {
         if request.context.is_cancelled() {
-            admission.finish(&request.context, false, true);
+            admission.finish(&request.context, request_class, false, true);
             let _ = request.response.send(Err(EngineError::Cancelled));
             return;
         }
@@ -1670,7 +1772,8 @@ fn handle_request(
     } else {
         result
     };
-    let completion_sequence = admission.finish(&request.context, result.is_ok(), cancelled);
+    let completion_sequence =
+        admission.finish(&request.context, request_class, result.is_ok(), cancelled);
     let _ = request
         .response
         .send(result.map(|vectors| EmbeddingRequestCompletion {
@@ -1705,23 +1808,7 @@ fn embed_inputs(
     let mut output = Vec::with_capacity(inputs.len());
     let mut offset = 0;
     while offset < tokenized.len() {
-        if request_context.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
-        if priority == RequestPriority::Bulk {
-            while let Some(query) = query_queue.try_pop() {
-                handle_request(
-                    query,
-                    RequestPriority::Query,
-                    model,
-                    context,
-                    telemetry,
-                    query_queue,
-                    config,
-                    admission,
-                );
-            }
-        }
+        ensure_embedding_request_live(request_context)?;
         let end = batch_end(
             &tokenized,
             offset,
@@ -1735,11 +1822,42 @@ fn embed_inputs(
             &mut output,
             config.dimension,
         )?;
-        admission.progress();
+        admission.progress(priority.request_class());
         offset = end;
+        if priority == RequestPriority::Bulk && offset < tokenized.len() {
+            if let Some(query) = take_query_between_bulk_batches(query_queue) {
+                handle_request(
+                    query,
+                    RequestPriority::Query,
+                    model,
+                    context,
+                    telemetry,
+                    query_queue,
+                    config,
+                    admission,
+                );
+            }
+            ensure_embedding_request_live(request_context)?;
+        }
     }
     request_context.record_completed_tokens(completed_tokens);
     Ok(output)
+}
+
+fn ensure_embedding_request_live(
+    request_context: &EmbeddingRequestContext,
+) -> Result<(), EngineError> {
+    if request_context.is_cancelled() {
+        Err(EngineError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn take_query_between_bulk_batches(
+    query_queue: &CancellableRequestQueue,
+) -> Option<EmbeddingRequest> {
+    query_queue.try_pop()
 }
 
 fn batch_end(
@@ -2121,40 +2239,62 @@ fn cache_error(error: impl std::fmt::Display) -> EngineError {
 mod tests {
     use super::*;
 
+    fn queued_request(
+        id: &str,
+    ) -> (
+        EmbeddingRequestContext,
+        EmbeddingRequest,
+        Receiver<Result<EmbeddingRequestCompletion, EngineError>>,
+    ) {
+        let context = EmbeddingRequestContext::new(id, "scope", 0);
+        let (response, result) = bounded(1);
+        (
+            context.clone(),
+            EmbeddingRequest {
+                context,
+                inputs: vec![id.into()],
+                response,
+            },
+            result,
+        )
+    }
+
     #[test]
     fn cancelled_queue_entries_release_capacity_without_reordering_live_work() {
-        let queue = CancellableRequestQueue::new(2);
-        let request = |id: &str| {
-            let context = EmbeddingRequestContext::new(id, "scope", 0);
-            let (response, result) = bounded(1);
-            (
-                context.clone(),
-                EmbeddingRequest {
-                    context,
-                    inputs: vec![id.into()],
-                    response,
-                },
-                result,
-            )
-        };
-        let (first_context, first, first_result) = request("first");
-        let (_, second, _) = request("second");
-        let (_, third, _) = request("third");
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let queue = CancellableRequestQueue::new(2, Arc::clone(&admission));
+        let (first_context, first, first_result) = queued_request("first");
+        let (_, second, _) = queued_request("second");
+        let (_, third, _) = queued_request("third");
         assert!(queue.try_push(first).is_ok(), "first queue slot");
         assert!(queue.try_push(second).is_ok(), "second queue slot");
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.depth(), 2);
 
         assert!(first_context.cancel());
-        assert_eq!(queue.len(), 1);
-        assert!(matches!(
-            first_result.try_recv(),
-            Ok(Err(EngineError::Cancelled))
-        ));
+        assert_eq!(
+            queue.depth(),
+            1,
+            "depth observes live work without mutating the queue"
+        );
+        assert_eq!(
+            admission.snapshot(queue.depth(), 0).cancelled_request_count,
+            0
+        );
+        assert!(matches!(first_result.try_recv(), Err(TryRecvError::Empty)));
         assert!(
             queue.try_push(third).is_ok(),
             "cancelled slot is immediately reusable"
         );
-        assert_eq!(queue.len(), 2);
+        assert!(matches!(
+            first_result.try_recv(),
+            Ok(Err(EngineError::Cancelled))
+        ));
+        assert_eq!(
+            admission.snapshot(queue.depth(), 0).cancelled_request_count,
+            1,
+            "pruning accounts for each cancelled request exactly once"
+        );
+        assert_eq!(queue.depth(), 2);
         assert_eq!(
             queue
                 .try_pop()
@@ -2171,6 +2311,113 @@ mod tests {
                 .request_id(),
             "third"
         );
+        assert_eq!(
+            admission.snapshot(queue.depth(), 0).cancelled_request_count,
+            1
+        );
+    }
+
+    #[test]
+    fn fair_scheduler_alternates_ready_classes_and_preserves_class_fifo() {
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query = CancellableRequestQueue::new(4, Arc::clone(&admission));
+        let bulk = CancellableRequestQueue::new(4, admission);
+        for id in ["query-1", "query-2"] {
+            let (_, request, _) = queued_request(id);
+            assert!(query.try_push(request).is_ok());
+        }
+        for id in ["bulk-1", "bulk-2"] {
+            let (_, request, _) = queued_request(id);
+            assert!(bulk.try_push(request).is_ok());
+        }
+
+        let mut scheduler = FairRequestScheduler::default();
+        let observed = (0..4)
+            .map(|_| {
+                let (request, priority) = scheduler
+                    .try_pop(&query, &bulk)
+                    .expect("both class queues contain work");
+                (priority, request.context.request_id().to_string())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            observed,
+            [
+                (RequestPriority::Query, "query-1".to_string()),
+                (RequestPriority::Bulk, "bulk-1".to_string()),
+                (RequestPriority::Query, "query-2".to_string()),
+                (RequestPriority::Bulk, "bulk-2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bulk_batch_boundary_takes_at_most_one_query() {
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query = CancellableRequestQueue::new(2, admission);
+        for id in ["query-1", "query-2"] {
+            let (_, request, _) = queued_request(id);
+            assert!(query.try_push(request).is_ok());
+        }
+
+        let first =
+            take_query_between_bulk_batches(&query).expect("one query may run at the boundary");
+
+        assert_eq!(first.context.request_id(), "query-1");
+        assert_eq!(query.depth(), 1);
+        assert_eq!(
+            query
+                .try_pop()
+                .expect("second query remains queued for a later boundary")
+                .context
+                .request_id(),
+            "query-2"
+        );
+    }
+
+    #[test]
+    fn cancelled_bulk_does_not_continue_after_query_boundary() {
+        let bulk = EmbeddingRequestContext::new("bulk", "scope", 0);
+        assert!(bulk.cancel());
+
+        assert!(matches!(
+            ensure_embedding_request_live(&bulk),
+            Err(EngineError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn resident_control_preempts_queued_embedding_work() {
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query = CancellableRequestQueue::new(1, Arc::clone(&admission));
+        let bulk = CancellableRequestQueue::new(1, admission);
+        let (_, request, _) = queued_request("must-not-run");
+        let (startup_sender, _startup_receiver) = bounded(1);
+        let (control_sender, control_receiver) = unbounded();
+        control_sender
+            .send(Control::Shutdown)
+            .expect("queue shutdown");
+        let channels = ResidentChannels {
+            startup: &startup_sender,
+            query: &query,
+            bulk: &bulk,
+            control: &control_receiver,
+        };
+        let snapshot = test_lifecycle_snapshot();
+        let mut handled = false;
+
+        let result = serve_resident_generation(
+            WakeReason::Query(request),
+            &snapshot,
+            &channels,
+            Duration::from_secs(1),
+            |_, _| handled = true,
+        );
+
+        assert!(matches!(result, ResidentRunResult::Shutdown(_)));
+        assert!(!handled);
+        assert_eq!(query.depth(), 0);
     }
 
     #[test]
@@ -2520,8 +2767,9 @@ mod tests {
     #[test]
     fn owner_loop_honors_injected_timeout_and_all_live_leases() {
         let (startup_sender, _startup_receiver) = bounded(1);
-        let query_queue = CancellableRequestQueue::new(1);
-        let bulk_queue = CancellableRequestQueue::new(1);
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
+        let query_queue = CancellableRequestQueue::new(1, Arc::clone(&admission));
+        let bulk_queue = CancellableRequestQueue::new(1, admission);
         let (control_sender, control_receiver) = unbounded();
         let (first_lease_sender, first_lease_receiver) = bounded(1);
         let (done_sender, done_receiver) = bounded(1);
