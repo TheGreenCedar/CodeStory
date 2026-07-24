@@ -500,7 +500,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::unix::fs::symlink;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn replaces_dangling_links_in_every_cargo_runtime_directory() {
