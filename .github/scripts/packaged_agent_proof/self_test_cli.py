@@ -59,6 +59,14 @@ def run_cli_self_tests() -> None:
             load_calibration_bundle(args, {}, {}, required=False) is None,
             "ground-only proof unexpectedly loaded a calibration bundle",
         )
+        args.calibration_bundle = attestation
+        try:
+            load_calibration_bundle(args, {}, {}, required=False)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("ground-only proof accepted a calibration bundle")
+        args.calibration_bundle = None
 
         args.ground_only = False
         args.server_behavior_only = True

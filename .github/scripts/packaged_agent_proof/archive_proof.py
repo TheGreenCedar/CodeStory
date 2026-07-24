@@ -43,6 +43,12 @@ def load_calibration_bundle(
     required: bool,
 ) -> dict[str, object] | None:
     if not required:
+        require(
+            args.calibration_bundle is None
+            and args.calibration_producer_run_id is None
+            and args.calibration_producer_artifact is None,
+            f"{claim_scope(args)} proof rejects calibration inputs",
+        )
         return None
     require(
         args.calibration_bundle is not None,

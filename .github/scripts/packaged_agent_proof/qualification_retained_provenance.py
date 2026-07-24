@@ -40,6 +40,12 @@ def _verify_marketplace_provenance(
         and re.fullmatch(r"[0-9a-f]{40}", plugin["marketplace_commit"]) is not None,
         "installed evidence marketplace commit is invalid",
     )
+    require(
+        isinstance(plugin.get("plugin_source_commit"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", plugin["plugin_source_commit"]) is not None
+        and plugin.get("plugin_source_tree") == contract.manifest["source"]["tree"],
+        "installed evidence marketplace plugin source is not immutable",
+    )
 
 
 def _verify_candidate_provenance(
@@ -93,10 +99,11 @@ def _verify_installed_provenance(contract: RetainedQualificationContract) -> Non
         plugin.get("plugin_package_sha256"),
         "installed evidence plugin_package_sha256",
     )
-    require(
-        plugin.get("plugin_source_commit") == manifest["source"]["commit"],
-        "installed evidence does not bind the marketplace plugin to the packaged source commit",
-    )
+    if installation_source == "candidate_archive":
+        require(
+            plugin.get("plugin_source_commit") == manifest["source"]["commit"],
+            "installed evidence does not bind the candidate plugin to the packaged source commit",
+        )
     require(
         runtime.get("cli_source") == "managed"
         and runtime.get("plugin_version") == manifest["release_version"]

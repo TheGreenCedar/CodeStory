@@ -62,7 +62,8 @@ def _installation_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:
         "marketplace_commit": "d" * 40,
         "plugin_id": "codestory",
         "plugin_version": "0.0.0",
-        "plugin_source_commit": manifest["source"]["commit"],
+        "plugin_source_commit": "e" * 40,
+        "plugin_source_tree": manifest["source"]["tree"],
         "plugin_package_sha256": "e" * 64,
     }
     managed_runtime = {

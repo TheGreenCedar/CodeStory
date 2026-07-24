@@ -34,23 +34,63 @@ function run(executable, args, options = {}) {
   return result.stdout.trim();
 }
 
-function commitFixture(root) {
-  run("git", ["init", "-q"], { cwd: root });
+function commitFixture(root, message = "fixture", { init = false, allowEmpty = false } = {}) {
+  if (init) run("git", ["init", "-q"], { cwd: root });
   run("git", ["add", "."], { cwd: root });
-  run(
-    "git",
-    [
-      "-c",
-      "user.name=fixture",
-      "-c",
-      "user.email=fixture@example.invalid",
-      "commit",
-      "-qm",
-      "fixture",
-    ],
-    { cwd: root },
-  );
+  const commitArgs = [
+    "-c",
+    "user.name=fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+  ];
+  if (allowEmpty) commitArgs.push("--allow-empty");
+  commitArgs.push("-qm", message);
+  run("git", commitArgs, { cwd: root });
   return run("git", ["rev-parse", "HEAD"], { cwd: root });
+}
+
+function proofArgs({
+  packageRoot,
+  proofRoot,
+  marketplaceRoot,
+  marketplaceRevision,
+  expectedVersion,
+  sourceRepository,
+}) {
+  const codexHome = path.join(proofRoot, "codex-home");
+  return [
+    helper,
+    "--codex-package-root",
+    packageRoot,
+    "--codex-home",
+    codexHome,
+    "--plugin-data",
+    path.join(codexHome, "plugin-data"),
+    "--marketplace-source",
+    marketplaceRoot,
+    "--marketplace-name",
+    "Fixture",
+    "--marketplace-revision",
+    marketplaceRevision,
+    "--local-fixture",
+    "true",
+    "--expected-version",
+    expectedVersion,
+    "--source-repository",
+    sourceRepository,
+    "--attestation",
+    path.join(proofRoot, "attestation.json"),
+  ];
+}
+
+function assertFailedProof(args, message) {
+  const result = spawnSync(process.execPath, args, {
+    encoding: "utf8",
+    shell: process.platform === "win32",
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, message);
 }
 
 test("pinned Codex installs a local marketplace fixture into the attested cache", () => {
@@ -74,7 +114,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       path.join(pluginSourceRoot, "plugins", "codestory"),
       { recursive: true },
     );
-    commitFixture(pluginSourceRoot);
+    const pluginSourceCommit = commitFixture(pluginSourceRoot, "fixture", { init: true });
     mkdirSync(path.join(marketplaceRoot, ".agents", "plugins"), { recursive: true });
     writeFileSync(
       path.join(marketplaceRoot, ".agents", "plugins", "marketplace.json"),
@@ -87,6 +127,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
             source: "git-subdir",
             url: pathToFileURL(pluginSourceRoot).href,
             path: "plugins/codestory",
+            sha: pluginSourceCommit,
           },
           policy: {
             installation: "AVAILABLE",
@@ -96,38 +137,36 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         }],
       }, null, 2)}\n`,
     );
-    const marketplaceRevision = commitFixture(marketplaceRoot);
+    const marketplaceRevision = commitFixture(marketplaceRoot, "fixture", {
+      init: true,
+    });
+    const releaseSourceCommit = commitFixture(
+      pluginSourceRoot,
+      "release merge",
+      { allowEmpty: true },
+    );
+    assert.notEqual(releaseSourceCommit, pluginSourceCommit);
+    assert.equal(
+      run("git", ["rev-parse", `${pluginSourceCommit}^{tree}`], {
+        cwd: pluginSourceRoot,
+      }),
+      run("git", ["rev-parse", "HEAD^{tree}"], { cwd: pluginSourceRoot }),
+    );
     const pluginManifest = JSON.parse(
       readFileSync(
         path.join(repositoryRoot, "plugins", "codestory", ".codex-plugin", "plugin.json"),
       ),
     );
     const codexHome = path.join(root, "codex-home");
-    const pluginData = path.join(codexHome, "plugin-data");
     const attestationPath = path.join(root, "attestation.json");
-    run(process.execPath, [
-      helper,
-      "--codex-package-root",
+    run(process.execPath, proofArgs({
       packageRoot,
-      "--codex-home",
-      codexHome,
-      "--plugin-data",
-      pluginData,
-      "--marketplace-source",
+      proofRoot: root,
       marketplaceRoot,
-      "--marketplace-name",
-      "Fixture",
-      "--marketplace-revision",
       marketplaceRevision,
-      "--local-fixture",
-      "true",
-      "--expected-version",
-      pluginManifest.version,
-      "--source-repository",
-      repositoryRoot,
-      "--attestation",
-      attestationPath,
-    ]);
+      expectedVersion: pluginManifest.version,
+      sourceRepository: pluginSourceRoot,
+    }));
 
     const attestation = JSON.parse(readFileSync(attestationPath));
     const expectedPluginRoot = path.join(
@@ -143,11 +182,11 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     assert.equal(attestation.marketplace.revision, marketplaceRevision);
     assert.equal(
       attestation.plugin.source_commit,
-      run("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot }),
+      pluginSourceCommit,
     );
     assert.equal(
       attestation.plugin.source_tree,
-      run("git", ["rev-parse", "HEAD^{tree}"], { cwd: repositoryRoot }),
+      run("git", ["rev-parse", "HEAD^{tree}"], { cwd: pluginSourceRoot }),
     );
     assert.equal(attestation.marketplace.provenance.add.revision, marketplaceRevision);
     assert.equal(attestation.marketplace.provenance.list.revision, marketplaceRevision);
@@ -161,52 +200,66 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       attestation.marketplace.plugin_list_result.installed.map(({ pluginId }) => pluginId),
       ["codestory@Fixture"],
     );
+    assert.equal(
+      attestation.marketplace.plugin_list_result.installed[0].source.sha,
+      pluginSourceCommit,
+    );
     const config = readFileSync(path.join(codexHome, "config.toml"), "utf8");
     assert.match(config, /\[marketplaces\.Fixture\]/u);
     assert.match(config, /\[plugins\."codestory@Fixture"\]/u);
     assert.match(config, /enabled = true/u);
 
-    const mismatchedSource = path.join(root, "mismatched-source");
-    cpSync(
-      path.join(repositoryRoot, "plugins", "codestory"),
-      path.join(mismatchedSource, "plugins", "codestory"),
-      { recursive: true },
-    );
     writeFileSync(
-      path.join(mismatchedSource, "plugins", "codestory", "mismatched.txt"),
+      path.join(pluginSourceRoot, "plugins", "codestory", "mismatched.txt"),
       "different package bytes\n",
     );
-    commitFixture(mismatchedSource);
-    const mismatch = spawnSync(process.execPath, [
-      helper,
-      "--codex-package-root",
-      packageRoot,
-      "--codex-home",
-      path.join(root, "mismatch-codex-home"),
-      "--plugin-data",
-      path.join(root, "mismatch-codex-home", "plugin-data"),
-      "--marketplace-source",
-      marketplaceRoot,
-      "--marketplace-name",
-      "Fixture",
-      "--marketplace-revision",
-      marketplaceRevision,
-      "--local-fixture",
-      "true",
-      "--expected-version",
-      pluginManifest.version,
-      "--source-repository",
-      mismatchedSource,
-      "--attestation",
-      path.join(root, "mismatch-attestation.json"),
-    ], {
-      encoding: "utf8",
-      shell: process.platform === "win32",
-    });
-    assert.notEqual(mismatch.status, 0);
-    assert.match(
-      mismatch.stderr,
+    assertFailedProof(
+      proofArgs({
+        packageRoot,
+        proofRoot: path.join(root, "mismatch"),
+        marketplaceRoot,
+        marketplaceRevision,
+        expectedVersion: pluginManifest.version,
+        sourceRepository: pluginSourceRoot,
+      }),
       /installed plugin bytes do not match the checked-out CodeStory package/u,
+    );
+    commitFixture(pluginSourceRoot, "change release tree");
+    assertFailedProof(
+      proofArgs({
+        packageRoot,
+        proofRoot: path.join(root, "changed-tree"),
+        marketplaceRoot,
+        marketplaceRevision,
+        expectedVersion: pluginManifest.version,
+        sourceRepository: pluginSourceRoot,
+      }),
+      /pinned marketplace plugin source does not match the release source tree/u,
+    );
+
+    const catalogPath = path.join(
+      marketplaceRoot,
+      ".agents",
+      "plugins",
+      "marketplace.json",
+    );
+    const unpinnedCatalog = JSON.parse(readFileSync(catalogPath));
+    delete unpinnedCatalog.plugins[0].source.sha;
+    writeFileSync(catalogPath, `${JSON.stringify(unpinnedCatalog, null, 2)}\n`);
+    const unpinnedMarketplaceRevision = commitFixture(
+      marketplaceRoot,
+      "remove source pin",
+    );
+    assertFailedProof(
+      proofArgs({
+        packageRoot,
+        proofRoot: path.join(root, "unpinned"),
+        marketplaceRoot,
+        marketplaceRevision: unpinnedMarketplaceRevision,
+        expectedVersion: pluginManifest.version,
+        sourceRepository: pluginSourceRoot,
+      }),
+      /marketplace plugin source is not pinned to one immutable commit/u,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

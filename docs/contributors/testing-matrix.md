@@ -233,8 +233,8 @@ python .github/scripts/check-packaged-agent-proof.py --self-test
 
 | Workflow | Required claim |
 | --- | --- |
-| `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
-| `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
+| `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and project-scoped grounding |
+| `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and project-scoped grounding |
 | `.github/workflows/linux-vulkan-proof.yml` | Exact Linux x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, and project-scoped grounding |
 
 Signing and notarization are main-release concerns, not PR gates. A PR package
@@ -549,9 +549,7 @@ fail-closed publication authority used by publish and post-publish jobs.
 ```text
 gh workflow run release.yml --ref dev/codestory-next \
   -f version=<version> \
-  -f expected_head_sha=<exact-full-dev-sha> \
-  -f calibration_bundle_artifact=<artifact-name> \
-  -f calibration_bundle_run_id=<run-id>
+  -f expected_head_sha=<exact-full-dev-sha>
 ```
 
 There is intentionally no `publish_release` field on this manual command.
