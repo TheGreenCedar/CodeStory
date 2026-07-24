@@ -4696,6 +4696,180 @@ impl Drop for PreparedCoreCommit {
     }
 }
 
+fn apply_core_indexing_stats(timings: &mut IndexingPhaseTimings, stats: &IncrementalIndexingStats) {
+    timings.parse_index_ms = clamp_u64_to_u32(stats.parse_index_ms);
+    timings.projection_flush_ms = clamp_u64_to_u32(stats.projection_flush_ms);
+    timings.edge_resolution_ms = clamp_u64_to_u32(stats.edge_resolution_ms);
+    timings.error_flush_ms = clamp_u64_to_u32(stats.error_flush_ms);
+    timings.cleanup_ms = clamp_u64_to_u32(stats.cleanup_ms);
+    timings.artifact_cache_write_ms = Some(clamp_u64_to_u32(stats.artifact_cache_write_ms));
+    timings.artifact_cache_writes = Some(clamp_usize_to_u32(stats.artifact_cache_writes));
+    timings.artifact_cache_write_transactions =
+        Some(clamp_usize_to_u32(stats.artifact_cache_write_transactions));
+    timings.parser_artifact_cache =
+        Some(artifact_cache_access_timings(&stats.parser_artifact_cache));
+    timings.structural_artifact_cache = Some(artifact_cache_access_timings(
+        &stats.structural_artifact_cache,
+    ));
+    timings.source_prepare_ms = Some(clamp_u64_to_u32(stats.source_prepare_ms));
+    timings.projection_batch_wall_ms = Some(clamp_u64_to_u32(stats.projection_batch_wall_ms));
+    timings.projection_batch_transactions =
+        Some(clamp_usize_to_u32(stats.projection_batch_transactions));
+    timings.projection_persistence = Some(projection_persistence_timings(
+        &stats.projection_persistence,
+    ));
+    timings.unresolved_calls_start = clamp_usize_to_u32(stats.unresolved_calls_start);
+    timings.unresolved_imports_start = clamp_usize_to_u32(stats.unresolved_imports_start);
+    timings.resolved_calls = clamp_usize_to_u32(stats.resolved_calls);
+    timings.resolved_imports = clamp_usize_to_u32(stats.resolved_imports);
+    timings.unresolved_calls_end = clamp_usize_to_u32(stats.unresolved_calls_end);
+    timings.unresolved_imports_end = clamp_usize_to_u32(stats.unresolved_imports_end);
+}
+
+fn apply_resolution_telemetry(
+    timings: &mut IndexingPhaseTimings,
+    telemetry: &OptionalResolutionTelemetry,
+) {
+    timings.setup_existing_projection_ids_ms = telemetry.setup_existing_projection_ids_ms;
+    timings.setup_seed_symbol_table_ms = telemetry.setup_seed_symbol_table_ms;
+    timings.flush_files_ms = telemetry.flush_files_ms;
+    timings.flush_nodes_ms = telemetry.flush_nodes_ms;
+    timings.flush_edges_ms = telemetry.flush_edges_ms;
+    timings.flush_occurrences_ms = telemetry.flush_occurrences_ms;
+    timings.flush_component_access_ms = telemetry.flush_component_access_ms;
+    timings.flush_callable_projection_ms = telemetry.flush_callable_projection_ms;
+    timings.resolution_override_count_ms = telemetry.resolution_override_count_ms;
+    timings.resolution_unresolved_counts_ms = telemetry.resolution_unresolved_counts_ms;
+    timings.resolution_calls_ms = telemetry.resolution_calls_ms;
+    timings.resolution_imports_ms = telemetry.resolution_imports_ms;
+    timings.resolution_cleanup_ms = telemetry.resolution_cleanup_ms;
+    timings.resolution_call_candidate_index_ms = telemetry.resolution_call_candidate_index_ms;
+    timings.resolution_import_candidate_index_ms = telemetry.resolution_import_candidate_index_ms;
+    timings.resolution_call_semantic_index_ms = telemetry.resolution_call_semantic_index_ms;
+    timings.resolution_import_semantic_index_ms = telemetry.resolution_import_semantic_index_ms;
+    timings.resolution_support_snapshot_limit_bytes =
+        telemetry.resolution_support_snapshot_limit_bytes;
+    timings.resolution_support_snapshot_stored = telemetry.resolution_support_snapshot_stored;
+    timings.resolution_support_snapshot_skipped_oversize =
+        telemetry.resolution_support_snapshot_skipped_oversize;
+    timings.resolution_call_semantic_candidates_ms =
+        telemetry.resolution_call_semantic_candidates_ms;
+    timings.resolution_import_semantic_candidates_ms =
+        telemetry.resolution_import_semantic_candidates_ms;
+    timings.resolution_call_semantic_requests = telemetry.resolution_call_semantic_requests;
+    timings.resolution_call_semantic_unique_requests =
+        telemetry.resolution_call_semantic_unique_requests;
+    timings.resolution_call_semantic_skipped_requests =
+        telemetry.resolution_call_semantic_skipped_requests;
+    timings.resolution_import_semantic_requests = telemetry.resolution_import_semantic_requests;
+    timings.resolution_import_semantic_unique_requests =
+        telemetry.resolution_import_semantic_unique_requests;
+    timings.resolution_import_semantic_skipped_requests =
+        telemetry.resolution_import_semantic_skipped_requests;
+    timings.resolution_call_compute_ms = telemetry.resolution_call_compute_ms;
+    timings.resolution_import_compute_ms = telemetry.resolution_import_compute_ms;
+    timings.resolution_call_apply_ms = telemetry.resolution_call_apply_ms;
+    timings.resolution_import_apply_ms = telemetry.resolution_import_apply_ms;
+    timings.resolution_override_resolution_ms = telemetry.resolution_override_resolution_ms;
+    timings.resolved_calls_same_file = telemetry.resolved_calls_same_file;
+    timings.resolved_calls_same_module = telemetry.resolved_calls_same_module;
+    timings.resolved_calls_global_unique = telemetry.resolved_calls_global_unique;
+    timings.resolved_calls_semantic = telemetry.resolved_calls_semantic;
+    timings.resolved_imports_same_file = telemetry.resolved_imports_same_file;
+    timings.resolved_imports_same_module = telemetry.resolved_imports_same_module;
+    timings.resolved_imports_global_unique = telemetry.resolved_imports_global_unique;
+    timings.resolved_imports_fuzzy = telemetry.resolved_imports_fuzzy;
+    timings.resolved_imports_semantic = telemetry.resolved_imports_semantic;
+}
+
+fn apply_staged_publication_timings(
+    timings: &mut IndexingPhaseTimings,
+    finalize_stats: StagedSnapshotFinalizeStats,
+    detail_snapshot_ms: u32,
+    publish_stats: StagedSnapshotPublishStats,
+    publish_duration: Duration,
+    semantic_context_index_ms: u32,
+) {
+    timings.deferred_indexes_ms = Some(
+        finalize_stats
+            .deferred_indexes_ms
+            .saturating_add(semantic_context_index_ms),
+    );
+    timings.summary_snapshot_ms = Some(finalize_stats.summary_snapshot_ms);
+    timings.detail_snapshot_ms = Some(detail_snapshot_ms);
+    timings.publish_ms = Some(clamp_u128_to_u32(publish_duration.as_millis()));
+    timings.staged_sqlite_wal_autocheckpoint_bytes = publish_stats.sqlite_wal_autocheckpoint_bytes;
+    timings.staged_sqlite_checkpoint_ms = publish_stats.sqlite_checkpoint_ms;
+    timings.staged_sqlite_sync_ms = publish_stats.sqlite_sync_ms;
+    timings.staged_snapshot_copy = publish_stats
+        .snapshot_copy
+        .map(database_snapshot_copy_timings);
+    timings.core_promotion = Some(core_promotion_timings(publish_stats.core_promotion));
+}
+
+fn apply_full_refresh_pipeline_timings(
+    timings: &mut IndexingPhaseTimings,
+    stats: &IncrementalIndexingStats,
+    wall: FullRefreshWallTimings,
+) {
+    timings.full_refresh_wall = Some(wall);
+    let pipeline_enabled = stats.full_refresh_queue_capacity > 0;
+    timings.full_refresh_chunks_produced =
+        pipeline_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunks_produced));
+    timings.full_refresh_chunks_persisted =
+        pipeline_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunks_persisted));
+    timings.full_refresh_queue_capacity =
+        pipeline_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_queue_capacity));
+    timings.full_refresh_queue_high_water =
+        pipeline_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_queue_high_water));
+    timings.full_refresh_producer_blocked_ms =
+        pipeline_enabled.then_some(clamp_u64_to_u32(stats.full_refresh_producer_blocked_ms));
+    timings.full_refresh_writer_idle_ms =
+        pipeline_enabled.then_some(clamp_u64_to_u32(stats.full_refresh_writer_idle_ms));
+    let chunking_enabled = stats.full_refresh_chunk_target_bytes > 0;
+    timings.full_refresh_chunk_target_bytes =
+        chunking_enabled.then_some(stats.full_refresh_chunk_target_bytes);
+    timings.full_refresh_chunk_target_nodes =
+        chunking_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunk_target_nodes));
+    timings.full_refresh_chunk_file_ceiling =
+        chunking_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunk_file_ceiling));
+    timings.full_refresh_chunk_max_files =
+        chunking_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunk_max_files));
+    timings.full_refresh_chunk_max_planned_bytes =
+        chunking_enabled.then_some(stats.full_refresh_chunk_max_planned_bytes);
+    timings.full_refresh_chunk_max_nodes =
+        chunking_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunk_max_nodes));
+    timings.full_refresh_chunk_budget_overruns =
+        chunking_enabled.then_some(clamp_usize_to_u32(stats.full_refresh_chunk_budget_overruns));
+    timings.full_refresh_chunk_planning_ms =
+        chunking_enabled.then_some(clamp_u64_to_u32(stats.full_refresh_chunk_planning_ms));
+}
+
+fn core_indexing_phase_timings(
+    stats: &IncrementalIndexingStats,
+    finalize_stats: StagedSnapshotFinalizeStats,
+    detail_snapshot_ms: u32,
+    publish_stats: StagedSnapshotPublishStats,
+    publish_duration: Duration,
+    semantic_context_index_ms: u32,
+) -> IndexingPhaseTimings {
+    let mut timings = IndexingPhaseTimings::default();
+    apply_core_indexing_stats(&mut timings, stats);
+    apply_resolution_telemetry(
+        &mut timings,
+        &OptionalResolutionTelemetry::from_incremental_stats(stats),
+    );
+    apply_staged_publication_timings(
+        &mut timings,
+        finalize_stats,
+        detail_snapshot_ms,
+        publish_stats,
+        publish_duration,
+        semantic_context_index_ms,
+    );
+    timings
+}
+
 fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -4821,12 +4995,6 @@ fn index_full_for_runtime(
     };
     wall_durations.semantic_stage = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let deferred_indexes_ms = prepared_snapshots
-        .finalize_stats
-        .deferred_indexes_ms
-        .saturating_add(prepared_snapshots.semantic_stats.semantic_context_index_ms);
-    let summary_snapshot_ms = prepared_snapshots.finalize_stats.summary_snapshot_ms;
-    let detail_snapshot_ms = Some(prepared_snapshots.detail_snapshot_ms);
     wall_durations.snapshot_stage = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
     if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
@@ -4881,192 +5049,19 @@ fn index_full_for_runtime(
         },
         cancel_token,
     )?;
-    let publish_ms = clamp_u128_to_u32(publish_duration.as_millis());
     wall_durations.catalog_publication = wall_stage_started.elapsed();
     let full_refresh_wall = wall_durations.finish(core_refresh_started.elapsed());
-    let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
-    let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
-    let full_refresh_chunking_enabled = index_stats.full_refresh_chunk_target_bytes > 0;
+    let mut phase_timings = core_indexing_phase_timings(
+        &index_stats,
+        prepared_snapshots.finalize_stats,
+        prepared_snapshots.detail_snapshot_ms,
+        staged_publish_stats,
+        publish_duration,
+        prepared_snapshots.semantic_stats.semantic_context_index_ms,
+    );
+    apply_full_refresh_pipeline_timings(&mut phase_timings, &index_stats, full_refresh_wall);
     Ok(IndexingRunSummary {
-        phase_timings: IndexingPhaseTimings {
-            full_refresh_wall: Some(full_refresh_wall),
-            parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
-            projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
-            edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
-            error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
-            cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
-            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
-            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
-            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
-                index_stats.artifact_cache_write_transactions,
-            )),
-            parser_artifact_cache: Some(artifact_cache_access_timings(
-                &index_stats.parser_artifact_cache,
-            )),
-            structural_artifact_cache: Some(artifact_cache_access_timings(
-                &index_stats.structural_artifact_cache,
-            )),
-            full_refresh_chunks_produced: full_refresh_pipeline_enabled
-                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunks_produced)),
-            full_refresh_chunks_persisted: full_refresh_pipeline_enabled.then_some(
-                clamp_usize_to_u32(index_stats.full_refresh_chunks_persisted),
-            ),
-            full_refresh_queue_capacity: full_refresh_pipeline_enabled
-                .then_some(clamp_usize_to_u32(index_stats.full_refresh_queue_capacity)),
-            full_refresh_queue_high_water: full_refresh_pipeline_enabled.then_some(
-                clamp_usize_to_u32(index_stats.full_refresh_queue_high_water),
-            ),
-            full_refresh_producer_blocked_ms: full_refresh_pipeline_enabled.then_some(
-                clamp_u64_to_u32(index_stats.full_refresh_producer_blocked_ms),
-            ),
-            full_refresh_writer_idle_ms: full_refresh_pipeline_enabled
-                .then_some(clamp_u64_to_u32(index_stats.full_refresh_writer_idle_ms)),
-            full_refresh_chunk_target_bytes: full_refresh_chunking_enabled
-                .then_some(index_stats.full_refresh_chunk_target_bytes),
-            full_refresh_chunk_target_nodes: full_refresh_chunking_enabled.then_some(
-                clamp_usize_to_u32(index_stats.full_refresh_chunk_target_nodes),
-            ),
-            full_refresh_chunk_file_ceiling: full_refresh_chunking_enabled.then_some(
-                clamp_usize_to_u32(index_stats.full_refresh_chunk_file_ceiling),
-            ),
-            full_refresh_chunk_max_files: full_refresh_chunking_enabled
-                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_files)),
-            full_refresh_chunk_max_planned_bytes: full_refresh_chunking_enabled
-                .then_some(index_stats.full_refresh_chunk_max_planned_bytes),
-            full_refresh_chunk_max_nodes: full_refresh_chunking_enabled
-                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_nodes)),
-            full_refresh_chunk_budget_overruns: full_refresh_chunking_enabled.then_some(
-                clamp_usize_to_u32(index_stats.full_refresh_chunk_budget_overruns),
-            ),
-            full_refresh_chunk_planning_ms: full_refresh_chunking_enabled
-                .then_some(clamp_u64_to_u32(index_stats.full_refresh_chunk_planning_ms)),
-            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
-            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
-            projection_batch_transactions: Some(clamp_usize_to_u32(
-                index_stats.projection_batch_transactions,
-            )),
-            projection_persistence: Some(projection_persistence_timings(
-                &index_stats.projection_persistence,
-            )),
-            cache_refresh_ms: None,
-            search_projection_rebuild_ms: None,
-            search_symbol_stream_ms: None,
-            search_symbol_stream_rows: None,
-            search_symbol_stream_batches: None,
-            search_symbol_index_ms: None,
-            search_symbol_index_docs_written: None,
-            search_symbol_index_writer_count: None,
-            search_symbol_index_commit_count: None,
-            search_symbol_index_reload_count: None,
-            search_symbol_index_commit_ms: None,
-            search_symbol_index_reload_ms: None,
-            runtime_cache_publish_ms: None,
-            semantic_context_index_ms: None,
-            semantic_node_load_ms: None,
-            semantic_node_load_rows: None,
-            semantic_node_stream_batches: None,
-            semantic_endpoint_load_ms: None,
-            semantic_endpoint_load_rows: None,
-            semantic_endpoint_load_batches: None,
-            semantic_selected_nodes: None,
-            semantic_context_file_count: None,
-            semantic_context_path_bytes: None,
-            semantic_node_lookup_entries: None,
-            semantic_context_ms: None,
-            semantic_doc_build_ms: None,
-            semantic_embedding_ms: None,
-            semantic_db_upsert_ms: None,
-            semantic_reload_ms: None,
-            semantic_prune_ms: None,
-            semantic_docs_reused: None,
-            semantic_docs_embedded: None,
-            semantic_docs_pending: None,
-            semantic_docs_stale: None,
-            symbol_search_docs_written: None,
-            semantic_dense_docs_skipped: None,
-            semantic_dense_public_api: None,
-            semantic_dense_entrypoint: None,
-            semantic_dense_documented_nontrivial: None,
-            semantic_dense_central_graph_node: None,
-            semantic_dense_component_report: None,
-            semantic_dense_unstructured_doc: None,
-            deferred_indexes_ms: Some(deferred_indexes_ms),
-            summary_snapshot_ms: Some(summary_snapshot_ms),
-            detail_snapshot_ms,
-            publish_ms: Some(publish_ms),
-            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
-                .sqlite_wal_autocheckpoint_bytes,
-            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
-            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
-            staged_snapshot_copy: staged_publish_stats
-                .snapshot_copy
-                .map(database_snapshot_copy_timings),
-            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
-            setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
-            setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
-            flush_files_ms: resolution_telemetry.flush_files_ms,
-            flush_nodes_ms: resolution_telemetry.flush_nodes_ms,
-            flush_edges_ms: resolution_telemetry.flush_edges_ms,
-            flush_occurrences_ms: resolution_telemetry.flush_occurrences_ms,
-            flush_component_access_ms: resolution_telemetry.flush_component_access_ms,
-            flush_callable_projection_ms: resolution_telemetry.flush_callable_projection_ms,
-            unresolved_calls_start: clamp_usize_to_u32(index_stats.unresolved_calls_start),
-            unresolved_imports_start: clamp_usize_to_u32(index_stats.unresolved_imports_start),
-            resolved_calls: clamp_usize_to_u32(index_stats.resolved_calls),
-            resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
-            unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
-            unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
-            resolution_override_count_ms: resolution_telemetry.resolution_override_count_ms,
-            resolution_unresolved_counts_ms: resolution_telemetry.resolution_unresolved_counts_ms,
-            resolution_calls_ms: resolution_telemetry.resolution_calls_ms,
-            resolution_imports_ms: resolution_telemetry.resolution_imports_ms,
-            resolution_cleanup_ms: resolution_telemetry.resolution_cleanup_ms,
-            resolution_call_candidate_index_ms: resolution_telemetry
-                .resolution_call_candidate_index_ms,
-            resolution_import_candidate_index_ms: resolution_telemetry
-                .resolution_import_candidate_index_ms,
-            resolution_call_semantic_index_ms: resolution_telemetry
-                .resolution_call_semantic_index_ms,
-            resolution_import_semantic_index_ms: resolution_telemetry
-                .resolution_import_semantic_index_ms,
-            resolution_support_snapshot_limit_bytes: resolution_telemetry
-                .resolution_support_snapshot_limit_bytes,
-            resolution_support_snapshot_stored: resolution_telemetry
-                .resolution_support_snapshot_stored,
-            resolution_support_snapshot_skipped_oversize: resolution_telemetry
-                .resolution_support_snapshot_skipped_oversize,
-            resolution_call_semantic_candidates_ms: resolution_telemetry
-                .resolution_call_semantic_candidates_ms,
-            resolution_import_semantic_candidates_ms: resolution_telemetry
-                .resolution_import_semantic_candidates_ms,
-            resolution_call_semantic_requests: resolution_telemetry
-                .resolution_call_semantic_requests,
-            resolution_call_semantic_unique_requests: resolution_telemetry
-                .resolution_call_semantic_unique_requests,
-            resolution_call_semantic_skipped_requests: resolution_telemetry
-                .resolution_call_semantic_skipped_requests,
-            resolution_import_semantic_requests: resolution_telemetry
-                .resolution_import_semantic_requests,
-            resolution_import_semantic_unique_requests: resolution_telemetry
-                .resolution_import_semantic_unique_requests,
-            resolution_import_semantic_skipped_requests: resolution_telemetry
-                .resolution_import_semantic_skipped_requests,
-            resolution_call_compute_ms: resolution_telemetry.resolution_call_compute_ms,
-            resolution_import_compute_ms: resolution_telemetry.resolution_import_compute_ms,
-            resolution_call_apply_ms: resolution_telemetry.resolution_call_apply_ms,
-            resolution_import_apply_ms: resolution_telemetry.resolution_import_apply_ms,
-            resolution_override_resolution_ms: resolution_telemetry
-                .resolution_override_resolution_ms,
-            resolved_calls_same_file: resolution_telemetry.resolved_calls_same_file,
-            resolved_calls_same_module: resolution_telemetry.resolved_calls_same_module,
-            resolved_calls_global_unique: resolution_telemetry.resolved_calls_global_unique,
-            resolved_calls_semantic: resolution_telemetry.resolved_calls_semantic,
-            resolved_imports_same_file: resolution_telemetry.resolved_imports_same_file,
-            resolved_imports_same_module: resolution_telemetry.resolved_imports_same_module,
-            resolved_imports_global_unique: resolution_telemetry.resolved_imports_global_unique,
-            resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
-            resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
-        },
+        phase_timings,
         staged_semantic_stats: prepared_snapshots.semantic_stats,
         llm_refresh_scope: None,
         #[cfg(test)]
@@ -5580,12 +5575,6 @@ fn run_incremental_indexing_common(
             return Err(error);
         }
     };
-    let deferred_indexes_ms = staged_finalize_stats
-        .deferred_indexes_ms
-        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
-    let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
-    let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
-
     let workspace = match runtime_workspace_manifest(root, storage_path) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -5633,168 +5622,16 @@ fn run_incremental_indexing_common(
         PreparedCoreCommit::new(staged, prepared_search_state, storage_path, &publication);
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
-    let publish_ms = clamp_u128_to_u32(publish_duration.as_millis());
-
+    let phase_timings = core_indexing_phase_timings(
+        &index_stats,
+        staged_finalize_stats,
+        detail_snapshot_ms,
+        staged_publish_stats,
+        publish_duration,
+        staged_semantic_stats.semantic_context_index_ms,
+    );
     Ok(IndexingRunSummary {
-        phase_timings: IndexingPhaseTimings {
-            full_refresh_wall: None,
-            parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
-            projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
-            edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
-            error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
-            cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
-            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
-            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
-            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
-                index_stats.artifact_cache_write_transactions,
-            )),
-            parser_artifact_cache: Some(artifact_cache_access_timings(
-                &index_stats.parser_artifact_cache,
-            )),
-            structural_artifact_cache: Some(artifact_cache_access_timings(
-                &index_stats.structural_artifact_cache,
-            )),
-            full_refresh_chunks_produced: None,
-            full_refresh_chunks_persisted: None,
-            full_refresh_queue_capacity: None,
-            full_refresh_queue_high_water: None,
-            full_refresh_producer_blocked_ms: None,
-            full_refresh_writer_idle_ms: None,
-            full_refresh_chunk_target_bytes: None,
-            full_refresh_chunk_target_nodes: None,
-            full_refresh_chunk_file_ceiling: None,
-            full_refresh_chunk_max_files: None,
-            full_refresh_chunk_max_planned_bytes: None,
-            full_refresh_chunk_max_nodes: None,
-            full_refresh_chunk_budget_overruns: None,
-            full_refresh_chunk_planning_ms: None,
-            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
-            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
-            projection_batch_transactions: Some(clamp_usize_to_u32(
-                index_stats.projection_batch_transactions,
-            )),
-            projection_persistence: Some(projection_persistence_timings(
-                &index_stats.projection_persistence,
-            )),
-            cache_refresh_ms: None,
-            search_projection_rebuild_ms: None,
-            search_symbol_stream_ms: None,
-            search_symbol_stream_rows: None,
-            search_symbol_stream_batches: None,
-            search_symbol_index_ms: None,
-            search_symbol_index_docs_written: None,
-            search_symbol_index_writer_count: None,
-            search_symbol_index_commit_count: None,
-            search_symbol_index_reload_count: None,
-            search_symbol_index_commit_ms: None,
-            search_symbol_index_reload_ms: None,
-            runtime_cache_publish_ms: None,
-            semantic_context_index_ms: None,
-            semantic_node_load_ms: None,
-            semantic_node_load_rows: None,
-            semantic_node_stream_batches: None,
-            semantic_endpoint_load_ms: None,
-            semantic_endpoint_load_rows: None,
-            semantic_endpoint_load_batches: None,
-            semantic_selected_nodes: None,
-            semantic_context_file_count: None,
-            semantic_context_path_bytes: None,
-            semantic_node_lookup_entries: None,
-            semantic_context_ms: None,
-            semantic_doc_build_ms: None,
-            semantic_embedding_ms: None,
-            semantic_db_upsert_ms: None,
-            semantic_reload_ms: None,
-            semantic_prune_ms: None,
-            semantic_docs_reused: None,
-            semantic_docs_embedded: None,
-            semantic_docs_pending: None,
-            semantic_docs_stale: None,
-            symbol_search_docs_written: None,
-            semantic_dense_docs_skipped: None,
-            semantic_dense_public_api: None,
-            semantic_dense_entrypoint: None,
-            semantic_dense_documented_nontrivial: None,
-            semantic_dense_central_graph_node: None,
-            semantic_dense_component_report: None,
-            semantic_dense_unstructured_doc: None,
-            deferred_indexes_ms: Some(deferred_indexes_ms),
-            summary_snapshot_ms: Some(summary_snapshot_ms),
-            detail_snapshot_ms: Some(detail_snapshot_ms),
-            publish_ms: Some(publish_ms),
-            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
-                .sqlite_wal_autocheckpoint_bytes,
-            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
-            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
-            staged_snapshot_copy: staged_publish_stats
-                .snapshot_copy
-                .map(database_snapshot_copy_timings),
-            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
-            setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
-            setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
-            flush_files_ms: resolution_telemetry.flush_files_ms,
-            flush_nodes_ms: resolution_telemetry.flush_nodes_ms,
-            flush_edges_ms: resolution_telemetry.flush_edges_ms,
-            flush_occurrences_ms: resolution_telemetry.flush_occurrences_ms,
-            flush_component_access_ms: resolution_telemetry.flush_component_access_ms,
-            flush_callable_projection_ms: resolution_telemetry.flush_callable_projection_ms,
-            unresolved_calls_start: clamp_usize_to_u32(index_stats.unresolved_calls_start),
-            unresolved_imports_start: clamp_usize_to_u32(index_stats.unresolved_imports_start),
-            resolved_calls: clamp_usize_to_u32(index_stats.resolved_calls),
-            resolved_imports: clamp_usize_to_u32(index_stats.resolved_imports),
-            unresolved_calls_end: clamp_usize_to_u32(index_stats.unresolved_calls_end),
-            unresolved_imports_end: clamp_usize_to_u32(index_stats.unresolved_imports_end),
-            resolution_override_count_ms: resolution_telemetry.resolution_override_count_ms,
-            resolution_unresolved_counts_ms: resolution_telemetry.resolution_unresolved_counts_ms,
-            resolution_calls_ms: resolution_telemetry.resolution_calls_ms,
-            resolution_imports_ms: resolution_telemetry.resolution_imports_ms,
-            resolution_cleanup_ms: resolution_telemetry.resolution_cleanup_ms,
-            resolution_call_candidate_index_ms: resolution_telemetry
-                .resolution_call_candidate_index_ms,
-            resolution_import_candidate_index_ms: resolution_telemetry
-                .resolution_import_candidate_index_ms,
-            resolution_call_semantic_index_ms: resolution_telemetry
-                .resolution_call_semantic_index_ms,
-            resolution_import_semantic_index_ms: resolution_telemetry
-                .resolution_import_semantic_index_ms,
-            resolution_support_snapshot_limit_bytes: resolution_telemetry
-                .resolution_support_snapshot_limit_bytes,
-            resolution_support_snapshot_stored: resolution_telemetry
-                .resolution_support_snapshot_stored,
-            resolution_support_snapshot_skipped_oversize: resolution_telemetry
-                .resolution_support_snapshot_skipped_oversize,
-            resolution_call_semantic_candidates_ms: resolution_telemetry
-                .resolution_call_semantic_candidates_ms,
-            resolution_import_semantic_candidates_ms: resolution_telemetry
-                .resolution_import_semantic_candidates_ms,
-            resolution_call_semantic_requests: resolution_telemetry
-                .resolution_call_semantic_requests,
-            resolution_call_semantic_unique_requests: resolution_telemetry
-                .resolution_call_semantic_unique_requests,
-            resolution_call_semantic_skipped_requests: resolution_telemetry
-                .resolution_call_semantic_skipped_requests,
-            resolution_import_semantic_requests: resolution_telemetry
-                .resolution_import_semantic_requests,
-            resolution_import_semantic_unique_requests: resolution_telemetry
-                .resolution_import_semantic_unique_requests,
-            resolution_import_semantic_skipped_requests: resolution_telemetry
-                .resolution_import_semantic_skipped_requests,
-            resolution_call_compute_ms: resolution_telemetry.resolution_call_compute_ms,
-            resolution_import_compute_ms: resolution_telemetry.resolution_import_compute_ms,
-            resolution_call_apply_ms: resolution_telemetry.resolution_call_apply_ms,
-            resolution_import_apply_ms: resolution_telemetry.resolution_import_apply_ms,
-            resolution_override_resolution_ms: resolution_telemetry
-                .resolution_override_resolution_ms,
-            resolved_calls_same_file: resolution_telemetry.resolved_calls_same_file,
-            resolved_calls_same_module: resolution_telemetry.resolved_calls_same_module,
-            resolved_calls_global_unique: resolution_telemetry.resolved_calls_global_unique,
-            resolved_calls_semantic: resolution_telemetry.resolved_calls_semantic,
-            resolved_imports_same_file: resolution_telemetry.resolved_imports_same_file,
-            resolved_imports_same_module: resolution_telemetry.resolved_imports_same_module,
-            resolved_imports_global_unique: resolution_telemetry.resolved_imports_global_unique,
-            resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
-            resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
-        },
+        phase_timings,
         staged_semantic_stats,
         llm_refresh_scope: Some(llm_refresh_scope),
         #[cfg(test)]
