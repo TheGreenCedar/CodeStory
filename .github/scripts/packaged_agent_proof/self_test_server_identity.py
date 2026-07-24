@@ -164,7 +164,6 @@ def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
         observations_by_kind=cold_transitions,
         process_observations=cold_process_observations,
         invocations=[],
-        control_actions=[],
         same_account={
             "relation": "same_os_account",
             "plugin_hosts": [{"pid": 101}, {"pid": 102}],
@@ -187,7 +186,6 @@ def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
             observations_by_kind=cold_transitions,
             process_observations=duplicate_phase_observations,
             invocations=[],
-            control_actions=[],
             same_account={
                 "relation": "same_os_account",
                 "plugin_hosts": [{"pid": 101}, {"pid": 102}],
@@ -233,7 +231,6 @@ def _cold_split_test(
             observations_by_kind=cold_transitions,
             process_observations=split_process_observations,
             invocations=[],
-            control_actions=[],
             same_account={
                 "relation": "same_os_account",
                 "plugin_hosts": [{"pid": 101}, {"pid": 102}],

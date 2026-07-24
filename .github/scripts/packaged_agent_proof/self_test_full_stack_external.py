@@ -214,7 +214,6 @@ def _server_crash_scenario_tests() -> None:
         observations_by_kind=scenario_observations,
         process_observations=[],
         invocations=[],
-        control_actions=["hold_class", "crash_server"],
         same_account={},
         materialization={},
     )
@@ -236,7 +235,6 @@ def _server_crash_scenario_tests() -> None:
             observations_by_kind=hostile_scenario,
             process_observations=[],
             invocations=[],
-            control_actions=["hold_class", "crash_server"],
             same_account={},
             materialization={},
         )

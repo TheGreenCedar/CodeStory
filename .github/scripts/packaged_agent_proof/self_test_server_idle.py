@@ -156,7 +156,6 @@ def _verified_true_idle_fixture(
         observations_by_kind=true_idle_transitions,
         process_observations=true_idle_process_observations,
         invocations=true_idle_invocations,
-        control_actions=[],
         same_account={},
         materialization={
             "sha256": materialized_sha256,
@@ -191,7 +190,6 @@ def _materialization_binding_hostiles(fixture: TrueIdleFixture) -> None:
                 observations_by_kind=hostile_transitions,
                 process_observations=true_idle_process_observations,
                 invocations=true_idle_invocations,
-                control_actions=[],
                 same_account={},
                 materialization={
                     "sha256": materialized_sha256,
@@ -221,7 +219,6 @@ def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
             observations_by_kind=true_idle_transitions,
             process_observations=true_idle_process_observations,
             invocations=historical_only_invocations,
-            control_actions=[],
             same_account={},
             materialization={
                 "sha256": materialized_sha256,
@@ -252,7 +249,6 @@ def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
             observations_by_kind=true_idle_transitions,
             process_observations=true_idle_process_observations,
             invocations=failed_then_successful_invocations,
-            control_actions=[],
             same_account={},
             materialization={
                 "sha256": materialized_sha256,
@@ -275,7 +271,6 @@ def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
             observations_by_kind=historical_respawn_transition,
             process_observations=true_idle_process_observations,
             invocations=true_idle_invocations,
-            control_actions=[],
             same_account={},
             materialization={
                 "sha256": materialized_sha256,
@@ -311,7 +306,6 @@ def _absence_cardinality_hostile(fixture: TrueIdleFixture) -> None:
             observations_by_kind=true_idle_transitions,
             process_observations=duplicate_absence,
             invocations=true_idle_invocations,
-            control_actions=[],
             same_account={},
             materialization={
                 "sha256": materialized_sha256,
