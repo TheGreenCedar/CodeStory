@@ -1366,6 +1366,27 @@ impl<'a> ProjectionWriter<'a> {
                 None => self.all_errors.push(error),
             }
         }
+        let incoming_file_ids = local_storage
+            .files
+            .iter()
+            .map(|file| file.id)
+            .collect::<HashSet<_>>();
+        if !incoming_file_ids.is_empty() {
+            // Refresh plans can repeat one path. Preserve their serial last-write
+            // semantics while keeping the store batch contract unambiguous.
+            self.batched_storage
+                .file_content_hashes
+                .retain(|identity| !incoming_file_ids.contains(&identity.file_id));
+            self.batched_storage
+                .structural_text_units
+                .retain(|unit| !incoming_file_ids.contains(&unit.file_id));
+            self.batched_storage
+                .structural_text_projections
+                .retain(|projection| !incoming_file_ids.contains(&projection.file_id));
+            self.batched_storage
+                .structural_text_cache_writes
+                .retain(|write| !incoming_file_ids.contains(&write.file_id));
+        }
         self.batched_storage.merge(local_storage);
 
         let should_flush = !self.batched_storage.files.is_empty()
@@ -23795,6 +23816,51 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                 .filter(|node| node.serialized_name == "duplicate")
                 .count(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_structural_paths_publish_one_coherent_projection() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workflow_dir = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflow_dir)?;
+        let workflow = workflow_dir.join("ci.yml");
+        std::fs::write(
+            &workflow,
+            "name: CI\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        )?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![workflow.clone(), workflow],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 1,
+                ..IncrementalIndexingConfig::default()
+            },
+        );
+        let mut storage = Storage::open_build(dir.path().join("duplicate-structural.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(stats.projection_batch_transactions, 1);
+        assert_eq!(storage.get_structural_text_projection_file_ids()?.len(), 1);
+        assert!(
+            !storage
+                .get_structural_text_units_for_nodes(
+                    &storage
+                        .get_nodes()?
+                        .into_iter()
+                        .map(|node| node.id)
+                        .collect::<Vec<_>>()
+                )?
+                .is_empty()
         );
         Ok(())
     }
