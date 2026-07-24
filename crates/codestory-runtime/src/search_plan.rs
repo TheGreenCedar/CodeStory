@@ -7,10 +7,10 @@ use super::{
     SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
     SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
     SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, architecture_query_intents,
-    clamp_usize_to_u32, compare_search_hits_with_project_root,
-    is_low_confidence_search_plan_bridge, leading_symbol_segment, looks_like_repo_text_query,
-    normalize_path_key, normalize_symbol_query, retrieval_file_role_from_path,
-    retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
+    clamp_usize_to_u32, compare_search_hits_with_project_root, leading_symbol_segment,
+    looks_like_repo_text_query, normalize_path_key, normalize_symbol_query,
+    retrieval_file_role_from_path, retrieval_state_from_storage_for_runtime,
+    should_expand_symbol_query, terminal_symbol_segment,
 };
 use crate::search_intent::{
     SearchIntentFilter, SearchIntentQuery, annotate_search_hit_match_quality,
@@ -28,6 +28,10 @@ use crate::search_terms::{
     SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_ROLE_SPECS,
     SEARCH_PLAN_SEED_ANCHOR_MARKER, SEARCH_PLAN_SYMBOL_TERMS, search_plan_terms,
 };
+
+fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
+    bridge.confidence == SearchPlanBridgeConfidenceDto::Low
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct SearchPlanExecutedEvidence {
