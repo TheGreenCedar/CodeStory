@@ -97,11 +97,26 @@ jobs:
           fetch-depth: 0
 
       - name: Install pinned Python
+        if: runner.os != 'macOS'
         uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.13"
         env:
           PSExecutionPolicyPreference: Bypass
+
+      - name: Install pinned Python on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.13.14
+          python_bin="$(uv python find 3.13.14)"
+          test -x "$python_bin"
+          test "$("$python_bin" -c 'import platform; print(platform.python_version())')" = 3.13.14
+          shim_dir="$RUNNER_TEMP/codestory-python-3.13.14"
+          mkdir -p "$shim_dir"
+          ln -sf "$python_bin" "$shim_dir/python"
+          echo "$shim_dir" >> "$GITHUB_PATH"
 
       - name: Download accepted pre-publish closeout
         if: inputs.emit_release_cells
@@ -134,6 +149,7 @@ jobs:
           echo "checksum=$dir/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
 
       - name: Prove packaged version, help, and stdio shape
+        shell: bash
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
           --archive "${{ steps.asset.outputs.archive }}"
@@ -201,15 +217,17 @@ jobs:
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-installed-proof"
           codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          isolated_home="$install_root/isolated-home"
           marketplace_revision="${{ inputs.marketplace_revision }}"
           test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
           rm -rf "$install_root"
+          mkdir -p "$isolated_home"
           npm install \
             --prefix "$codex_package_root" \
             --no-audit \
             --no-fund \
             "@openai/codex@$CODEX_CLI_VERSION"
-          node .github/scripts/install-codestory-marketplace-proof.mjs \
+          HOME="$isolated_home" node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
