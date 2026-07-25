@@ -13,6 +13,8 @@ const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
 const sccacheVersion = "v0.16.0";
+const nextestVersion = "0.9.98";
+const nextestLinuxSha256 = "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7";
 const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
@@ -280,6 +282,13 @@ const draftCacheRestoreKeys = [
   `${retrievalCachePrefix}-`,
 ];
 const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
+const draftCompilerCachePath = "${{ runner.temp }}/codestory-draft-sccache";
+const draftCompilerCachePrefix =
+  "${{ runner.os }}-draft-sccache-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}";
+const draftCompilerCachePrimary = `${draftCompilerCachePrefix}-${cacheLock}`;
+const draftCompilerSaveCondition =
+  "success() && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''";
+const draftCompilerSaveKey = "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}";
 const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
 const draftWorkflowPaths = [
   "Cargo.lock",
@@ -371,9 +380,15 @@ const draftStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
   { name: "Install Rust stable", keys: ["name", "run"] },
   { name: "Install Linux Vulkan build dependencies", keys: ["name", "run"] },
+  { name: "Install pinned sccache", keys: ["name", "uses", "with"] },
+  { name: "Configure bounded compiler cache", keys: ["name", "shell", "run"] },
   { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
   {
     name: "Restore Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  {
+    name: "Restore compiler objects",
     keys: ["name", "id", "uses", "continue-on-error", "with"],
   },
   { name: "Check formatting", keys: ["name", "run"] },
@@ -386,8 +401,22 @@ const draftStepSequence = [
     name: "Save Cargo inputs and output",
     keys: ["name", "if", "uses", "continue-on-error", "with"],
   },
+  {
+    name: "Save compiler objects",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
 ];
 const draftRunCommands = new Map([
+  ["Configure bounded compiler cache", [
+    "{",
+    'echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-draft-sccache"',
+    'echo "SCCACHE_CACHE_SIZE=1G"',
+    'echo "RUSTC_WRAPPER=sccache"',
+    'echo "CARGO_INCREMENTAL=0"',
+    'echo "CMAKE_C_COMPILER_LAUNCHER=sccache"',
+    'echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"',
+    '} >> "$GITHUB_ENV"',
+  ]],
   ["Install Rust stable", [
     "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
     "rustup default stable",
@@ -756,6 +785,31 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   add(violations, sameStrings(nonCommentLines(restoreWith.path), draftCachePaths), "draft source cache restore must use only the Cargo registry, git, and default target paths");
   add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, target, proof topology, feature, manifest, and lock identity");
   add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact seeded retrieval, prior draft, then prior retrieval order and omit only the lock identity from prior prefixes");
+
+  const sccache = namedStep(job, "Install pinned sccache");
+  add(violations, sccache?.uses === sccacheAction, "draft source sccache must use the pinned mozilla-actions release");
+  add(
+    violations,
+    object(sccache?.with).version === sccacheVersion
+      && object(sccache?.with).disable_annotations === true,
+    "draft source sccache must pin the shared sccache version without annotations",
+  );
+
+  const compilerRestore = namedStep(job, "Restore compiler objects");
+  const compilerRestoreWith = object(compilerRestore?.with);
+  add(violations, compilerRestore?.id === "compiler-cache-restore", "draft compiler cache restore must keep its stable step id");
+  add(violations, compilerRestore?.uses === "actions/cache/restore@v5", "draft compiler cache restore must use actions/cache/restore@v5");
+  add(violations, compilerRestore?.["continue-on-error"] === true && compilerRestore?.if === undefined, "draft compiler cache restore must remain optional without conditional bypasses");
+  add(violations, compilerRestoreWith.path === draftCompilerCachePath, "draft compiler cache must live in the runner-temp sccache directory");
+  add(violations, compilerRestoreWith.key === draftCompilerCachePrimary, "draft compiler cache primary must bind platform, toolchain, target, and lock identity");
+  add(violations, sameStrings(nonCommentLines(compilerRestoreWith["restore-keys"]), [`${draftCompilerCachePrefix}-`]), "draft compiler cache fallback must omit only the lock identity");
+
+  const compilerSave = namedStep(job, "Save compiler objects");
+  const compilerSaveWith = object(compilerSave?.with);
+  add(violations, compilerSave?.uses === "actions/cache/save@v5", "draft compiler cache save must use actions/cache/save@v5");
+  add(violations, compilerSave?.["continue-on-error"] === true, "draft compiler cache save must remain non-blocking");
+  add(violations, compilerSave?.if === draftCompilerSaveCondition, "draft compiler cache must save only on a successful run that missed its primary key");
+  add(violations, compilerSaveWith.path === draftCompilerCachePath && compilerSaveWith.key === draftCompilerSaveKey, "draft compiler cache save must publish the restored primary key path");
 
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
   const retrievalRestoreWith = object(retrievalRestore?.with);
@@ -1473,7 +1527,25 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && lint?.if === "steps.compile-workspace.outcome == 'success'",
       `${sourceFile} compilation and lint must preserve cache state before reporting failure`,
     );
-    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
+    // nextest owns unit/integration execution; the doc pass rides along so a future doctest can
+    // never silently stop being run (nextest does not execute doctests).
+    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", [
+      "cargo nextest run --workspace --locked",
+      "cargo test --workspace --doc --locked",
+    ]);
+    requireStepRun(violations, sourceFile, full, "Install pinned cargo-nextest", [
+      `cargo-nextest-${nextestVersion}-x86_64-unknown-linux-gnu.tar.gz`,
+      `${nextestLinuxSha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
+      "sha256sum --check --strict",
+      "cargo nextest --version",
+    ]);
+    add(
+      violations,
+      stepIndex(full, "Install pinned cargo-nextest") > stepIndex(full, "Install pinned sccache")
+        && stepIndex(full, "Install pinned cargo-nextest")
+          < stepIndex(full, "Test the complete workspace once"),
+      `${sourceFile} must install the pinned test runner before the workspace test step`,
+    );
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
     requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
       "codestory-release-cell-manifest.mjs produce",
