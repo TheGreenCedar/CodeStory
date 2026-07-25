@@ -3445,7 +3445,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "$run.head_sha",
       "$run.run_attempt",
       "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "$env:RUNNER_TEMP",
+      "[IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)",
       "cs-ci-",
       "Substring(0, 12)",
       "[IO.Path]::GetFullPath",
