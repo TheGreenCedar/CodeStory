@@ -3111,6 +3111,27 @@ function validateRemainingWorkflows(workflows, violations) {
         === "inputs.calibration_mode || !inputs.server_behavior_only",
       `${metalFile} packaged server-behavior proof must skip the qualification driver`,
     );
+    const packagedArtifactDownload = namedStep(job, "Download packaged CLI artifact");
+    add(
+      violations,
+      packagedArtifactDownload?.if === "inputs.use_packaged_cli_artifact"
+        && packagedArtifactDownload?.shell === "bash"
+        && object(packagedArtifactDownload?.env).GH_TOKEN === "${{ github.token }}"
+        && object(packagedArtifactDownload?.env).ARTIFACT_NAME === "codestory-cli-macos-arm64",
+      `${metalFile} packaged CLI download must be an authenticated exact-artifact Bash boundary`,
+    );
+    requireStepRun(violations, metalFile, job, "Download packaged CLI artifact", [
+      "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+      ".workflow_run.id == $run_id",
+      ".workflow_run.head_sha == $sha",
+      ".digest",
+      ".size_in_bytes",
+      "--continue-at -",
+      "--max-time 120",
+      "test \"$actual_size\" = \"$expected_size\"",
+      "test \"$actual_digest\" = \"${expected_digest#sha256:}\"",
+      "ditto -x -k",
+    ]);
     requireCalibrationProducerBoundary(
       violations,
       metalFile,
