@@ -172,23 +172,33 @@ def read_plugin_version(path: Path) -> str:
     return version
 
 
+def read_previous_plugin_version(before_sha: str, manifest_path: str) -> str:
+    if not before_sha or set(before_sha) == {"0"}:
+        return ""
+    try:
+        shown = subprocess.run(
+            ["git", "show", f"{before_sha}:{manifest_path}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return ""
+    version = json.loads(shown).get("version")
+    return version if isinstance(version, str) else ""
+
+
 def classify_release_lane(*, cli_version: str, plugin_version: str) -> str:
     """Which release lane a head describes.
 
-    Equal versions are the only shape this repository can currently release: the plugin
-    downloads the CLI archive published under its own version. A plugin version ahead of the
-    CLI is the plugin fast lane, which needs the pinned-CLI release path; refuse it rather
-    than publish a plugin whose archive URL resolves to nothing.
+    Equal versions release through the native chain. A plugin version ahead of the CLI is
+    the plugin fast lane: the plugin ships alone and runs the already-published CLI named by
+    its pin. A plugin behind the CLI is always a synchronization error.
     """
     if plugin_version == cli_version:
         return "native"
     if compare_semver(plugin_version, cli_version) > 0:
-        raise ValueError(
-            f"plugin version {plugin_version} is ahead of codestory-cli {cli_version}. "
-            "The plugin-only release lane is not implemented yet, so this head cannot be "
-            "released: a plugin published at that version would resolve its runtime archive "
-            "to a tag that does not exist."
-        )
+        return "plugin"
     raise ValueError(
         f"plugin version {plugin_version} is behind codestory-cli {cli_version}; "
         "synchronize them with scripts/bump-version.mjs."
@@ -237,6 +247,13 @@ def main() -> None:
         release_lane = classify_release_lane(
             cli_version=new_version, plugin_version=plugin_version
         )
+        # The released artifact on the plugin lane is the plugin, so its version and its
+        # previous value drive the decision; the CLI version did not move.
+        if release_lane == "plugin":
+            old_version = read_previous_plugin_version(
+                args.before_sha, args.plugin_manifest_path
+            )
+            new_version = plugin_version
         tag = f"v{new_version}"
         tag_exists = remote_tag_exists(tag)
         release_exists = github_release_exists(tag, args.repo) if args.repo else False

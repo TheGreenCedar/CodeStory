@@ -4316,12 +4316,96 @@ export function validateCargoTestFilters(
   }
 }
 
+export function validatePluginRelease(workflows, violations) {
+  const file = "plugin-release.yml";
+  const workflow = workflows.get(file);
+  if (!workflow) {
+    violations.push(`${file} must exist`);
+    return;
+  }
+  const scalars = scalarStrings(workflow);
+  add(violations, hasExactKeys(object(workflow.on), ["workflow_call"]), `${file} must be callable only`);
+  add(
+    violations,
+    !JSON.stringify(workflow).includes("secrets"),
+    `${file} must not receive or forward secrets: nothing is built or signed on the plugin lane`,
+  );
+  walk(workflow, (key, value) => {
+    if (/^APPLE_/u.test(key) || (typeof value === "string" && /\bAPPLE_[A-Z0-9_]+\b/u.test(value))) {
+      violations.push(`${file} must never reference Apple signing material`);
+    }
+  });
+  const jobs = object(workflow.jobs);
+  add(
+    violations,
+    hasExactKeys(jobs, ["workflow-policy", "preflight", "plugin-proof", "publish", "post-publish-smoke"]),
+    `${file} must keep its exact five-job plugin lane`,
+  );
+  for (const [name, job] of Object.entries(jobs)) {
+    const permissions = object(job).permissions;
+    add(
+      violations,
+      name === "publish" ? object(permissions).contents === "write" : permissions === undefined,
+      `${file} only the publish job may hold write permission`,
+    );
+  }
+  const preflight = object(jobs.preflight);
+  requireStepRun(violations, file, preflight, "Validate release authority", [
+    "auto-release.yml@refs/heads/main",
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+  ]);
+  requireStepRun(violations, file, preflight, "Validate plugin-lane version synchronization", [
+    "check-codestory-release.py",
+    "--lane plugin",
+  ]);
+  requireStepRun(violations, file, preflight, "Bind the pin to the published CLI release", [
+    "cli-version.json",
+    "SHA256SUMS.txt",
+  ]);
+  requireStepRun(violations, file, preflight, "Refuse a changed tool surface", [
+    "generated-mcp-catalog.json",
+  ]);
+  requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
+    "scripts/prove-plugin-pinned-provision.mjs",
+  ]);
+  requireStepRun(violations, file, object(jobs.publish), "Re-verify main before tagging", [
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+  ]);
+  add(
+    violations,
+    sameStrings(nonCommentLines(object(jobs.publish).needs === undefined ? "" : ""), []) ||
+      JSON.stringify(object(jobs.publish).needs) === JSON.stringify(["preflight", "plugin-proof"]),
+    `${file} publish must wait on preflight and plugin proof`,
+  );
+  add(
+    violations,
+    !scalars.some((value) => /cargo\s+(?:build|test)/u.test(value)),
+    `${file} must not build native code`,
+  );
+
+  const auto = workflows.get("auto-release.yml");
+  const pluginCaller = object(at(auto, "jobs", "plugin-release"));
+  add(
+    violations,
+    pluginCaller.uses === "./.github/workflows/plugin-release.yml"
+      && String(pluginCaller.if ?? "").includes("release_lane == 'plugin'")
+      && pluginCaller.secrets === undefined,
+    "auto-release.yml must route the plugin lane without forwarding secrets",
+  );
+  add(
+    violations,
+    String(object(at(auto, "jobs", "release")).if ?? "").includes("release_lane == 'native'"),
+    "auto-release.yml native release must be gated on the native lane",
+  );
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
   }
   validateCargoTestFilters(workflows, violations);
+  validatePluginRelease(workflows, violations);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);

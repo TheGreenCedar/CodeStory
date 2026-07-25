@@ -101,6 +101,60 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def compare_semver_core(left: str, right: str) -> int:
+    parse = lambda value: tuple(int(part) for part in value.split("-")[0].split("."))
+    l, r = parse(left), parse(right)
+    return (l > r) - (l < r)
+
+
+def validate_plugin_lane(root: Path, *, plugin_version: str, cli_version: str) -> None:
+    """A plugin-only release: the plugin moves, the CLI does not.
+
+    The workspace (and therefore the pin) stays on the already-published CLI version,
+    the three host manifests carry the new plugin version, and the pin must carry all
+    three archive digests so the shipped plugin verifies content it can no longer
+    derive from its own version.
+    """
+    versions = plugin_versions(root)
+    distinct = set(versions.values())
+    if len(distinct) != 1:
+        fail(f"plugin manifests disagree: { {str(k): v for k, v in versions.items()} }")
+    manifest_version = distinct.pop()
+    if manifest_version != plugin_version:
+        fail(f"plugin manifests carry {manifest_version}, expected {plugin_version}")
+    if compare_semver_core(plugin_version, cli_version) <= 0:
+        fail(
+            f"plugin version {plugin_version} must be ahead of the pinned CLI "
+            f"{cli_version} on the plugin lane"
+        )
+
+    pin_path = root / CLI_VERSION_PIN
+    pin = json.loads(pin_path.read_text(encoding="utf-8"))
+    if pin.get("schema_version") != 1:
+        fail(f"{pin_path} must declare schema_version 1")
+    if pin.get("cli_version") != cli_version:
+        fail(
+            f"{pin_path} cli_version is {pin.get('cli_version')!r}; the plugin lane "
+            f"requires the workspace CLI version {cli_version}"
+        )
+    if pin.get("release_tag") != f"v{cli_version}":
+        fail(f"{pin_path} release_tag must be v{cli_version}")
+    archives = pin.get("archives")
+    if not isinstance(archives, dict) or sorted(archives) != sorted(PINNED_CLI_TARGETS):
+        fail(
+            f"{pin_path} must carry archive digests for exactly "
+            f"{', '.join(PINNED_CLI_TARGETS)} on the plugin lane"
+        )
+    for target, digest in archives.items():
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            fail(f"{pin_path} archives[{target!r}] must be a lowercase sha256")
+
+    try:
+        validate_model_producer(root, cli_version)
+    except ValueError as exc:
+        fail(str(exc))
+
+
 def validate_cli_version_pin(root: Path, expected: str) -> None:
     """The pin names the CLI the shipped plugin downloads.
 
@@ -143,6 +197,16 @@ def main() -> None:
     )
     parser.add_argument("--version", required=True, help="Expected release version, without v prefix.")
     parser.add_argument(
+        "--lane",
+        choices=("native", "plugin"),
+        default="native",
+        help=(
+            "native: every surface carries --version. plugin: --version is the plugin "
+            "version, the workspace stays on the pinned CLI version, and the pin must "
+            "carry all three archive digests."
+        ),
+    )
+    parser.add_argument(
         "--project-root",
         default=".",
         help="Repository root containing Cargo.toml and Cargo.lock.",
@@ -158,6 +222,19 @@ def main() -> None:
     cli_name, cli_version = package_info(cli_manifest)
     if cli_name != "codestory-cli":
         fail(f"{cli_manifest} package.name is {cli_name!r}, expected 'codestory-cli'")
+
+    if args.lane == "plugin":
+        try:
+            validate_plugin_lane(root, plugin_version=expected, cli_version=cli_version)
+        except ValueError as exc:
+            fail(str(exc))
+        print(
+            f"CodeStory plugin release {expected} is synchronized: host manifests agree, "
+            f"the workspace stays on pinned CLI {cli_version}, and the pin carries all "
+            "release archive digests."
+        )
+        return
+
     if cli_version != expected:
         fail(f"codestory-cli version is {cli_version}, expected {expected}")
 
