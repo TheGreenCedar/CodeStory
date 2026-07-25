@@ -4103,7 +4103,8 @@ const cargoValueOptions = new Set([
   "-j",
 ]);
 
-const expressionPlaceholder = " expr";
+const expressionPlaceholder = "__CODESTORY_GITHUB_EXPRESSION__";
+const harnessValueOptions = new Set(["--color", "--format", "--skip", "--test-threads"]);
 
 function cargoTestFilterNames(line) {
   // GitHub expressions expand at run time; treat each as one opaque token so an option that takes a
@@ -4138,7 +4139,12 @@ function cargoTestFilterNames(line) {
     filters.push(token);
     break;
   }
-  for (const token of harnessTokens) {
+  for (let index = 0; index < harnessTokens.length; index += 1) {
+    const token = harnessTokens[index];
+    if (harnessValueOptions.has(token)) {
+      index += 1;
+      continue;
+    }
     if (token.startsWith("-") || token.includes(expressionPlaceholder)) continue;
     filters.push(token);
   }

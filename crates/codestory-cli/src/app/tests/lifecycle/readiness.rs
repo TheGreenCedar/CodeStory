@@ -3,11 +3,13 @@ use super::transport::EnvVarSnapshot;
 use crate::app::diagnostics::{
     agent_readiness_sidecar_runtime, build_summary_readiness, readiness_lane_output,
 };
-use crate::app::{build_agent_preflight_output, local_freshness_needs_refresh};
+use crate::app::{
+    build_agent_preflight_output, local_freshness_idle_reason, local_freshness_needs_refresh,
+};
 use crate::args::RetrievalStatusOutput;
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessStatusDto,
-    StorageStatsDto,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, ReadinessGoalDto,
+    ReadinessStatusDto, StorageStatsDto,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,12 +33,21 @@ fn local_freshness_refreshes_stale_and_not_checked_summaries() {
         samples: Vec::new(),
     });
     assert!(!local_freshness_needs_refresh(&summary));
+    assert_eq!(local_freshness_idle_reason(&summary), "already_fresh");
 
     summary.freshness.as_mut().expect("freshness").status = IndexFreshnessStatusDto::Stale;
     assert!(local_freshness_needs_refresh(&summary));
 
     summary.freshness.as_mut().expect("freshness").status = IndexFreshnessStatusDto::NotChecked;
     assert!(local_freshness_needs_refresh(&summary));
+
+    summary
+        .freshness
+        .as_mut()
+        .expect("freshness")
+        .not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+    assert!(!local_freshness_needs_refresh(&summary));
+    assert_eq!(local_freshness_idle_reason(&summary), "bounded_inventory");
 }
 
 #[test]

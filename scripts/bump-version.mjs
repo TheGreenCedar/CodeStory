@@ -37,6 +37,7 @@ const PLUGIN_MANIFESTS = [
 
 const MODEL_CONTRACT = "crates/codestory-llama-sys/model-contract.json";
 const CHANGELOG = "CHANGELOG.md";
+const CARGO_LOCK = "Cargo.lock";
 
 function fail(message) {
   console.error(`bump-version: ${message}`);
@@ -51,7 +52,9 @@ function parseArguments(argv) {
       values.check = true;
       continue;
     }
-    const [name, inline] = argument.split("=");
+    const separator = argument.indexOf("=");
+    const name = separator < 0 ? argument : argument.slice(0, separator);
+    const inline = separator < 0 ? undefined : argument.slice(separator + 1);
     if (name !== "--version") fail(`unknown argument ${argument}`);
     values.version = inline ?? argv[++index];
   }
@@ -112,9 +115,29 @@ function promoteChangelog(source, version) {
   return source.replace("\n## Unreleased\n", `\n## Unreleased\n\n## ${version}\n`);
 }
 
+function cargoLockVersions(source) {
+  const versions = new Map();
+  for (const block of source.split(/(?=^\[\[package\]\]$)/mu)) {
+    const name = /^name\s*=\s*"([^"]+)"/mu.exec(block)?.[1];
+    const version = /^version\s*=\s*"([^"]+)"/mu.exec(block)?.[1];
+    if (!name || !version || !WORKSPACE_MEMBERS.includes(name)) continue;
+    if (versions.has(name)) fail(`Cargo.lock contains duplicate workspace package ${name}`);
+    versions.set(name, version);
+  }
+  for (const member of WORKSPACE_MEMBERS) {
+    if (!versions.has(member)) fail(`Cargo.lock has no package entry for ${member}`);
+  }
+  return versions;
+}
+
+function cargoLockCarriesVersion(source, version) {
+  return [...cargoLockVersions(source).values()].every((current) => current === version);
+}
+
 function main() {
   const { version, check } = parseArguments(process.argv.slice(2));
   const changes = [];
+  const cargoLockBefore = readFileSync(path.join(repositoryRoot, CARGO_LOCK), "utf8");
 
   for (const member of WORKSPACE_MEMBERS) {
     rewrite(
@@ -138,6 +161,7 @@ function main() {
   rewrite(CHANGELOG, (source) => promoteChangelog(source, version), changes, { check });
 
   if (check) {
+    if (!cargoLockCarriesVersion(cargoLockBefore, version)) changes.push(CARGO_LOCK);
     if (changes.length > 0) {
       fail(`these surfaces do not carry ${version}:\n  ${changes.join("\n  ")}`);
     }
@@ -150,6 +174,9 @@ function main() {
     cwd: repositoryRoot,
     stdio: "inherit",
   });
+  if (readFileSync(path.join(repositoryRoot, CARGO_LOCK), "utf8") !== cargoLockBefore) {
+    changes.push(CARGO_LOCK);
+  }
 
   // Fail here rather than in CI if a surface was missed.
   execFileSync(

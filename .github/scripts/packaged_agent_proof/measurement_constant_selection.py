@@ -79,10 +79,24 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
             f"production-constant formula {field} changed",
         )
     require(
+        formulas["connect_timeout_ms"].get("formula")
+        == "max(2000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["connect_timeout_ms"].get("slow_host_floor_ms") == 2000
+        and formulas["spawn_convergence_timeout_ms"].get("formula")
+        == "max(15000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["spawn_convergence_timeout_ms"].get("slow_host_floor_ms")
+        == 15000,
+        "connect or spawn slow-host floor changed",
+    )
+    require(
         formulas["request_deadlines_ms"]
         .get("query_request_deadline_ms", {})
         .get("formula")
-        == "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        == "max(10000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["request_deadlines_ms"]
+        .get("query_request_deadline_ms", {})
+        .get("slow_host_floor_ms")
+        == 10000
         and formulas["request_deadlines_ms"]
         .get("bulk_request_deadline_ms", {})
         .get("replay_success_budget_formula")
@@ -115,6 +129,11 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
         constant_selection["post_result_formula_changes"] is False,
         "production constants allow post-result formula changes",
     )
+    require(
+        isinstance(constant_selection["slow_host_floor_rationale"], str)
+        and bool(constant_selection["slow_host_floor_rationale"].strip()),
+        "production constants omitted the slow-host floor rationale",
+    )
 
 
 def _verify_constant_selection(protocol: dict) -> None:
@@ -131,6 +150,7 @@ def _verify_constant_selection(protocol: dict) -> None:
             "clean_run_requirements",
             "formulas",
             "post_result_formula_changes",
+            "slow_host_floor_rationale",
         },
         "measurement production-constant selection",
     )

@@ -4,7 +4,7 @@ use crate::runtime::RuntimeContext;
 use crate::{display, local_refresh_status, readiness};
 use anyhow::Result;
 use codestory_contracts::api::{
-    IndexFreshnessStatusDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
+    IndexFreshnessNotCheckedCauseDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
 };
 
 pub(crate) fn wait_for_local_freshness(
@@ -15,7 +15,7 @@ pub(crate) fn wait_for_local_freshness(
     if !local_freshness_needs_refresh(&summary) {
         let mut output = local_refresh_output_from_summary(&summary);
         if output.state == readiness::LocalRefreshState::Refreshed {
-            output.reason = Some("already_fresh".to_string());
+            output.reason = Some(local_freshness_idle_reason(&summary).to_string());
         }
         return Ok((summary, Some(output)));
     }
@@ -143,12 +143,20 @@ pub(crate) fn attach_complete_publication(
 }
 
 pub(in crate::app) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
-    summary.freshness.as_ref().is_some_and(|freshness| {
-        matches!(
-            freshness.status,
-            IndexFreshnessStatusDto::Stale | IndexFreshnessStatusDto::NotChecked
-        )
-    })
+    summary
+        .freshness
+        .as_ref()
+        .is_some_and(readiness::freshness_requires_refresh)
+}
+
+pub(in crate::app) fn local_freshness_idle_reason(summary: &ProjectSummary) -> &'static str {
+    if summary.freshness.as_ref().is_some_and(|freshness| {
+        freshness.not_checked_cause == Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+    }) {
+        "bounded_inventory"
+    } else {
+        "already_fresh"
+    }
 }
 
 pub(crate) fn local_refresh_output_from_summary(

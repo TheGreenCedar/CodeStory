@@ -8,7 +8,8 @@ pub(super) use preflight::run_agent;
 
 #[cfg(test)]
 pub(super) use local_freshness::{
-    classify_local_refresh_failure_state, local_freshness_needs_refresh,
+    classify_local_refresh_failure_state, local_freshness_idle_reason,
+    local_freshness_needs_refresh,
 };
 #[cfg(test)]
 pub(super) use preflight::build_agent_preflight_output;

@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::io;
 use std::time::{Instant, UNIX_EPOCH};
 
-const INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT: usize = 25_000;
-const INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT: usize = 25_000;
+const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
+const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
 const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
 const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
 #[cfg(test)]
@@ -36,28 +36,6 @@ fn run_after_index_freshness_fence_test_hook() {
     if let Some(hook) = hook {
         hook();
     }
-}
-
-fn bounded_cap(variable: &str, default: usize) -> usize {
-    std::env::var(variable)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|cap| *cap > 0)
-        .unwrap_or(default)
-}
-
-fn indexed_file_cap() -> usize {
-    bounded_cap(
-        "CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP",
-        INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT,
-    )
-}
-
-fn current_file_cap() -> usize {
-    bounded_cap(
-        "CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP",
-        INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT,
-    )
 }
 
 /// A freshness check that produced no verdict, carrying why.
@@ -253,12 +231,12 @@ fn load_index_freshness_inventory(
             indexed_file_count,
         ));
     }
-    let indexed_cap = indexed_file_cap();
-    if files.len() > indexed_cap {
+    if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
         return Err((
             NotCheckedReason::bounded(format!(
-                "indexed file inventory exceeds bounded freshness cap ({} > {indexed_cap})",
+                "indexed file inventory exceeds bounded freshness cap ({} > {})",
                 files.len(),
+                INDEX_FRESHNESS_INDEXED_FILE_CAP,
             )),
             indexed_file_count,
         ));
@@ -304,9 +282,12 @@ fn plan_index_freshness(
     inventory: &IndexFreshnessInventory,
     policy: &SourceIndexPolicy,
 ) -> Result<IndexFreshnessPlan, NotCheckedReason> {
-    let current_cap = current_file_cap();
     let refresh = workspace
-        .build_execution_outcome_bounded_with_policy(&inventory.refresh_inputs, current_cap, policy)
+        .build_execution_outcome_bounded_with_policy(
+            &inventory.refresh_inputs,
+            INDEX_FRESHNESS_CURRENT_FILE_CAP,
+            policy,
+        )
         .map_err(|error| {
             NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
         })?;
@@ -323,8 +304,8 @@ fn plan_index_freshness(
                 refresh.refresh.inventory_outcome
             )),
             None => NotCheckedReason::bounded(format!(
-                "current workspace inventory is {:?} (>{current_cap})",
-                refresh.refresh.inventory_outcome
+                "current workspace inventory is {:?} (>{})",
+                refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
             )),
         });
     }
@@ -794,44 +775,8 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
 }
 
 #[cfg(test)]
-mod bounded_cap_tests {
+mod not_checked_reason_tests {
     use super::*;
-    use crate::process_env_test_lock;
-
-    #[test]
-    fn caps_default_but_remain_operator_overridable() {
-        let _lock = process_env_test_lock();
-        // SAFETY: the process-wide env lock serializes every test that reads or writes env vars.
-        unsafe {
-            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP");
-            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP");
-        }
-        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
-        assert_eq!(current_file_cap(), INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT);
-
-        // A repository past the default bound has no other way to restore a real drift check.
-        unsafe {
-            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "120000");
-            std::env::set_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP", "120000");
-        }
-        assert_eq!(indexed_file_cap(), 120_000);
-        assert_eq!(current_file_cap(), 120_000);
-
-        // Nonsense never silently disables the bound.
-        unsafe {
-            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "0");
-        }
-        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
-        unsafe {
-            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "not-a-number");
-        }
-        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
-
-        unsafe {
-            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP");
-            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP");
-        }
-    }
 
     #[test]
     fn a_bound_and_a_failure_are_recorded_as_different_causes() {

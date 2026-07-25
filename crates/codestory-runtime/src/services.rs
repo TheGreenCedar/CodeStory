@@ -706,7 +706,7 @@ impl ActivationService {
             && summary
                 .freshness
                 .as_ref()
-                .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Fresh);
+                .is_some_and(index_freshness_admits_operation);
         if !local_ready {
             if summary.stats.node_count > 0
                 && summary.stats.fatal_error_count == 0

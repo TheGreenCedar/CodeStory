@@ -1,6 +1,7 @@
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessIndexSnapshotDto,
-    ReadinessSidecarSnapshotDto, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, ReadinessGoalDto,
+    ReadinessIndexSnapshotDto, ReadinessSidecarSnapshotDto, ReadinessStatusDto,
+    ReadinessVerdictDto, StorageStatsDto,
 };
 use serde::Serialize;
 
@@ -138,7 +139,7 @@ pub(crate) fn status_label_for_goal(
     goal: ReadinessGoalDto,
     verdicts: &[ReadinessVerdictDto],
     indexed: bool,
-    freshness_status: Option<IndexFreshnessStatusDto>,
+    freshness: Option<&IndexFreshnessDto>,
     retrieval_mode: &str,
 ) -> &'static str {
     if let Some(verdict) = verdicts.iter().find(|verdict| verdict.goal == goal) {
@@ -149,14 +150,18 @@ pub(crate) fn status_label_for_goal(
         return "repair_index";
     }
 
-    match freshness_status {
-        Some(IndexFreshnessStatusDto::Stale) => return "repair_index",
-        Some(IndexFreshnessStatusDto::NotChecked)
-            if goal == ReadinessGoalDto::AgentPacketSearch =>
+    match freshness {
+        Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
+            return "repair_index";
+        }
+        Some(freshness)
+            if freshness.status == IndexFreshnessStatusDto::NotChecked
+                && freshness_requires_refresh(freshness)
+                && goal == ReadinessGoalDto::AgentPacketSearch =>
         {
             return "check_index";
         }
-        Some(IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::NotChecked) | None => {}
+        Some(_) | None => {}
     }
 
     if goal == ReadinessGoalDto::AgentPacketSearch && retrieval_mode != "full" {
@@ -164,6 +169,17 @@ pub(crate) fn status_label_for_goal(
     }
 
     "ready"
+}
+
+pub(crate) fn freshness_requires_refresh(freshness: &IndexFreshnessDto) -> bool {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => false,
+        IndexFreshnessStatusDto::Stale => true,
+        IndexFreshnessStatusDto::NotChecked => !matches!(
+            freshness.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+        ),
+    }
 }
 
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
@@ -288,15 +304,18 @@ fn verdict_state(
             );
         }
 
-        match freshness.map(|freshness| freshness.status) {
-            Some(IndexFreshnessStatusDto::Stale) => {
+        match freshness {
+            Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
                 return index_repair_state(
                     goal,
                     "The index has changed, new, or removed files.",
                     project_arg,
                 );
             }
-            Some(IndexFreshnessStatusDto::NotChecked) => {
+            Some(freshness)
+                if freshness.status == IndexFreshnessStatusDto::NotChecked
+                    && freshness_requires_refresh(freshness) =>
+            {
                 let command =
                     format!("codestory-cli index --project {project_arg} --refresh incremental");
                 return (
@@ -309,7 +328,7 @@ fn verdict_state(
                     ],
                 );
             }
-            Some(IndexFreshnessStatusDto::Fresh) | None => {}
+            Some(_) | None => {}
         }
     }
 
@@ -544,12 +563,18 @@ mod tests {
 
     #[test]
     fn status_label_for_goal_preserves_doctor_fallback_readiness_lanes() {
+        let not_checked = freshness(IndexFreshnessStatusDto::NotChecked);
+        let fresh = freshness(IndexFreshnessStatusDto::Fresh);
+        let stale = freshness(IndexFreshnessStatusDto::Stale);
+        let mut bounded = not_checked.clone();
+        bounded.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+
         assert_eq!(
             status_label_for_goal(
                 ReadinessGoalDto::LocalNavigation,
                 &[],
                 true,
-                Some(IndexFreshnessStatusDto::NotChecked),
+                Some(&not_checked),
                 "unavailable",
             ),
             "ready",
@@ -560,7 +585,7 @@ mod tests {
                 ReadinessGoalDto::AgentPacketSearch,
                 &[],
                 true,
-                Some(IndexFreshnessStatusDto::NotChecked),
+                Some(&not_checked),
                 "full",
             ),
             "check_index"
@@ -570,10 +595,21 @@ mod tests {
                 ReadinessGoalDto::AgentPacketSearch,
                 &[],
                 true,
-                Some(IndexFreshnessStatusDto::Fresh),
+                Some(&fresh),
                 "unavailable",
             ),
             "blocked"
+        );
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[],
+                true,
+                Some(&bounded),
+                "full",
+            ),
+            "ready",
+            "bounded inventory should keep the last complete publication usable"
         );
 
         let verdict = ReadinessVerdictDto {
@@ -591,7 +627,7 @@ mod tests {
                 ReadinessGoalDto::AgentPacketSearch,
                 &[verdict],
                 false,
-                Some(IndexFreshnessStatusDto::Stale),
+                Some(&stale),
                 "unavailable",
             ),
             "ready",
@@ -712,6 +748,27 @@ mod tests {
             Some(IndexFreshnessStatusDto::NotChecked)
         );
         assert!(verdict.minimum_next[0].contains("--refresh incremental"));
+    }
+
+    #[test]
+    fn bounded_inventory_keeps_last_complete_index_ready() {
+        let stats = stats(3);
+        let mut freshness = freshness(IndexFreshnessStatusDto::NotChecked);
+        freshness.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::LocalNavigation,
+            inputs(&stats, Some(&freshness), None),
+        );
+
+        assert_eq!(verdict.status, ReadinessStatusDto::Ready);
+        let refresh = local_refresh_output(&verdict);
+        assert_eq!(refresh.state, LocalRefreshState::Refreshed);
+        assert!(!refresh.blocks_local_surfaces);
+        assert!(
+            verdict.minimum_next[0].contains("codestory-cli ground"),
+            "bounded inventory should proceed to normal navigation: {verdict:?}"
+        );
     }
 
     #[test]

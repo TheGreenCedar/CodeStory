@@ -68,7 +68,7 @@ fn packet_markdown_labels_context_blocks_when_no_covered_claims() {
 }
 
 #[test]
-fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
+fn index_next_commands_allow_proof_after_bounded_inventory() {
     let freshness = IndexFreshnessDto {
         status: IndexFreshnessStatusDto::NotChecked,
         changed_file_count: 0,
@@ -86,16 +86,13 @@ fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
     let joined = commands.join("\n");
 
     assert!(
-        joined.contains("codestory-cli index")
-            && joined.contains("--refresh full")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
-        "not-checked freshness should recommend index verification before proof commands: {joined}"
+        !joined.contains("codestory-cli index") && !joined.contains("codestory-cli doctor"),
+        "a bounded inventory cannot be repaired by repeating the same refresh: {joined}"
     );
-    for blocked in ["ground", "search", "context"] {
+    for proof in ["ground", "search", "context"] {
         assert!(
-            !joined.contains(&format!("codestory-cli {blocked} ")),
-            "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
+            joined.contains(&format!("codestory-cli {proof} ")),
+            "the last complete publication should remain usable for `{proof}`: {joined}"
         );
     }
 }

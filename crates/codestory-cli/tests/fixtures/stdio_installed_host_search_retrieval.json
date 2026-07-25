@@ -1,11 +1,11 @@
 {
   "input": {
-    "fallback_reason": "missing_semantic_docs",
-    "mode": "symbolic"
+    "fallback_reason": null,
+    "mode": "hybrid",
+    "semantic_ready": true
   },
   "projected": {
-    "state": "degraded",
-    "mode": "symbolic",
-    "fallback_reason": "missing_semantic_docs"
+    "state": "ready",
+    "mode": "hybrid"
   }
 }

@@ -19,7 +19,7 @@ use crate::embedding_contract::normalize_and_validate_vectors;
 use anyhow::{Result, anyhow, bail};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -36,6 +36,7 @@ type ClientTransportFactory =
 pub(super) struct LazyClientTransport {
     factory: OnceLock<ClientTransportFactory>,
     resolved: OnceLock<Arc<dyn EmbeddingClientTransport>>,
+    initialization: Mutex<()>,
 }
 
 impl LazyClientTransport {
@@ -43,22 +44,44 @@ impl LazyClientTransport {
         Self {
             factory: OnceLock::new(),
             resolved: OnceLock::new(),
+            initialization: Mutex::new(()),
         }
     }
 
     pub(super) fn install(&self, transport: Arc<dyn EmbeddingClientTransport>) -> Result<()> {
+        let _initialization = self
+            .initialization
+            .lock()
+            .map_err(|_| anyhow!("embedding_client_transport_initialization_poisoned"))?;
+        if self.factory.get().is_some() || self.resolved.get().is_some() {
+            bail!("embedding_client_transport_already_installed");
+        }
         self.resolved
             .set(transport)
             .map_err(|_| anyhow!("embedding_client_transport_already_installed"))
     }
 
     pub(super) fn install_factory(&self, factory: ClientTransportFactory) -> Result<()> {
+        let _initialization = self
+            .initialization
+            .lock()
+            .map_err(|_| anyhow!("embedding_client_transport_initialization_poisoned"))?;
+        if self.factory.get().is_some() || self.resolved.get().is_some() {
+            bail!("embedding_client_transport_already_installed");
+        }
         self.factory
             .set(factory)
             .map_err(|_| anyhow!("embedding_client_transport_already_installed"))
     }
 
     pub(super) fn resolve(&self) -> Result<Arc<dyn EmbeddingClientTransport>> {
+        if let Some(transport) = self.resolved.get() {
+            return Ok(Arc::clone(transport));
+        }
+        let _initialization = self
+            .initialization
+            .lock()
+            .map_err(|_| anyhow!("embedding_client_transport_initialization_poisoned"))?;
         if let Some(transport) = self.resolved.get() {
             return Ok(Arc::clone(transport));
         }
@@ -69,7 +92,10 @@ impl LazyClientTransport {
         // A failed capture is not cached: the next caller retries rather than inheriting the
         // failure for the life of the process.
         let transport = factory()?;
-        Ok(Arc::clone(self.resolved.get_or_init(|| transport)))
+        self.resolved
+            .set(Arc::clone(&transport))
+            .map_err(|_| anyhow!("embedding_client_transport_already_installed"))?;
+        Ok(transport)
     }
 }
 

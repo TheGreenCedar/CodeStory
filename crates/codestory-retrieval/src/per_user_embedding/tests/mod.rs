@@ -24,8 +24,9 @@ use transport_fixtures::{MemoryStream, TestClock};
 mod lazy_transport {
     use super::super::client::LazyClientTransport;
     use super::client_transports::ClientTestTransport;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn transport() -> Arc<ClientTestTransport> {
         ClientTestTransport::new(0, false)
@@ -89,5 +90,58 @@ mod lazy_transport {
                 .contains("embedding_server_transport_unavailable"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn concurrent_first_callers_capture_one_transport() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let lazy = Arc::new(LazyClientTransport::new());
+        let counter = Arc::clone(&builds);
+        lazy.install_factory(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(transport() as Arc<dyn super::super::EmbeddingClientTransport>)
+        }))
+        .expect("register factory");
+
+        let start = Arc::new(Barrier::new(9));
+        let callers = (0..8)
+            .map(|_| {
+                let lazy = Arc::clone(&lazy);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    lazy.resolve().expect("resolve shared transport")
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for caller in callers {
+            caller.join().expect("join first caller");
+        }
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn direct_and_factory_installation_are_mutually_exclusive() {
+        let direct = LazyClientTransport::new();
+        direct
+            .install(transport())
+            .expect("install direct transport");
+        assert!(
+            direct
+                .install_factory(Box::new(|| {
+                    Ok(transport() as Arc<dyn super::super::EmbeddingClientTransport>)
+                }))
+                .is_err()
+        );
+
+        let deferred = LazyClientTransport::new();
+        deferred
+            .install_factory(Box::new(|| {
+                Ok(transport() as Arc<dyn super::super::EmbeddingClientTransport>)
+            }))
+            .expect("install factory");
+        assert!(deferred.install(transport()).is_err());
     }
 }

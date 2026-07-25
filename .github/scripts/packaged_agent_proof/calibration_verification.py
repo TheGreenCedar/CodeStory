@@ -32,7 +32,10 @@ def verify_calibration_bundle(
         expected_producer_artifact=expected_producer_artifact,
     )
     accumulator = _verified_calibration_runs(bundle)
-    selected_constants = _selected_calibration_constants(accumulator.duration_values_ms)
+    selected_constants = _selected_calibration_constants(
+        accumulator.duration_values_ms,
+        bundle.protocol["constant_selection"],
+    )
     thresholds = _selected_calibration_thresholds(
         accumulator.metric_values,
         bundle.protocol["metric_contracts"],

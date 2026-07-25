@@ -31,6 +31,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 

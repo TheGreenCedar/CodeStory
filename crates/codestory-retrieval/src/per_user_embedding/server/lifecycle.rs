@@ -160,9 +160,6 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
 
     state.draining.store(true, Ordering::Release);
     let _ = listener.close();
-    // The accept loop is done, so the watchdog has nothing left to observe. Releasing it before the
-    // engine teardown keeps shutdown from blocking on its poll cadence.
-    state.stopped.store(true, Ordering::Release);
     let state_for_cleanup = Arc::clone(&state);
     let cleanup = thread::Builder::new()
         .name("codestory-embedding-cleanup".into())

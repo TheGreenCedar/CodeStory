@@ -13,7 +13,11 @@ from .calibration_records import (
     _calibration_sample,
     _record_calibration_durations,
 )
-from .contract_primitives import require_exact_keys, require_nonnegative_int
+from .contract_primitives import (
+    require_exact_keys,
+    require_nonnegative_int,
+    require_positive_int,
+)
 from .foundation import require
 
 
@@ -133,12 +137,37 @@ def _verified_calibration_runs(
     return accumulator
 
 
-def _selected_calibration_constants(durations: dict[str, list[float]]) -> dict:
-    connect = max(
-        1, math.ceil(max(durations["existing_owner_connect_duration"]) * 1.50)
+def _selected_calibration_constants(
+    durations: dict[str, list[float]],
+    constant_selection: dict,
+) -> dict:
+    formulas = constant_selection["formulas"]
+    connect_floor = require_positive_int(
+        formulas["connect_timeout_ms"]["slow_host_floor_ms"],
+        "connect timeout slow-host floor",
     )
-    spawn = max(1, math.ceil(max(durations["spawn_convergence_duration"]) * 1.50))
-    query = max(1, math.ceil(max(durations["query_request_duration"]) * 1.50))
+    spawn_floor = require_positive_int(
+        formulas["spawn_convergence_timeout_ms"]["slow_host_floor_ms"],
+        "spawn convergence slow-host floor",
+    )
+    query_floor = require_positive_int(
+        formulas["request_deadlines_ms"]["query_request_deadline_ms"][
+            "slow_host_floor_ms"
+        ],
+        "query request slow-host floor",
+    )
+    connect = max(
+        connect_floor,
+        math.ceil(max(durations["existing_owner_connect_duration"]) * 1.50),
+    )
+    spawn = max(
+        spawn_floor,
+        math.ceil(max(durations["spawn_convergence_duration"]) * 1.50),
+    )
+    query = max(
+        query_floor,
+        math.ceil(max(durations["query_request_duration"]) * 1.50),
+    )
     replay = max(query, math.ceil(max(durations["bulk_request_duration"]) * 1.50))
     retry = max(1, math.floor(min(durations["capacity_condition_duration"]) * 0.50))
     initial = max(

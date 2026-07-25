@@ -295,6 +295,7 @@ jobs:
           cargo test --locked -p demo-crate --lib publication_survives
           cargo test --locked -p demo-crate --lib -- --exact tests::demo_tests::full_publication_survives_restart
           cargo test --locked -p demo-crate --target \${{ matrix.rust_target }} --lib tests
+          cargo test --locked -p demo-crate --lib publication_survives -- --test-threads 1
 `),
     ],
   ]);
