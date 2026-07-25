@@ -137,6 +137,18 @@ jobs:
           version: ${{ env.SCCACHE_VERSION }}
           disable_annotations: true
 
+      # Checksum-pinned official archive, same trust model as the actionlint gate. nextest
+      # schedules test binaries in parallel across the whole workspace, which measured 3.9x
+      # faster than `cargo test --workspace` on an identical tree with identical test parity.
+      - name: Install pinned cargo-nextest
+        shell: bash
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/cargo-nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.98/cargo-nextest-0.9.98-x86_64-unknown-linux-gnu.tar.gz"
+          echo "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7  $RUNNER_TEMP/cargo-nextest.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/cargo-nextest" "$HOME/.cargo/bin/cargo-nextest"
+          cargo nextest --version
+
       - name: Configure bounded compiler cache
         shell: bash
         run: |
@@ -341,8 +353,12 @@ jobs:
           test "$COMPILE_OUTCOME" = success
           test "$LINT_OUTCOME" = success
 
+      # nextest does not execute doctests, so the doc pass stays: today it is empty and costs
+      # seconds, and it means a future doctest can never silently stop being run.
       - name: Test the complete workspace once
-        run: cargo test --workspace --locked
+        run: |
+          cargo nextest run --workspace --locked
+          cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
         if: inputs.emit_release_cells

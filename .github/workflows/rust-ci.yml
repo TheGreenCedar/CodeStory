@@ -41,6 +41,27 @@ jobs:
       - name: Install Linux Vulkan build dependencies
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
 
+      - name: Install pinned sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.16.0"
+          disable_annotations: true
+
+      # A Cargo.lock change invalidates the whole target/ cache key, and this lane runs on every
+      # crate-touching PR. sccache's content-addressed store salvages the unchanged compilations
+      # that a key miss would otherwise redo from scratch.
+      - name: Configure bounded compiler cache
+        shell: bash
+        run: |
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-draft-sccache"
+            echo "SCCACHE_CACHE_SIZE=1G"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
+
       - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
@@ -62,6 +83,16 @@ jobs:
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
             ${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-
+
+      - name: Restore compiler objects
+        id: compiler-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-draft-sccache
+          key: ${{ runner.os }}-draft-sccache-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-draft-sccache-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -101,3 +132,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
+
+      - name: Save compiler objects
+        if: success() && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-draft-sccache
+          key: ${{ steps.compiler-cache-restore.outputs.cache-primary-key }}
