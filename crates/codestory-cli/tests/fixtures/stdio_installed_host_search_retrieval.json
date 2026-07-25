@@ -4,6 +4,8 @@
     "mode": "symbolic"
   },
   "projected": {
-    "state": "ready"
+    "state": "degraded",
+    "mode": "symbolic",
+    "fallback_reason": "missing_semantic_docs"
   }
 }

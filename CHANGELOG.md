@@ -34,6 +34,11 @@
 - CodeStory installed to a shared or read-only location (`sudo tar -C /opt`, a
   locked-down Program Files install, a read-only container layer) now runs for
   users who cannot write to it, instead of failing with a bare permission error.
+- Search results now report their real retrieval state. Every result claimed
+  `ready`, including searches that fell back to symbolic matching because
+  semantic data was not available, so an agent could not tell a full search from
+  a degraded one and would cite either as complete evidence. Results that fell
+  back now say so and name the reason.
 
 ## 0.16.1
 
