@@ -47,6 +47,7 @@ jobs:
   resolve:
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
     steps:

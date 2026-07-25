@@ -51,6 +51,7 @@ jobs:
   route:
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       base_sha: ${{ steps.resolve.outputs.base_sha }}
@@ -296,6 +297,7 @@ jobs:
       - calibration-linux
       - calibration-macos
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout exact calibration head
         uses: actions/checkout@v5
@@ -497,6 +499,7 @@ jobs:
       - windows-vulkan-proof
       - linux-vulkan-proof
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Require one coherent accepted proof
         shell: bash

@@ -19,6 +19,7 @@ import {
   releaseWorkflowContractViolations,
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
+  validateCargoTestFilters,
   validateWorkflows,
   windowsManifestProofPolicyViolations,
 } from "./check-workflow-policy.mjs";
@@ -247,11 +248,75 @@ test("release workflows retain the closeout coordinator contract test", () => {
   }
 });
 
+test("workflow hygiene requires declared permissions and step-job timeouts", () => {
+  const valid = parseWorkflow(`
+on: { workflow_dispatch: null }
+permissions: { contents: read }
+jobs:
+  work:
+    timeout-minutes: 5
+    steps:
+      - run: echo ok
+  call:
+    uses: ./.github/workflows/other.yml
+`);
+  assert.deepEqual(basicWorkflowViolations("fixture.yml", valid), []);
+
+  const withoutPermissions = structuredClone(valid);
+  delete withoutPermissions.permissions;
+  assert.match(
+    basicWorkflowViolations("fixture.yml", withoutPermissions).join("\n"),
+    /must declare a top-level permissions block/u,
+  );
+
+  const withoutTimeout = structuredClone(valid);
+  delete withoutTimeout.jobs.work["timeout-minutes"];
+  assert.match(
+    basicWorkflowViolations("fixture.yml", withoutTimeout).join("\n"),
+    /jobs\.work must declare timeout-minutes/u,
+  );
+});
+
+test("cargo test filters must select at least one real test", () => {
+  const identifiers = new Map([["demo-crate", "/unused"]]);
+  const known = new Set(["tests", "demo_tests", "full_publication_survives_restart"]);
+  const originalReaddir = known;
+  const workflows = new Map([
+    [
+      "fixture.yml",
+      parseWorkflow(`
+on: { workflow_dispatch: null }
+permissions: { contents: read }
+jobs:
+  proof:
+    timeout-minutes: 5
+    steps:
+      - run: |
+          cargo test --locked -p demo-crate --lib publication_survives
+          cargo test --locked -p demo-crate --lib -- --exact tests::demo_tests::full_publication_survives_restart
+          cargo test --locked -p demo-crate --target \${{ matrix.rust_target }} --lib tests
+`),
+    ],
+  ]);
+  // Substring semantics: `publication_survives` legitimately selects the `full_…_restart` test.
+  const violations = [];
+  validateCargoTestFilters(workflows, violations, identifiers, () => originalReaddir);
+  assert.deepEqual(violations, []);
+
+  const renamed = new Set(["tests", "demo_tests", "renamed_publication_check"]);
+  const afterRename = [];
+  validateCargoTestFilters(workflows, afterRename, identifiers, () => renamed);
+  assert.match(afterRename.join("\n"), /selects no test: publication_survives/u);
+  assert.match(afterRename.join("\n"), /selects no test: full_publication_survives_restart/u);
+});
+
 test("third-party action policy reads only parsed uses values", () => {
   const valid = parseWorkflow(`
 on: { workflow_dispatch: null }
+permissions: { contents: read }
 jobs:
   check:
+    timeout-minutes: 5
     steps:
       - uses: vendor/action@${fullSha}
 # uses: vendor/action@main
@@ -950,8 +1015,10 @@ test("standard release paths reject calibration plumbing", async (t) => {
 test("Cargo lock policy reads executable step commands", () => {
   const workflow = parseWorkflow(`
 on: { workflow_dispatch: null }
+permissions: { contents: read }
 jobs:
   check:
+    timeout-minutes: 5
     steps:
       - run: |
           # cargo test --workspace
