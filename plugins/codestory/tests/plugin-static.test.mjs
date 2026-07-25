@@ -1564,8 +1564,16 @@ test("managed cli pending-owner cleanup protects live and young artifacts", asyn
 });
 
 test("managed cli waiter covers both configured asset retry windows", () => {
-  assert.ok(launcherTest.releaseAssetRetryBudgetMs > 3 * 60 * 1000);
-  assert.ok(launcherTest.managedCliLockWaitMs >= 2 * launcherTest.releaseAssetRetryBudgetMs);
+  // The archive budget has to be large enough that a multi-hundred-megabyte download can finish on
+  // a slow link, and a waiter must outlast a publisher spending both asset budgets back to back.
+  assert.ok(launcherTest.releaseArchiveTotalTimeoutMs >= 30 * 60 * 1000);
+  assert.equal(launcherTest.releaseAssetRetryBudgetMs, launcherTest.releaseArchiveTotalTimeoutMs);
+  assert.ok(
+    launcherTest.managedCliLockWaitMs >=
+      launcherTest.releaseChecksumTotalTimeoutMs + launcherTest.releaseArchiveTotalTimeoutMs,
+  );
+  // The stall timeout, not the total budget, is what should cut off a dead connection.
+  assert.ok(launcherTest.releaseDownloadStallTimeoutMs < launcherTest.releaseArchiveTotalTimeoutMs);
 });
 
 test("managed cli initializing reclaim preserves a new ABA owner", async () => {
@@ -3692,14 +3700,24 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
-    assert.deepEqual(coldGround.result.structuredContent.operation, {
+    const { progress, ...operationCore } = coldGround.result.structuredContent.operation;
+    assert.deepEqual(operationCore, {
       operation_id: "managed-runtime-provisioning",
       state: "preparing",
-      stage: "dense_preparation",
+      stage: "downloading_runtime",
       attempt: 1,
       retry_after_ms: 1500,
       failure: null,
     });
+    // Progress appears once a release asset fetch is in flight; the request can land just before
+    // the background provisioner gets that far, so null is the only other legal value.
+    if (progress !== null) {
+      assert.deepEqual(
+        Object.keys(progress).sort(),
+        ["asset", "percent", "received_bytes", "total_bytes"],
+      );
+      assert.equal(typeof progress.received_bytes, "number");
+    }
     assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
@@ -4384,6 +4402,236 @@ test("release asset downloader bounds announced and streamed bytes without parti
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("release asset downloader resumes a partial transfer instead of restarting it", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-resume-"));
+  const destination = join(dataDir, "runtime.bin");
+  const body = Buffer.from("0123456789abcdefghijklmnopqrstuvwxyz");
+  const served = [];
+  let cutFirstTransfer = true;
+  const server = createServer((request, response) => {
+    const range = /^bytes=(\d+)-$/u.exec(request.headers.range || "");
+    const start = range ? Number(range[1]) : 0;
+    served.push(start);
+    if (cutFirstTransfer) {
+      cutFirstTransfer = false;
+      // Announce the full length, deliver a prefix, then drop the connection mid-transfer.
+      response.writeHead(200, { "content-length": String(body.length) });
+      response.write(body.subarray(0, 10));
+      setTimeout(() => response.destroy(), 10);
+      return;
+    }
+    if (start > 0) {
+      response.writeHead(206, {
+        "content-length": String(body.length - start),
+        "content-range": `bytes ${start}-${body.length - 1}/${body.length}`,
+      });
+      response.end(body.subarray(start));
+      return;
+    }
+    response.writeHead(200, { "content-length": String(body.length) });
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await launcherTest.downloadFile(
+      `http://127.0.0.1:${server.address().port}/runtime`,
+      destination,
+      { attempts: 3, retryDelayMs: () => 1, timeoutMs: 5000 },
+    );
+    assert.deepEqual(await readFile(destination), body);
+    // The second attempt asked to continue from the bytes already on disk rather than from zero.
+    assert.deepEqual(served, [0, 10]);
+    assert.equal(fs.existsSync(`${destination}.part`), false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader keeps a resumable partial across separate runs", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-restart-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  let cutFirstTransfer = true;
+  const server = createServer((request, response) => {
+    const range = /^bytes=(\d+)-$/u.exec(request.headers.range || "");
+    const start = range ? Number(range[1]) : 0;
+    if (cutFirstTransfer) {
+      cutFirstTransfer = false;
+      response.writeHead(200, { "content-length": String(body.length) });
+      response.write(body.subarray(0, 12));
+      setTimeout(() => response.destroy(), 10);
+      return;
+    }
+    response.writeHead(start > 0 ? 206 : 200, {
+      "content-length": String(body.length - start),
+      ...(start > 0
+        ? { "content-range": `bytes ${start}-${body.length - 1}/${body.length}` }
+        : {}),
+    });
+    response.end(body.subarray(start));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/runtime`;
+  try {
+    // First run exhausts its single attempt and fails, standing in for an MCP restart.
+    await assert.rejects(
+      launcherTest.downloadFile(url, destination, { attempts: 1, timeoutMs: 5000, partialPath }),
+      /download failed after 1 attempts/u,
+    );
+    assert.equal(fs.existsSync(destination), false);
+    assert.equal(fs.statSync(partialPath).size, 12);
+
+    // A fresh run picks the partial back up rather than re-downloading what already landed.
+    await launcherTest.downloadFile(url, destination, { attempts: 1, timeoutMs: 5000, partialPath });
+    assert.deepEqual(await readFile(destination), body);
+    assert.equal(fs.existsSync(partialPath), false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader survives a transfer slower than the stall window", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-slow-"));
+  const destination = join(dataDir, "slow.bin");
+  const chunks = 8;
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-length": String(chunks) });
+    let sent = 0;
+    const interval = setInterval(() => {
+      sent += 1;
+      response.write("x");
+      if (sent === chunks) {
+        clearInterval(interval);
+        response.end();
+      }
+    }, 25);
+    response.on("close", () => clearInterval(interval));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    // Every chunk arrives well after a 40ms budget would have expired, but each one resets the
+    // stall window, so a steady trickle now completes instead of being cut off.
+    await launcherTest.downloadFile(
+      `http://127.0.0.1:${server.address().port}/slow`,
+      destination,
+      { attempts: 1, stallTimeoutMs: 400, timeoutMs: 5000 },
+    );
+    assert.equal((await readFile(destination, "utf8")).length, chunks);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader fails a silent connection on the stall window", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-stall-"));
+  const destination = join(dataDir, "silent.bin");
+  const server = createServer((_request, response) => {
+    response.writeHead(200);
+    // Headers only: never send a body byte.
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      launcherTest.downloadFile(`http://127.0.0.1:${server.address().port}/silent`, destination, {
+        attempts: 1,
+        stallTimeoutMs: 80,
+        timeoutMs: 60_000,
+      }),
+      /stalled after 80ms without data/u,
+    );
+    // The stall window, not the hour-long total budget, is what ends a dead transfer.
+    assert.ok(Date.now() - started < 5000);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader stops immediately on a permanent status", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-permanent-"));
+  const destination = join(dataDir, "missing.bin");
+  let calls = 0;
+  const fakeGet = (_url, onResponse) => {
+    const request = new EventEmitter();
+    request.destroy = () => request;
+    calls += 1;
+    process.nextTick(() => {
+      const response = new PassThrough();
+      response.statusCode = 404;
+      response.headers = {};
+      onResponse(response);
+      response.end("");
+    });
+    return request;
+  };
+  try {
+    await assert.rejects(
+      launcherTest.downloadFile("https://example.invalid/missing", destination, {
+        attempts: 5,
+        get: fakeGet,
+        retryDelayMs: () => 1,
+        timeoutMs: 5000,
+      }),
+      /download failed 404/u,
+    );
+    // A missing release asset is a fixed answer; retrying it only delays the real error.
+    assert.equal(calls, 1);
+    assert.equal(fs.existsSync(`${destination}.part`), false);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("download failure hints stay structured and actionable", () => {
+  const stalled = launcherTest.sanitizeDownloadFailure({
+    kind: "stalled",
+    asset: "codestory-cli-v0.16.1-x86_64-apple-darwin.tar.gz",
+    resumable_bytes: 52_428_800,
+    elapsed_ms: 900_000,
+    attempts: 6,
+  });
+  assert.equal(stalled.kind, "stalled");
+  assert.equal(stalled.http_status, null);
+  const stalledHint = launcherTest.managedCliDownloadHint(stalled, "managed_cli_asset_fetch_failed");
+  assert.match(stalledHint, /50\.0 MB already downloaded is kept/u);
+  assert.match(stalledHint, /CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS/u);
+
+  const missing = launcherTest.sanitizeDownloadFailure({ kind: "http_status", http_status: 404 });
+  assert.match(
+    launcherTest.managedCliDownloadHint(missing, "managed_cli_asset_fetch_failed"),
+    /was not found/u,
+  );
+
+  // Anything unrecognised collapses to a safe enum rather than echoing attacker-controlled text.
+  const hostile = launcherTest.sanitizeDownloadFailure({
+    kind: "C:\\private\\candidate.exe",
+    asset: "untrusted detail\nsecond line",
+    http_status: 99_999,
+    resumable_bytes: -5,
+  });
+  assert.deepEqual(hostile, {
+    kind: "network",
+    asset: null,
+    http_status: null,
+    resumable_bytes: 0,
+    elapsed_ms: 0,
+    attempts: 0,
+  });
+
+  // A failure that is not a download failure must not be described as one.
+  assert.equal(launcherTest.managedCliDownloadHint(null, "managed_cli_probe_failed"), null);
 });
 
 test("mcp launcher keeps managed provision failures primary", async () => {

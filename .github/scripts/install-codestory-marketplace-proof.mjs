@@ -259,11 +259,13 @@ function verifyInstallation(setup, installed) {
     fail("pinned marketplace plugin source does not match the release source tree");
   }
   const listedMarketplaces = installed.marketplaceList.marketplaces;
-  const marketplaceListEntry = listedMarketplaces?.[0];
+  const matchingMarketplaces = Array.isArray(listedMarketplaces)
+    ? listedMarketplaces.filter(({ name }) => name === setup.marketplaceName)
+    : [];
+  const marketplaceListEntry = matchingMarketplaces[0];
   if (
     !Array.isArray(listedMarketplaces)
-    || listedMarketplaces.length !== 1
-    || marketplaceListEntry?.name !== setup.marketplaceName
+    || matchingMarketplaces.length !== 1
   ) {
     fail("Codex marketplace list has an unexpected identity");
   }

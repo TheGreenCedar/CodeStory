@@ -140,6 +140,16 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     const marketplaceRevision = commitFixture(marketplaceRoot, "fixture", {
       init: true,
     });
+    const personalHome = path.join(root, "personal-home");
+    mkdirSync(path.join(personalHome, ".agents", "plugins"), { recursive: true });
+    writeFileSync(
+      path.join(personalHome, ".agents", "plugins", "marketplace.json"),
+      `${JSON.stringify({
+        name: "Personal",
+        interface: { displayName: "Personal" },
+        plugins: [],
+      }, null, 2)}\n`,
+    );
     const releaseSourceCommit = commitFixture(
       pluginSourceRoot,
       "release merge",
@@ -166,7 +176,12 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       marketplaceRevision,
       expectedVersion: pluginManifest.version,
       sourceRepository: pluginSourceRoot,
-    }));
+    }), {
+      env: {
+        ...process.env,
+        HOME: personalHome,
+      },
+    });
 
     const attestation = JSON.parse(readFileSync(attestationPath));
     const expectedPluginRoot = path.join(
@@ -190,6 +205,10 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     );
     assert.equal(attestation.marketplace.provenance.add.revision, marketplaceRevision);
     assert.equal(attestation.marketplace.provenance.list.revision, marketplaceRevision);
+    assert.deepEqual(
+      attestation.marketplace.list_result.marketplaces.map(({ name }) => name).sort(),
+      ["Fixture", "Personal"],
+    );
     assert.equal(
       attestation.marketplace.provenance.add.root,
       attestation.marketplace.provenance.list.root,

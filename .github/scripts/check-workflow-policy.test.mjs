@@ -1706,6 +1706,10 @@ test("post-publish proof keeps every release asset on its protected accelerator"
     workflow.jobs.smoke,
     "Prove the catalog-resolved published runtime",
   );
+  const installStep = workflow => draftStep(
+    workflow.jobs.smoke,
+    "Resolve the published plugin through the marketplace catalog",
+  );
   const row = (workflow, assetTarget) => {
     const match = workflow.jobs.smoke.strategy.matrix.include.find(
       ({ asset_target: candidate }) => candidate === assetTarget,
@@ -1740,6 +1744,19 @@ test("post-publish proof keeps every release asset on its protected accelerator"
     ["published Python loses the protected execution policy", workflow => {
       delete draftStep(workflow.jobs.smoke, "Install pinned Python")
         .env.PSExecutionPolicyPreference;
+    }],
+    ["published Python proof falls back to PowerShell", workflow => {
+      draftStep(workflow.jobs.smoke, "Prove packaged version, help, and stdio shape").shell
+        = "powershell";
+    }],
+    ["published marketplace install inherits personal HOME", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace('HOME="$isolated_home" node', "node");
+    }],
+    ["published macOS Python pin drifts", workflow => {
+      draftStep(workflow.jobs.smoke, "Install pinned Python on macOS").run
+        = draftStep(workflow.jobs.smoke, "Install pinned Python on macOS").run
+          .replaceAll("3.13.14", "3.14.6");
     }],
     ["Windows installer loses the protected execution policy", workflow => {
       draftStep(workflow.jobs.smoke, "Run Windows installer ownership self-test").shell
