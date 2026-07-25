@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 0.16.1
+
+Fixes first use on a slow or unreliable connection.
+
+The plugin downloads the CodeStory runtime the first time you use it. That
+download was given 60 seconds in total, which a multi-hundred-megabyte archive
+cannot meet on a slow link. Every attempt was cut off mid-transfer, each retry
+threw away the bytes already downloaded and started again from zero, and after
+three rounds the whole thing reported a bare failure code.
+
+- The 60-second total budget is replaced by a stall timeout: as long as bytes
+  keep arriving, the download keeps going. A connection that goes silent for 60
+  seconds still fails fast, and an hour-long ceiling remains as a backstop.
+- Interrupted downloads resume with an HTTP range request instead of restarting.
+  Partial downloads are kept under the managed CLI directory, so progress
+  survives a retry and an MCP restart.
+- Retries are more patient (20 resumable attempts with exponential backoff) but
+  stop immediately on a permanent error such as a missing release asset, instead
+  of retrying something that cannot succeed.
+- While the runtime downloads, tools report real progress — bytes, percentage,
+  and attempt — rather than a fixed "preparing" placeholder.
+- A failed download now explains what happened and what to do about it,
+  including how much has already been downloaded and kept. The machine-readable
+  failure code stays sanitized as before.
+- New environment overrides: `CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS`,
+  `CODESTORY_PLUGIN_DOWNLOAD_STALL_TIMEOUT_MS`, and
+  `CODESTORY_PLUGIN_DOWNLOAD_ATTEMPTS`.
+
 ## 0.16.0
 
 CodeStory 0.16 is the release where the machinery disappears.
