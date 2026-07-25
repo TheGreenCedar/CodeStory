@@ -350,6 +350,11 @@ jobs:
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
           $pluginRoot = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "plugin"
           $pluginData = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "data"
+          $proofTemp = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "tmp"
+          New-Item -ItemType Directory -Path $proofTemp | Out-Null
+          $env:TEMP = $proofTemp
+          $env:TMP = $proofTemp
+          $env:TMPDIR = $proofTemp
           python .github/scripts/check-packaged-agent-proof.py `
             --archive $archive `
             --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
@@ -509,6 +514,16 @@ jobs:
           ) {
             throw "refusing to clean unexpected candidate-managed root: $candidateRoot"
           }
-          if (Test-Path -LiteralPath $candidateRoot) {
-            Remove-Item -LiteralPath $candidateRoot -Recurse -Force
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+            try {
+              if (Test-Path -LiteralPath $candidateRoot) {
+                Remove-Item -LiteralPath $candidateRoot -Recurse -Force
+              }
+              break
+            } catch {
+              if ($attempt -eq 30) {
+                throw
+              }
+              Start-Sleep -Seconds 1
+            }
           }
