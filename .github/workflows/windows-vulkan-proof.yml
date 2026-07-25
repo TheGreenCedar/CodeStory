@@ -307,7 +307,7 @@ jobs:
           $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
           $candidateRoot = Join-Path `
             $env:RUNNER_TEMP `
-            ("codestory-candidate-installed-windows." + [Guid]::NewGuid().ToString("N"))
+            ("cs-ci-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
           $candidateRoot = [IO.Path]::GetFullPath($candidateRoot)
           $workspaceRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           if ($candidateRoot.StartsWith(
