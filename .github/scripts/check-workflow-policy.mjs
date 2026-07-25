@@ -1684,6 +1684,30 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, source.uses === "./.github/workflows/source-proof.yml", `${releaseFile} must call exact source proof`);
   add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
   add(violations, object(source.with).ref === "${{ github.sha }}", `${releaseFile} source proof must receive the exact release SHA`);
+  // Reuse is admissible only through the authenticated closeout binding, never by simply
+  // dropping the gate: the job may be skipped, and only when preflight resolved reusable
+  // evidence for this exact tree.
+  add(
+    violations,
+    String(source.if ?? "") === "needs.preflight.outputs.source_proof_reused != 'true'",
+    `${releaseFile} source proof may be skipped only when preflight resolved reusable evidence`,
+  );
+  requireStepRun(violations, releaseFile, requireJob(violations, releaseFile, release, "preflight"), "Resolve reusable prior evidence", [
+    'git rev-parse "$GITHUB_SHA^{tree}"',
+    "merge-base --is-ancestor",
+    "full-source-gate",
+    '.path == ".github/workflows/source-proof.yml"',
+  ]);
+  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
+    '--reuse "$REUSE_SELECTION"',
+  ]);
+  add(
+    violations,
+    String(closeout.if ?? "").includes("needs.source-proof.result == 'skipped'")
+      && String(closeout.if ?? "").includes("needs.preflight.result == 'success'"),
+    `${releaseFile} closeout must accept a skipped source gate only alongside a successful preflight`,
+  );
   add(violations, object(source.with).version === "${{ needs.preflight.outputs.version }}" && object(source.with).emit_release_cells === true, `${releaseFile} source proof must emit its authenticated release cell`);
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
