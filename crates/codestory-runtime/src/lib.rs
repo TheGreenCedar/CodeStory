@@ -16,7 +16,7 @@ use codestory_contracts::api::{
     GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingOrientationConfidenceDto,
     GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
     GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexedFileRoleDto, IndexingPhaseTimings,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexedFileRoleDto, IndexingPhaseTimings,
     NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointKindDto,
     RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,

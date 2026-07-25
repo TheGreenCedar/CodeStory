@@ -4,7 +4,8 @@ use crate::app::diagnostics::{index_next_commands, semantic_contract_check};
 use crate::app::{packet_budget_mode_label, packet_task_class_label, render_packet_markdown};
 use crate::output::REPO_CONTENT_BOUNDARY_LINE;
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessStatusDto, PacketBudgetModeDto, PacketTaskClassDto,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto,
+    PacketBudgetModeDto, PacketTaskClassDto,
     RetrievalFallbackReasonDto, SearchHitOrigin,
 };
 use std::path::Path;
@@ -78,6 +79,7 @@ fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
         indexed_file_count: 1,
         duration_ms: 0,
         reason: Some("bounded inventory overflow".to_string()),
+        not_checked_cause: Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
         samples: Vec::new(),
     };
 

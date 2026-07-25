@@ -501,6 +501,7 @@ fn project_arg(project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::IndexFreshnessNotCheckedCauseDto;
 
     fn stats(node_count: u32) -> StorageStatsDto {
         StorageStatsDto {
@@ -522,6 +523,8 @@ mod tests {
             indexed_file_count: 1,
             duration_ms: 1,
             reason: None,
+            not_checked_cause: (status == IndexFreshnessStatusDto::NotChecked)
+                .then_some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable),
             samples: Vec::new(),
         }
     }

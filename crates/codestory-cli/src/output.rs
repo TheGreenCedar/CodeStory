@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
-use codestory_contracts::api::IndexFreshnessStatusDto;
+use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
@@ -4404,6 +4404,7 @@ mod tests {
             indexed_file_count: 1,
             duration_ms: 0,
             reason: Some("bounded inventory overflow".to_string()),
+            not_checked_cause: Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
             samples: Vec::new(),
         });
 

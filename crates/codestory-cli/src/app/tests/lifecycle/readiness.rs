@@ -27,6 +27,7 @@ fn local_freshness_refreshes_stale_and_not_checked_summaries() {
         indexed_file_count: 1,
         duration_ms: 1,
         reason: None,
+        not_checked_cause: None,
         samples: Vec::new(),
     });
     assert!(!local_freshness_needs_refresh(&summary));

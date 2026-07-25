@@ -542,6 +542,19 @@ pub enum IndexFreshnessStatusDto {
     NotChecked,
 }
 
+/// Why a freshness check could not reach a verdict.
+///
+/// `NotChecked` conflates two very different situations. `BoundedInventory` means discovery hit a
+/// deliberate size bound, so drift is unknown but the publication itself is complete and usable.
+/// `InventoryUnavailable` means the check could not run at all, which proves nothing about the
+/// publication. Only the second may block agent-facing retrieval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessNotCheckedCauseDto {
+    BoundedInventory,
+    InventoryUnavailable,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexFreshnessChangeKindDto {
@@ -567,6 +580,9 @@ pub struct IndexFreshnessDto {
     pub duration_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Set only when `status` is `NotChecked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_checked_cause: Option<IndexFreshnessNotCheckedCauseDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<IndexFreshnessSampleDto>,
 }
