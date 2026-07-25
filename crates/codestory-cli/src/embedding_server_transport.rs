@@ -371,6 +371,10 @@ impl NativeEmbeddingListener {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        // Give up the endpoint and the lifetime authority now, not at process exit. A client that
+        // arrives during the drain must observe no owner and start a replacement; while the
+        // authority is still held it instead waits for a hello this server will never send.
+        self.inner.release();
     }
 }
 
@@ -931,7 +935,7 @@ mod platform {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     const SERVER_DIR_NAME: &str = "codestory-embedding-v1";
@@ -1110,11 +1114,36 @@ mod platform {
         socket_name: String,
         socket_identity: (u64, u64),
         identity: TransportIdentity,
+        released: AtomicBool,
     }
 
     impl Listener {
         pub(super) fn identity(&self) -> &TransportIdentity {
             &self.identity
+        }
+
+        /// Remove this listener's socket entry and release the lifetime authority.
+        ///
+        /// Draining must do this immediately rather than at process exit: while the authority is
+        /// still held a client sees an owner, waits for a hello that will never come, and fails
+        /// instead of electing a replacement. Idempotent, so `Drop` can call it again.
+        pub(super) fn release(&self) {
+            if self.released.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // Hold the lifetime authority until the exact listener entry has
+            // been removed. Releasing it first lets a replacement bind and
+            // then lose its fresh socket to this old listener's destructor.
+            if runtime_directory_matches(&self.authority_directory)
+                && runtime_directory_matches(&self.runtime)
+                && socket_identity_at(&self.runtime, &self.socket_name)
+                    .ok()
+                    .flatten()
+                    == Some(self.socket_identity)
+            {
+                let _ = unlink_socket_at(&self.runtime, &self.socket_name);
+            }
+            let _ = unlock(self.authority.as_raw_fd());
         }
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<Option<Stream>> {
@@ -1168,19 +1197,7 @@ mod platform {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            // Hold the lifetime authority until the exact listener entry has
-            // been removed. Releasing it first lets a replacement bind and
-            // then lose its fresh socket to this old listener's destructor.
-            if runtime_directory_matches(&self.authority_directory)
-                && runtime_directory_matches(&self.runtime)
-                && socket_identity_at(&self.runtime, &self.socket_name)
-                    .ok()
-                    .flatten()
-                    == Some(self.socket_identity)
-            {
-                let _ = unlink_socket_at(&self.runtime, &self.socket_name);
-            }
-            let _ = unlock(self.authority.as_raw_fd());
+            self.release();
         }
     }
 
@@ -1435,6 +1452,7 @@ mod platform {
             socket_name: paths.socket_name,
             socket_identity,
             identity,
+            released: AtomicBool::new(false),
         }))
     }
 
@@ -2637,6 +2655,7 @@ mod platform {
                     peer_pid: None,
                     peer_process_start_id: None,
                 },
+                released: AtomicBool::new(false),
             };
             drop(listener);
             assert!(!socket_path.exists(), "owner drop must unlink its endpoint");
@@ -2845,6 +2864,7 @@ mod platform {
                     peer_pid: None,
                     peer_process_start_id: None,
                 },
+                released: AtomicBool::new(false),
             };
             let started = Instant::now();
             assert!(
@@ -2894,6 +2914,7 @@ mod platform {
     use std::path::PathBuf;
     use std::process::Command;
     use std::ptr::{null, null_mut};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
@@ -2968,14 +2989,27 @@ mod platform {
         pipe_name: Vec<u16>,
         security_sddl: Vec<u16>,
         current_sid: SidBuffer,
-        _authority_server: OwnedHandle,
-        _authority_client: OwnedHandle,
+        authority_server: Mutex<Option<OwnedHandle>>,
+        authority_client: Mutex<Option<OwnedHandle>>,
         identity: TransportIdentity,
     }
 
     impl Listener {
         pub(super) fn identity(&self) -> &TransportIdentity {
             &self.identity
+        }
+
+        /// Drop the retained first pipe instance so the lifetime authority is observably gone.
+        ///
+        /// Draining must do this immediately rather than at process exit: while the authority
+        /// handles are still open a client sees an owner, waits for a hello that will never come,
+        /// and fails instead of electing a replacement. Idempotent.
+        pub(super) fn release(&self) {
+            for handle in [&self.authority_server, &self.authority_client] {
+                if let Ok(mut slot) = handle.lock() {
+                    drop(slot.take());
+                }
+            }
         }
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<Option<Stream>> {
@@ -3429,8 +3463,8 @@ mod platform {
             pipe_name,
             security_sddl,
             current_sid,
-            _authority_server: authority_server,
-            _authority_client: authority_client,
+            authority_server: Mutex::new(Some(authority_server)),
+            authority_client: Mutex::new(Some(authority_client)),
             identity: TransportIdentity {
                 endpoint_namespace_id,
                 lifetime_authority_id,
