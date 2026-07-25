@@ -20,16 +20,47 @@ const {
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
-const releaseDownloadTimeoutMs = 60000;
-const releaseDownloadAttempts = 3;
-const releaseDownloadRetryDelaysMs = [1000, 3000];
+function positiveDurationEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Release downloads are bounded by two independent limits. The stall timeout detects a dead
+// connection (no bytes at all within the window) and is the limit that should normally fire; the
+// total budget is only a backstop for a link that trickles forever. A single total deadline sized
+// for a fast link is what made first use unusable on a slow one: a multi-hundred-megabyte archive
+// simply cannot land inside it, so every attempt aborted mid-transfer no matter how healthy the
+// connection was. Budgets span all attempts of one asset because attempts resume rather than
+// restart, so retries no longer multiply the wall clock.
+const releaseDownloadStallTimeoutMs = positiveDurationEnv(
+  'CODESTORY_PLUGIN_DOWNLOAD_STALL_TIMEOUT_MS',
+  60 * 1000,
+);
+const releaseChecksumTotalTimeoutMs = positiveDurationEnv(
+  'CODESTORY_PLUGIN_DOWNLOAD_CHECKSUM_TIMEOUT_MS',
+  60 * 1000,
+);
+const releaseArchiveTotalTimeoutMs = positiveDurationEnv(
+  'CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS',
+  60 * 60 * 1000,
+);
+// Attempts resume from the bytes already on disk, so a high cap costs little and lets a flaky
+// link keep inching forward; the total budget above is what actually ends a hopeless download.
+const releaseDownloadAttempts = positiveDurationEnv('CODESTORY_PLUGIN_DOWNLOAD_ATTEMPTS', 20);
+const releaseDownloadRetryDelaysMs = [1000, 2000, 5000, 10000, 15000];
+const releaseDownloadRetryJitterMs = 250;
 const managedCliLockStaleMs = 10 * 60 * 1000;
 const managedCliLockMaxAgeMs = 30 * 60 * 1000;
-const releaseAssetRetryBudgetMs =
-  releaseDownloadAttempts * releaseDownloadTimeoutMs +
-  releaseDownloadRetryDelaysMs.slice(0, releaseDownloadAttempts - 1).reduce((sum, delay) => sum + delay, 0);
+const releaseAssetRetryBudgetMs = releaseArchiveTotalTimeoutMs;
 const managedCliStagingBudgetMs = 30 * 1000;
-const managedCliLockWaitMs = 2 * releaseAssetRetryBudgetMs + managedCliStagingBudgetMs;
+// A waiter blocks only the background provisioning task, never a tool call, so it can afford to
+// outlast a publisher that is legitimately downloading the archive over a slow link.
+const managedCliLockWaitMs =
+  releaseChecksumTotalTimeoutMs + releaseArchiveTotalTimeoutMs + managedCliStagingBudgetMs;
+const managedCliDownloadCacheDirName = '.download';
+const managedCliDownloadCacheMaxAgeMs = 7 * 24 * 60 * 60 * 1000;
 const managedCliPendingOwnerCleanupLimit = 64;
 const managedCliQuarantineRetention = 2;
 const managedCliArchiveMaxBytes = 256 * 1024 * 1024;
@@ -246,6 +277,77 @@ function releaseFileMaxBytes(name) {
   return name === 'SHA256SUMS.txt' ? managedCliChecksumMaxBytes : managedCliArchiveMaxBytes;
 }
 
+function releaseFileTotalTimeoutMs(name) {
+  return name === 'SHA256SUMS.txt' ? releaseChecksumTotalTimeoutMs : releaseArchiveTotalTimeoutMs;
+}
+
+// A single mutable record of what provisioning is currently doing. Tool calls answered while the
+// runtime is still preparing read this so the client sees real download progress instead of a
+// fixed "preparing" placeholder for the several minutes a large archive takes on a slow link.
+const managedCliDownloadProgress = {
+  stage: null,
+  asset: null,
+  attempt: 0,
+  receivedBytes: 0,
+  totalBytes: null,
+  startedAt: null,
+  updatedAt: null,
+};
+
+function resetManagedCliDownloadProgress(stage, asset) {
+  managedCliDownloadProgress.stage = stage;
+  managedCliDownloadProgress.asset = asset;
+  managedCliDownloadProgress.attempt = 0;
+  managedCliDownloadProgress.receivedBytes = 0;
+  managedCliDownloadProgress.totalBytes = null;
+  managedCliDownloadProgress.startedAt = Date.now();
+  managedCliDownloadProgress.updatedAt = Date.now();
+}
+
+function recordManagedCliDownloadProgress(progress) {
+  if (Number.isSafeInteger(progress.receivedBytes)) {
+    managedCliDownloadProgress.receivedBytes = progress.receivedBytes;
+  }
+  // `totalBytes` is unknown at the start of each attempt; keep the last known value rather than
+  // flickering the reported percentage back to null.
+  if (Number.isSafeInteger(progress.totalBytes)) {
+    managedCliDownloadProgress.totalBytes = progress.totalBytes;
+  }
+  if (Number.isSafeInteger(progress.attempt)) {
+    managedCliDownloadProgress.attempt = progress.attempt;
+  }
+  managedCliDownloadProgress.updatedAt = Date.now();
+}
+
+function formatByteSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return null;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function managedCliDownloadProgressReport() {
+  const { stage, asset, attempt, receivedBytes, totalBytes } = managedCliDownloadProgress;
+  if (!stage) return null;
+  const percent = Number.isSafeInteger(totalBytes) && totalBytes > 0
+    ? Math.min(100, Math.floor((receivedBytes / totalBytes) * 100))
+    : null;
+  return {
+    stage,
+    asset,
+    attempt: Math.max(1, attempt),
+    received_bytes: receivedBytes,
+    total_bytes: Number.isSafeInteger(totalBytes) ? totalBytes : null,
+    percent,
+  };
+}
+
 function copyLocalReleaseFile(releaseDir, name, destination, maxBytes) {
   const source = path.join(releaseDir, name);
   try {
@@ -266,19 +368,63 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Download failures carry a structured tag rather than being re-derived from their message. Error
+// text can embed untrusted or environment-specific detail, so anything that reaches a user-facing
+// surface must be built from these allow-listed enums and numbers instead.
+function downloadError(kind, message, extra = {}) {
+  const error = new Error(message);
+  error.downloadKind = kind;
+  Object.assign(error, extra);
+  return error;
+}
+
+function downloadFailureKind(error) {
+  return typeof error?.downloadKind === 'string' ? error.downloadKind : 'network';
+}
+
+// Failures that cannot improve on a later attempt. Retrying these only burns the user's time
+// before showing the same error, so the retry loop stops at the first one.
+function downloadFailurePermanent(error) {
+  const kind = downloadFailureKind(error);
+  if (['size_limit', 'content_length', 'transport'].includes(kind)) return true;
+  if (kind !== 'http_status') return false;
+  const status = Number(error?.httpStatus);
+  // 408/425/429 are explicitly "come back later"; every other 4xx is a fixed answer.
+  return Number.isInteger(status) && status >= 400 && status < 500 &&
+    ![408, 425, 429].includes(status);
+}
+
+function parseContentRangeStart(header) {
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/iu.exec(String(header || '').trim());
+  if (!match) return null;
+  const start = Number(match[1]);
+  const total = match[3] === '*' ? null : Number(match[3]);
+  if (!Number.isSafeInteger(start) || start < 0) return null;
+  if (total !== null && (!Number.isSafeInteger(total) || total < 0)) return null;
+  return { start, total };
+}
+
 function downloadFileOnce(url, destination, options = {}) {
-  const timeoutMs = options.timeoutMs || releaseDownloadTimeoutMs;
+  const stallTimeoutMs = options.stallTimeoutMs || releaseDownloadStallTimeoutMs;
+  const timeoutMs = options.timeoutMs || releaseArchiveTotalTimeoutMs;
   const maxBytes = options.maxBytes ?? managedCliArchiveMaxBytes;
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
-    return Promise.reject(new Error(`download_size_limit_invalid:${maxBytes}`));
+    return Promise.reject(downloadError('size_limit', `download_size_limit_invalid:${maxBytes}`));
   }
+  const resumeFrom = Number.isSafeInteger(options.resumeFrom) && options.resumeFrom > 0
+    ? options.resumeFrom
+    : 0;
+  if (resumeFrom > maxBytes) {
+    return Promise.reject(downloadError('size_limit', `download_size_limit_exceeded:${url}`));
+  }
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
   const redirectsRemaining = options.redirectsRemaining ?? 5;
   const parsedUrl = new URL(url);
   const loopbackHttp = parsedUrl.protocol === 'http:' &&
     ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(parsedUrl.hostname);
   if (!options.get && parsedUrl.protocol !== 'https:' && !loopbackHttp) {
-    return Promise.reject(new Error('download transport must be HTTPS'));
+    return Promise.reject(downloadError('transport', 'download transport must be HTTPS'));
   }
   const get = options.get || (loopbackHttp ? http.get : https.get);
   return new Promise((resolve, reject) => {
@@ -287,101 +433,211 @@ function downloadFileOnce(url, destination, options = {}) {
     let activeRequest = null;
     let activeResponse = null;
     let limiter = null;
+    let stallTimer = null;
+    // Bytes already on disk from earlier attempts, plus whatever this attempt appends.
+    let downloadedBytes = resumeFrom;
     const finish = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
+      if (stallTimer) clearTimeout(stallTimer);
       if (error) {
         if (limiter) limiter.destroy();
         if (output) output.destroy();
         if (activeResponse) activeResponse.destroy();
         if (activeRequest) activeRequest.destroy();
+        error.downloadedBytes = downloadedBytes;
         reject(error);
       } else {
-        resolve();
+        resolve({ downloadedBytes });
       }
+    };
+    const armStall = () => {
+      if (settled) return;
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(
+        () => finish(downloadError('stalled', `download stalled after ${stallTimeoutMs}ms without data: ${url}`)),
+        stallTimeoutMs,
+      );
+      // A stall timer must never hold the event loop open on its own.
+      if (typeof stallTimer.unref === 'function') stallTimer.unref();
     };
     const remainingMs = Math.max(0, deadlineMs - Date.now());
     const deadlineTimer = setTimeout(
-      () => finish(new Error(`download timed out after ${timeoutMs}ms total: ${url}`)),
+      () => finish(downloadError('timed_out', `download timed out after ${timeoutMs}ms total: ${url}`)),
       remainingMs,
     );
-    const request = get(url, (response) => {
+    const handleResponse = (response) => {
       activeResponse = response;
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         response.resume();
         if (!response.headers.location || redirectsRemaining <= 0) {
-          finish(new Error(`download redirect failed: ${url}`));
+          finish(downloadError('redirect', `download redirect failed: ${url}`));
           return;
         }
         const nextUrl = new URL(response.headers.location, url).toString();
+        if (stallTimer) clearTimeout(stallTimer);
         downloadFileOnce(nextUrl, destination, {
           ...options,
           deadlineMs,
           redirectsRemaining: redirectsRemaining - 1,
-        }).then(() => finish(null), finish);
+        }).then((result) => {
+          downloadedBytes = result?.downloadedBytes ?? downloadedBytes;
+          finish(null);
+        }, finish);
         return;
       }
-      if (response.statusCode !== 200) {
+      // 416 means the partial on disk is at least as long as the asset: it is unusable, and the
+      // caller restarts from zero once the stale bytes are dropped.
+      if (resumeFrom > 0 && response.statusCode === 416) {
         response.resume();
-        finish(new Error(`download failed ${response.statusCode}: ${url}`));
+        finish(downloadError('range', `download_range_unsatisfiable:${url}`));
         return;
       }
+      if (![200, 206].includes(response.statusCode)) {
+        response.resume();
+        finish(downloadError('http_status', `download failed ${response.statusCode}: ${url}`, { httpStatus: response.statusCode }));
+        return;
+      }
+      // A server that ignores Range answers 200 with the whole body; the partial must be
+      // discarded rather than appended to, or the file would be silently corrupt.
+      let appendFrom = resumeFrom;
+      if (response.statusCode === 206) {
+        const range = parseContentRangeStart(response.headers['content-range']);
+        if (!range || range.start !== resumeFrom) {
+          response.resume();
+          finish(downloadError('range', `download_range_mismatch:${url}`));
+          return;
+        }
+      } else {
+        appendFrom = 0;
+      }
+      downloadedBytes = appendFrom;
+
       const announced = response.headers['content-length'];
+      let totalBytes = null;
       if (announced !== undefined) {
         const contentLength = Number(announced);
         if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
           response.resume();
-          finish(new Error(`download_content_length_invalid:${url}`));
+          finish(downloadError('content_length', `download_content_length_invalid:${url}`));
           return;
         }
-        if (contentLength > maxBytes) {
+        totalBytes = appendFrom + contentLength;
+        if (totalBytes > maxBytes) {
           response.resume();
-          finish(new Error(`download_size_limit_exceeded:${url}`));
+          finish(downloadError('size_limit', `download_size_limit_exceeded:${url}`));
           return;
         }
       }
-      let receivedBytes = 0;
+      if (onProgress) onProgress({ receivedBytes: appendFrom, totalBytes });
+
       limiter = new Transform({
         transform(chunk, _encoding, callback) {
-          receivedBytes += chunk.length;
-          if (receivedBytes > maxBytes) {
-            callback(new Error(`download_size_limit_exceeded:${url}`));
+          downloadedBytes += chunk.length;
+          if (downloadedBytes > maxBytes) {
+            callback(downloadError('size_limit', `download_size_limit_exceeded:${url}`));
             return;
           }
+          armStall();
+          if (onProgress) onProgress({ receivedBytes: downloadedBytes, totalBytes });
           callback(null, chunk);
         },
       });
-      output = fs.createWriteStream(destination);
+      output = fs.createWriteStream(destination, appendFrom > 0 ? { flags: 'a' } : { flags: 'w' });
       pipeline(response, limiter, output, (error) => finish(error || null));
-    });
+    };
+    // Only pass a request-options object when a Range header is actually needed: the two-argument
+    // form is what injected `get` doubles in tests implement.
+    const request = resumeFrom > 0
+      ? get(url, { headers: { Range: `bytes=${resumeFrom}-` } }, handleResponse)
+      : get(url, handleResponse);
     activeRequest = request;
     request.on('error', finish);
+    armStall();
   });
 }
 
+function partialDownloadBytes(partialPath) {
+  try {
+    const metadata = fs.statSync(partialPath);
+    return metadata.isFile() ? metadata.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Downloads into `<destination>.part` and only publishes `destination` once the transfer
+// completes, so a failed run leaves a resumable partial instead of a truncated asset. When the
+// partial lives in a persistent cache the resume also survives an MCP restart, which is what
+// turns a repeatedly interrupted first run into forward progress.
 async function downloadFile(url, destination, options = {}) {
   const attempts = options.attempts || releaseDownloadAttempts;
   const startedAt = Date.now();
+  const totalTimeoutMs = options.timeoutMs || releaseArchiveTotalTimeoutMs;
+  const deadlineMs = startedAt + totalTimeoutMs;
+  const partialPath = options.partialPath || `${destination}.part`;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const purgePartial = () => fs.rmSync(partialPath, { force: true });
+  // `attempts` is a strict cap. Because every attempt resumes rather than restarting, attempts are
+  // cheap, so the default is generous and the real bound on a doomed download is the total
+  // deadline. `stalledAttempts` only picks the backoff delay: an attempt that moved the partial
+  // forward resets it, so a link that is working is not punished with the long waits.
   let lastError = null;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  let attempt = 0;
+  let stalledAttempts = 0;
+  while (attempt < attempts) {
+    attempt += 1;
+    const resumeFrom = partialDownloadBytes(partialPath);
+    if (onProgress) onProgress({ receivedBytes: resumeFrom, attempt });
     try {
-      await downloadFileOnce(url, destination, options);
+      await downloadFileOnce(url, partialPath, {
+        ...options,
+        resumeFrom,
+        deadlineMs,
+        onProgress: onProgress
+          ? (progress) => onProgress({ ...progress, attempt })
+          : undefined,
+      });
+      fs.rmSync(destination, { force: true });
+      fs.renameSync(partialPath, destination);
       return;
     } catch (error) {
       lastError = error;
-      fs.rmSync(destination, { force: true });
-      if (attempt < attempts) {
-        const delayMs = options.retryDelayMs
-          ? options.retryDelayMs(attempt)
-          : releaseDownloadRetryDelaysMs[attempt - 1] ||
-            releaseDownloadRetryDelaysMs[releaseDownloadRetryDelaysMs.length - 1];
-        if (delayMs > 0) await sleep(delayMs);
+      if (downloadFailurePermanent(error)) {
+        purgePartial();
+        break;
       }
+      // A partial that the server rejects or that drifted out of sync is worthless; drop it so the
+      // next attempt starts clean instead of failing the same way forever.
+      if (downloadFailureKind(error) === 'range') purgePartial();
+      const advanced = partialDownloadBytes(partialPath) > resumeFrom;
+      stalledAttempts = advanced ? 0 : stalledAttempts + 1;
+      if (Date.now() >= deadlineMs || attempt >= attempts) break;
+      const index = Math.max(0, stalledAttempts - 1);
+      const delayMs = options.retryDelayMs
+        ? options.retryDelayMs(attempt)
+        : (releaseDownloadRetryDelaysMs[index] ||
+          releaseDownloadRetryDelaysMs[releaseDownloadRetryDelaysMs.length - 1]) +
+          Math.floor(Math.random() * releaseDownloadRetryJitterMs);
+      const budgetedDelayMs = Math.max(0, Math.min(delayMs, deadlineMs - Date.now()));
+      if (budgetedDelayMs > 0) await sleep(budgetedDelayMs);
     }
   }
   const elapsedMs = Date.now() - startedAt;
-  throw new Error(`download failed after ${attempts} attempts over ${elapsedMs}ms: ${lastError?.message || 'unknown error'}`);
+  const resumableBytes = partialDownloadBytes(partialPath);
+  const resumeNote = resumableBytes > 0 ? ` resumable_bytes=${resumableBytes}` : '';
+  const failure = new Error(
+    `download failed after ${attempt} attempts over ${elapsedMs}ms:${resumeNote} ${lastError?.message || 'unknown error'}`,
+  );
+  failure.downloadFailure = {
+    kind: downloadFailureKind(lastError),
+    http_status: Number.isInteger(lastError?.httpStatus) ? lastError.httpStatus : null,
+    resumable_bytes: resumableBytes,
+    elapsed_ms: elapsedMs,
+    attempts: attempt,
+  };
+  throw failure;
 }
 
 function releaseAssetFetchFailure(name, startedAt, attempts, error) {
@@ -407,7 +663,7 @@ function redactedReleaseFileUrl(version, name) {
   return url.toString();
 }
 
-async function fetchReleaseFile(version, name, destination) {
+async function fetchReleaseFile(version, name, destination, options = {}) {
   const startedAt = Date.now();
   const maxBytes = releaseFileMaxBytes(name);
   if (process.env.CODESTORY_PLUGIN_RELEASE_DIR) {
@@ -419,10 +675,22 @@ async function fetchReleaseFile(version, name, destination) {
     return redactedReleaseFileUrl(version, name);
   }
   const url = releaseFileUrl(version, name);
+  // One stage name for the whole release fetch keeps the reported stage deterministic for clients;
+  // `asset` in the progress detail distinguishes the checksum file from the archive.
+  resetManagedCliDownloadProgress('downloading_runtime', name);
   try {
-    await downloadFile(url, destination, { maxBytes });
+    await downloadFile(url, destination, {
+      maxBytes,
+      timeoutMs: releaseFileTotalTimeoutMs(name),
+      partialPath: options.partialPath,
+      onProgress: recordManagedCliDownloadProgress,
+    });
   } catch (error) {
-    throw new Error(releaseAssetFetchFailure(name, startedAt, releaseDownloadAttempts, error));
+    const wrapped = new Error(releaseAssetFetchFailure(name, startedAt, releaseDownloadAttempts, error));
+    if (error?.downloadFailure) {
+      wrapped.downloadFailure = { ...error.downloadFailure, asset: name };
+    }
+    throw wrapped;
   }
   return redactedReleaseFileUrl(version, name);
 }
@@ -1130,9 +1398,91 @@ function managedCliFailureCode(error) {
   return probeFailure ? `${code}:${probeFailure}` : code;
 }
 
+// The machine-readable failure code is deliberately reduced to a single safe token, which left the
+// user staring at `managed_cli_asset_fetch_failed` with no idea that their download had simply been
+// cut short. The context and hint below restore that explanation without reopening the sanitization
+// hole: both are derived only from the structured `downloadFailure` tag and the already-sanitized
+// failure code, never from raw error text (which can carry untrusted child-process output).
+const managedCliProvisionFailure = { code: null, context: null, hint: null };
+
+const downloadFailureKinds = new Set([
+  'stalled',
+  'timed_out',
+  'http_status',
+  'size_limit',
+  'content_length',
+  'transport',
+  'range',
+  'redirect',
+  'network',
+]);
+
+function sanitizeDownloadFailure(failure) {
+  if (!failure || typeof failure !== 'object') return null;
+  const kind = downloadFailureKinds.has(failure.kind) ? failure.kind : 'network';
+  const safeInt = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
+  return {
+    kind,
+    // The asset name is one of our own fixed release filenames, never user or server supplied.
+    asset: typeof failure.asset === 'string' && /^[\w.+-]{1,128}$/u.test(failure.asset)
+      ? failure.asset
+      : null,
+    http_status: Number.isInteger(failure.http_status) &&
+      failure.http_status >= 100 && failure.http_status <= 599
+      ? failure.http_status
+      : null,
+    resumable_bytes: safeInt(failure.resumable_bytes) ?? 0,
+    elapsed_ms: safeInt(failure.elapsed_ms) ?? 0,
+    attempts: safeInt(failure.attempts) ?? 0,
+  };
+}
+
+const manualInstallHint =
+  'To skip the download, install codestory-cli yourself and point CODESTORY_CLI at it.';
+
+function managedCliDownloadHint(context, code) {
+  if (code === 'archive_checksum_mismatch') {
+    return 'The runtime archive failed checksum verification and was discarded. ' +
+      'Retry the tool to download it again.';
+  }
+  if (!context) return null;
+  const resumeNote = context.resumable_bytes > 0
+    ? ` ${formatByteSize(context.resumable_bytes)} already downloaded is kept, and retrying resumes from there.`
+    : '';
+  switch (context.kind) {
+    case 'stalled':
+    case 'timed_out':
+    case 'network':
+      return 'The CodeStory runtime download could not complete over this connection.' +
+        `${resumeNote} Retry the tool to continue downloading, or raise the budget with ` +
+        `CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS / CODESTORY_PLUGIN_DOWNLOAD_STALL_TIMEOUT_MS. ${manualInstallHint}`;
+    case 'http_status':
+      if (context.http_status === 404) {
+        return 'The release asset for this plugin version was not found. ' +
+          `Update the plugin, or install codestory-cli yourself and point CODESTORY_CLI at it.`;
+      }
+      return `The release download was rejected (HTTP ${context.http_status ?? 'error'}). ` +
+        `Retry later, or ${manualInstallHint.charAt(0).toLowerCase()}${manualInstallHint.slice(1)}`;
+    case 'size_limit':
+    case 'content_length':
+      return `The release asset did not match its expected size bounds. ${manualInstallHint}`;
+    case 'transport':
+      return `The release download was blocked because it was not served over HTTPS. ${manualInstallHint}`;
+    case 'range':
+    case 'redirect':
+      return 'The release download could not be resumed and was reset. Retry the tool to start it again.';
+    default:
+      return null;
+  }
+}
+
 function recordManagedCliProvisionFailure(warnings, error) {
   const code = managedCliFailureCode(error);
   const failure = `managed_cli_provision_failed:${code}`;
+  const context = sanitizeDownloadFailure(error?.downloadFailure);
+  managedCliProvisionFailure.code = code;
+  managedCliProvisionFailure.context = context;
+  managedCliProvisionFailure.hint = managedCliDownloadHint(context, code);
   warnings.push(`managed_cli_publication:terminal_failure:${code}`, failure);
   return failure;
 }
@@ -1331,6 +1681,55 @@ function trimManagedCliQuarantines(root, version, options = {}) {
   }
 }
 
+// Partial archives live under the managed root rather than an ephemeral temp dir so an interrupted
+// first run resumes after an MCP restart instead of starting the whole transfer over. The name is
+// dot-prefixed, so version enumeration and retention already skip it.
+function managedCliDownloadCacheDir(root, version) {
+  const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
+  if (fs.existsSync(cacheRoot)) {
+    const metadata = fs.lstatSync(cacheRoot);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error('managed_cli_download_cache_not_direct');
+    }
+  }
+  const dir = path.join(cacheRoot, version);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+function trimManagedCliDownloadCache(root, version) {
+  const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
+  let children;
+  try {
+    children = fs.readdirSync(cacheRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const child of children) {
+    const childPath = path.join(cacheRoot, child.name);
+    try {
+      // Partials for a version we are no longer provisioning can never be resumed, and even the
+      // current version's partial goes stale once the release has had time to be re-cut.
+      const expired = child.name !== version ||
+        Date.now() - fs.statSync(childPath).mtimeMs > managedCliDownloadCacheMaxAgeMs;
+      if (expired) fs.rmSync(childPath, { recursive: true, force: true });
+    } catch {
+      // Best effort: a partial we cannot inspect is simply re-downloaded.
+    }
+  }
+}
+
+function removeManagedCliDownloadCache(root, version) {
+  try {
+    fs.rmSync(path.join(root, managedCliDownloadCacheDirName, version), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    // Best effort: a leftover partial is trimmed on the next provisioning run.
+  }
+}
+
 function quarantineManagedCliVersion(root, versionDir, version, reason, options = {}) {
   const renameSync = options.renameSync || fs.renameSync;
   const metadata = fs.lstatSync(versionDir);
@@ -1396,8 +1795,21 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
     const archivePath = path.join(tempRoot, asset);
     const extractDir = path.join(tempRoot, 'extract');
+    trimManagedCliDownloadCache(root, version);
+    let archivePartialPath;
+    try {
+      archivePartialPath = path.join(managedCliDownloadCacheDir(root, version), `${asset}.part`);
+    } catch (error) {
+      // A cache we cannot use costs resume, not correctness: fall back to the temp dir.
+      warnings.push(`managed_cli_publication:download_cache_unavailable:${managedCliFailureCode(error)}`);
+      archivePartialPath = `${archivePath}.part`;
+    }
+    const resumeBytes = partialDownloadBytes(archivePartialPath);
+    if (resumeBytes > 0) warnings.push(`managed_cli_publication:resume_bytes:${resumeBytes}`);
     await fetchReleaseFile(version, 'SHA256SUMS.txt', sumsPath);
-    const archiveUrl = await fetchReleaseFile(version, asset, archivePath);
+    const archiveUrl = await fetchReleaseFile(version, asset, archivePath, {
+      partialPath: archivePartialPath,
+    });
     const expected = expectedArchiveHash(fs.readFileSync(sumsPath, 'utf8'), asset);
     const actual = fileSha256(archivePath);
     if (actual !== expected) {
@@ -1443,6 +1855,8 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     if (fs.existsSync(versionDir)) throw new Error('managed_cli_publish_target_reappeared');
     fs.renameSync(stagingDir, versionDir);
     stagingDir = null;
+    removeManagedCliDownloadCache(root, version);
+    managedCliDownloadProgress.stage = null;
     return resolveManifest(path.join(versionDir, 'manifest.json'));
   } finally {
     if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
@@ -2399,6 +2813,39 @@ function selectExplicitProject(value) {
   }
 }
 
+function managedProvisioningOperation() {
+  const progress = managedCliDownloadProgressReport();
+  return {
+    operation_id: 'managed-runtime-provisioning',
+    state: 'preparing',
+    stage: progress?.stage || 'downloading_runtime',
+    attempt: progress?.attempt ?? 1,
+    retry_after_ms: 1500,
+    failure: null,
+    progress: progress
+      ? {
+        asset: progress.asset,
+        received_bytes: progress.received_bytes,
+        total_bytes: progress.total_bytes,
+        percent: progress.percent,
+      }
+      : null,
+  };
+}
+
+function managedProvisioningMessage() {
+  const progress = managedCliDownloadProgressReport();
+  if (!progress || progress.asset === 'SHA256SUMS.txt') {
+    return 'CodeStory is preparing: downloading the runtime. Retry the same tool shortly.';
+  }
+  const received = formatByteSize(progress.received_bytes);
+  const total = progress.total_bytes === null ? null : formatByteSize(progress.total_bytes);
+  const measure = total
+    ? `${progress.percent}% of ${total}`
+    : `${received} so far`;
+  return `CodeStory is preparing: downloading the runtime (${measure}). Retry the same tool shortly.`;
+}
+
 function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
   const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
@@ -2440,15 +2887,10 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       state: preparing ? 'preparing' : 'unavailable',
       degraded_reason: degradedReason,
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
-      current_operation: preparing ? {
-        operation_id: 'managed-runtime-provisioning',
-        state: 'preparing',
-        stage: 'dense_preparation',
-        attempt: 1,
-        retry_after_ms: 1500,
-        failure: null,
-      } : null,
+      current_operation: preparing ? managedProvisioningOperation() : null,
       failure: preparing ? null : primaryFailure,
+      failure_context: !preparing && managedFailure ? managedCliProvisionFailure.context : null,
+      hint: !preparing && managedFailure ? managedCliProvisionFailure.hint : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: preparing ? 1500 : null,
       diagnostics_uri: diagnosticsUri,
@@ -2459,30 +2901,27 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     };
   }
   const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
+  const failureHint = managedFailure ? managedCliProvisionFailure.hint : null;
   const structuredContent = preparing ? {
     code: 'codestory_preparing',
-    message: 'CodeStory is preparing. Retry the same tool shortly.',
+    message: managedProvisioningMessage(),
     tool,
     project,
     state: 'preparing',
     retry_tool: tool,
     retry_after_ms: 1500,
-    operation: {
-      operation_id: 'managed-runtime-provisioning',
-      state: 'preparing',
-      stage: 'dense_preparation',
-      attempt: 1,
-      retry_after_ms: 1500,
-      failure: null,
-    },
+    operation: managedProvisioningOperation(),
     diagnostics_uri: diagnosticsUri,
   } : {
     code: 'codestory_unavailable',
-    message: 'CodeStory is unavailable. Continue with focused source inspection.',
+    message: failureHint
+      ? `CodeStory is unavailable. ${failureHint} Meanwhile, continue with focused source inspection.`
+      : 'CodeStory is unavailable. Continue with focused source inspection.',
     tool,
     project,
     state: 'unavailable',
     failure: primaryFailure,
+    failure_context: managedFailure ? managedCliProvisionFailure.context : null,
     diagnostics_uri: diagnosticsUri,
   };
   return {
@@ -2946,6 +3385,16 @@ if (require.main === module) {
       compareManagedCliVersions,
       cleanPublicProjectPath,
       downloadFile,
+      downloadFailurePermanent,
+      managedCliDownloadHint,
+      managedCliDownloadProgress,
+      managedCliProvisionFailure,
+      managedProvisioningOperation,
+      sanitizeDownloadFailure,
+      releaseDownloadStallTimeoutMs,
+      releaseArchiveTotalTimeoutMs,
+      releaseChecksumTotalTimeoutMs,
+      trimManagedCliDownloadCache,
       extractArchive,
       failOpenToolResult,
       failOpenToolCatalog,
