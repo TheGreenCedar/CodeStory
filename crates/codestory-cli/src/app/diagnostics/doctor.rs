@@ -394,7 +394,9 @@ pub(in crate::app) fn index_next_commands(
                 ));
                 return commands;
             }
-            IndexFreshnessStatusDto::NotChecked => {
+            IndexFreshnessStatusDto::NotChecked
+                if crate::readiness::freshness_requires_refresh(freshness) =>
+            {
                 commands.push(format!(
                     "codestory-cli index --project {project} --refresh full"
                 ));
@@ -403,7 +405,7 @@ pub(in crate::app) fn index_next_commands(
                 ));
                 return commands;
             }
-            IndexFreshnessStatusDto::Fresh => {}
+            IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::NotChecked => {}
         }
     }
     if !sidecar_is_full {

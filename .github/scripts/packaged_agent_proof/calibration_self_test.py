@@ -260,12 +260,12 @@ def _self_test_runs(
 
 def _self_test_selection(protocol: dict) -> tuple[dict, dict]:
     constants = {
-        "connect_timeout_ms": 2,
-        "spawn_convergence_timeout_ms": 2,
+        "connect_timeout_ms": 2000,
+        "spawn_convergence_timeout_ms": 15000,
         "request_deadlines_ms": {
-            "query_request_deadline_ms": 2,
-            "bulk_replay_success_budget_ms": 2,
-            "bulk_request_deadline_ms": 9,
+            "query_request_deadline_ms": 10000,
+            "bulk_replay_success_budget_ms": 10000,
+            "bulk_request_deadline_ms": 25005,
         },
         "capacity_retry_policy": {
             "retry_after_ms": 1,
@@ -325,7 +325,9 @@ def _frozen_self_test_contract(
         "calibration_bundle_sha256": sha256(path),
         "calibration_freeze_digest": bundle["freeze_digest"],
         "run_artifact_sha256s": sorted(digests),
-        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+        "selection_rule": (
+            "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1"
+        ),
         "selected_at": "self-test",
     }
     return frozen

@@ -127,7 +127,8 @@ pub use per_user_embedding::{
     PerUserEmbeddingError, PerUserEmbeddingResidencyLease, PerUserEmbeddingServerConfig,
     embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
     embedding_retry_state, install_embedding_client_transport,
-    run_per_user_embedding_qualification, run_per_user_embedding_server,
+    install_embedding_client_transport_factory, run_per_user_embedding_qualification,
+    run_per_user_embedding_server,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{

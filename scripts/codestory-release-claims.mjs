@@ -698,6 +698,14 @@ const PUBLIC_SUPPORT_DOCUMENTS = [
   "plugins/codestory/README.md",
 ];
 
+// Pages that hand-maintain their own platform table instead of embedding the generated block.
+// They cannot be regenerated, but every supported platform must at least appear in them: both of
+// these silently kept telling Linux x64 readers their platform had no release path.
+const PLATFORM_NARRATIVE_DOCUMENTS = [
+  "docs/ops/retrieval-engine.md",
+  "docs/architecture/retrieval-design.md",
+];
+
 export function renderPublicSupport(graph) {
   validateReleaseClaimGraph(graph);
   const rows = graph.public_support.packages.map((row) => {
@@ -738,6 +746,30 @@ export function validatePublicSupportDocuments(graph, repoRoot) {
     const actual = document.slice(start, end + PUBLIC_SUPPORT_END.length);
     if (actual !== expected) {
       fail(`${relative} public support block is stale`);
+    }
+  }
+}
+
+// How each shipped target is named in prose. These pages predate the generated block and word
+// platforms their own way, so the check is on identity rather than on the marketing label.
+const PLATFORM_NARRATIVE_TOKENS = new Map([
+  ["macos-arm64", ["Apple Silicon"]],
+  ["windows-x64", ["Windows x64"]],
+  ["linux-x64", ["Linux x64"]],
+]);
+
+export function validatePlatformNarrativeDocuments(graph, repoRoot) {
+  validateReleaseClaimGraph(graph);
+  for (const relative of PLATFORM_NARRATIVE_DOCUMENTS) {
+    const document = readFileSync(path.join(repoRoot, relative), "utf8");
+    for (const { target } of graph.public_support.packages) {
+      const tokens = PLATFORM_NARRATIVE_TOKENS.get(target);
+      if (!tokens) {
+        fail(`${target} ships but has no prose spelling; add one to PLATFORM_NARRATIVE_TOKENS`);
+      }
+      if (!tokens.some((token) => document.includes(token))) {
+        fail(`${relative} does not mention the supported platform ${target}`);
+      }
     }
   }
 }
@@ -1247,6 +1279,7 @@ function main() {
   const graph = loadReleaseClaimGraph(repoRoot);
   if (command === "validate") {
     validatePublicSupportDocuments(graph, repoRoot);
+    validatePlatformNarrativeDocuments(graph, repoRoot);
     console.log(`Release claim graph passed: ${releaseClaimGraphDigest(graph)}`);
     return;
   }

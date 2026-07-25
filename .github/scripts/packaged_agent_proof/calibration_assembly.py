@@ -106,7 +106,9 @@ def _frozen_calibration_constant_set(
         "calibration_bundle_sha256": sha256(bundle_output),
         "calibration_freeze_digest": selection["freeze_digest"],
         "run_artifact_sha256s": selection["run_artifact_sha256s"],
-        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+        "selection_rule": (
+            "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1"
+        ),
         "selected_at": require_nonempty_string(
             selected_at,
             "--freeze-selected-at",

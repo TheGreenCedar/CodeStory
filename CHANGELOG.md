@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed
+
+- First use completes on Linux hosts that keep `/tmp` on its own filesystem.
+  Setup previously downloaded the runtime, failed to install it, and started the
+  download again until it gave up.
+- Repositories over 25,000 files can use broad search. Packet, search, context,
+  and drill were refused on them permanently, and re-indexing did not help.
+- A question asked while the local model is still starting waits for it instead
+  of reporting the project as unavailable. Slower machines, encrypted or network
+  disks, and hosts running antivirus were most affected.
+- Search results say whether they used full retrieval. Results that fell back to
+  symbolic matching reported themselves as complete, so an agent could cite
+  partial evidence as if it were whole.
+- CodeStory installed somewhere shared or read-only runs for people who cannot
+  write to that location.
+
+### Faster
+
+- Commands that do not search — indexing, symbol lookup, call trails,
+  `--version` — start immediately. Only the first command that needs the model
+  waits for it.
+- Windows and Linux start faster, and commands run at the same time no longer
+  queue behind one another.
+
+### For operators
+
+- `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
+  `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the repository size at which
+  CodeStory stops checking for changes.
+
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.
@@ -105,7 +135,17 @@ paths more accurately.
 
 Update the CodeStory plugin and start a fresh session in your agent host. The
 first broad question may take a little longer while CodeStory updates the
-repository's local index. No manual migration or cleanup is required.
+repository's local index. Your existing index migrates in place; no manual
+migration step is required.
+
+If you ran 0.15, its retrieval sidecars are no longer used and 0.16 does not
+remove them, because CodeStory only deletes resources it can prove it owns.
+Two Docker containers, `codestory-qdrant` and `codestory-embed` (or your
+`CODESTORY_SIDECAR_NAMESPACE` prefix instead of `codestory`), were started with
+`restart: unless-stopped` and so survive reboots while holding ports 6333, 6334,
+and 8080. The directory `qdrant` under your CodeStory cache root is likewise
+orphaned and includes a downloaded model. Both are safe to remove once you are
+on 0.16.
 
 ## 0.15.0
 

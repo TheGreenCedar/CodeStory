@@ -418,8 +418,17 @@ fn read_publication_qualification_command(
     if bytes.len() as u64 > PUBLICATION_QUALIFICATION_MAX_CONTROL_BYTES {
         bail!("embedding_publication_qualification_control_too_large");
     }
-    let command: PublicationQualificationCommand =
-        serde_json::from_slice(&bytes).context("parse publication qualification control")?;
+    // A control file appears the moment its writer creates it, before the writer has finished
+    // filling it. The poller must not treat that window as corruption: report the control as not
+    // yet present and let the caller poll again. A genuinely malformed control stops being
+    // readable for good and surfaces as the wait timeout, which names the stuck control, rather
+    // than as a parse error whose timing depends on machine load.
+    //
+    // The trust checks above are all metadata-based and have already run, so tolerating a
+    // half-written body does not widen what this function will accept.
+    let Ok(command) = serde_json::from_slice::<PublicationQualificationCommand>(&bytes) else {
+        return Ok(None);
+    };
     if command.schema_version != PUBLICATION_QUALIFICATION_SCHEMA_VERSION
         || command.action != expected_action
     {
@@ -2230,6 +2239,60 @@ mod tests {
                     && event["clock"]["elapsed_ns"].is_u64()
             }),
             "raw events omitted their local monotonic clock or correlation"
+        );
+    }
+
+    #[test]
+    fn a_half_written_control_reads_as_absent_instead_of_failing() {
+        // The writer creates the file and then fills it, so a poller can observe it empty or torn.
+        // Treating that as corruption made every caller's success depend on how loaded the machine
+        // was, which is what made the correlated-events test flaky under the full suite.
+        let directory = TempDir::new().expect("qualification directory");
+        secure_test_directory(directory.path());
+        let path = directory.path().join("publication-resume-partial.json");
+
+        for partial in [
+            "".to_string(),
+            "{".to_string(),
+            r#"{"schema_version": 1, "nonce_sha"#.to_string(),
+        ] {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).expect("create partial control");
+            file.write_all(partial.as_bytes())
+                .expect("write partial control");
+            file.sync_all().expect("sync partial control");
+            drop(file);
+
+            assert!(
+                read_publication_qualification_command(&path, "resume_manifest_commit")
+                    .expect("a partially written control is not an error")
+                    .is_none(),
+                "partial control {partial:?} should read as absent"
+            );
+        }
+
+        // The same path still resolves once the writer completes.
+        fs::remove_file(&path).expect("clear partial control");
+        write_private_control(
+            &path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "nonce_sha256": hex_sha256(b"nonce"),
+                "correlation_id": "0123456789abcdef0123456789abcdef",
+                "action": "resume_manifest_commit"
+            }),
+        );
+        assert!(
+            read_publication_qualification_command(&path, "resume_manifest_commit")
+                .expect("read complete control")
+                .is_some(),
+            "a complete control must still resolve"
         );
     }
 

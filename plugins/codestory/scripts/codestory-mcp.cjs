@@ -437,7 +437,9 @@ function downloadFailureKind(error) {
 // before showing the same error, so the retry loop stops at the first one.
 function downloadFailurePermanent(error) {
   const kind = downloadFailureKind(error);
-  if (['size_limit', 'content_length', 'transport'].includes(kind)) return true;
+  // `publish` is a local filesystem failure after a complete transfer. Retrying re-downloads the
+  // whole asset only to fail identically at the same step, so it stops here.
+  if (['size_limit', 'content_length', 'transport', 'publish'].includes(kind)) return true;
   if (kind !== 'http_status') return false;
   const status = Number(error?.httpStatus);
   // 408/425/429 are explicitly "come back later"; every other 4xx is a fixed answer.
@@ -609,6 +611,27 @@ function downloadFileOnce(url, destination, options = {}) {
   });
 }
 
+// `rename` cannot cross filesystems, and the partial deliberately lives under the managed CLI root
+// so it survives a restart while the caller's destination may sit in a temp directory on another
+// mount. Falling back to copy-then-unlink keeps publication correct wherever the two land.
+function publishDownloadedFile(partialPath, destination) {
+  try {
+    fs.rmSync(destination, { force: true });
+    fs.renameSync(partialPath, destination);
+    return;
+  } catch (error) {
+    if (error?.code !== 'EXDEV') {
+      throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+    }
+  }
+  try {
+    fs.copyFileSync(partialPath, destination);
+    fs.rmSync(partialPath, { force: true });
+  } catch (error) {
+    throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+  }
+}
+
 function partialDownloadBytes(partialPath) {
   try {
     const metadata = fs.statSync(partialPath);
@@ -650,8 +673,7 @@ async function downloadFile(url, destination, options = {}) {
           ? (progress) => onProgress({ ...progress, attempt })
           : undefined,
       });
-      fs.rmSync(destination, { force: true });
-      fs.renameSync(partialPath, destination);
+      publishDownloadedFile(partialPath, destination);
       return;
     } catch (error) {
       lastError = error;
@@ -1735,7 +1757,10 @@ function trimManagedCliQuarantines(root, version, options = {}) {
 // Partial archives live under the managed root rather than an ephemeral temp dir so an interrupted
 // first run resumes after an MCP restart instead of starting the whole transfer over. The name is
 // dot-prefixed, so version enumeration and retention already skip it.
-function managedCliDownloadCacheDir(root, version) {
+// Every path that reads or deletes inside the download cache resolves it through here first. The
+// cache is recursively deleted from, so a symlinked `.download` would make provisioning delete
+// through it into whatever it points at.
+function managedCliDownloadCacheRoot(root) {
   const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
   if (fs.existsSync(cacheRoot)) {
     const metadata = fs.lstatSync(cacheRoot);
@@ -1743,20 +1768,28 @@ function managedCliDownloadCacheDir(root, version) {
       throw new Error('managed_cli_download_cache_not_direct');
     }
   }
-  const dir = path.join(cacheRoot, version);
+  return cacheRoot;
+}
+
+function managedCliDownloadCacheDir(root, version) {
+  const dir = path.join(managedCliDownloadCacheRoot(root), version);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
 
 function trimManagedCliDownloadCache(root, version) {
-  const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
+  let cacheRoot;
   let children;
   try {
+    cacheRoot = managedCliDownloadCacheRoot(root);
     children = fs.readdirSync(cacheRoot, { withFileTypes: true });
   } catch {
     return;
   }
   for (const child of children) {
+    // A symlinked version entry is not a partial this process created, so it is never ours to
+    // delete through.
+    if (child.isSymbolicLink()) continue;
     const childPath = path.join(cacheRoot, child.name);
     try {
       // Partials for a version we are no longer provisioning can never be resumed, and even the
@@ -1772,10 +1805,9 @@ function trimManagedCliDownloadCache(root, version) {
 
 function removeManagedCliDownloadCache(root, version) {
   try {
-    fs.rmSync(path.join(root, managedCliDownloadCacheDirName, version), {
-      recursive: true,
-      force: true,
-    });
+    const versionDir = path.join(managedCliDownloadCacheRoot(root), version);
+    if (fs.lstatSync(versionDir).isSymbolicLink()) return;
+    fs.rmSync(versionDir, { recursive: true, force: true });
   } catch {
     // Best effort: a leftover partial is trimmed on the next provisioning run.
   }
@@ -1844,16 +1876,20 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     warnings.push('managed_cli_publication:publisher');
     tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
-    const archivePath = path.join(tempRoot, asset);
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
-    let archivePartialPath;
+    // Keep the completed archive on the same filesystem as its own partial so publication is a
+    // same-directory rename. The temp root frequently sits on a different mount from the managed
+    // root, and a cross-device rename fails after the whole transfer has already succeeded.
+    let archivePath = path.join(tempRoot, asset);
+    let archivePartialPath = `${archivePath}.part`;
     try {
-      archivePartialPath = path.join(managedCliDownloadCacheDir(root, version), `${asset}.part`);
+      const downloadCacheDir = managedCliDownloadCacheDir(root, version);
+      archivePath = path.join(downloadCacheDir, asset);
+      archivePartialPath = path.join(downloadCacheDir, `${asset}.part`);
     } catch (error) {
       // A cache we cannot use costs resume, not correctness: fall back to the temp dir.
       warnings.push(`managed_cli_publication:download_cache_unavailable:${managedCliFailureCode(error)}`);
-      archivePartialPath = `${archivePath}.part`;
     }
     const resumeBytes = partialDownloadBytes(archivePartialPath);
     if (resumeBytes > 0) warnings.push(`managed_cli_publication:resume_bytes:${resumeBytes}`);
@@ -3474,6 +3510,8 @@ if (require.main === module) {
       pinnedCliContract,
       pinnedCliVersion,
       pinnedArchiveSha256,
+      publishDownloadedFile,
+      removeManagedCliDownloadCache,
       managedCliDownloadHint,
       managedCliDownloadProgress,
       managedCliProvisionFailure,

@@ -111,7 +111,7 @@ pub(crate) use readiness_commands::{
 #[cfg(test)]
 use readiness_commands::{
     build_agent_preflight_output, classify_local_refresh_failure_state,
-    local_freshness_needs_refresh,
+    local_freshness_idle_reason, local_freshness_needs_refresh,
 };
 #[cfg(test)]
 use runtime::map_api_error;

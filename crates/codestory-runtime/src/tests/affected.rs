@@ -8,6 +8,7 @@ use super::{
     classify_unmatched_affected_input_with_metadata, compose_affected_completeness,
     compose_affected_evidence_gaps, match_affected_file_identities, normalized_affected_input,
 };
+use crate::index_freshness::NotCheckedReason;
 use crate::route_coverage::{RouteHandlerCandidate, compare_route_handler_candidates};
 use crate::tests::assert_no_staged_publication_artifacts;
 use crate::{
@@ -809,6 +810,7 @@ fn affected_test_freshness(
             indexed_file_count: 1,
             duration_ms: 0,
             reason: None,
+            not_checked_cause: None,
             samples,
         },
         inventory_complete: status != IndexFreshnessStatusDto::NotChecked,
@@ -1120,7 +1122,7 @@ fn affected_indexable_absence_uses_complete_inventory_and_exact_staleness() {
     assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
 
     let incomplete = IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-        "bounded inventory",
+        NotCheckedReason::bounded("bounded inventory"),
         1,
         Instant::now(),
     ));

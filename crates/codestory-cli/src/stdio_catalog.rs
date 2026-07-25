@@ -619,6 +619,17 @@ impl SchemaObject {
         }
     }
 
+    /// The property names this schema declares.
+    ///
+    /// Used by the transport tests to check that nothing is emitted which the schema forbids.
+    #[cfg(test)]
+    pub(crate) fn declared_property_names(&self) -> Vec<&'static str> {
+        self.properties
+            .iter()
+            .map(|property| property.name)
+            .collect()
+    }
+
     const fn passthrough_object(description: &'static str) -> Self {
         Self {
             description: Some(description),
@@ -896,7 +907,7 @@ static SYMBOL_SUMMARY_SCHEMA: SchemaObject = SchemaObject::object(
     &["id", "label", "kind", "has_children"],
 );
 
-static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
+pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),

@@ -5,6 +5,11 @@ index. Install the adapter for your host, open a repository, and ask an ordinary
 code question. Repository preparation happens on the first relevant tool call;
 there is no background service for you to configure or approve.
 
+The very first call also downloads the CodeStory runtime, which is a few hundred
+megabytes because it carries the local model. It happens once per version,
+reports progress while it runs, and resumes if it is interrupted. See
+[First use downloads the runtime](troubleshooting.md#first-use-downloads-the-runtime).
+
 ## Pick your host
 
 | Host | Setup | What is automatic |
