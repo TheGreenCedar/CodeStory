@@ -1074,9 +1074,14 @@
           "preflight",
           "pre-publish-closeout"
         ],
-        "post-publish-smoke": [
+        "marketplace-publish": [
           "preflight",
           "publish"
+        ],
+        "post-publish-smoke": [
+          "preflight",
+          "publish",
+          "marketplace-publish"
         ],
         "post-publish-closeout": [
           "preflight",

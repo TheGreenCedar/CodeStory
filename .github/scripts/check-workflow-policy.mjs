@@ -1862,6 +1862,46 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
+  const marketplacePublish = requireJob(violations, releaseFile, release, "marketplace-publish");
+  add(
+    violations,
+    marketplacePublish.if === "inputs.publish_release",
+    `${releaseFile} marketplace publication must require trusted publication authority`,
+  );
+  add(
+    violations,
+    sameMembers(needs(marketplacePublish), releaseChain.dependencies["marketplace-publish"]),
+    `${releaseFile} marketplace publication dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    marketplacePublish.environment === "marketplace-publish",
+    `${releaseFile} marketplace publication must hold its cross-repository credential in its own environment`,
+  );
+  add(
+    violations,
+    marketplacePublish.permissions === undefined,
+    `${releaseFile} marketplace publication must not hold repository write permission`,
+  );
+  // The credential is minted per run and scoped to the one external repository; it must never
+  // exist in a job that also runs release code.
+  const tokenStep = namedStep(marketplacePublish, "Mint a scoped marketplace token");
+  add(
+    violations,
+    String(tokenStep?.uses ?? "").startsWith("actions/create-github-app-token@")
+      && fullSha.test(String(tokenStep?.uses ?? "").split("@")[1] ?? "")
+      && object(tokenStep?.with).owner === "TheGreenCedar"
+      && object(tokenStep?.with).repositories === "AgentPluginMarketplace",
+    `${releaseFile} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
+  );
+  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+  ]);
+  requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
+    "build-marketplace-fixture.mjs",
+    "--local-fixture true",
+  ]);
+
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
   add(violations, post.if === "inputs.publish_release", `${releaseFile} post-publish smoke must require trusted publication authority`);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
@@ -1870,7 +1910,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations,
     object(post.with).emit_release_cells === true
       && object(post.with).marketplace_revision
-        === "${{ needs.preflight.outputs.marketplace_revision }}"
+        === "${{ needs.marketplace-publish.outputs.marketplace_revision }}"
       && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
     `${releaseFile} post-publish smoke must consume the proved marketplace revision and accepted pre-publish ledger`,
   );

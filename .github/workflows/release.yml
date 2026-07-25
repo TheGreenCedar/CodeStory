@@ -215,13 +215,24 @@ jobs:
             --no-audit \
             --no-fund \
             "@openai/codex@$CODEX_CLI_VERSION"
+          # Fixture mode proves the install mechanics against a catalog pinned to THIS
+          # candidate. The live catalog still points at the previous release at this point --
+          # it is updated by marketplace-publish after publication -- so requiring a live
+          # tree match here is what forced a human to edit another repository before every
+          # merge to main.
+          fixture_root="$install_root/marketplace-fixture"
+          node .github/scripts/build-marketplace-fixture.mjs \
+            --out "$fixture_root" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA"
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-source "$fixture_root" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$marketplace_revision" \
+            --local-fixture true \
             --expected-version "$VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json" \
@@ -509,16 +520,57 @@ jobs:
             --title "CodeStory $TAG" \
             --notes-file target/release-assets/release-notes.md
 
+  marketplace-publish:
+    name: Publish the marketplace catalog
+    if: inputs.publish_release
+    needs:
+      - preflight
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: marketplace-publish
+    outputs:
+      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Mint a scoped marketplace token
+        id: token
+        uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
+        with:
+          app-id: ${{ secrets.MARKETPLACE_APP_ID }}
+          private-key: ${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}
+          owner: TheGreenCedar
+          repositories: AgentPluginMarketplace
+
+      # Publication already happened, so a failure here leaves the catalog serving the previous
+      # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      - name: Point the catalog at the published release
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+
   post-publish-smoke:
     name: Post-publish release asset smoke
     if: inputs.publish_release
     needs:
       - preflight
       - publish
+      - marketplace-publish
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      marketplace_revision: ${{ needs.preflight.outputs.marketplace_revision }}
+      marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true
     permissions:
