@@ -14,6 +14,7 @@ const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
 const sccacheVersion = "v0.16.0";
 const sccacheCacheSize = "1G";
+const windowsSccacheCacheSize = "2G";
 
 export { retrievalFile };
 
@@ -1922,6 +1923,7 @@ function validatePackagedProof(workflows, violations, graph) {
     violations,
     object(workflow.env).SCCACHE_VERSION === sccacheVersion
       && object(workflow.env).SCCACHE_CACHE_SIZE === sccacheCacheSize
+      && object(workflow.env).WINDOWS_SCCACHE_CACHE_SIZE === windowsSccacheCacheSize
       && object(workflow.env).CARGO_DEPENDENCY_CACHE_MAX_BYTES === "1073741824",
     `${file} must pin bounded compiler and dependency caches`,
   );
@@ -1968,9 +1970,12 @@ function validatePackagedProof(workflows, violations, graph) {
     '"CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV',
   ]);
   requireStepRun(violations, file, job, "Configure bounded compiler cache", [
+    'cache_size="$SCCACHE_CACHE_SIZE"',
+    'if [[ "$RUNNER_OS" == "Windows" ]]',
+    'cache_size="$WINDOWS_SCCACHE_CACHE_SIZE"',
     "CARGO_HOME=$RUNNER_TEMP/codestory-release-cargo",
     "SCCACHE_DIR=$RUNNER_TEMP/codestory-release-sccache",
-    "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE",
+    "SCCACHE_CACHE_SIZE=$cache_size",
     "RUSTC_WRAPPER=sccache",
     "CARGO_INCREMENTAL=0",
     "CMAKE_C_COMPILER_LAUNCHER=sccache",

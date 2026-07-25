@@ -394,6 +394,18 @@ node --test .github/scripts/check-workflow-policy.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
 
+Exact source and package jobs keep dependency downloads, compiler objects, and
+release artifacts separate. Compiler keys end in the exact candidate SHA but
+restore through a compatibility prefix bound to the platform, target, Rust and
+native toolchains, generator, features, lockfile, Cargo configuration, and
+relevant native inputs. A restored compiler cache still produces and verifies a
+fresh exact-head binary and archive. The isolated sccache store is bounded at
+1 GiB, except for Windows packaging's 2 GiB mixed Rust, MSVC, Vulkan, and
+embedded-model working set; dependency inputs have their own 1 GiB bound.
+Successful compilation is saved before tests, signing, packaging, or protected
+proof. Cache logs name the requested and restored keys, compatibility hit,
+restored bytes, compilation time, and save result.
+
 The base-branch retrieval lane seeds the five draft publication-proof test
 targets with serial `cargo test --no-run` commands before it saves its cache.
 Draft CI first requests the complete retrieval key, then same-topology prior-lock

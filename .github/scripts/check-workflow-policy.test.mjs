@@ -676,6 +676,9 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["packaged dependency cache loses its bound", packagedFile, workflow => {
       delete workflow.env.CARGO_DEPENDENCY_CACHE_MAX_BYTES;
     }, /must pin bounded compiler and dependency caches/u],
+    ["packaged Windows compiler cache loses its mixed-workload bound", packagedFile, workflow => {
+      workflow.env.WINDOWS_SCCACHE_CACHE_SIZE = "1G";
+    }, /must pin bounded compiler and dependency caches/u],
     ["source invalidation loses Cargo.lock", sourceFile, workflow => {
       sourceIdentity(workflow).run = sourceIdentity(workflow).run
         .replace("--lock-file Cargo.lock", "--lock-file Cargo.toml");

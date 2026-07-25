@@ -86,6 +86,7 @@ env:
   APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
   SCCACHE_VERSION: "v0.16.0"
   SCCACHE_CACHE_SIZE: "1G"
+  WINDOWS_SCCACHE_CACHE_SIZE: "2G"
   CARGO_DEPENDENCY_CACHE_MAX_BYTES: "1073741824"
 
 jobs:
@@ -169,10 +170,14 @@ jobs:
       - name: Configure bounded compiler cache
         shell: bash
         run: |
+          cache_size="$SCCACHE_CACHE_SIZE"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cache_size="$WINDOWS_SCCACHE_CACHE_SIZE"
+          fi
           {
             echo "CARGO_HOME=$RUNNER_TEMP/codestory-release-cargo"
             echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-release-sccache"
-            echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+            echo "SCCACHE_CACHE_SIZE=$cache_size"
             echo "RUSTC_WRAPPER=sccache"
             echo "CARGO_INCREMENTAL=0"
             echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
