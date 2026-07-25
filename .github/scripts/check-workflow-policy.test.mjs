@@ -1609,6 +1609,40 @@ test("protected candidate installs prove accelerated server behavior without CPU
   }
 });
 
+test("protected macOS package download is resumable and container-verified", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "macos-metal-proof.yml";
+  const mutations = [
+    ["resume removed", step => {
+      step.run = step.run.replace("--continue-at -", "--remote-name");
+    }, /Download packaged CLI artifact/u],
+    ["container digest bypassed", step => {
+      step.run = step.run.replace(
+        'test "$actual_digest" = "${expected_digest#sha256:}"',
+        "true",
+      );
+    }, /Download packaged CLI artifact/u],
+    ["producer SHA binding removed", step => {
+      step.run = step.run.replace(".workflow_run.head_sha == $sha", "true");
+    }, /Download packaged CLI artifact/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      const step = draftStep(
+        workflows.get(file).jobs["packaged-metal"],
+        "Download packaged CLI artifact",
+      );
+      mutate(step);
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
 test("post-publish proof uses an immutable real Codex marketplace install", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
