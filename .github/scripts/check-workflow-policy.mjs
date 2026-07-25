@@ -3470,6 +3470,9 @@ function validateRemainingWorkflows(workflows, violations) {
       "--expected-source-sha",
       "--expected-source-tree",
       "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
+      "$env:TEMP = $proofTemp",
+      "$env:TMP = $proofTemp",
+      "$env:TMPDIR = $proofTemp",
     ]);
     const candidateProofRun = stepRun(
       job,
