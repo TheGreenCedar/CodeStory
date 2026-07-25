@@ -288,7 +288,7 @@ jobs:
             --path "$CARGO_HOME/registry" \
             --path "$CARGO_HOME/git"
 
-      # Compatible compiler objects may cross SHAs; packaged release artifacts never do.
+      # Compiler objects may cross compatible SHAs; packaged release artifacts never do.
       - name: Restore compatible compiler objects
         id: compiler-cache-restore
         uses: actions/cache/restore@v5
