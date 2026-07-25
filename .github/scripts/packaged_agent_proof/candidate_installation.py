@@ -117,15 +117,20 @@ def _stage_candidate_installation(
             archive.name == _expected_archive_name(version, manifest["asset_target"]),
             "candidate install archive name does not match its package target",
         )
+        package_root = cli.parent
+        require(
+            package_root.parent == unpacked,
+            "candidate install archive must contain one package root",
+        )
         shutil.copytree(source_plugin, plugin_output)
         version_root = data_output / "codestory-cli" / version
-        shutil.copytree(unpacked, version_root)
+        shutil.copytree(package_root, version_root)
         write_json(
             version_root / "manifest.json",
             _managed_manifest(
                 archive,
                 manifest,
-                cli.relative_to(unpacked).as_posix(),
+                cli.relative_to(package_root).as_posix(),
                 version,
             ),
         )
