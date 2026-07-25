@@ -2,47 +2,35 @@
 
 ## Unreleased
 
-- Fixed first use failing on Linux hosts that keep `/tmp` on a separate
-  filesystem from your home directory. The runtime archive downloaded
-  successfully and then could not be moved into place, and because that looked
-  like a network problem, the whole download restarted — repeatedly, until it
-  gave up. The finished download is now kept alongside the partial it came
-  from, so it is never moved across filesystems, and a failure to store it is
-  reported as such instead of triggering another download.
-- Restored broad search on repositories with more than 25,000 files. CodeStory
-  stops checking for changes past that many files because the check itself gets
-  expensive, but it was then treating "I did not check" the same as "this index
-  is out of date" — so packet, search, context, and drill were refused
-  permanently, and re-indexing could not help. Those repositories now answer
-  again from their existing index. A refresh that is genuinely unknown or has
-  genuinely fallen behind still fails closed, and the refusal now says which of
-  the two it was. `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
-  `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the bound if you would
-  rather pay for the full check.
-- A first question that arrives while the local model is still starting now asks
-  you to try again in a moment instead of reporting the project as unavailable.
-  On a slower machine the engine often needed longer to start than the client
-  was willing to wait, and that timeout was treated as permanent.
-- The engine is also given a realistic amount of time to start. The previous
-  budgets were derived from continuous-integration machines and left a slower
-  laptop, an encrypted or network disk, or a Windows host with antivirus
-  inspection failing a first question that would have succeeded a moment later.
-- Commands that never search — indexing, symbol lookup, call trails, `--version`
-  — no longer verify the embedded model at startup. Only the first command that
-  actually needs the engine pays for it.
-- Linux and Windows start faster. Every command re-read and re-hashed the whole
-  bundled runtime several times before doing anything, and did it while holding
-  a machine-wide lock, so concurrent commands queued behind each other. The
-  runtime is now read once per command and the lock is taken only when there is
-  something to install.
-- CodeStory installed to a shared or read-only location (`sudo tar -C /opt`, a
-  locked-down Program Files install, a read-only container layer) now runs for
-  users who cannot write to it, instead of failing with a bare permission error.
-- Search results now report their real retrieval state. Every result claimed
-  `ready`, including searches that fell back to symbolic matching because
-  semantic data was not available, so an agent could not tell a full search from
-  a degraded one and would cite either as complete evidence. Results that fell
-  back now say so and name the reason.
+### Fixed
+
+- First use completes on Linux hosts that keep `/tmp` on its own filesystem.
+  Setup previously downloaded the runtime, failed to install it, and started the
+  download again until it gave up.
+- Repositories over 25,000 files can use broad search. Packet, search, context,
+  and drill were refused on them permanently, and re-indexing did not help.
+- A question asked while the local model is still starting waits for it instead
+  of reporting the project as unavailable. Slower machines, encrypted or network
+  disks, and hosts running antivirus were most affected.
+- Search results say whether they used full retrieval. Results that fell back to
+  symbolic matching reported themselves as complete, so an agent could cite
+  partial evidence as if it were whole.
+- CodeStory installed somewhere shared or read-only runs for people who cannot
+  write to that location.
+
+### Faster
+
+- Commands that do not search — indexing, symbol lookup, call trails,
+  `--version` — start immediately. Only the first command that needs the model
+  waits for it.
+- Windows and Linux start faster, and commands run at the same time no longer
+  queue behind one another.
+
+### For operators
+
+- `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
+  `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the repository size at which
+  CodeStory stops checking for changes.
 
 ## 0.16.1
 
