@@ -23,6 +23,10 @@
   you to try again in a moment instead of reporting the project as unavailable.
   On a slower machine the engine often needed longer to start than the client
   was willing to wait, and that timeout was treated as permanent.
+- The engine is also given a realistic amount of time to start. The previous
+  budgets were derived from continuous-integration machines and left a slower
+  laptop, an encrypted or network disk, or a Windows host with antivirus
+  inspection failing a first question that would have succeeded a moment later.
 - Commands that never search — indexing, symbol lookup, call trails, `--version`
   — no longer verify the embedded model at startup. Only the first command that
   actually needs the engine pays for it.
