@@ -233,10 +233,18 @@ adapter to compensate for incorrect upstream state.
   hardware, post-publish, installed-runtime, and live behavior evidence for the
   claims being shipped. A merge, tag, or downloadable archive alone is not
   release completion.
-- When Codex must observe a plugin-source change, publish the corresponding
-  update to `TheGreenCedar/AgentPluginMarketplace`, refresh the marketplace,
-  and verify the installed managed runtime path/version plus project-scoped
-  status. CodeStory repository state alone does not update the marketplace.
+- The release workflow owns marketplace publication. Its `marketplace-publish`
+  job points `TheGreenCedar/AgentPluginMarketplace` at the published commit
+  after the release exists, and post-publish smoke proves that catalog. Do not
+  hand-edit the catalog before a release; preflight proves the install path
+  against a candidate-pinned fixture and no longer requires the live catalog to
+  match an unreleased commit. If the catalog push fails, the release is still
+  complete and the catalog still serves the previous release: recover with the
+  `marketplace-sync` workflow rather than editing by hand.
+- For a local plugin-source change Codex must observe outside a release, refresh
+  the installed package and verify the managed runtime path/version plus
+  project-scoped status. CodeStory repository state alone does not update an
+  already-installed host.
 
 ## Platform and Security Notes
 

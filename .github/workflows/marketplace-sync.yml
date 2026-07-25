@@ -1,0 +1,75 @@
+name: Marketplace sync
+
+# Recovery for a release whose catalog push did not land.
+#
+# Publication and the catalog update are separate steps, so a failure between them leaves the
+# release published and the catalog still serving the previous one. That is the safe direction --
+# no user is offered a plugin that does not exist -- and this workflow closes the gap. It is
+# idempotent: re-running it against an already-synced catalog succeeds without pushing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published release version to point the catalog at, without v prefix.
+        required: true
+        type: string
+      commit:
+        description: Exact published release commit on main.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marketplace-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: marketplace-publish
+    steps:
+      - name: Checkout the published commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+
+      - name: Require a published release for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          target="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)"
+          resolved="$(git rev-parse "${{ inputs.commit }}^{commit}")"
+          if [ "$target" != "$resolved" ]; then
+            echo "::error::release $tag targets $target, not $resolved. The catalog may only point at a published release commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$resolved" origin/main; then
+            echo "::error::$resolved is not on main."
+            exit 1
+          fi
+
+      - name: Mint a scoped marketplace token
+        id: token
+        uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
+        with:
+          app-id: ${{ secrets.MARKETPLACE_APP_ID }}
+          private-key: ${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}
+          owner: TheGreenCedar
+          repositories: AgentPluginMarketplace
+
+      - name: Point the catalog at the published release
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "${{ inputs.commit }}" \
+            --version "${{ inputs.version }}"
