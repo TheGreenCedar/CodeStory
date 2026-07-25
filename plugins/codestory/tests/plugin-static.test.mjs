@@ -731,17 +731,61 @@ test("plugin package version tracks the codestory-cli release version", async ()
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
     "utf8",
   );
-  const expectedVersion = readCargoVersion(cliManifest);
+  const workspaceVersion = readCargoVersion(cliManifest);
   const manifestPaths = [
     join(pluginRoot, ".codex-plugin", "plugin.json"),
     join(pluginRoot, ".claude-plugin", "plugin.json"),
     join(pluginRoot, ".github", "plugin", "plugin.json"),
   ];
 
+  // The three host manifests always agree with each other; that is the plugin's identity.
+  const versions = [];
   for (const manifestPath of manifestPaths) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(manifest.version, expectedVersion);
+    versions.push(manifest.version);
   }
+  assert.equal(new Set(versions).size, 1, `host manifests disagree: ${versions}`);
+
+  // The pin names the CLI the plugin runs. The workspace builds that CLI, so the pin and the
+  // workspace version move together; the plugin version may only run ahead of them once the
+  // plugin-only release lane exists, and never behind.
+  const pin = JSON.parse(await readFile(join(pluginRoot, "cli-version.json"), "utf8"));
+  assert.equal(pin.schema_version, 1);
+  assert.equal(pin.cli_version, workspaceVersion, "pin must name the workspace CLI version");
+  assert.equal(pin.release_tag, `v${pin.cli_version}`);
+  const [pluginVersion] = versions;
+  assert.ok(
+    pluginVersion === pin.cli_version || semverGreater(pluginVersion, pin.cli_version),
+    `plugin ${pluginVersion} must not trail its pinned CLI ${pin.cli_version}`,
+  );
+  if (pin.archives !== undefined) {
+    const targets = Object.keys(pin.archives).sort();
+    assert.deepEqual(targets, ["linux-x64", "macos-arm64", "windows-x64"]);
+    for (const digest of Object.values(pin.archives)) {
+      assert.match(digest, /^[0-9a-f]{64}$/u);
+    }
+  }
+});
+
+function semverGreater(left, right) {
+  const parse = (value) => value.split("-")[0].split(".").map(Number);
+  const [lmaj, lmin, lpat] = parse(left);
+  const [rmaj, rmin, rpat] = parse(right);
+  if (lmaj !== rmaj) return lmaj > rmaj;
+  if (lmin !== rmin) return lmin > rmin;
+  return lpat > rpat;
+}
+
+test("the CLI version pin decides what the managed path provisions", async () => {
+  // With a valid pin, the launcher resolves the pinned version and its published digest.
+  assert.equal(launcherTest.pinnedCliVersion(), "0.16.1");
+  const pin = launcherTest.pinnedCliContract();
+  assert.equal(pin.release_tag, "v0.16.1");
+  assert.equal(
+    launcherTest.pinnedArchiveSha256("macos-arm64"),
+    pin.archives["macos-arm64"],
+  );
+  assert.equal(launcherTest.pinnedArchiveSha256("no-such-target"), null);
 });
 
 test("source setup adapters prepare and pass the canonical embedded model", async () => {

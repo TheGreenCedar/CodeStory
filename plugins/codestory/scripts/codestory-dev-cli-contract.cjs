@@ -199,10 +199,14 @@ function validateDevCliReceipt(root, options = {}) {
     }
     const binary = expectedBinaryName(options.platform);
     const expectedRelative = `bin/${binary}`;
+    // The dev CLI is built from the tree, whose workspace version follows the pinned CLI version.
+    // During a plugin-only divergence the plugin version moves ahead of the pin, so the CLI is
+    // compared against the pin when the caller supplies one.
+    const expectedCliVersion = options.expectedCliVersion || receipt.plugin_version;
     if (
       receipt.cli.path !== expectedRelative
       || receipt.cli.name !== binary
-      || receipt.cli.version !== receipt.plugin_version
+      || receipt.cli.version !== expectedCliVersion
       || !Number.isSafeInteger(receipt.cli.bytes)
       || receipt.cli.bytes <= 0
       || !sha256Pattern.test(String(receipt.cli.sha256 || ''))

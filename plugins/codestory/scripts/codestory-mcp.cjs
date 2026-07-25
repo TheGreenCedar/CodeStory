@@ -113,6 +113,57 @@ function pluginVersion() {
   return manifest && typeof manifest.version === 'string' ? manifest.version : null;
 }
 
+const SEMVER_SHAPE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+const SHA256_SHAPE = /^[0-9a-f]{64}$/u;
+const PINNED_CLI_TARGETS = ['macos-arm64', 'windows-x64', 'linux-x64'];
+
+// The plugin's own version names the package; the pin names the CLI it runs. Splitting them is
+// what lets a plugin-only release ship without cutting new native archives: the plugin version
+// moves, the pin keeps naming the already-published, already-proven CLI. When the file is absent
+// the two are the same, which is exactly the pre-pin behavior.
+//
+// A malformed pin fails closed rather than falling back: a pin that no longer parses must not
+// silently change which binary every session runs.
+function pinnedCliContract() {
+  const pinPath = path.join(pluginRoot, 'cli-version.json');
+  if (!fs.existsSync(pinPath)) return null;
+  const pin = readJson(pinPath);
+  const validShape =
+    pin &&
+    pin.schema_version === 1 &&
+    typeof pin.cli_version === 'string' &&
+    SEMVER_SHAPE.test(pin.cli_version) &&
+    pin.release_tag === `v${pin.cli_version}` &&
+    (pin.archives === undefined ||
+      (pin.archives &&
+        typeof pin.archives === 'object' &&
+        !Array.isArray(pin.archives) &&
+        Object.keys(pin.archives).every(
+          (target) =>
+            PINNED_CLI_TARGETS.includes(target) && SHA256_SHAPE.test(String(pin.archives[target])),
+        )));
+  if (!validShape) {
+    const error = new Error('managed_cli_pin_invalid');
+    error.pinInvalid = true;
+    throw error;
+  }
+  return pin;
+}
+
+function pinnedCliVersion() {
+  const pin = pinnedCliContract();
+  return pin ? pin.cli_version : pluginVersion();
+}
+
+// The expected archive digest for this target when the pin carries one. Content-addressing on top
+// of SHA256SUMS.txt: the checksums file arrives over the same channel as the archive, while the
+// pin ships inside the reviewed plugin package.
+function pinnedArchiveSha256(target) {
+  const pin = pinnedCliContract();
+  const digest = pin?.archives?.[target];
+  return typeof digest === 'string' ? digest.toLowerCase() : null;
+}
+
 function pluginCacheVersion() {
   const parent = path.basename(path.dirname(pluginRoot)).toLowerCase();
   return parent === 'codestory' ? path.basename(pluginRoot) : null;
@@ -1851,6 +1902,16 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     if (actual !== expected) {
       throw new Error(`archive_checksum_mismatch:${asset}`);
     }
+    // SHA256SUMS.txt travels over the same channel as the archive; the pin ships inside the
+    // reviewed plugin package. When the pin names this version's digest, a real release download
+    // must match it. Explicit packages (CODESTORY_PLUGIN_RELEASE_DIR and test fixtures) are
+    // legitimately different bytes, the same relaxation the manifest metadata checks apply.
+    if (buildSource === 'github_release') {
+      const pinned = pinnedArchiveSha256(target);
+      if (pinned && pinned !== actual) {
+        throw new Error(`archive_pin_mismatch:${asset}`);
+      }
+    }
     extractArchive(archivePath, extractDir);
 
     stagingDir = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
@@ -1934,8 +1995,32 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
 async function resolveCli(options = {}) {
   const version = pluginVersion();
   const warnings = [];
+  let managedVersion;
+  try {
+    managedVersion = pinnedCliVersion();
+  } catch {
+    // A pin that no longer parses must not silently change which binary runs.
+    const reason = 'managed_cli_pin_invalid';
+    warnings.push(reason);
+    return {
+      source: 'managed_unavailable',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'managed_unavailable',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      managedFailure: reason,
+      warnings,
+    };
+  }
   const devReceipt = validateDevCliReceipt(pluginRoot, {
     expectedPluginVersion: version,
+    expectedCliVersion: managedVersion,
   });
   if (process.env.CODESTORY_CLI && devReceipt.state !== 'absent') {
     const reason = 'codestory_dev_cli_ambiguous_override';
@@ -2018,7 +2103,7 @@ async function resolveCli(options = {}) {
     };
   }
 
-  const managed = await resolveManagedCli(pluginDataDir(), version, warnings, options);
+  const managed = await resolveManagedCli(pluginDataDir(), managedVersion, warnings, options);
   if (managed && managed.warning) warnings.push(managed.warning);
   if (managed && managed.path) {
     return { source: 'managed', version, warnings, ...managed };
@@ -3422,6 +3507,9 @@ if (require.main === module) {
       cleanPublicProjectPath,
       downloadFile,
       downloadFailurePermanent,
+      pinnedCliContract,
+      pinnedCliVersion,
+      pinnedArchiveSha256,
       publishDownloadedFile,
       removeManagedCliDownloadCache,
       managedCliDownloadHint,
