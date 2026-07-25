@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 
 from .foundation import ProofFailure, require
-from .native_contract_identity import verify_runtime_against_manifest
+from .native_contract_identity import (
+    verify_engine_identities_against_manifest,
+    verify_runtime_against_manifest,
+)
 from .qualification_scenario_assertions import derive_scenario_assertions
 from .self_test_full_stack_types import FullStackFixture, ServerIdentityFixture
 from .server_engine_identity import engine_identity
@@ -48,13 +51,29 @@ def _engine_runtime_test(fixture: FullStackFixture) -> dict:
         evidence["execution"] == "proven_by_live_runtime",
         "runtime contract proof failed",
     )
+    single_host = verify_engine_identities_against_manifest(
+        manifest,
+        [("ground plugin host", valid)],
+        "accelerated",
+    )
+    require(
+        single_host == evidence,
+        "single-project server proof lost native runtime contract evidence",
+    )
+    try:
+        verify_engine_identities_against_manifest(manifest, [], "accelerated")
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("empty runtime observations were accepted")
     return valid
 
 
 def _shared_snapshot_test(
     fixture: FullStackFixture,
 ) -> tuple[dict, dict, dict]:
-    manifest = fixture.manifest
+    manifest = json.loads(json.dumps(fixture.manifest))
+    manifest["runtime_executable"]["sha256"] = "b" * 64
     protocol_sha256 = fixture.protocol_sha256
     constant_set_sha256 = fixture.constant_set_sha256
     measurement_protocol_sha256 = fixture.measurement_protocol_sha256
@@ -86,7 +105,7 @@ def _shared_snapshot_test(
                 "server_instance_id": "server-1",
                 "pid": 101,
                 "process_start_id": "boot-1:101",
-                "executable_sha256": manifest["binary"]["sha256"],
+                "executable_sha256": manifest["runtime_executable"]["sha256"],
                 "executable_version": "0.0.0",
             },
             "scheduler": {
@@ -115,6 +134,16 @@ def _shared_snapshot_test(
         manifest,
         require_resident=True,
     )
+    launcher_snapshot = json.loads(json.dumps(snapshot_payload))
+    launcher_snapshot["embedding_server"]["process"]["executable_sha256"] = manifest[
+        "binary"
+    ]["sha256"]
+    try:
+        server_snapshot(launcher_snapshot, manifest, require_resident=True)
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("launcher digest was accepted as the runtime process")
     shared = shared_server_identity(first_snapshot, second_snapshot)
     require(shared["model_load_count"] == 1, "shared server identity self-test failed")
     return snapshot_payload, first_snapshot, shared

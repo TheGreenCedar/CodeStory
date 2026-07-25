@@ -11,6 +11,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/cargo-cache-contract.mjs
+      - .github/scripts/cargo-cache-contract.test.mjs
       - .github/scripts/install-codestory-marketplace-proof.mjs
       - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
@@ -73,6 +75,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/cargo-cache-contract.mjs
+      - .github/scripts/cargo-cache-contract.test.mjs
       - .github/scripts/install-codestory-marketplace-proof.mjs
       - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
@@ -165,6 +169,7 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+          node --test .github/scripts/cargo-cache-contract.test.mjs
 
       - name: Check real Codex marketplace installation
         run: node --test .github/scripts/install-codestory-marketplace-proof.test.mjs

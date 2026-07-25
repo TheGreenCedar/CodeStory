@@ -220,6 +220,13 @@ def validate_runtime_claim_scope(args: argparse.Namespace) -> None:
             "server-behavior-only proof requires a frozen non-calibration runtime tier",
         )
         require(
+            args.plugin_handoff
+            and args.project is not None
+            and not args.additional_project
+            and not args.additional_query,
+            "server-behavior-only proof requires plugin handoff and exactly one project",
+        )
+        require(
             not args.produce_qualification_evidence
             and args.qualification_evidence is None
             and args.retrieval_quality_evidence is None

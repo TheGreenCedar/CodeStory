@@ -12,6 +12,8 @@ from pathlib import Path
 from .foundation import ProofFailure, require
 from .process_identity import ExactProcessExitWaiter, process_start_identity
 from .server_cleanup import (
+    _cleanup_environment,
+    cleanup_projects,
     native_server_exit_wait_budget,
     native_server_exit_wait_required,
     remaining_native_server_exit_wait_ms,
@@ -80,6 +82,50 @@ def _exit_budget_tests() -> dict[str, int]:
     else:
         raise ProofFailure("expired native server shared exit-wait deadline passed")
     return budget
+
+
+def _cleanup_project_tests() -> None:
+    project = str(Path.cwd().resolve())
+    require(
+        cleanup_projects({"projects": [project]}) == [Path(project)]
+        and cleanup_projects({"projects": [project, project]})
+        == [Path(project), Path(project)],
+        "one- and two-project cleanup contexts were rejected",
+    )
+    for projects in ([], [project, project, project], ["relative"], [1]):
+        try:
+            cleanup_projects({"projects": projects})
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(f"invalid cleanup projects were accepted: {projects!r}")
+
+
+def _cleanup_environment_test() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="codestory-cleanup-environment-self-test-"
+    ) as raw:
+        root = Path(raw)
+        manifest_path = root / "codestory-native-manifest.json"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        cleanup = _cleanup_environment(
+            {
+                "CODESTORY_CLI": "stale-launcher",
+                "CODESTORY_PLUGIN_CLI_MANIFEST_PATH": "stale-manifest",
+            },
+            {
+                "qualification_directory": str(root),
+                "qualification_nonce": "self-test-nonce",
+                "plugin_cli_archive_sha256": "a" * 64,
+                "plugin_cli_manifest_path": str(manifest_path),
+            },
+        )
+        require(
+            "CODESTORY_CLI" not in cleanup
+            and cleanup["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] == "a" * 64
+            and cleanup["CODESTORY_PLUGIN_CLI_MANIFEST_PATH"] == str(manifest_path),
+            "final cleanup lost the split runtime package environment",
+        )
 
 
 def _retained_exit_tests(budget: dict[str, int]) -> None:
@@ -228,5 +274,7 @@ def run_process_exit_self_tests() -> None:
     target_os = _target_os()
     _observed_exit_test(target_os)
     _retained_exit_tests(_exit_budget_tests())
+    _cleanup_project_tests()
+    _cleanup_environment_test()
     _windows_exit_tests(target_os)
     _exit_timeout_test(target_os)

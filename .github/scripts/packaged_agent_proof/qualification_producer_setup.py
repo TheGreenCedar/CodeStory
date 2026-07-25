@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .contract_primitives import sha256
 from .foundation import RETRIEVAL_QUALITY_EVIDENCE_CONTRACT, ProofFailure, require
+from .native_manifest import runtime_executable_sha256
 from .publication_consistency_verifier import (
     verify_fault_recovery_consistency_raw_evidence,
 )
@@ -46,8 +47,8 @@ def prepare_qualification_producer(
         f"qualification executable is missing: {qualification_cli}",
     )
     require(
-        sha256(qualification_cli) == manifest["binary"]["sha256"],
-        "qualification executable does not match the packaged executable",
+        sha256(qualification_cli) == runtime_executable_sha256(manifest),
+        "qualification executable does not match the packaged runtime executable",
     )
     private_root = root / "qualification-suite"
     artifact_root = private_root / "artifacts"
@@ -73,7 +74,7 @@ def prepare_qualification_producer(
     }
     package = {
         "archive_sha256": archive_sha256,
-        "executable_sha256": manifest["binary"]["sha256"],
+        "executable_sha256": runtime_executable_sha256(manifest),
         "asset_target": manifest["asset_target"],
         "release_version": manifest["release_version"],
     }
@@ -88,6 +89,9 @@ def prepare_qualification_producer(
             "qualification_directory": str(private_root.resolve()),
             "qualification_nonce": nonce,
             "plugin_cli_archive_sha256": archive_sha256,
+            "plugin_cli_manifest_path": qualification_env.get(
+                "CODESTORY_PLUGIN_CLI_MANIFEST_PATH"
+            ),
             "projects": list(projects),
         }
     )

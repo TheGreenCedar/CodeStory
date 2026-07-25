@@ -83,18 +83,6 @@
       ]
     },
     {
-      "id": "target-matrix",
-      "class_prefix": "[target_matrix]",
-      "workflow": "post-publish-release-smoke.yml",
-      "job": "smoke",
-      "field": [
-        "strategy",
-        "matrix",
-        "include"
-      ],
-      "value": []
-    },
-    {
       "id": "synchronize-proof-trigger",
       "class_prefix": "[proof_identity]",
       "workflow": "source-proof.yml",

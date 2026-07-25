@@ -10,6 +10,7 @@ const receiptPluginId = 'codestory@CodeStoryDev';
 const receiptPluginName = 'codestory';
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const commitPattern = /^[0-9a-f]{40}$/u;
+const cliVersionProbeTimeoutMs = 15 * 1000;
 
 function sourceBuildTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'win32' && arch === 'x64') return 'windows-x64';
@@ -239,7 +240,7 @@ function validateDevCliReceipt(root, options = {}) {
       : spawnSync(cliPath, ['--version'], {
         encoding: 'utf8',
         shell: false,
-        timeout: 3000,
+        timeout: cliVersionProbeTimeoutMs,
         windowsHide: true,
       });
     if (probe.error || probe.status !== 0) {
@@ -283,6 +284,7 @@ function validateDevCliReceipt(root, options = {}) {
 }
 
 module.exports = {
+  cliVersionProbeTimeoutMs,
   directoryContractSha256,
   expectedBinaryName,
   pluginCacheIdentity,

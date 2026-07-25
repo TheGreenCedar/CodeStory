@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
+from .foundation import require
 from .qualification_artifact_document import _qualification_artifact_document
 from .qualification_artifact_snapshots import (
     _qualification_controls,
@@ -134,15 +134,3 @@ def qualification_artifact(
         },
         assertions,
     )
-
-
-def require_candidate_matrix_installation_source(
-    cell_id: str | None,
-    installation_source: str,
-) -> None:
-    alias = CANDIDATE_QUALIFICATION_MATRIX_ALIASES.get(cell_id)
-    if alias is not None:
-        require(
-            installation_source == alias["installation_source"],
-            "candidate qualification matrix alias requires candidate-installed provenance",
-        )

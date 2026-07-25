@@ -535,6 +535,88 @@ async function writeManagedCliFixture(dataDir, version, body = version) {
   return { cliPath, versionDir };
 }
 
+test("CLI version probe budget covers cold starts above three seconds", () => {
+  const coldStartMs = 3250;
+  const version = "0.16.0";
+  const probe = launcherTest.probeResolvedCli(
+    { path: process.execPath },
+    {
+      spawnCli(cliPath, args, options) {
+        assert.equal(cliPath, process.execPath);
+        assert.deepEqual(args, ["--version"]);
+        assert.equal(options.timeout, devCliContract.cliVersionProbeTimeoutMs);
+        assert.ok(options.timeout > coldStartMs);
+        return {
+          status: 0,
+          error: null,
+          stdout: `codestory-cli ${version}\n`,
+          stderr: "",
+        };
+      },
+    },
+  );
+
+  assert.equal(devCliContract.cliVersionProbeTimeoutMs, 15000);
+  assert.equal(probe.status, 0, probe.error);
+  assert.equal(probe.version, version);
+});
+
+test("managed probe failures stay sanitized through fail-open output", () => {
+  const hostile = "C:\\private\\candidate.exe\nuntrusted-detail";
+  const cases = [
+    {
+      probe: {
+        error: `spawnSync failed: ${hostile}`,
+        errorCode: `ETIMEDOUT:${hostile}`,
+        status: null,
+        version: null,
+      },
+      reason: "version_probe_error:ETIMEDOUT",
+    },
+    {
+      probe: { error: null, status: 7, stderr: hostile, version: null },
+      reason: "version_probe_exit:7",
+    },
+    {
+      probe: { error: null, status: 0, stdout: hostile, version: "0.15.0" },
+      reason: "version_probe_mismatch",
+    },
+  ];
+
+  for (const { probe, reason } of cases) {
+    const classified = launcherTest.managedCliVersionProbeFailure(probe, "0.16.0");
+    assert.equal(classified, reason);
+    const error = new Error(
+      `managed_cli_staging_verification_failed:${classified}:${hostile}`,
+    );
+    const code = launcherTest.managedCliFailureCode(error);
+    assert.equal(code, `managed_cli_staging_verification_failed:${reason}`);
+    const warnings = [];
+    const warning = launcherTest.recordManagedCliProvisionFailure(warnings, error);
+    assert.deepEqual(warnings, [
+      `managed_cli_publication:terminal_failure:${code}`,
+      warning,
+    ]);
+    const output = launcherTest.failOpenToolResult(
+      "ground",
+      {
+        plugin_runtime: { plugin_version: "0.16.0" },
+        managed_retrieval: { state: "unavailable" },
+        degraded_reason: warning,
+        warnings,
+        readiness: [{
+          reason: warning,
+          summary: "runtime unavailable",
+          setup: { probe_error: "generic_probe_failure" },
+        }],
+      },
+      { project: repoRoot },
+    );
+    assert.equal(output.structuredContent.failure, warning);
+    assert.doesNotMatch(JSON.stringify(output), /private|untrusted-detail/u);
+  }
+});
+
 async function writeAttestedDevPluginFixture(root, version) {
   const { cp } = await import("node:fs/promises");
   const installRoot = join(
@@ -3003,6 +3085,67 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(responses[5].result.structuredContent.code, "project_required");
     assert.equal(responses[6].result.isError, true);
     assert.equal(responses[6].result.structuredContent.code, "project_unavailable");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher preserves the managed CLI verification failure", async () => {
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-invalid-managed-cli-"));
+  const versionDir = join(dataDir, "codestory-cli", version);
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const reason = "managed_cli_verification_failed:manifest_version_mismatch";
+  const input = [
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "resources/read",
+      params: { uri: statusUri },
+    }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "ground", arguments: { project: repoRoot } },
+    }),
+  ].join("\n") + "\n";
+
+  try {
+    await mkdir(versionDir, { recursive: true });
+    await writeFile(
+      join(versionDir, "manifest.json"),
+      JSON.stringify({ version: "0.0.0" }),
+      "utf8",
+    );
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+        CODESTORY_PLUGIN_DATA: dataDir,
+        CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      cwd: repoRoot,
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.degraded_reason, reason);
+    assert.ok(status.warnings.includes(reason), JSON.stringify(status.warnings));
+    assert.equal(status.readiness[0].reason, reason);
+    assert.equal(responses[2].result.structuredContent.failure, reason);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

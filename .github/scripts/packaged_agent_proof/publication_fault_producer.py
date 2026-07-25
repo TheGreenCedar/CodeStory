@@ -46,6 +46,7 @@ def produce_product_publication_fault_evidence(
         nonce,
         fixture,
         commands,
+        executable_sha256=package["executable_sha256"],
         timeout=timeout,
     )
     final_status, final_publication, post_ranks, status_sha256, search_sha256 = (

@@ -14,7 +14,7 @@ from native_binary_contract import (
     runtime_artifact_role,
 )
 
-from .contract_primitives import sha256
+from .contract_primitives import require_sha256, sha256
 from .foundation import (
     NATIVE_ENGINE_MARKER_PREFIX,
     NATIVE_MANIFEST_FILE,
@@ -480,3 +480,20 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     _verify_model(parts, build_fields, expected_version)
     _verify_accelerator(parts, target_contract)
     return manifest
+
+
+def runtime_executable_sha256(manifest: dict) -> str:
+    runtime = manifest.get("runtime_executable")
+    require(
+        isinstance(runtime, dict),
+        "native manifest has no runtime executable descriptor",
+    )
+    return require_sha256(
+        runtime.get("sha256"),
+        "native manifest runtime executable sha256",
+    )
+
+
+def runtime_executable_path(cli: Path, manifest: dict) -> Path:
+    runtime, _directory = _runtime_path(cli.resolve(), _manifest_parts(manifest))
+    return runtime.resolve()

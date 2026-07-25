@@ -14,7 +14,6 @@ from .contract_primitives import (
     require_opaque_identifier,
     require_positive_int,
     require_sha256,
-    sha256,
     write_private_json,
 )
 from .foundation import ProofFailure, require
@@ -249,8 +248,13 @@ def run_publication_replacement_worker(
     private_root: Path,
     nonce: str,
     *,
+    executable_sha256: str,
     timeout: int,
 ) -> None:
+    executable_sha256 = require_sha256(
+        executable_sha256,
+        "publication replacement worker executable sha256",
+    )
     request_path = private_root / "publication-replacement-worker-request.json"
     output_path = private_root / "publication-replacement-worker-output.json"
     write_private_json(
@@ -258,7 +262,7 @@ def run_publication_replacement_worker(
         {
             "schema_version": 1,
             "nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
-            "executable_sha256": sha256(cli),
+            "executable_sha256": executable_sha256,
             "project": str(project.resolve()),
             "operation": "query",
             "parameters": {
@@ -296,7 +300,7 @@ def run_publication_replacement_worker(
     require(
         isinstance(output, dict)
         and output.get("schema_version") == 1
-        and output.get("executable_sha256") == sha256(cli)
+        and output.get("executable_sha256") == executable_sha256
         and output.get("error") is None,
         "publication replacement worker failed",
     )

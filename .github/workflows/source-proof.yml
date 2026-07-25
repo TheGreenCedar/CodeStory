@@ -38,6 +38,11 @@ concurrency:
   group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
   cancel-in-progress: true
 
+env:
+  SCCACHE_VERSION: "v0.16.0"
+  SCCACHE_CACHE_SIZE: "1G"
+  CARGO_DEPENDENCY_CACHE_MAX_BYTES: "1073741824"
+
 jobs:
   resolve:
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
@@ -126,29 +131,218 @@ jobs:
       - name: Install Linux Vulkan build dependencies
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
 
-      - name: Capture Rust cache identity
-        id: rust-cache-key
+      - name: Install pinned sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+          disable_annotations: true
+
+      - name: Configure bounded compiler cache
         shell: bash
         run: |
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/codestory-source-cargo"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-source-sccache"
+            echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
 
-      - name: Restore Cargo inputs and output
-        id: cargo-cache-restore
+      - name: Capture reusable build cache contract
+        id: build-cache
+        shell: bash
+        env:
+          EXACT_SHA: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          rust_version="$(rustc -Vv | sed -n 's/^release: //p')"
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          native_toolchain="$(cc --version | head -n 1 | tr -d '\r')"
+          cmake_version="$(cmake --version | sed -n 's/^cmake version //p')"
+          ninja_version="$(ninja --version 2>/dev/null || printf 'not-installed')"
+          relevant_inputs=(
+            --relevant-input .cargo/llama-dynamic-backends.cmake
+            --relevant-input .github/scripts/install-linux-vulkan-build-deps.sh
+            --relevant-input crates/codestory-llama-sys/build.rs
+            --relevant-input crates/codestory-llama-sys/model-contract.json
+            --relevant-input scripts/prepare-embedded-model.mjs
+          )
+          while IFS= read -r manifest; do
+            relevant_inputs+=(--relevant-input "$manifest")
+          done < <(git ls-files '*Cargo.toml')
+          node .github/scripts/cargo-cache-contract.mjs identity \
+            --namespace source-proof-v2 \
+            --exact-sha "$EXACT_SHA" \
+            --os "$RUNNER_OS" \
+            --target "$target" \
+            --rust-version "$rust_version" \
+            --features workspace-test-default-and-clippy-all-targets-all-features \
+            --native-toolchain "$native_toolchain" \
+            --generator unix-makefiles \
+            --cmake-version "$cmake_version" \
+            --ninja-version "$ninja_version" \
+            --sccache-version "$SCCACHE_VERSION" \
+            --lock-file Cargo.lock \
+            --cargo-config .cargo/config.toml \
+            "${relevant_inputs[@]}" \
+            --identity cargo_incremental=0
+
+      - name: Restore Cargo dependency inputs
+        id: cargo-dependency-cache
         uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-source-proof-v2-${{ needs.resolve.outputs.ref }}-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}
+            ${{ runner.temp }}/codestory-source-cargo/registry
+            ${{ runner.temp }}/codestory-source-cargo/git
+          key: ${{ steps.build-cache.outputs.dependency-key }}
+
+      - name: Report Cargo dependency cache restore
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cargo-dependency-cache.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.cargo-dependency-cache.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.dependency-key }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs restore \
+            --kind dependencies \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --cache-hit "${CACHE_HIT:-false}" \
+            --path "$CARGO_HOME/registry" \
+            --path "$CARGO_HOME/git"
+
+      - name: Restore compatible compiler objects
+        id: compiler-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-source-sccache
+          key: ${{ steps.build-cache.outputs.compiler-key }}
+          restore-keys: |
+            ${{ steps.build-cache.outputs.compiler-prefix }}
+
+      - name: Report compiler cache restore
+        id: compiler-cache-report
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.compiler-cache-restore.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.compiler-cache-restore.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.compiler-key }}
+          COMPATIBILITY_PREFIX: ${{ steps.build-cache.outputs.compiler-prefix }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs restore \
+            --kind compiler \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --compatibility-prefix "$COMPATIBILITY_PREFIX" \
+            --cache-hit "${CACHE_HIT:-false}" \
+            --path "$SCCACHE_DIR"
+
+      - name: Start compilation clock
+        id: compile-clock
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
+      - name: Compile the complete workspace test suite
+        id: compile-workspace
+        continue-on-error: true
+        run: cargo test --workspace --locked --no-run
+
+      - name: Lint every workspace target and feature once
+        id: lint-workspace
+        if: steps.compile-workspace.outcome == 'success'
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Stop compilation clock
+        id: compile-clock-stop
+        if: always() && steps.compile-workspace.outcome == 'success'
+        run: node .github/scripts/cargo-cache-contract.mjs stop
+
+      - name: Finalize compiler objects
+        if: always() && steps.compile-workspace.outcome == 'success'
+        shell: bash
+        run: |
+          sccache --show-stats
+          sccache --stop-server
+
+      - name: Bound Cargo dependency cache
+        id: cargo-dependency-cache-size
+        if: always() && steps.compile-workspace.outcome == 'success'
+        shell: bash
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs size \
+            --kind dependencies \
+            --max-bytes "$CARGO_DEPENDENCY_CACHE_MAX_BYTES" \
+            --path "$CARGO_HOME/registry" \
+            --path "$CARGO_HOME/git"
+
+      - name: Save Cargo dependency inputs
+        id: cargo-dependency-cache-save
+        if: always() && steps.compile-workspace.outcome == 'success' && steps.cargo-dependency-cache-size.outputs.within-limit == 'true' && steps.cargo-dependency-cache.outputs.cache-hit != 'true' && steps.cargo-dependency-cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/codestory-source-cargo/registry
+            ${{ runner.temp }}/codestory-source-cargo/git
+          key: ${{ steps.cargo-dependency-cache.outputs.cache-primary-key }}
+
+      - name: Start compiler cache save clock
+        id: compiler-cache-save-clock
+        if: always() && steps.compile-workspace.outcome == 'success'
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
+      - name: Save compiler objects after compilation
+        id: compiler-cache-save
+        if: always() && steps.compile-workspace.outcome == 'success' && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/codestory-source-sccache
+          key: ${{ steps.compiler-cache-restore.outputs.cache-primary-key }}
+
+      - name: Report compiler cache save
+        if: always() && steps.compile-workspace.outcome == 'success'
+        shell: bash
+        env:
+          HIT_TYPE: ${{ steps.compiler-cache-report.outputs.hit-type }}
+          MATCHED_KEY: ${{ steps.compiler-cache-restore.outputs.cache-matched-key }}
+          REQUESTED_KEY: ${{ steps.build-cache.outputs.compiler-key }}
+          COMPATIBILITY_PREFIX: ${{ steps.build-cache.outputs.compiler-prefix }}
+          RESTORED_BYTES: ${{ steps.compiler-cache-report.outputs.restored-bytes }}
+          SAVE_RESULT: ${{ steps.compiler-cache-save.outcome }}
+          STARTED_MS: ${{ steps.compile-clock.outputs.started-ms }}
+          ENDED_MS: ${{ steps.compile-clock-stop.outputs.ended-ms }}
+          SAVE_STARTED_MS: ${{ steps.compiler-cache-save-clock.outputs.started-ms }}
+        run: |
+          node .github/scripts/cargo-cache-contract.mjs save \
+            --kind compiler \
+            --requested-key "$REQUESTED_KEY" \
+            --matched-key "$MATCHED_KEY" \
+            --compatibility-prefix "$COMPATIBILITY_PREFIX" \
+            --hit-type "$HIT_TYPE" \
+            --restored-bytes "$RESTORED_BYTES" \
+            --started-ms "$STARTED_MS" \
+            --ended-ms "$ENDED_MS" \
+            --save-started-ms "$SAVE_STARTED_MS" \
+            --save-result "$SAVE_RESULT" \
+            --path "$SCCACHE_DIR"
+
+      - name: Require successful source compilation
+        if: always()
+        shell: bash
+        env:
+          COMPILE_OUTCOME: ${{ steps.compile-workspace.outcome }}
+          LINT_OUTCOME: ${{ steps.lint-workspace.outcome }}
+        run: |
+          test "$COMPILE_OUTCOME" = success
+          test "$LINT_OUTCOME" = success
 
       - name: Test the complete workspace once
         run: cargo test --workspace --locked
-
-      - name: Lint every workspace target and feature once
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Emit authenticated source release cell
         if: inputs.emit_release_cells
@@ -175,14 +369,3 @@ jobs:
           path: target/release-cells/source_behavior.json
           if-no-files-found: error
           retention-days: 30
-
-      - name: Save Cargo inputs and output
-        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
