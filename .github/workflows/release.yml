@@ -74,6 +74,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      source_proof_reused: ${{ steps.reuse.outputs.source_proof_reused }}
       tag: ${{ steps.version.outputs.tag }}
       marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
@@ -152,6 +154,44 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve reusable prior evidence
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          entries=()
+
+          # The source gate proves a tree. When dev was already gated and promoted without
+          # changing the tree, re-running it for an hour cannot reach a different answer.
+          release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          while IFS= read -r run_id; do
+            head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
+            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
+            test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
+            git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name | endswith("full-source-gate")) | select(.conclusion == "success") | .id' \
+              | grep -q . || continue
+            entries+=("source_behavior=$run_id:$head_sha")
+            echo "Reusing source proof from run $run_id (tree $release_tree)."
+            break
+          done < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+              | jq -r --arg repo "$GITHUB_REPOSITORY" \
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .conclusion == "success") | .id'
+          )
+
+          reuse="$(IFS=,; echo "${entries[*]:-}")"
+          echo "reuse=${reuse:--}" >> "$GITHUB_OUTPUT"
+          if [ -n "$reuse" ]; then
+            echo "source_proof_reused=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_proof_reused=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prove the public marketplace install path
         if: inputs.publish_release
         id: marketplace
@@ -189,6 +229,9 @@ jobs:
 
   source-proof:
     needs: preflight
+    # A completed gate for this exact tree is already authenticated evidence; the closeout
+    # consumes it through the reuse binding instead of re-running an hour of compilation.
+    if: needs.preflight.outputs.source_proof_reused != 'true'
     uses: ./.github/workflows/source-proof.yml
     with:
       ref: ${{ github.sha }}
@@ -264,6 +307,7 @@ jobs:
 
   pre-publish-closeout:
     name: Authenticate pre-publish release cells
+    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped')
     needs:
       - preflight
       - source-proof
@@ -284,6 +328,7 @@ jobs:
         id: pre-publish-provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSE_SELECTION: ${{ needs.preflight.outputs.reuse }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,6 +338,7 @@ jobs:
             --phase pre_publish \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --reuse "$REUSE_SELECTION" \
             --out target/release-closeout/trusted-pre-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-pre-publish-producers.json)"
           test -n "$artifact_ids"
