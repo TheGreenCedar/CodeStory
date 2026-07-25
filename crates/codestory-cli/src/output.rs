@@ -6,8 +6,6 @@
 //! already-computed response.
 
 use anyhow::{Context, Result, bail};
-#[cfg(test)]
-use codestory_contracts::api::IndexFreshnessStatusDto;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
@@ -20,6 +18,8 @@ use codestory_contracts::api::{
     SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto,
     SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
+#[cfg(test)]
+use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
 use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
 use serde_json::Value;
@@ -2768,7 +2768,7 @@ fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
         codestory_contracts::api::ReadinessGoalDto::LocalNavigation,
         &output.readiness,
         output.indexed,
-        output.freshness.as_ref().map(|freshness| freshness.status),
+        output.freshness.as_ref(),
         &output.retrieval_mode,
     )
 }
@@ -2778,7 +2778,7 @@ fn doctor_agent_packet_search_readiness(output: &DoctorOutput) -> &'static str {
         codestory_contracts::api::ReadinessGoalDto::AgentPacketSearch,
         &output.readiness,
         output.indexed,
-        output.freshness.as_ref().map(|freshness| freshness.status),
+        output.freshness.as_ref(),
         &output.retrieval_mode,
     )
 }
@@ -4403,7 +4403,8 @@ mod tests {
             checked_file_count: 0,
             indexed_file_count: 1,
             duration_ms: 0,
-            reason: Some("bounded inventory overflow".to_string()),
+            reason: Some("indexed inventory unavailable".to_string()),
+            not_checked_cause: Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable),
             samples: Vec::new(),
         });
 

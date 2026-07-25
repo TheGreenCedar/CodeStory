@@ -21,6 +21,8 @@ flowchart TD
 | --- | --- | --- |
 | Local files or symbols look stale | Retry `ground`, `files`, or the requested local graph tool | The tool cites the current checkout |
 | Packet/search is preparing | Retry that exact tool after its returned delay | It returns cited evidence or a clear unavailable state |
+| First use stays "preparing" for a long time | Nothing — the runtime is downloading; see [First use downloads the runtime](#first-use-downloads-the-runtime) | Progress reports rising bytes and percentage |
+| First use fails with a download error | Retry the same tool; the transfer resumes from what it already has | The download completes and the tool answers |
 | CodeStory tools are missing | Fix or reload the host MCP registration | A project-scoped CodeStory tool is visible |
 | Update installed but old runtime is active | Replace the plugin package and start a fresh host | Fresh status identifies the new CLI |
 | Automatic preparation becomes unavailable | Use local graph tools or source inspection; collect diagnostics only if needed | No unsupported broad-search claim is made |
@@ -100,6 +102,47 @@ unavailable.
 
 No macOS user needs to start a server, choose an endpoint, approve retrieval
 infrastructure, or install a model.
+
+### Windows and Linux
+
+Both select Vulkan automatically and both need a working Vulkan driver for a
+physical GPU. Production never silently falls back to CPU, so a missing or
+software-only adapter leaves broad search unavailable rather than slow.
+
+If broad search stays unavailable on a machine that has a GPU:
+
+- Confirm the vendor GPU driver is installed and current. Vulkan arrives with
+  the graphics driver, not with CodeStory.
+- On Linux, confirm the Vulkan loader and the vendor ICD are present
+  (`vulkaninfo --summary` lists the adapter your driver provides).
+- Remote desktop, virtual machines, and containers frequently expose only a
+  software adapter such as llvmpipe or SwiftShader. CodeStory rejects those on
+  purpose; the answer is a session with real GPU access, not a configuration
+  change.
+
+Local graph tools keep working throughout. Only broad search depends on the
+accelerator.
+
+## First use downloads the runtime
+
+The plugin ships as a small package and downloads the CodeStory runtime the
+first time you use it. That download is a few hundred megabytes, because the
+runtime carries the local model, and it happens once per version.
+
+While it runs, tools answer with a preparing state that reports real bytes,
+percentage, and attempt. On a slow link this legitimately takes a while.
+
+If it is interrupted, the next attempt resumes from the bytes already on disk
+rather than starting over, and partial downloads survive a restart of your agent
+host. Retrying the same tool is the whole recovery procedure.
+
+Three environment variables override the defaults if you need them:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `CODESTORY_PLUGIN_DOWNLOAD_STALL_TIMEOUT_MS` | 60000 | How long a silent connection is tolerated before the attempt fails |
+| `CODESTORY_PLUGIN_DOWNLOAD_TIMEOUT_MS` | 3600000 | Ceiling on the whole download, across attempts |
+| `CODESTORY_PLUGIN_DOWNLOAD_ATTEMPTS` | 20 | How many resuming attempts before giving up |
 
 ## Update and runtime drift
 

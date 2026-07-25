@@ -4380,11 +4380,14 @@ fn stdio_effective_freshness(
         indexed_file_count: 0,
         duration_ms: 0,
         reason: None,
+        not_checked_cause: None,
         samples: Vec::new(),
     });
     effective.status = IndexFreshnessStatusDto::Stale;
     effective.changed_file_count = effective.changed_file_count.max(1);
     effective.reason = marker.reason.clone();
+    // The dirty marker overrides to Stale, so any inherited not-checked cause no longer applies.
+    effective.not_checked_cause = None;
     if effective.samples.is_empty()
         && let Some(marker) = marker.marker.as_ref()
     {
@@ -5412,6 +5415,9 @@ fn enrich_stdio_search_result(
             "suggestions",
             "indexed_symbol_hits",
             "repo_text_hits",
+            // Already carried in the response `_meta`, and the declared output schema forbids
+            // undeclared properties, so a host that validates would reject every search result.
+            "retrieval_publication",
         ] {
             object.remove(diagnostic_field);
         }
@@ -5421,13 +5427,49 @@ fn enrich_stdio_search_result(
     value
 }
 
+/// Reduce the retrieval state to what an agent needs to judge the result, without changing it.
+///
+/// This is the one field the grounding skill tells an agent to check before trusting search
+/// evidence. Reporting a constant made a symbolic fallback -- a search that ran without semantic
+/// docs -- indistinguishable on the wire from a full hybrid search, so an agent would cite degraded
+/// results as full-retrieval proof.
 fn compact_stdio_ready_search_retrieval(value: &mut serde_json::Value) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "retrieval".to_string(),
-            serde_json::json!({"state": "ready"}),
-        );
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let retrieval = object
+        .get("retrieval")
+        .and_then(serde_json::Value::as_object);
+    let mode = retrieval
+        .and_then(|retrieval| retrieval.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("symbolic");
+    let semantic_ready = retrieval
+        .and_then(|retrieval| retrieval.get("semantic_ready"))
+        .and_then(serde_json::Value::as_bool);
+    let fallback_reason = retrieval
+        .and_then(|retrieval| retrieval.get("fallback_reason"))
+        .and_then(serde_json::Value::as_str);
+    let fallback_message = retrieval
+        .and_then(|retrieval| retrieval.get("fallback_message"))
+        .and_then(serde_json::Value::as_str);
+
+    // A hybrid search that never fell back is the only one that used the full path. `semantic_ready`
+    // is absent on some projections, so a stated fallback is what decides when it is missing.
+    let ready = mode == "hybrid" && fallback_reason.is_none() && semantic_ready != Some(false);
+    let mut compact = serde_json::Map::new();
+    compact.insert(
+        "state".to_string(),
+        serde_json::json!(if ready { "ready" } else { "degraded" }),
+    );
+    compact.insert("mode".to_string(), serde_json::json!(mode));
+    if let Some(reason) = fallback_reason {
+        compact.insert("fallback_reason".to_string(), serde_json::json!(reason));
     }
+    if let Some(message) = fallback_message {
+        compact.insert("fallback_message".to_string(), serde_json::json!(message));
+    }
+    object.insert("retrieval".to_string(), serde_json::Value::Object(compact));
 }
 
 fn compact_stdio_ground_result(mut value: serde_json::Value) -> serde_json::Value {
@@ -6392,6 +6434,114 @@ version = "0.11.20"
         );
         assert_eq!(hit["resolution_status"], "source_range_only");
         assert_eq!(hit["eligible_for_sufficiency"], false);
+    }
+
+    #[test]
+    fn a_compacted_search_result_declares_every_field_it_emits() {
+        // The output schema sets additionalProperties: false, so a host that validates
+        // structuredContent rejects the whole result over one undeclared field. Nothing checked
+        // that, and retrieval_publication was reaching the wire while only `_meta` declared it.
+        let declared = crate::stdio_catalog::SEARCH_RESULTS_SCHEMA.declared_property_names();
+        let dto = codestory_contracts::api::SearchResultsDto {
+            query: "scripted".into(),
+            // Must be populated: serde skips a None, so a None fixture cannot observe the field
+            // reaching the wire at all.
+            retrieval_publication: Some(
+                codestory_contracts::api::EmbeddingVectorPublicationIdentityDto {
+                    core_generation_id: "core-generation".into(),
+                    core_run_id: "core-run".into(),
+                    retrieval_generation: "retrieval-generation".into(),
+                    retrieval_input_hash: "retrieval-input-hash".into(),
+                    semantic_generation: "semantic-generation".into(),
+                },
+            ),
+            retrieval: codestory_contracts::api::RetrievalStateDto {
+                mode: codestory_contracts::api::RetrievalModeDto::Symbolic,
+                hybrid_configured: false,
+                semantic_ready: false,
+                semantic_mode: Default::default(),
+                semantic_doc_count: 0,
+                embedding_model: None,
+                current_embedding: None,
+                stored_embedding: None,
+                fallback_reason: None,
+                fallback_message: None,
+            },
+            retrieval_shadow: None,
+            freshness: None,
+            limit_per_source: 5,
+            repo_text_mode: Default::default(),
+            repo_text_enabled: false,
+            query_assessment: None,
+            search_plan: None,
+            repo_text_stats: None,
+            suggestions: Vec::new(),
+            indexed_symbol_hits: Vec::new(),
+            repo_text_hits: Vec::new(),
+            hits: Vec::new(),
+        };
+        let compacted = enrich_stdio_search_result(dto, std::path::Path::new("/repo"));
+        let undeclared = compacted
+            .as_object()
+            .expect("compacted search result is an object")
+            .keys()
+            .filter(|key| !declared.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "the output schema forbids additional properties, but these are emitted: {undeclared:?}"
+        );
+    }
+
+    #[test]
+    fn compact_search_retrieval_distinguishes_full_from_degraded() {
+        // Before this projection every one of these produced {"state":"ready"}, so an agent could
+        // not tell a full hybrid search from one that ran without semantic docs.
+        let mut full = json!({
+            "hits": [],
+            "retrieval": {"mode": "hybrid", "semantic_ready": true, "semantic_doc_count": 12}
+        });
+        compact_stdio_ready_search_retrieval(&mut full);
+        assert_eq!(full["retrieval"]["state"], json!("ready"));
+        assert_eq!(full["retrieval"]["mode"], json!("hybrid"));
+
+        let mut fell_back = json!({
+            "hits": [],
+            "retrieval": {
+                "mode": "symbolic",
+                "semantic_ready": false,
+                "fallback_reason": "missing_semantic_docs",
+                "fallback_message": "semantic documents are not published yet"
+            }
+        });
+        compact_stdio_ready_search_retrieval(&mut fell_back);
+        assert_eq!(fell_back["retrieval"]["state"], json!("degraded"));
+        assert_eq!(fell_back["retrieval"]["mode"], json!("symbolic"));
+        assert_eq!(
+            fell_back["retrieval"]["fallback_reason"],
+            json!("missing_semantic_docs")
+        );
+        assert_eq!(
+            fell_back["retrieval"]["fallback_message"],
+            json!("semantic documents are not published yet")
+        );
+
+        // Hybrid that reports a fallback is still degraded: the reason is what decides.
+        let mut hybrid_with_fallback = json!({
+            "hits": [],
+            "retrieval": {"mode": "hybrid", "fallback_reason": "degraded_runtime"}
+        });
+        compact_stdio_ready_search_retrieval(&mut hybrid_with_fallback);
+        assert_eq!(
+            hybrid_with_fallback["retrieval"]["state"],
+            json!("degraded")
+        );
+
+        // A missing retrieval block cannot be reported as ready.
+        let mut absent = json!({"hits": []});
+        compact_stdio_ready_search_retrieval(&mut absent);
+        assert_eq!(absent["retrieval"]["state"], json!("degraded"));
     }
 
     #[test]

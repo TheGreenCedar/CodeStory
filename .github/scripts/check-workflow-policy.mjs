@@ -980,6 +980,25 @@ export function basicWorkflowViolations(file, workflow) {
     );
   }
 
+  // Least privilege is not the repository default, so every workflow states its own scopes.
+  add(
+    violations,
+    workflow.permissions !== undefined,
+    `${file} must declare a top-level permissions block`,
+  );
+
+  // Reusable-workflow callers inherit the callee's budget and cannot set one themselves, so the
+  // rule applies only to jobs that own steps.
+  for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+    const job = object(rawJob);
+    if (!Array.isArray(job.steps)) continue;
+    add(
+      violations,
+      job["timeout-minutes"] !== undefined,
+      `${file} jobs.${jobName} must declare timeout-minutes`,
+    );
+  }
+
   walk(workflow, (key, value, trail) => {
     if (key === "key" && typeof value === "string" && value.includes("github.sha")) {
       violations.push(`${file} ${trail.join(".")} Cargo cache key must not include commit SHA`);
@@ -4064,11 +4083,173 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
   }
 }
 
+// Cargo test-name filters are substring matches: a filter that names nothing selects zero tests and
+// still exits 0, so a renamed test turns its proof lane green without running anything. `--exact`
+// does not help — libtest also exits 0 when an exact filter matches nothing. These names are
+// therefore checked statically against the crate sources they claim to select.
+const cargoValueOptions = new Set([
+  "-p",
+  "--package",
+  "--test",
+  "--bench",
+  "--example",
+  "--bin",
+  "--features",
+  "--target",
+  "--target-dir",
+  "--manifest-path",
+  "--profile",
+  "--jobs",
+  "-j",
+]);
+
+const expressionPlaceholder = "__CODESTORY_GITHUB_EXPRESSION__";
+const harnessValueOptions = new Set(["--color", "--format", "--skip", "--test-threads"]);
+
+function cargoTestFilterNames(line) {
+  // GitHub expressions expand at run time; treat each as one opaque token so an option that takes a
+  // value consumes it instead of leaving `matrix.foo` behind as a bare positional.
+  const tokens = line
+    .replace(/\$\{\{.*?\}\}/gu, expressionPlaceholder)
+    .trim()
+    .split(/\s+/u)
+    .filter(token => token !== "\\");
+  const start = tokens.findIndex(token => token === "test");
+  if (start < 0) return { package: null, filters: [], exact: false };
+  const separator = tokens.indexOf("--", start + 1);
+  const cargoTokens = tokens.slice(start + 1, separator < 0 ? undefined : separator);
+  const harnessTokens = separator < 0 ? [] : tokens.slice(separator + 1);
+
+  let packageName = null;
+  const filters = [];
+  for (let index = 0; index < cargoTokens.length; index += 1) {
+    const token = cargoTokens[index];
+    if (cargoValueOptions.has(token)) {
+      if (token === "-p" || token === "--package") packageName = cargoTokens[index + 1] ?? null;
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      const [name, value] = token.split("=");
+      if ((name === "-p" || name === "--package") && value) packageName = value;
+      continue;
+    }
+    if (token.includes(expressionPlaceholder)) continue;
+    // Cargo accepts at most one positional TESTNAME filter.
+    filters.push(token);
+    break;
+  }
+  for (let index = 0; index < harnessTokens.length; index += 1) {
+    const token = harnessTokens[index];
+    if (harnessValueOptions.has(token)) {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-") || token.includes(expressionPlaceholder)) continue;
+    filters.push(token);
+  }
+  return { package: packageName, filters, exact: harnessTokens.includes("--exact") };
+}
+
+function crateDirectories() {
+  const crateRoot = path.join(repositoryRoot, "crates");
+  const directories = new Map();
+  if (!fs.existsSync(crateRoot)) return directories;
+  for (const entry of fs.readdirSync(crateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifest = path.join(crateRoot, entry.name, "Cargo.toml");
+    if (!fs.existsSync(manifest)) continue;
+    const name = /^\s*name\s*=\s*"([^"]+)"/mu.exec(fs.readFileSync(manifest, "utf8"))?.[1];
+    if (name) directories.set(name, path.join(crateRoot, entry.name));
+  }
+  return directories;
+}
+
+function rustSourceIdentifiers(directory) {
+  const identifiers = new Set();
+  const stack = [directory];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "target") stack.push(entryPath);
+        continue;
+      }
+      if (!entry.name.endsWith(".rs")) continue;
+      const source = fs.readFileSync(entryPath, "utf8");
+      for (const match of source.matchAll(/\b(?:fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)/gu)) {
+        identifiers.add(match[1]);
+      }
+    }
+  }
+  return identifiers;
+}
+
+export function validateCargoTestFilters(
+  workflows,
+  violations,
+  directories = crateDirectories(),
+  readIdentifiers = rustSourceIdentifiers,
+) {
+  const identifierCache = new Map();
+  const identifiersFor = packageName => {
+    if (!identifierCache.has(packageName)) {
+      const directory = directories.get(packageName);
+      identifierCache.set(packageName, directory ? readIdentifiers(directory) : null);
+    }
+    return identifierCache.get(packageName);
+  };
+
+  for (const [file, workflow] of workflows) {
+    for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+      for (const [stepIndex, step] of list(object(rawJob).steps).entries()) {
+        if (typeof step?.run !== "string") continue;
+        for (const { line, number } of executableCargoLines(step.run)) {
+          if (!/^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:sudo\s+)?cargo\s+test\b/u.test(line)) continue;
+          const { package: packageName, filters, exact } = cargoTestFilterNames(line);
+          if (filters.length === 0) continue;
+          // A workspace-wide run resolves names across every crate, which this guard does not model.
+          if (!packageName) continue;
+          const identifiers = identifiersFor(packageName);
+          const location = `${file} jobs.${jobName}.steps.${stepIndex}.run:${number}`;
+          if (!identifiers) {
+            violations.push(`${location} names unknown package ${packageName}`);
+            continue;
+          }
+          for (const filter of filters) {
+            for (const segment of filter.split("::").filter(Boolean)) {
+              // Without `--exact` cargo matches substrings, so mirror that rather than demanding a
+              // whole identifier: `publication_transitions_...` legitimately selects both the
+              // `full_` and `incremental_` variants.
+              const resolved = exact
+                ? identifiers.has(segment)
+                : [...identifiers].some(identifier => identifier.includes(segment));
+              add(
+                violations,
+                resolved,
+                `${location} cargo test filter "${filter}" selects no test: ${segment} matches no fn or mod in ${packageName}`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
   }
+  validateCargoTestFilters(workflows, violations);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);

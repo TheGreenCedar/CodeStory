@@ -19,8 +19,10 @@ flowchart LR
 ```
 
 The released executable includes CodeRankEmbed Q8 and its accelerator engine.
-There is no service to start, model to download, port to manage, or retrieval
-setup to approve. Source, indexes, and queries stay local by default.
+There is no service to start, model to fetch separately, port to manage, or
+retrieval setup to approve. The plugin downloads that executable once, the first
+time you use it, and reports progress while it does. Source, indexes, and
+queries stay local by default.
 
 ## What it adds
 
@@ -135,7 +137,9 @@ Full routing: [docs/README.md](docs/README.md).
 
 Broader public-repo evidence uses the
 [`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)
-manifest across 18 pinned OSS packages. Latest recorded suite totals:
+manifest across 18 pinned OSS packages. Suite totals recorded **2026-06-17**,
+before 0.16 replaced the retrieval path, so these are a 0.15-era measurement and
+not a claim about the current release:
 
 | Metric | Without | With | Change |
 | --- | ---: | ---: | --- |

@@ -429,14 +429,14 @@
     }
   },
   "constant_selection": {
-      "selection_order": [
-        "connect_timeout_ms",
-        "spawn_convergence_timeout_ms",
-        "hard_native_no_progress_ms",
-        "watchdog_cadence_ms",
-        "request_deadlines_ms",
-        "capacity_retry_policy",
-        "election_backoff_policy"
+    "selection_order": [
+      "connect_timeout_ms",
+      "spawn_convergence_timeout_ms",
+      "hard_native_no_progress_ms",
+      "watchdog_cadence_ms",
+      "request_deadlines_ms",
+      "capacity_retry_policy",
+      "election_backoff_policy"
     ],
     "raw_source_cells": {
       "existing_owner_connect_duration": {
@@ -498,20 +498,23 @@
         "source_cells": [
           "existing_owner_connect_duration"
         ],
-        "formula": "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        "formula": "max(2000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+        "slow_host_floor_ms": 2000
       },
       "spawn_convergence_timeout_ms": {
         "source_cells": [
           "spawn_convergence_duration"
         ],
-        "formula": "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        "formula": "max(15000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+        "slow_host_floor_ms": 15000
       },
       "request_deadlines_ms": {
         "query_request_deadline_ms": {
           "source_cells": [
             "query_request_duration"
           ],
-          "formula": "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+          "formula": "max(10000,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+          "slow_host_floor_ms": 10000
         },
         "bulk_request_deadline_ms": {
           "source_cells": [
@@ -551,7 +554,8 @@
         "formula": "max(1,floor(hard_native_no_progress_ms/20))"
       }
     },
-    "post_result_formula_changes": false
+    "post_result_formula_changes": false,
+    "slow_host_floor_rationale": "The calibration matrix is hosted Linux x64 and protected macOS arm64 only, so no Windows named-pipe host and no host without SHA hardware acceleration contributes to the maxima these budgets scale. A release executable also embeds the model, and the spawned server hashes its whole image before it binds, so the spawn budget must cover a multi-hundred-megabyte read on a cold cache. 1.50x over a CI maximum does not cover that population. The floors are the pre-freeze draft values, which were the vetted conservative behavior. Thresholds are deliberately not floored: qualification keeps measuring regressions against the calibrated maxima while users get budgets sized for the slowest supported host."
   },
   "threshold_selection": {
     "minimum_clean_calibration_runs_per_matrix_cell": 3,

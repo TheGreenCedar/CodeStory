@@ -202,10 +202,12 @@ adapter to compensate for incorrect upstream state.
   the selected claim is proved or the user says the evidence is sufficient,
   preserve the artifacts and stop. Signing, notarization, checksums, and
   publication remain owned by the canonical release workflow.
-- `crates/codestory-cli/Cargo.toml` is the release version source. Synchronize
-  every `codestory-*` workspace crate, `Cargo.lock`, the
-  `producer.version` in `crates/codestory-llama-sys/model-contract.json`, and
-  these plugin manifests:
+- `crates/codestory-cli/Cargo.toml` is the release version source. Bump every
+  surface with `node scripts/bump-version.mjs --version <version>`, which writes
+  all of them and then runs the release validator; `--check` reports drift
+  without writing. Do not edit them by hand. The surfaces are every
+  `codestory-*` workspace crate, `Cargo.lock`, the `producer.version` in
+  `crates/codestory-llama-sys/model-contract.json`, and these plugin manifests:
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`

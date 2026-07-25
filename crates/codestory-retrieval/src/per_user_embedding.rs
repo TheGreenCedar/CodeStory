@@ -17,6 +17,7 @@ mod transport;
 
 pub use client::{
     PerUserEmbeddingClient, PerUserEmbeddingResidencyLease, install_embedding_client_transport,
+    install_embedding_client_transport_factory,
 };
 pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,

@@ -84,6 +84,6 @@ def _verify_calibration_freeze_record(
         and record["calibration_freeze_digest"] == freeze_digest
         and sorted(record["run_artifact_sha256s"]) == digests
         and record["selection_rule"]
-        == "all_preregistered_clean_runs_no_outlier_removal",
+        == "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1",
         "constant-set freeze record does not bind the exact recomputed calibration bundle",
     )
