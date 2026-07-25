@@ -2452,10 +2452,24 @@ function validatePostPublish(workflows, violations) {
   add(
     violations,
     pythonSetup?.uses === "actions/setup-python@v7.0.0"
+      && pythonSetup?.if === "runner.os != 'macOS'"
       && object(pythonSetup?.with)["python-version"] === "3.13"
       && object(pythonSetup?.env).PSExecutionPolicyPreference === "Bypass",
     `${file} must install pinned Python with the protected Windows execution policy`,
   );
+  const macosPythonSetup = namedStep(job, "Install pinned Python on macOS");
+  add(
+    violations,
+    macosPythonSetup?.if === "runner.os == 'macOS'"
+      && macosPythonSetup?.shell === "bash",
+    `${file} must install pinned Python through the protected macOS user toolchain`,
+  );
+  requireStepRun(violations, file, job, "Install pinned Python on macOS", [
+    "uv python install 3.13.14",
+    'python_bin="$(uv python find 3.13.14)"',
+    "platform.python_version()",
+    'echo "$shim_dir" >> "$GITHUB_PATH"',
+  ]);
   const expected = expectedPostPublishRows();
   add(
     violations,
@@ -2487,7 +2501,14 @@ function validatePostPublish(workflows, violations) {
     '--marketplace-revision "$marketplace_revision"',
     '--source-repository "$GITHUB_WORKSPACE"',
     "install-attestation-v2.json",
+    'isolated_home="$install_root/isolated-home"',
+    'HOME="$isolated_home" node',
   ]);
+  add(
+    violations,
+    namedStep(job, "Prove packaged version, help, and stdio shape")?.shell === "bash",
+    `${file} packaged Python proof must use Bash on every protected platform`,
+  );
   const resolveRun = executableRunText(String(resolveInstalled?.run ?? ""));
   for (const forbidden of [
     "git archive",
