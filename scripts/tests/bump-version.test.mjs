@@ -68,6 +68,19 @@ function fixtureRoot(version) {
     )}\n`,
   );
   writeFileSync(
+    path.join(root, "plugins/codestory/cli-version.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        cli_version: version,
+        release_tag: `v${version}`,
+        archives: { "macos-arm64": "a".repeat(64) },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
     path.join(root, "CHANGELOG.md"),
     `# Changelog\n\n## Unreleased\n\n- something user visible\n\n## ${version}\n\nolder notes\n`,
   );
@@ -127,6 +140,7 @@ test("--check reports every surface that has not been bumped", () => {
       "crates/codestory-cli/Cargo.toml",
       "plugins/codestory/.codex-plugin/plugin.json",
       "crates/codestory-llama-sys/model-contract.json",
+      "plugins/codestory/cli-version.json",
       "CHANGELOG.md",
       "Cargo.lock",
     ]) {

@@ -207,7 +207,8 @@ adapter to compensate for incorrect upstream state.
   all of them and then runs the release validator; `--check` reports drift
   without writing. Do not edit them by hand. The surfaces are every
   `codestory-*` workspace crate, `Cargo.lock`, the `producer.version` in
-  `crates/codestory-llama-sys/model-contract.json`, and these plugin manifests:
+  `crates/codestory-llama-sys/model-contract.json`, the CLI version pin in
+  `plugins/codestory/cli-version.json`, and these plugin manifests:
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`

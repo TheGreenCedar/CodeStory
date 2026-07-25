@@ -37,6 +37,7 @@ const PLUGIN_MANIFESTS = [
 
 const MODEL_CONTRACT = "crates/codestory-llama-sys/model-contract.json";
 const CHANGELOG = "CHANGELOG.md";
+const CLI_VERSION_PIN = "plugins/codestory/cli-version.json";
 const CARGO_LOCK = "Cargo.lock";
 
 function fail(message) {
@@ -155,6 +156,22 @@ function main() {
   rewrite(
     MODEL_CONTRACT,
     (source) => setJsonVersion(source, version, ["producer", "version"]),
+    changes,
+    { check },
+  );
+  // A native release publishes new archives, so the pin follows the release version and its
+  // digests are dropped: they do not exist until the release builds them. The plugin fast lane
+  // re-adds digests when it pins an already-published CLI.
+  rewrite(
+    CLI_VERSION_PIN,
+    (source) => {
+      const pin = JSON.parse(source);
+      if (pin.cli_version === version) return source;
+      delete pin.archives;
+      pin.cli_version = version;
+      pin.release_tag = `v${version}`;
+      return `${JSON.stringify(pin, null, 2)}\n`;
+    },
     changes,
     { check },
   );
