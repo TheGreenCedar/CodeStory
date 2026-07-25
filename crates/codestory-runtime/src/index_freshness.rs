@@ -1,6 +1,7 @@
 use super::{
     AffectedOperationIdentityIndex, ApiError, CURRENT_SCHEMA_VERSION, HashMap, HashSet,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessObservation,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
+    IndexFreshnessObservation,
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, Path, PathBuf, RefreshExecutionPlan,
     RefreshInputs, SourceIndexPolicy, Storage, WorkspaceInventoryOutcome, WorkspaceManifest,
     WorkspaceMemberIndexDto, WorkspacePathIdentity, clamp_u128_to_u32, clamp_usize_to_u32,
@@ -12,8 +13,8 @@ use std::cell::RefCell;
 use std::io;
 use std::time::{Instant, UNIX_EPOCH};
 
-const INDEX_FRESHNESS_INDEXED_FILE_CAP: usize = 25_000;
-const INDEX_FRESHNESS_CURRENT_FILE_CAP: usize = 25_000;
+const INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT: usize = 25_000;
+const INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT: usize = 25_000;
 const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
 const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
 #[cfg(test)]
@@ -38,8 +39,57 @@ fn run_after_index_freshness_fence_test_hook() {
     }
 }
 
+fn bounded_cap(variable: &str, default: usize) -> usize {
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(default)
+}
+
+fn indexed_file_cap() -> usize {
+    bounded_cap(
+        "CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP",
+        INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT,
+    )
+}
+
+fn current_file_cap() -> usize {
+    bounded_cap(
+        "CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP",
+        INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT,
+    )
+}
+
+/// A freshness check that produced no verdict, carrying why.
+///
+/// Callers need the distinction: hitting a discovery bound leaves the publication complete and
+/// usable, while a check that could not run proves nothing.
+pub(super) struct NotCheckedReason {
+    detail: String,
+    cause: IndexFreshnessNotCheckedCauseDto,
+}
+
+impl NotCheckedReason {
+    /// Discovery hit a deliberate size bound. Drift is unknown; the publication is not implicated.
+    pub(super) fn bounded(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            cause: IndexFreshnessNotCheckedCauseDto::BoundedInventory,
+        }
+    }
+
+    /// The check could not run. Nothing about the publication is established.
+    pub(super) fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            cause: IndexFreshnessNotCheckedCauseDto::InventoryUnavailable,
+        }
+    }
+}
+
 pub(super) fn not_checked_index_freshness(
-    reason: impl Into<String>,
+    reason: NotCheckedReason,
     indexed_file_count: u32,
     started_at: Instant,
 ) -> IndexFreshnessDto {
@@ -51,7 +101,8 @@ pub(super) fn not_checked_index_freshness(
         checked_file_count: 0,
         indexed_file_count,
         duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
-        reason: Some(reason.into()),
+        reason: Some(reason.detail),
+        not_checked_cause: Some(reason.cause),
         samples: Vec::new(),
     }
 }
@@ -187,31 +238,38 @@ fn validate_index_freshness_publication(
 
 fn load_index_freshness_inventory(
     storage: &Storage,
-) -> Result<IndexFreshnessInventory, (String, u32)> {
+) -> Result<IndexFreshnessInventory, (NotCheckedReason, u32)> {
     let files = storage
         .get_files()
-        .map_err(|error| (format!("failed to read indexed file inventory: {error}"), 0))?;
+        .map_err(|error| {
+            (
+                NotCheckedReason::unavailable(format!(
+                    "failed to read indexed file inventory: {error}"
+                )),
+                0,
+            )
+        })?;
     let indexed_file_count = clamp_usize_to_u32(files.len());
     if files.is_empty() {
         return Err((
-            "no indexed file inventory is available yet".to_string(),
+            NotCheckedReason::unavailable("no indexed file inventory is available yet"),
             indexed_file_count,
         ));
     }
-    if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
+    let indexed_cap = indexed_file_cap();
+    if files.len() > indexed_cap {
         return Err((
-            format!(
-                "indexed file inventory exceeds bounded freshness cap ({} > {})",
+            NotCheckedReason::bounded(format!(
+                "indexed file inventory exceeds bounded freshness cap ({} > {indexed_cap})",
                 files.len(),
-                INDEX_FRESHNESS_INDEXED_FILE_CAP
-            ),
+            )),
             indexed_file_count,
         ));
     }
 
     let stored_files = storage.files().inventory().map_err(|error| {
         (
-            format!("failed to read refresh inventory: {error}"),
+            NotCheckedReason::unavailable(format!("failed to read refresh inventory: {error}")),
             indexed_file_count,
         )
     })?;
@@ -221,7 +279,9 @@ fn load_index_freshness_inventory(
         .collect::<HashMap<_, _>>();
     let stored_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
         (
-            format!("failed to read source policy exclusions: {error}"),
+            NotCheckedReason::unavailable(format!(
+                "failed to read source policy exclusions: {error}"
+            )),
             indexed_file_count,
         )
     })?;
@@ -246,14 +306,17 @@ fn plan_index_freshness(
     workspace: &WorkspaceManifest,
     inventory: &IndexFreshnessInventory,
     policy: &SourceIndexPolicy,
-) -> Result<IndexFreshnessPlan, String> {
+) -> Result<IndexFreshnessPlan, NotCheckedReason> {
+    let current_cap = current_file_cap();
     let refresh = workspace
         .build_execution_outcome_bounded_with_policy(
             &inventory.refresh_inputs,
-            INDEX_FRESHNESS_CURRENT_FILE_CAP,
+            current_cap,
             policy,
         )
-        .map_err(|error| format!("failed to check workspace inventory: {error}"))?;
+        .map_err(|error| {
+            NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
+        })?;
     if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         let detail = refresh
             .refresh
@@ -261,14 +324,15 @@ fn plan_index_freshness(
             .first()
             .map(|issue| format!("{}: {}", issue.path.display(), issue.message));
         return Err(match detail {
-            Some(detail) => format!(
+            // A named issue is a real discovery failure, not the size bound.
+            Some(detail) => NotCheckedReason::unavailable(format!(
                 "current workspace inventory is {:?}: {detail}",
                 refresh.refresh.inventory_outcome
-            ),
-            None => format!(
-                "current workspace inventory is {:?} (>{})",
-                refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
-            ),
+            )),
+            None => NotCheckedReason::bounded(format!(
+                "current workspace inventory is {:?} (>{current_cap})",
+                refresh.refresh.inventory_outcome
+            )),
         });
     }
 
@@ -453,12 +517,15 @@ where
                     reason: Some(
                         "previous_incremental_run_incomplete_full_refresh_required".to_string(),
                     ),
+                    not_checked_cause: None,
                     samples: Vec::new(),
                 })
             }
             IndexFreshnessFenceFailure::Unavailable(reason) => {
                 IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-                    reason, 0, started_at,
+                    NotCheckedReason::unavailable(reason),
+                    0,
+                    started_at,
                 ))
             }
         };
@@ -512,6 +579,7 @@ where
             indexed_file_count: inventory.indexed_file_count,
             duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
             reason: None,
+            not_checked_cause: None,
             samples: changes.samples,
         },
         inventory_complete: identity.gap_count == 0,
@@ -730,4 +798,70 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
     }
     Storage::open_read_only(path)
         .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+}
+
+#[cfg(test)]
+mod bounded_cap_tests {
+    use super::*;
+    use crate::process_env_test_lock;
+
+    #[test]
+    fn caps_default_but_remain_operator_overridable() {
+        let _lock = process_env_test_lock();
+        // SAFETY: the process-wide env lock serializes every test that reads or writes env vars.
+        unsafe {
+            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP");
+            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP");
+        }
+        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
+        assert_eq!(current_file_cap(), INDEX_FRESHNESS_CURRENT_FILE_CAP_DEFAULT);
+
+        // A repository past the default bound has no other way to restore a real drift check.
+        unsafe {
+            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "120000");
+            std::env::set_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP", "120000");
+        }
+        assert_eq!(indexed_file_cap(), 120_000);
+        assert_eq!(current_file_cap(), 120_000);
+
+        // Nonsense never silently disables the bound.
+        unsafe {
+            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "0");
+        }
+        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
+        unsafe {
+            std::env::set_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP", "not-a-number");
+        }
+        assert_eq!(indexed_file_cap(), INDEX_FRESHNESS_INDEXED_FILE_CAP_DEFAULT);
+
+        unsafe {
+            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP");
+            std::env::remove_var("CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP");
+        }
+    }
+
+    #[test]
+    fn a_bound_and_a_failure_are_recorded_as_different_causes() {
+        let started_at = Instant::now();
+        let bounded = not_checked_index_freshness(
+            NotCheckedReason::bounded("indexed file inventory exceeds bounded freshness cap"),
+            30_000,
+            started_at,
+        );
+        assert_eq!(bounded.status, IndexFreshnessStatusDto::NotChecked);
+        assert_eq!(
+            bounded.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+        );
+
+        let unavailable = not_checked_index_freshness(
+            NotCheckedReason::unavailable("failed to read indexed file inventory"),
+            0,
+            started_at,
+        );
+        assert_eq!(
+            unavailable.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable)
+        );
+    }
 }

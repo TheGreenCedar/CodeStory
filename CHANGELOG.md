@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Restored broad search on repositories with more than 25,000 files. CodeStory
+  stops checking for changes past that many files because the check itself gets
+  expensive, but it was then treating "I did not check" the same as "this index
+  is out of date" — so packet, search, context, and drill were refused
+  permanently, and re-indexing could not help. Those repositories now answer
+  again from their existing index. A refresh that is genuinely unknown or has
+  genuinely fallen behind still fails closed, and the refusal now says which of
+  the two it was. `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
+  `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the bound if you would
+  rather pay for the full check.
+
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.

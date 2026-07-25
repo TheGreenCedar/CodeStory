@@ -21,6 +21,7 @@ use crate::{
     indexable_source_path_in_workspace, not_checked_index_freshness, process_env_test_lock,
     resolve_project_file_path_from_root, stored_file_coverage_diagnostics,
 };
+use crate::index_freshness::NotCheckedReason;
 use codestory_contracts::api::{IndexMode, OpenProjectRequest};
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
@@ -809,6 +810,7 @@ fn affected_test_freshness(
             indexed_file_count: 1,
             duration_ms: 0,
             reason: None,
+            not_checked_cause: None,
             samples,
         },
         inventory_complete: status != IndexFreshnessStatusDto::NotChecked,
@@ -1120,7 +1122,7 @@ fn affected_indexable_absence_uses_complete_inventory_and_exact_staleness() {
     assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
 
     let incomplete = IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-        "bounded inventory",
+        NotCheckedReason::bounded("bounded inventory"),
         1,
         Instant::now(),
     ));

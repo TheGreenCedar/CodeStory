@@ -4380,11 +4380,14 @@ fn stdio_effective_freshness(
         indexed_file_count: 0,
         duration_ms: 0,
         reason: None,
+        not_checked_cause: None,
         samples: Vec::new(),
     });
     effective.status = IndexFreshnessStatusDto::Stale;
     effective.changed_file_count = effective.changed_file_count.max(1);
     effective.reason = marker.reason.clone();
+    // The dirty marker overrides to Stale, so any inherited not-checked cause no longer applies.
+    effective.not_checked_cause = None;
     if effective.samples.is_empty()
         && let Some(marker) = marker.marker.as_ref()
     {
