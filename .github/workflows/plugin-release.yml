@@ -1,0 +1,226 @@
+name: Plugin release
+
+# The plugin fast lane: publishes a plugin whose pin names an already-published,
+# already-proven CLI. No native build, signing, or hardware proof runs here, and
+# no lower-tier claim is emitted for them: native claims are inherited from the
+# pinned release and re-verified by digest, never re-proven.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Plugin version being released, without v prefix.
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: plugin-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  workflow-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+      - name: Enforce workflow policy
+        run: node .github/scripts/check-workflow-policy.mjs
+
+  preflight:
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      pinned_cli_version: ${{ steps.pin.outputs.pinned_cli_version }}
+      marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_caller="$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main"
+          if [ "$GITHUB_EVENT_NAME" != "push" ] || [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_WORKFLOW_REF" != "$expected_caller" ]; then
+            echo "::error::Plugin publication authority requires the trusted reusable-workflow caller on main."
+            exit 1
+          fi
+          live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$live_head" != "$GITHUB_SHA" ]; then
+            echo "::error::main moved from release head $GITHUB_SHA to $live_head."
+            exit 1
+          fi
+
+      - name: Validate plugin-lane version synchronization
+        run: python .github/scripts/check-codestory-release.py --version "${{ inputs.version }}" --lane plugin
+
+      - name: Refuse an existing plugin release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists."
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists."
+            exit 1
+          fi
+
+      - name: Bind the pin to the published CLI release
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+          const pin = JSON.parse(fs.readFileSync("plugins/codestory/cli-version.json", "utf8"));
+          const url = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${pin.release_tag}/SHA256SUMS.txt`;
+          const sums = execFileSync("curl", ["-sSL", "--fail", url], { encoding: "utf8" });
+          const published = new Map(
+            sums.trim().split("\n").map((line) => {
+              const [digest, name] = line.trim().split(/\s+/u);
+              return [name, digest];
+            }),
+          );
+          const targets = {
+            "macos-arm64": `codestory-cli-v${pin.cli_version}-macos-arm64.tar.gz`,
+            "windows-x64": `codestory-cli-v${pin.cli_version}-windows-x64.zip`,
+            "linux-x64": `codestory-cli-v${pin.cli_version}-linux-x64.tar.gz`,
+          };
+          for (const [target, asset] of Object.entries(targets)) {
+            const pinned = pin.archives?.[target];
+            const live = published.get(asset);
+            if (!pinned || !live || pinned !== live) {
+              console.error(`::error::pin digest for ${target} (${pinned}) does not match published ${asset} (${live}).`);
+              process.exit(1);
+            }
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `pinned_cli_version=${pin.cli_version}\n`);
+          NODE
+
+      - name: Refuse a changed tool surface
+        run: |
+          set -euo pipefail
+          pin_tag="$(node -p "JSON.parse(require('fs').readFileSync('plugins/codestory/cli-version.json','utf8')).release_tag")"
+          git fetch -q --depth 1 origin "refs/tags/$pin_tag:refs/tags/$pin_tag"
+          if ! git diff --quiet "$pin_tag" HEAD -- plugins/codestory/generated-mcp-catalog.json; then
+            echo "::error::generated-mcp-catalog.json changed since $pin_tag. A changed tool surface belongs to the CLI: release through the native lane."
+            exit 1
+          fi
+
+      - name: Extract plugin release notes
+        run: |
+          set -euo pipefail
+          node .github/scripts/extract-codestory-release-notes.mjs --version "${{ inputs.version }}" > /tmp/plugin-release-notes.md
+          test -s /tmp/plugin-release-notes.md
+
+      - name: Capture the live marketplace revision
+        id: marketplace
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(git ls-remote https://github.com/TheGreenCedar/AgentPluginMarketplace.git refs/heads/main | cut -f1)"
+          test -n "$revision"
+          echo "marketplace_revision=$revision" >> "$GITHUB_OUTPUT"
+
+  plugin-proof:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-15
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run the plugin static suite
+        run: node --test plugins/codestory/tests/plugin-static.test.mjs
+
+      # The launcher provisions the pinned, already-published CLI over the real
+      # github_release path, which is the one place the pin's content addressing
+      # is enforced. A digest drift between the pin and the published archive
+      # fails here, before anything is tagged.
+      - name: Provision the pinned CLI end to end
+        run: node scripts/prove-plugin-pinned-provision.mjs --timeout-ms 1200000
+
+  publish:
+    needs: [preflight, plugin-proof]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Re-verify main before tagging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$live_head" != "$GITHUB_SHA" ]; then
+            echo "::error::main moved from release head $GITHUB_SHA to $live_head."
+            exit 1
+          fi
+
+      - name: Publish the plugin release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/extract-codestory-release-notes.mjs --version "${{ inputs.version }}" > /tmp/plugin-release-notes.md
+          gh release create "v${{ inputs.version }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "CodeStory plugin ${{ inputs.version }}" \
+            --notes-file /tmp/plugin-release-notes.md
+
+  post-publish-smoke:
+    needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prove the public marketplace install path
+        env:
+          CODEX_CLI_VERSION: "0.144.5"
+          MARKETPLACE_REVISION: ${{ needs.preflight.outputs.marketplace_revision }}
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-marketplace-postpublish"
+          codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          rm -rf "$install_root"
+          npm install \
+            --prefix "$codex_package_root" \
+            --no-audit \
+            --no-fund \
+            "@openai/codex@$CODEX_CLI_VERSION"
+          node .github/scripts/install-codestory-marketplace-proof.mjs \
+            --codex-package-root "$codex_package_root" \
+            --codex-home "$install_root/codex-home" \
+            --plugin-data "$install_root/codex-home/plugin-data" \
+            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-name TheGreenCedar \
+            --marketplace-revision "$MARKETPLACE_REVISION" \
+            --expected-version "${{ inputs.version }}" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --attestation "$install_root/install-attestation-v2.json"
