@@ -86,6 +86,26 @@ class AutoReleaseDecisionTest(unittest.TestCase):
             )
 
 
+class ReleaseLaneTest(unittest.TestCase):
+    def test_equal_versions_are_the_native_lane(self) -> None:
+        self.assertEqual(
+            detector.classify_release_lane(cli_version="0.16.1", plugin_version="0.16.1"),
+            "native",
+        )
+
+    def test_plugin_ahead_is_refused_until_the_fast_lane_exists(self) -> None:
+        # A plugin published ahead of the CLI would resolve its runtime archive to a tag
+        # that does not exist, so the detector must stop the release rather than ship it.
+        with self.assertRaises(ValueError) as caught:
+            detector.classify_release_lane(cli_version="0.16.1", plugin_version="0.16.2")
+        self.assertIn("plugin-only release lane is not implemented", str(caught.exception))
+
+    def test_plugin_behind_is_a_synchronization_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            detector.classify_release_lane(cli_version="0.16.2", plugin_version="0.16.1")
+        self.assertIn("bump-version.mjs", str(caught.exception))
+
+
 class ReleaseSynchronizationTest(unittest.TestCase):
     def test_refuses_embedded_model_producer_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

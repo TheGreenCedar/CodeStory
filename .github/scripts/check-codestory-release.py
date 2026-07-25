@@ -21,6 +21,9 @@ PLUGIN_MANIFESTS = (
     Path("plugins/codestory/.github/plugin/plugin.json"),
 )
 MODEL_CONTRACT = Path("crates/codestory-llama-sys/model-contract.json")
+CLI_VERSION_PIN = Path("plugins/codestory/cli-version.json")
+PINNED_CLI_TARGETS = ("macos-arm64", "windows-x64", "linux-x64")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def read_toml(path: Path) -> dict:
@@ -98,6 +101,42 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def validate_cli_version_pin(root: Path, expected: str) -> None:
+    """The pin names the CLI the shipped plugin downloads.
+
+    A native release publishes new archives, so the pin must name the version being
+    released; its archive digests cannot exist yet and are therefore optional here.
+    The plugin release lane owns the diverged case (plugin version ahead of the pin
+    with mandatory digests) and carries its own checks.
+    """
+    pin_path = root / CLI_VERSION_PIN
+    try:
+        pin = json.loads(pin_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{pin_path} does not exist") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{pin_path} is not valid JSON: {exc}") from exc
+    if pin.get("schema_version") != 1:
+        raise ValueError(f"{pin_path} must declare schema_version 1")
+    cli_version = pin.get("cli_version")
+    if cli_version != expected:
+        raise ValueError(
+            f"{pin_path} cli_version is {cli_version!r}, expected {expected}; "
+            "bump it with scripts/bump-version.mjs"
+        )
+    if pin.get("release_tag") != f"v{expected}":
+        raise ValueError(f"{pin_path} release_tag must be v{expected}")
+    archives = pin.get("archives")
+    if archives is not None:
+        if not isinstance(archives, dict):
+            raise ValueError(f"{pin_path} archives must be an object when present")
+        for target, digest in archives.items():
+            if target not in PINNED_CLI_TARGETS:
+                raise ValueError(f"{pin_path} archives names unknown target {target!r}")
+            if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                raise ValueError(f"{pin_path} archives[{target!r}] must be a lowercase sha256")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Validate synchronized CodeStory release version surfaces.",
@@ -130,6 +169,11 @@ def main() -> None:
     for manifest_path, current_plugin_version in plugin_versions(root).items():
         if current_plugin_version != expected:
             fail(f"{manifest_path} version is {current_plugin_version}, expected {expected}")
+
+    try:
+        validate_cli_version_pin(root, expected)
+    except ValueError as exc:
+        fail(str(exc))
 
     workspace_versions: dict[str, str] = {}
     for manifest_path in workspace_members(root):
@@ -164,9 +208,9 @@ def main() -> None:
 
     print(
         f"CodeStory release version {expected} is synchronized across "
-        f"{len(workspace_versions)} workspace crates, Cargo.lock, and "
-        f"{len(PLUGIN_MANIFESTS)} codestory plugin manifests; the embedded-model "
-        "producer matches."
+        f"{len(workspace_versions)} workspace crates, Cargo.lock, "
+        f"{len(PLUGIN_MANIFESTS)} codestory plugin manifests, and the CLI version "
+        "pin; the embedded-model producer matches."
     )
 
 
