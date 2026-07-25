@@ -26,6 +26,14 @@
 - Commands that never search — indexing, symbol lookup, call trails, `--version`
   — no longer verify the embedded model at startup. Only the first command that
   actually needs the engine pays for it.
+- Linux and Windows start faster. Every command re-read and re-hashed the whole
+  bundled runtime several times before doing anything, and did it while holding
+  a machine-wide lock, so concurrent commands queued behind each other. The
+  runtime is now read once per command and the lock is taken only when there is
+  something to install.
+- CodeStory installed to a shared or read-only location (`sudo tar -C /opt`, a
+  locked-down Program Files install, a read-only container layer) now runs for
+  users who cannot write to it, instead of failing with a bare permission error.
 
 ## 0.16.1
 
