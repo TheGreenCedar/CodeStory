@@ -4498,6 +4498,104 @@ test("release asset downloader keeps a resumable partial across separate runs", 
   }
 });
 
+// Provisioning downloads into a partial under the managed CLI root but published into a temp-dir
+// destination, so on any host whose temp dir is a separate mount (tmpfs /tmp, a redirected TMPDIR,
+// $HOME on another volume) every completed transfer died at the rename. The other download tests
+// put both paths under one mkdtemp root and cannot observe it. CI cannot either: the packaged
+// proof pins TMPDIR next to the plugin data.
+test("release asset publication survives a partial and destination on different filesystems", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-exdev-"));
+  const destination = join(dataDir, "dest", "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  await mkdir(join(dataDir, "dest"), { recursive: true });
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  let served = 0;
+  const server = createServer((request, response) => {
+    served += 1;
+    const start = Number(/^bytes=(\d+)-$/u.exec(request.headers.range || "")?.[1] ?? 0);
+    if (start >= body.length) {
+      response.writeHead(416, { "content-range": `bytes */${body.length}` });
+      response.end();
+      return;
+    }
+    response.writeHead(start > 0 ? 206 : 200, {
+      "content-length": String(body.length - start),
+      ...(start > 0
+        ? { "content-range": `bytes ${start}-${body.length - 1}/${body.length}` }
+        : {}),
+    });
+    response.end(body.subarray(start));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/runtime`;
+  const realRename = fs.renameSync;
+  try {
+    // Stand in for a cross-device publication: the transfer completes, the rename cannot.
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath) {
+        const error = new Error("EXDEV: cross-device link not permitted");
+        error.code = "EXDEV";
+        throw error;
+      }
+      return realRename(from, to);
+    };
+    await launcherTest.downloadFile(url, destination, {
+      attempts: 3,
+      timeoutMs: 5000,
+      retryDelayMs: () => 1,
+      partialPath,
+    });
+    assert.deepEqual(await readFile(destination), body);
+    assert.equal(fs.existsSync(partialPath), false);
+    // The payload transfers once. Before the fix each publication failure was classified as a
+    // retryable network error and re-downloaded the whole asset.
+    assert.equal(served, 1);
+  } finally {
+    fs.renameSync = realRename;
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a publication failure is permanent instead of restarting the transfer", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "nope", "runtime.bin");
+  await writeFile(partialPath, "payload");
+  try {
+    assert.throws(
+      () => launcherTest.publishDownloadedFile(partialPath, destination),
+      /download_publish_failed:ENOENT/u,
+    );
+    assert.equal(
+      launcherTest.downloadFailurePermanent({ downloadKind: "publish" }),
+      true,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("download cache trimming refuses to delete through a symlinked cache root", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-symlink-"));
+  const root = join(dataDir, "codestory-cli");
+  const outside = join(dataDir, "outside");
+  await mkdir(root, { recursive: true });
+  await mkdir(outside, { recursive: true });
+  await writeFile(join(outside, "keep.txt"), "precious");
+  await symlink(outside, join(root, ".download"), "dir");
+  try {
+    // Both cleanup paths resolve the cache root through the same guard, so neither follows the link.
+    launcherTest.trimManagedCliDownloadCache(root, "0.16.1");
+    launcherTest.removeManagedCliDownloadCache(root, "0.16.1");
+    assert.equal(fs.existsSync(join(outside, "keep.txt")), true);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("release asset downloader survives a transfer slower than the stall window", async () => {
   const { createServer } = await import("node:http");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-slow-"));
