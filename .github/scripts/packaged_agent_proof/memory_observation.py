@@ -17,6 +17,7 @@ from .contract_primitives import (
 from .foundation import MEMORY_EVIDENCE_CONTRACT, TARGET_CONTRACTS, require
 from .measurement_protocol import load_measurement_protocol
 from .measurement_samples import selected_qualification_matrix_cell
+from .native_manifest import runtime_executable_sha256
 from .process_identity import process_start_identity, verified_live_executable
 from .process_memory_sampling import process_resident_memory, suspend_clock_pair
 from .subprocess_control import McpProcess
@@ -47,7 +48,7 @@ def plugin_client_process(
         pid=pid,
         process_start_id=start_id,
         reported_sha256=process["executable_sha256"],
-        expected_sha256=manifest["binary"]["sha256"],
+        expected_sha256=runtime_executable_sha256(manifest),
         target_os=target_os,
         label=f"{label} client process",
     )
@@ -91,7 +92,7 @@ def _verified_process_set(
             "embedding server process_start_id",
         ),
         reported_sha256=server.get("executable_sha256"),
-        expected_sha256=manifest["binary"]["sha256"],
+        expected_sha256=runtime_executable_sha256(manifest),
         target_os=target_os,
         label="embedding server process",
     )

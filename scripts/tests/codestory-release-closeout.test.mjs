@@ -88,7 +88,6 @@ function identityFor(cell, producerRunAttempt = "1") {
       case "producer_run_id": identity[key] = "12345"; break;
       case "producer_run_attempt": identity[key] = producerRunAttempt; break;
       case "native_engine": identity[key] = "coderank_q8"; break;
-      case "calibration_sha256": identity[key] = "c".repeat(64); break;
       default: throw new Error(`test fixture has no identity value for ${key}`);
     }
   }

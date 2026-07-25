@@ -127,6 +127,19 @@ test("versioned claim graph has one deterministic digest and all declared contro
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
     ["linux-x64", "macos-arm64", "windows-x64"],
   );
+  assert.equal(graph.evidence_policy.identity_formats.calibration_sha256, undefined);
+  for (const cellId of [
+    "accelerator_execution",
+    "candidate_installed_behavior",
+    "installed_runtime_behavior",
+  ]) {
+    assert.ok(
+      !graph.closeout.cell_groups
+        .find(({ id }) => id === cellId)
+        .required_identity.includes("calibration_sha256"),
+      `${cellId} must not claim external calibration evidence`,
+    );
+  }
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
     [
@@ -142,7 +155,6 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.proof_run_sha_expression, "${{ github.sha }}");
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
-  assert.equal(graph.workflow_policy.promotion.macos_source_cache_namespace, "macos-source-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
 });
 
@@ -267,7 +279,6 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     "proof_run_sha_expression",
     "manual_pr_ref_hint",
     "source_cache_namespace",
-    "macos_source_cache_namespace",
     "packaged_cache_namespace",
   ]) {
     const incompletePromotion = structuredClone(graph);

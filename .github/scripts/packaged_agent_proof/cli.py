@@ -15,9 +15,6 @@ from .contract_primitives import (
     validate_runtime_claim_scope,
 )
 from .foundation import DEFAULT_QUERY, DEFAULT_QUESTION, MEASUREMENT_PROTOCOL, require
-from .qualification_artifacts import (
-    require_candidate_matrix_installation_source,
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,27 +109,6 @@ def _resolve_optional_paths(args: argparse.Namespace) -> None:
             setattr(args, field, value.resolve())
 
 
-def _installed_proof_source(args: argparse.Namespace) -> str:
-    if args.installed_plugin_attestation is None:
-        return "marketplace"
-    attestation = json.loads(
-        args.installed_plugin_attestation.read_text(encoding="utf-8")
-    )
-    require(
-        isinstance(attestation, dict),
-        "installed plugin attestation must be an object",
-    )
-    source = {
-        "candidate_archive": "candidate",
-        "codex_marketplace_install": "marketplace",
-    }.get(attestation.get("installation_source"))
-    require(
-        source is not None,
-        "installed plugin attestation has an invalid installation source",
-    )
-    return source
-
-
 def _prepare_proof_arguments(args: argparse.Namespace) -> None:
     require(
         args.archive and args.checksum_file and args.expected_version,
@@ -149,10 +125,6 @@ def _prepare_proof_arguments(args: argparse.Namespace) -> None:
     require(
         args.calibration_run_output is None or args.proof_tier == "calibration",
         "calibration run output is valid only for the calibration proof tier",
-    )
-    require_candidate_matrix_installation_source(
-        args.qualification_matrix_cell,
-        _installed_proof_source(args),
     )
     validate_runtime_claim_scope(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)

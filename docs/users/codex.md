@@ -7,14 +7,24 @@ tool call still names its repository explicitly.
 
 ## Requirements
 
-- Apple Silicon macOS 15 or later, or Windows x64;
+- One of the supported platform and accelerator combinations below;
 - Node.js available to the plugin adapter; and
 - a fresh Codex session after installing or replacing the plugin package.
 
-Apple Silicon broad search uses Metal; Windows x64 uses Vulkan. The packaged CLI
-contains its model and embedding engine, so normal use needs no Docker, external
-embedding endpoint, model download, or Xcode toolchain. Building CodeStory from
-source has separate [contributor
+<!-- codestory-public-support:start -->
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
+<!-- codestory-public-support:end -->
+
+The packaged CLI contains its model and embedding engine, so normal use needs
+no Docker, external embedding endpoint, model download, or Xcode toolchain.
+Building CodeStory from source has separate [contributor
 prerequisites](../contributors/getting-started.md#prerequisites).
 
 ## Install

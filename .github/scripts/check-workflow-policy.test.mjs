@@ -11,7 +11,6 @@ import {
   draftWorkflowPolicyViolations,
   loadWorkflows,
   macosCliDistributionViolations,
-  managedPluginViolations,
   notaryStepViolations,
   packagedPrSigningViolations,
   parseWorkflow,
@@ -55,22 +54,13 @@ function draftStep(job, name) {
   return matches[0];
 }
 
-function moveNamedStepBefore(job, movedName, beforeName) {
+function moveNamedStepAfter(job, movedName, afterName) {
   const movedIndex = job.steps.findIndex(step => step.name === movedName);
   assert.notEqual(movedIndex, -1, `missing ${movedName}`);
   const [moved] = job.steps.splice(movedIndex, 1);
-  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
-  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
-  job.steps.splice(beforeIndex, 0, moved);
-}
-
-function cloneCacheSaveBefore(job, sourceName, beforeName, uses) {
-  const clone = structuredClone(draftStep(job, sourceName));
-  clone.name = `${sourceName} clone`;
-  if (uses !== undefined) clone.uses = uses;
-  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
-  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
-  job.steps.splice(beforeIndex, 0, clone);
+  const afterIndex = job.steps.findIndex(step => step.name === afterName);
+  assert.notEqual(afterIndex, -1, `missing ${afterName}`);
+  job.steps.splice(afterIndex + 1, 0, moved);
 }
 
 function runResolver(file, jobName, environment) {
@@ -138,28 +128,6 @@ function windowsManifestJob(workflow) {
 
 function windowsManifestStep(workflow, name) {
   return draftStep(windowsManifestJob(workflow), name);
-}
-
-function managedJob() {
-  return {
-    strategy: { "fail-fast": false, matrix: { include: [{ os: "ubuntu-latest" }] } },
-    steps: [
-      {
-        name: "Prove managed plugin handoff",
-        env: { CODESTORY_EMBED_ALLOW_CPU: "1" },
-        run: [
-          "python .github/scripts/check-packaged-agent-proof.py",
-          "--archive package.tar.gz",
-          "--plugin-handoff",
-          "--engine-policy cpu_explicit",
-          "--expected-backend CPU",
-          "--offline",
-          "--ground-only",
-          "--timeout-secs 1800",
-        ].join(" "),
-      },
-    ],
-  };
 }
 
 function releaseEvidenceApprovalBoundary() {
@@ -265,7 +233,6 @@ test("release workflows retain the closeout coordinator contract test", () => {
   for (const [file, jobName] of [
     ["plugin-static.yml", "plugin-static"],
     ["release.yml", "workflow-policy"],
-    ["auto-release.yml", "workflow-policy"],
   ]) {
     const workflows = loadWorkflows();
     const step = workflows.get(file).jobs[jobName].steps.find(
@@ -488,10 +455,11 @@ test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before 
   });
 });
 
-test("exact proof policy rejects trigger, identity, and cache downgrades", async (t) => {
+test("exact proof policy rejects trigger and identity downgrades", async (t) => {
   const sourceFile = "source-proof.yml";
   const packagedCoordinatorFile = "packaged-platform-pr.yml";
   const packagedProofFile = "packaged-platform-proof.yml";
+  const linuxVulkanFile = "linux-vulkan-proof.yml";
   const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
   const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
 
@@ -592,13 +560,27 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
     ["exact integration Linux scope removed", packagedCoordinatorFile, workflow => {
       const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
       step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
-    }, /integration must preserve explicit hosted and Linux scopes/u],
+    }, /integration must preserve explicit no-op and Linux scopes/u],
     ["release evidence runs implicitly", packagedCoordinatorFile, workflow => {
       workflow.jobs["release-evidence"].if = "needs.route.outputs.mode != 'calibration'";
     }, /optional release evidence must run only in explicit release-evidence mode/u],
     ["package waits for release evidence", packagedCoordinatorFile, workflow => {
       workflow.jobs["packaged-proof"].needs.push("release-evidence");
     }, /package proof must not depend on optional release evidence/u],
+    ["protected Linux proof removed", packagedCoordinatorFile, workflow => {
+      workflow.jobs["linux-vulkan-proof"].uses = "./.github/workflows/packaged-platform-proof.yml";
+    }, /Linux proof must use the protected Vulkan workflow/u],
+    ["protected Linux candidate proof disabled", packagedCoordinatorFile, workflow => {
+      workflow.jobs["linux-vulkan-proof"].with.candidate_installed_proof = false;
+    }, /Linux proof must close Vulkan and candidate-installed claims/u],
+    ["manual Linux candidate trusts a non-producer", linuxVulkanFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.candidate_producer_workflow_path.default
+        = ".github/workflows/release.yml";
+    }, /manual candidate proof must trust the package-producing workflow/u],
+    ["closeout skips protected Linux", packagedCoordinatorFile, workflow => {
+      workflow.jobs.closeout.needs = workflow.jobs.closeout.needs
+        .filter(name => name !== "linux-vulkan-proof");
+    }, /closeout must wait for every selected platform proof/u],
     ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
       workflow.jobs.closeout.needs.push("release-evidence");
     }, /normal closeout must not depend on optional release evidence/u],
@@ -606,100 +588,44 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
     }, /matrix must select structural JSON by scope/u],
-    ["Linux candidate install guard removed", packagedProofFile, workflow => {
-      const step = draftStep(workflow.jobs.build, "Stage isolated candidate-managed Linux install");
-      step.if += " && inputs.quality_evidence_artifact != ''";
-    }, /without optional quality evidence/u],
-    ["source unversioned cache", sourceFile, workflow => {
-      const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
-      restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
-    }, /versioned exact-SHA namespace/u],
-    ["source broad cache fallback", sourceFile, workflow => {
-      draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output")
-        .with["restore-keys"] = "Linux-source-proof-";
-    }, /must not use fallback restore keys/u],
-    ["source cache always-save", sourceFile, workflow => {
-      draftStep(workflow.jobs["full-source-gate"], "Save Cargo inputs and output").if
-        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
-    }, /save only a successful exact miss/u],
-    ["source cache save before final proof", sourceFile, workflow => {
-      moveNamedStepBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-      );
-    }, /source cache unique cache save must run after every proof step/u],
-    ["source cache clone before proof", sourceFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-      );
-    }, /source cache must contain exactly one actions\/cache\/save action/u],
-    ["source mixed-case cache clone before proof", sourceFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["full-source-gate"],
-        "Save Cargo inputs and output",
-        "Test the complete workspace once",
-        "Actions/Cache/Save@v5",
-      );
-    }, /source cache must contain exactly one actions\/cache\/save action/u],
-    ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
-      const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
-      restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
-    }, /macOS source cache must be an exact-SHA restore/u],
-    ["macOS source cache save before final proof", packagedCoordinatorFile, workflow => {
-      moveNamedStepBefore(
-        workflow.jobs["macos-source"],
-        "Save exact-head macOS source cache",
-        "Capture Rust cache identity",
-      );
-    }, /macOS source cache unique cache save must run after every proof step/u],
-    ["macOS source cache clone before proof", packagedCoordinatorFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["macos-source"],
-        "Save exact-head macOS source cache",
-        "Capture Rust cache identity",
-      );
-    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
-    ["macOS source mixed-case cache clone before proof", packagedCoordinatorFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs["macos-source"],
-        "Save exact-head macOS source cache",
-        "Capture Rust cache identity",
-        "Actions/Cache/Save@v5",
-      );
-    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
-    ["packaged cache loses exact SHA", packagedProofFile, workflow => {
-      const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
-      restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
-    }, /native build cache.*exact SHA/u],
-    ["packaged cache always-save", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Save Cargo registry, git sources, and build output").if
-        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
-    }, /save only a successful exact miss/u],
-    ["packaged cache save before final proof", packagedProofFile, workflow => {
-      moveNamedStepBefore(
+    ["package evaluation driver reaches the standard path", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Build qualification driver").if
+        = "matrix.asset_target == 'linux-x64'";
+    }, /packaged-platform-proof\.yml/u],
+    ["package evaluation reaches the standard path", packagedProofFile, workflow => {
+      const step = draftStep(
         workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
+        "Packaged per-user server calibration or qualification",
       );
-    }, /native build cache unique cache save must run after every proof and cleanup step/u],
-    ["packaged cache clone before proof", packagedProofFile, workflow => {
-      cloneCacheSaveBefore(
+      step.if = "matrix.asset_target == 'linux-x64'";
+    }, /packaged-platform-proof\.yml/u],
+    ["package evaluation downloads calibration on the standard path", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Authenticate calibration bundle producer").if
+        = "matrix.asset_target == 'linux-x64'";
+      draftStep(workflow.jobs.build, "Download frozen calibration bundle").if
+        = "matrix.asset_target == 'linux-x64'";
+    }, /packaged-platform-proof\.yml/u],
+    ["package evaluation artifact upload reaches the standard path", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload packaged agent proof artifacts").if
+        = "always() && matrix.asset_target == 'linux-x64'";
+    }, /packaged-platform-proof\.yml/u],
+    ["package calibration artifact escapes into quality evaluation", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration runs").if
+        = "success() && matrix.asset_target == 'linux-x64'";
+    }, /hosted calibration artifact must remain calibration-only/u],
+    ["package evaluation becomes a standard server-behavior proof", packagedProofFile, workflow => {
+      draftStep(
         workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
-      );
-    }, /native build cache must contain exactly one actions\/cache\/save action/u],
-    ["packaged mixed-case cache clone before proof", packagedProofFile, workflow => {
-      cloneCacheSaveBefore(
-        workflow.jobs.build,
-        "Save Cargo registry, git sources, and build output",
-        "Build codestory-cli",
-        "Actions/Cache/Save@v5",
-      );
-    }, /native build cache must contain exactly one actions\/cache\/save action/u],
+        "Packaged per-user server calibration or qualification",
+      ).run += "\n--server-behavior-only";
+    }, /optional hosted CPU lane must remain evaluation-only/u],
+    ["package workflow reclaims candidate-installed proof", packagedProofFile, workflow => {
+      workflow.on.workflow_call.inputs.candidate_installed_proof = {
+        required: false,
+        default: false,
+        type: "boolean",
+      };
+    }, /package-only workflow must not define candidate_installed_proof/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
@@ -712,26 +638,311 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
   }
 });
 
-test("hosted Linux calibration keeps its bounded per-run timeout", async (t) => {
+test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
-  for (const [name, replacement] of [
-    ["removed", ""],
-    ["shortened", "--timeout-secs 900"],
-  ]) {
+  const sourceFile = "source-proof.yml";
+  const packagedFile = "packaged-platform-proof.yml";
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const releaseFile = "release.yml";
+  const sourceJob = workflow => workflow.jobs["full-source-gate"];
+  const packagedJob = workflow => workflow.jobs.build;
+  const sourceIdentity = workflow =>
+    draftStep(sourceJob(workflow), "Capture reusable build cache contract");
+  const packagedIdentity = workflow =>
+    draftStep(packagedJob(workflow), "Capture reusable build cache contract");
+
+  const mutations = [
+    ["source compiler restore becomes exact-SHA-only", sourceFile, workflow => {
+      draftStep(sourceJob(workflow), "Restore compatible compiler objects")
+        .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";
+    }, /source-proof\.yml compiler cache must restore the newest compatible prior candidate/u],
+    ["packaged compiler restore becomes exact-SHA-only", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore compatible compiler objects")
+        .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";
+    }, /packaged-platform-proof\.yml compiler cache must restore the newest compatible prior candidate/u],
+    ["packaged dependency restore accepts stale inputs", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore Cargo dependency inputs")
+        .with["restore-keys"] = "codestory-release-dependencies-";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["source dependency cache escapes isolation", sourceFile, workflow => {
+      draftStep(sourceJob(workflow), "Restore Cargo dependency inputs")
+        .with.path = "~/.cargo/registry\n~/.cargo/git";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["packaged dependency cache escapes isolation", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Restore Cargo dependency inputs")
+        .with.path = "~/.cargo/registry\n~/.cargo/git";
+    }, /dependency cache must be exact-input-only and exclude compiler output/u],
+    ["packaged dependency cache loses its bound", packagedFile, workflow => {
+      delete workflow.env.CARGO_DEPENDENCY_CACHE_MAX_BYTES;
+    }, /must pin bounded compiler and dependency caches/u],
+    ["packaged Windows compiler cache loses its mixed-workload bound", packagedFile, workflow => {
+      workflow.env.WINDOWS_SCCACHE_CACHE_SIZE = "1G";
+    }, /must pin bounded compiler and dependency caches/u],
+    ["source invalidation loses Cargo.lock", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("--lock-file Cargo.lock", "--lock-file Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses Cargo config", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("--cargo-config .cargo/config.toml", "--cargo-config Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses feature set", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace(
+          "--features workspace-test-default-and-clippy-all-targets-all-features",
+          "--features default",
+        );
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["source invalidation loses workspace manifests", sourceFile, workflow => {
+      sourceIdentity(workflow).run = sourceIdentity(workflow).run
+        .replace("git ls-files '*Cargo.toml'", "printf '%s\\n' Cargo.toml");
+    }, /source-proof\.yml must compute one reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Rust version", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--rust-version "$rust_version"', "--rust-release ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses target", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--target "${{ matrix.rust_target }}"', "--architecture ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses feature set", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--features codestory-cli-default-features", "--features default");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses native toolchain", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--native-toolchain "$native_toolchain"', "--toolchain ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses generator", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--generator "$generator"', "--build-system ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses CMake", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--cmake-version "$cmake_version"', "--cmake ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Ninja", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--ninja-version "$ninja_version"', "--ninja ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Cargo.lock", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--lock-file Cargo.lock", "--lock-file Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Cargo config", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("--cargo-config .cargo/config.toml", "--cargo-config Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses workspace manifests", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("git ls-files '*Cargo.toml'", "printf '%s\\n' Cargo.toml");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Windows native installer", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/scripts/install-windows-vulkan-sdk.ps1", "ignored-windows-input");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux Dockerfile", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/docker/linux-glibc-build.Dockerfile", ".github/docker/ignored.Dockerfile");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux glslc inputs", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(".github/docker/glslc", ".github/docker/ignored-glslc");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux build image", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("LINUX_GLIBC_BUILD_IMAGE", "UNPINNED_BUILD_IMAGE");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged invalidation loses Linux glslc image", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace("LINUX_GLSLC_IMAGE", "UNPINNED_GLSLC_IMAGE");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["packaged workload variants collide", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace('--identity "qualification_driver=$qualification_driver"', "--workload ignored");
+    }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["source compiler cache waits for tests", sourceFile, workflow => {
+      moveNamedStepAfter(
+        sourceJob(workflow),
+        "Save compiler objects after compilation",
+        "Test the complete workspace once",
+      );
+    }, /source-proof\.yml compiler cache must save before test execution or release-cell failure/u],
+    ["packaged compiler cache waits for protected regression", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Test immutable native staging on Windows",
+      );
+    }, /compiler cache must save before late Test immutable native staging on Windows failure/u],
+    ["packaged compiler cache waits for signing", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Sign and notarize macOS CLI",
+      );
+    }, /compiler cache must save before late Sign and notarize macOS CLI failure/u],
+    ["packaged compiler cache waits for packaging", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Save compiler objects after compilation",
+        "Package release asset",
+      );
+    }, /compiler cache must save before late Package release asset failure/u],
+    ["packaged compile timer includes cache uploads", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Stop compilation clock",
+        "Save compiler objects after compilation",
+      );
+    }, /compile and compiler-cache-save timings must cover only their named stages/u],
+    ["source compile telemetry omits its end boundary", sourceFile, workflow => {
+      const report = draftStep(sourceJob(workflow), "Report compiler cache save");
+      report.run = report.run.replace('--ended-ms "$ENDED_MS" \\\n', "");
+    }, /step Report compiler cache save must run --ended-ms/u],
+    ["source cache restores Cargo target output", sourceFile, workflow => {
+      const restore = draftStep(sourceJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\ntarget";
+    }, /source-proof\.yml cache paths must exclude Cargo target and exact proof outputs/u],
+    ["packaged cache restores release-dist", packagedFile, workflow => {
+      const restore = draftStep(packagedJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\nrelease-dist";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["packaged cache restores an exact archive", packagedFile, workflow => {
+      const restore = draftStep(packagedJob(workflow), "Restore compatible compiler objects");
+      restore.with.path += "\n/tmp/codestory-linux-x64.tar.gz";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["packaged cache saves proof output", packagedFile, workflow => {
+      const save = draftStep(packagedJob(workflow), "Save compiler objects after compilation");
+      save.with.path += "\ntarget/notarization-proof";
+    }, /packaged-platform-proof\.yml cache paths must exclude Cargo target, native seeds, models, proofs, and exact archives/u],
+    ["package dispatch mode is removed", coordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.mode.options
+        = workflow.on.workflow_dispatch.inputs.mode.options.filter(mode => mode !== "package");
+    }, /packaged-platform-pr\.yml dispatch modes changed/u],
+    ["package mode skips archive construction", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].if = workflow.jobs["packaged-proof"].if
+        .replace("needs.route.outputs.mode == 'package' || ", "");
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["package mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = true;
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["qualification mode disables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = false;
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["platform mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux
+        = "${{ needs.route.outputs.mode == 'platform' }}";
+    }, /package and platform modes must build fresh archives while only qualification runs the cold Linux boundary/u],
+    ["package mode enables protected Metal proof", coordinatorFile, workflow => {
+      workflow.jobs["macos-metal-proof"].if = workflow.jobs["macos-metal-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Metal proof/u],
+    ["package mode enables protected Windows proof", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].if = workflow.jobs["windows-vulkan-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Windows proof/u],
+    ["package mode enables protected Linux proof", coordinatorFile, workflow => {
+      workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
+        .replace("needs.route.outputs.mode != 'package' &&", "");
+    }, /package-only mode must skip protected Linux proof/u],
+    ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
+      workflow.jobs["calibration-linux"].with.hermetic_linux = true;
+    }, /hosted Linux calibration must call packaged proof in calibration mode/u],
+    ["package matrix repeats frozen Linux qualification", packagedFile, workflow => {
+      packagedJob(workflow).steps.push(structuredClone(draftStep(
+        workflow.jobs["frozen-linux-qualification"],
+        "Prove fresh-target Node-absent network-denied Cargo release boundary",
+      )));
+    }, /matrix package jobs must not repeat the frozen Linux Cargo boundary/u],
+    ["frozen Linux qualification becomes unconditional", packagedFile, workflow => {
+      workflow.jobs["frozen-linux-qualification"].if = "always()";
+    }, /frozen Linux Cargo boundary must be one explicit post-package job/u],
+    ["frozen Linux qualification restores exact archives", packagedFile, workflow => {
+      workflow.jobs["frozen-linux-qualification"].steps.push({
+        name: "Restore exact package archive",
+        uses: "actions/cache/restore@v5",
+        with: {
+          path: "release-dist/codestory-linux-x64.tar.gz",
+          key: "forbidden-exact-archive",
+        },
+      });
+    }, /frozen Linux fresh-target qualification must not restore compiler output/u],
+    ["Linux compiler cache exits with an active server", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace("/sccache/sccache --stop-server", "true");
+    }, /step Build Linux x64 at the glibc 2\.31 baseline must run \/sccache\/sccache --stop-server/u],
+    ["package checkout accepts a fallback SHA", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Checkout").with.ref = "${{ inputs.ref || github.sha }}";
+    }, /package jobs must checkout only the requested exact SHA/u],
+    ["package smoke loses source identity", packagedFile, workflow => {
+      const smoke = draftStep(packagedJob(workflow), "Smoke packaged release asset");
+      smoke.run = smoke.run.replace(
+        '--expected-source-sha "${{ steps.source-identity.outputs.sha }}" \\\n',
+        "",
+      );
+    }, /step Smoke packaged release asset must run --expected-source-sha/u],
+    ["fresh package identity is reported after upload", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Report fresh package identity",
+        "Upload release asset",
+      );
+    }, /must report a verified fresh archive identity before upload/u],
+    ["release repeats frozen Linux qualification", releaseFile, workflow => {
+      workflow.jobs["packaged-proof"].with.hermetic_linux = true;
+    }, /release\.yml main release must not repeat frozen-candidate Linux qualification/u],
+  ];
+
+  for (const [name, file, mutate, expectedReason] of mutations) {
     await t.test(name, () => {
       const workflows = loadWorkflows();
-      const packaged = workflows.get("packaged-platform-proof.yml");
-      const step = draftStep(
-        packaged.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      step.run = step.run.replace("--timeout-secs 1800", replacement);
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
 
-      assert.match(
-        validateWorkflows(workflows).join("\n"),
-        /step Packaged per-user server calibration or qualification must run --timeout-secs 1800/u,
+test("standard release paths reject calibration plumbing", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const mutations = [
+    ["auto-release forwards calibration", workflows => {
+      workflows.get("auto-release.yml").jobs.release.with.calibration_bundle_artifact
+        = "${{ vars.CODESTORY_CALIBRATION_BUNDLE_ARTIFACT }}";
+    }, /auto-release\.yml standard release path must not reference calibration/u],
+    ["release accepts calibration input", workflows => {
+      workflows.get("release.yml").on.workflow_call.inputs.calibration_bundle_artifact = {
+        required: true,
+        type: "string",
+      };
+    }, /release\.yml standard release path must not reference calibration/u],
+    ["release forwards calibration to package proof", workflows => {
+      workflows.get("release.yml").jobs["packaged-proof"].with.calibration_bundle_run_id
+        = "${{ inputs.calibration_bundle_run_id }}";
+    }, /release\.yml standard release path must not reference calibration/u],
+    ["post-publish proof receives calibration", workflows => {
+      const step = draftStep(
+        workflows.get("post-publish-release-smoke.yml").jobs.smoke,
+        "Prove the catalog-resolved published runtime",
       );
+      step.run += '\n--calibration-bundle "$calibration_bundle"';
+    }, /post-publish-release-smoke\.yml standard release path must not reference calibration/u],
+    ["accelerator cell claims calibration identity", workflows => {
+      const step = draftStep(
+        workflows.get("macos-metal-proof.yml").jobs["packaged-metal"],
+        "Emit authenticated Metal release cell",
+      );
+      step.run += "\ncalibration_sha256=forged";
+    }, /must not run calibration/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
     });
   }
 });
@@ -1179,15 +1390,22 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
 
   const packagedFile = "packaged-platform-proof.yml";
   const protectedFile = "windows-vulkan-proof.yml";
-  const packagedIdentity = workflow => draftStep(workflow.jobs.build, "Capture Rust cache key");
-  const packagedCache = workflow => draftStep(
+  const packagedIdentity = workflow => draftStep(
     workflow.jobs.build,
-    "Restore Cargo registry, git sources, and build output",
+    "Capture reusable build cache contract",
+  );
+  const packagedCacheSetup = workflow => draftStep(
+    workflow.jobs.build,
+    "Configure bounded compiler cache",
   );
   const packagedBuild = workflow => draftStep(workflow.jobs.build, "Build codestory-cli");
   const packagedShortTarget = workflow => draftStep(
     workflow.jobs.build,
     "Configure short Windows Cargo target",
+  );
+  const packagedNativeStaging = workflow => draftStep(
+    workflow.jobs.build,
+    "Test immutable native staging on Windows",
   );
   const protectedSourceTools = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
@@ -1209,16 +1427,16 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
   const mutations = [
     ["packaged CMake identity removed", packagedFile, workflow => {
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
-        .replace(/.*cmake --version.*\n/u, "");
-    }, /native build identity must include cmake/u],
+        .replace('--cmake-version "$cmake_version"', "--cmake ignored");
+    }, /must compute one complete reusable compiler compatibility contract/u],
     ["packaged Ninja identity removed", packagedFile, workflow => {
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
-        .replace(/.*ninja --version.*\n/u, "");
-    }, /native build identity must include ninja/u],
+        .replace('--ninja-version "$ninja_version"', "--ninja ignored");
+    }, /must compute one complete reusable compiler compatibility contract/u],
     ["packaged Ninja selection removed", packagedFile, workflow => {
-      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+      packagedCacheSetup(workflow).run = packagedCacheSetup(workflow).run
         .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
-    }, /native build identity must include CMAKE_GENERATOR=Ninja/u],
+    }, /Configure bounded compiler cache/u],
     ["packaged short Windows target made cross-platform", packagedFile, workflow => {
       packagedShortTarget(workflow).if = "runner.os != 'Windows'";
     }, /short Cargo target must be Windows-only/u],
@@ -1238,34 +1456,12 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("| Out-File -FilePath $env:GITHUB_ENV", "| Write-Output");
     }, /Configure short Windows Cargo target/u],
-    ["packaged identity made conditional", packagedFile, workflow => {
-      packagedIdentity(workflow).if = "runner.os != 'Windows'";
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity made optional", packagedFile, workflow => {
-      packagedIdentity(workflow)["continue-on-error"] = true;
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity cloned", packagedFile, workflow => {
-      workflow.jobs.build.steps.push(structuredClone(packagedIdentity(workflow)));
-    }, /native build identity must be unique, unconditional/u],
-    ["packaged identity moved after build", packagedFile, workflow => {
-      const steps = workflow.jobs.build.steps;
-      const identityIndex = steps.findIndex(step => step.name === "Capture Rust cache key");
-      const [identity] = steps.splice(identityIndex, 1);
-      const buildIndex = steps.findIndex(step => step.name === "Build codestory-cli");
-      steps.splice(buildIndex + 1, 0, identity);
-    }, /native build identity must run immediately after Rust selection/u],
-    ["packaged generator-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-${{ steps.rust-cache-key.outputs.generator }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
-    ["packaged CMake-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-cmake-${{ steps.rust-cache-key.outputs.cmake }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
-    ["packaged Ninja-free cache", packagedFile, workflow => {
-      packagedCache(workflow).with.key = packagedCache(workflow).with.key
-        .replace("-ninja-${{ steps.rust-cache-key.outputs.ninja }}", "");
-    }, /native build cache must bind generator, CMake, Ninja/u],
+    ["packaged native staging regression made cross-platform", packagedFile, workflow => {
+      packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
+    }, /immutable native staging regression must run on Windows/u],
+    ["packaged native staging regression removed", packagedFile, workflow => {
+      packagedNativeStaging(workflow).run = "cargo test --release --locked";
+    }, /Test immutable native staging on Windows/u],
     ["packaged build overrides generator", packagedFile, workflow => {
       packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
     }, /native package build must not override the selected generator/u],
@@ -1351,154 +1547,65 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
   }
 });
 
-test("Windows candidate-installed proof remains distinct and provenance-bound", async (t) => {
+test("protected candidate installs prove accelerated server behavior without CPU fallback", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
-  const coordinatorFile = "packaged-platform-pr.yml";
-  const protectedFile = "windows-vulkan-proof.yml";
-  const releaseFile = "release.yml";
-  const candidateStage = workflow => draftStep(
-    workflow.jobs["packaged-vulkan"],
-    "Stage isolated candidate-managed Windows install",
-  );
-  const candidateProof = workflow => draftStep(
-    workflow.jobs["packaged-vulkan"],
-    "Prove two-host candidate-installed Windows runtime",
-  );
-  const candidateUpload = workflow => draftStep(
-    workflow.jobs["packaged-vulkan"],
-    "Upload candidate-installed Windows proof",
-  );
-
-  const mutations = [
-    ["coordinator opt-in removed", coordinatorFile, workflow => {
-      delete workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof;
-    }, /accepted PR Windows package into candidate-installed proof/u],
-    ["coordinator server-only scope removed", coordinatorFile, workflow => {
-      delete workflow.jobs["windows-vulkan-proof"].with.server_behavior_only;
-    }, /Windows proof must use bounded retrieval readiness/u],
-    ["coordinator quality artifact bypasses producer result", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact
-        = "${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}";
-    }, /Windows proof must not consume optional quality evidence/u],
-    ["release disables candidate-installed proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
-    ["release suppresses physical Vulkan proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = true;
-    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
-    ["release reintroduces quality evaluation", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = false;
-    }, /without optional quality evidence/u],
-    ["explicit opt-in removed", protectedFile, workflow => {
-      delete workflow.on.workflow_call.inputs.candidate_installed_proof;
-    }, /candidate-installed proof must be an explicit opt-in/u],
-    ["server-only opt-in removed", protectedFile, workflow => {
-      delete workflow.on.workflow_call.inputs.server_behavior_only;
-    }, /server-behavior-only claim scope must be an explicit opt-in/u],
-    ["candidate staging loses server-only route", protectedFile, workflow => {
-      candidateStage(workflow).if = candidateStage(workflow).if
-        .replace("inputs.server_behavior_only || ", "");
-    }, /candidate-managed staging must require coordinator opt-in and remain runnable in Windows server scope/u],
-    ["candidate staging bypassed", protectedFile, workflow => {
-      candidateStage(workflow).run = candidateStage(workflow).run
-        .replace("--prepare-candidate-installed-proof", "--version-only");
-    }, /Stage isolated candidate-managed Windows install/u],
-    ["candidate tier weakened", protectedFile, workflow => {
-      candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--proof-tier installed_runtime", "--proof-tier protected_hardware");
-    }, /Prove two-host candidate-installed Windows runtime/u],
-    ["candidate proof loses server-only route", protectedFile, workflow => {
-      candidateProof(workflow).if = candidateProof(workflow).if
-        .replace("inputs.server_behavior_only || ", "");
-    }, /candidate-installed proof must require coordinator opt-in and remain runnable in Windows server scope/u],
-    ["candidate installed-ground claim removed", protectedFile, workflow => {
-      candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--ground-only", "--version-only");
-    }, /Prove two-host candidate-installed Windows runtime/u],
-    ["candidate cell relabeled", protectedFile, workflow => {
-      candidateProof(workflow).run = candidateProof(workflow).run
-        .replace(
-          "candidate_installed_windows_x64_cpu",
-          "protected_windows_x64_vulkan",
-        );
-    }, /Prove two-host candidate-installed Windows runtime/u],
-    ["candidate CPU opt-in removed", protectedFile, workflow => {
-      candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
-    }, /explicit CPU execution/u],
-    ["candidate attestation removed", protectedFile, workflow => {
-      candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--installed-plugin-attestation", "--untrusted-plugin-attestation");
-    }, /Prove two-host candidate-installed Windows runtime/u],
-    ["candidate artifact loses attempt identity", protectedFile, workflow => {
-      candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
-    }, /attempt-scoped artifact/u],
-    ["server-only proof suppresses release cell", protectedFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
-        = "inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only";
-    }, /bounded server proof must retain the authenticated Vulkan release cell/u],
+  const platforms = [
+    {
+      file: "macos-metal-proof.yml",
+      job: "packaged-metal",
+      proof: "Prove candidate-installed macOS Metal runtime",
+      backend: "Metal",
+    },
+    {
+      file: "windows-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      proof: "Prove candidate-installed Windows Vulkan runtime",
+      backend: "Vulkan",
+    },
+    {
+      file: "linux-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      proof: "Prove candidate-installed Linux Vulkan runtime",
+      backend: "Vulkan",
+    },
   ];
 
-  for (const [name, file, mutate, expectedReason] of mutations) {
-    await t.test(name, () => {
-      const workflows = loadWorkflows();
-      mutate(workflows.get(file));
-      const violations = validateWorkflows(workflows);
-      assert.notDeepEqual(violations, []);
-      assert.match(violations.join("\n"), expectedReason);
-    });
-  }
-});
+  for (const platform of platforms) {
+    const mutations = [
+      ["CPU fallback enabled", step => {
+        step.env.CODESTORY_EMBED_ALLOW_CPU = "1";
+      }],
+      ["accelerated engine policy removed", step => {
+        step.run = step.run.replace("--engine-policy accelerated", "--engine-policy cpu_explicit");
+      }],
+      ["accelerator backend replaced by CPU", step => {
+        step.run = step.run.replace(`--expected-backend ${platform.backend}`, "--expected-backend CPU");
+      }],
+      ["server behavior reduced to a ground-only probe", step => {
+        step.run = step.run.replace("--server-behavior-only", "--ground-only");
+      }],
+      ["installed provenance removed", step => {
+        step.run = step.run.replace("--installed-plugin-attestation", "--installed-plugin-provenance");
+      }],
+      ["calibration is smuggled into the standard candidate proof", step => {
+        step.run += "\n--calibration-bundle forged.json";
+      }],
+    ];
 
-test("Linux x64 Vulkan proof remains protected and fail-closed", async (t) => {
-  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
-
-  const file = "linux-vulkan-proof.yml";
-  const protectedJob = workflow => workflow.jobs["packaged-vulkan"];
-  const protectedProof = workflow => draftStep(
-    protectedJob(workflow),
-    "Prove offline Linux Vulkan retrieval",
-  );
-  const candidateProof = workflow => draftStep(
-    protectedJob(workflow),
-    "Prove candidate-installed Linux Vulkan runtime",
-  );
-
-  const mutations = [
-    ["runner label drifts", workflow => {
-      protectedJob(workflow)["runs-on"][3] = "generic-vulkan";
-    }, /must use \["self-hosted","Linux","X64","codestory-linux-vulkan"\]/u],
-    ["protected CPU fallback enabled", workflow => {
-      protectedProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
-    }, /protected proof must reject CPU fallback/u],
-    ["protected qualification cell drifts", workflow => {
-      protectedProof(workflow).run = protectedProof(workflow).run
-        .replace("protected_linux_x64_vulkan", "hosted_linux_x64_cpu");
-    }, /Prove offline Linux Vulkan retrieval/u],
-    ["candidate CPU fallback enabled", workflow => {
-      candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
-    }, /candidate-installed proof must reject CPU fallback/u],
-    ["candidate qualification cell drifts", workflow => {
-      candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("candidate_installed_linux_x64_vulkan", "candidate_installed_linux_x64_cpu");
-    }, /Prove candidate-installed Linux Vulkan runtime/u],
-    ["release cell omitted", workflow => {
-      const step = draftStep(
-        protectedJob(workflow),
-        "Emit authenticated Linux Vulkan release cells",
-      );
-      step.run = step.run.replace("retrieval_readiness:linux-x64", "retrieval_readiness:windows-x64");
-    }, /Emit authenticated Linux Vulkan release cells/u],
-  ];
-
-  for (const [name, mutate, expectedReason] of mutations) {
-    await t.test(name, () => {
-      const workflows = loadWorkflows();
-      mutate(workflows.get(file));
-      const violations = validateWorkflows(workflows);
-      assert.notDeepEqual(violations, []);
-      assert.match(violations.join("\n"), expectedReason);
-    });
+    for (const [name, mutate] of mutations) {
+      await t.test(`${platform.file}: ${name}`, () => {
+        const workflows = loadWorkflows();
+        const workflow = workflows.get(platform.file);
+        mutate(draftStep(workflow.jobs[platform.job], platform.proof));
+        const violations = validateWorkflows(workflows);
+        assert.notDeepEqual(violations, []);
+        assert.match(violations.join("\n"), new RegExp(
+          `${platform.file.replaceAll(".", "\\.")}|${platform.proof}`,
+          "u",
+        ));
+      });
+    }
   }
 });
 
@@ -1510,7 +1617,7 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
     ({ name }) => name === "Resolve the published plugin through the marketplace catalog",
   );
   const proofStep = workflow => workflow.jobs.smoke.steps.find(
-    ({ name }) => name === "Qualify the catalog-resolved published runtime",
+    ({ name }) => name === "Prove the catalog-resolved published runtime",
   );
   const mutations = [
     ["Codex CLI pin drifts", workflow => {
@@ -1519,6 +1626,16 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
     ["marketplace revision becomes mutable", workflow => {
       installStep(workflow).run = installStep(workflow).run
         .replace('--marketplace-revision "$marketplace_revision"', "--marketplace-revision main");
+    }, /Resolve the published plugin through the marketplace catalog/u],
+    ["marketplace revision is resolved again after publication", workflow => {
+      installStep(workflow).run += "\ngit ls-remote origin refs/heads/main";
+    }, /must not fabricate installation with git ls-remote/u],
+    ["checked-out package binding is removed", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace(
+          '--source-repository "$GITHUB_WORKSPACE"',
+          '--source-commit "$GITHUB_SHA"',
+        );
     }, /Resolve the published plugin through the marketplace catalog/u],
     ["real installer helper is bypassed", workflow => {
       installStep(workflow).run = installStep(workflow).run
@@ -1547,16 +1664,76 @@ test("post-publish proof uses an immutable real Codex marketplace install", asyn
   }
 });
 
-test("candidate-installed package qualification retains enough bounded job time", () => {
+test("post-publish proof keeps every release asset on its protected accelerator", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "post-publish-release-smoke.yml";
+  const proof = workflow => draftStep(
+    workflow.jobs.smoke,
+    "Prove the catalog-resolved published runtime",
+  );
+  const row = (workflow, assetTarget) => {
+    const match = workflow.jobs.smoke.strategy.matrix.include.find(
+      ({ asset_target: candidate }) => candidate === assetTarget,
+    );
+    assert.ok(match, `missing ${assetTarget} post-publish row`);
+    return match;
+  };
+  const mutations = [
+    ["Windows moves to a hosted runner", workflow => {
+      row(workflow, "windows-x64").runs_on = '["windows-latest"]';
+    }],
+    ["macOS loses its protected environment", workflow => {
+      row(workflow, "macos-arm64").environment = "";
+    }],
+    ["Linux backend falls back to CPU", workflow => {
+      row(workflow, "linux-x64").backend = "CPU";
+    }],
+    ["matrix starts cancelling sibling platform proof", workflow => {
+      workflow.jobs.smoke.strategy["fail-fast"] = true;
+    }],
+    ["published runtime enables CPU fallback", workflow => {
+      proof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }],
+    ["published runtime drops accelerated policy", workflow => {
+      proof(workflow).run = proof(workflow).run
+        .replace("--engine-policy accelerated", "--engine-policy cpu_explicit");
+    }],
+    ["published runtime drops bounded server behavior", workflow => {
+      proof(workflow).run = proof(workflow).run
+        .replace("--server-behavior-only", "--ground-only");
+    }],
+    ["published Python loses the protected execution policy", workflow => {
+      delete draftStep(workflow.jobs.smoke, "Install pinned Python")
+        .env.PSExecutionPolicyPreference;
+    }],
+    ["Windows installer loses the protected execution policy", workflow => {
+      draftStep(workflow.jobs.smoke, "Run Windows installer ownership self-test").shell
+        = "pwsh";
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), /post-publish-release-smoke\.yml/u);
+    });
+  }
+});
+
+test("package workflow keeps a packaging-only timeout", () => {
   const workflows = loadWorkflows();
   assert.deepEqual(validateWorkflows(workflows), []);
 
   workflows.get("packaged-platform-proof.yml").jobs.build["timeout-minutes"] =
-    "${{ inputs.calibration_mode && 180 || (inputs.candidate_installed_proof && (matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64') && 60 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60)) }}";
+    "${{ inputs.calibration_mode && 180 || (inputs.candidate_installed_proof && 120 || 60) }}";
 
   assert.match(
     validateWorkflows(workflows).join("\n"),
-    /x64 candidate-installed package qualification must retain a bounded 120-minute timeout/u,
+    /package build timeout must cover only calibration or signed macOS packaging/u,
   );
 });
 
@@ -1700,37 +1877,6 @@ test("draft source workflow rejects cloned top-level jobs", () => {
     validateWorkflows(workflows).join("\n"),
     /must contain exactly the linux-draft job/u,
   );
-});
-
-test("managed proof rejects structural bypasses and decoy commands", () => {
-  assert.deepEqual(managedPluginViolations(managedJob(), "--archive package.tar.gz"), []);
-
-  const mutations = [
-    job => { job.strategy["fail-fast"] = true; },
-    job => { job.strategy.matrix.exclude = [{ os: "ubuntu-latest" }]; },
-    job => { job.if = "always()"; },
-    job => { job.steps[0]["continue-on-error"] = true; },
-    job => { delete job.steps[0].env.CODESTORY_EMBED_ALLOW_CPU; },
-    job => { job.steps[0].run = job.steps[0].run.replace("--engine-policy cpu_explicit", ""); },
-    job => { job.steps[0].run = job.steps[0].run.replace("--expected-backend CPU", ""); },
-    job => { job.steps[0].run = job.steps[0].run.replace("--offline", ""); },
-    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "--timeout-secs 900"); },
-    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "--timeout-secs 18000"); },
-    job => { job.steps[0].run += "\n--timeout-secs 900"; },
-    job => { job.steps[0].run += "\n--timeout-secs=900"; },
-    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "# --timeout-secs 1800"); },
-    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "; echo --timeout-secs 1800"); },
-    job => { job.steps[0].run += "\necho --timeout-secs 1800"; },
-    job => {
-      job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --plugin-handoff";
-      job.steps.push({ name: "Decoy", run: "--plugin-handoff" });
-    },
-  ];
-  for (const mutate of mutations) {
-    const candidate = managedJob();
-    mutate(candidate);
-    assert.notDeepEqual(managedPluginViolations(candidate, "--archive package.tar.gz"), []);
-  }
 });
 
 test("PR package proof cannot opt into signing credentials", () => {
@@ -1882,6 +2028,18 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     ["post-publish closeout authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-closeout"].if; }],
     ["trusted caller opt-in", workflows => { delete workflows.get("auto-release.yml").jobs.release.with.publish_release; }],
     ["trusted caller secret handoff", workflows => { delete workflows.get("auto-release.yml").jobs.release.secrets; }],
+    ["duplicate automatic policy gate", workflows => {
+      workflows.get("auto-release.yml").jobs["workflow-policy"] = {
+        "runs-on": "ubuntu-latest",
+        steps: [],
+      };
+    }],
+    ["duplicate automatic version validation", workflows => {
+      workflows.get("auto-release.yml").jobs["detect-version"].steps.push({
+        name: "Validate synchronized release version",
+        run: "python .github/scripts/check-codestory-release.py --version 0.16.0",
+      });
+    }],
     ["manual release source permissions", workflows => { delete workflows.get("release.yml").permissions["pull-requests"]; }],
     ["automatic release source permissions", workflows => { delete workflows.get("auto-release.yml").jobs.release.permissions["pull-requests"]; }],
     ["rogue release caller", workflows => {
@@ -1894,6 +2052,14 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       workflows.get("release.yml").jobs.preflight.steps = workflows
         .get("release.yml").jobs.preflight.steps
         .filter(({ name }) => name !== "Refuse existing tag or release");
+    }],
+    ["public marketplace preflight", workflows => {
+      workflows.get("release.yml").jobs.preflight.steps = workflows
+        .get("release.yml").jobs.preflight.steps
+        .filter(({ name }) => name !== "Prove the public marketplace install path");
+    }],
+    ["post-publish marketplace revision handoff", workflows => {
+      workflows.get("release.yml").jobs["post-publish-smoke"].with.marketplace_revision = "main";
     }],
     ["publish replay guard", workflows => {
       const step = workflows.get("release.yml").jobs.publish.steps
@@ -1945,7 +2111,7 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     }],
     ["overwriteable terminal evidence", workflows => {
       const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
-        .find(({ name }) => name === "Upload candidate-installed Linux proof");
+        .find(({ name }) => name === "Upload packaged agent proof artifacts");
       step.name = "Upload hosted Linux calibration runs";
       step.with.name = "embedding-calibration-linux-${{ inputs.version }}";
       step.with.path = "target/calibration-runs/linux";

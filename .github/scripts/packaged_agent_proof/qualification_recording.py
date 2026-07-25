@@ -96,18 +96,31 @@ def record_qualification_contract(
     if args.ground_only:
         return
     if args.server_behavior_only:
+        ground = runtime.get("ground")
+        search = runtime.get("search")
+        require(
+            isinstance(ground, dict)
+            and ground.get("project_bound") is True
+            and isinstance(search, dict)
+            and search.get("project_bound") is True
+            and search.get("retrieval_ready") is True,
+            "server-behavior proof omitted project-bound ground or ready retrieval",
+        )
         summary["server_behavior"] = {
             "status": "pass",
             "runtime_tier_exercised": args.proof_tier,
+            "project_bound": True,
+            "retrieval_ready": True,
             "answer_quality_claim": False,
             "retrieval_quality_claim": False,
+            "shared_server_claim": False,
             "release_readiness_claim": True,
             "installed_runtime_provenance_proven": (
                 installed_runtime_provenance_is_proven(args, runtime)
             ),
         }
         summary["package_contract"]["release_readiness_claim"] = True
-        summary["package_contract"]["highest_proof_tier"] = "server_behavior"
+        summary["package_contract"]["highest_proof_tier"] = args.proof_tier
     elif args.proof_tier == "calibration":
         record_calibration_qualification(args, summary)
     else:

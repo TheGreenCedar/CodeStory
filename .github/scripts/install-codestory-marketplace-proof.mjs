@@ -94,6 +94,26 @@ function directoryDigest(root) {
   return digest.digest("hex");
 }
 
+const pinnedSourceKeys = ["path", "sha", "source", "url"];
+
+function pinnedPluginSource(source, expectedUrl) {
+  if (
+    !source
+    || Object.keys(source).sort().join(",") !== pinnedSourceKeys.join(",")
+    || source.source !== "git-subdir"
+    || source.path !== "plugins/codestory"
+    || !/^[0-9a-f]{40}$/u.test(source.sha)
+    || (expectedUrl && source.url !== expectedUrl)
+  ) {
+    fail("Codex marketplace plugin source is not pinned to one immutable commit");
+  }
+  return source;
+}
+
+function samePinnedSource(left, right) {
+  return pinnedSourceKeys.every((key) => left[key] === right[key]);
+}
+
 function containedPath(root, candidate, label) {
   const relative = path.relative(root, candidate);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
@@ -135,11 +155,14 @@ function prepareInstallation(rawArgs) {
     fail("marketplace revision must be an immutable commit");
   }
   const expectedVersion = required(args, "expected_version");
-  const sourceCommit = required(args, "source_commit");
-  const sourceTree = required(args, "source_tree");
-  for (const [label, value] of [["source commit", sourceCommit], ["source tree", sourceTree]]) {
-    if (!/^[0-9a-f]{40}$/u.test(value)) fail(`${label} must be an immutable Git identity`);
+  const sourceRepository = realpathSync(path.resolve(required(args, "source_repository")));
+  const releaseTree = run("git", ["-C", sourceRepository, "rev-parse", "HEAD^{tree}"]);
+  if (!/^[0-9a-f]{40}$/u.test(releaseTree)) {
+    fail("release tree must be an immutable Git identity");
   }
+  const sourcePluginRoot = realpathSync(
+    path.join(sourceRepository, "plugins", "codestory"),
+  );
   return {
     args,
     codexExecutable,
@@ -149,8 +172,9 @@ function prepareInstallation(rawArgs) {
     marketplaceName,
     marketplaceRevision,
     expectedVersion,
-    sourceCommit,
-    sourceTree,
+    sourceRepository,
+    releaseTree,
+    expectedPackageSha256: directoryDigest(sourcePluginRoot),
   };
 }
 
@@ -200,10 +224,49 @@ function verifyInstallation(setup, installed) {
   ) {
     fail("Codex marketplace or plugin add result has an unexpected identity");
   }
-  const marketplaceListEntry = installed.marketplaceList.marketplaces?.find(
-    ({ name }) => name === setup.marketplaceName,
-  );
-  if (!marketplaceListEntry) fail("Codex marketplace list omitted the installed marketplace");
+  const installedPlugins = installed.pluginList.installed;
+  const availablePlugins = installed.pluginList.available;
+  const pluginListEntry = installedPlugins?.[0];
+  const expectedSourceUrl = setup.args.local_fixture === "true"
+    ? undefined
+    : "https://github.com/TheGreenCedar/CodeStory.git";
+  if (
+    !Array.isArray(installedPlugins)
+    || installedPlugins.length !== 1
+    || !Array.isArray(availablePlugins)
+    || availablePlugins.length !== 0
+    || pluginListEntry?.pluginId !== `codestory@${setup.marketplaceName}`
+  ) {
+    fail("Codex plugin list has an unexpected identity");
+  }
+  const pluginSource = pinnedPluginSource(pluginListEntry.source, expectedSourceUrl);
+  const pluginSourceCommit = run("git", [
+    "-C",
+    setup.sourceRepository,
+    "rev-parse",
+    `${pluginSource.sha}^{commit}`,
+  ]);
+  const pluginSourceTree = run("git", [
+    "-C",
+    setup.sourceRepository,
+    "rev-parse",
+    `${pluginSource.sha}^{tree}`,
+  ]);
+  if (
+    pluginSourceCommit !== pluginSource.sha
+    || pluginSourceTree !== setup.releaseTree
+  ) {
+    fail("pinned marketplace plugin source does not match the release source tree");
+  }
+  const listedMarketplaces = installed.marketplaceList.marketplaces;
+  const marketplaceListEntry = listedMarketplaces?.[0];
+  if (
+    !Array.isArray(listedMarketplaces)
+    || listedMarketplaces.length !== 1
+    || marketplaceListEntry?.name !== setup.marketplaceName
+  ) {
+    fail("Codex marketplace list has an unexpected identity");
+  }
   const marketplaceAddRoot = realpathSync(installed.marketplaceAdd.installedRoot);
   const marketplaceListRoot = realpathSync(marketplaceListEntry.root);
   const marketplaceAddRevision = marketplaceRevisionAt(marketplaceAddRoot);
@@ -215,12 +278,36 @@ function verifyInstallation(setup, installed) {
   ) {
     fail("Codex marketplace provenance does not match the requested immutable revision");
   }
+  const catalog = JSON.parse(
+    readFileSync(
+      path.join(marketplaceAddRoot, ".agents", "plugins", "marketplace.json"),
+      "utf8",
+    ),
+  );
+  const catalogEntries = catalog.plugins?.filter(({ name }) => name === "codestory") ?? [];
+  const catalogSource = pinnedPluginSource(
+    catalogEntries[0]?.source,
+    expectedSourceUrl,
+  );
+  if (
+    catalogEntries.length !== 1
+    || !samePinnedSource(catalogSource, pluginSource)
+  ) {
+    fail("Codex plugin list source does not match the pinned marketplace catalog");
+  }
+  const packageSha256 = directoryDigest(pluginRoot);
+  if (packageSha256 !== setup.expectedPackageSha256) {
+    fail("installed plugin bytes do not match the checked-out CodeStory package");
+  }
   return {
     pluginRoot,
+    packageSha256,
     marketplaceAddRoot,
     marketplaceListRoot,
     marketplaceAddRevision,
     marketplaceListRevision,
+    pluginSourceCommit,
+    pluginSourceTree,
   };
 }
 
@@ -236,9 +323,9 @@ function attestInstallation(setup, installed, verified) {
     plugin: {
       id: "codestory",
       version: setup.expectedVersion,
-      source_commit: setup.sourceCommit,
-      source_tree: setup.sourceTree,
-      package_sha256: directoryDigest(verified.pluginRoot),
+      source_commit: verified.pluginSourceCommit,
+      source_tree: verified.pluginSourceTree,
+      package_sha256: verified.packageSha256,
     },
     marketplace: {
       repository: setup.marketplaceSource,

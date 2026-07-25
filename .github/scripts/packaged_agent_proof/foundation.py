@@ -123,23 +123,6 @@ MEASUREMENT_PROTOCOL = (
     / "testing"
     / "per-user-embedding-server-measurement-protocol.json"
 )
-CANDIDATE_QUALIFICATION_MATRIX_ALIASES = {
-    "candidate_installed_windows_x64_cpu": {
-        "source_cell_id": "installed_windows_x64_cpu",
-        "source_host_class": "post_publish_windows_x64",
-        "installation_source": "candidate",
-        "cell": {
-            "asset_target": "windows-x64",
-            "proof_tier": "installed_runtime",
-            "host_class": "premerge_candidate_windows_x64",
-            "policy": "cpu_explicit",
-            "backend": "cpu",
-            "cache_state": "reused",
-            "residency_state": "resident",
-            "accelerator_claim": "none",
-        },
-    }
-}
 SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
     "per-user-embedding-server-protocol.json"
 )

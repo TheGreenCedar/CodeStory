@@ -12,6 +12,7 @@ const { Transform, pipeline } = require('stream');
 const { TextDecoder } = require('util');
 const zlib = require('zlib');
 const {
+  cliVersionProbeTimeoutMs,
   sourceBuildTarget,
   validateDevCliReceipt,
 } = require('./codestory-dev-cli-contract.cjs');
@@ -1087,8 +1088,53 @@ async function acquireManagedCliLockAsync(root, purpose, waitMs) {
   }
 }
 
+function safeFailureToken(value, fallback) {
+  return String(value ?? '').match(/^[a-z0-9_]+/iu)?.[0]?.slice(0, 64) || fallback;
+}
+
+function managedCliVersionProbeFailure(probeOrReason, expectedVersion) {
+  let kind;
+  let detail;
+  if (typeof probeOrReason === 'string') {
+    const separator = probeOrReason.indexOf(':');
+    kind = separator < 0 ? probeOrReason : probeOrReason.slice(0, separator);
+    detail = separator < 0 ? null : probeOrReason.slice(separator + 1);
+  } else if (probeOrReason?.error) {
+    kind = 'version_probe_error';
+    detail = probeOrReason.errorCode;
+  } else if (probeOrReason?.status !== 0) {
+    kind = 'version_probe_exit';
+    detail = probeOrReason?.status;
+  } else if (probeOrReason?.version !== expectedVersion) {
+    kind = 'version_probe_mismatch';
+  } else {
+    return null;
+  }
+
+  if (kind === 'version_probe_error') {
+    return `${kind}:${safeFailureToken(detail, 'unknown')}`;
+  }
+  if (kind === 'version_probe_exit') {
+    const status = safeFailureToken(detail, 'unknown');
+    const exitCode = Number(status);
+    return `${kind}:${Number.isSafeInteger(exitCode) && exitCode > 0 ? exitCode : 'unknown'}`;
+  }
+  return kind === 'version_probe_mismatch' ? kind : null;
+}
+
 function managedCliFailureCode(error) {
-  return String(error?.message || error || 'unknown_failure').match(/^[a-z0-9_]+/iu)?.[0] || 'unknown_failure';
+  const message = String(error?.message || error || 'unknown_failure');
+  const code = safeFailureToken(message, 'unknown_failure');
+  if (code !== 'managed_cli_staging_verification_failed') return code;
+  const probeFailure = managedCliVersionProbeFailure(message.slice(code.length + 1));
+  return probeFailure ? `${code}:${probeFailure}` : code;
+}
+
+function recordManagedCliProvisionFailure(warnings, error) {
+  const code = managedCliFailureCode(error);
+  const failure = `managed_cli_provision_failed:${code}`;
+  warnings.push(`managed_cli_publication:terminal_failure:${code}`, failure);
+  return failure;
 }
 
 function verifyPublishedManagedCli(
@@ -1379,8 +1425,9 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       stdio_initialize_verified: true,
     };
     const versionProbe = probeResolvedCli({ path: destination, provisioningProbe: true });
-    if (versionProbe.error || versionProbe.status !== 0 || versionProbe.version !== version) {
-      throw new Error('managed_cli_staging_verification_failed:version_probe_failed');
+    const versionProbeFailure = managedCliVersionProbeFailure(versionProbe, version);
+    if (versionProbeFailure) {
+      throw new Error(`managed_cli_staging_verification_failed:${versionProbeFailure}`);
     }
     await probeManagedCliStdio(destination);
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -1423,14 +1470,13 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   if (fs.existsSync(versionDir)) {
     const existing = verifyPublishedManagedCli(versionDir, version, target);
     if (existing.verified) return existing.resolved;
+    warnings.push(`managed_cli_verification_failed:${existing.reason}`);
   }
   if (options.provision === false) return null;
   try {
     return await provisionManagedCli(dataDir, version, warnings);
   } catch (error) {
-    const code = managedCliFailureCode(error);
-    warnings.push(`managed_cli_publication:terminal_failure:${code}`);
-    warnings.push(`managed_cli_provision_failed:${code}`);
+    recordManagedCliProvisionFailure(warnings, error);
   }
   return null;
 }
@@ -1528,7 +1574,10 @@ async function resolveCli(options = {}) {
     return { source: 'managed', version, warnings, ...managed };
   }
 
-  const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
+  const managedFailure =
+    warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) ||
+    warnings.find((warning) => warning.startsWith('managed_cli_verification_failed:')) ||
+    null;
   warnings.push('managed_cli_unavailable');
   return {
     source: 'managed_unavailable',
@@ -1542,7 +1591,7 @@ async function resolveCli(options = {}) {
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
-    managedProvisionFailure,
+    managedFailure,
     warnings,
   };
 }
@@ -1552,28 +1601,32 @@ function normalizeVersion(value) {
   return match ? match[1] : null;
 }
 
-function probeResolvedCli(resolved) {
+function probeResolvedCli(resolved, options = {}) {
   if (!resolved.path) {
     return {
       status: null,
       error: `${resolved.source || 'unavailable'}_cli_unavailable`,
+      errorCode: null,
       version: null,
       stdout: '',
       stderr: '',
     };
   }
-  const result = spawnCodeStoryCliSync(resolved.path, ['--version'], {
+  const env = resolved.provisioningProbe
+    ? { ...process.env, CODESTORY_PLUGIN_PROVISIONING_PROBE: '1' }
+    : process.env;
+  const spawnCli = options.spawnCli || spawnCodeStoryCliSync;
+  const result = spawnCli(resolved.path, ['--version'], {
     encoding: 'utf8',
-    env: resolved.provisioningProbe
-      ? { ...process.env, CODESTORY_PLUGIN_PROVISIONING_PROBE: '1' }
-      : process.env,
-    timeout: 3000,
+    env,
+    timeout: cliVersionProbeTimeoutMs,
     windowsHide: true,
   });
   const output = `${result.stdout || ''}\n${result.stderr || ''}`;
   return {
     status: result.status,
     error: result.error ? result.error.message : null,
+    errorCode: result.error?.code || null,
     version: normalizeVersion(output),
     stdout: result.stdout || '',
     stderr: result.stderr || '',
@@ -1585,7 +1638,7 @@ function failOpenReasonForProbe(resolved, probe) {
     warning.startsWith('codestory_cli_batch_override_rejected:'));
   if (batchRejection) return batchRejection;
   if (resolved.source === 'managed_unavailable') {
-    return resolved.managedProvisionFailure || 'managed_cli_unavailable';
+    return resolved.managedFailure || 'managed_cli_unavailable';
   }
   if (resolved.source === 'local_dev_receipt_invalid') {
     return resolved.localDevReceiptFailure || 'codestory_dev_receipt_invalid';
@@ -1772,9 +1825,8 @@ function verifyManagedCliVersion(entry, probeVersion = probeResolvedCli) {
     warnings: [],
   };
   const probe = probeVersion(resolved);
-  if (probe.error || probe.status !== 0 || probe.version !== entry.version) {
-    return { verified: false, reason: 'version_probe_mismatch' };
-  }
+  const probeFailure = managedCliVersionProbeFailure(probe, entry.version);
+  if (probeFailure) return { verified: false, reason: probeFailure };
   return { verified: true, reason: null, executablePath: realExecutable, resolved };
 }
 
@@ -2351,7 +2403,10 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
   const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
   const degradedReason = status.degraded_reason || readiness?.reason || (preparing ? 'managed_cli_provisioning' : 'runtime_unavailable');
-  const primaryFailure = readiness?.setup?.probe_error
+  const managedFailure = status.warnings?.find((warning) =>
+    /^managed_cli_(?:provision|verification)_failed:/u.test(String(warning || '')));
+  const primaryFailure = managedFailure
+    || readiness?.setup?.probe_error
     || readiness?.setup?.probe_stderr
     || readiness?.summary
     || status.warnings?.find((warning) => String(warning || '').trim())
@@ -2427,6 +2482,7 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     tool,
     project,
     state: 'unavailable',
+    failure: primaryFailure,
     diagnostics_uri: diagnosticsUri,
   };
   return {
@@ -2891,7 +2947,11 @@ if (require.main === module) {
       cleanPublicProjectPath,
       downloadFile,
       extractArchive,
+      failOpenToolResult,
       failOpenToolCatalog,
+      managedCliFailureCode,
+      managedCliVersionProbeFailure,
+      recordManagedCliProvisionFailure,
       parseFailOpenResourceRequest,
       projectBoundResourceUri,
       strictUriComponentDecode,
@@ -2906,6 +2966,7 @@ if (require.main === module) {
       reclaimStaleManagedCliPendingOwners,
       removeManagedCliInitializationIf,
       processStartIdentity,
+      probeResolvedCli,
       probeManagedCliStdio,
       provisionManagedCli,
       quarantineManagedCliVersion,

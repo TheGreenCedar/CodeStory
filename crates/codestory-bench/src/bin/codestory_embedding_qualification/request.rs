@@ -269,7 +269,7 @@ fn validate_manifest(
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).context("parse native package manifest")?;
     if manifest.get("source") != Some(&serde_json::to_value(&request.source)?)
-        || manifest.pointer("/binary/sha256")
+        || manifest.pointer("/runtime_executable/sha256")
             != Some(&serde_json::Value::String(
                 request.package.executable_sha256.clone(),
             ))

@@ -251,18 +251,13 @@ def parse_server_proof_identity(identity: str) -> dict[str, object]:
     }
 
 
-def verify_runtime_against_manifest(
+def verify_engine_identities_against_manifest(
     manifest: dict,
-    runtime: dict,
+    identities: list[tuple[str, dict]],
     expected_policy: str | None,
 ) -> dict:
-    identities = [
-        runtime.get("identity"),
-        runtime.get("second_host_identity"),
-        runtime.get("rejoin_identity"),
-    ]
     require(
-        all(isinstance(identity, dict) for identity in identities),
+        bool(identities) and all(isinstance(identity, dict) for _, identity in identities),
         "runtime proof omitted engine identity",
     )
     engine = manifest["engine"]
@@ -270,9 +265,7 @@ def verify_runtime_against_manifest(
     accelerator = manifest["accelerator"]
     compiled_backends = engine["compiled_backends"]
     observed_backend = ""
-    for label, identity in zip(
-        ("first plugin host", "second plugin host", "rejoined plugin host"), identities
-    ):
+    for label, identity in identities:
         require(
             identity.get("embedding_ggml_build_identity") == engine["build_identity"],
             f"{label} loaded a different native engine build than the package manifest",
@@ -290,10 +283,10 @@ def verify_runtime_against_manifest(
             observed_backend = current_backend
         require(
             current_backend == observed_backend,
-            "native backend changed across process restart",
+            "native backend changed across runtime observations",
         )
 
-    policy = str(identities[0].get("embedding_policy") or "")
+    policy = str(identities[0][1].get("embedding_policy") or "")
     require(
         policy == expected_policy,
         "runtime policy does not match the requested proof lane",
@@ -333,3 +326,19 @@ def verify_runtime_against_manifest(
         "answer_quality_claim": False,
         "non_claim_reason": non_claim_reason,
     }
+
+
+def verify_runtime_against_manifest(
+    manifest: dict,
+    runtime: dict,
+    expected_policy: str | None,
+) -> dict:
+    return verify_engine_identities_against_manifest(
+        manifest,
+        [
+            ("first plugin host", runtime.get("identity")),
+            ("second plugin host", runtime.get("second_host_identity")),
+            ("rejoined plugin host", runtime.get("rejoin_identity")),
+        ],
+        expected_policy,
+    )

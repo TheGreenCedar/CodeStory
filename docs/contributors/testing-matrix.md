@@ -87,13 +87,14 @@ cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
-behavior changed. Intermediate commits do not append telemetry.
-Use the coordinator's explicit `none` scope for that final integration when
-only the hosted source and repo-scale gates are required; it deliberately skips
-package, release-evidence, and protected-hardware jobs.
+behavior changed. It is standalone telemetry, not a platform-release gate, and
+intermediate commits do not append it. Use the coordinator's explicit `none`
+scope when final integration requires source proof without package or protected
+hardware jobs.
 Use the explicit `linux` scope when the same exact final-dev integration should
-also build and exercise the Linux x64 candidate on its server-behavior-only
-boundary without scheduling Mac or Windows protected runners.
+also build, install, and exercise the Linux x64 Vulkan candidate on its
+single-project server-behavior boundary without scheduling Mac or Windows
+protected runners.
 
 Semantic document allocation changes use focused runtime proof before the
 broad gate. Cover shared-file path cardinality, byte-identical and
@@ -168,14 +169,19 @@ used by `build.rs`; it proves partial bytes are never published and a racing
 destination is never replaced. Protected package and hardware lanes remain
 responsible for proving the real release model and accelerator runtime.
 
-The Linux x64 packaged-platform job additionally runs the named
-`Prove clean-cache Node-absent network-denied offline release build` lane. It
+The manually dispatched `qualification` mode runs the named
+`Prove fresh-target Node-absent network-denied Cargo release boundary` once,
+after all selected packages succeed. Corrective package-only iterations,
+ordinary platform reruns, calibration, integration, and the later main release
+do not repeat it. The job
 seeds a new isolated Cargo home, mounts the source read-only into the pinned
 build image, removes Node from the execution contract, denies container network
 access, and runs both `cargo check --release --locked --offline` and
 `cargo build --release --locked --offline` from a fresh target. The container's
 `--network none` boundary is the network-denial proof; Cargo's offline flag
-alone is not treated as OS-level denial.
+alone is not treated as OS-level denial. This proves the Cargo release boundary,
+not that the separately packaged Linux archive was produced by that discarded
+fresh-target build.
 
 Hosted source/package jobs may set:
 
@@ -201,11 +207,18 @@ commit and tree, executable digest, server protocol, accepted constant set, and
 measurement protocol. `--version-only` proves package structure, version, and
 help; it does not prove a running server.
 
-Runtime proof uses the ordinary plugin launcher with two independently started
-host processes and different repositories. `--proof-tier calibration` may
-collect draft measurements, but cannot satisfy a package, hardware, installed,
-or release claim. A higher tier requires a frozen constant set and a retained
-qualification record. `--produce-qualification-evidence` requires the separate
+Full calibration and qualification use the ordinary plugin launcher with two
+independently started host processes and different repositories.
+`--server-behavior-only` is the smaller release path: one host grounds one
+project, waits for search readiness in that same project, and verifies the
+resident engine and server against the package manifest. It rejects
+calibration and quality inputs and makes no two-host or broader lifecycle
+claim.
+
+`--proof-tier calibration` may collect draft measurements, but cannot satisfy a
+package, hardware, installed, or release claim. A higher qualification tier
+requires a frozen constant set and a retained qualification record.
+`--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through
 `--cli`; the driver orchestrates private nonce-gated worker calls without
@@ -216,9 +229,10 @@ fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship the runtime executable and native modules in one immutable generation
-selected by the public launcher through a single atomic pointer. Hosted Linux
-proof does not install a Vulkan loader before help, stdio initialization, or
-explicit diagnostic CPU execution. It cannot replace protected Vulkan proof.
+selected by the public launcher through a single atomic pointer. Optional
+hosted Linux calibration and quality proof does not install a Vulkan loader
+before help, stdio initialization, or explicit diagnostic CPU execution. It
+cannot replace the protected Vulkan release proof.
 
 Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
 to make the claim explicit. Protected and installed tiers additionally name
@@ -233,8 +247,8 @@ python .github/scripts/check-packaged-agent-proof.py --self-test
 
 | Workflow | Required claim |
 | --- | --- |
-| `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
-| `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
+| `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and project-scoped grounding |
+| `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and project-scoped grounding |
 | `.github/workflows/linux-vulkan-proof.yml` | Exact Linux x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, and project-scoped grounding |
 
 Signing and notarization are main-release concerns, not PR gates. A PR package
@@ -380,6 +394,18 @@ node --test .github/scripts/check-workflow-policy.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
 
+Exact source and package jobs keep dependency downloads, compiler objects, and
+release artifacts separate. Compiler keys end in the exact candidate SHA but
+restore through a compatibility prefix bound to the platform, target, Rust and
+native toolchains, generator, features, lockfile, Cargo configuration, and
+relevant native inputs. A restored compiler cache still produces and verifies a
+fresh exact-head binary and archive. The isolated sccache store is bounded at
+1 GiB, except for Windows packaging's 2 GiB mixed Rust, MSVC, Vulkan, and
+embedded-model working set; dependency inputs have their own 1 GiB bound.
+Successful compilation is saved before tests, signing, packaging, or protected
+proof. Cache logs name the requested and restored keys, compatibility hit,
+restored bytes, compilation time, and save result.
+
 The base-branch retrieval lane seeds the five draft publication-proof test
 targets with serial `cargo test --no-run` commands before it saves its cache.
 Draft CI first requests the complete retrieval key, then same-topology prior-lock
@@ -490,16 +516,19 @@ the frozen exact-head producer manifests and does not upgrade source or package
 proof into installed, protected-hardware, or live-behavior proof.
 
 Pre-publish authorization deliberately uses candidate-managed installations
-because a marketplace-catalog-resolved package cannot exist before publication. These receipts
-must come from isolated installs of the exact candidate archive, initialize
-MCP, start the bundled local runtime, and complete one real `ground` request.
-They do not replace the two marketplace-catalog-resolved post-publish receipts.
-For v0.16, `check-packaged-agent-proof.py --ground-only` is the fail-closed
-receipt mode for that claim. It retains exact archive, source, plugin, managed
-binary, isolated data-root, and project-bound MCP evidence while deliberately
-skipping search, snippet, packet, shared-server, lifecycle, accelerator,
-accuracy, and performance claims. Omit `--ground-only` to run the broader
-qualification contract.
+because a marketplace-catalog-resolved package cannot exist before publication.
+These receipts must come from isolated installs of the exact candidate archive
+on Apple Silicon, Windows x64, and Linux x64. Each initializes MCP, completes
+one real project-bound `ground`, waits for same-project search readiness, and
+verifies the expected Metal or Vulkan engine and package identity. They do not
+replace the three marketplace-catalog-resolved post-publish receipts.
+
+For v0.16, `check-packaged-agent-proof.py --server-behavior-only` is the
+fail-closed receipt mode for that claim. It deliberately skips multi-host
+sharing, broader server lifecycle, accuracy, and performance claims.
+`--ground-only` remains a lower-tier launcher and provenance check: it stops
+after the project-bound ground request and cannot claim search readiness,
+server identity, or accelerator execution.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply
@@ -549,9 +578,7 @@ fail-closed publication authority used by publish and post-publish jobs.
 ```text
 gh workflow run release.yml --ref dev/codestory-next \
   -f version=<version> \
-  -f expected_head_sha=<exact-full-dev-sha> \
-  -f calibration_bundle_artifact=<artifact-name> \
-  -f calibration_bundle_run_id=<run-id>
+  -f expected_head_sha=<exact-full-dev-sha>
 ```
 
 There is intentionally no `publish_release` field on this manual command.

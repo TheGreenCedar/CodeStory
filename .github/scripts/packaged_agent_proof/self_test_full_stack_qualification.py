@@ -1,14 +1,16 @@
-"""Retained installed-runtime qualification self-tests."""
+"""Retained qualification self-tests."""
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
-    PINNED_CODEX_CLI_VERSION,
     ProofFailure,
+    require,
 )
+from .native_manifest import runtime_executable_sha256
 from .qualification_retained import verify_retained_qualification
 from .self_test_full_stack_types import (
     ExternalEvidenceFixture,
@@ -22,14 +24,14 @@ def _package_and_host_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:
     manifest = fixture.manifest
     package = {
         "archive_sha256": "b" * 64,
-        "executable_sha256": manifest["binary"]["sha256"],
+        "executable_sha256": runtime_executable_sha256(manifest),
         "asset_target": manifest["asset_target"],
         "release_version": manifest["release_version"],
         "model_sha256": manifest["model"]["sha256"],
-        "matrix_cell_id": "installed_macos_arm64_cpu",
-        "accelerator_claim": "none",
-        "backend": "cpu",
-        "policy": "cpu_explicit",
+        "matrix_cell_id": "protected_macos_arm64_metal",
+        "accelerator_claim": "metal",
+        "backend": "metal",
+        "policy": "accelerated",
         "cache_state": "reused",
         "residency_state": "resident",
         "protocol_sha256": fixture.protocol_sha256,
@@ -40,41 +42,16 @@ def _package_and_host_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:
         "fingerprint": "f" * 64,
         "platform": "macos",
         "target": manifest["asset_target"],
-        "matrix_cell_id": "installed_macos_arm64_cpu",
-        "host_class": "post_publish_macos_arm64",
-        "accelerator_claim": "none",
-        "backend": "cpu",
-        "policy": "cpu_explicit",
+        "matrix_cell_id": "protected_macos_arm64_metal",
+        "host_class": "protected_self_hosted_macos_arm64",
+        "accelerator_claim": "metal",
+        "backend": "metal",
+        "policy": "accelerated",
         "cache_state": "reused",
         "residency_state": "resident",
         "unplanned_suspend": False,
     }
     return package, host
-
-
-def _installation_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:
-    manifest = fixture.manifest
-    installed_plugin = {
-        "schema_version": 2,
-        "installation_source": "codex_marketplace_install",
-        "codex_cli_version": PINNED_CODEX_CLI_VERSION,
-        "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
-        "marketplace_commit": "d" * 40,
-        "plugin_id": "codestory",
-        "plugin_version": "0.0.0",
-        "plugin_source_commit": manifest["source"]["commit"],
-        "plugin_package_sha256": "e" * 64,
-    }
-    managed_runtime = {
-        "cli_source": "managed",
-        "plugin_version": "0.0.0",
-        "managed_binary_sha256": manifest["binary"]["sha256"],
-        "archive_sha256": "b" * 64,
-        "build_source": "github_release",
-        "repo_ref": "v0.0.0",
-        "provisioned_at": "self-test",
-    }
-    return installed_plugin, managed_runtime
 
 
 def _scenario_evidence(measurement_contract: dict) -> dict:
@@ -115,7 +92,6 @@ def _build_retained_evidence(
     measurement_contract: dict,
 ) -> tuple[dict, dict]:
     package, host = _package_and_host_evidence(fixture)
-    installed_plugin, managed_runtime = _installation_evidence(fixture)
     qualification_contract = json.loads(json.dumps(measurement_contract))
     qualification_contract["constant_set"]["qualification_thresholds"] = {
         metric: 1
@@ -124,12 +100,10 @@ def _build_retained_evidence(
     retained = {
         "schema_version": 1,
         "status": "pass",
-        "tier": "installed_runtime",
+        "tier": "protected_hardware",
         "source": fixture.manifest["source"],
         "package": package,
         "host": host,
-        "installed_plugin": installed_plugin,
-        "managed_runtime": managed_runtime,
         "same_account": {
             "account_id": "uid:501",
             "relation": "same_os_account",
@@ -197,13 +171,13 @@ def _verify_retained(
         archive_sha256="b" * 64,
         shared_identity=server.shared,
         measurement_contract=qualification_contract,
-        required_tier="installed_runtime",
-        required_matrix_cell_id="installed_macos_arm64_cpu",
-        expected_policy="cpu_explicit",
-        expected_backend="cpu",
-        expected_accelerator_claim="none",
-        installed_plugin=candidate["installed_plugin"],
-        managed_runtime=candidate["managed_runtime"],
+        required_tier="protected_hardware",
+        required_matrix_cell_id="protected_macos_arm64_metal",
+        expected_policy="accelerated",
+        expected_backend="metal",
+        expected_accelerator_claim="metal",
+        installed_plugin=None,
+        managed_runtime=None,
     )
 
 
@@ -231,13 +205,13 @@ def _retained_hostile_tests(
     missing_scenario = json.loads(json.dumps(retained))
     missing_scenario["scenarios"].pop("frozen_owner")
     wrong_tier = json.loads(json.dumps(retained))
-    wrong_tier["tier"] = "protected_hardware"
+    wrong_tier["tier"] = "installed_runtime"
     stale_shared = json.loads(json.dumps(retained))
     stale_shared["shared_identity"]["server_instance_id"] = "stale-server"
     wrong_cell = json.loads(json.dumps(retained))
-    wrong_cell["package"]["matrix_cell_id"] = "protected_macos_arm64_metal"
+    wrong_cell["package"]["matrix_cell_id"] = "hosted_linux_x64_cpu"
     for candidate, message in (
-        (missing_scenario, "incomplete installed scenario evidence was accepted"),
+        (missing_scenario, "incomplete scenario evidence was accepted"),
         (wrong_tier, "different-tier retained qualification was accepted"),
         (stale_shared, "stale retained shared server identity was accepted"),
         (wrong_cell, "wrong qualification matrix cell was accepted"),
@@ -272,6 +246,43 @@ def _engine_identity_hostiles(server: ServerIdentityFixture) -> None:
         raise ProofFailure("inferred accelerator execution was accepted")
 
 
+def _split_executable_retained_test(
+    fixture: FullStackFixture,
+    server: ServerIdentityFixture,
+    external: ExternalEvidenceFixture,
+    measurement_contract: dict,
+) -> None:
+    manifest = json.loads(json.dumps(fixture.manifest))
+    runtime_digest = "e" * 64
+    manifest["runtime_executable"]["sha256"] = runtime_digest
+    split_fixture = replace(fixture, manifest=manifest)
+    retained, qualification_contract = _build_retained_evidence(
+        split_fixture,
+        server,
+        external,
+        measurement_contract,
+    )
+    require(
+        retained["package"]["executable_sha256"] == runtime_digest,
+        "retained qualification used the launcher digest for a split runtime package",
+    )
+    _verify_retained(
+        retained,
+        split_fixture,
+        server,
+        qualification_contract,
+    )
+    launcher_bound = json.loads(json.dumps(retained))
+    launcher_bound["package"]["executable_sha256"] = manifest["binary"]["sha256"]
+    _expect_retained_rejected(
+        launcher_bound,
+        split_fixture,
+        server,
+        qualification_contract,
+        "retained qualification accepted the launcher digest as the runtime executable",
+    )
+
+
 def run_retained_qualification_self_tests(
     fixture: FullStackFixture,
     server: ServerIdentityFixture,
@@ -290,5 +301,11 @@ def run_retained_qualification_self_tests(
         fixture,
         server,
         qualification_contract,
+    )
+    _split_executable_retained_test(
+        fixture,
+        server,
+        external,
+        measurement_contract,
     )
     _engine_identity_hostiles(server)

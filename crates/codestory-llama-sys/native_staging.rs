@@ -1,7 +1,7 @@
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -201,8 +201,12 @@ fn write_runtime_file_list<'a>(
 ) -> io::Result<()> {
     let mut body = names.into_iter().collect::<Vec<_>>().join("\n");
     body.push('\n');
-    fs::write(destination, body)?;
-    File::open(destination)?.sync_all()
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()
 }
 
 /// Copy one Windows runtime DLL without exposing a missing or partial destination.
@@ -836,6 +840,49 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod generation_tests {
+    use super::{NATIVE_RUNTIME_FILE_LIST, NATIVE_SEEDS_DIR, stage_native_generation};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn stages_complete_immutable_native_seeds() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let sources = temp.path().join("sources");
+        let profile = temp.path().join("target/debug");
+        fs::create_dir_all(&sources).expect("source directory");
+        fs::write(sources.join("libggml.so"), b"generation-one").expect("first source");
+        fs::write(sources.join("libllama.so"), b"llama").expect("second source");
+        let paths = [sources.join("libggml.so"), sources.join("libllama.so")];
+        let refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+
+        let first = stage_native_generation(&refs, &profile).expect("first generation");
+        assert_eq!(
+            fs::read_to_string(first.directory.join(NATIVE_RUNTIME_FILE_LIST))
+                .expect("generation manifest"),
+            "libggml.so\nlibllama.so\n"
+        );
+        fs::write(&paths[0], b"generation-two").expect("replace source bytes");
+        let second = stage_native_generation(&refs, &profile).expect("second generation");
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            fs::read(first.directory.join("libggml.so")).expect("immutable first bytes"),
+            b"generation-one"
+        );
+        assert_eq!(
+            fs::read(second.directory.join("libggml.so")).expect("second bytes"),
+            b"generation-two"
+        );
+        assert_eq!(
+            fs::read_dir(profile.join(NATIVE_SEEDS_DIR))
+                .expect("seed inventory")
+                .count(),
+            2
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::{prepare_runtime_copy, publish_all_with, replace_file, stage_windows_runtime_file};
@@ -897,50 +944,13 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        NATIVE_RUNTIME_FILE_LIST, NATIVE_SEEDS_DIR, acquire_profile_staging_lock,
-        prepare_real_hard_link, publish_all, publish_all_with, stage_linux_shared_libraries,
-        stage_native_generation,
+        acquire_profile_staging_lock, prepare_real_hard_link, publish_all, publish_all_with,
+        stage_linux_shared_libraries,
     };
     use std::fs;
     use std::io;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
-
-    #[test]
-    fn stages_complete_immutable_native_seeds() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let sources = temp.path().join("sources");
-        let profile = temp.path().join("target/debug");
-        fs::create_dir_all(&sources).expect("source directory");
-        fs::write(sources.join("libggml.so"), b"generation-one").expect("first source");
-        fs::write(sources.join("libllama.so"), b"llama").expect("second source");
-        let paths = [sources.join("libggml.so"), sources.join("libllama.so")];
-        let refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-
-        let first = stage_native_generation(&refs, &profile).expect("first generation");
-        assert_eq!(
-            fs::read_to_string(first.directory.join(NATIVE_RUNTIME_FILE_LIST))
-                .expect("generation manifest"),
-            "libggml.so\nlibllama.so\n"
-        );
-        fs::write(&paths[0], b"generation-two").expect("replace source bytes");
-        let second = stage_native_generation(&refs, &profile).expect("second generation");
-        assert_ne!(first.id, second.id);
-        assert_eq!(
-            fs::read(first.directory.join("libggml.so")).expect("immutable first bytes"),
-            b"generation-one"
-        );
-        assert_eq!(
-            fs::read(second.directory.join("libggml.so")).expect("second bytes"),
-            b"generation-two"
-        );
-        assert_eq!(
-            fs::read_dir(profile.join(NATIVE_SEEDS_DIR))
-                .expect("seed inventory")
-                .count(),
-            2
-        );
-    }
 
     #[test]
     fn replaces_dangling_links_in_every_cargo_runtime_directory() {

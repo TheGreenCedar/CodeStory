@@ -110,7 +110,6 @@
       "producer_run_attempt": "positive_integer",
       "producer_artifact": "non_empty_text",
       "native_engine": "identifier",
-      "calibration_sha256": "sha256",
       "pre_publish_artifact_sha256": "sha256"
     }
   },
@@ -469,15 +468,16 @@
       ],
       "prerequisites": [
         "the exact packaged archive runs on protected release hardware",
-        "packet and search complete on two project-bound plugin hosts",
-        "live encoding and shared-server continuity remain observable"
+        "one plugin host grounds one project and completes search in that same project",
+        "the resident packaged engine proves the expected Metal or Vulkan execution"
       ],
       "non_claims": [
+        "multi-host sharing or broader server lifecycle behavior",
         "answer sufficiency for an unmeasured task",
         "performance outside the approved profile"
       ],
       "accepted_risks": [
-        "measured-corpus-is-bounded"
+        "single-project-readiness-probe-is-bounded"
       ]
     },
     {
@@ -644,7 +644,6 @@
           "runner",
           "backend",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",
@@ -788,7 +787,6 @@
           "installer",
           "runtime_version",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",
@@ -897,7 +895,6 @@
           "installer",
           "runtime_version",
           "native_engine",
-          "calibration_sha256",
           "producer_workflow",
           "producer_job",
           "producer_job_name",
@@ -1096,7 +1093,6 @@
       "proof_run_sha_expression": "${{ github.sha }}",
       "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
       "source_cache_namespace": "source-proof-v2",
-      "macos_source_cache_namespace": "macos-source-v2",
       "packaged_cache_namespace": "codestory-cli-native-v4",
       "label_routed_workflows": [
         "source-proof.yml",

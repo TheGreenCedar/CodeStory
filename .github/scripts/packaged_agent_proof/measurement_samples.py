@@ -10,7 +10,7 @@ from .contract_primitives import (
     require_positive_int,
     require_sha256,
 )
-from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
+from .foundation import require
 
 
 def selected_qualification_matrix_cell(
@@ -27,21 +27,8 @@ def selected_qualification_matrix_cell(
         if proof_tier == "calibration"
         else protocol["host_package_matrix"]
     )
-    if cell_id in matrix:
-        cell = matrix[cell_id]
-    else:
-        alias = CANDIDATE_QUALIFICATION_MATRIX_ALIASES.get(cell_id)
-        require(alias is not None, f"unknown qualification matrix cell {cell_id!r}")
-        cell = alias["cell"]
-        source_cell = matrix.get(alias["source_cell_id"])
-        require(
-            source_cell
-            == {
-                **cell,
-                "host_class": alias["source_host_class"],
-            },
-            "candidate qualification matrix alias no longer matches its frozen installed-runtime source cell",
-        )
+    cell = matrix.get(cell_id)
+    require(cell is not None, f"unknown qualification matrix cell {cell_id!r}")
     require(
         cell["asset_target"] == target
         and cell["policy"] == expected_policy
