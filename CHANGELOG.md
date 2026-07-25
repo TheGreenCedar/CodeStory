@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed first use failing on Linux hosts that keep `/tmp` on a separate
+  filesystem from your home directory. The runtime archive downloaded
+  successfully and then could not be moved into place, and because that looked
+  like a network problem, the whole download restarted — repeatedly, until it
+  gave up. The finished download is now kept alongside the partial it came
+  from, so it is never moved across filesystems, and a failure to store it is
+  reported as such instead of triggering another download.
+
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.
