@@ -306,7 +306,7 @@ jobs:
           $version = $env:VERSION.TrimStart('v')
           $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
           $candidateRoot = Join-Path `
-            $env:RUNNER_TEMP `
+            ([IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)) `
             ("cs-ci-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
           $candidateRoot = [IO.Path]::GetFullPath($candidateRoot)
           $workspaceRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
@@ -490,3 +490,25 @@ jobs:
           path: target/windows-vulkan-proof
           if-no-files-found: error
           retention-days: 30
+
+      - name: Clean candidate-managed Windows install
+        if: always() && inputs.candidate_installed_proof
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([String]::IsNullOrWhiteSpace($env:CODESTORY_CANDIDATE_WINDOWS_ROOT)) {
+            return
+          }
+          $candidateRoot = [IO.Path]::GetFullPath($env:CODESTORY_CANDIDATE_WINDOWS_ROOT)
+          $candidateLeaf = [IO.Path]::GetFileName($candidateRoot)
+          $candidateParent = [IO.Path]::GetDirectoryName($candidateRoot)
+          $expectedParent = [IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+          if (
+            $candidateLeaf -notmatch '^cs-ci-[0-9a-f]{12}$' -or
+            $candidateParent -ne $expectedParent
+          ) {
+            throw "refusing to clean unexpected candidate-managed root: $candidateRoot"
+          }
+          if (Test-Path -LiteralPath $candidateRoot) {
+            Remove-Item -LiteralPath $candidateRoot -Recurse -Force
+          }
