@@ -4,11 +4,11 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
     GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessDto,
-    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode,
-    IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest,
+    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
     TrailContextDto,
 };
@@ -1840,6 +1840,53 @@ impl BookmarkService {
 
     pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
         self.controller.delete_bookmark(id)
+    }
+}
+
+#[cfg(test)]
+mod embedding_start_classification_tests {
+    use super::*;
+
+    fn classify(code: &str, retry_class: &str) -> ApiError {
+        let error = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: code.into(),
+            message: format!("{code} occurred"),
+            retry_class: retry_class.into(),
+            retry_after_ms: 250,
+            retry_condition: "the server finishes starting".into(),
+            capacity: None,
+        });
+        map_activation_error(error)
+    }
+
+    #[test]
+    fn a_slow_cold_start_is_retryable_rather_than_terminal() {
+        // The spawned server keeps converging past the client's budget, so the next request
+        // usually connects. Reporting this as terminal turned an ordinary slow first use into a
+        // failed ground with nothing the caller could do.
+        for code in ["embedding_server_start_timeout", "embedding_server_absent"] {
+            let error = classify(code, "after_delay");
+            assert_eq!(
+                error.code, "activation_retryable",
+                "{code} must invite a retry"
+            );
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("embedding_retryable"),
+                "{code} must keep its cause visible"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unretryable_embedding_failure_still_fails_closed() {
+        assert_eq!(
+            classify("native_model_not_embedded", "none").code,
+            "project_unavailable"
+        );
     }
 }
 

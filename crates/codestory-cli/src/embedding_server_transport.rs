@@ -472,9 +472,14 @@ fn run_retrieval_server(
 }
 
 pub(crate) fn install_client_transport(mode: ClientTransportMode) -> Result<()> {
-    codestory_retrieval::install_embedding_client_transport(Arc::new(
-        NativeEmbeddingClientTransport::capture_with_mode(mode)?,
-    ))
+    // Registered, not captured: capture_with_mode hashes the whole executable, and a release build
+    // embeds the model. Commands that never embed must not pay for it.
+    codestory_retrieval::install_embedding_client_transport_factory(Box::new(move || {
+        Ok(
+            Arc::new(NativeEmbeddingClientTransport::capture_with_mode(mode)?)
+                as Arc<dyn codestory_retrieval::EmbeddingClientTransport>,
+        )
+    }))
 }
 
 pub(crate) fn clock_domain() -> &'static str {

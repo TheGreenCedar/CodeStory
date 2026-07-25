@@ -6,8 +6,6 @@
 //! already-computed response.
 
 use anyhow::{Context, Result, bail};
-#[cfg(test)]
-use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
@@ -20,6 +18,8 @@ use codestory_contracts::api::{
     SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto,
     SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
+#[cfg(test)]
+use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
 use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
 use serde_json::Value;

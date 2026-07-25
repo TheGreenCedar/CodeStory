@@ -5,8 +5,7 @@ use crate::app::{packet_budget_mode_label, packet_task_class_label, render_packe
 use crate::output::REPO_CONTENT_BOUNDARY_LINE;
 use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto,
-    PacketBudgetModeDto, PacketTaskClassDto,
-    RetrievalFallbackReasonDto, SearchHitOrigin,
+    PacketBudgetModeDto, PacketTaskClassDto, RetrievalFallbackReasonDto, SearchHitOrigin,
 };
 use std::path::Path;
 

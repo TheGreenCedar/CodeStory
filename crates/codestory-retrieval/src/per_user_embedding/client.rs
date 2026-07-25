@@ -24,14 +24,66 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-static CLIENT_TRANSPORT: OnceLock<Arc<dyn EmbeddingClientTransport>> = OnceLock::new();
+type ClientTransportFactory =
+    Box<dyn Fn() -> Result<Arc<dyn EmbeddingClientTransport>> + Send + Sync>;
+
+/// Holds either a ready transport or the means to build one on first use.
+///
+/// Capturing the exact executable identity hashes the whole binary, and a release build embeds the
+/// model, so eager capture is a fixed ~150 MB read on every process start. Most commands never
+/// embed anything, so the cost belongs to the first caller that actually needs a transport.
+#[derive(Default)]
+pub(super) struct LazyClientTransport {
+    factory: OnceLock<ClientTransportFactory>,
+    resolved: OnceLock<Arc<dyn EmbeddingClientTransport>>,
+}
+
+impl LazyClientTransport {
+    pub(super) const fn new() -> Self {
+        Self {
+            factory: OnceLock::new(),
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub(super) fn install(&self, transport: Arc<dyn EmbeddingClientTransport>) -> Result<()> {
+        self.resolved
+            .set(transport)
+            .map_err(|_| anyhow!("embedding_client_transport_already_installed"))
+    }
+
+    pub(super) fn install_factory(&self, factory: ClientTransportFactory) -> Result<()> {
+        self.factory
+            .set(factory)
+            .map_err(|_| anyhow!("embedding_client_transport_already_installed"))
+    }
+
+    pub(super) fn resolve(&self) -> Result<Arc<dyn EmbeddingClientTransport>> {
+        if let Some(transport) = self.resolved.get() {
+            return Ok(Arc::clone(transport));
+        }
+        let factory = self
+            .factory
+            .get()
+            .ok_or_else(|| anyhow!("embedding_server_transport_unavailable"))?;
+        // A failed capture is not cached: the next caller retries rather than inheriting the
+        // failure for the life of the process.
+        let transport = factory()?;
+        Ok(Arc::clone(self.resolved.get_or_init(|| transport)))
+    }
+}
+
+static CLIENT_TRANSPORT: LazyClientTransport = LazyClientTransport::new();
 
 pub fn install_embedding_client_transport(
     transport: Arc<dyn EmbeddingClientTransport>,
 ) -> Result<()> {
-    CLIENT_TRANSPORT
-        .set(transport)
-        .map_err(|_| anyhow!("embedding_client_transport_already_installed"))
+    CLIENT_TRANSPORT.install(transport)
+}
+
+/// Register how to build the client transport without building it yet.
+pub fn install_embedding_client_transport_factory(factory: ClientTransportFactory) -> Result<()> {
+    CLIENT_TRANSPORT.install_factory(factory)
 }
 
 #[derive(Clone)]
@@ -161,10 +213,7 @@ impl fmt::Debug for PerUserEmbeddingClient {
 
 impl PerUserEmbeddingClient {
     pub fn for_runtime(runtime: &SidecarRuntimeConfig) -> Result<Self> {
-        let transport = CLIENT_TRANSPORT
-            .get()
-            .cloned()
-            .ok_or_else(|| anyhow!("embedding_server_transport_unavailable"))?;
+        let transport = CLIENT_TRANSPORT.resolve()?;
         Ok(Self {
             transport,
             compatibility: EmbeddingCompatibility::current(runtime.embedding.allow_cpu),
@@ -537,7 +586,19 @@ impl PerUserEmbeddingClient {
             let elapsed = elapsed_since(self.transport.clock().as_ref(), started_at_ns);
             let remaining = budgets.spawn.saturating_sub(elapsed);
             if remaining.is_zero() {
-                bail!("embedding_server_start_timeout");
+                // The server it was waiting for keeps converging after this budget expires, so the
+                // next request usually connects. Reporting it as terminal turned an ordinary slow
+                // cold start into a failed ground with no path forward.
+                return Err(PerUserEmbeddingError {
+                    code: "embedding_server_start_timeout".into(),
+                    message: "the embedding server did not finish starting within its budget"
+                        .into(),
+                    retry_class: "after_delay".into(),
+                    retry_after_ms: duration_ms(budgets.retry_after),
+                    retry_condition: "the spawned embedding server finishes starting".into(),
+                    capacity: None,
+                }
+                .into());
             }
             let remaining = control
                 .map(|control| control.remaining(remaining))
@@ -595,7 +656,19 @@ impl PerUserEmbeddingClient {
                     spawned_at_ns = Some(self.transport.clock().now_ns());
                 }
                 EmbeddingConnectOutcome::NoOwner if !may_spawn => {
-                    bail!("embedding_server_absent");
+                    // An observe-only caller cannot start the server, but a spawn-capable one will,
+                    // so this is a wait rather than a dead end.
+                    return Err(PerUserEmbeddingError {
+                        code: "embedding_server_absent".into(),
+                        message: "no embedding server is running and this caller cannot start one"
+                            .into(),
+                        retry_class: "after_delay".into(),
+                        retry_after_ms: duration_ms(budgets.retry_after),
+                        retry_condition: "a spawn-capable caller starts the embedding server"
+                            .into(),
+                        capacity: None,
+                    }
+                    .into());
                 }
                 EmbeddingConnectOutcome::NoOwner => {
                     let spawned_at_ns =

@@ -8,6 +8,7 @@ use super::{
     classify_unmatched_affected_input_with_metadata, compose_affected_completeness,
     compose_affected_evidence_gaps, match_affected_file_identities, normalized_affected_input,
 };
+use crate::index_freshness::NotCheckedReason;
 use crate::route_coverage::{RouteHandlerCandidate, compare_route_handler_candidates};
 use crate::tests::assert_no_staged_publication_artifacts;
 use crate::{
@@ -21,7 +22,6 @@ use crate::{
     indexable_source_path_in_workspace, not_checked_index_freshness, process_env_test_lock,
     resolve_project_file_path_from_root, stored_file_coverage_diagnostics,
 };
-use crate::index_freshness::NotCheckedReason;
 use codestory_contracts::api::{IndexMode, OpenProjectRequest};
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{

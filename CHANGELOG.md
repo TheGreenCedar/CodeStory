@@ -19,6 +19,13 @@
   the two it was. `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
   `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the bound if you would
   rather pay for the full check.
+- A first question that arrives while the local model is still starting now asks
+  you to try again in a moment instead of reporting the project as unavailable.
+  On a slower machine the engine often needed longer to start than the client
+  was willing to wait, and that timeout was treated as permanent.
+- Commands that never search — indexing, symbol lookup, call trails, `--version`
+  — no longer verify the embedded model at startup. Only the first command that
+  actually needs the engine pays for it.
 
 ## 0.16.1
 

@@ -1,12 +1,11 @@
 use super::{
     AffectedOperationIdentityIndex, ApiError, CURRENT_SCHEMA_VERSION, HashMap, HashSet,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
-    IndexFreshnessObservation,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, Path, PathBuf, RefreshExecutionPlan,
-    RefreshInputs, SourceIndexPolicy, Storage, WorkspaceInventoryOutcome, WorkspaceManifest,
-    WorkspaceMemberIndexDto, WorkspacePathIdentity, clamp_u128_to_u32, clamp_usize_to_u32,
-    runtime_relative_path, source_policy_exclusion_candidate, validate_source_policy_exclusions,
-    validate_structural_text_units,
+    IndexFreshnessObservation, IndexFreshnessSampleDto, IndexFreshnessStatusDto, Path, PathBuf,
+    RefreshExecutionPlan, RefreshInputs, SourceIndexPolicy, Storage, WorkspaceInventoryOutcome,
+    WorkspaceManifest, WorkspaceMemberIndexDto, WorkspacePathIdentity, clamp_u128_to_u32,
+    clamp_usize_to_u32, runtime_relative_path, source_policy_exclusion_candidate,
+    validate_source_policy_exclusions, validate_structural_text_units,
 };
 #[cfg(test)]
 use std::cell::RefCell;
@@ -239,16 +238,14 @@ fn validate_index_freshness_publication(
 fn load_index_freshness_inventory(
     storage: &Storage,
 ) -> Result<IndexFreshnessInventory, (NotCheckedReason, u32)> {
-    let files = storage
-        .get_files()
-        .map_err(|error| {
-            (
-                NotCheckedReason::unavailable(format!(
-                    "failed to read indexed file inventory: {error}"
-                )),
-                0,
-            )
-        })?;
+    let files = storage.get_files().map_err(|error| {
+        (
+            NotCheckedReason::unavailable(format!(
+                "failed to read indexed file inventory: {error}"
+            )),
+            0,
+        )
+    })?;
     let indexed_file_count = clamp_usize_to_u32(files.len());
     if files.is_empty() {
         return Err((
@@ -309,11 +306,7 @@ fn plan_index_freshness(
 ) -> Result<IndexFreshnessPlan, NotCheckedReason> {
     let current_cap = current_file_cap();
     let refresh = workspace
-        .build_execution_outcome_bounded_with_policy(
-            &inventory.refresh_inputs,
-            current_cap,
-            policy,
-        )
+        .build_execution_outcome_bounded_with_policy(&inventory.refresh_inputs, current_cap, policy)
         .map_err(|error| {
             NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
         })?;
