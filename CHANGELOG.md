@@ -143,7 +143,17 @@ paths more accurately.
 
 Update the CodeStory plugin and start a fresh session in your agent host. The
 first broad question may take a little longer while CodeStory updates the
-repository's local index. No manual migration or cleanup is required.
+repository's local index. Your existing index migrates in place; no manual
+migration step is required.
+
+If you ran 0.15, its retrieval sidecars are no longer used and 0.16 does not
+remove them, because CodeStory only deletes resources it can prove it owns.
+Two Docker containers, `codestory-qdrant` and `codestory-embed` (or your
+`CODESTORY_SIDECAR_NAMESPACE` prefix instead of `codestory`), were started with
+`restart: unless-stopped` and so survive reboots while holding ports 6333, 6334,
+and 8080. The directory `qdrant` under your CodeStory cache root is likewise
+orphaned and includes a downloaded model. Both are safe to remove once you are
+on 0.16.
 
 ## 0.15.0
 

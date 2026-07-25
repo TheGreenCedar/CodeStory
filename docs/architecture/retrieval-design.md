@@ -46,6 +46,7 @@ batching contract.
 | --- | --- |
 | Apple Silicon macOS | v0.16 package with verified Metal acceleration |
 | Windows x64 | v0.16 package with verified Vulkan acceleration |
+| Linux x64 | v0.16 package with verified Vulkan acceleration |
 | Other targets | no v0.16 package or runtime claim |
 | Hosted CI or maintainer diagnostic | CPU only with `CODESTORY_EMBED_ALLOW_CPU=1` |
 
