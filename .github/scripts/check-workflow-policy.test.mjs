@@ -742,6 +742,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
         = "inputs.emit_release_cells";
     }, /must retain the authenticated Vulkan release cell outside calibration/u],
+    ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
+      delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
+    }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],
     ["Vulkan candidate staging runs during calibration", windowsVulkanFile, workflow => {
       draftStep(workflow.jobs["packaged-vulkan"], "Stage isolated candidate-managed Windows install").if
         = "inputs.candidate_installed_proof";

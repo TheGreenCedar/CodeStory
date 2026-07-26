@@ -160,6 +160,9 @@ jobs:
 
       - name: Prepare checksum-pinned embedded model
         if: ${{ !inputs.use_packaged_cli_artifact }}
+        # The self-hosted runner service account has the default Restricted execution
+        # policy, so every run step must carry the bypass shell or die before running.
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: node scripts/prepare-embedded-model.mjs
 
       - name: Build and package native CLI

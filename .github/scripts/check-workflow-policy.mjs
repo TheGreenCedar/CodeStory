@@ -1782,6 +1782,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--cell-id retrieval_readiness:windows-x64",
     "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
   ]);
+  // The self-hosted Windows service account runs under the default Restricted execution
+  // policy, so a run step left on the default shell dies before executing anything:
+  // every step must pick bash or a powershell invocation that bypasses the policy.
+  for (const step of at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan", "steps") ?? []) {
+    if (typeof object(step).run !== "string") continue;
+    const shell = object(step).shell;
+    add(
+      violations,
+      typeof shell === "string" && (shell === "bash" || shell.includes("-ExecutionPolicy Bypass")),
+      `windows-vulkan-proof.yml step ${object(step).name ?? "<unnamed>"} must declare the bypass shell for the locked-down service account`,
+    );
+  }
 
   const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
   add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
