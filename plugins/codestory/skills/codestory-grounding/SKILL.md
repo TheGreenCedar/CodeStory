@@ -28,8 +28,9 @@ ceremony.
 1. Resolve the target repository root.
 2. Call the intended tool with `project=<absolute-root>`.
 3. If the result says `state=preparing`, wait for `retry_after_ms` and retry the
-   same tool with the same arguments. Do not poll status or ask the user to set
-   up CodeStory.
+   same tool with the same arguments. The delay tracks observed preparation
+   progress, so honor the reported value instead of a fixed poll interval. Do
+   not poll status or ask the user to set up CodeStory.
 4. Preserve cited anchors in source claims. Read focused source only for the
    remaining evidence gaps.
 

@@ -617,6 +617,103 @@ test("managed probe failures stay sanitized through fail-open output", () => {
   }
 });
 
+test("provisioning retry hints derive remaining transfer time within documented bounds", () => {
+  const hint = launcherTest.provisioningRetryHintMs;
+  // States carrying no measurable transfer keep the documented fallback.
+  assert.equal(launcherTest.provisioningRetryHintFallbackMs, 1500);
+  assert.equal(hint({ receivedBytes: 0, totalBytes: null, startedAt: null, updatedAt: null }), 1500);
+  assert.equal(hint({ receivedBytes: 4096, totalBytes: null, startedAt: 0, updatedAt: 1000 }), 1500);
+  assert.equal(hint({ receivedBytes: 0, totalBytes: 1024, startedAt: 0, updatedAt: 1000 }), 1500);
+  assert.equal(hint({ receivedBytes: 10, totalBytes: 100, startedAt: 500, updatedAt: 500 }), 1500);
+  // A quarter received in one second forecasts three more seconds of transfer.
+  assert.equal(hint({ receivedBytes: 25, totalBytes: 100, startedAt: 0, updatedAt: 1000 }), 3000);
+  // A slow large download clamps to the ceiling instead of parking the agent for minutes.
+  assert.equal(
+    hint({ receivedBytes: 1024, totalBytes: 1024 * 1024 * 1024, startedAt: 0, updatedAt: 1000 }),
+    launcherTest.provisioningRetryHintMaxMs,
+  );
+  // An almost-finished transfer clamps to the floor instead of oversleeping readiness.
+  assert.equal(
+    hint({ receivedBytes: 1_048_575, totalBytes: 1_048_576, startedAt: 0, updatedAt: 10 }),
+    launcherTest.provisioningRetryHintMinMs,
+  );
+  // A completed asset needs no rate to forecast: the next provisioning stage is imminent.
+  assert.equal(
+    hint({ receivedBytes: 2048, totalBytes: 2048, startedAt: 100, updatedAt: 100 }),
+    launcherTest.provisioningRetryHintMinMs,
+  );
+});
+
+test("preparing fail-open surfaces share one progress-derived retry hint", () => {
+  const original = { ...launcherTest.managedCliDownloadProgress };
+  try {
+    Object.assign(launcherTest.managedCliDownloadProgress, {
+      stage: "downloading_runtime",
+      asset: "codestory-cli-v0.0.0-test.tar.gz",
+      attempt: 2,
+      receivedBytes: 25,
+      totalBytes: 100,
+      startedAt: 0,
+      updatedAt: 1000,
+    });
+    const operation = launcherTest.managedProvisioningOperation();
+    assert.equal(operation.retry_after_ms, 3000);
+    const preparingStatus = {
+      plugin_runtime: { plugin_version: "test" },
+      managed_retrieval: { state: "preparing" },
+      degraded_reason: "managed_cli_provisioning",
+      warnings: [],
+      readiness: [],
+    };
+    const ground = launcherTest.failOpenToolResult("ground", preparingStatus, { project: repoRoot });
+    assert.equal(ground.structuredContent.retry_after_ms, 3000);
+    assert.equal(ground.structuredContent.operation.retry_after_ms, 3000);
+    const status = launcherTest.failOpenToolResult("status", preparingStatus, { project: repoRoot });
+    assert.equal(status.structuredContent.retry_after_ms, 3000);
+    assert.equal(status.structuredContent.current_operation.retry_after_ms, 3000);
+  } finally {
+    Object.assign(launcherTest.managedCliDownloadProgress, original);
+  }
+});
+
+test("fail-open status reads refresh the preparing retry hint from live download progress", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    `const launcherModule=require(${JSON.stringify(launcher)})._test;`,
+    // The diagnostic snapshot predates the transfer, so its recommended call still carries the
+    // no-signal fallback; only the read below observes the in-flight download.
+    "const status={",
+    'plugin_runtime:{plugin_version:"test"},',
+    'managed_retrieval:{state:"preparing"},',
+    'degraded_reason:"managed_cli_provisioning",',
+    "readiness:[],",
+    "recommended_next_calls:[",
+    '{method:"tools/call",instruction:"Retry the intended CodeStory tool shortly.",after_ms:launcherModule.provisioningRetryHintFallbackMs},',
+    '{method:"resources/read",uri_template:"codestory://status{?project}"}',
+    "]};",
+    'Object.assign(launcherModule.managedCliDownloadProgress,{stage:"downloading_runtime",asset:"archive.tar.gz",attempt:1,receivedBytes:25,totalBytes:100,startedAt:0,updatedAt:1000});',
+    "launcherModule.runFailOpenMcp(()=>status);",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.end(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "resources/read",
+    params: { uri: statusUri },
+  })}\n`);
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  const status = JSON.parse(responses.find((response) => response.id === 1).result.contents[0].text);
+  assert.deepEqual(status.recommended_next_calls, [
+    { method: "tools/call", instruction: "Retry the intended CodeStory tool shortly.", after_ms: 3000 },
+    { method: "resources/read", uri: statusUri },
+  ]);
+});
+
 async function writeAttestedDevPluginFixture(root, version) {
   const { cp } = await import("node:fs/promises");
   const installRoot = join(
@@ -3745,14 +3842,20 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
     const { progress, ...operationCore } = coldGround.result.structuredContent.operation;
+    // The gated release server withholds every asset byte here, so no transfer is measurable and
+    // the retry hint must be the documented no-signal fallback.
     assert.deepEqual(operationCore, {
       operation_id: "managed-runtime-provisioning",
       state: "preparing",
       stage: "downloading_runtime",
       attempt: 1,
-      retry_after_ms: 1500,
+      retry_after_ms: launcherTest.provisioningRetryHintFallbackMs,
       failure: null,
     });
+    assert.equal(
+      coldGround.result.structuredContent.retry_after_ms,
+      coldGround.result.structuredContent.operation.retry_after_ms,
+    );
     // Progress appears once a release asset fetch is in flight; the request can land just before
     // the background provisioner gets that far, so null is the only other legal value.
     if (progress !== null) {
