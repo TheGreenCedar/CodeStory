@@ -42,8 +42,8 @@ pages, runbooks, and workflows own detailed mechanics.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
   grounding, search, packet construction, and agent flows belong here.
 - `codestory-cli`: command and transport parsing, output rendering, process
-  configuration capture, readiness-broker integration, and managed sidecar
-  lifecycle boundaries. Do not move product orchestration into adapters.
+  configuration capture, and managed sidecar lifecycle boundaries. Do not move
+  product orchestration into adapters.
 - `plugins/codestory`: host hooks, the packaged launcher, MCP routing, and the
   canonical agent skill. Plugin routing selects a project per request and
   reaches product behavior through the version-matched CLI.

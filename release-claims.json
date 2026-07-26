@@ -1098,8 +1098,7 @@
       "windows-vulkan-proof.yml",
       "linux-vulkan-proof.yml",
       "post-publish-release-smoke.yml",
-      "release.yml",
-      "repo-scale-stats.yml"
+      "release.yml"
     ],
     "promotion": {
       "source_branch": "dev/codestory-next",

@@ -916,6 +916,12 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"].with.hermetic_linux = true;
     }, /hosted Linux calibration must call packaged proof in calibration mode/u],
+    ["coordinator adds a macOS source hard gate", coordinatorFile, workflow => {
+      workflow.jobs["macos-source"] = {
+        "runs-on": "macos-14",
+        steps: [],
+      };
+    }, /packaged-platform-pr\.yml standard coordinator must not add a macOS source hard gate/u],
     ["package matrix repeats frozen Linux qualification", packagedFile, workflow => {
       packagedJob(workflow).steps.push(structuredClone(draftStep(
         workflow.jobs["frozen-linux-qualification"],
