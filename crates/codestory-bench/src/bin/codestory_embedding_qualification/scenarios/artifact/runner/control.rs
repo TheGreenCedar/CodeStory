@@ -224,6 +224,11 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     fn observe_worker(&mut self) -> Result<Option<EmbeddingServerSnapshot>> {
+        // One observe worker per poll: executable capture, connect, one
+        // snapshot, no request work and no per-request transport fan-out, so
+        // the flat snapshot budget dominates its honest chain. Waits that
+        // cover a client ramping queue load must carry the queue-setup
+        // budget instead (see dead_client_setup_timeout).
         let worker = self.spawn_worker("observe", query_parameters(1), None)?;
         let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
         require_worker_success(&output, "observe")?;
