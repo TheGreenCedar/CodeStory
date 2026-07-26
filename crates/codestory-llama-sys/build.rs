@@ -38,6 +38,7 @@ struct ModelContract {
     config_sha256: String,
     producer_name: String,
     producer_version: String,
+    producer_embedding_revision: String,
     license_spdx_id: String,
     license_source_url: String,
 }
@@ -94,15 +95,18 @@ fn main() {
         contract.llama_cpp_source_commit,
         contract.sha256,
         contract.producer_name,
-        contract.producer_version,
+        contract.producer_embedding_revision,
     );
+    // The embedding revision, not the crate version. Persisted vectors are keyed by this id, so
+    // using the release version discarded every user's dense sidecars on a bugfix that touched
+    // nothing about embeddings. The revision moves only when the embeddings themselves change.
     let product_embedding_runtime_id = format!(
         "{}:sha256-{}:llama.cpp-{}:producer-{}@{}",
         contract.embedding_family,
         contract.sha256,
         contract.llama_cpp_source_commit,
         contract.producer_name,
-        contract.producer_version
+        contract.producer_embedding_revision
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
@@ -609,6 +613,16 @@ fn load_model_contract() -> ModelContract {
         env::var("CARGO_PKG_VERSION").expect("Cargo sets CARGO_PKG_VERSION"),
         "producer.version must match the crate version"
     );
+    // Deliberately not tied to the crate version: it must be free to stay still across releases.
+    let producer_embedding_revision = required_string(producer, "embedding_revision");
+    assert!(
+        producer_embedding_revision
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+            && producer_embedding_revision.split('.').count() == 3,
+        "producer.embedding_revision must be a dotted numeric revision"
+    );
     let license_spdx_id = required_string(license, "spdx_id");
     assert_eq!(license_spdx_id, "MIT", "unsupported model license");
     let license_source_url = required_string(license, "source_url");
@@ -635,6 +649,7 @@ fn load_model_contract() -> ModelContract {
         config_sha256,
         producer_name,
         producer_version,
+        producer_embedding_revision,
         license_spdx_id,
         license_source_url,
     }

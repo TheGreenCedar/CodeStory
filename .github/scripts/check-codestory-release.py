@@ -94,6 +94,14 @@ def validate_model_producer(root: Path, expected: str) -> None:
         raise ValueError(
             f"{MODEL_CONTRACT} producer.version is {version!r}, expected {expected}"
         )
+    # Deliberately not compared with the release version. This keys persisted vectors, so it
+    # must be free to stay still across releases; bumping it discards every user's dense
+    # sidecars. It moves only when the embeddings themselves change.
+    revision = producer.get("embedding_revision")
+    if not isinstance(revision, str) or not SEMVER_RE.fullmatch(revision):
+        raise ValueError(
+            f"{MODEL_CONTRACT} producer.embedding_revision must be a semver string"
+        )
 
 
 def fail(message: str) -> None:
