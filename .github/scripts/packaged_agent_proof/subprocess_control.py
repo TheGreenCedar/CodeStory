@@ -322,23 +322,47 @@ class McpProcess:
         time.sleep(min(retry_after_ms, max(0, int(remaining * 1000))) / 1000)
 
     def search_until_ready(self, arguments: dict, request_id: str) -> tuple[dict, int]:
-        response, attempts = self.tool_until_ready("search", arguments, request_id)
-        state = response["result"]["structuredContent"]
-        query = arguments.get("query")
-        require(
-            isinstance(query, str) and state.get("query") == query,
-            f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
-        )
-        require(
-            isinstance(state.get("hits"), list),
-            f"MCP search returned non-array hits: {state!r}",
-        )
-        retrieval = state.get("retrieval")
-        require(
-            isinstance(retrieval, dict) and retrieval.get("state") == "ready",
-            f"MCP search did not return the ready installed retrieval projection: {state!r}",
-        )
-        return response, attempts
+        deadline = time.monotonic() + self.timeout
+        total_attempts = 0
+        poll = 0
+        while True:
+            poll += 1
+            poll_request_id = (
+                request_id if poll == 1 else f"{request_id}-degraded-{poll}"
+            )
+            response, attempts = self.tool_until_ready(
+                "search", arguments, poll_request_id
+            )
+            total_attempts += attempts
+            self.tool_attempt_counts[request_id] = total_attempts
+            state = response["result"]["structuredContent"]
+            query = arguments.get("query")
+            require(
+                isinstance(query, str) and state.get("query") == query,
+                f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+            )
+            require(
+                isinstance(state.get("hits"), list),
+                f"MCP search returned non-array hits: {state!r}",
+            )
+            retrieval = state.get("retrieval")
+            require(
+                isinstance(retrieval, dict)
+                and retrieval.get("state") in ("ready", "degraded"),
+                f"MCP search did not return the ready installed retrieval projection: {state!r}",
+            )
+            if retrieval.get("state") == "ready":
+                return response, total_attempts
+            # The projection reports the real retrieval state, so a fresh install
+            # answers lexically while the semantic sidecar is still publishing.
+            # That degraded window is convergence, not failure: keep asking until
+            # the shared deadline, and let a host that never converges fail loud.
+            remaining = deadline - time.monotonic()
+            require(
+                remaining > 0,
+                f"MCP search retrieval projection never became ready: {state!r}",
+            )
+            time.sleep(min(1.0, remaining))
 
     def close(self) -> None:
         if self.process.stdin:
