@@ -9,6 +9,7 @@ from pathlib import Path
 from .archive_io import find_cli, unpack_archive
 from .calibration_verification import verify_calibration_bundle
 from .contract_primitives import write_json
+from .failure_evidence import preserve_failure_evidence
 from .foundation import LEGACY_HELP_TOKENS, REPOSITORY_ROOT, require
 from .installation_support import isolated_environment
 from .native_manifest import load_native_manifest
@@ -134,72 +135,87 @@ def run_archive_proof(args: argparse.Namespace) -> None:
     )
     with temporary_package_directory as raw:
         root = Path(raw)
-        unpack_archive(args.archive, root / "unpacked")
-        cli = find_cli(root / "unpacked")
-        manifest = load_native_manifest(
-            root / "unpacked",
-            cli,
-            args.expected_version,
+        try:
+            _run_proof_phases(args, temporary_package_directory, root)
+        except BaseException as error:
+            # The temporary package root is destroyed on exit; copy the
+            # qualification evidence it holds into the workflow-uploaded
+            # output directory before that happens.
+            preserve_failure_evidence(root, args.out_dir, error)
+            raise
+
+
+def _run_proof_phases(
+    args: argparse.Namespace,
+    temporary_package_directory: FailurePreservingTemporaryDirectory,
+    root: Path,
+) -> None:
+    unpack_archive(args.archive, root / "unpacked")
+    cli = find_cli(root / "unpacked")
+    manifest = load_native_manifest(
+        root / "unpacked",
+        cli,
+        args.expected_version,
+    )
+    verify_package_source(args, manifest)
+    require_frozen = requires_calibration_bundle(args)
+    require(
+        not args.enforce_calibration_freeze_lineage or require_frozen,
+        "calibration freeze lineage is valid only for the immediate frozen proof",
+    )
+    measurement_contract = verify_package_server_contracts(
+        manifest,
+        args.measurement_protocol,
+        require_frozen=require_frozen,
+    )
+    if args.ground_only and os.name == "nt":
+        cleanup_wait_budget = native_server_exit_wait_budget(
+            manifest,
+            measurement_contract["constant_set"],
         )
-        verify_package_source(args, manifest)
-        require_frozen = requires_calibration_bundle(args)
+        temporary_package_directory.cleanup_retry_budget_secs = (
+            cleanup_wait_budget["timeout_ms"] / 1000
+        )
+    calibration_bundle = load_calibration_bundle(
+        args,
+        manifest,
+        measurement_contract,
+        required=require_frozen,
+    )
+    env = isolated_environment(root, args.engine_policy, args.offline)
+    summary = package_summary(
+        args,
+        cli,
+        root,
+        env,
+        manifest,
+        measurement_contract,
+        calibration_bundle,
+    )
+    if not args.version_only:
         require(
-            not args.enforce_calibration_freeze_lineage or require_frozen,
-            "calibration freeze lineage is valid only for the immediate frozen proof",
+            args.project is not None,
+            "--project is required for the runtime proof",
         )
-        measurement_contract = verify_package_server_contracts(
-            manifest,
-            args.measurement_protocol,
-            require_frozen=require_frozen,
+        require(
+            args.engine_policy is not None,
+            "--engine-policy is required for the runtime proof",
         )
-        if args.ground_only and os.name == "nt":
-            cleanup_wait_budget = native_server_exit_wait_budget(
-                manifest,
-                measurement_contract["constant_set"],
-            )
-            temporary_package_directory.cleanup_retry_budget_secs = (
-                cleanup_wait_budget["timeout_ms"] / 1000
-            )
-        calibration_bundle = load_calibration_bundle(
-            args,
-            manifest,
-            measurement_contract,
-            required=require_frozen,
-        )
-        env = isolated_environment(root, args.engine_policy, args.offline)
-        summary = package_summary(
+        runtime = run_runtime_proof(
             args,
             cli,
-            root,
             env,
+            root,
             manifest,
             measurement_contract,
-            calibration_bundle,
         )
-        if not args.version_only:
-            require(
-                args.project is not None,
-                "--project is required for the runtime proof",
-            )
-            require(
-                args.engine_policy is not None,
-                "--engine-policy is required for the runtime proof",
-            )
-            runtime = run_runtime_proof(
-                args,
-                cli,
-                env,
-                root,
-                manifest,
-                measurement_contract,
-            )
-            summary["runtime"] = runtime
-            record_runtime_contract(args, summary, manifest, runtime)
-            record_qualification_contract(
-                args,
-                summary,
-                manifest,
-                runtime,
-                measurement_contract,
-            )
-        write_json(args.out_dir / "summary.json", summary)
+        summary["runtime"] = runtime
+        record_runtime_contract(args, summary, manifest, runtime)
+        record_qualification_contract(
+            args,
+            summary,
+            manifest,
+            runtime,
+            measurement_contract,
+        )
+    write_json(args.out_dir / "summary.json", summary)
