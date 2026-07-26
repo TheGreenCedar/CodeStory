@@ -681,6 +681,18 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs.build, "Upload hosted Linux calibration runs").if
         = "success() && matrix.asset_target == 'linux-x64'";
     }, /hosted calibration artifact must remain calibration-only/u],
+    ["package calibration failure evidence removed", packagedProofFile, workflow => {
+      workflow.jobs.build.steps = workflow.jobs.build.steps
+        .filter(({ name }) => name !== "Upload hosted Linux calibration failure evidence");
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence becomes success-gated", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence").if
+        = "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence fails closed", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence")
+        .with["if-no-files-found"] = "error";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
     ["package evaluation becomes a standard server-behavior proof", packagedProofFile, workflow => {
       draftStep(
         workflow.jobs.build,

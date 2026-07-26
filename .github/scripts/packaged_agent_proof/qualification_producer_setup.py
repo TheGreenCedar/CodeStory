@@ -8,6 +8,7 @@ import secrets
 from pathlib import Path
 
 from .contract_primitives import sha256
+from .failure_evidence import register_failure_evidence_secret
 from .foundation import RETRIEVAL_QUALITY_EVIDENCE_CONTRACT, ProofFailure, require
 from .native_manifest import runtime_executable_sha256
 from .publication_consistency_verifier import (
@@ -55,6 +56,7 @@ def prepare_qualification_producer(
     private_root.mkdir(mode=0o700)
     artifact_root.mkdir(mode=0o700)
     nonce = secrets.token_hex(32)
+    register_failure_evidence_secret(nonce)
     projects = runtime.get("_qualification_projects")
     require(
         isinstance(projects, list)

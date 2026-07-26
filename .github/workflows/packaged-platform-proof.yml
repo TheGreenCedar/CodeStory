@@ -899,6 +899,15 @@ jobs:
           retention-days: 30
           overwrite: true
 
+      - name: Upload hosted Linux calibration failure evidence
+        if: failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: embedding-calibration-linux-failure-evidence-attempt-${{ github.run_attempt }}
+          path: target/calibration-runs/linux
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Upload packaged agent proof artifacts
         if: >-
           always() &&

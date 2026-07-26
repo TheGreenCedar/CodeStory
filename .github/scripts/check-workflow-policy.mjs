@@ -2540,6 +2540,20 @@ function validatePackagedProof(workflows, violations, graph) {
         === "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode",
     `${file} hosted calibration artifact must remain calibration-only`,
   );
+  const hostedCalibrationFailureUpload = namedStep(
+    job,
+    "Upload hosted Linux calibration failure evidence",
+  );
+  add(
+    violations,
+    hostedCalibrationFailureUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hostedCalibrationFailureUpload?.if
+        === "failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode"
+      && object(hostedCalibrationFailureUpload?.with).path
+        === "target/calibration-runs/linux"
+      && object(hostedCalibrationFailureUpload?.with)["if-no-files-found"] === "warn",
+    `${file} hosted calibration failure evidence must stay a failure-only best-effort upload`,
+  );
   const hostedEvaluationUpload = namedStep(job, "Upload packaged agent proof artifacts");
   add(
     violations,
