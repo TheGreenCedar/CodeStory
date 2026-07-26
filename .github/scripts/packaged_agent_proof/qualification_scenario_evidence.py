@@ -84,22 +84,22 @@ class ReplayAttempt:
     submitted_ns: int
     completed_ns: int
     outcome: str
+    loss_code: str | None
 
 
 def _validated_replay_attempt(value: object, index: int) -> ReplayAttempt:
     require(isinstance(value, dict), "replay attempt is malformed")
-    require_exact_keys(
-        value,
-        {
-            "ordinal",
-            "request_id",
-            "server_instance_id",
-            "submitted_ns",
-            "completed_ns",
-            "outcome",
-        },
-        f"replay attempt {index}",
-    )
+    expected = {
+        "ordinal",
+        "request_id",
+        "server_instance_id",
+        "submitted_ns",
+        "completed_ns",
+        "outcome",
+    }
+    if "loss_code" in value:
+        expected.add("loss_code")
+    require_exact_keys(value, expected, f"replay attempt {index}")
     require(value["ordinal"] == index, "replay attempt ordinal is not exact")
     request_id = require_nonempty_string(
         value["request_id"],
@@ -122,6 +122,16 @@ def _validated_replay_attempt(value: object, index: int) -> ReplayAttempt:
         value["outcome"],
         f"replay attempt {index} outcome",
     )
+    loss_code = value.get("loss_code")
+    if loss_code is not None:
+        loss_code = require_nonempty_string(
+            loss_code,
+            f"replay attempt {index} loss_code",
+        )
+    require(
+        (outcome == "server_loss") == (loss_code is not None),
+        f"replay attempt {index} loss classification does not match its outcome",
+    )
     return ReplayAttempt(
         ordinal=index,
         request_id=request_id,
@@ -129,6 +139,7 @@ def _validated_replay_attempt(value: object, index: int) -> ReplayAttempt:
         submitted_ns=submitted_ns,
         completed_ns=completed_ns,
         outcome=outcome,
+        loss_code=loss_code,
     )
 
 
@@ -157,6 +168,14 @@ def validate_replay_attempts(
         and replay.server_instance_id == new_server_instance_id
         and replay.outcome == "completed",
         "replay attempts do not bind the old loss and exact replacement completion",
+    )
+    # These scenarios kill a live peer mid-RPC, so the original loss must be
+    # the classified transport disconnect; an unresponsive-owner timeout here
+    # is the misclassification that previously masked real Windows named-pipe
+    # disconnects.
+    require(
+        original.loss_code == "embedding_server_connection_lost",
+        "replay original loss is not the classified transport disconnect",
     )
     return attempts
 

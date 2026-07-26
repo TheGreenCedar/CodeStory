@@ -22,6 +22,12 @@
   the background. The model keeps running between commands as before, so later
   commands do not reload it. A runtime crash now also reports the raw Windows
   exit code instead of a bare failure.
+- On Windows, losing the connection to the embedding runtime while sending it a
+  request is recognized as a disconnect and retried once against the
+  replacement, instead of waiting out the full request deadline and failing as
+  an unresponsive runtime. The recorded failure keeps the raw Windows error
+  code and whether the runtime exited, so a crash can be told apart from an
+  external kill.
 
 ### Faster
 

@@ -165,10 +165,15 @@ impl EmbeddingServerStream for MemoryStream {
     }
 }
 
+/// The raw Win32 code a named-pipe writer observes when the peer end closed:
+/// ERROR_NO_DATA, "the pipe is being closed".
+pub(super) const WINDOWS_PIPE_CLOSING_RAW_CODE: i32 = 232;
+
 #[derive(Clone)]
 pub(super) enum ScriptOutcome {
     Success,
     Loss,
+    WriteDisconnect,
     HelloLoss,
     Capacity,
     TimedBulk {
@@ -189,6 +194,7 @@ pub(super) struct ScriptStream {
     pub(super) outcome: ScriptOutcome,
     pub(super) compatibility: EmbeddingCompatibility,
     pub(super) read_gate: Option<Arc<AtomicBool>>,
+    pub(super) hello_completed: bool,
 }
 
 impl ScriptStream {
@@ -200,6 +206,7 @@ impl ScriptStream {
             outcome,
             compatibility,
             read_gate: None,
+            hello_completed: false,
         }
     }
 
@@ -221,7 +228,11 @@ impl ScriptStream {
     ) -> io::Result<Option<(EmbeddingProtocolResponse, Vec<u8>)>> {
         let request_id = request.request_id;
         match request.operation {
-            EmbeddingOperation::Hello { .. } => self.hello_response(&request_id),
+            EmbeddingOperation::Hello { .. } => {
+                let response = self.hello_response(&request_id);
+                self.hello_completed = true;
+                response
+            }
             EmbeddingOperation::EmbedQuery { .. } => self.query_response(&request_id),
             EmbeddingOperation::EmbedDocuments { inputs, .. } => {
                 self.documents_response(&request_id, inputs.len())
@@ -328,6 +339,9 @@ impl ScriptStream {
                 )))
             }
             ScriptOutcome::HelloLoss => Err(io::Error::other("query reached hello-loss stream")),
+            ScriptOutcome::WriteDisconnect => Err(io::Error::other(
+                "query write must fail before a response is produced",
+            )),
             ScriptOutcome::TimedBulk { .. } => {
                 Err(io::Error::other("query reached timed bulk stream"))
             }
@@ -402,6 +416,15 @@ impl Read for ScriptStream {
 
 impl Write for ScriptStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.hello_completed && matches!(self.outcome, ScriptOutcome::WriteDisconnect) {
+            // The exact shape the Windows transport surfaces when the peer
+            // closed the pipe during a request write: the portable
+            // BrokenPipe kind with the raw pipe-closing code retained.
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                io::Error::from_raw_os_error(WINDOWS_PIPE_CLOSING_RAW_CODE),
+            ));
+        }
         self.writes.extend_from_slice(buffer);
         Ok(buffer.len())
     }

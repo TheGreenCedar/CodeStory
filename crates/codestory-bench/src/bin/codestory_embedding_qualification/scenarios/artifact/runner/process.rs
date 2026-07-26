@@ -159,14 +159,20 @@ pub(super) fn validate_replay_attempts(
     new_server_instance_id: &str,
     phase: &str,
 ) -> Result<()> {
+    // Crash and stall scenarios kill a live peer mid-RPC, so the original
+    // loss must be the classified transport disconnect; an
+    // unresponsive-owner timeout here means the platform transport
+    // misclassified a real disconnect again.
     if attempts.len() != 2
         || attempts[0].ordinal != 1
         || attempts[1].ordinal != 2
         || attempts[0].request_id == attempts[1].request_id
         || attempts[0].server_instance_id != old_server_instance_id
         || attempts[0].outcome != "server_loss"
+        || attempts[0].loss_code.as_deref() != Some("embedding_server_connection_lost")
         || attempts[1].server_instance_id != new_server_instance_id
         || attempts[1].outcome != "completed"
+        || attempts[1].loss_code.is_some()
         || attempts.iter().any(|attempt| {
             attempt.request_id.trim().is_empty() || attempt.submitted_ns > attempt.completed_ns
         })

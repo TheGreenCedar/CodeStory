@@ -59,6 +59,37 @@ fn pure_rpc_replays_once_and_only_once_on_typed_loss() {
 }
 
 #[test]
+fn windows_pipe_closing_write_loss_is_classified_and_replayed_exactly_once() {
+    let transport = BootstrapTestTransport::new(
+        [BootstrapConnectOutcome::WriteDisconnect],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(5),
+    );
+    let client = PerUserEmbeddingClient {
+        transport: transport.clone(),
+        compatibility: EmbeddingCompatibility::current(true),
+        scope_id: "test-scope".into(),
+    };
+
+    let (vector, attempts) = client
+        .embed_query_with_qualification_attempts("x")
+        .expect("a classified pipe-closing write loss earns exactly one replay");
+
+    assert_eq!(vector.len(), RETRIEVAL_EMBEDDING_DIM);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].outcome, "server_loss");
+    assert_eq!(
+        attempts[0].loss_code.as_deref(),
+        Some("embedding_server_connection_lost"),
+        "the recorded loss must be the classified transport disconnect, \
+         not an unresponsive-owner timeout"
+    );
+    assert_eq!(attempts[1].outcome, "completed");
+    assert_eq!(attempts[1].loss_code, None);
+    assert_ne!(attempts[0].request_id, attempts[1].request_id);
+}
+
+#[test]
 fn pure_rpc_replay_waits_for_a_fail_stopped_owner_to_release_authority() {
     let transport = BootstrapTestTransport::new(
         [

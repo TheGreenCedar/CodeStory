@@ -140,6 +140,7 @@ impl EmbeddingClientTransport for ControlledCancelTestTransport {
 pub(super) enum BootstrapConnectOutcome {
     Connected,
     Loss,
+    WriteDisconnect,
     HelloLoss,
     NoOwner,
     OwnerUnresponsive,
@@ -344,6 +345,12 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
             BootstrapConnectOutcome::Loss => EmbeddingConnectOutcome::Connected(Box::new(
                 ScriptStream::new(ScriptOutcome::Loss, self.compatibility.clone()),
             )),
+            BootstrapConnectOutcome::WriteDisconnect => {
+                EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
+                    ScriptOutcome::WriteDisconnect,
+                    self.compatibility.clone(),
+                )))
+            }
             BootstrapConnectOutcome::HelloLoss => EmbeddingConnectOutcome::Connected(Box::new(
                 ScriptStream::new(ScriptOutcome::HelloLoss, self.compatibility.clone()),
             )),
