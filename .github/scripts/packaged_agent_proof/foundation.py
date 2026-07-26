@@ -28,6 +28,15 @@ STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
 SERVER_PROOF_SCHEMA_VERSION = 1
 QUALIFICATION_SCHEMA_VERSION = 1
+# Outer wire contract of the packaged CLI qualification worker. This must
+# equal EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION in
+# EMBEDDING_QUALIFICATION_WORKER_CONTRACT_SOURCE below: the harness asserts
+# the version its own tree compiled, exactly like the codestory-bench driver,
+# so a stale runtime can never make a mismatch self-consistent. The packaged
+# proof self-test pins the two declarations together; bump them in the same
+# change. This is distinct from QUALIFICATION_SCHEMA_VERSION, which is the
+# inner EmbeddingQualificationResult contract.
+EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION = 2
 NATIVE_SERVER_TEARDOWN_GRACE_MS = 60_000
 PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
 FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
@@ -128,6 +137,14 @@ SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
 )
 SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name(
     "per-user-embedding-server-constant-set.json"
+)
+EMBEDDING_QUALIFICATION_WORKER_CONTRACT_SOURCE = (
+    REPOSITORY_ROOT
+    / "crates"
+    / "codestory-retrieval"
+    / "src"
+    / "per_user_embedding"
+    / "qualification_worker.rs"
 )
 HOLDOUT_TASK_ROOT = REPOSITORY_ROOT / "benchmarks" / "tasks" / "holdout-retrieval"
 DEFAULT_QUERY = "RuntimeContext"

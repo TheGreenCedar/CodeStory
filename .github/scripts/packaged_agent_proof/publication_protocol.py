@@ -16,7 +16,11 @@ from .contract_primitives import (
     require_sha256,
     write_private_json,
 )
-from .foundation import ProofFailure, require
+from .foundation import (
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    ProofFailure,
+    require,
+)
 from .subprocess_control import json_command, run
 
 
@@ -260,7 +264,7 @@ def run_publication_replacement_worker(
     write_private_json(
         request_path,
         {
-            "schema_version": 1,
+            "schema_version": EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
             "nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
             "executable_sha256": executable_sha256,
             "project": str(project.resolve()),
@@ -299,13 +303,16 @@ def run_publication_replacement_worker(
         ) from exc
     require(
         isinstance(output, dict)
-        and output.get("schema_version") == 1
+        and output.get("schema_version")
+        == EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION
         and output.get("executable_sha256") == executable_sha256
         and output.get("error") is None,
         "publication replacement worker failed",
     )
     result = output.get("result")
     operations = result.get("operations") if isinstance(result, dict) else None
+    # The inner EmbeddingQualificationResult contract versions independently
+    # of the outer worker wire contract checked above.
     require(
         isinstance(result, dict)
         and result.get("schema_version") == 1
