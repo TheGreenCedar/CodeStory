@@ -140,6 +140,10 @@ def _verified_true_idle_fixture(
     true_idle_transitions, materialized_sha256 = _true_idle_transitions(
         before, respawned
     )
+    # Mirrors the driver's post-#1420 invocation shape: one plain query causes
+    # the respawn inside the proof window, and the resident-identity re-check
+    # starts only after the replacement engine is witnessed (observed_ns 400),
+    # so it must stay outside the consentless-respawn proof window.
     true_idle_invocations = [
         {
             "operation": "query",
@@ -152,6 +156,13 @@ def _verified_true_idle_fixture(
             "operation": "query",
             "started_ns": 10,
             "finished_ns": 20,
+            "exit_code": 0,
+            "termination": "exited",
+        },
+        {
+            "operation": "resident_identity",
+            "started_ns": 420,
+            "finished_ns": 440,
             "exit_code": 0,
             "termination": "exited",
         },
@@ -268,6 +279,31 @@ def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
         )
     else:
         raise ProofFailure("failed first query was hidden by a later respawn success")
+    premature_identity_invocations = json.loads(json.dumps(true_idle_invocations))
+    premature_identity_invocations[2]["started_ns"] = 300
+    premature_identity_invocations[2]["finished_ns"] = 320
+    try:
+        derive_scenario_assertions(
+            "true_idle_respawn",
+            observations_by_kind=true_idle_transitions,
+            process_observations=true_idle_process_observations,
+            invocations=premature_identity_invocations,
+            same_account={},
+            materialization={
+                "sha256": materialized_sha256,
+                "reused_on_rejoin": False,
+            },
+        )
+    except ProofFailure as error:
+        require(
+            str(error)
+            == "qualification scenario true_idle_respawn raw evidence failed assertions: next_product_operation_respawns_without_consent",
+            "premature identity probe changed its exact temporal failure",
+        )
+    else:
+        raise ProofFailure(
+            "identity probe inside the consentless-respawn window was accepted"
+        )
     historical_respawn_transition = json.loads(json.dumps(true_idle_transitions))
     historical_respawn_transition["server_respawned"][0]["observed_ns"] = 150
     try:
