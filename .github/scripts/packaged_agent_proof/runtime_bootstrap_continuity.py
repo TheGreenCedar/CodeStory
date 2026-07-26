@@ -12,7 +12,8 @@ from .contract_primitives import (
     write_json,
 )
 from .foundation import require
-from .installation_support import run_parallel
+from .installation_support import run_parallel, same_existing_path
+from .managed_layout import verify_flat_managed_layout
 from .managed_runtime import verify_managed_runtime_status
 from .memory_observation import capture_five_process_memory
 from .process_identity import process_start_identity
@@ -69,6 +70,15 @@ def _managed_runtime(
     require(
         managed_binary.is_relative_to(args.installed_plugin_data.resolve()),
         "installed managed executable is outside the installed plugin data root",
+    )
+    staged_launcher = verify_flat_managed_layout(
+        args.installed_plugin_data.resolve(),
+        manifest["release_version"],
+        manifest["asset_target"],
+    )
+    require(
+        same_existing_path(managed_binary, staged_launcher),
+        "installed managed executable is not the flat provisioned launcher",
     )
     require(
         managed_binary != cli.resolve(),
