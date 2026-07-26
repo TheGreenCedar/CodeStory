@@ -209,6 +209,10 @@ adapter to compensate for incorrect upstream state.
   `codestory-*` workspace crate, `Cargo.lock`, the `producer.version` in
   `crates/codestory-llama-sys/model-contract.json`, the CLI version pin in
   `plugins/codestory/cli-version.json`, and these plugin manifests:
+  (`producer.embedding_revision` is deliberately not a release surface: it keys
+  persisted vectors, so bumping it discards every user's dense sidecars. Move it
+  only when the embeddings themselves change -- model, llama.cpp commit,
+  pooling, normalization, dimension, prefixes, or vector schema.)
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`

@@ -153,6 +153,9 @@ function main() {
       check,
     });
   }
+  // producer.version only. producer.embedding_revision keys persisted vectors and is left
+  // alone on purpose: bumping it would discard every user's dense sidecars on a release that
+  // changed nothing about embeddings.
   rewrite(
     MODEL_CONTRACT,
     (source) => setJsonVersion(source, version, ["producer", "version"]),
