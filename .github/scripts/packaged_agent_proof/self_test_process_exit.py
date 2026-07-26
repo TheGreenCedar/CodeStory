@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .foundation import ProofFailure, require
+from .foundation import SERVER_CONSTANT_SET, ProofFailure, require
 from .process_identity import ExactProcessExitWaiter, process_start_identity
 from .server_cleanup import (
     _cleanup_environment,
@@ -55,8 +56,13 @@ def _exit_budget_tests() -> dict[str, int]:
         and not native_server_exit_wait_required("macos", "installed_runtime"),
         "native server exit-wait tier selection self-test failed",
     )
+    manifest = {"server_proof": {"idle_timeout_ms": 60_000}}
     budget = native_server_exit_wait_budget(
-        {"server_proof": {"idle_timeout_ms": 60_000}}
+        manifest,
+        {
+            "status": "frozen",
+            "qualification_thresholds": {"true_idle_exit": 72_285},
+        },
     )
     require(
         budget
@@ -66,6 +72,32 @@ def _exit_budget_tests() -> dict[str, int]:
             "timeout_ms": 120_000,
         },
         "native server exit-wait budget self-test failed",
+    )
+    require(
+        native_server_exit_wait_budget(
+            manifest,
+            {"status": "draft", "qualification_thresholds": {"true_idle_exit": None}},
+        )
+        == budget,
+        "an unfrozen constant set changed the conservative exit-wait budget",
+    )
+    for hostile in (
+        {"status": "frozen"},
+        {"status": "frozen", "qualification_thresholds": {"true_idle_exit": None}},
+        {"status": "frozen", "qualification_thresholds": {"true_idle_exit": 120_001}},
+    ):
+        try:
+            native_server_exit_wait_budget(manifest, hostile)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"a broken frozen constant set produced an exit-wait budget: {hostile!r}"
+            )
+    checked_in = json.loads(SERVER_CONSTANT_SET.read_text(encoding="utf-8"))
+    require(
+        native_server_exit_wait_budget(manifest, checked_in) == budget,
+        "the checked-in constant set no longer clears the exit-wait floor",
     )
     require(
         remaining_native_server_exit_wait_ms(120.0, 120_000, now=0.0) == 120_000
@@ -251,18 +283,21 @@ def _windows_abnormal_exit_test(target_os: str) -> None:
 
 def _exit_timeout_test(target_os: str) -> None:
     pid = os.getpid()
-    waiter = ExactProcessExitWaiter(
-        pid,
-        process_start_identity(pid),
-        target_os,
-    )
+    start_id = process_start_identity(pid)
+    waiter = ExactProcessExitWaiter(pid, start_id, target_os)
     try:
         try:
             waiter.wait(1)
         except ProofFailure as error:
+            message = str(error)
             require(
-                "did not exit within 1ms" in str(error),
-                "exact process exit timeout reported the wrong failure",
+                f"exact process {pid}" in message
+                and start_id in message
+                and "did not exit within 1ms" in message
+                and "waited" in message
+                and "still running" in message,
+                "exact process exit timeout omitted its pid, identity, waited"
+                f" duration, or final process state: {message}",
             )
         else:
             raise ProofFailure("live process bypassed the bounded exit wait")

@@ -153,7 +153,10 @@ def run_archive_proof(args: argparse.Namespace) -> None:
             require_frozen=require_frozen,
         )
         if args.ground_only and os.name == "nt":
-            cleanup_wait_budget = native_server_exit_wait_budget(manifest)
+            cleanup_wait_budget = native_server_exit_wait_budget(
+                manifest,
+                measurement_contract["constant_set"],
+            )
             temporary_package_directory.cleanup_retry_budget_secs = (
                 cleanup_wait_budget["timeout_ms"] / 1000
             )

@@ -322,6 +322,14 @@ class ExactProcessExitWaiter:
             self.close()
             raise
 
+    def _windows_expired_wait_state(self, kernel) -> str:
+        exit_code = ctypes.c_uint32()
+        if not kernel.GetExitCodeProcess(self.handle, ctypes.byref(exit_code)):
+            return "in an unreadable exit state"
+        if exit_code.value == 259:
+            return "still running"
+        return f"exited with code {exit_code.value} only after the wait expired"
+
     def _wait_windows(self, timeout_ms: int, require_clean_exit: bool) -> int:
         kernel = ctypes.windll.kernel32
         kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -331,14 +339,22 @@ class ExactProcessExitWaiter:
             ctypes.POINTER(ctypes.c_uint32),
         ]
         kernel.GetExitCodeProcess.restype = ctypes.c_int
+        started = time.monotonic()
         result = kernel.WaitForSingleObject(self.handle, timeout_ms)
+        if result == 258:
+            # A timed-out receipt must carry enough evidence to refute a
+            # vacuous pass: which exact process was held, how long it was
+            # actually held, and what state it was left in.
+            waited_ms = int((time.monotonic() - started) * 1000)
+            raise ProofFailure(
+                f"exact process {self.pid} (start identity"
+                f" {self.expected_start_id}) did not exit within {timeout_ms}ms:"
+                f" waited {waited_ms}ms and left it"
+                f" {self._windows_expired_wait_state(kernel)}"
+            )
         require(
             result == 0,
-            (
-                f"exact process {self.pid} did not exit within {timeout_ms}ms"
-                if result == 258
-                else f"exact process {self.pid} exit wait failed with result {result}"
-            ),
+            f"exact process {self.pid} exit wait failed with result {result}",
         )
         exit_code = ctypes.c_uint32()
         require(
@@ -353,7 +369,8 @@ class ExactProcessExitWaiter:
         return exit_code.value
 
     def _wait_unix(self, timeout_ms: int) -> None:
-        deadline = time.monotonic() + (timeout_ms / 1000)
+        started = time.monotonic()
+        deadline = started + (timeout_ms / 1000)
         while True:
             try:
                 current_identity = process_start_identity(self.pid)
@@ -369,10 +386,16 @@ class ExactProcessExitWaiter:
                 current_identity == self.expected_start_id,
                 f"process {self.pid} changed identity during exit wait",
             )
-            require(
-                time.monotonic() < deadline,
-                f"exact process {self.pid} did not exit within {timeout_ms}ms",
-            )
+            if time.monotonic() >= deadline:
+                # Match the Windows timeout evidence: exact identity, real
+                # waited duration, and the state the process was left in.
+                waited_ms = int((time.monotonic() - started) * 1000)
+                raise ProofFailure(
+                    f"exact process {self.pid} (start identity"
+                    f" {self.expected_start_id}) did not exit within"
+                    f" {timeout_ms}ms: waited {waited_ms}ms and left it still"
+                    " running with its start identity unchanged"
+                )
             time.sleep(0.01)
 
     def wait(self, timeout_ms: int, *, require_clean_exit: bool = True) -> dict:
