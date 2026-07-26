@@ -15,6 +15,15 @@
 - Search results say whether they used full retrieval. Results that fell back to
   symbolic matching reported themselves as complete, so an agent could cite
   partial evidence as if it were whole.
+- Search, ground, index, and doctor surfaces recognize the semantic index a
+  fresh install builds automatically. They previously reported retrieval as
+  symbolic with missing or stale semantic docs forever — even right after a
+  successful build — and the suggested repair, `retrieval index --refresh
+  full`, could never clear the message. Readiness now reflects the published
+  retrieval index itself, so a healthy project reports full hybrid retrieval
+  and a healthy doctor semantic check without any manual command. Projects
+  small enough to publish a semantic index with zero dense entries report that
+  truthfully as ready instead of prescribing the same impossible repair.
 - CodeStory installed somewhere shared or read-only runs for people who cannot
   write to that location.
 - On Windows, ending the CodeStory process also ends the runtime it launched.

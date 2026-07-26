@@ -342,7 +342,8 @@ impl AppController {
     }
 
     pub fn retrieval_state(&self) -> Result<RetrievalStateDto, ApiError> {
+        let project_root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
-        retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config)
+        retrieval_state_from_storage_for_runtime(&storage, &project_root, &self.runtime_config)
     }
 }

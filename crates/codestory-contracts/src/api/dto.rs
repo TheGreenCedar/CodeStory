@@ -501,6 +501,12 @@ impl EmbeddingVectorProducerEvidenceDto {
 ///
 /// `mixed_*` flags are diagnostic evidence that the cache was built from more
 /// than one profile/model/backend/dimension/doc-shape and may need repair.
+///
+/// Producers that project this contract from a publication pointer (the
+/// retrieval index manifest) carry only the fields that pointer records — the
+/// embedding runtime id as `cache_key`, the dimension, and the semantic
+/// policy version. Optional fields the publication contract does not carry
+/// stay `None`; consumers must not read an absent optional field as drift.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct StoredSemanticDocsContractDto {
     pub doc_count: u32,
