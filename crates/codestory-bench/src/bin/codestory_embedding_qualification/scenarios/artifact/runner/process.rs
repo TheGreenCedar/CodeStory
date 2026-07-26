@@ -6,8 +6,8 @@ use super::{
 use crate::qualification::request::QUALIFICATION_NONCE_ENV;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters, EmbeddingResult,
-    PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, ProcessStartProbe,
+    EmbeddingClientBudgets, EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters,
+    EmbeddingResult, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, ProcessStartProbe,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -226,4 +226,31 @@ pub(super) fn stall_worker_timeout() -> Duration {
             .saturating_add(SNAPSHOT_TIMEOUT.as_millis() as u64)
             .saturating_add(CONTROL_TIMEOUT.as_millis() as u64),
     )
+}
+
+/// Coordinator kill budget for one measurement worker. `wait_for_child` exists
+/// only as a hung-worker watchdog, so its budget must strictly dominate the
+/// worker's honest worst case, and that worst case is already defined by the
+/// constant-set deadlines the worker enforces on itself: connect to or spawn
+/// the server, then run one request bounded by its class deadline. The
+/// snapshot and control terms cover the coordinator-visible bookkeeping around
+/// the operation, matching `stall_worker_timeout`. Every term is
+/// contract-derived; a flat snapshot-wait budget killed legitimately
+/// progressing bulk workloads on the hosted 2-core calibration cell
+/// (run 30197324641: warm_bulk_64x256b needs ~24s and the 256-document
+/// throughput workload ~96s at the calibrated 2.658 docs/s, both inside the
+/// worker's own bulk deadline).
+pub(super) fn measurement_worker_timeout(operation: &str) -> Duration {
+    let budgets = EmbeddingClientBudgets::current();
+    let request_deadline = if operation == "bulk" {
+        budgets.bulk_request
+    } else {
+        budgets.query_request
+    };
+    budgets
+        .connect
+        .saturating_add(budgets.spawn)
+        .saturating_add(request_deadline)
+        .saturating_add(SNAPSHOT_TIMEOUT)
+        .saturating_add(CONTROL_TIMEOUT)
 }
