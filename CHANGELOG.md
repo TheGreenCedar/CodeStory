@@ -17,6 +17,10 @@
   partial evidence as if it were whole.
 - CodeStory installed somewhere shared or read-only runs for people who cannot
   write to that location.
+- On Windows, ending the CodeStory process also ends the runtime it launched.
+  A launcher that was killed or crashed previously left that runtime running in
+  the background. A runtime crash now also reports the raw Windows exit code
+  instead of a bare failure.
 
 ### Faster
 
