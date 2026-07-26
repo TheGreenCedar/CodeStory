@@ -105,6 +105,15 @@ function selfTest() {
         "scripts/tests/codex-worktree-setup.test.mjs",
       ],
     },
+    {
+      name: "embedding server contract changes use every platform",
+      expected: "full",
+      paths: [
+        "crates/codestory-llama-sys/per-user-embedding-server-protocol.json",
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "crates/codestory-llama-sys/per-user-embedding-server-measurement-protocol.json",
+      ],
+    },
   ];
   for (const fixture of fixtures) {
     const actual = classifyProofScope(fixture.paths);

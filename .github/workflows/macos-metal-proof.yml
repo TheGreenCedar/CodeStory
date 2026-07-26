@@ -373,7 +373,7 @@ jobs:
           CODESTORY_EMBED_ALLOW_CPU: "0"
         run: |
           set -euo pipefail
-          test "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = unfrozen
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
           version="${VERSION#v}"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"

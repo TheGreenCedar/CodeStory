@@ -857,7 +857,7 @@ jobs:
             --timeout-secs 1800
           )
           if [ "$CALIBRATION_MODE" = true ]; then
-            test "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = unfrozen
+            test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
             mkdir -p target/calibration-runs/linux
             for run_index in 1 2 3; do
               python .github/scripts/check-packaged-agent-proof.py \
@@ -872,7 +872,7 @@ jobs:
             done
             exit 0
           fi
-          test "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = frozen
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen
           calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
           test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"

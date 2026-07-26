@@ -37,9 +37,11 @@ NATIVE_GENERATIONS_DIR = "codestory-native-generations"
 NATIVE_CURRENT_GENERATION_FILE = "codestory-native-current-generation-v1.txt"
 NATIVE_RUNTIME_SEED_MARKER_PREFIX = b"codestory-native-runtime-seed-v1|id="
 NATIVE_RUNTIME_SEED_MARKER_SUFFIX = b"|end"
-MEASUREMENT_PROTOCOL = "docs/testing/per-user-embedding-server-measurement-protocol.json"
-SERVER_PROTOCOL = "docs/testing/per-user-embedding-server-protocol.json"
-SERVER_CONSTANT_SET = "docs/testing/per-user-embedding-server-constant-set.json"
+MEASUREMENT_PROTOCOL = (
+    "crates/codestory-llama-sys/per-user-embedding-server-measurement-protocol.json"
+)
+SERVER_PROTOCOL = "crates/codestory-llama-sys/per-user-embedding-server-protocol.json"
+SERVER_CONSTANT_SET = "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
 class PackageContractError(RuntimeError):
     pass
 
@@ -207,9 +209,9 @@ def source_identity(root: Path) -> dict[str, object]:
         "release package source has tracked modifications or untracked inputs",
     )
     for relative in (
-        "docs/testing/per-user-embedding-server-protocol.json",
-        "docs/testing/per-user-embedding-server-constant-set.json",
-        "docs/testing/per-user-embedding-server-measurement-protocol.json",
+        SERVER_PROTOCOL,
+        SERVER_CONSTANT_SET,
+        MEASUREMENT_PROTOCOL,
     ):
         tracked = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", relative],
@@ -1033,7 +1035,7 @@ def run_self_test() -> None:
             "producer": {"name": "codestory-llama-sys", "version": "0.0.0"},
         }
         model_contract_path = repo_root / "crates/codestory-llama-sys/model-contract.json"
-        model_contract_path.parent.mkdir(parents=True)
+        model_contract_path.parent.mkdir(parents=True, exist_ok=True)
         model_contract_path.write_text(
             json.dumps(model_contract, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

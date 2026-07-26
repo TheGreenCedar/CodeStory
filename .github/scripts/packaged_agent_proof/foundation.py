@@ -119,8 +119,8 @@ EXTERNAL_QUALIFICATION_METRICS = {
 }
 MEASUREMENT_PROTOCOL = (
     REPOSITORY_ROOT
-    / "docs"
-    / "testing"
+    / "crates"
+    / "codestory-llama-sys"
     / "per-user-embedding-server-measurement-protocol.json"
 )
 SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
