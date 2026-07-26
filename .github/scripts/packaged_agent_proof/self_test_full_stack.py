@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from .self_test_failure_evidence import run_failure_evidence_self_tests
 from .self_test_full_stack_calibration import run_calibration_self_tests
 from .self_test_full_stack_external import run_external_evidence_self_tests
 from .self_test_full_stack_fixture import build_full_stack_fixture
@@ -22,6 +23,7 @@ def run_full_stack_self_tests() -> None:
         server = run_server_identity_self_tests(fixture)
         run_true_idle_self_tests(server)
         measurement_contract = run_calibration_self_tests(fixture)
+        run_failure_evidence_self_tests(fixture)
         external = run_external_evidence_self_tests(fixture)
         run_retained_qualification_self_tests(
             fixture,

@@ -681,6 +681,18 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs.build, "Upload hosted Linux calibration runs").if
         = "success() && matrix.asset_target == 'linux-x64'";
     }, /hosted calibration artifact must remain calibration-only/u],
+    ["package calibration failure evidence removed", packagedProofFile, workflow => {
+      workflow.jobs.build.steps = workflow.jobs.build.steps
+        .filter(({ name }) => name !== "Upload hosted Linux calibration failure evidence");
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence becomes success-gated", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence").if
+        = "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence fails closed", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence")
+        .with["if-no-files-found"] = "error";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
     ["package evaluation becomes a standard server-behavior proof", packagedProofFile, workflow => {
       draftStep(
         workflow.jobs.build,
@@ -742,6 +754,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
         = "inputs.emit_release_cells";
     }, /must retain the authenticated Vulkan release cell outside calibration/u],
+    ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
+      delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
+    }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],
     ["Vulkan candidate staging runs during calibration", windowsVulkanFile, workflow => {
       draftStep(workflow.jobs["packaged-vulkan"], "Stage isolated candidate-managed Windows install").if
         = "inputs.candidate_installed_proof";

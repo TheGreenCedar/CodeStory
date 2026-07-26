@@ -1,7 +1,9 @@
-use super::super::{CONTROL_TIMEOUT, SNAPSHOT_TIMEOUT, ScenarioArtifact, ScenarioOrchestration};
+use super::super::{
+    CONTROL_TIMEOUT, QUEUE_SETUP_TIMEOUT, SNAPSHOT_TIMEOUT, ScenarioArtifact, ScenarioOrchestration,
+};
 use super::analysis::resident_generation_is_valid;
 use super::evidence::validate_named_evidence;
-use super::process::measurement_worker_timeout;
+use super::process::{dead_client_setup_timeout, measurement_worker_timeout};
 use super::{ScenarioEvidence, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_SCENARIOS};
 use codestory_retrieval::{EmbeddingClientBudgets, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS};
@@ -40,6 +42,33 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
     assert!(
         bulk_timeout >= Duration::from_millis(PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS),
         "bulk measurement budget must not undercut the contract bulk request deadline"
+    );
+}
+
+#[test]
+fn dead_client_setup_budget_dominates_the_seeding_terms_the_flat_wait_undercut() {
+    // The `client_death_lease_active` wait bounds queue seeding by a freshly
+    // spawned client, not one snapshot: before its lease and held work are
+    // visible together the client pays its contract connect and
+    // spawn-convergence allowances and each poll of the wait spends part of
+    // the snapshot allowance. Regression: calibration run 30200986788
+    // (protected macOS Metal cell) timed out at the flat 20s snapshot wait
+    // while the dead client was legitimately still ramping its held load.
+    let budgets = EmbeddingClientBudgets::current();
+    assert!(
+        dead_client_setup_timeout()
+            >= budgets
+                .connect
+                .saturating_add(budgets.spawn)
+                .saturating_add(SNAPSHOT_TIMEOUT),
+        "dead-client setup budget must dominate the client's connect and spawn allowances plus the snapshot allowance"
+    );
+    // Load establishment is the same phase family as mixed_queue's gated
+    // seeding, which bounds a strictly larger 64+64 enqueue with the
+    // queue-setup budget; the dead-client wait must not fall back below it.
+    assert!(
+        dead_client_setup_timeout() >= QUEUE_SETUP_TIMEOUT,
+        "dead-client load establishment is a queue-seeding phase and must carry the queue-setup budget"
     );
 }
 

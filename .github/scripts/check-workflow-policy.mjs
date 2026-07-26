@@ -1782,6 +1782,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--cell-id retrieval_readiness:windows-x64",
     "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
   ]);
+  // The self-hosted Windows service account runs under the default Restricted execution
+  // policy, so a run step left on the default shell dies before executing anything:
+  // every step must pick bash or a powershell invocation that bypasses the policy.
+  for (const step of at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan", "steps") ?? []) {
+    if (typeof object(step).run !== "string") continue;
+    const shell = object(step).shell;
+    add(
+      violations,
+      typeof shell === "string" && (shell === "bash" || shell.includes("-ExecutionPolicy Bypass")),
+      `windows-vulkan-proof.yml step ${object(step).name ?? "<unnamed>"} must declare the bypass shell for the locked-down service account`,
+    );
+  }
 
   const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
   add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
@@ -2527,6 +2539,20 @@ function validatePackagedProof(workflows, violations, graph) {
       && hostedCalibrationUpload?.if
         === "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode",
     `${file} hosted calibration artifact must remain calibration-only`,
+  );
+  const hostedCalibrationFailureUpload = namedStep(
+    job,
+    "Upload hosted Linux calibration failure evidence",
+  );
+  add(
+    violations,
+    hostedCalibrationFailureUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hostedCalibrationFailureUpload?.if
+        === "failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode"
+      && object(hostedCalibrationFailureUpload?.with).path
+        === "target/calibration-runs/linux"
+      && object(hostedCalibrationFailureUpload?.with)["if-no-files-found"] === "warn",
+    `${file} hosted calibration failure evidence must stay a failure-only best-effort upload`,
   );
   const hostedEvaluationUpload = namedStep(job, "Upload packaged agent proof artifacts");
   add(
