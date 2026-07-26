@@ -561,7 +561,7 @@ mod tests {
     use super::{
         NATIVE_RUNTIME_CURRENT_FILE, NATIVE_RUNTIME_EXECUTABLE, NATIVE_RUNTIME_FILE_LIST,
         NATIVE_RUNTIME_GENERATIONS_DIR, NATIVE_RUNTIME_SEEDS_DIR, final_generation_id,
-        native_seed_id, prepare_runtime_at, raw_exit_evidence, seed_id_from_bytes,
+        job_step_error, native_seed_id, prepare_runtime_at, raw_exit_evidence, seed_id_from_bytes,
     };
     use std::fs;
 
@@ -632,6 +632,20 @@ mod tests {
         assert_eq!(raw_exit_evidence(Some(0)), None);
         assert_eq!(raw_exit_evidence(Some(255)), None);
         assert_eq!(raw_exit_evidence(None), None);
+    }
+
+    #[test]
+    fn job_object_failures_name_the_step_that_failed() {
+        let denied = std::io::Error::from_raw_os_error(5);
+        let kind = denied.kind();
+        let error = job_step_error("assign runtime child to its job object", denied);
+        assert!(
+            error
+                .to_string()
+                .starts_with("assign runtime child to its job object: "),
+            "the failing step survives into the rendered failure"
+        );
+        assert_eq!(error.kind(), kind, "the classification is preserved");
     }
 
     #[test]
@@ -772,13 +786,22 @@ fn raw_exit_evidence(code: Option<i32>) -> Option<String> {
     })
 }
 
+#[cfg(any(windows, test))]
+fn job_step_error(step: &str, error: io::Error) -> io::Error {
+    // Every job-object failure surfaces through the launcher's single
+    // activation message, so the failing step has to be named here for a
+    // field report to distinguish creation, configuration, and assignment
+    // problems.
+    io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
 #[cfg(windows)]
 fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
     // Windows has no process-group teardown on parent death, so the runtime
@@ -786,14 +809,24 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
     // killed, its job handle closes and the kernel reaps the child tree.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
-        return Err(io::Error::last_os_error());
+        return Err(job_step_error(
+            "create runtime job object",
+            io::Error::last_os_error(),
+        ));
     }
     // SAFETY: the job handle is non-null, live, and owned by nothing else.
     let job = unsafe { OwnedHandle::from_raw_handle(job.cast()) };
     // SAFETY: all-zero extended limits are the documented "no limits" state;
-    // only the kill-on-close flag is raised on top of it.
+    // only the two flags below are raised on top of it.
     let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // Kill-on-close scopes the runtime tree to this launcher invocation.
+    // Breakaway stays permitted because the per-user embedding server outlives
+    // any single invocation by design — its idle timeout owns its lifetime and
+    // later commands reconnect to it instead of reloading the model — so its
+    // spawn opts out of the job explicitly. Nothing else the runtime starts
+    // asks to break away.
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     // SAFETY: limits is a live extended-limit block passed with its exact size
     // for this information class.
     let configured = unsafe {
@@ -805,7 +838,10 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
         )
     };
     if configured == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(job_step_error(
+            "configure runtime job object limits",
+            io::Error::last_os_error(),
+        ));
     }
 
     let mut child = Command::new(path)
@@ -822,7 +858,10 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
         AssignProcessToJobObject(job.as_raw_handle().cast(), child.as_raw_handle().cast())
     };
     if assigned == 0 {
-        let error = io::Error::last_os_error();
+        let error = job_step_error(
+            "assign runtime child to its job object",
+            io::Error::last_os_error(),
+        );
         // A child left outside the job would outlive this failed activation
         // unmanaged, which is exactly what the job exists to prevent.
         let _ = child.kill();

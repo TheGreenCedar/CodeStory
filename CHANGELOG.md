@@ -19,8 +19,9 @@
   write to that location.
 - On Windows, ending the CodeStory process also ends the runtime it launched.
   A launcher that was killed or crashed previously left that runtime running in
-  the background. A runtime crash now also reports the raw Windows exit code
-  instead of a bare failure.
+  the background. The model keeps running between commands as before, so later
+  commands do not reload it. A runtime crash now also reports the raw Windows
+  exit code instead of a bare failure.
 
 ### Faster
 

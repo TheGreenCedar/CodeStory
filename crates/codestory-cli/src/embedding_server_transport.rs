@@ -266,8 +266,7 @@ impl NativeEmbeddingClientTransport {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        platform::detach_command(&mut command);
-        let mut child = command.spawn().with_context(|| {
+        let mut child = spawn_detached(&mut command).with_context(|| {
             format!(
                 "spawn exact executable {}",
                 self.executable.path().display()
@@ -323,6 +322,23 @@ impl NativeEmbeddingClientTransport {
             .context("start embedding server child reaper")?;
         Ok(spawn_attempt)
     }
+}
+
+fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child> {
+    platform::detach_command(command);
+    let spawned = command.spawn();
+    #[cfg(windows)]
+    if let Err(error) = &spawned
+        && platform::job_breakaway_denied(error)
+    {
+        // An enclosing job outside CodeStory's control can veto the breakaway
+        // that the launcher's own job permits. Staying inside that job matches
+        // the server's pre-job lifetime in such environments and beats
+        // refusing to serve embeddings at all.
+        platform::detach_command_without_breakaway(command);
+        return command.spawn();
+    }
+    spawned
 }
 
 #[derive(Debug)]
@@ -2955,6 +2971,9 @@ mod platform {
     const PIPE_IO_POLL: Duration = Duration::from_millis(1);
     const PIPE_CONNECT_POLL: Duration = Duration::from_millis(25);
     const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     pub(super) struct NativeExecutableAttestationStore;
 
@@ -3478,9 +3497,26 @@ mod platform {
 
     pub(super) fn detach_command(command: &mut Command) {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        // The native launcher tethers each runtime tree to a kill-on-close
+        // job so a dying launcher cannot orphan it. This server's lifetime is
+        // owned by its idle timeout, not by the invocation that spawned it —
+        // later commands reconnect instead of reloading the model — so it
+        // breaks away from that job, whose limits permit exactly this spawn
+        // through JOB_OBJECT_LIMIT_BREAKAWAY_OK.
+        command.creation_flags(
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    }
+
+    pub(super) fn detach_command_without_breakaway(command: &mut Command) {
+        use std::os::windows::process::CommandExt;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub(super) fn job_breakaway_denied(error: &std::io::Error) -> bool {
+        // CreateProcess reports a job chain that withholds
+        // JOB_OBJECT_LIMIT_BREAKAWAY_OK as plain access denial.
+        error.raw_os_error().map(|code| code as u32) == Some(ERROR_ACCESS_DENIED)
     }
 
     pub(super) fn clock_api() -> &'static str {
