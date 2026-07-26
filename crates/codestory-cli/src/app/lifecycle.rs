@@ -26,6 +26,7 @@ pub(super) fn embedding_client_transport_mode(
 }
 
 pub(super) fn run_internal_owned_delete(cmd: InternalOwnedDeleteCommand) -> Result<()> {
+    ensure_root_is_codestory_owned(&cmd.root)?;
     let deletion = codestory_workspace::owned_deletion::OwnedDeletionRoot::open(&cmd.root)
         .with_context(|| format!("open owned deletion root {}", cmd.root.display()))?;
     deletion.remove(&cmd.relative).with_context(|| {
@@ -35,6 +36,34 @@ pub(super) fn run_internal_owned_delete(cmd: InternalOwnedDeleteCommand) -> Resu
             cmd.root.display()
         )
     })?;
+    Ok(())
+}
+
+/// Refuse deletion roots outside the process cache root.
+///
+/// The caller's claim of ownership is not proof: cleanup may remove only
+/// resources CodeStory itself owns, so the root must sit inside the cache
+/// root captured at process start rather than any directory named on the
+/// command line.
+fn ensure_root_is_codestory_owned(root: &std::path::Path) -> Result<()> {
+    let owned_root = crate::sidecar_runtime::process_defaults()
+        .cache_root()
+        .to_path_buf();
+    let owned_root = runtime::canonicalize_configuration_path(&owned_root)
+        .with_context(|| format!("resolve owned cache root {}", owned_root.display()))?;
+    let candidate = runtime::canonicalize_configuration_path(root)
+        .with_context(|| format!("resolve owned deletion root {}", root.display()))?;
+    let candidate_identity = codestory_workspace::workspace_path_lexical_identity(&candidate)
+        .with_context(|| format!("observe owned deletion root {}", candidate.display()))?;
+    let owned_identity = codestory_workspace::workspace_path_lexical_identity(&owned_root)
+        .with_context(|| format!("observe owned cache root {}", owned_root.display()))?;
+    if !candidate_identity.is_within(&owned_identity) {
+        anyhow::bail!(
+            "owned deletion refused: {} is not inside the CodeStory cache root {}",
+            candidate.display(),
+            owned_root.display()
+        );
+    }
     Ok(())
 }
 

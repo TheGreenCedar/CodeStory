@@ -8,9 +8,8 @@ use super::{
     SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
     SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, architecture_query_intents,
     clamp_usize_to_u32, compare_search_hits_with_project_root, leading_symbol_segment,
-    looks_like_repo_text_query, normalize_path_key, normalize_symbol_query,
-    retrieval_file_role_from_path, retrieval_state_from_storage_for_runtime,
-    should_expand_symbol_query, terminal_symbol_segment,
+    looks_like_repo_text_query, normalize_symbol_query, retrieval_file_role_from_path,
+    retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
 };
 use crate::search_intent::{
     SearchIntentFilter, SearchIntentQuery, annotate_search_hit_match_quality,
@@ -523,7 +522,14 @@ pub(super) fn same_search_file(left: &SearchHit, right: &SearchHit) -> bool {
     let Some(right_path) = right.file_path.as_deref() else {
         return false;
     };
-    normalize_path_key(left_path) == normalize_path_key(right_path)
+    // Identical spellings need no filesystem observation. Distinct spellings
+    // compare by native filesystem identity so Unix stays case-sensitive and
+    // only real aliases (Windows case folds, links) group as one file.
+    left_path == right_path
+        || codestory_workspace::same_workspace_path(
+            std::path::Path::new(left_path),
+            std::path::Path::new(right_path),
+        )
 }
 
 pub(super) fn hit_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
