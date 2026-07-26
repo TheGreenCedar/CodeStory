@@ -1,9 +1,10 @@
 use super::{
     HashMap, Path, SearchHitOrigin, SearchPlanActivePathEvidence, SearchPlanChannelDto,
     apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
-    architecture_query_intents, fs, search_plan_anchor_groups, search_plan_eligible,
-    search_plan_path_is_test_or_bench, search_plan_runtime_call_is_speculative,
-    search_plan_subqueries, search_plan_terms, search_plan_test_hit, tempdir,
+    architecture_query_intents, fs, same_search_file, search_plan_anchor_groups,
+    search_plan_eligible, search_plan_path_is_test_or_bench,
+    search_plan_runtime_call_is_speculative, search_plan_subqueries, search_plan_terms,
+    search_plan_test_hit, tempdir,
 };
 
 #[test]
@@ -1176,4 +1177,53 @@ fn search_plan_speculation_policy_matches_hidden_trail_edges() {
         Some(codestory_contracts::graph::ResolutionCertainty::Certain),
         Some(codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN)
     ));
+}
+
+#[test]
+fn search_file_identity_groups_aliases_without_folding_unix_case() {
+    let temp = tempdir().expect("project");
+    let file = temp.path().join("routes.rs");
+    fs::write(&file, "pub fn routes() {}\n").expect("write source");
+    let spelled = search_plan_test_hit(
+        "direct",
+        "routes",
+        &file,
+        1,
+        SearchHitOrigin::IndexedSymbol,
+        true,
+    );
+    let aliased = search_plan_test_hit(
+        "aliased",
+        "routes",
+        &temp.path().join(".").join("routes.rs"),
+        3,
+        SearchHitOrigin::TextMatch,
+        false,
+    );
+    assert!(
+        same_search_file(&spelled, &aliased),
+        "distinct spellings of one existing file are the same search file"
+    );
+
+    let upper = search_plan_test_hit(
+        "upper",
+        "routes",
+        &temp.path().join("Missing.rs"),
+        1,
+        SearchHitOrigin::IndexedSymbol,
+        true,
+    );
+    let lower = search_plan_test_hit(
+        "lower",
+        "routes",
+        &temp.path().join("missing.rs"),
+        1,
+        SearchHitOrigin::TextMatch,
+        false,
+    );
+    assert_eq!(
+        same_search_file(&upper, &lower),
+        cfg!(windows),
+        "missing paths keep platform lexical identity: Unix case-sensitive, Windows case-insensitive"
+    );
 }

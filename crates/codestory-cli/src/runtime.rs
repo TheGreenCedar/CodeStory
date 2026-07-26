@@ -724,7 +724,7 @@ fn cache_root_for_project_in(
 /// Resolve existing configuration roots through native filesystem identity.
 /// Missing suffixes retain lexical path rules beneath the nearest existing
 /// ancestor so a cache has the same identity before and after creation.
-fn canonicalize_configuration_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_configuration_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
