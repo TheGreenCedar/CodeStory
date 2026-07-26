@@ -614,6 +614,7 @@ pub(super) fn retrieval_state_from_parts(
         current_embedding,
         stored_embedding,
         runtime_degraded,
+        false,
         hybrid_retrieval_enabled(),
     )
 }
@@ -627,22 +628,28 @@ pub(super) fn retrieval_state_from_parts_with_hybrid(
     current_embedding: Option<EmbeddingProfileContractDto>,
     stored_embedding: Option<StoredSemanticDocsContractDto>,
     runtime_degraded: bool,
+    zero_dense_published: bool,
     hybrid_configured: bool,
 ) -> RetrievalStateDto {
+    // `zero_dense_published` distinguishes a current, contract-matched full
+    // publication that truthfully selected zero dense anchors from a semantic
+    // lane that was never built. Only the latter is repairable by
+    // `retrieval index --refresh full`.
+    let semantic_lane_unbuilt = semantic_doc_count == 0 && !zero_dense_published;
     let fallback_reason = if !hybrid_configured {
         Some(RetrievalFallbackReasonDto::DisabledByConfig)
     } else if runtime_degraded {
         Some(RetrievalFallbackReasonDto::DegradedRuntime)
     } else if !embedding_runtime_available {
         Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
-    } else if semantic_doc_count == 0 {
+    } else if semantic_lane_unbuilt {
         Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
     } else {
         None
     };
     let semantic_mode = if !hybrid_configured {
         SemanticModeDto::DisabledByConfig
-    } else if runtime_degraded || !embedding_runtime_available || semantic_doc_count == 0 {
+    } else if runtime_degraded || !embedding_runtime_available || semantic_lane_unbuilt {
         SemanticModeDto::DegradedRuntime
     } else {
         SemanticModeDto::Enabled
@@ -738,9 +745,18 @@ pub(super) fn retrieval_state_from_storage(
 /// project. The legacy `llm_symbol_doc` table is intentionally cleared on
 /// every semantic publication, so counting it reported `missing_semantic_docs`
 /// forever on stores whose sidecar vectors were fully published — including
-/// every fresh auto-bootstrap. This read stays observational: one indexed
-/// manifest-row lookup plus pure contract checks, with no probing, repair, or
-/// refresh.
+/// every fresh auto-bootstrap.
+///
+/// Cost and parity: resolving the manifest key goes through
+/// `sidecar_project_id_for_root`, which re-observes project identity with
+/// three git subprocesses per call (`config --get remote.origin.url`,
+/// `rev-parse HEAD^{tree}`, and a workload-dependent `status --porcelain`)
+/// before the single indexed manifest-row lookup and pure contract checks.
+/// That is deliberately the same uncached helper per-search sidecar admission
+/// uses (`retrieval_primary::retrieval_manifest_exists`), so this projection
+/// and admission can never disagree about which manifest row is current. Do
+/// not substitute a cached identity here without proving admission reads the
+/// same cache. The read stays observational: no probing, repair, or refresh.
 pub(super) fn retrieval_state_from_storage_for_runtime(
     storage: &Storage,
     project_root: &Path,
@@ -769,6 +785,15 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         .is_some_and(|manifest| !manifest_matches_current_embedding_contract(manifest, runtime));
     let runtime_degraded =
         semantic_doc_count > 0 && probe.available && (stale_publication || contract_mismatch);
+    // A current, contract-matched full publication may legitimately select
+    // zero dense anchors (generation only requires the dense count to equal
+    // the projection count). Admission serves that sidecar as full, so the
+    // semantic lane is published-and-empty, not unbuilt: reporting
+    // `missing_semantic_docs` here would prescribe a refresh that republishes
+    // the identical zero-anchor manifest and can never clear the message.
+    let zero_dense_published = manifest.as_ref().is_some_and(|manifest| {
+        manifest.dense_projection_count == Some(0) && !stale_publication && !contract_mismatch
+    });
     let fallback_message = probe.fallback_message.or_else(|| {
         if !runtime_degraded {
             None
@@ -800,6 +825,7 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         current_embedding,
         stored_embedding,
         runtime_degraded,
+        zero_dense_published,
         runtime.retrieval.hybrid_enabled,
     ))
 }
@@ -824,13 +850,24 @@ fn manifest_matches_current_embedding_contract(
         && manifest.embedding_dim == Some(expected_dim)
 }
 
+/// Project the manifest's producer evidence into the consumer vocabulary of
+/// [`StoredSemanticDocsContractDto`].
+///
+/// The manifest records the embedding identity as one opaque runtime id (its
+/// `embedding_backend` column) plus a dimension and the semantic policy
+/// version. That runtime id lives in the same identity space as the current
+/// contract's `cache_key` (`embedding_runtime_id()`), so it maps to
+/// `cache_key`. The manifest does not carry a per-doc backend label, profile,
+/// doc shape, or doc version: those inputs are validated at publication time
+/// and folded into the sidecar input hash, so they stay `None` here instead
+/// of being fabricated in a vocabulary the doctor would flag forever.
 fn stored_semantic_docs_contract_from_manifest(
     manifest: &codestory_store::RetrievalIndexManifest,
 ) -> StoredSemanticDocsContractDto {
     StoredSemanticDocsContractDto {
         doc_count: published_dense_projection_count(manifest),
         embedding_profile: None,
-        embedding_backend: manifest.embedding_backend.clone(),
+        embedding_backend: None,
         cache_key: manifest.embedding_backend.clone(),
         dimension: manifest
             .embedding_dim

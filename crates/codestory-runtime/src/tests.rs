@@ -2063,6 +2063,24 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
         Some(2),
         "the stored contract reports the published dense projection count"
     );
+    let stored = retrieval.stored_embedding.as_ref().expect("stored contract");
+    let current = retrieval
+        .current_embedding
+        .as_ref()
+        .expect("current contract");
+    assert_eq!(
+        stored.cache_key.as_deref(),
+        Some(current.cache_key.as_str()),
+        "the manifest's embedding runtime id must project into the current \
+         contract's cache-key identity space so consumers (doctor) can compare it"
+    );
+    assert_eq!(
+        stored.embedding_backend, None,
+        "the manifest carries no per-doc backend label; projecting the runtime \
+         id into that field made doctor report semantic stale forever"
+    );
+    assert_eq!(stored.embedding_profile, None);
+    assert_eq!(stored.doc_shape, None);
 
     // The stdio host compaction projects {"state":"ready"} from exactly these
     // wire fields: mode == "hybrid" with no stated fallback.
@@ -2070,6 +2088,73 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
     assert_eq!(wire["mode"], serde_json::json!("hybrid"));
     assert_eq!(wire["semantic_ready"], serde_json::json!(true));
     assert!(wire.get("fallback_reason").is_none());
+}
+
+#[test]
+fn zero_dense_full_publication_reports_ready_without_missing_docs() {
+    // A tiny project can legally publish a current, non-degraded full sidecar
+    // with zero dense anchors (generation only requires the dense projection
+    // count to equal the projection count). Admission serves that sidecar as
+    // full, so readiness must report the lane as published-and-empty rather
+    // than unbuilt: `retrieval index --refresh full` would republish the
+    // identical zero-anchor manifest and could never clear the message.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let mut manifest = published_full_retrieval_manifest(&project_root);
+    manifest.projection_count = Some(0);
+    manifest.symbol_doc_count = Some(0);
+    manifest.dense_projection_count = Some(0);
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .expect("publish zero-dense manifest");
+    let runtime = test_sidecar_runtime_from_env();
+
+    let retrieval = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("retrieval state");
+
+    assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+    assert!(retrieval.semantic_ready);
+    assert_eq!(retrieval.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(retrieval.semantic_doc_count, 0);
+    assert_eq!(retrieval.fallback_reason, None);
+    assert_eq!(retrieval.fallback_message, None);
+    assert_eq!(
+        retrieval
+            .stored_embedding
+            .as_ref()
+            .map(|stored| stored.doc_count),
+        Some(0),
+        "the truthful published state remains visible as a zero dense count"
+    );
+
+    // A zero-dense manifest that is stale or mismatched keeps the unbuilt
+    // classification: there a refresh genuinely rebuilds the publication, so
+    // the repair advice stays truthful and the state stays fail-closed.
+    let mut mismatched = manifest.clone();
+    mismatched.embedding_backend = Some("legacy-backend".to_string());
+    storage
+        .upsert_retrieval_index_manifest(&mismatched)
+        .expect("publish mismatched zero-dense manifest");
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("mismatched zero-dense retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Symbolic);
+    assert!(!state.semantic_ready);
+    assert_eq!(
+        state.fallback_reason,
+        Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
+    );
 }
 
 #[test]
