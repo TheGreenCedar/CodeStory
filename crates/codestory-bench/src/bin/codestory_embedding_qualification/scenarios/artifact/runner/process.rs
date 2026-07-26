@@ -1,4 +1,6 @@
-use super::super::{CONTROL_TIMEOUT, ControlEvent, POLL, QUEUE_SETUP_TIMEOUT, SNAPSHOT_TIMEOUT};
+use super::super::{
+    CONTROL_TIMEOUT, ControlEvent, IDLE_EXIT_GRACE, POLL, QUEUE_SETUP_TIMEOUT, SNAPSHOT_TIMEOUT,
+};
 use super::analysis::elapsed;
 use super::{
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, ProcessInvocation, RunningWorker, WorkerOutput,
@@ -7,7 +9,8 @@ use crate::qualification::request::QUALIFICATION_NONCE_ENV;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
     EmbeddingClientBudgets, EmbeddingQualificationAttemptResult, EmbeddingQualificationParameters,
-    EmbeddingResult, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, ProcessStartProbe,
+    EmbeddingResult, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS,
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, ProcessStartProbe,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,6 +132,7 @@ pub(super) fn validate_worker_output(
             + output.protocol_exchange.is_some() as u8
             + output.queue_operations.is_some() as u8
             + output.engine_identity.is_some() as u8
+            + output.measurement.is_some() as u8
             + output.error.is_some() as u8)
             != 1
     {
@@ -242,15 +246,67 @@ pub(super) fn stall_worker_timeout() -> Duration {
 /// worker's own bulk deadline).
 pub(super) fn measurement_worker_timeout(operation: &str) -> Duration {
     let budgets = EmbeddingClientBudgets::current();
-    let request_deadline = if operation == "bulk" {
-        budgets.bulk_request
-    } else {
-        budgets.query_request
+    if operation == "measure_true_idle" {
+        // The idle worker first proves the resident owner quiescent (bounded
+        // by the snapshot allowance), then waits out the server's own idle
+        // deadline plus the exit grace before the absence observation.
+        return Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
+            .saturating_add(IDLE_EXIT_GRACE)
+            .saturating_add(SNAPSHOT_TIMEOUT)
+            .saturating_add(SNAPSHOT_TIMEOUT)
+            .saturating_add(CONTROL_TIMEOUT);
+    }
+    let request_deadline = match operation {
+        // Bulk frame measurements run one bulk exchange under the contract
+        // bulk deadline; spawn-hello, product-query, and residency
+        // measurements contain an `EnsureResident` exchange or a cold model
+        // load, both bounded by the same bulk deadline the client enforces on
+        // itself.
+        "bulk"
+        | "measure_bulk_frame"
+        | "measure_spawn_hello"
+        | "measure_product_query"
+        | "measure_resident_identity" => budgets.bulk_request,
+        _ => budgets.query_request,
     };
     budgets
         .connect
         .saturating_add(budgets.spawn)
         .saturating_add(request_deadline)
+        .saturating_add(SNAPSHOT_TIMEOUT)
+        .saturating_add(CONTROL_TIMEOUT)
+}
+
+/// Deadline the busy-retry worker's queued query threads enforce on
+/// themselves (mirrors the worker's queue-operation deadline).
+const BUSY_RETRY_QUEUE_REQUEST_DEADLINE_MS: u64 = 120_000;
+/// Deadline the busy-retry worker's seed and replay exchanges enforce on
+/// themselves (mirrors the worker's anti-idle protocol deadline).
+const BUSY_RETRY_PROTOCOL_DEADLINE_MS: u64 = 90_000;
+
+/// Coordinator kill budget for the single-process busy-retry measurement
+/// worker. Seeding the held queues is a queue-setup phase; after the driver
+/// releases the classes every queued query is bounded by the worker's own
+/// per-request deadline and the replay by its protocol deadline, so the
+/// watchdog budget is the sum of those self-enforced deadlines plus the
+/// snapshot and control allowances around hold/release.
+pub(super) fn busy_retry_worker_timeout() -> Duration {
+    let budgets = EmbeddingClientBudgets::current();
+    budgets
+        .connect
+        .saturating_add(QUEUE_SETUP_TIMEOUT)
+        .saturating_add(Duration::from_millis(BUSY_RETRY_QUEUE_REQUEST_DEADLINE_MS))
+        .saturating_add(Duration::from_millis(BUSY_RETRY_PROTOCOL_DEADLINE_MS))
+        .saturating_add(SNAPSHOT_TIMEOUT)
+        .saturating_add(CONTROL_TIMEOUT)
+        .saturating_add(CONTROL_TIMEOUT)
+}
+
+/// Driver budget for the busy-retry worker's typed-retry marker: the worker
+/// must first seed the held queues (a queue-setup phase) and validate the
+/// typed capacity response before it can drop the marker.
+pub(super) fn busy_retry_marker_timeout() -> Duration {
+    QUEUE_SETUP_TIMEOUT
         .saturating_add(SNAPSHOT_TIMEOUT)
         .saturating_add(CONTROL_TIMEOUT)
 }
