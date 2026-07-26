@@ -420,6 +420,33 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
         .expect("tools/call error should include structuredContent")
 }
 
+fn assert_error_envelope(response: &Value, id: Value) -> &Value {
+    assert_eq!(response.get("jsonrpc"), Some(&json!("2.0")));
+    assert_eq!(response.get("id"), Some(&id));
+    assert!(
+        response.get("result").is_none(),
+        "error response should not include result: {response}"
+    );
+    let error = response.get("error").expect("error object");
+    assert!(
+        error.get("code").and_then(Value::as_i64).is_some(),
+        "error should include numeric code: {response}"
+    );
+    assert!(
+        error.get("message").and_then(Value::as_str).is_some(),
+        "error should include message: {response}"
+    );
+    error
+}
+
+fn assert_error_code(error: &Value, code: i64) {
+    assert_eq!(
+        error.get("code").and_then(Value::as_i64),
+        Some(code),
+        "unexpected JSON-RPC error code: {error}"
+    );
+}
+
 fn assert_search_repaired_before_terminal_model_absence(
     server: &mut StdioServer,
     error: &Value,
@@ -5573,5 +5600,162 @@ fn failed_replacement_retries_keep_identity_and_offer_retained_local_analysis() 
         false,
         "agent_packet_search",
         "unavailable",
+    );
+}
+
+#[test]
+fn unknown_method_returns_jsonrpc_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({"jsonrpc": "2.0", "id": 20, "method": "codestory/nope"}),
+    );
+
+    let error = assert_error_envelope(&response, json!(20));
+    assert_error_code(error, -32601);
+    let message = error["message"]
+        .as_str()
+        .expect("error message")
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("method not found") || message.contains("unknown method"),
+        "unknown method message should be stable: {response}"
+    );
+}
+
+#[test]
+fn invalid_json_returns_parse_error_with_null_id() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_line(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":21,"method":"tools/list""#,
+    );
+
+    let error = assert_error_envelope(&response, Value::Null);
+    assert_error_code(error, -32700);
+    let message = error["message"]
+        .as_str()
+        .expect("error message")
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("parse error") || message.contains("json"),
+        "invalid JSON message should mention parsing: {response}"
+    );
+}
+
+#[test]
+fn oversized_stdio_frame_returns_structured_protocol_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let oversized = "x".repeat(1024 * 1024 + 1);
+
+    let response = send_line(&mut server, &oversized);
+
+    let error = assert_error_envelope(&response, Value::Null);
+    assert_error_code(error, -32700);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("stdio_frame_too_large"),
+        "oversized frame should use a structured protocol error: {response}"
+    );
+    assert_eq!(
+        error
+            .pointer("/data/max_frame_bytes")
+            .and_then(Value::as_u64),
+        Some(1024 * 1024),
+        "oversized frame error should report the configured byte limit: {response}"
+    );
+    assert!(
+        error
+            .pointer("/data/line_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 1024 * 1024),
+        "oversized frame error should report observed line bytes: {response}"
+    );
+
+    let follow_up = send_json(
+        &mut server,
+        json!({"jsonrpc": "2.0", "id": "after-oversized", "method": "initialize"}),
+    );
+    assert_success_envelope(&follow_up, json!("after-oversized"));
+}
+
+#[test]
+fn bad_tool_call_args_return_jsonrpc_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {"arguments": {"query": "AppController"}}
+        }),
+    );
+
+    let error = assert_error_envelope(&response, json!(22));
+    assert_error_code(error, -32602);
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("error message")
+            .contains("tool"),
+        "bad tools/call args should name the tool problem: {response}"
+    );
+}
+
+#[test]
+fn not_found_resource_returns_jsonrpc_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "resources/read",
+            "params": {"uri": "codestory://missing/resource"}
+        }),
+    );
+
+    let error = assert_error_envelope(&response, json!(23));
+    assert_error_code(error, -32602);
+    let message = error["message"].as_str().expect("error message");
+    assert!(
+        message.contains("unknown resource") || message.contains("not found"),
+        "not-found resource message should be stable: {response}"
+    );
+}
+
+#[test]
+fn unknown_prompt_returns_jsonrpc_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "prompts/get",
+            "params": {"name": "not_a_prompt"}
+        }),
+    );
+
+    let error = assert_error_envelope(&response, json!(24));
+    assert_error_code(error, -32602);
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Unknown prompt"),
+        "unknown prompt message should identify the missing prompt: {response}"
     );
 }
