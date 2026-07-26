@@ -864,6 +864,41 @@ fn classify_windows_data_pipe_open_error(
     })
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_PIPE_BUSY_CODE: u32 = 231;
+
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_NO_DATA_CODE: u32 = 232;
+
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_PIPE_LISTENING_CODE: u32 = 536;
+
+/// Whether a failed nonblocking named-pipe ReadFile may keep polling inside
+/// its configured deadline. ERROR_NO_DATA on a read only reports an empty
+/// pipe; a peer that closed its end surfaces as ERROR_BROKEN_PIPE or
+/// ERROR_PIPE_NOT_CONNECTED, which must escape the poll loop.
+#[cfg(any(windows, test))]
+fn windows_pipe_read_failure_is_pollable(error_code: u32) -> bool {
+    matches!(
+        error_code,
+        WINDOWS_ERROR_PIPE_BUSY_CODE
+            | WINDOWS_ERROR_NO_DATA_CODE
+            | WINDOWS_ERROR_PIPE_LISTENING_CODE
+    )
+}
+
+/// Whether a failed nonblocking named-pipe WriteFile may keep polling inside
+/// its configured deadline. ERROR_NO_DATA is deliberately not pollable on a
+/// write: a full kernel buffer surfaces as a successful zero-byte write, so
+/// a failing write with this code means the peer end of the pipe is gone.
+/// Polling it would burn the whole write deadline and then misreport a real
+/// disconnect as an unresponsive owner instead of a connection loss carrying
+/// its raw code and peer-exit evidence.
+#[cfg(any(windows, test))]
+fn windows_pipe_write_failure_is_pollable(error_code: u32) -> bool {
+    error_code == WINDOWS_ERROR_PIPE_BUSY_CODE
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableFileIdentity {
     native_identity: codestory_workspace::WorkspacePathIdentity,
@@ -2922,6 +2957,7 @@ mod platform {
         ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
         QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, RetainedWindowsAuthorityState,
         TransportIdentity, awake_deadline_ns, classify_windows_data_pipe_open_error, sha256_fields,
+        windows_pipe_read_failure_is_pollable, windows_pipe_write_failure_is_pollable,
     };
     use anyhow::{Context, Result, bail};
     use std::ffi::c_void;
@@ -2965,6 +3001,14 @@ mod platform {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise;
+
+    // The host-testable poll classification must decide on the exact Win32
+    // values the platform calls below observe.
+    const _: () = {
+        assert!(super::WINDOWS_ERROR_PIPE_BUSY_CODE == ERROR_PIPE_BUSY);
+        assert!(super::WINDOWS_ERROR_NO_DATA_CODE == ERROR_NO_DATA);
+        assert!(super::WINDOWS_ERROR_PIPE_LISTENING_CODE == ERROR_PIPE_LISTENING);
+    };
 
     const NO_TIMEOUT: u64 = u64::MAX;
     const PIPE_BUFFER_BYTES: usize = 1024 * 1024;
@@ -3179,7 +3223,7 @@ mod platform {
                 let error = std::io::Error::last_os_error();
                 match error.raw_os_error().map(|code| code as u32) {
                     Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => return Ok(()),
-                    Some(ERROR_NO_DATA) | Some(ERROR_PIPE_BUSY) | Some(ERROR_PIPE_LISTENING) => {
+                    Some(code) if windows_pipe_read_failure_is_pollable(code) => {
                         wait_pipe_io(
                             started,
                             self.read_timeout_ns.load(Ordering::Acquire),
@@ -3226,11 +3270,7 @@ mod platform {
                 if !error
                     .raw_os_error()
                     .map(|code| code as u32)
-                    .is_some_and(|code| {
-                        code == ERROR_NO_DATA
-                            || code == ERROR_PIPE_BUSY
-                            || code == ERROR_PIPE_LISTENING
-                    })
+                    .is_some_and(windows_pipe_read_failure_is_pollable)
                 {
                     return Err(normalize_windows_pipe_io_error(error));
                 }
@@ -3284,7 +3324,7 @@ mod platform {
                 if !error
                     .raw_os_error()
                     .map(|code| code as u32)
-                    .is_some_and(|code| code == ERROR_NO_DATA || code == ERROR_PIPE_BUSY)
+                    .is_some_and(windows_pipe_write_failure_is_pollable)
                 {
                     return Err(normalize_windows_pipe_io_error(error));
                 }
@@ -4087,6 +4127,99 @@ mod platform {
         }
 
         #[test]
+        fn write_to_a_closed_named_pipe_surfaces_the_pipe_closing_code_immediately() {
+            let current_sid = current_process_sid().expect("current process SID");
+            let sid_string = sid_string(&current_sid).expect("current SID string");
+            let security_sddl = wide(&format!(
+                "O:{sid_string}D:P(A;;GA;;;{sid_string})(A;;GA;;;SY)"
+            ));
+            let pipe_name = wide(&format!(
+                r"\\.\pipe\codestory-write-disconnect-test-{}-{}",
+                unsafe { GetCurrentProcessId() },
+                awake_now_ns()
+            ));
+            let server = create_pipe_instance(&pipe_name, &security_sddl, true, true)
+                .expect("create named-pipe server");
+            let client = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE, "connect named-pipe client");
+            let client = unsafe { OwnedHandle::from_raw_handle(client.cast()) };
+            let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+            assert_ne!(
+                unsafe { SetNamedPipeHandleState(raw(&client), &nonblocking, null(), null()) },
+                0,
+                "set named-pipe client nonblocking"
+            );
+            if unsafe { ConnectNamedPipe(raw(&server), null_mut()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_PIPE_CONNECTED),
+                    "client connection must be the only failed accept state"
+                );
+            }
+
+            let peer_pid = unsafe { GetCurrentProcessId() };
+            let peer_process_start_id =
+                canonical_process_start_identity(peer_pid).expect("current process start identity");
+            let mut stream = Stream::new(
+                client,
+                false,
+                TransportIdentity {
+                    endpoint_namespace_id: "test-endpoint".into(),
+                    lifetime_authority_id: "test-authority".into(),
+                    listener_id: "test-listener".into(),
+                    peer_verified: true,
+                    peer_pid: Some(peer_pid),
+                    peer_process_start_id: Some(peer_process_start_id),
+                },
+            )
+            .expect("retain named-pipe client stream");
+            stream
+                .set_write_timeout(Some(
+                    codestory_retrieval::EmbeddingClientBudgets::current().query_request,
+                ))
+                .expect("bound request write");
+            // Close the raw server handle without DisconnectNamedPipe so the
+            // writer observes the peer-close code rather than the explicit
+            // disconnect code already covered above.
+            drop(server);
+
+            let started = std::time::Instant::now();
+            let error = stream
+                .write(&[7_u8; 8])
+                .expect_err("a write to a closed named pipe must fail");
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "a real disconnect must escape the write poll loop instead of \
+                 burning the configured write deadline"
+            );
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_NO_DATA)
+            );
+            assert!(stream.peer_is_alive().expect("probe retained peer"));
+            eprintln!(
+                "named-pipe write disconnect evidence: raw_os_error={} normalized_kind={:?} \
+                 elapsed_ms={} peer_state=running",
+                ERROR_NO_DATA,
+                error.kind(),
+                started.elapsed().as_millis()
+            );
+        }
+
+        #[test]
         fn final_response_delivery_waits_for_the_client_to_drain_before_disconnect() {
             let current_sid = current_process_sid().expect("current process SID");
             let sid_string = sid_string(&current_sid).expect("current SID string");
@@ -4666,6 +4799,38 @@ mod tests {
         )
         .expect("missing data pipe is classified");
         assert!(matches!(outcome, NativeConnectOutcome::NoOwner));
+    }
+
+    #[test]
+    fn windows_pipe_closing_write_code_escapes_the_poll_loop_while_empty_reads_wait() {
+        // ERROR_NO_DATA reports an empty pipe to a nonblocking reader but a
+        // vanished peer to a writer, so only the read side may keep polling.
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_NO_DATA_CODE
+        ));
+        assert!(!windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_NO_DATA_CODE
+        ));
+
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_BUSY_CODE
+        ));
+        assert!(windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_BUSY_CODE
+        ));
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_LISTENING_CODE
+        ));
+        assert!(!windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_LISTENING_CODE
+        ));
+
+        // ERROR_BROKEN_PIPE and ERROR_PIPE_NOT_CONNECTED are disconnects on
+        // both directions and must surface with their raw code retained.
+        for disconnect_code in [109, 233] {
+            assert!(!windows_pipe_read_failure_is_pollable(disconnect_code));
+            assert!(!windows_pipe_write_failure_is_pollable(disconnect_code));
+        }
     }
 
     #[test]

@@ -520,10 +520,15 @@ impl PerUserEmbeddingClient {
                 Ok::<_, anyhow::Error>((result, payload))
             })();
             let completed_ns = clock.now_ns();
-            let outcome = match &call {
-                Ok(_) => "completed",
-                Err(error) if is_server_loss(error) => "server_loss",
-                Err(_) => "failed",
+            let (outcome, loss_code) = match &call {
+                Ok(_) => ("completed", None),
+                Err(error) if is_server_loss(error) => (
+                    "server_loss",
+                    error
+                        .downcast_ref::<PerUserEmbeddingError>()
+                        .map(|typed| typed.code.clone()),
+                ),
+                Err(_) => ("failed", None),
             };
             attempts.push(EmbeddingQualificationAttemptResult {
                 ordinal: attempts.len() as u32 + 1,
@@ -532,6 +537,7 @@ impl PerUserEmbeddingClient {
                 submitted_ns,
                 completed_ns,
                 outcome: outcome.into(),
+                loss_code,
             });
             match call {
                 Ok(result) => return Ok((result, attempts)),

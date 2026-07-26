@@ -214,6 +214,7 @@ def _server_crash_scenario_tests() -> None:
                             "submitted_ns": 1,
                             "completed_ns": 2,
                             "outcome": "server_loss",
+                            "loss_code": "embedding_server_connection_lost",
                         },
                         {
                             "ordinal": 2,
@@ -261,6 +262,25 @@ def _server_crash_scenario_tests() -> None:
         pass
     else:
         raise ProofFailure("named scenario transitions with false values were accepted")
+    misclassified_scenario = json.loads(json.dumps(scenario_observations))
+    misclassified_scenario["query_replayed"][0]["values"]["wire_attempts"][0][
+        "loss_code"
+    ] = "embedding_server_owner_unresponsive"
+    try:
+        derive_scenario_assertions(
+            "server_crash",
+            observations_by_kind=misclassified_scenario,
+            process_observations=[],
+            invocations=[],
+            same_account={},
+            materialization={},
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure(
+            "a crash loss misclassified as an unresponsive owner was accepted"
+        )
 
 
 def _fault_consistency_tests(fixture: FullStackFixture) -> dict:

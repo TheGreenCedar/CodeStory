@@ -74,6 +74,11 @@ pub struct EmbeddingQualificationAttemptResult {
     pub submitted_ns: u64,
     pub completed_ns: u64,
     pub outcome: String,
+    /// The typed code behind a `server_loss` outcome, so retained replay
+    /// evidence can distinguish a classified transport disconnect from an
+    /// unresponsive-owner timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_code: Option<String>,
 }
 
 pub(super) type EmbeddingQualificationAttemptExchange = (
