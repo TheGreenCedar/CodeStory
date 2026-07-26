@@ -45,7 +45,6 @@ on:
       - .github/workflows/windows-vulkan-proof.yml
       - '.github/workflows/retrieval-engine-smoke.yml'
       - .github/workflows/source-proof.yml
-      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - .github/workflows/**
       - scripts/install-codestory.ps1
@@ -109,7 +108,6 @@ on:
       - .github/workflows/windows-vulkan-proof.yml
       - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/source-proof.yml
-      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - .github/workflows/**
       - scripts/install-codestory.ps1

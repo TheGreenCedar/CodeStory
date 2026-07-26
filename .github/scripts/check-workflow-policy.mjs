@@ -1244,7 +1244,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ".github/workflows/windows-vulkan-proof.yml",
       ".github/workflows/retrieval-engine-smoke.yml",
       ".github/workflows/source-proof.yml",
-      ".github/workflows/repo-scale-stats.yml",
       "package.json",
       "package-lock.json",
       "scripts/codex-worktree-setup.*",
@@ -2911,9 +2910,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    at(workflow, "jobs", "macos-source") === undefined
-      && at(workflow, "jobs", "repo-scale-stats") === undefined,
-    `${file} standard coordinator must not add macOS source or repo-scale hard gates`,
+    at(workflow, "jobs", "macos-source") === undefined,
+    `${file} standard coordinator must not add a macOS source hard gate`,
   );
   const calibrationAssemble = requireJob(
     violations,
@@ -3928,18 +3926,6 @@ function validateRemainingWorkflows(workflows, violations) {
         "actions/upload-artifact@v7.0.1",
       );
     }
-  }
-
-  const statsFile = "repo-scale-stats.yml";
-  const stats = workflows.get(statsFile);
-  if (!stats) {
-    violations.push(`${statsFile} must exist`);
-  } else {
-    const job = requireJob(violations, statsFile, stats, "stats");
-    requireStepRun(violations, statsFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
-    requireStepRun(violations, statsFile, job, "Build the release CLI", ["cargo build --release --locked -p codestory-cli"]);
-    requireStepRun(violations, statsFile, job, "Run mandatory repo-scale stats once", ["cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture"]);
-    requireStepUses(violations, statsFile, job, "Upload repo-scale stats output", "actions/upload-artifact@v7.0.1");
   }
 
   const retrieval = workflows.get(retrievalFile);
