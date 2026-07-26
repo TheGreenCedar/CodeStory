@@ -8,7 +8,7 @@ tiers. A lower tier never inherits a higher claim.
 ## Bound contracts
 
 The release binary and `codestory-native-manifest.json` bind three checked-in
-documents:
+documents under `crates/codestory-llama-sys/`:
 
 - `per-user-embedding-server-protocol.json` fixes framing, operations, replay,
   privacy, and size limits;

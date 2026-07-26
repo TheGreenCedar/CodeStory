@@ -526,6 +526,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
   const packagedCoordinatorFile = "packaged-platform-pr.yml";
   const packagedProofFile = "packaged-platform-proof.yml";
   const linuxVulkanFile = "linux-vulkan-proof.yml";
+  const metalProofFile = "macos-metal-proof.yml";
   const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
   const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
 
@@ -692,6 +693,26 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
         type: "boolean",
       };
     }, /package-only workflow must not define candidate_installed_proof/u],
+    ["package evaluation reads the calibration contract from an unpinned location", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      step.run = step.run.replaceAll(
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "per-user-embedding-server-constant-set.json",
+      );
+    }, /must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
+    ["Metal calibration reads the calibration contract from an unpinned location", metalProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs["packaged-metal"],
+        "Collect three independent Metal calibration runs",
+      );
+      step.run = step.run.replaceAll(
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "per-user-embedding-server-constant-set.json",
+      );
+    }, /Collect three independent Metal calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);

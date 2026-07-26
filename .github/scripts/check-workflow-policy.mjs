@@ -2508,6 +2508,8 @@ function validatePackagedProof(workflows, violations, graph) {
       "--expected-backend CPU",
       "--produce-qualification-evidence",
       "--timeout-secs 1800",
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen',
     ],
   );
   const packagedProofRun = stepRun(
@@ -3312,6 +3314,9 @@ function validateRemainingWorkflows(workflows, violations) {
       job,
       "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
     );
+    requireStepRun(violations, metalFile, job, "Collect three independent Metal calibration runs", [
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+    ]);
     const engine = namedStep(job, "Prove protected Metal runtime");
     requireStepRun(violations, metalFile, job, "Prove protected Metal runtime", [
       "--engine-policy accelerated",

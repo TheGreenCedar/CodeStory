@@ -65,7 +65,7 @@ fn response_correlation_and_protocol_hashes_are_enforced() {
 #[test]
 fn checked_in_protocol_hash_flows_into_the_build_marker() {
     let expected = hex_sha256(include_bytes!(
-        "../../../../../docs/testing/per-user-embedding-server-protocol.json"
+        "../../../../codestory-llama-sys/per-user-embedding-server-protocol.json"
     ));
     assert_eq!(PER_USER_EMBEDDING_PROTOCOL_SHA256, expected);
 

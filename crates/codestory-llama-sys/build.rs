@@ -13,12 +13,10 @@ use std::fs;
 use std::path::PathBuf;
 
 const MODEL_CONTRACT_FILE: &str = "model-contract.json";
-const EMBEDDING_SERVER_PROTOCOL_FILE: &str =
-    "../../docs/testing/per-user-embedding-server-protocol.json";
-const EMBEDDING_SERVER_CONSTANT_SET_FILE: &str =
-    "../../docs/testing/per-user-embedding-server-constant-set.json";
+const EMBEDDING_SERVER_PROTOCOL_FILE: &str = "per-user-embedding-server-protocol.json";
+const EMBEDDING_SERVER_CONSTANT_SET_FILE: &str = "per-user-embedding-server-constant-set.json";
 const EMBEDDING_SERVER_MEASUREMENT_PROTOCOL_FILE: &str =
-    "../../docs/testing/per-user-embedding-server-measurement-protocol.json";
+    "per-user-embedding-server-measurement-protocol.json";
 
 struct ModelContract {
     file_name: String,

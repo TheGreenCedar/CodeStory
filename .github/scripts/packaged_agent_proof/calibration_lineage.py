@@ -90,7 +90,8 @@ def verify_calibration_source_lineage(
         if path
     ]
     require(
-        changed_paths == ["docs/testing/per-user-embedding-server-constant-set.json"],
+        changed_paths
+        == ["crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"],
         "post-calibration source drift exceeded the one allowed constant-set freeze file",
     )
     return {
