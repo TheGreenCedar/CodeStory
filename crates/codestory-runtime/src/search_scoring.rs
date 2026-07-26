@@ -1267,7 +1267,10 @@ impl AppController {
         let storage_retrieval = if semantic_disabled {
             None
         } else {
-            Some(retrieval_state_from_storage(&storage)?)
+            Some(retrieval_state_from_storage(
+                &storage,
+                &self.require_project_root()?,
+            )?)
         };
         let mut graph_boosts = HashMap::<codestory_contracts::graph::NodeId, f32>::new();
         let requested_max_results = max_results.clamp(1, 50);
