@@ -980,9 +980,7 @@ mod platform {
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{
-        DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-    };
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1475,13 +1473,13 @@ mod platform {
 
         let socket_path = runtime.path.join(&paths.socket_name);
         remove_stale_socket(&runtime, &socket_path, &paths.socket_name)?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("bind embedding socket {}", socket_path.display()))?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-            .with_context(|| format!("secure embedding socket {}", socket_path.display()))?;
+        let (listener, bound_identity) = bind_private_socket(&runtime, &paths.socket_name)?;
         let listener_id = validate_socket_path(&socket_path, runtime.uid)?
             .context("bound embedding socket disappeared")?;
         let socket_identity = socket_identity(&socket_path)?;
+        if socket_identity != bound_identity {
+            bail!("embedding_endpoint_replaced: published socket identity changed after rename");
+        }
         ensure_runtime_directory_matches(&runtime)?;
         listener
             .set_nonblocking(true)
@@ -2372,6 +2370,88 @@ mod platform {
         ensure_runtime_directory_matches(runtime)
     }
 
+    /// Bind the endpoint at a unique temporary name, restrict it to the
+    /// private mode, re-verify it through the held directory handle, and only
+    /// then rename it onto the canonical socket name.
+    ///
+    /// `UnixListener::bind` creates the socket entry with the kernel default
+    /// mode (`0o777 & !umask`, `0o755` under the near-universal umask `022`)
+    /// and only a later chmod makes it private. Binding at the canonical name
+    /// directly therefore exposes a transient that a client's single-shot
+    /// trust probe (`validate_socket_path`) rejects terminally as
+    /// `embedding_endpoint_untrusted`. Publishing by same-directory rename
+    /// keeps that transient off the canonical name: rename(2) within one
+    /// directory is atomic and preserves the inode, so the canonical entry is
+    /// either absent or already a fully private socket, and the identity
+    /// captured before the rename stays valid afterwards.
+    fn bind_private_socket(
+        runtime: &RuntimeDirectory,
+        socket_name: &str,
+    ) -> Result<(UnixListener, (u64, u64))> {
+        static NEXT_BIND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let temp_name = format!(
+            ".b{:x}.{:x}",
+            std::process::id(),
+            NEXT_BIND_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let temp_path = runtime.path.join(&temp_name);
+        validate_unix_socket_path(&temp_path).map_err(anyhow::Error::new)?;
+        let temp = UnixCString::new(temp_name.as_str())
+            .context("temporary embedding endpoint name contains NUL")?;
+        let destination =
+            UnixCString::new(socket_name).context("embedding endpoint name contains NUL")?;
+        ensure_runtime_directory_matches(runtime)?;
+        // A binder that crashed mid-publication and whose PID was later reused
+        // can leave a dead entry at this name. The name is derived from our
+        // own live PID plus a process-global sequence inside the private
+        // runtime directory, so no live binder can own it and removing it is
+        // safe.
+        if unsafe { libc::unlinkat(runtime.handle.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::NotFound {
+                return Err(error).context("remove leftover temporary embedding endpoint");
+            }
+        }
+        let listener = UnixListener::bind(&temp_path)
+            .with_context(|| format!("bind embedding socket {}", temp_path.display()))?;
+        let published = (|| {
+            if unsafe {
+                libc::fchmodat(
+                    runtime.handle.as_raw_fd(),
+                    temp.as_ptr(),
+                    PRIVATE_FILE_MODE as libc::mode_t,
+                    0,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("secure embedding socket {}", temp_path.display()));
+            }
+            let identity = socket_identity_at(runtime, &temp_name)?
+                .context("embedding socket disappeared before publication")?;
+            ensure_runtime_directory_matches(runtime)?;
+            if unsafe {
+                libc::renameat(
+                    runtime.handle.as_raw_fd(),
+                    temp.as_ptr(),
+                    runtime.handle.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).context("publish embedding socket");
+            }
+            Ok(identity)
+        })();
+        match published {
+            Ok(identity) => Ok((listener, identity)),
+            Err(error) => {
+                let _ = unsafe { libc::unlinkat(runtime.handle.as_raw_fd(), temp.as_ptr(), 0) };
+                Err(error)
+            }
+        }
+    }
+
     fn socket_identity_at(
         runtime: &RuntimeDirectory,
         socket_name: &str,
@@ -2607,7 +2687,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
         use std::time::Instant;
 
         fn private_directory(path: &Path) {
@@ -2789,6 +2869,87 @@ mod platform {
             assert!(!socket_path.exists());
             unlock(second.as_raw_fd()).expect("release second authority");
             drop(stale_listener);
+        }
+
+        #[test]
+        fn embedding_endpoint_publication_never_exposes_an_untrusted_transient() {
+            let root = tempfile::tempdir().expect("create test root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("secure test root");
+            let runtime_path = root.path().join(SERVER_DIR_NAME);
+            private_directory(&runtime_path);
+            let runtime = validate_private_directory(&runtime_path, false)
+                .expect("validate runtime")
+                .expect("runtime exists");
+            let socket_path = runtime.path.join(SOCKET_NAME);
+
+            // Poll the canonical path exactly like a client's single-shot
+            // trust probe: any sighting that validate_socket_path would
+            // reject terminally is a publication defect. The pre-rename
+            // sequence (bind at the canonical name, then chmod) exposes the
+            // kernel's default bind mode on essentially every cycle.
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let observer = {
+                let stop = stop.clone();
+                let socket_path = socket_path.clone();
+                std::thread::spawn(move || -> Option<u32> {
+                    while !stop.load(Ordering::Acquire) {
+                        if let Ok(metadata) = fs::symlink_metadata(&socket_path)
+                            && (!metadata.file_type().is_socket() || metadata.mode() & 0o077 != 0)
+                        {
+                            return Some(metadata.mode());
+                        }
+                    }
+                    None
+                })
+            };
+
+            for cycle in 0..200 {
+                let (listener, identity) = bind_private_socket(&runtime, SOCKET_NAME)
+                    .unwrap_or_else(|error| panic!("publish endpoint on cycle {cycle}: {error:#}"));
+                assert_eq!(
+                    socket_identity_at(&runtime, SOCKET_NAME).expect("inspect published endpoint"),
+                    Some(identity),
+                    "published entry must carry the bound socket identity"
+                );
+                drop(listener);
+                unlink_socket_at(&runtime, SOCKET_NAME).expect("remove published endpoint");
+            }
+            stop.store(true, Ordering::Release);
+            let sighting = observer.join().expect("join endpoint observer");
+            assert_eq!(
+                sighting,
+                None,
+                "the canonical endpoint must never be observable in a state the trust \
+                 predicate rejects (saw mode {:o})",
+                sighting.unwrap_or(0)
+            );
+        }
+
+        #[test]
+        fn embedding_endpoint_publication_replaces_a_crash_leftover_entry() {
+            let root = tempfile::tempdir().expect("create test root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("secure test root");
+            let runtime_path = root.path().join(SERVER_DIR_NAME);
+            private_directory(&runtime_path);
+            let runtime = validate_private_directory(&runtime_path, false)
+                .expect("validate runtime")
+                .expect("runtime exists");
+            let socket_path = runtime.path.join(SOCKET_NAME);
+            let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("secure stale socket");
+            let stale_identity = socket_identity(&socket_path).expect("stale socket identity");
+
+            let (listener, identity) =
+                bind_private_socket(&runtime, SOCKET_NAME).expect("publish over crash leftover");
+            assert_ne!(identity, stale_identity, "rename must replace the leftover");
+            assert_eq!(
+                socket_identity_at(&runtime, SOCKET_NAME).expect("inspect published endpoint"),
+                Some(identity)
+            );
+            drop((listener, stale_listener));
         }
 
         #[test]
