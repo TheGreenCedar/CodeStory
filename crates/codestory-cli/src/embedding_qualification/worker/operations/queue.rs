@@ -81,6 +81,7 @@ pub(in crate::embedding_qualification::worker) fn run_queue_load(
                         class,
                         ordinal,
                         correlation_id,
+                        input: None,
                         submitted_tx,
                     })
                 })?;
@@ -146,18 +147,24 @@ fn wait_for_queue_admission(
     }
 }
 
-struct QueueOperation {
-    runtime: SidecarRuntimeConfig,
-    transport: crate::embedding_server_transport::NativeEmbeddingClientTransport,
-    clock: Arc<dyn AwakeMonotonicClock>,
-    project_identity_sha256: String,
-    class: &'static str,
-    ordinal: u32,
-    correlation_id: String,
-    submitted_tx: std::sync::mpsc::SyncSender<u64>,
+pub(in crate::embedding_qualification::worker) struct QueueOperation {
+    pub(in crate::embedding_qualification::worker) runtime: SidecarRuntimeConfig,
+    pub(in crate::embedding_qualification::worker) transport:
+        crate::embedding_server_transport::NativeEmbeddingClientTransport,
+    pub(in crate::embedding_qualification::worker) clock: Arc<dyn AwakeMonotonicClock>,
+    pub(in crate::embedding_qualification::worker) project_identity_sha256: String,
+    pub(in crate::embedding_qualification::worker) class: &'static str,
+    pub(in crate::embedding_qualification::worker) ordinal: u32,
+    pub(in crate::embedding_qualification::worker) correlation_id: String,
+    /// Measurement flows supply the deterministic workload input; scenario
+    /// queue loads keep the generic per-ordinal input.
+    pub(in crate::embedding_qualification::worker) input: Option<String>,
+    pub(in crate::embedding_qualification::worker) submitted_tx: std::sync::mpsc::SyncSender<u64>,
 }
 
-fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation> {
+pub(in crate::embedding_qualification::worker) fn run_queue_operation(
+    operation: QueueOperation,
+) -> Result<WorkerQueueOperation> {
     let QueueOperation {
         runtime,
         transport,
@@ -166,6 +173,7 @@ fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation
         class,
         ordinal,
         correlation_id,
+        input,
         submitted_tx,
     } = operation;
     let mut stream = match transport.connect(Duration::from_secs(2))? {
@@ -210,20 +218,21 @@ fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation
         .unwrap_or_else(|| runtime.namespace.clone());
     let scope_id = sha256_bytes(scope_seed.as_bytes());
     let deadline_ms = 120_000;
+    let input = input.unwrap_or_else(|| format!("qualification-queue-{ordinal}"));
     let operation = match class {
         "query" => EmbeddingOperation::EmbedQuery {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            input: format!("qualification-queue-{ordinal}"),
+            input,
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            inputs: vec![format!("qualification-queue-{ordinal}")],
+            inputs: vec![input],
         },
         _ => bail!("embedding_qualification_queue_class_invalid"),
     };

@@ -26,6 +26,7 @@ pub use qualification_control::{
 };
 pub use qualification_worker::{
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
+    EmbeddingQualificationWorkerMeasurement, EmbeddingQualificationWorkerMeasurementSpan,
     EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
     EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
 };
