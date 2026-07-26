@@ -29,6 +29,11 @@ on:
         required: false
         default: ""
         type: string
+      calibration_mode:
+        description: Collect three independent pre-freeze Vulkan calibration runs.
+        required: false
+        default: false
+        type: boolean
       candidate_installed_proof:
         description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
@@ -70,6 +75,11 @@ on:
         required: false
         default: ""
         type: string
+      calibration_mode:
+        description: Collect three independent pre-freeze Vulkan calibration runs.
+        required: false
+        default: false
+        type: boolean
       candidate_installed_proof:
         description: Install and prove the exact package through the candidate-managed launcher boundary.
         required: false
@@ -99,7 +109,7 @@ jobs:
     name: Packaged Windows Vulkan engine
     runs-on: [self-hosted, Windows, X64, codestory-vulkan]
     environment: windows-vulkan-proof
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.calibration_mode && 180 || 120 }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -129,6 +139,9 @@ jobs:
           if ("${{ inputs.server_behavior_only }}" -ne "true") {
             throw "candidate_installed_proof requires server_behavior_only"
           }
+          if ("${{ inputs.calibration_mode }}" -ne "false") {
+            throw "candidate_installed_proof cannot run in calibration mode"
+          }
 
       - name: Capture source build tool evidence
         if: ${{ !inputs.use_packaged_cli_artifact }}
@@ -139,7 +152,7 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}
+        if: ${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -172,7 +185,7 @@ jobs:
           path: target/release-dist
 
       - name: Build qualification driver
-        if: ${{ !inputs.server_behavior_only }}
+        if: ${{ inputs.calibration_mode || !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
@@ -184,7 +197,7 @@ jobs:
           path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
-        if: ${{ !inputs.server_behavior_only }}
+        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,7 +228,7 @@ jobs:
           }
 
       - name: Download frozen calibration bundle
-        if: ${{ !inputs.server_behavior_only }}
+        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
@@ -224,7 +237,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Prove protected Windows Vulkan runtime
-        if: ${{ !inputs.candidate_installed_proof }}
+        if: ${{ !inputs.calibration_mode && !inputs.candidate_installed_proof }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
@@ -281,8 +294,53 @@ jobs:
             --timeout-secs 1800 `
             --out-dir target/windows-vulkan-proof/packaged-agent
 
+      - name: Collect three independent Vulkan calibration runs
+        if: inputs.calibration_mode
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $constantStatus = (Get-Content crates/codestory-llama-sys/per-user-embedding-server-constant-set.json -Raw | ConvertFrom-Json).status
+          if ($constantStatus -ne "unfrozen") {
+            throw "calibration collection requires the unfrozen constant set"
+          }
+          $version = $env:VERSION.TrimStart('v')
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          New-Item -ItemType Directory -Force target/calibration-runs/windows | Out-Null
+          foreach ($runIndex in 1, 2, 3) {
+            python .github/scripts/check-packaged-agent-proof.py `
+              --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
+              --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
+              --expected-version $version `
+              --project "${{ github.workspace }}" `
+              --plugin-root plugins/codestory `
+              --plugin-handoff `
+              --engine-policy accelerated `
+              --expected-backend Vulkan `
+              --offline `
+              --proof-tier calibration `
+              --qualification-matrix-cell protected_windows_x64_vulkan `
+              --produce-qualification-evidence `
+              --qualification-driver target/release/codestory_embedding_qualification.exe `
+              --qualification-evidence "target/calibration-runs/windows/qualification-$runIndex.json" `
+              --calibration-run-index $runIndex `
+              --calibration-run-output "target/calibration-runs/windows/run-$runIndex.json" `
+              --expected-source-sha $sourceSha `
+              --expected-source-tree $sourceTree `
+              --timeout-secs 1800 `
+              --out-dir "target/calibration-runs/windows/proof-$runIndex"
+            # The Actions PowerShell wrapper propagates only the final exit code, so an
+            # early failed run must not be masked by a later clean one.
+            if ($LASTEXITCODE -ne 0) {
+              throw "calibration run $runIndex failed"
+            }
+          }
+
       - name: Stage isolated candidate-managed Windows install
-        if: inputs.candidate_installed_proof
+        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -336,7 +394,7 @@ jobs:
             --candidate-artifact-name (Split-Path -Leaf $archive)
 
       - name: Prove candidate-installed Windows Vulkan runtime
-        if: inputs.candidate_installed_proof
+        if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
@@ -380,7 +438,7 @@ jobs:
             --out-dir target/candidate-installed-windows/proof
 
       - name: Upload candidate-installed Windows proof
-        if: always() && inputs.candidate_installed_proof
+        if: always() && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}
@@ -389,7 +447,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Vulkan release cell
-        if: inputs.emit_release_cells
+        if: inputs.emit_release_cells && !inputs.calibration_mode
         shell: bash
         run: |
           set -euo pipefail
@@ -414,7 +472,7 @@ jobs:
             --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
 
       - name: Upload authenticated Vulkan release cell
-        if: success() && inputs.emit_release_cells
+        if: success() && inputs.emit_release_cells && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
@@ -423,7 +481,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Windows retrieval-readiness release cell
-        if: inputs.emit_release_cells && inputs.server_behavior_only
+        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode
         shell: bash
         run: |
           set -euo pipefail
@@ -443,7 +501,7 @@ jobs:
             --out target/release-cells/retrieval_readiness-windows-x64.json
 
       - name: Upload authenticated Windows retrieval-readiness release cell
-        if: success() && inputs.emit_release_cells && inputs.server_behavior_only
+        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-postpublish-retrieval-windows-x64-attempt-${{ github.run_attempt }}
@@ -452,7 +510,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated candidate-installed Windows release cell
-        if: inputs.emit_release_cells && inputs.candidate_installed_proof
+        if: inputs.emit_release_cells && inputs.candidate_installed_proof && !inputs.calibration_mode
         shell: bash
         run: |
           set -euo pipefail
@@ -479,7 +537,7 @@ jobs:
             --out target/release-cells/candidate_installed_behavior-windows-x64.json
 
       - name: Upload authenticated candidate-installed Windows release cell
-        if: success() && inputs.emit_release_cells && inputs.candidate_installed_proof
+        if: success() && inputs.emit_release_cells && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-candidate-installed-windows-x64-attempt-${{ github.run_attempt }}
@@ -487,8 +545,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload Vulkan calibration runs
+        if: always() && inputs.calibration_mode
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: embedding-calibration-windows-${{ inputs.version }}
+          path: target/calibration-runs/windows
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
       - name: Upload Vulkan proof artifacts
-        if: always()
+        if: always() && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: windows-x64-vulkan-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
