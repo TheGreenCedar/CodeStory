@@ -348,6 +348,40 @@ function managedCliDownloadProgressReport() {
   };
 }
 
+// Preparing responses derive their agent retry hint from the provisioning state this launcher
+// actually observes instead of a fixed placeholder: a fixed delay makes agents busy-poll a
+// multi-minute archive download and oversleep when readiness is imminent. While a transfer is
+// measurable, the hint is the estimated remaining transfer time at the observed throughput. The
+// clamp keeps degenerate estimates sane: the floor matches the runtime's own minimum activation
+// retry delay, and the ceiling bounds how long an agent sleeps past a completion, failure, or
+// stall the estimate could not foresee.
+const provisioningRetryHintMinMs = 250;
+const provisioningRetryHintMaxMs = 10000;
+// Provisioning states carrying no measurable transfer keep the historical fixed hint.
+const provisioningRetryHintFallbackMs = 1500;
+
+function provisioningRetryHintMs(progress = managedCliDownloadProgress) {
+  const { receivedBytes, totalBytes, startedAt, updatedAt } = progress;
+  if (
+    !Number.isSafeInteger(totalBytes) || totalBytes <= 0
+    || !Number.isSafeInteger(receivedBytes) || receivedBytes <= 0
+  ) {
+    return provisioningRetryHintFallbackMs;
+  }
+  const remainingBytes = Math.max(0, totalBytes - receivedBytes);
+  // Throughput is measured over the window that actually transferred the received bytes; a
+  // wall-clock "now" would decay the rate during a stall and inflate the estimate open-endedly.
+  const observedMs = Number.isFinite(startedAt) && Number.isFinite(updatedAt)
+    ? updatedAt - startedAt
+    : 0;
+  if (remainingBytes > 0 && observedMs <= 0) return provisioningRetryHintFallbackMs;
+  const estimatedRemainingMs = remainingBytes === 0 ? 0 : remainingBytes * (observedMs / receivedBytes);
+  return Math.min(
+    provisioningRetryHintMaxMs,
+    Math.max(provisioningRetryHintMinMs, Math.round(estimatedRemainingMs)),
+  );
+}
+
 function copyLocalReleaseFile(releaseDir, name, destination, maxBytes) {
   const source = path.join(releaseDir, name);
   try {
@@ -2566,8 +2600,10 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
       automatic: true,
     },
     allowed_surfaces: Object.fromEntries(surfaces.map((surface) => [surface, blockedSurface()])),
+    // `after_ms` matches the field the CLI runtime attaches to its own preparing
+    // recommended-next-call, so agents see one timing contract across the handoff boundary.
     recommended_next_calls: preparing
-      ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', retry_after_ms: 1500 }]
+      ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', after_ms: provisioningRetryHintMs() }]
       : projectRoot
         ? [{
             method: 'resources/read',
@@ -2820,7 +2856,7 @@ function managedProvisioningOperation() {
     state: 'preparing',
     stage: progress?.stage || 'downloading_runtime',
     attempt: progress?.attempt ?? 1,
-    retry_after_ms: 1500,
+    retry_after_ms: provisioningRetryHintMs(),
     failure: null,
     progress: progress
       ? {
@@ -2882,17 +2918,20 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   const project = selection.project;
   if (tool === 'status') {
     const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
+    // The top-level hint repeats the operation snapshot's so one status response never carries
+    // two disagreeing delays.
+    const currentOperation = preparing ? managedProvisioningOperation() : null;
     const structuredContent = {
       project,
       state: preparing ? 'preparing' : 'unavailable',
       degraded_reason: degradedReason,
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
-      current_operation: preparing ? managedProvisioningOperation() : null,
+      current_operation: currentOperation,
       failure: preparing ? null : primaryFailure,
       failure_context: !preparing && managedFailure ? managedCliProvisionFailure.context : null,
       hint: !preparing && managedFailure ? managedCliProvisionFailure.hint : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
-      retry_after_ms: preparing ? 1500 : null,
+      retry_after_ms: currentOperation ? currentOperation.retry_after_ms : null,
       diagnostics_uri: diagnosticsUri,
     };
     return {
@@ -2902,6 +2941,9 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   }
   const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
   const failureHint = managedFailure ? managedCliProvisionFailure.hint : null;
+  // The top-level hint repeats the operation snapshot's so one preparing response never carries
+  // two disagreeing delays.
+  const provisioningOperation = preparing ? managedProvisioningOperation() : null;
   const structuredContent = preparing ? {
     code: 'codestory_preparing',
     message: managedProvisioningMessage(),
@@ -2909,8 +2951,8 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     project,
     state: 'preparing',
     retry_tool: tool,
-    retry_after_ms: 1500,
-    operation: managedProvisioningOperation(),
+    retry_after_ms: provisioningOperation.retry_after_ms,
+    operation: provisioningOperation,
     diagnostics_uri: diagnosticsUri,
   } : {
     code: 'codestory_unavailable',
@@ -3151,11 +3193,18 @@ function runFailOpenMcp(status, options = {}) {
           statusValue.project_root_source = parsedResource.projectSource;
           statusValue.diagnostics_uri = parsedResource.uri;
           if (Array.isArray(statusValue.recommended_next_calls)) {
-            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
-              call?.method === 'resources/read'
-                && call?.uri_template === 'codestory://status{?project}'
-                ? { method: call.method, uri: parsedResource.uri }
-                : call);
+            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) => {
+              if (call?.method === 'resources/read'
+                && call?.uri_template === 'codestory://status{?project}') {
+                return { method: call.method, uri: parsedResource.uri };
+              }
+              // The preparing diagnostic is snapshotted when provisioning starts; the retry hint
+              // must track the download progress observed at this read, not that initial instant.
+              if (call?.method === 'tools/call' && Number.isSafeInteger(call.after_ms)) {
+                return { ...call, after_ms: provisioningRetryHintMs() };
+              }
+              return call;
+            });
           }
           response = jsonrpcResult(
             request.id,
@@ -3390,6 +3439,10 @@ if (require.main === module) {
       managedCliDownloadProgress,
       managedCliProvisionFailure,
       managedProvisioningOperation,
+      provisioningRetryHintMs,
+      provisioningRetryHintMinMs,
+      provisioningRetryHintMaxMs,
+      provisioningRetryHintFallbackMs,
       sanitizeDownloadFailure,
       releaseDownloadStallTimeoutMs,
       releaseArchiveTotalTimeoutMs,

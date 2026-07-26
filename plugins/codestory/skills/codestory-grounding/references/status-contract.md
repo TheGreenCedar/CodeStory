@@ -30,6 +30,14 @@ When no complete publication exists yet, `ground`, `packet`, `search`, and
 coming up. Retry that same tool. Do not ask the user to enable, repair,
 approve, or configure an internal service.
 
+While the plugin launcher is still provisioning the managed runtime itself,
+`retry_after_ms` derives from the observed runtime-download progress: the
+estimated remaining transfer time at the observed throughput, clamped between
+250 ms and 10 s. A state with no measurable transfer reports the 1500 ms
+fallback instead. Preparing responses repeat the same value inside the embedded
+`operation` snapshot, and a preparing entry in `recommended_next_calls` carries
+it as `after_ms`.
+
 `ground`, `files`, and `affected` can build or refresh the bounded local map as
 part of the call. Once a complete publication exists, local graph tools keep
 using it during refresh and never read a half-published generation.
