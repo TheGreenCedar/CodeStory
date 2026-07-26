@@ -763,9 +763,11 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<RetrievalStateDto, ApiError> {
     let project_id = codestory_retrieval::sidecar_project_id_for_root(project_root);
-    let manifest = storage.get_retrieval_index_manifest(&project_id).map_err(|e| {
-        ApiError::internal(format!("Failed to query retrieval index manifest: {e}"))
-    })?;
+    let manifest = storage
+        .get_retrieval_index_manifest(&project_id)
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to query retrieval index manifest: {e}"))
+        })?;
     let probe = embedding_runtime_availability_from_config(runtime);
     let current_embedding = current_embedding_contract_for_runtime(runtime);
     let stored_embedding = manifest

@@ -122,10 +122,8 @@ fn doctor_retrieval_state_for_manifest(
     std::fs::create_dir_all(&project_root).expect("project root");
     let storage_path = temp.path().join("codestory.db");
     let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
-    let mut manifest = codestory_retrieval::test_support::retrieval_manifest_fixture(
-        &project_id,
-        &"a".repeat(64),
-    );
+    let mut manifest =
+        codestory_retrieval::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
     manifest.projection_count = Some(2);
     manifest.symbol_doc_count = Some(8);
     manifest.dense_projection_count = Some(2);

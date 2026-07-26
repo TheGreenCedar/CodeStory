@@ -10,16 +10,15 @@ use super::{
     LLM_SYMBOL_DOC_SCHEMA_VERSION, NodeId, OVERSIZED_SOURCE_POLICY_VERSION, PUBLICATION_TEST_FAULT,
     PendingLlmSymbolDoc, PublicationTestAction, PublicationTestBoundary, RefreshExecutionPlan,
     RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalIndexManifest, RetrievalModeDto,
-    RetrievalStateDto,
-    SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV,
-    SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_STREAM_PENDING_DOCS_ENV,
-    SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine,
-    SearchGenerationCompletion, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchPlanAnchorGroupDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
-    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
-    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
-    SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
-    WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
+    RetrievalStateDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
+    SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+    SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
+    SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCompletion, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanAnchorGroupDto, SearchPlanChannelDto,
+    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SearchSymbolProjection,
+    SemanticDocAliasMode, SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
+    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc,
+    TrailConfigDto, WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
     arm_full_refresh_staged_store_hook, arm_incremental_staged_store_hook,
     arm_publication_test_fault, arm_semantic_projection_before_revalidate_hook,
     arm_source_policy_after_plan_hook, arm_source_policy_before_revalidate_hook,
@@ -2007,10 +2006,8 @@ fn core_dense_anchor_publication_succeeds_when_embedding_backend_is_unavailable(
 /// publication for `project_root` under the current sidecar contract.
 fn published_full_retrieval_manifest(project_root: &Path) -> RetrievalIndexManifest {
     let project_id = codestory_retrieval::sidecar_project_id_for_root(project_root);
-    let mut manifest = codestory_retrieval::test_support::retrieval_manifest_fixture(
-        &project_id,
-        &"a".repeat(64),
-    );
+    let mut manifest =
+        codestory_retrieval::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
     manifest.projection_count = Some(2);
     manifest.symbol_doc_count = Some(8);
     manifest.dense_projection_count = Some(2);
@@ -2063,7 +2060,10 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
         Some(2),
         "the stored contract reports the published dense projection count"
     );
-    let stored = retrieval.stored_embedding.as_ref().expect("stored contract");
+    let stored = retrieval
+        .stored_embedding
+        .as_ref()
+        .expect("stored contract");
     let current = retrieval
         .current_embedding
         .as_ref()

@@ -5,10 +5,10 @@ use super::{
     IndexingPhaseTimings, Instant, LlmSymbolDoc, LlmSymbolDocStats, Path, RetrievalFileRole,
     SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES, SearchEngine,
     SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, StoreFileRole,
-    SymbolSearchDoc, clamp_u128_to_u32, clamp_usize_to_u32,
-    current_epoch_ms, indexing_cancelled_error, is_indexing_cancelled, node_display_name,
-    read_file_text_limited, retrieval_file_role_from_path, semantic_doc_language_from_path,
-    semantic_path_aliases, semantic_symbol_aliases, semantic_symbol_role_aliases,
+    SymbolSearchDoc, clamp_u128_to_u32, clamp_usize_to_u32, current_epoch_ms,
+    indexing_cancelled_error, is_indexing_cancelled, node_display_name, read_file_text_limited,
+    retrieval_file_role_from_path, semantic_doc_language_from_path, semantic_path_aliases,
+    semantic_symbol_aliases, semantic_symbol_role_aliases,
 };
 #[cfg(test)]
 use super::{embedding_profile_contract_from_env, test_sidecar_runtime_from_env};

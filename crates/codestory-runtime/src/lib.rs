@@ -144,7 +144,9 @@ pub fn publish_retrieval_manifest_for_test(
     manifest: &codestory_retrieval::RetrievalIndexManifest,
 ) -> Result<(), ApiError> {
     let mut storage = Storage::open(storage_path).map_err(|error| {
-        ApiError::internal(format!("Failed to open storage for manifest fixture: {error}"))
+        ApiError::internal(format!(
+            "Failed to open storage for manifest fixture: {error}"
+        ))
     })?;
     storage
         .upsert_retrieval_index_manifest(manifest)

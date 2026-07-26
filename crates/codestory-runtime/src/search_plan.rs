@@ -1614,20 +1614,18 @@ impl AppController {
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
         let project_root = self.require_project_root()?;
         indexed_symbol_hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(
-                Some(project_root.as_path()),
-                &query,
-                left,
-                right,
-            )
+            compare_search_hits_with_project_root(Some(project_root.as_path()), &query, left, right)
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
 
         let storage = self.open_storage_read_only()?;
-        let retrieval =
-            retrieval_state_from_storage_for_runtime(&storage, &project_root, &self.runtime_config)?;
+        let retrieval = retrieval_state_from_storage_for_runtime(
+            &storage,
+            &project_root,
+            &self.runtime_config,
+        )?;
         let freshness = self.index_freshness().ok();
         let mut repo_text_hits = Vec::new();
         let mut suggestions = Vec::new();
