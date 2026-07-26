@@ -18,8 +18,7 @@ use crate::semantic_projection::{
 };
 use crate::semantic_projection::{
     SEARCH_SYMBOL_STREAM_BATCH_SIZE, SearchStateBuildStats, current_embedding_contract_for_runtime,
-    load_persisted_semantic_docs_for_runtime, semantic_doc_stats_match_contract,
-    stored_semantic_docs_contract_from_stats,
+    load_persisted_semantic_docs_for_runtime,
 };
 use serde::{Deserialize, Serialize};
 
@@ -723,36 +722,73 @@ pub(super) fn retrieval_state_from_engine_with_storage_contract(
 #[cfg(test)]
 pub(super) fn retrieval_state_from_storage(
     storage: &Storage,
+    project_root: &Path,
 ) -> Result<RetrievalStateDto, ApiError> {
-    retrieval_state_from_storage_for_runtime(storage, &test_sidecar_runtime_from_env())
+    retrieval_state_from_storage_for_runtime(
+        storage,
+        project_root,
+        &test_sidecar_runtime_from_env(),
+    )
 }
 
+/// Derive agent-visible retrieval readiness from the published retrieval manifest.
+///
+/// Semantic readiness must come from the same publication pointer that admits
+/// sidecar-primary retrieval: the `retrieval_index_manifest` row for this
+/// project. The legacy `llm_symbol_doc` table is intentionally cleared on
+/// every semantic publication, so counting it reported `missing_semantic_docs`
+/// forever on stores whose sidecar vectors were fully published — including
+/// every fresh auto-bootstrap. This read stays observational: one indexed
+/// manifest-row lookup plus pure contract checks, with no probing, repair, or
+/// refresh.
 pub(super) fn retrieval_state_from_storage_for_runtime(
     storage: &Storage,
+    project_root: &Path,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<RetrievalStateDto, ApiError> {
-    let stats = storage
-        .get_llm_symbol_doc_stats()
-        .map_err(|e| ApiError::internal(format!("Failed to query LLM symbol doc stats: {e}")))?;
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(project_root);
+    let manifest = storage.get_retrieval_index_manifest(&project_id).map_err(|e| {
+        ApiError::internal(format!("Failed to query retrieval index manifest: {e}"))
+    })?;
     let probe = embedding_runtime_availability_from_config(runtime);
     let current_embedding = current_embedding_contract_for_runtime(runtime);
-    let stored_embedding = stored_semantic_docs_contract_from_stats(&stats);
-    let contract_mismatch = stats.doc_count > 0
-        && probe.available
-        && !current_embedding
-            .as_ref()
-            .is_some_and(|contract| semantic_doc_stats_match_contract(&stats, contract));
+    let stored_embedding = manifest
+        .as_ref()
+        .map(stored_semantic_docs_contract_from_manifest);
+    let semantic_doc_count = manifest
+        .as_ref()
+        .map(published_dense_projection_count)
+        .unwrap_or(0);
+    // Fail closed: published vectors count as semantic readiness only while the
+    // manifest still classifies as a current, non-degraded full publication.
+    let stale_publication = manifest
+        .as_ref()
+        .is_some_and(|manifest| !codestory_retrieval::manifest_classifies_full(manifest));
+    let contract_mismatch = manifest
+        .as_ref()
+        .is_some_and(|manifest| !manifest_matches_current_embedding_contract(manifest, runtime));
+    let runtime_degraded =
+        semantic_doc_count > 0 && probe.available && (stale_publication || contract_mismatch);
     let fallback_message = probe.fallback_message.or_else(|| {
-        contract_mismatch.then(|| {
-            "Stored semantic docs do not match the current embedding contract. Run `retrieval index --refresh full` before trusting hybrid retrieval."
-                .to_string()
-        })
+        if !runtime_degraded {
+            None
+        } else if contract_mismatch {
+            Some(
+                "Stored semantic docs do not match the current embedding contract. Run `retrieval index --refresh full` before trusting hybrid retrieval."
+                    .to_string(),
+            )
+        } else {
+            Some(
+                "The published retrieval sidecar is stale or degraded for the current contract. Run `retrieval index --refresh full` to repair full sidecar readiness."
+                    .to_string(),
+            )
+        }
     });
     Ok(retrieval_state_from_parts_with_hybrid(
-        stats.doc_count,
-        stats
-            .embedding_model
-            .clone()
+        semantic_doc_count,
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest.embedding_backend.clone())
             .or_else(|| {
                 current_embedding
                     .as_ref()
@@ -762,8 +798,52 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         probe.available,
         fallback_message,
         current_embedding,
-        Some(stored_embedding),
-        contract_mismatch,
+        stored_embedding,
+        runtime_degraded,
         runtime.retrieval.hybrid_enabled,
     ))
+}
+
+fn published_dense_projection_count(manifest: &codestory_store::RetrievalIndexManifest) -> u32 {
+    match manifest.dense_projection_count {
+        Some(count) if count > 0 => u32::try_from(count).unwrap_or(u32::MAX),
+        _ => 0,
+    }
+}
+
+/// Manifest-only check that the published vectors were produced under the
+/// embedding contract this runtime queries with.
+fn manifest_matches_current_embedding_contract(
+    manifest: &codestory_store::RetrievalIndexManifest,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> bool {
+    let expected_backend = codestory_retrieval::embedding_runtime_id_for_runtime(runtime);
+    let expected_dim = i32::try_from(codestory_retrieval::semantic_vector_dim())
+        .unwrap_or(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32);
+    manifest.embedding_backend.as_deref() == Some(expected_backend.as_str())
+        && manifest.embedding_dim == Some(expected_dim)
+}
+
+fn stored_semantic_docs_contract_from_manifest(
+    manifest: &codestory_store::RetrievalIndexManifest,
+) -> StoredSemanticDocsContractDto {
+    StoredSemanticDocsContractDto {
+        doc_count: published_dense_projection_count(manifest),
+        embedding_profile: None,
+        embedding_backend: manifest.embedding_backend.clone(),
+        cache_key: manifest.embedding_backend.clone(),
+        dimension: manifest
+            .embedding_dim
+            .and_then(|dimension| u32::try_from(dimension).ok()),
+        doc_version: None,
+        mixed_embedding_profiles: false,
+        mixed_embedding_models: false,
+        mixed_embedding_backends: false,
+        mixed_dimensions: false,
+        mixed_doc_versions: false,
+        mixed_doc_shapes: false,
+        doc_shape: None,
+        semantic_policy_version: manifest.semantic_policy_version.clone(),
+        mixed_semantic_policy_versions: false,
+    }
 }

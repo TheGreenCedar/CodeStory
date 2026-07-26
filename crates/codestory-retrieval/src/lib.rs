@@ -79,8 +79,8 @@ pub use generation::{
 };
 pub use health::{
     ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
-    RetrievalManifestLaneProvenance, RetrievalStatusReport, probe_infrastructure_health,
-    probe_sidecar_health,
+    RetrievalManifestLaneProvenance, RetrievalStatusReport, manifest_classifies_full,
+    probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
     FinalizeIndexOutcome, RetrievalIndexCancelled, SidecarInputChanged, finalize_index,
