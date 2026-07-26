@@ -8,6 +8,7 @@ on:
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/packaged_agent_proof/**
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
@@ -55,6 +56,7 @@ on:
       - crates/codestory-llama-sys/model_staging.rs
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
+      - crates/codestory-retrieval/src/per_user_embedding/qualification_worker.rs
       - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
       - scripts/tests/release-evidence-runner-contract.test.mjs
@@ -71,6 +73,7 @@ on:
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/packaged_agent_proof/**
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
@@ -118,6 +121,7 @@ on:
       - crates/codestory-llama-sys/model_staging.rs
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
+      - crates/codestory-retrieval/src/per_user_embedding/qualification_worker.rs
       - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
       - scripts/tests/release-evidence-runner-contract.test.mjs
