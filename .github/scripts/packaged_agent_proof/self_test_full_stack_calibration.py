@@ -119,8 +119,8 @@ def _calibration_bundle_tests(
         )
     )
     require(
-        assembled["run_count"] == 6
-        and assembled["matrix_cell_count"] == 2
+        assembled["run_count"] == 9
+        and assembled["matrix_cell_count"] == 3
         and assembled_bundle_path.is_file()
         and assembled_constant_path.is_file(),
         "calibration assembler did not produce the exact frozen artifacts",
@@ -131,8 +131,8 @@ def _calibration_bundle_tests(
         enforce_source_lineage=False,
     )
     require(
-        calibration_result["run_count"] == 6
-        and calibration_result["matrix_cell_count"] == 2,
+        calibration_result["run_count"] == 9
+        and calibration_result["matrix_cell_count"] == 3,
         "calibration bundle self-test did not verify the full matrix",
     )
     return CalibrationFixture(
