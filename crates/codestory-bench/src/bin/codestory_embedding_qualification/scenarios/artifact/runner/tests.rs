@@ -1,9 +1,47 @@
-use super::super::{ScenarioArtifact, ScenarioOrchestration};
+use super::super::{CONTROL_TIMEOUT, SNAPSHOT_TIMEOUT, ScenarioArtifact, ScenarioOrchestration};
 use super::analysis::resident_generation_is_valid;
 use super::evidence::validate_named_evidence;
+use super::process::measurement_worker_timeout;
 use super::{ScenarioEvidence, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_SCENARIOS};
+use codestory_retrieval::{EmbeddingClientBudgets, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS};
 use std::collections::BTreeSet;
+use std::time::Duration;
+
+#[test]
+fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
+    // `wait_for_child` is a hung-worker watchdog: it must never kill a
+    // measurement worker that is still inside its own contract deadlines
+    // (connect or spawn convergence, then one request bounded by its class
+    // deadline), plus the coordinator's snapshot and control allowances.
+    // Regression: calibration run 30197324641 (hosted_linux_x64_cpu) was
+    // killed by a flat 20s snapshot-wait budget while the warm-bulk workload
+    // legitimately needs ~24s and the 256-document throughput workload ~96s.
+    let budgets = EmbeddingClientBudgets::current();
+    let orchestration_terms = budgets
+        .connect
+        .saturating_add(budgets.spawn)
+        .saturating_add(SNAPSHOT_TIMEOUT)
+        .saturating_add(CONTROL_TIMEOUT);
+    for operation in ["query", "observe", "resident_identity"] {
+        assert!(
+            measurement_worker_timeout(operation)
+                >= orchestration_terms.saturating_add(budgets.query_request),
+            "query-class measurement budget must dominate the worker's own query deadline chain"
+        );
+    }
+    let bulk_timeout = measurement_worker_timeout("bulk");
+    assert!(
+        bulk_timeout >= orchestration_terms.saturating_add(budgets.bulk_request),
+        "bulk measurement budget must dominate the worker's own bulk deadline chain"
+    );
+    // The exact defect: the coordinator killed bulk measurement workers below
+    // the bulk request deadline the workers themselves honor.
+    assert!(
+        bulk_timeout >= Duration::from_millis(PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS),
+        "bulk measurement budget must not undercut the contract bulk request deadline"
+    );
+}
 
 #[test]
 fn measurement_sample_ids_are_opaque_stable_and_unique_between_runs() {

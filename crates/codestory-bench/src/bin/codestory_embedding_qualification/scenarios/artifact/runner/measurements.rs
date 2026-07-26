@@ -6,7 +6,7 @@ use super::analysis::{
     accelerator_operands, completed_token_count, raw_server_identity,
     snapshot_has_resident_generation,
 };
-use super::process::{query_parameters, require_worker_success};
+use super::process::{measurement_worker_timeout, query_parameters, require_worker_success};
 use super::{ScenarioRunner, WorkerOutput, push_metric};
 use crate::qualification::request::REQUIRED_METRICS;
 use anyhow::{Result, bail};
@@ -154,7 +154,10 @@ impl<'a> ScenarioRunner<'a> {
         }
 
         let residency_worker = self.spawn_worker("resident_identity", query_parameters(1), None)?;
-        let residency_output = self.finish_worker(residency_worker, SNAPSHOT_TIMEOUT)?;
+        let residency_output = self.finish_worker(
+            residency_worker,
+            measurement_worker_timeout("resident_identity"),
+        )?;
         let residency_interval = measurement_interval(&residency_output)?;
         let identity = residency_output
             .engine_identity
@@ -178,7 +181,7 @@ impl<'a> ScenarioRunner<'a> {
                 snapshot.scheduler.active_request_count > 0 || snapshot.scheduler.query_depth > 0
             })?;
             self.control("release_class", Some("query"))?;
-            let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
+            let output = self.finish_worker(worker, measurement_worker_timeout("query"))?;
             require_worker_success(&output, "busy_retry_usefulness")?;
             let interval = measurement_interval(&output)?;
             let snapshot = self.record_worker_snapshot("measurement_busy_complete", &output)?;
@@ -235,7 +238,7 @@ impl<'a> ScenarioRunner<'a> {
         parameters: EmbeddingQualificationParameters,
     ) -> Result<(MeasurementInterval, EmbeddingServerSnapshot, WorkerOutput)> {
         let worker = self.spawn_worker(operation, parameters, None)?;
-        let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
+        let output = self.finish_worker(worker, measurement_worker_timeout(operation))?;
         require_worker_success(&output, operation)?;
         let interval = measurement_interval(&output)?;
         let snapshot = self.record_worker_snapshot("measurement_worker", &output)?;
