@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import time
 from pathlib import Path
 
@@ -16,12 +15,19 @@ from .contract_primitives import (
     require_sha256,
     write_private_json,
 )
+from .event_producer_liveness import (
+    EventProducer,
+    NativeProcessProducer,
+    UnobservedProducer,
+)
 from .foundation import (
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
     ProofFailure,
     require,
 )
 from .subprocess_control import json_command, run
+
+SERVER_PRODUCER_LABEL = "the per-user embedding qualification server"
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -40,28 +46,109 @@ def read_jsonl(path: Path) -> list[dict]:
     return events
 
 
+def jsonl_log_state(path: Path) -> str:
+    """How far the awaited log actually got, in one attributable sentence.
+
+    A wait that fails must never leave open whether the log was missing, empty,
+    torn, or simply short of the awaited record: those have different causes and
+    only the log itself can tell them apart.
+    """
+    if path.is_symlink():
+        return "is a symlink and was never a trustworthy qualification log"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return "was never created"
+    except OSError as error:
+        return f"could not be read: {error}"
+    lines = [line for line in raw.split(b"\n") if line.strip()]
+    records = read_jsonl(path)
+    trailer = "" if not raw or raw.endswith(b"\n") else "; its last line is unterminated"
+    if not records:
+        return f"holds {len(raw)} bytes and no parsed record{trailer}"
+    sequences = [
+        event["sequence"]
+        for event in records
+        if isinstance(event.get("sequence"), int)
+    ]
+    last = records[-1]
+    actions = sorted({str(event.get("action")) for event in records})
+    return (
+        f"holds {len(raw)} bytes and {len(records)} parsed record(s)"
+        f" out of {len(lines)} line(s); actions {', '.join(actions)};"
+        f" highest sequence {max(sequences) if sequences else 'none'};"
+        f" last record sequence={last.get('sequence')!r}"
+        f" action={last.get('action')!r} status={last.get('status')!r}{trailer}"
+    )
+
+
 def wait_for_jsonl_event(
     path: Path,
     predicate,
     *,
     timeout: int,
-    process: subprocess.Popen | None = None,
+    awaited: str,
+    producer: EventProducer,
 ) -> dict:
+    """Wait for one qualification record, attributing every way it can fail.
+
+    ``producer`` has no default on purpose. A wait without a liveness argument
+    turns any producer failure -- exit, crash, or a server that idled out before
+    the control was written -- into the same anonymous timeout, which is the
+    defect this signature exists to prevent. Callers with nothing to observe
+    pass an explicit ``UnobservedProducer`` that states why.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for event in read_jsonl(path):
             if predicate(event):
                 return event
-        if process is not None and process.poll() is not None:
-            stdout, stderr = process.communicate()
+        if producer.exited():
+            # The producer may have appended the awaited record and exited
+            # between the read above and this probe, so the log decides last.
+            for event in read_jsonl(path):
+                if predicate(event):
+                    return event
             raise ProofFailure(
-                "qualification product process exited before its raw event: "
-                f"exit={process.returncode} stdout_sha256="
-                f"{hashlib.sha256(stdout.encode('utf-8')).hexdigest()} stderr_sha256="
-                f"{hashlib.sha256(stderr.encode('utf-8')).hexdigest()}"
+                f"{producer.label} ({producer.activity}) {producer.termination()}"
+                f" before {awaited} was written:"
+                f" qualification event file {path.name} {jsonl_log_state(path)}"
             )
         time.sleep(0.01)
-    raise ProofFailure(f"timed out waiting for qualification event file {path.name}")
+    raise ProofFailure(
+        f"timed out after {timeout}s waiting for {awaited}:"
+        f" qualification event file {path.name} {jsonl_log_state(path)};"
+        f" {producer.describe()}"
+    )
+
+
+def server_producer_from_control_event(event: dict, activity: str) -> EventProducer:
+    """Pin the exact server process that answered one control, when it named it."""
+    snapshot = event.get("snapshot")
+    process = snapshot.get("process") if isinstance(snapshot, dict) else None
+    pid = process.get("pid") if isinstance(process, dict) else None
+    process_start_id = (
+        process.get("process_start_id") if isinstance(process, dict) else None
+    )
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(process_start_id, str)
+        or not process_start_id
+    ):
+        return UnobservedProducer(
+            SERVER_PRODUCER_LABEL,
+            activity,
+            "did not report an exact process identity in its control event,"
+            " so its liveness cannot be pinned",
+        )
+    return NativeProcessProducer(
+        pid,
+        process_start_id,
+        SERVER_PRODUCER_LABEL,
+        activity,
+    )
 
 
 def send_server_qualification_control(
@@ -71,6 +158,7 @@ def send_server_qualification_control(
     sequence: int,
     action: str,
     timeout: int,
+    producer: EventProducer,
 ) -> dict:
     nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
     command_path = directory / f"{nonce}.command.json"
@@ -96,6 +184,11 @@ def send_server_qualification_control(
                 and candidate.get("action") == action
             ),
             timeout=timeout,
+            awaited=(
+                f"embedding qualification control sequence={sequence}"
+                f" action={action}"
+            ),
+            producer=producer,
         )
         require(
             event.get("status") in {"completed", "accepted"},

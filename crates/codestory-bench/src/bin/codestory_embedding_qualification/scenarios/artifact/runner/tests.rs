@@ -9,6 +9,7 @@ use super::measurements::{
 use super::process::{
     LOAD_ESTABLISHMENT_WAITS, busy_retry_worker_timeout, dead_client_setup_timeout,
     load_establishment_budget, load_establishment_timeout, measurement_worker_timeout,
+    published_control_events,
 };
 use super::{ScenarioEvidence, WorkerOutput, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_METRICS, REQUIRED_SCENARIOS};
@@ -629,4 +630,114 @@ fn complete_evidence(scenario: &str) -> ScenarioEvidence {
         controls: controls.iter().map(|value| (*value).into()).collect(),
         transitions: transitions.iter().map(|value| (*value).into()).collect(),
     }
+}
+
+/// The exact record that tore on the Linux calibration cell in run
+/// 30269041727: 242 bytes starting at offset 89916 of a 90159-byte log, so its
+/// first 196 bytes end at 90112 — a 4 KiB page boundary — part-way through the
+/// `boot_id` string value.
+const TORN_HOLD_CLASS_RECORD: &str = "{\"schema_version\":1,\"sequence\":28,\"action\":\"hold_class\",\"status\":\"completed\",\"server_event_sequence\":17,\"clock\":{\"domain\":\"awake_monotonic\",\"api\":\"CLOCK_MONOTONIC\",\"boot_id\":\"cb5daa6d-70bb-4839-962e-9c5c3850a68d\",\"observed_ns\":3538471174799}}";
+
+/// Bytes of that record the reader actually observed: the near-side page of
+/// the torn append, cut inside a string literal.
+const TORN_HOLD_CLASS_PREFIX_BYTES: usize = 196;
+
+fn published_event_line(sequence: u64) -> String {
+    format!(
+        "{{\"schema_version\":1,\"sequence\":{sequence},\"action\":\"snapshot\",\"status\":\"completed\",\"server_event_sequence\":{sequence},\"clock\":{{\"domain\":\"awake_monotonic\",\"api\":\"CLOCK_MONOTONIC\",\"boot_id\":\"cb5daa6d-70bb-4839-962e-9c5c3850a68d\",\"observed_ns\":{sequence}}}}}"
+    )
+}
+
+fn published_event_sequences(path: &std::path::Path) -> Vec<u64> {
+    published_control_events(path)
+        .expect("an append-only event log must read without error")
+        .into_iter()
+        .map(|event| event.sequence)
+        .collect()
+}
+
+#[test]
+fn a_half_written_event_line_reads_as_not_yet_written_instead_of_failing() {
+    // Regression: calibration run 30269041727 (hosted_linux_x64_cpu) failed
+    // `mixed_queue` with `parse embedding qualification control event: EOF
+    // while parsing a string at line 1 column 196`. The preserved log is
+    // wholly valid at rest; the control poll simply read it while the server
+    // was still publishing the very `hold_class` response the poll was waiting
+    // for, and a buffered append becomes visible page by page. The poll has to
+    // treat that prefix as "not written yet" and come back, which is what its
+    // `CONTROL_TIMEOUT` loop exists to do.
+    let torn = &TORN_HOLD_CLASS_RECORD[..TORN_HOLD_CLASS_PREFIX_BYTES];
+    let observed = serde_json::from_str::<super::super::ControlEvent>(torn)
+        .expect_err("the near-side page of the torn append is not a parsable record");
+    assert_eq!(
+        observed.to_string(),
+        "EOF while parsing a string at line 1 column 196",
+        "the fixture must reproduce the calibration failure byte for byte, or this test guards nothing"
+    );
+
+    let directory = tempfile::tempdir().expect("temporary qualification directory");
+    let path = directory.path().join("nonce.events.jsonl");
+
+    // A log whose only content is a record still being published reads as
+    // empty, not as a corrupt log.
+    std::fs::write(&path, torn).expect("write partially published log");
+    assert!(
+        published_event_sequences(&path).is_empty(),
+        "a log holding only an unfinished record has published nothing yet"
+    );
+
+    // Records completed ahead of the unfinished tail are still delivered.
+    let published = format!(
+        "{}\n{}\n",
+        published_event_line(26),
+        published_event_line(27)
+    );
+    std::fs::write(&path, format!("{published}{torn}")).expect("write torn log");
+    assert_eq!(
+        published_event_sequences(&path),
+        vec![26, 27],
+        "an unfinished trailing record must not hide the records already published"
+    );
+
+    // Once the writer finishes the record it appears, so tolerating the tail
+    // delays the observation by one poll rather than losing it.
+    std::fs::write(&path, format!("{published}{TORN_HOLD_CLASS_RECORD}\n"))
+        .expect("write completed log");
+    assert_eq!(
+        published_event_sequences(&path),
+        vec![26, 27, 28],
+        "the completed record must be observed on the next poll"
+    );
+}
+
+#[test]
+fn a_complete_but_malformed_event_line_still_fails_the_read() {
+    // The tolerance above is scoped to the one condition an append-only log
+    // makes benign: bytes after the last newline, which the writer has not
+    // finished publishing. A line the writer did terminate is a finished
+    // record, so malformed content there is real corruption and must stay a
+    // hard failure instead of silently shrinking the event history.
+    let directory = tempfile::tempdir().expect("temporary qualification directory");
+    let path = directory.path().join("nonce.events.jsonl");
+
+    let interior = format!(
+        "{}\n{{\"schema_version\":1,\"sequence\":27,\"action\":\n{}\n",
+        published_event_line(26),
+        published_event_line(28)
+    );
+    std::fs::write(&path, &interior).expect("write log with a malformed interior line");
+    assert!(
+        published_control_events(&path).is_err(),
+        "a terminated but malformed interior record must fail the read"
+    );
+
+    let trailing = format!(
+        "{}\n{{\"schema_version\":1,\"sequence\":27,\"action\":\n",
+        published_event_line(26)
+    );
+    std::fs::write(&path, &trailing).expect("write log with a malformed final line");
+    assert!(
+        published_control_events(&path).is_err(),
+        "a malformed record the writer terminated is corruption even when it is last"
+    );
 }

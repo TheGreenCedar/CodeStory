@@ -11,7 +11,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 #[derive(Debug)]
 pub(in crate::per_user_embedding) struct PinnedQualificationDirectory {
@@ -55,6 +55,7 @@ pub(in crate::per_user_embedding) fn server_qualification_control_from_values(
                 processed_command_sha256: Mutex::new(None),
                 force_incompatible: AtomicBool::new(false),
                 freeze_owner: AtomicBool::new(false),
+                denied_command_ticks: AtomicU32::new(0),
             }))
         }
         _ => bail!("embedding_qualification_gate_incomplete"),

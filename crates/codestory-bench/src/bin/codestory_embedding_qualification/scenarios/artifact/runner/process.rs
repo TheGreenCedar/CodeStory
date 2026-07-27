@@ -18,13 +18,50 @@ use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
 pub(super) fn existing_control_events(directory: &Path) -> Result<Vec<ControlEvent>> {
-    let path = directory.join(format!("{}.events.jsonl", qualification_nonce()?));
-    let bytes = match fs::read(&path) {
+    published_control_events(&directory.join(format!("{}.events.jsonl", qualification_nonce()?)))
+}
+
+/// Read the records the server has finished publishing to its append-only
+/// qualification event log, treating an unterminated trailing line as a record
+/// that is not written yet rather than as corruption.
+///
+/// The writer is not at fault and needs no change: it encodes one event,
+/// appends the newline to that same buffer, issues exactly one `write_all` on
+/// an unbuffered `O_APPEND` handle, then flushes and `sync_all`s. Linux still
+/// publishes a buffered append page by page — `i_size` advances inside each
+/// per-page `write_end` while buffered readers take no `i_rwsem` — so a record
+/// that straddles a page boundary is briefly visible as its near-side prefix.
+/// Calibration run 30269041727 caught exactly that on the Linux cell: the
+/// preserved log is 90159 bytes and every one of its 248 records parses at
+/// rest, but the poll that was waiting for the 242-byte `hold_class` record at
+/// offset 89916 read only its first 196 bytes (89916 + 196 = 90112, a 4 KiB
+/// boundary to the byte), the cut landed inside `boot_id`, and the scenario
+/// died with `EOF while parsing a string at line 1 column 196`.
+///
+/// Tolerating that tail is sound because the log is append-only: whatever is
+/// visible is always a true prefix of the final content, so everything up to
+/// the last newline is a whole number of finished records and anything after
+/// it is a record still being published. Reporting it as not-yet-written is
+/// what every caller already expects — the control wait polls again inside its
+/// own `CONTROL_TIMEOUT`, and the telemetry readers only need records whose
+/// worker exited long before the concurrent tail. A line that is complete and
+/// still malformed keeps failing the whole read, so this stays fail-closed on
+/// real corruption; the same distinction the publication control poller draws
+/// in `codestory-retrieval`'s `index.rs`. The writer's own open-time check that
+/// an adopted log ends in a newline is a different question — a new producer
+/// inheriting an unterminated log means the previous producer died mid-record —
+/// and deliberately stays strict.
+pub(super) fn published_control_events(path: &Path) -> Result<Vec<ControlEvent>> {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("read embedding qualification control events"),
     };
-    bytes
+    let published = match bytes.iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => &bytes[..=newline],
+        None => &bytes[..0],
+    };
+    published
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| {

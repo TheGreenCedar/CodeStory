@@ -8,14 +8,30 @@ use super::event_log::{
     qualification_detail, write_server_qualification_event,
 };
 use super::filesystem::{
-    native_file_identity, native_path_identity, validate_private_qualification_file_metadata,
+    CommandAbsence, Observation, native_file_identity, optional_native_path_identity,
+    qualification_file_absence, qualification_file_lost_its_last_name,
+    validate_private_qualification_file_metadata,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// How many consecutive ticks may answer `ACCESS_DENIED` before the server
+/// stops calling it a removal in progress.
+///
+/// A Windows delete-pending entry cannot outlive the handles that put it in
+/// that state, and this server's own handle closes inside one consume, so the
+/// real case clears within a tick or two. A denial that persists is something
+/// else -- an ACL that genuinely refuses the open -- and treating that as "no
+/// command this tick" forever recreates the unattributable multi-minute hang
+/// this whole lane exists to remove. The accept loop polls roughly every 25ms,
+/// so this bound is a few seconds: far beyond any real removal race, far short
+/// of a proof budget.
+pub(in crate::per_user_embedding) const MAX_DENIED_COMMAND_TICKS: u32 = 200;
 
 #[derive(Debug)]
 pub(in crate::per_user_embedding) struct ServerQualificationCommandFile {
@@ -39,25 +55,111 @@ struct ServerQualificationCommandParameters {
     class: Option<String>,
 }
 
+/// Observe the command file's own metadata, reporting why nothing is there.
+fn optional_command_metadata(
+    path: &Path,
+    context_message: &'static str,
+) -> Result<Observation<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if qualification_file_lost_its_last_name(&metadata) => {
+            Ok(Err(CommandAbsence::Removed))
+        }
+        Ok(metadata) => Ok(Ok(metadata)),
+        Err(error) => match qualification_file_absence(&error) {
+            Some(absence) => Ok(Err(absence)),
+            None => Err(error).context(context_message),
+        },
+    }
+}
+
+/// Record one tick that found no command, and decide whether the reason is
+/// still credible.
+///
+/// A removal is proof and resets the denial run. A denial is only ever
+/// provisional: it is tolerated while it stays inside the bound and named as a
+/// failure once it outlives it.
+pub(in crate::per_user_embedding) fn absent_command(
+    control: &ServerQualificationControl,
+    absence: CommandAbsence,
+) -> Result<Option<ServerQualificationCommandFile>> {
+    match absence {
+        CommandAbsence::Removed => {
+            control.denied_command_ticks.store(0, Ordering::Release);
+            Ok(None)
+        }
+        CommandAbsence::Denied => {
+            let denied = control
+                .denied_command_ticks
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            if denied > MAX_DENIED_COMMAND_TICKS {
+                bail!("embedding_qualification_command_denied");
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Consume the pinned qualification command for one poll tick.
+///
+/// `Ok(None)` means "no command this tick", and covers both "the writer has not
+/// written one yet" and "the writer took its command back while this tick was
+/// reading it". The second case is ordinary: the proof harness removes each
+/// command once it has seen the matching event, and that removal races every
+/// tick that already opened the file. What the loser of that race observes is
+/// platform- and filesystem-dependent -- `NotFound`, a zero link count, or, on
+/// a Windows volume without POSIX delete semantics, `ACCESS_DENIED` from an
+/// entry left delete-pending -- so a poll loop that treats any of them as fatal
+/// kills the server during routine command cleanup.
+///
+/// Every other outcome stays fatal, because tolerance here must not become a
+/// blanket "ignore all IO errors" that turns real control-plane failures into
+/// silent waits: untrusted metadata, a different file substituted at the pinned
+/// path, an oversized command, a replaced pinned directory, and any other
+/// filesystem error all still stop the server. The Windows denial is bounded
+/// as well as narrow: `ACCESS_DENIED` is indistinguishable from an ACL that
+/// simply refuses the open, so it is tolerated only for as long as a real
+/// delete-pending entry could last, then fails as
+/// `embedding_qualification_command_denied` rather than waiting forever.
+///
+/// Every step of the sequence can lose that race, and each loses it
+/// differently: a `stat` fails or reports a zero link count, the native path
+/// identity fails, the open fails, and the opened handle keeps serving a file
+/// that no longer has a name. All of them are classified here, and nowhere
+/// else -- the shared metadata gate and the accept loop both stay fail-closed.
 pub(in crate::per_user_embedding) fn read_server_qualification_command(
     control: &ServerQualificationControl,
 ) -> Result<Option<ServerQualificationCommandFile>> {
+    match consume_server_qualification_command(control)? {
+        Ok(command) => {
+            control.denied_command_ticks.store(0, Ordering::Release);
+            Ok(Some(command))
+        }
+        Err(absence) => absent_command(control, absence),
+    }
+}
+
+/// One consume attempt, reporting either the command or why there was none.
+fn consume_server_qualification_command(
+    control: &ServerQualificationControl,
+) -> Result<Observation<ServerQualificationCommandFile>> {
     control.directory.revalidate()?;
     let path = control
         .directory
         .join(format!("{}.command.json", control.nonce));
-    let path_metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).context("inspect embedding qualification command");
-        }
-    };
+    let path_metadata =
+        match optional_command_metadata(&path, "inspect embedding qualification command")? {
+            Ok(metadata) => metadata,
+            Err(absence) => return Ok(Err(absence)),
+        };
     validate_private_qualification_file_metadata(
         &path_metadata,
         SERVER_QUALIFICATION_MAX_COMMAND_BYTES,
     )?;
-    let identity = native_path_identity(&path)?;
+    let identity = match optional_native_path_identity(&path)? {
+        Ok(identity) => identity,
+        Err(absence) => return Ok(Err(absence)),
+    };
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -65,12 +167,19 @@ pub(in crate::per_user_embedding) fn read_server_qualification_command(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options
-        .open(&path)
-        .context("open embedding qualification command")?;
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) => match qualification_file_absence(&error) {
+            Some(absence) => return Ok(Err(absence)),
+            None => return Err(error).context("open embedding qualification command"),
+        },
+    };
     let opened = file
         .metadata()
         .context("inspect opened embedding qualification command")?;
+    if qualification_file_lost_its_last_name(&opened) {
+        return Ok(Err(CommandAbsence::Removed));
+    }
     validate_private_qualification_file_metadata(&opened, SERVER_QUALIFICATION_MAX_COMMAND_BYTES)?;
     if native_file_identity(&file)? != identity {
         bail!("embedding_qualification_command_replaced");
@@ -84,16 +193,31 @@ pub(in crate::per_user_embedding) fn read_server_qualification_command(
         bail!("embedding_qualification_command_limit");
     }
     let path_metadata =
-        fs::symlink_metadata(&path).context("reinspect embedding qualification command")?;
+        match optional_command_metadata(&path, "reinspect embedding qualification command")? {
+            Ok(metadata) => metadata,
+            Err(absence) => return Ok(Err(absence)),
+        };
     validate_private_qualification_file_metadata(
         &path_metadata,
         SERVER_QUALIFICATION_MAX_COMMAND_BYTES,
     )?;
-    if native_path_identity(&path)? != identity {
+    let reobserved = match optional_native_path_identity(&path)? {
+        Ok(identity) => identity,
+        Err(absence) => return Ok(Err(absence)),
+    };
+    if reobserved != identity {
+        // A missing Unix path still yields a lexical identity, so separate "the
+        // writer removed it" from "a different file now sits at the pinned
+        // path". Only the latter is a substitution the server must refuse.
+        if let Err(absence) =
+            optional_command_metadata(&path, "reinspect embedding qualification command")?
+        {
+            return Ok(Err(absence));
+        }
         bail!("embedding_qualification_command_replaced");
     }
     control.directory.revalidate()?;
-    Ok(Some(ServerQualificationCommandFile { bytes }))
+    Ok(Ok(ServerQualificationCommandFile { bytes }))
 }
 
 pub(in crate::per_user_embedding) fn poll_server_qualification_command(
