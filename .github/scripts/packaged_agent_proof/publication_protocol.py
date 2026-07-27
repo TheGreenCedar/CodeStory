@@ -383,7 +383,13 @@ def run_embedding_qualification_query_worker(
     observed lifetime would corrupt the very constant being measured.
 
     ``label`` separates one caller's request and output files from another's, so
-    two callers in the same run never read each other's evidence.
+    two callers in the same run never read each other's evidence -- and so that
+    two invocations can both run. The worker refuses to overwrite an existing
+    output (`embedding_qualification_output_exists`), which makes a reused label
+    a one-shot: the second invocation cannot complete, whatever it was for. That
+    is checked here rather than left to the CLI so a reused label is reported as
+    the harness defect it is, at the caller that reused it, instead of as an
+    opaque non-zero exit from a command that never got to run.
     """
     require(
         isinstance(label, str) and _WORKER_LABEL.fullmatch(label) is not None,
@@ -395,6 +401,13 @@ def run_embedding_qualification_query_worker(
     )
     request_path = private_root / f"publication-{label}-worker-request.json"
     output_path = private_root / f"publication-{label}-worker-output.json"
+    require(
+        not output_path.exists() and not output_path.is_symlink(),
+        f"embedding qualification worker label {label!r} was already used in this"
+        f" run: {output_path.name} exists, and the worker refuses to overwrite an"
+        " output, so this invocation could never complete. Give each invocation"
+        " its own label instead of retrying into the previous one's evidence",
+    )
     write_private_json(
         request_path,
         {
@@ -546,11 +559,16 @@ def send_control_to_resident_server(
     unbounded retry loop and never a silent pass: a second loss fails closed and
     names both servers.
 
-    ``establish`` returns the pinned producer for the server it made resident,
-    so the wait it guards fails in seconds with a named process instead of
-    spending its budget on anonymous silence.
+    ``establish`` is called with the attempt number, 1 and then 2, and returns
+    the pinned producer for the server it made resident, so the wait it guards
+    fails in seconds with a named process instead of spending its budget on
+    anonymous silence. The attempt is not decoration: an establishing step that
+    writes evidence has to write the second attempt's evidence somewhere the
+    first attempt's does not already sit, or the tolerance this function exists
+    to provide cannot run at all. Every failure on the way is attributed to the
+    loss that started it, including a replacement that could not be established.
     """
-    producer = establish()
+    producer = establish(1)
     try:
         return send_server_qualification_control(
             directory,
@@ -568,7 +586,14 @@ def send_control_to_resident_server(
             raise
         lost = f"{producer.label} {producer.termination()}"
         first = str(first_failure)
-    replacement = establish()
+    try:
+        replacement = establish(2)
+    except ProofFailure as replacement_failure:
+        raise ProofFailure(
+            f"embedding qualification control sequence={sequence} action={action}"
+            f" lost its resident server: {lost} ({first}); no replacement server"
+            f" could be established to answer it ({replacement_failure})"
+        ) from replacement_failure
     try:
         return send_server_qualification_control(
             directory,

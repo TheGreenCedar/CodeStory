@@ -118,7 +118,11 @@ def _run_fault(
         sequence=1,
         action="snapshot",
         timeout=control_timeout,
-        establish=lambda: ensure_resident_qualification_server(
+        # Each attempt writes its own worker request and output. The worker
+        # refuses to overwrite an existing output, so a shared label would make
+        # the tolerated respawn unrunnable -- the replacement would die before
+        # it started, and the run would report that instead of the lost server.
+        establish=lambda attempt: ensure_resident_qualification_server(
             cli,
             env,
             fixture.project,
@@ -127,7 +131,7 @@ def _run_fault(
             executable_sha256=executable_sha256,
             timeout=timeout,
             activity="answering the first control of this publication fault run",
-            label="fault-residency",
+            label=f"fault-residency-{attempt}",
         ),
     )
     resident_server = server_producer_from_control_event(
@@ -160,16 +164,23 @@ def _run_fault(
             producer=candidate_producer,
         )
         # This control's residency comes from the candidate itself: it embedded
-        # the mutated fixture and is now paused at the manifest fence, so the
-        # server's idle window restarted moments ago. Re-establishing residency
-        # here would put an extra admitted request inside the fault window this
-        # step exists to observe, so it is deliberately not done.
+        # the mutated fixture on its way to the manifest fence, so the server's
+        # idle window restarted during that work. Re-establishing residency here
+        # would put an extra admitted request inside the fault window this step
+        # exists to observe, so it is deliberately not done.
         #
-        # The pinned predecessor is therefore reported as state, never as cause:
-        # sequence 2's whole purpose is to end that server, and a replacement
-        # reads the same pinned command file. Only the candidate process --
-        # which nothing replaces -- can fail this wait, and the control budget
-        # bounds it either way.
+        # That is a judgement, not a bound. Nothing here measures the interval
+        # between the candidate's last embed and the fence, and on a host where
+        # one packaged CLI invocation costs the better part of a minute it is
+        # not comfortably inside the 60s budget. The residual risk is accepted
+        # rather than hidden: the control budget turns it into a fast, named
+        # timeout instead of the half hour of anonymous silence that made this
+        # class of failure so expensive to diagnose.
+        #
+        # The pinned predecessor is reported as state, never as cause: sequence
+        # 2's whole purpose is to end that server, so its exit proves nothing
+        # about this wait. Only the candidate process -- which nothing replaces
+        # -- can fail it.
         send_server_qualification_control(
             private_root,
             nonce,
