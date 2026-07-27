@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 codestory-contracts = { workspace = true }
+codestory-workspace = { workspace = true }
 anyhow = { workspace = true }
 fs4 = { workspace = true }
 parking_lot = { workspace = true }

@@ -9,6 +9,7 @@
 mod file_store;
 mod projection_store;
 mod snapshot_store;
+mod sqlite_path;
 mod storage_impl;
 
 pub use file_store::FileStore;
