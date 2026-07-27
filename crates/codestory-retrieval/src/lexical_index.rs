@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use codestory_store::{FileRole, Store, SymbolSearchDoc};
+use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -512,7 +513,7 @@ fn write_lexical_database<F>(
 where
     F: FnOnce(&mut dyn FnMut(&LexicalDocument) -> Result<()>) -> Result<LexicalCoverage>,
 {
-    let mut connection = Connection::open(path)
+    let mut connection = Connection::open(sqlite_open_path(path))
         .with_context(|| format!("create lexical SQLite shard {}", path.display()))?;
     connection.execute_batch(
         "PRAGMA journal_mode = OFF;
@@ -813,7 +814,7 @@ fn validate_open_database_metadata(
 
 fn open_read_only(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
-        path,
+        sqlite_open_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open lexical SQLite shard {}", path.display()))?;
@@ -1471,6 +1472,37 @@ mod tests {
                 "query={query}"
             );
         }
+    }
+
+    #[test]
+    fn lexical_shard_survives_data_dirs_beyond_max_path() {
+        // Regression companion to the embedded vector deep-root test: the
+        // lexical shard is built at the same sidecar depth, so its SQLite
+        // opens must also survive cache roots beyond the Windows MAX_PATH
+        // cap for non-longPathAware processes.
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn deep_handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let mut deep_data = data.path().to_path_buf();
+        let segment = "max-path-regression-padding-segment".repeat(2);
+        while deep_data.as_os_str().len() < 320 {
+            deep_data.push(&segment);
+        }
+        std::fs::create_dir_all(&deep_data).expect("create deep lexical data dir");
+
+        let shard = build(project.path(), &deep_data, "longpath", "input");
+        assert!(
+            shard.join(LEXICAL_INDEX_FILE).as_os_str().len() > 260,
+            "regression shard no longer exceeds MAX_PATH: {}",
+            shard.display()
+        );
+        assert_eq!(
+            search_lexical_index(&shard, "input", "deep_handler", 4)
+                .expect("search lexical shard under a deep data dir")
+                .first()
+                .map(|hit| hit.path.as_str()),
+            Some("lib.rs")
+        );
     }
 
     #[test]
