@@ -32,6 +32,7 @@ mod row_mapping;
 mod schema;
 mod trail;
 
+use crate::sqlite_path;
 use helpers::{
     decode_embedding_blob, deserialize_candidate_targets, encode_embedding_blob,
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
@@ -235,7 +236,10 @@ fn database_logical_bytes(connection: &Connection) -> Result<u64, StorageError> 
 }
 
 fn database_logical_bytes_at_path(path: &Path) -> Result<u64, StorageError> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let connection = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     database_logical_bytes(&connection)
 }
 
@@ -493,7 +497,10 @@ fn read_source_policy_exclusion_rollback_identity(
     if !path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let table_exists: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master
@@ -689,7 +696,10 @@ fn read_structural_text_unit_rollback_identity(
     if !path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let table_exists: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master
@@ -870,7 +880,10 @@ fn inspect_promotion_database(path: &Path) -> Result<Option<(Connection, u32)>, 
     if !path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
     let _ = conn.busy_timeout(Duration::from_millis(2_500));
     let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
@@ -1193,9 +1206,15 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
 }
 
 fn restore_promotion_database(source_path: &Path, live_path: &Path) -> Result<(), StorageError> {
-    let mut live = Connection::open(live_path)?;
+    let mut live = Connection::open(sqlite_path::open_path(live_path))?;
     let _ = live.busy_timeout(Duration::from_millis(2_500));
-    live.restore(MAIN_DB, source_path, None::<fn(rusqlite::backup::Progress)>)?;
+    // `restore` opens `source_path` as a second SQLite database, so it needs
+    // the same extended-length treatment as the live connection.
+    live.restore(
+        MAIN_DB,
+        sqlite_path::open_path(source_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
     Ok(())
 }
 
@@ -3657,7 +3676,10 @@ impl Storage {
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
         recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -3735,7 +3757,7 @@ impl Storage {
         // connection observes it without materializing either sidecar. SQLite
         // may update transient reader marks inside the existing SHM wal-index;
         // durable database and WAL bytes remain observationally unchanged.
-        let uri = observational_sqlite_uri(path, !wal_exists);
+        let uri = sqlite_path::observational_uri(path, !wal_exists);
         let conn = Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -3839,7 +3861,7 @@ impl Storage {
         if matches!(mode, StorageOpenMode::Live) {
             recover_interrupted_promotion(path)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(sqlite_path::open_path(path))?;
         // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
         // in app shells when users query mid-index.
         conn.busy_timeout(Duration::from_millis(2_500))?;
@@ -3878,7 +3900,10 @@ impl Storage {
 
     pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
         recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
     }
@@ -3886,7 +3911,10 @@ impl Storage {
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
     pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
         recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         if version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && version > SCHEMA_VERSION {
@@ -3908,7 +3936,10 @@ impl Storage {
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
         recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         read_index_publication(&conn)
     }
 
@@ -3918,7 +3949,10 @@ impl Storage {
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
         recover_interrupted_promotion(path)?;
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         read_complete_index_publication(&conn)
     }
 
@@ -3935,12 +3969,23 @@ impl Storage {
                 ))
             })?;
         }
-        let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let source = Connection::open_with_flags(
+            sqlite_path::open_path(source_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let source_bytes = database_logical_bytes(&source)?;
         let copy_started = Instant::now();
-        source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
+        // `backup` opens the target as a second SQLite database.
+        source.backup(
+            MAIN_DB,
+            sqlite_path::open_path(target_path),
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
         let copy_ms = duration_ms(copy_started.elapsed());
-        let target = Connection::open_with_flags(target_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let target = Connection::open_with_flags(
+            sqlite_path::open_path(target_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let target_bytes = database_logical_bytes(&target)?;
         Ok(DatabaseSnapshotCopyStats {
             copy_ms,
@@ -3987,7 +4032,13 @@ impl Storage {
         else {
             return Ok(None);
         };
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // SQLite already reports the resolved full pathname of this
+        // connection, so on Windows it is normally verbatim already and the
+        // conversion is idempotent.
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(Path::new(path)),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "query_only", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -4065,7 +4116,7 @@ impl Storage {
         if !source_path.exists() {
             return Ok(0);
         }
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -4129,7 +4180,7 @@ impl Storage {
             return Ok(0);
         }
         drop(Storage::open(source_path)?);
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn.execute(
             "ATTACH DATABASE ?1 AS structural_cache_source",
             params![source],
@@ -5252,11 +5303,11 @@ impl Storage {
         let mut rollback_backup_bytes = None;
         if previous.is_some() {
             let rollback_backup_copy_started = Instant::now();
-            let live_conn = Connection::open(live_path)?;
+            let live_conn = Connection::open(sqlite_path::open_path(live_path))?;
             let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
             live_conn.backup(
                 MAIN_DB,
-                &backup_path,
+                sqlite_path::open_path(&backup_path),
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             drop(live_conn);
@@ -5313,17 +5364,19 @@ impl Storage {
         durations.prepared_journal_directory_sync = journal_write_stats.directory_sync;
 
         let staged_to_live_restore_started = Instant::now();
-        let mut live_conn = Connection::open(live_path)?;
+        let mut live_conn = Connection::open(sqlite_path::open_path(live_path))?;
         let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
         live_conn.pragma_update(None, "synchronous", "FULL")?;
 
+        // `restore` opens the staged database itself, so it needs the same
+        // conversion as the live connection above.
         #[cfg(test)]
         let restore_result = if let Some(sentinel_path) =
             std::env::var_os(PROMOTION_ABORT_SENTINEL_ENV).map(PathBuf::from)
         {
             live_conn.restore(
                 MAIN_DB,
-                staged_path,
+                sqlite_path::open_path(staged_path),
                 Some(move |_progress| {
                     let mut sentinel = std::fs::File::create(&sentinel_path)
                         .expect("create promotion abort sentinel");
@@ -5335,11 +5388,18 @@ impl Storage {
                 }),
             )
         } else {
-            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
+            live_conn.restore(
+                MAIN_DB,
+                sqlite_path::open_path(staged_path),
+                None::<fn(rusqlite::backup::Progress)>,
+            )
         };
         #[cfg(not(test))]
-        let restore_result =
-            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>);
+        let restore_result = live_conn.restore(
+            MAIN_DB,
+            sqlite_path::open_path(staged_path),
+            None::<fn(rusqlite::backup::Progress)>,
+        );
 
         if let Err(err) = restore_result {
             drop(live_conn);
@@ -5893,7 +5953,7 @@ impl Storage {
             return Ok(0);
         }
         drop(Storage::open(source_path)?);
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -8237,7 +8297,7 @@ impl Storage {
             return Ok(0);
         }
         drop(Storage::open(source_path)?);
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
         let copy_result = self.conn.execute(
@@ -8560,7 +8620,7 @@ impl Storage {
             return Ok(0);
         }
         drop(Storage::open(source_path)?);
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -9278,7 +9338,7 @@ impl Storage {
             return Ok(0);
         }
         drop(Storage::open(source_path)?);
-        let source = source_path.to_string_lossy().to_string();
+        let source = sqlite_path::attach_argument(source_path);
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
         let copy_result = self.conn.execute(
@@ -11477,34 +11537,6 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
-}
-
-fn observational_sqlite_uri(path: &Path, immutable: bool) -> String {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(not(unix))]
-    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
-
-    let mut encoded = String::with_capacity(bytes.len() + 24);
-    for byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    #[cfg(windows)]
-    if encoded.len() >= 3 && encoded.as_bytes()[1] == b':' && encoded.as_bytes()[2] == b'/' {
-        encoded.insert(0, '/');
-    }
-    format!(
-        "file:{encoded}?mode=ro{}",
-        if immutable { "&immutable=1" } else { "" }
-    )
 }
 
 fn neighbor_for_direction(
