@@ -12,6 +12,7 @@ use codestory_contracts::api::{
     EmbeddingVectorSemanticsDto,
 };
 use codestory_store::{FileRole, Store};
+use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -860,10 +861,15 @@ fn write_database(
     expected_anchors: Option<&BTreeMap<String, String>>,
     produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut connection = Connection::open(path)
+    let mut connection = Connection::open(sqlite_open_path(path))
         .with_context(|| format!("create embedded vector index {}", path.display()))?;
-    connection.execute_batch(
-        "PRAGMA journal_mode=DELETE;
+    // The staged file is deleted on any failure and only published after
+    // `validate_database` passes, so a rollback journal adds no durability.
+    // Keeping it off also matches the lexical shard builder and avoids the
+    // derived `-journal` sibling, the longest path SQLite would create here.
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=OFF;
          PRAGMA synchronous=FULL;
          CREATE TABLE metadata (
              singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -886,15 +892,20 @@ fn write_database(
              dense_reason TEXT,
              vector BLOB NOT NULL
          ) WITHOUT ROWID;",
-    )?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        )
+        .with_context(|| format!("create embedded vector schema {}", path.display()))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .with_context(|| format!("begin embedded vector write transaction {}", path.display()))?;
     let mut actual_anchors = BTreeMap::new();
     {
-        let mut insert = transaction.prepare(
-            "INSERT INTO vectors (
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO vectors (
                  node_id, document_hash, display_name, file_path, file_role, dense_reason, vector
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
+            )
+            .with_context(|| format!("prepare embedded vector insert {}", path.display()))?;
         let mut visit = |attested: AttestedSemanticPoint| -> Result<()> {
             let AttestedSemanticPoint {
                 point,
@@ -923,15 +934,17 @@ fn write_database(
             {
                 bail!("duplicate embedded vector anchor {}", point.node_id);
             }
-            insert.execute(params![
-                point.node_id,
-                document_hash,
-                point.display_name,
-                point.file_path,
-                point.file_role.map(|role| role.as_str()),
-                point.dense_reason,
-                vector_bytes(&point.vector),
-            ])?;
+            insert
+                .execute(params![
+                    point.node_id,
+                    document_hash,
+                    point.display_name,
+                    point.file_path,
+                    point.file_role.map(|role| role.as_str()),
+                    point.dense_reason,
+                    vector_bytes(&point.vector),
+                ])
+                .with_context(|| format!("write embedded vector index {}", path.display()))?;
             Ok(())
         };
         produce(&mut visit)?;
@@ -952,23 +965,30 @@ fn write_database(
             missing
         );
     }
-    let vector_digest = canonical_vector_digest(&transaction, contract.embedding_dim)?;
-    transaction.execute(
-        "INSERT INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            VECTOR_INDEX_SCHEMA_VERSION,
-            generation,
-            input_hash,
-            contract.embedding_backend,
-            contract.embedding_dim as i64,
-            actual_anchors.len() as i64,
-            contract.producer_identity,
-            contract.evidence_contract_identity,
-            vector_digest,
-        ],
-    )?;
-    transaction.commit()?;
-    connection.execute_batch("PRAGMA optimize;")?;
+    let vector_digest = canonical_vector_digest(&transaction, contract.embedding_dim)
+        .with_context(|| format!("digest embedded vector index {}", path.display()))?;
+    transaction
+        .execute(
+            "INSERT INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                VECTOR_INDEX_SCHEMA_VERSION,
+                generation,
+                input_hash,
+                contract.embedding_backend,
+                contract.embedding_dim as i64,
+                actual_anchors.len() as i64,
+                contract.producer_identity,
+                contract.evidence_contract_identity,
+                vector_digest,
+            ],
+        )
+        .with_context(|| format!("write embedded vector metadata {}", path.display()))?;
+    transaction
+        .commit()
+        .with_context(|| format!("commit embedded vector index {}", path.display()))?;
+    connection
+        .execute_batch("PRAGMA optimize;")
+        .with_context(|| format!("optimize embedded vector index {}", path.display()))?;
     drop(connection);
     std::fs::OpenOptions::new()
         .write(true)
@@ -989,8 +1009,10 @@ fn validate_database(
 ) -> Result<VectorDatabaseAttestation> {
     contract.validate()?;
     let connection = open_read_only(path)?;
-    validate_sqlite_quick_check(&connection)?;
-    let metadata = read_metadata(&connection)?;
+    validate_sqlite_quick_check(&connection)
+        .with_context(|| format!("quick-check embedded vector index {}", path.display()))?;
+    let metadata = read_metadata(&connection)
+        .with_context(|| format!("read embedded vector metadata {}", path.display()))?;
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
         || metadata.generation != generation
         || metadata.input_hash != input_hash
@@ -1003,8 +1025,9 @@ fn validate_database(
     {
         bail!("embedded vector metadata does not match the evidence contract");
     }
-    let actual_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))?;
+    let actual_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))
+        .with_context(|| format!("count embedded vector rows {}", path.display()))?;
     if actual_count < 0 || actual_count as usize != expected_anchors.len() {
         bail!(
             "embedded vector count mismatch: expected {}, found {}",
@@ -1013,7 +1036,8 @@ fn validate_database(
         );
     }
     let (vector_digest, actual_anchors) =
-        validate_and_digest_vectors(&connection, contract.embedding_dim, expected_anchors)?;
+        validate_and_digest_vectors(&connection, contract.embedding_dim, expected_anchors)
+            .with_context(|| format!("validate embedded vector rows {}", path.display()))?;
     if actual_anchors != expected_anchors.len() || vector_digest != metadata.vector_digest {
         bail!("embedded vector canonical digest does not match metadata");
     }
@@ -1407,7 +1431,7 @@ fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
 
 fn open_read_only(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
-        path,
+        sqlite_open_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open embedded vector index {}", path.display()))
@@ -1770,6 +1794,65 @@ mod tests {
             )
             .ready
         );
+    }
+
+    #[test]
+    fn vector_publication_survives_cache_roots_beyond_max_path() {
+        // Regression: NT service profiles and isolated proof harnesses resolve
+        // cache roots deep enough that the staged vector database exceeds the
+        // 260-character Windows MAX_PATH cap for non-longPathAware processes.
+        // Publication, validation, health, and search must all keep working.
+        let root = tempdir().expect("tempdir");
+        let mut deep_root = root.path().to_path_buf();
+        let segment = "max-path-regression-padding-segment".repeat(2);
+        while deep_root.as_os_str().len() < 320 {
+            deep_root.push(&segment);
+        }
+        std::fs::create_dir_all(&deep_root).expect("create deep cache root");
+        let layout = layout(&deep_root);
+        let collection = "codestory_longpath_deadbeefdeadbeef";
+        EmbeddedVectorIndex::build_with_points(
+            &layout,
+            collection,
+            "longpath-deadbeefdeadbeef",
+            "input",
+            "backend",
+            2,
+            |visit| {
+                visit(point("1", vec![1.0, 0.0]))?;
+                visit(point("2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("publish embedded vector index under a deep cache root");
+
+        let path = index_path(&layout, collection);
+        assert!(
+            path.as_os_str().len() > 260,
+            "regression layout no longer exceeds MAX_PATH: {}",
+            path.display()
+        );
+        assert!(
+            EmbeddedVectorIndex::health(
+                &layout,
+                collection,
+                "longpath-deadbeefdeadbeef",
+                "input",
+                2,
+                "backend",
+                2,
+            )
+            .ready
+        );
+        let hits = search_database(
+            &path,
+            "longpath-deadbeefdeadbeef",
+            "input",
+            &[0.9, 0.1],
+            1,
+            || false,
+        )
+        .expect("search embedded vector index under a deep cache root");
+        assert_eq!(hits[0].node_id.as_deref(), Some("1"));
     }
 
     #[test]
