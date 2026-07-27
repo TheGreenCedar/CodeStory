@@ -1,5 +1,6 @@
-use super::super::gate::{POLL, elapsed, qualification_request_id};
-use anyhow::{Result, bail};
+use super::super::gate::qualification_request_id;
+use super::owner_exit::{observe_owner_exit, wait_for_owner_exit};
+use anyhow::Result;
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingQualificationOperationResult, EmbeddingQualificationResult,
     PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PerUserEmbeddingClient, SidecarRuntimeConfig,
@@ -18,22 +19,13 @@ pub(in crate::embedding_qualification::worker) fn wait_for_owner_absence(
     let timeout = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
         .saturating_add(OWNER_ABSENCE_GRACE);
     if let Some(initial) = initial_snapshot.as_ref() {
-        loop {
-            match client.observe()? {
-                None => break,
-                Some(snapshot)
-                    if snapshot.process.server_instance_id
-                        != initial.process.server_instance_id =>
-                {
-                    bail!("embedding_qualification_owner_changed_before_absence")
-                }
-                Some(_) => {}
-            }
-            if elapsed(clock, started_ns) >= timeout {
-                bail!("embedding_qualification_owner_exit_timeout");
-            }
-            clock.sleep(POLL);
-        }
+        wait_for_owner_exit(
+            clock,
+            started_ns,
+            timeout,
+            &initial.process.server_instance_id,
+            || observe_owner_exit(&client),
+        )?;
     }
     let completed_ns = clock.now_ns();
     Ok(EmbeddingQualificationResult {
