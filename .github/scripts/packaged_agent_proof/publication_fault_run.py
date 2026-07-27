@@ -8,6 +8,12 @@ import subprocess
 from pathlib import Path
 
 from .contract_primitives import write_private_json
+from .event_producer_liveness import (
+    ChildProcessProducer,
+    ObservationalProducer,
+    ProducerGroup,
+    UnobservedProducer,
+)
 from .foundation import require
 from .publication_fault_setup import _restore_fixture
 from .publication_fault_types import (
@@ -17,11 +23,15 @@ from .publication_fault_types import (
     PublicationFixture,
 )
 from .publication_protocol import (
+    SERVER_PRODUCER_LABEL,
     read_jsonl,
     run_publication_replacement_worker,
     send_server_qualification_control,
+    server_producer_from_control_event,
     wait_for_jsonl_event,
 )
+
+CANDIDATE_PRODUCER_LABEL = "the publication candidate process"
 
 
 def _start_fault_candidate(
@@ -83,12 +93,30 @@ def _run_fault(
     executable_sha256: str,
     timeout: int,
 ) -> PublicationFaultRun:
+    # Nothing in this harness keeps a resident server warm across the baseline
+    # publication, and no control of this run has been answered yet, so the
+    # first snapshot has no process to pin. This does not make a server that
+    # idled out attributable -- an unobserved producer can never name an exit --
+    # but it does stop the gap from being silent: a timeout here reports how far
+    # the event log actually got and states that no liveness could be observed,
+    # instead of only that a record never arrived.
     snapshot_before = send_server_qualification_control(
         private_root,
         nonce,
         sequence=1,
         action="snapshot",
         timeout=timeout,
+        producer=UnobservedProducer(
+            SERVER_PRODUCER_LABEL,
+            "answering the first control of this publication fault run",
+            "has not identified itself in this run: no control has been answered"
+            " yet, so it may never have started for this fault run or may have"
+            " already exited after the baseline publication",
+        ),
+    )
+    resident_server = server_producer_from_control_event(
+        snapshot_before,
+        "answering the publication fault controls",
     )
     candidate = _start_fault_candidate(
         env,
@@ -96,6 +124,11 @@ def _run_fault(
         nonce,
         fixture,
         commands,
+    )
+    candidate_producer = ChildProcessProducer(
+        candidate.process,
+        CANDIDATE_PRODUCER_LABEL,
+        "indexing the paused candidate publication",
     )
     stdout = ""
     stderr = ""
@@ -107,14 +140,31 @@ def _run_fault(
                 and event.get("status") == "waiting_for_resume"
             ),
             timeout=timeout,
-            process=candidate.process,
+            awaited="the publication hook pause_before_manifest_commit event",
+            producer=candidate_producer,
         )
+        # The pinned server's exit does not prove this control will go
+        # unanswered: the CLI transport starts a replacement embedding server on
+        # demand, and a replacement reads the same pinned command file. Failing
+        # the wait on that exit would reject runs the proof accepts today, so
+        # the predecessor is reported as state and only the candidate process --
+        # which nothing replaces -- can fail this wait.
         send_server_qualification_control(
             private_root,
             nonce,
             sequence=2,
             action="crash_server",
             timeout=timeout,
+            producer=ProducerGroup(
+                [
+                    ObservationalProducer(
+                        resident_server,
+                        "answering the crash control, unless it exited first and"
+                        " a replacement server answered instead",
+                    ),
+                    candidate_producer,
+                ]
+            ),
         )
         run_publication_replacement_worker(
             cli,
@@ -125,12 +175,31 @@ def _run_fault(
             executable_sha256=executable_sha256,
             timeout=timeout,
         )
+        # Sequence 2 crashed the pinned server on purpose, so its exit proves
+        # nothing here: a replacement server must start to answer this control.
+        # The crashed predecessor stays in the report as state, never as cause.
         snapshot_after = send_server_qualification_control(
             private_root,
             nonce,
             sequence=3,
             action="snapshot",
             timeout=timeout,
+            producer=ProducerGroup(
+                [
+                    UnobservedProducer(
+                        f"the replacement for {SERVER_PRODUCER_LABEL}",
+                        "answering the post-crash snapshot control",
+                        "has not identified itself: the sequence-2 server was"
+                        " crashed on purpose, so a replacement must start and"
+                        " answer before this control can complete",
+                    ),
+                    ObservationalProducer(
+                        resident_server,
+                        "the server this run crashed at sequence 2",
+                    ),
+                    candidate_producer,
+                ]
+            ),
         )
         write_private_json(
             candidate.resume_path,

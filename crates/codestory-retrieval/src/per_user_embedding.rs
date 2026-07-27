@@ -73,9 +73,12 @@ pub use protocol::{
     embedding_qualification_watchdog_marker_filename, embedding_retry_state,
 };
 use qualification_control::ServerQualificationControl;
+#[cfg(all(test, windows))]
+use qualification_control::native_path_identity;
 #[cfg(test)]
 use qualification_control::{
-    ServerQualificationEvent, ServerQualificationEventClock, read_server_qualification_command,
+    CommandAbsence, MAX_DENIED_COMMAND_TICKS, ServerQualificationEvent,
+    ServerQualificationEventClock, absent_command, read_server_qualification_command,
     server_qualification_control_from_values,
 };
 #[cfg(test)]

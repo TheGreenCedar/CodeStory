@@ -1,11 +1,281 @@
 use super::super::{
-    SERVER_QUALIFICATION_MAX_COMMAND_BYTES, SERVER_QUALIFICATION_MAX_EVENT_BYTES,
-    SERVER_QUALIFICATION_MAX_EVENT_RECORDS, hex_sha256, read_server_qualification_command,
+    CommandAbsence, MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
     server_qualification_control_from_values,
+};
+// Only the platform-gated tests below use these, so importing them
+// unconditionally would warn on whichever platform is not running them.
+#[cfg(windows)]
+use super::super::native_path_identity;
+#[cfg(unix)]
+use super::super::{
+    SERVER_QUALIFICATION_MAX_COMMAND_BYTES, SERVER_QUALIFICATION_MAX_EVENT_BYTES,
+    SERVER_QUALIFICATION_MAX_EVENT_RECORDS, hex_sha256,
 };
 use super::{test_qualification_control, test_qualification_event};
 use std::fs;
-use std::sync::atomic::Ordering;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+
+/// Write one command file already private, before anything can observe it.
+fn write_private_command(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).expect("write qualification command");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("private qualification command");
+    }
+}
+
+/// A command the proof harness takes back mid-consume must read as "no command
+/// this tick", never as a fatal poll error.
+///
+/// The harness removes each command once it has seen the matching event, and
+/// that removal races every poll tick that has already inspected the file.
+/// Before the vanish tolerance the consume sequence turned the loser of that
+/// race into an error, which propagates out of the accept loop and kills the
+/// server -- leaving the harness waiting out its whole budget on a producer
+/// that no longer exists.
+#[test]
+fn a_command_removed_mid_consume_never_kills_the_poll_loop() {
+    const ROUNDS: usize = 4_096;
+
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    let round = AtomicUsize::new(0);
+    let removed = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let consumed = AtomicUsize::new(0);
+    let absent = AtomicUsize::new(0);
+
+    thread::scope(|scope| {
+        let remover_path = command_path.clone();
+        let remover = &round;
+        let acknowledged = &removed;
+        let halt = &stop;
+        scope.spawn(move || {
+            let mut seen = 0;
+            loop {
+                let mut waited = 0_u32;
+                while remover.load(Ordering::Acquire) == seen {
+                    if halt.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Spin to keep the handshake tight enough to land inside a
+                    // consume, but yield periodically so a single-core host
+                    // still makes progress.
+                    waited = waited.wrapping_add(1);
+                    if waited.is_multiple_of(1_024) {
+                        thread::yield_now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                seen = remover.load(Ordering::Acquire);
+                // Sweep the removal across the whole consume sequence and past
+                // its end, so across the run it lands before the first stat,
+                // between the stat and the open, while the handle is open, and
+                // after the consume has already finished.
+                for _ in 0..((seen % 512) * 64) {
+                    std::hint::spin_loop();
+                }
+                let _ = fs::remove_file(&remover_path);
+                acknowledged.store(seen, Ordering::Release);
+            }
+        });
+
+        for index in 1..=ROUNDS {
+            write_private_command(&command_path, b"{\"schema_version\":1}");
+            round.store(index, Ordering::Release);
+            match read_server_qualification_command(&control) {
+                Ok(Some(_)) => {
+                    consumed.fetch_add(1, Ordering::Release);
+                }
+                Ok(None) => {
+                    absent.fetch_add(1, Ordering::Release);
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    panic!("round {index} killed the poll loop: {error:#}");
+                }
+            }
+            let mut waited = 0_u32;
+            while removed.load(Ordering::Acquire) != index {
+                waited = waited.wrapping_add(1);
+                if waited.is_multiple_of(1_024) {
+                    thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            let _ = fs::remove_file(&command_path);
+        }
+        stop.store(true, Ordering::Release);
+        round.fetch_add(1, Ordering::Release);
+    });
+
+    assert!(
+        consumed.load(Ordering::Acquire) > 0,
+        "the race never let one command through, so nothing was consumed"
+    );
+    assert!(
+        absent.load(Ordering::Acquire) > 0,
+        "the race never removed a command in time, so the tolerance was untested"
+    );
+}
+
+/// The vanish tolerance must not become "ignore every filesystem error".
+///
+/// A command that is present but unreadable is a real control-plane failure:
+/// tolerating it would convert the poll loop's genuine faults into silent
+/// waits, which is worse than the crash the tolerance removes.
+#[cfg(unix)]
+#[test]
+fn a_present_but_unreadable_command_still_stops_the_server() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        // Root ignores the mode, so this host cannot produce the denial.
+        return;
+    }
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    write_private_command(&command_path, b"{\"schema_version\":1}");
+    // Still owner-only and still exactly one link, so only the read is denied.
+    fs::set_permissions(&command_path, fs::Permissions::from_mode(0o000))
+        .expect("deny reads on a present command");
+    let error = read_server_qualification_command(&control)
+        .expect_err("an unreadable present command is not a vanished command");
+    assert!(
+        format!("{error:#}").contains("open embedding qualification command"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// A Windows `ACCESS_DENIED` is only evidence of a removal in progress for as
+/// long as a delete-pending entry could plausibly last.
+///
+/// The tolerance cannot distinguish a delete-pending entry from a file whose
+/// ACL simply refuses the open, so an unbounded tolerance would skip a genuinely
+/// unreadable command on every tick forever -- reproducing, inside the server,
+/// exactly the unattributable multi-minute hang this lane exists to remove. The
+/// bound is driven directly here because no Unix host can produce the Windows
+/// observation that feeds it.
+#[test]
+fn a_denial_that_outlives_a_delete_pending_entry_stops_the_server() {
+    let (_temporary, control) = test_qualification_control();
+    for tick in 1..=MAX_DENIED_COMMAND_TICKS {
+        assert!(
+            absent_command(&control, CommandAbsence::Denied)
+                .unwrap_or_else(|error| panic!("denied tick {tick} was not tolerated: {error:#}"))
+                .is_none(),
+            "a denied tick produced a command"
+        );
+    }
+    let error = absent_command(&control, CommandAbsence::Denied)
+        .expect_err("a denial past the bound is not a removal in progress");
+    assert!(
+        format!("{error:#}").contains("embedding_qualification_command_denied"),
+        "unexpected error: {error:#}"
+    );
+
+    // A proven removal is the ordinary case and must clear the run, so routine
+    // command cleanup can never accumulate its way into that failure however
+    // many times it races a poll tick.
+    for round in 1..=3 {
+        absent_command(&control, CommandAbsence::Removed).expect("a removal is never a failure");
+        for tick in 1..=MAX_DENIED_COMMAND_TICKS {
+            absent_command(&control, CommandAbsence::Denied).unwrap_or_else(|error| {
+                panic!("round {round} tick {tick} outlived a reset run: {error:#}")
+            });
+        }
+    }
+}
+
+/// A different file substituted at the pinned path is a substitution, not a
+/// vanish, and must still stop the server.
+#[test]
+fn a_non_file_at_the_pinned_command_path_still_stops_the_server() {
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    fs::create_dir(&command_path).expect("directory at the pinned command path");
+    let error = read_server_qualification_command(&control)
+        .expect_err("a directory is not a vanished command");
+    assert!(
+        format!("{error:#}").contains("embedding_qualification_file_untrusted"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// The Windows removal the proof harness actually performs must read as "no
+/// command this tick" whichever way the filesystem answers it.
+///
+/// `os.unlink` calls `DeleteFileW`, and what that leaves behind is not the same
+/// on every host. Measured on the Windows proof host (Windows 11 build
+/// 26200.8894, NTFS, `C:`): `DeleteFileW` takes POSIX delete semantics, so the
+/// name is unlinked at once and every later observation -- `symlink_metadata`,
+/// the attributes-only open native path identity performs, and a read open --
+/// answers `NotFound`. On a volume or Windows version without POSIX delete the
+/// classic behaviour applies instead: the entry stays visible and delete-pending
+/// while a handle is open, and answers those same opens with `ACCESS_DENIED`.
+///
+/// Both are the writer taking its command back, so this asserts the outcome and
+/// records the regime rather than assuming one of them. Assuming the classic
+/// regime is what an earlier version of this test did, and on the measured host
+/// that assumption is simply false.
+#[cfg(windows)]
+#[test]
+fn a_removed_command_never_kills_the_poll_loop_on_windows() {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeleteFileW(file_name: *const u16) -> i32;
+    }
+
+    let (_temporary, control) = test_qualification_control();
+    let command_path = control
+        .directory
+        .join(format!("{}.command.json", control.nonce));
+    write_private_command(&command_path, b"{\"schema_version\":1}");
+    // Hold the command open across the removal, which is the state a poll tick
+    // that has already opened the file is in when the harness takes it back.
+    let held = fs::File::open(&command_path).expect("hold the command open");
+    let wide: Vec<u16> = command_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Exactly the call `os.unlink` makes, not std's remove_file, so the test
+    // observes whatever the harness itself produces on this host.
+    assert_ne!(
+        unsafe { DeleteFileW(wide.as_ptr()) },
+        0,
+        "DeleteFileW failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let regime = match fs::symlink_metadata(&command_path) {
+        Ok(_) => "delete-pending: the entry is still visible",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "posix delete: the name was unlinked at once"
+        }
+        Err(error) => panic!("unexpected observation after DeleteFileW: {error:?}"),
+    };
+    assert!(
+        read_server_qualification_command(&control)
+            .unwrap_or_else(|error| panic!("{regime} was a fatal poll error: {error:#}"))
+            .is_none(),
+        "{regime} must read as no command this tick"
+    );
+    drop(held);
+}
 
 #[cfg(unix)]
 #[test]
