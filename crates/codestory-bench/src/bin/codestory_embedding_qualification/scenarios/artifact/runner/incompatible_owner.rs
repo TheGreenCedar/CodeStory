@@ -22,7 +22,10 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        self.wait_for_snapshot("incompatible_owner_active", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment, one client: the freshly spawned lease client must
+        // start, capture its executable and transport and converge on the owner
+        // before its residency lease is visible.
+        self.wait_for_established_load("incompatible_owner_active", |snapshot| {
             snapshot.scheduler.lease_count > 0
         })?;
         self.control("force_incompatible", None)?;
@@ -58,6 +61,9 @@ impl<'a> ScenarioRunner<'a> {
             ]),
         );
         self.terminate_worker(lease)?;
+        // Observation: the lease client is already terminated, so this only
+        // watches the owner's own peer-death sweep over the control channel and
+        // spawns no worker at all.
         self.wait_for_control_snapshot("incompatible_owner_idle", SNAPSHOT_TIMEOUT, |snapshot| {
             snapshot.scheduler.lease_count == 0 && snapshot.scheduler.active_request_count == 0
         })?;
@@ -87,6 +93,14 @@ impl<'a> ScenarioRunner<'a> {
                 ),
             ]),
         );
+        // Not a poll budget and not load establishment: `wait_for_absence`
+        // spawns a fresh worker and this value is that worker's kill budget,
+        // covering its start, captures, connect and absence loop. The worker's
+        // own self-enforced bound is the contract idle timeout plus its 30s
+        // absence grace (90s), deliberately not honored here: the drained-owner
+        // probe above already proved the exit under way, so the shorter flat
+        // budget asserts that it lands promptly instead of waiting out an idle
+        // exit this scenario is not testing.
         self.wait_for_absence("incompatible_owner_exited", SNAPSHOT_TIMEOUT)?;
         let replacement = self.spawn_worker("query", query_parameters(1), None)?;
         let replacement_output = self.finish_worker(replacement, NORMAL_WORKER_TIMEOUT)?;

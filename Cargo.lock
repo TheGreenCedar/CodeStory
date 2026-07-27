@@ -665,6 +665,7 @@ version = "0.16.1"
 dependencies = [
  "anyhow",
  "codestory-contracts",
+ "codestory-workspace",
  "fs4",
  "parking_lot",
  "rusqlite",

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const script = resolve(repositoryRoot, "scripts/prepare-embedded-model.mjs");
@@ -40,12 +40,15 @@ function contractDigest(domain, value) {
   return hash.digest("hex");
 }
 
-async function fixture(t, expected = Buffer.from("good")) {
+async function fixture(t, expected = Buffer.from("good"), sourceCount = 1) {
   const directory = await mkdtemp(resolve(tmpdir(), "codestory-model-contract-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
   const contract = resolve(directory, "contract.json");
   const modelSha256 = sha256(expected);
   const revision = "0123456789abcdef0123456789abcdef01234567";
+  const urls = ["example.invalid", "mirror.example.invalid"]
+    .slice(0, sourceCount)
+    .map(host => `https://${host}/resolve/${revision}/model.gguf`);
   await writeFile(
     contract,
     JSON.stringify({
@@ -54,12 +57,7 @@ async function fixture(t, expected = Buffer.from("good")) {
         file_name: "model.gguf",
         size_bytes: expected.length,
         sha256: modelSha256,
-        sources: [
-          {
-            url: `https://example.invalid/resolve/${revision}/model.gguf`,
-            revision,
-          },
-        ],
+        sources: urls.map(url => ({ url, revision })),
       },
       runtime: {
         embedding_family: "test",
@@ -90,14 +88,79 @@ async function fixture(t, expected = Buffer.from("good")) {
       },
     }),
   );
-  return { contract, directory, expected };
+  return { contract, directory, expected, urls };
 }
 
-function run(args, cwd) {
-  return spawnSync(process.execPath, [script, ...args], {
+function run(args, cwd, options = {}) {
+  const { env, nodeArgs = [] } = options;
+  return spawnSync(process.execPath, [...nodeArgs, script, ...args], {
     cwd,
     encoding: "utf8",
+    env: env ? { ...process.env, ...env } : process.env,
   });
+}
+
+const fetchPreloadSource = `import { appendFileSync } from "node:fs";
+
+const plan = (process.env.CODESTORY_TEST_FETCH_PLAN ?? "").split(",").filter(Boolean);
+const body = Buffer.from(process.env.CODESTORY_TEST_FETCH_BODY ?? "", "base64");
+const log = process.env.CODESTORY_TEST_FETCH_LOG;
+let calls = 0;
+
+globalThis.fetch = async url => {
+  const step = plan[Math.min(calls, plan.length - 1)];
+  calls += 1;
+  if (log) appendFileSync(log, \`\${url}\\n\`);
+  if (step === "ok") {
+    return new Response(body, {
+      status: 200,
+      headers: { "content-length": String(body.length) },
+    });
+  }
+  if (step === "corrupt") {
+    const corrupt = Buffer.from(body);
+    corrupt.reverse();
+    return new Response(corrupt, {
+      status: 200,
+      headers: { "content-length": String(corrupt.length) },
+    });
+  }
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(body.subarray(0, Math.min(2, body.length)));
+        controller.error(new Error("other side closed"));
+      },
+    }),
+    { status: 200, headers: { "content-length": String(body.length) } },
+  );
+};
+`;
+
+async function transportFixture(t, plan, expected = Buffer.from("good"), sourceCount = 1) {
+  const base = await fixture(t, expected, sourceCount);
+  const preload = resolve(base.directory, "fetch-preload.mjs");
+  const log = resolve(base.directory, "fetch-calls.log");
+  await writeFile(preload, fetchPreloadSource);
+  return {
+    ...base,
+    log,
+    env: {
+      CODESTORY_TEST_FETCH_PLAN: plan,
+      CODESTORY_TEST_FETCH_BODY: expected.toString("base64"),
+      CODESTORY_TEST_FETCH_LOG: log,
+    },
+    nodeArgs: ["--import", pathToFileURL(preload).href],
+  };
+}
+
+async function fetchCalls(log) {
+  try {
+    return (await readFile(log, "utf8")).split("\n").filter(Boolean);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 test("copies and verifies an explicit source while offline", async (t) => {
@@ -153,6 +216,66 @@ test("offline acquisition fails before any download", async (t) => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /offline model preparation requires/u);
+});
+
+test("retries a transport failure and succeeds within the attempt budget", async (t) => {
+  const { contract, directory, env, expected, log, nodeArgs, urls } = await transportFixture(
+    t,
+    "closed,ok",
+  );
+  const output = resolve(directory, "output.gguf");
+
+  const result = run(["--contract", contract, "--output", output], directory, { env, nodeArgs });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), output);
+  assert.deepEqual(await readFile(output), expected);
+  assert.deepEqual(await fetchCalls(log), [urls[0], urls[0]]);
+});
+
+test("retries a corrupt payload so the checksum gates every attempt", async (t) => {
+  const { contract, directory, env, expected, log, nodeArgs, urls } = await transportFixture(
+    t,
+    "corrupt,ok",
+  );
+  const output = resolve(directory, "output.gguf");
+
+  const result = run(["--contract", contract, "--output", output], directory, { env, nodeArgs });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(await readFile(output), expected);
+  assert.deepEqual(await fetchCalls(log), [urls[0], urls[0]]);
+});
+
+test("falls through to the next pinned source after exhausting one source", async (t) => {
+  const { contract, directory, env, expected, log, nodeArgs, urls } = await transportFixture(
+    t,
+    "closed,closed,closed,ok",
+    Buffer.from("good"),
+    2,
+  );
+  const output = resolve(directory, "output.gguf");
+
+  const result = run(["--contract", contract, "--output", output], directory, { env, nodeArgs });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(await readFile(output), expected);
+  assert.deepEqual(await fetchCalls(log), [urls[0], urls[0], urls[0], urls[1]]);
+});
+
+test("fails closed with the aggregated error after bounded attempts", async (t) => {
+  const { contract, directory, env, log, nodeArgs, urls } = await transportFixture(t, "closed");
+  const output = resolve(directory, "output.gguf");
+
+  const result = run(["--contract", contract, "--output", output], directory, { env, nodeArgs });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /model download failed after 3 attempts/u);
+  assert.match(result.stderr, /other side closed/u);
+  assert.deepEqual(await fetchCalls(log), [urls[0], urls[0], urls[0]]);
+  await assert.rejects(readFile(output), { code: "ENOENT" });
+  const leftovers = (await readdir(directory)).filter(name => name.endsWith(".partial"));
+  assert.deepEqual(leftovers, []);
 });
 
 test("rejects a symlink model destination without replacing it", async (t) => {

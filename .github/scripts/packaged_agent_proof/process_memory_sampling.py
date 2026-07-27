@@ -11,6 +11,46 @@ import time
 
 from .foundation import ProofFailure, require
 
+# QueryUnbiasedInterruptTimePrecise and QueryInterruptTimePrecise are exported
+# by the api-ms-win-core-realtime-l1-1-1 API set, hosted by KernelBase.dll.
+# Neither function is exported by kernel32.dll, so the pair must be resolved
+# from these modules in preference order.
+WINDOWS_INTERRUPT_CLOCK_MODULES = (
+    "api-ms-win-core-realtime-l1-1-1.dll",
+    "KernelBase.dll",
+)
+_WINDOWS_CLOCK_UNAVAILABLE = (
+    "Windows qualification host could not read unbiased interrupt time"
+)
+
+
+def _load_windows_module(name: str):
+    return ctypes.WinDLL(name)
+
+
+def resolve_windows_interrupt_clocks(load_module=_load_windows_module):
+    """Resolve the precise interrupt-time pair from the module exporting it.
+
+    Both clock functions must come from one module so the sampled pair shares
+    a provider. Prefer the realtime API set and fall back to KernelBase; fail
+    closed when no module provides both functions. The functions return void,
+    so genuine unavailability surfaces here rather than as a call-site status.
+    """
+    for module_name in WINDOWS_INTERRUPT_CLOCK_MODULES:
+        try:
+            module = load_module(module_name)
+        except OSError:
+            continue
+        unbiased = getattr(module, "QueryUnbiasedInterruptTimePrecise", None)
+        inclusive = getattr(module, "QueryInterruptTimePrecise", None)
+        if unbiased is None or inclusive is None:
+            continue
+        for clock in (unbiased, inclusive):
+            clock.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+            clock.restype = None
+        return unbiased, inclusive
+    raise ProofFailure(_WINDOWS_CLOCK_UNAVAILABLE)
+
 
 def parse_byte_quantity(value: str) -> int:
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMG])?", value.strip())
@@ -95,14 +135,15 @@ def suspend_clock_pair(target_os: str) -> tuple[int, int, str, str]:
     require(
         target_os == "windows", f"unsupported qualification clock target {target_os}"
     )
-    kernel = ctypes.windll.kernel32
+    query_unbiased, query_inclusive = resolve_windows_interrupt_clocks()
     unbiased = ctypes.c_ulonglong()
     inclusive = ctypes.c_ulonglong()
+    query_unbiased(ctypes.byref(unbiased))
+    query_inclusive(ctypes.byref(inclusive))
     require(
-        bool(kernel.QueryUnbiasedInterruptTimePrecise(ctypes.byref(unbiased))),
-        "Windows qualification host could not read unbiased interrupt time",
+        0 < unbiased.value <= inclusive.value,
+        _WINDOWS_CLOCK_UNAVAILABLE,
     )
-    kernel.QueryInterruptTimePrecise(ctypes.byref(inclusive))
     return (
         int(unbiased.value) * 100,
         int(inclusive.value) * 100,

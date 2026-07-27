@@ -37,6 +37,9 @@ impl<'a> ScenarioRunner<'a> {
                 ("clock_boot_id", json!(output.clock.boot_id)),
             ]),
         );
+        // Observation: the predicate accepts any snapshot, so the first observe
+        // worker that reaches the already-running owner satisfies it; nothing
+        // in its path waits on a client ramp.
         let after = self.wait_for_snapshot("frozen_owner_released", SNAPSHOT_TIMEOUT, |_| true)?;
         if !same_server_authority(&before, &after) {
             bail!("embedding_qualification_frozen_owner_takeover_detected");
