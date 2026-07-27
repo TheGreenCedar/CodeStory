@@ -3,7 +3,7 @@
 use configuration::PinnedQualificationDirectory;
 use event_log::ServerQualificationEventLog;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 mod command_io;
 mod configuration;
@@ -12,13 +12,19 @@ mod filesystem;
 
 pub(in crate::per_user_embedding) use command_io::poll_server_qualification_command;
 #[cfg(test)]
-pub(in crate::per_user_embedding) use command_io::read_server_qualification_command;
+pub(in crate::per_user_embedding) use command_io::{
+    MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
+};
 pub(in crate::per_user_embedding) use configuration::server_qualification_control_from_env;
 #[cfg(test)]
 pub(in crate::per_user_embedding) use configuration::server_qualification_control_from_values;
 pub(in crate::per_user_embedding) use event_log::{
     ServerQualificationEvent, ServerQualificationEventClock, write_server_qualification_event,
 };
+#[cfg(test)]
+pub(in crate::per_user_embedding) use filesystem::CommandAbsence;
+#[cfg(all(test, windows))]
+pub(in crate::per_user_embedding) use filesystem::native_path_identity;
 pub(in crate::per_user_embedding) use filesystem::{
     sync_qualification_directory, validate_private_qualification_file_metadata,
 };
@@ -33,6 +39,10 @@ pub(in crate::per_user_embedding) struct ServerQualificationControl {
     pub(in crate::per_user_embedding) processed_command_sha256: Mutex<Option<String>>,
     pub(in crate::per_user_embedding) force_incompatible: AtomicBool,
     pub(in crate::per_user_embedding) freeze_owner: AtomicBool,
+    /// Consecutive poll ticks that answered `ACCESS_DENIED` at the pinned
+    /// command path. Bounds how long a Windows delete-pending entry may be
+    /// assumed, so a permanent denial fails by name instead of hanging.
+    pub(in crate::per_user_embedding) denied_command_ticks: AtomicU32,
 }
 
 impl ServerQualificationControl {

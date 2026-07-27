@@ -112,6 +112,48 @@ def _linux_process_start_identity(pid: int) -> str:
     return f"linux:{process_fields[19]}"
 
 
+def linux_terminated_state(stat: str) -> str | None:
+    """The terminated state named in one `/proc/<pid>/stat`, or None.
+
+    A phrase, not a sentence: the caller owns naming the process it asked about.
+    """
+    fields = stat.rsplit(") ", 1)
+    if len(fields) != 2:
+        return None
+    process_fields = fields[1].split()
+    # `Z` is exited-but-unreaped; `X` and `x` are the kernel's dead states.
+    if process_fields and process_fields[0] in {"Z", "X", "x"}:
+        return (
+            f"is in state {process_fields[0]}: it has terminated and is waiting"
+            " to be reaped"
+        )
+    return None
+
+
+def terminated_process_state(pid: int) -> str | None:
+    """How ``pid`` is provably no longer running, or None if it may still be.
+
+    Only Linux needs this. A process that has exited but has not yet been reaped
+    keeps a readable ``/proc/<pid>/stat`` whose start time never changes, so a
+    liveness probe built on start identity alone calls a dead process running
+    until its parent reaps it. macOS ``proc_pidinfo`` already fails outright for
+    a zombie, and Windows ``GetExitCodeProcess`` already reports its real exit
+    code, so both answer correctly without this.
+
+    Observational only: an unreadable or unparsable ``/proc`` entry answers
+    None, because "cannot tell" must never be reported as "has exited".
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return "no longer exists"
+    except OSError:
+        return None
+    return linux_terminated_state(stat)
+
+
 def _macos_process_start_identity(pid: int) -> str:
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     libproc.proc_pidinfo.argtypes = [
