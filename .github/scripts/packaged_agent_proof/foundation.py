@@ -38,6 +38,25 @@ QUALIFICATION_SCHEMA_VERSION = 1
 # inner EmbeddingQualificationResult contract.
 EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION = 2
 NATIVE_SERVER_TEARDOWN_GRACE_MS = 60_000
+# The product's frozen per-user embedding server idle timeout, mirrored so a
+# harness wait can be bounded by the budget that actually governs the server it
+# waits on. This is not a competing source of truth: the packaged proof marker
+# is verified to carry exactly this value in `native_contract_identity`, the
+# frozen constant set declares it, and the self-test pins this constant to that
+# declaration. It is mirrored here, never chosen here, and it must never be
+# changed to make a proof pass -- it is hashed into `constant_set_sha256` and
+# `measurement_protocol_sha256`, and `true_idle_exit` measures it.
+PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS = 60_000
+# A resident server consumes a qualification control at the top of its accept
+# loop, one 25ms poll at a time, so it answers in milliseconds. A control still
+# unanswered after the idle timeout plus this grace therefore has no resident
+# server to answer it and never will: the wait is deadlocked, not slow. Spending
+# the whole proof budget on it turns a deterministic deadlock into an anonymous
+# half-hour timeout, which is exactly what this defect cost to diagnose.
+SERVER_QUALIFICATION_CONTROL_GRACE_MS = 30_000
+SERVER_QUALIFICATION_CONTROL_TIMEOUT_SECS = (
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS + SERVER_QUALIFICATION_CONTROL_GRACE_MS
+) // 1000
 PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
 FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
 RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
