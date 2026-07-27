@@ -24,8 +24,11 @@ from .publication_fault_types import (
 )
 from .publication_protocol import (
     SERVER_PRODUCER_LABEL,
+    control_timeout_secs,
+    ensure_resident_qualification_server,
     read_jsonl,
     run_publication_replacement_worker,
+    send_control_to_resident_server,
     send_server_qualification_control,
     server_producer_from_control_event,
     wait_for_jsonl_event,
@@ -93,25 +96,42 @@ def _run_fault(
     executable_sha256: str,
     timeout: int,
 ) -> PublicationFaultRun:
-    # Nothing in this harness keeps a resident server warm across the baseline
-    # publication, and no control of this run has been answered yet, so the
-    # first snapshot has no process to pin. This does not make a server that
-    # idled out attributable -- an unobserved producer can never name an exit --
-    # but it does stop the gap from being silent: a timeout here reports how far
-    # the event log actually got and states that no liveness could be observed,
-    # instead of only that a record never arrived.
-    snapshot_before = send_server_qualification_control(
+    # The baseline publication embeds once, at its very start, and then spends
+    # the rest of its time in packaged CLI invocations that do no embedding at
+    # all. By the time this run's first control is written, that gap has already
+    # exceeded the server's frozen 60s idle budget on a slow host -- 703s on the
+    # Windows calibration cell against a 3.9s gap on Linux -- so the server that
+    # served the baseline has correctly exited, no process is left to consume
+    # the command file, and writing one starts nothing. The wait was therefore
+    # deadlocked, not slow, and burned the whole proof budget every time.
+    #
+    # The harness owes this residency, not the product: idle exit releases the
+    # resident model, is a frozen contract value, and is itself the subject of
+    # the `true_idle_exit` measurement, so extending it to survive a harness
+    # phase would corrupt the constant it measures. One admitted query
+    # establishes residency by construction on every platform, and pins the
+    # exact server that will answer.
+    control_timeout = control_timeout_secs(timeout)
+    snapshot_before = send_control_to_resident_server(
         private_root,
         nonce,
         sequence=1,
         action="snapshot",
-        timeout=timeout,
-        producer=UnobservedProducer(
-            SERVER_PRODUCER_LABEL,
-            "answering the first control of this publication fault run",
-            "has not identified itself in this run: no control has been answered"
-            " yet, so it may never have started for this fault run or may have"
-            " already exited after the baseline publication",
+        timeout=control_timeout,
+        # Each attempt writes its own worker request and output. The worker
+        # refuses to overwrite an existing output, so a shared label would make
+        # the tolerated respawn unrunnable -- the replacement would die before
+        # it started, and the run would report that instead of the lost server.
+        establish=lambda attempt: ensure_resident_qualification_server(
+            cli,
+            env,
+            fixture.project,
+            private_root,
+            nonce,
+            executable_sha256=executable_sha256,
+            timeout=timeout,
+            activity="answering the first control of this publication fault run",
+            label=f"fault-residency-{attempt}",
         ),
     )
     resident_server = server_producer_from_control_event(
@@ -143,18 +163,30 @@ def _run_fault(
             awaited="the publication hook pause_before_manifest_commit event",
             producer=candidate_producer,
         )
-        # The pinned server's exit does not prove this control will go
-        # unanswered: the CLI transport starts a replacement embedding server on
-        # demand, and a replacement reads the same pinned command file. Failing
-        # the wait on that exit would reject runs the proof accepts today, so
-        # the predecessor is reported as state and only the candidate process --
-        # which nothing replaces -- can fail this wait.
+        # This control's residency comes from the candidate itself: it embedded
+        # the mutated fixture on its way to the manifest fence, so the server's
+        # idle window restarted during that work. Re-establishing residency here
+        # would put an extra admitted request inside the fault window this step
+        # exists to observe, so it is deliberately not done.
+        #
+        # That is a judgement, not a bound. Nothing here measures the interval
+        # between the candidate's last embed and the fence, and on a host where
+        # one packaged CLI invocation costs the better part of a minute it is
+        # not comfortably inside the 60s budget. The residual risk is accepted
+        # rather than hidden: the control budget turns it into a fast, named
+        # timeout instead of the half hour of anonymous silence that made this
+        # class of failure so expensive to diagnose.
+        #
+        # The pinned predecessor is reported as state, never as cause: sequence
+        # 2's whole purpose is to end that server, so its exit proves nothing
+        # about this wait. Only the candidate process -- which nothing replaces
+        # -- can fail it.
         send_server_qualification_control(
             private_root,
             nonce,
             sequence=2,
             action="crash_server",
-            timeout=timeout,
+            timeout=control_timeout,
             producer=ProducerGroup(
                 [
                     ObservationalProducer(
@@ -183,7 +215,7 @@ def _run_fault(
             nonce,
             sequence=3,
             action="snapshot",
-            timeout=timeout,
+            timeout=control_timeout,
             producer=ProducerGroup(
                 [
                     UnobservedProducer(
