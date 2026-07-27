@@ -1,4 +1,4 @@
-use super::super::{NORMAL_WORKER_TIMEOUT, SNAPSHOT_TIMEOUT, btree};
+use super::super::{NORMAL_WORKER_TIMEOUT, btree};
 use super::ScenarioRunner;
 use super::analysis::scheduler_values;
 use super::process::{query_parameters, require_worker_success, validate_replay_attempts};
@@ -10,14 +10,17 @@ impl<'a> ScenarioRunner<'a> {
         let before = self.ensure_owner("server_crash_before")?;
         self.control("hold_class", Some("query"))?;
         let worker = self.spawn_worker("query", query_parameters(1), None)?;
-        let active =
-            self.wait_for_snapshot("server_crash_inflight", SNAPSHOT_TIMEOUT, |snapshot| {
-                snapshot
-                    .scheduler
-                    .active_request
-                    .as_ref()
-                    .is_some_and(|active| active.class == "query")
-            })?;
+        // Load establishment, one client: the freshly spawned query client must
+        // start, capture its executable and transport, converge on the owner
+        // and be admitted against the held query class before this predicate
+        // can turn true.
+        let active = self.wait_for_established_load("server_crash_inflight", |snapshot| {
+            snapshot
+                .scheduler
+                .active_request
+                .as_ref()
+                .is_some_and(|active| active.class == "query")
+        })?;
         self.transition("inflight_request_observed", scheduler_values(&active));
         self.control("crash_server", None)?;
         let output = self.finish_worker(worker, NORMAL_WORKER_TIMEOUT)?;
