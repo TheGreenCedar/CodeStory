@@ -46,7 +46,61 @@ pub(crate) fn open_path(path: &Path) -> PathBuf {
     if is_magic_sqlite_filename(path) {
         return path.to_path_buf();
     }
-    codestory_workspace::paths::sqlite_open_path(path)
+    extended_length_open_path(path)
+}
+
+/// Return `path` in the form `CreateFileW` accepts at any length.
+///
+/// This mirrors `codestory_workspace::paths::sqlite_open_path`. The two copies
+/// are deliberate: an architecture contract forbids this crate from depending
+/// on `codestory-workspace`, and the conversion is a pure platform primitive
+/// with no shared state to keep in sync. Both copies carry the same tests.
+#[cfg(windows)]
+fn extended_length_open_path(path: &Path) -> PathBuf {
+    // `std::path::absolute` uses `GetFullPathNameW` semantics: it resolves
+    // relative paths and `.`/`..` components and rewrites `/` separators. That
+    // normalization must happen before prefixing because Win32 skips
+    // normalization entirely for `\\?\` paths.
+    let absolute = match std::path::absolute(path) {
+        Ok(absolute) => absolute,
+        // An empty or otherwise unabsolutizable path keeps today's behavior and
+        // surfaces SQLite's own open error instead.
+        Err(_) => return path.to_path_buf(),
+    };
+    match absolute.to_str().and_then(windows_extended_length_form) {
+        Some(extended) => PathBuf::from(extended),
+        // Non-UTF-8, already-verbatim, device-namespace, or otherwise
+        // unrecognized forms pass through unchanged.
+        None => absolute,
+    }
+}
+
+/// Non-Windows platforms have no `MAX_PATH` cliff; the path is returned
+/// unchanged.
+#[cfg(not(windows))]
+fn extended_length_open_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Pure conversion of an absolute, already-normalized Windows path string into
+/// its extended-length form.
+///
+/// Returns `None` when the path must pass through unchanged: already verbatim
+/// (`\\?\`), a device-namespace path (`\\.\`), or not a recognized drive/UNC
+/// absolute form.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_extended_length_form(path: &str) -> Option<String> {
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    if let Some(server_share) = path.strip_prefix(r"\\") {
+        return Some(format!(r"\\?\UNC\{server_share}"));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return Some(format!(r"\\?\{path}"));
+    }
+    None
 }
 
 /// Return the `ATTACH DATABASE` argument for `path`.
@@ -213,5 +267,50 @@ mod tests {
         let open = open_path(path);
         assert_eq!(open, Path::new(r"\\?\C:\cache\codestory\core.db"));
         assert_eq!(attach_argument(path), r"\\?\C:\cache\codestory\core.db");
+    }
+
+    // The conversion below is duplicated from `codestory-workspace` because an
+    // architecture contract forbids depending on that crate. These run on every
+    // host so the copies cannot drift while only Windows CI would notice.
+
+    #[test]
+    fn drive_paths_gain_the_extended_length_prefix() {
+        assert_eq!(
+            windows_extended_length_form(r"C:\cw\CodeStory\core.db").as_deref(),
+            Some(r"\\?\C:\cw\CodeStory\core.db")
+        );
+    }
+
+    #[test]
+    fn extended_length_form_carries_paths_beyond_max_path() {
+        let deep = format!(r"C:\{}\core.db", "a".repeat(300));
+        let extended = windows_extended_length_form(&deep).expect("extended-length form");
+        assert_eq!(extended, format!(r"\\?\{deep}"));
+        assert!(extended.len() > 260);
+    }
+
+    #[test]
+    fn unc_paths_use_the_unc_namespace() {
+        assert_eq!(
+            windows_extended_length_form(r"\\server\share\cache\core.db").as_deref(),
+            Some(r"\\?\UNC\server\share\cache\core.db")
+        );
+    }
+
+    #[test]
+    fn verbatim_and_device_namespace_paths_pass_through() {
+        assert_eq!(windows_extended_length_form(r"\\?\C:\cw\core.db"), None);
+        assert_eq!(
+            windows_extended_length_form(r"\\?\UNC\server\share\core.db"),
+            None
+        );
+        assert_eq!(windows_extended_length_form(r"\\.\pipe\codestory"), None);
+    }
+
+    #[test]
+    fn relative_and_rootless_forms_are_not_prefixed() {
+        assert_eq!(windows_extended_length_form(r"cache\core.db"), None);
+        assert_eq!(windows_extended_length_form(r"C:core.db"), None);
+        assert_eq!(windows_extended_length_form(""), None);
     }
 }
