@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 pub mod atomic_file;
 pub mod owned_deletion;
+pub mod paths;
 mod repository_identity;
 pub use repository_identity::{
     PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,

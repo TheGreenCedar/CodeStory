@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed semantic sidecar publication failing with `unable to open database file` on Windows under deep cache roots (service profiles, redirected homes): sidecar SQLite opens now use extended-length paths and the staged vector index no longer creates a rollback journal.
 - First use completes on Linux hosts that keep `/tmp` on its own filesystem.
   Setup previously downloaded the runtime, failed to install it, and started the
   download again until it gave up.
@@ -52,6 +53,7 @@
   `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the repository size at which
   CodeStory stops checking for changes.
 
+||||||| parent of e925d6da (note the windows deep-cache-root publication fix in the changelog)
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.
