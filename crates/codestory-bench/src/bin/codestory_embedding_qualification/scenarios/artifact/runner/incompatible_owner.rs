@@ -3,9 +3,7 @@ use super::super::{
     btree,
 };
 use super::ScenarioRunner;
-use super::process::{
-    load_establishment_timeout, query_parameters, require_worker_error, require_worker_success,
-};
+use super::process::{query_parameters, require_worker_error, require_worker_success};
 use anyhow::{Result, bail};
 use codestory_retrieval::EmbeddingQualificationParameters;
 use serde_json::json;
@@ -24,14 +22,12 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        // Load establishment: the freshly spawned lease client must start,
-        // capture its executable and transport and converge on the owner before
-        // its residency lease is visible.
-        self.wait_for_snapshot(
-            "incompatible_owner_active",
-            load_establishment_timeout(),
-            |snapshot| snapshot.scheduler.lease_count > 0,
-        )?;
+        // Load establishment, one client: the freshly spawned lease client must
+        // start, capture its executable and transport and converge on the owner
+        // before its residency lease is visible.
+        self.wait_for_established_load("incompatible_owner_active", |snapshot| {
+            snapshot.scheduler.lease_count > 0
+        })?;
         self.control("force_incompatible", None)?;
         let active = self.spawn_worker("activate_probe", query_parameters(1), None)?;
         let active_output = self.finish_worker(active, FROZEN_WORKER_TIMEOUT)?;
@@ -97,9 +93,14 @@ impl<'a> ScenarioRunner<'a> {
                 ),
             ]),
         );
-        // Observation: the wait above already proved the owner drained, so the
-        // absence worker only confirms an exit already under way; no client
-        // ramp gates it.
+        // Not a poll budget and not load establishment: `wait_for_absence`
+        // spawns a fresh worker and this value is that worker's kill budget,
+        // covering its start, captures, connect and absence loop. The worker's
+        // own self-enforced bound is the contract idle timeout plus its 30s
+        // absence grace (90s), deliberately not honored here: the drained-owner
+        // probe above already proved the exit under way, so the shorter flat
+        // budget asserts that it lands promptly instead of waiting out an idle
+        // exit this scenario is not testing.
         self.wait_for_absence("incompatible_owner_exited", SNAPSHOT_TIMEOUT)?;
         let replacement = self.spawn_worker("query", query_parameters(1), None)?;
         let replacement_output = self.finish_worker(replacement, NORMAL_WORKER_TIMEOUT)?;

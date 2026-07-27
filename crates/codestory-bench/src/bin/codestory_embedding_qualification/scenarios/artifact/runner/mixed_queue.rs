@@ -7,7 +7,7 @@ use super::analysis::{
     analyze_queue_operations, attach_native_completion_sequences,
     require_pre_release_capacity_overflow, scheduler_values,
 };
-use super::process::{load_establishment_timeout, query_parameters, require_protocol_success};
+use super::process::{query_parameters, require_protocol_success};
 use crate::qualification::output::write_atomic_json;
 use anyhow::{Result, bail};
 use codestory_retrieval::EmbeddingQualificationParameters;
@@ -24,20 +24,17 @@ impl<'a> ScenarioRunner<'a> {
         self.control("hold_class", Some("bulk"))?;
         self.control("hold_class", Some("query"))?;
         let seed = self.spawn_worker("long_protocol_bulk", query_parameters(1), None)?;
-        // Load establishment: the freshly spawned seed client must start,
-        // capture its executable and transport, converge on the owner and have
-        // its bulk request admitted before this predicate can turn true.
-        self.wait_for_snapshot(
-            "mixed_queue_seed_active",
-            load_establishment_timeout(),
-            |snapshot| {
-                snapshot
-                    .scheduler
-                    .active_request
-                    .as_ref()
-                    .is_some_and(|active| active.class == "bulk")
-            },
-        )?;
+        // Load establishment, one client: the freshly spawned seed client must
+        // start, capture its executable and transport, converge on the owner
+        // and have its bulk request admitted before this predicate can turn
+        // true.
+        self.wait_for_established_load("mixed_queue_seed_active", |snapshot| {
+            snapshot
+                .scheduler
+                .active_request
+                .as_ref()
+                .is_some_and(|active| active.class == "bulk")
+        })?;
         let first_gate = self
             .context
             .output_directory

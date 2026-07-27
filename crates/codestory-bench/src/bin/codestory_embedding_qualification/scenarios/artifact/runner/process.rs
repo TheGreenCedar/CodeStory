@@ -261,12 +261,18 @@ pub(super) fn measurement_worker_timeout(operation: &str) -> Duration {
         // bulk deadline; spawn-hello, product-query, and residency
         // measurements contain an `EnsureResident` exchange or a cold model
         // load, both bounded by the same bulk deadline the client enforces on
-        // itself.
+        // itself. The true_idle respawn scenario's `resident_identity` probe
+        // is that same `EnsureResident` exchange under that same
+        // client-enforced bulk deadline, so it must name this arm: an
+        // operation the match does not name falls through to the query
+        // deadline and would let the coordinator kill a worker that is still
+        // inside the deadline it honors.
         "bulk"
         | "measure_bulk_frame"
         | "measure_spawn_hello"
         | "measure_product_query"
-        | "measure_resident_identity" => budgets.bulk_request,
+        | "measure_resident_identity"
+        | "resident_identity" => budgets.bulk_request,
         _ => budgets.query_request,
     };
     budgets
@@ -311,31 +317,68 @@ pub(super) fn busy_retry_marker_timeout() -> Duration {
         .saturating_add(CONTROL_TIMEOUT)
 }
 
+/// Every snapshot wait in the scenario driver whose predicate gates on
+/// worker-driven load establishment, with the number of freshly spawned
+/// clients whose own start-and-capture chain has to complete inside the wait
+/// window before the predicate can turn true. `load_establishment_timeout` is
+/// the only way to spend this budget and it fails closed on a phase that is
+/// not listed here, so a new load wait cannot inherit a budget nobody derived
+/// for it; `load_establishment_waits_are_classified_at_every_site` holds this
+/// table and the call sites to each other so a site cannot quietly return to
+/// the flat snapshot budget.
+pub(super) const LOAD_ESTABLISHMENT_WAITS: &[(&str, u32)] = &[
+    ("mixed_queue_seed_active", 1),
+    ("server_crash_inflight", 1),
+    ("worker_stall_inflight", 1),
+    ("incompatible_owner_active", 1),
+    ("true_idle_lease_active", 1),
+    ("true_idle_active_bulk", 1),
+    // Two clients, one per project, are spawned inside this wait window and
+    // must each ramp before the query and bulk depths are visible together.
+    ("true_idle_work_held", 2),
+];
+
 /// Coordinator budget for one worker-driven load-establishment snapshot wait.
 /// These waits bound a phase, not an observation: the predicate cannot turn
-/// true until a freshly spawned client process has started and captured its own
-/// executable and transport, paid its contract connect and spawn-convergence
-/// allowances, and had its first request admitted or its residency lease
-/// granted — while every poll of the wait is itself a fresh observe worker that
-/// can spend the whole snapshot allowance before the predicate is next
-/// evaluated. So the budget is the establishing client's own start-and-capture
-/// chain (one snapshot allowance, the honest chain `observe_worker`
-/// documents), plus the contract connect and spawn-convergence terms, plus one
-/// more snapshot allowance for the poll already in flight. Waits whose
-/// predicate needs a seeded queue rather than a single admission carry the
-/// strictly larger queue-setup budget instead (`dead_client_setup_timeout` and
-/// mixed_queue's gated enqueue waits). Regression: calibration run 30238772170
-/// (hosted_linux_x64_cpu) died with
+/// true until every freshly spawned client the wait gates on has started and
+/// captured its own executable and transport, paid its contract connect and
+/// spawn-convergence allowances, and had its first request admitted or its
+/// residency lease granted — while every poll of the wait is itself a fresh
+/// observe worker that can spend the whole snapshot allowance before the
+/// predicate is next evaluated. So the budget is one start-and-capture
+/// allowance per establishing client (a snapshot allowance each, the honest
+/// chain `observe_worker` documents, and the clients ramp concurrently on a
+/// 2-core cell), plus the contract connect and spawn-convergence terms, plus
+/// one more snapshot allowance for the poll already in flight. Waits whose
+/// predicate needs a seeded queue rather than an admission or a lease carry
+/// the strictly larger queue-setup budget instead (`dead_client_setup_timeout`
+/// and mixed_queue's gated enqueue waits). Regression: calibration run
+/// 30238772170 (hosted_linux_x64_cpu) died with
 /// `embedding_qualification_snapshot_timeout:mixed_queue_seed_active` at the
 /// flat 20s snapshot budget while the seed client was legitimately still
 /// starting; the capture-reuse optimization is unmerged, so every captured
 /// transport is still a full ~201MB hash of the packaged binary.
-pub(super) fn load_establishment_timeout() -> Duration {
+pub(super) fn load_establishment_budget(establishing_clients: u32) -> Duration {
     let budgets = EmbeddingClientBudgets::current();
     SNAPSHOT_TIMEOUT
+        .saturating_mul(establishing_clients.max(1))
         .saturating_add(budgets.connect)
         .saturating_add(budgets.spawn)
         .saturating_add(SNAPSHOT_TIMEOUT)
+}
+
+/// Budget for the named load-establishment wait, fail-closed on a phase that
+/// carries no derivation: a wait whose establishing clients nobody counted has
+/// no honest worst case, and silently handing it a default is how a budget
+/// ends up undercutting the very chain it is supposed to bound.
+pub(super) fn load_establishment_timeout(phase: &str) -> Result<Duration> {
+    LOAD_ESTABLISHMENT_WAITS
+        .iter()
+        .find(|(wait, _)| *wait == phase)
+        .map(|(_, establishing_clients)| load_establishment_budget(*establishing_clients))
+        .ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_load_establishment_unclassified:{phase}")
+        })
 }
 
 /// Coordinator budget for observing the dead client's established load. The

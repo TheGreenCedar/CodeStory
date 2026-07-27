@@ -7,8 +7,8 @@ use super::measurements::{
     declared_phase_boundaries, declared_workload_id, measurement_span_interval,
 };
 use super::process::{
-    busy_retry_worker_timeout, dead_client_setup_timeout, load_establishment_timeout,
-    measurement_worker_timeout,
+    LOAD_ESTABLISHMENT_WAITS, busy_retry_worker_timeout, dead_client_setup_timeout,
+    load_establishment_budget, load_establishment_timeout, measurement_worker_timeout,
 };
 use super::{ScenarioEvidence, WorkerOutput, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_METRICS, REQUIRED_SCENARIOS};
@@ -35,13 +35,7 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
         .saturating_add(budgets.spawn)
         .saturating_add(SNAPSHOT_TIMEOUT)
         .saturating_add(CONTROL_TIMEOUT);
-    for operation in [
-        "query",
-        "observe",
-        "resident_identity",
-        "measure_hello",
-        "measure_query_frame",
-    ] {
+    for operation in ["query", "observe", "measure_hello", "measure_query_frame"] {
         assert!(
             measurement_worker_timeout(operation)
                 >= orchestration_terms.saturating_add(budgets.query_request),
@@ -54,6 +48,7 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
         "measure_spawn_hello",
         "measure_product_query",
         "measure_resident_identity",
+        "resident_identity",
     ] {
         let bulk_timeout = measurement_worker_timeout(operation);
         assert!(
@@ -67,6 +62,18 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
             "bulk measurement budget must not undercut the contract bulk request deadline"
         );
     }
+    // The true_idle respawn scenario spawns the `resident_identity` worker,
+    // whose whole body is one `EnsureResident` exchange that the client bounds
+    // by the contract bulk deadline. Regression: that operation name matched no
+    // arm and fell through to the query deadline, so its coordinator budget was
+    // 57s against a worker worst case of ~512s — the coordinator-kills-a-
+    // progressing-worker defect this function exists to eliminate, reintroduced
+    // by a name the match never saw.
+    assert_eq!(
+        measurement_worker_timeout("resident_identity"),
+        measurement_worker_timeout("measure_resident_identity"),
+        "the scenario residency probe must carry the same bulk-deadline budget as the residency measurement"
+    );
     // The true-idle measurement worker waits out the server's own idle
     // deadline before the absence observation; its watchdog must dominate
     // that self-enforced wait plus its quiescence and absence-grace waits.
@@ -117,47 +124,214 @@ fn dead_client_setup_budget_dominates_the_seeding_terms_the_flat_wait_undercut()
 }
 
 #[test]
-fn load_establishment_budget_dominates_the_terms_the_flat_snapshot_wait_undercut() {
+fn load_establishment_budgets_cover_every_establishing_client_chain() {
     // The mixed_queue `mixed_queue_seed_active` wait — and every sibling that
-    // gates on a freshly spawned client reaching the owner — bounds a phase,
-    // not a single observation: the seed client pays its own process start and
+    // gates on freshly spawned clients reaching the owner — bounds a phase,
+    // not a single observation: each client pays its own process start and
     // executable/transport captures, then its contract connect and
-    // spawn-convergence allowances, before its bulk request is admitted, and
-    // the coordinator's own in-flight poll is one more observe worker that can
-    // spend the whole snapshot allowance first. Regression: calibration run
-    // 30238772170 (hosted_linux_x64_cpu) died with
+    // spawn-convergence allowances, before its request is admitted or its lease
+    // is granted, and the coordinator's own in-flight poll is one more observe
+    // worker that can spend the whole snapshot allowance first. Regression:
+    // calibration run 30238772170 (hosted_linux_x64_cpu) died with
     // embedding_qualification_snapshot_timeout:mixed_queue_seed_active at the
     // flat 20s budget while the seed client was legitimately still starting.
     let budgets = EmbeddingClientBudgets::current();
+    for (phase, establishing_clients) in LOAD_ESTABLISHMENT_WAITS {
+        let budget = load_establishment_timeout(phase).expect("classified wait");
+        // Independently composed chain for this site: one start-and-capture
+        // allowance per client the predicate gates on (each still a full
+        // executable and transport hash, because capture reuse is unmerged),
+        // the contract connect and spawn-convergence allowances paid to reach
+        // the owner, and one more snapshot allowance for the coordinator's poll
+        // already in flight.
+        let mut chain = budgets
+            .connect
+            .saturating_add(budgets.spawn)
+            .saturating_add(SNAPSHOT_TIMEOUT);
+        for _ in 0..*establishing_clients {
+            chain = chain.saturating_add(SNAPSHOT_TIMEOUT);
+        }
+        assert!(
+            budget >= chain,
+            "{phase}: budget must cover all {establishing_clients} establishing start-and-capture chains plus connect, spawn and the in-flight poll"
+        );
+        // The exact defect: the flat budget bounded a whole establishing phase
+        // with the allowance the coordinator sizes for one observe worker.
+        assert!(
+            budget > SNAPSHOT_TIMEOUT,
+            "{phase}: budget must strictly dominate the flat snapshot wait it replaced"
+        );
+    }
+    // Each additional establishing client buys at least another whole
+    // start-and-capture allowance, so a site's budget tracks its client count
+    // instead of being one magnitude that happens to clear the single-client
+    // chain. Regression: `true_idle_work_held` gates on two clients ramping
+    // concurrently inside its own wait window and was given the single-client
+    // budget, leaving the same flake class live in true_idle_respawn.
+    for establishing_clients in 1..=4_u32 {
+        assert!(
+            load_establishment_budget(establishing_clients.saturating_add(1))
+                >= load_establishment_budget(establishing_clients).saturating_add(SNAPSHOT_TIMEOUT),
+            "each additional establishing client must buy another start-and-capture allowance"
+        );
+    }
     assert!(
-        load_establishment_timeout()
-            >= budgets
-                .connect
-                .saturating_add(budgets.spawn)
-                .saturating_add(SNAPSHOT_TIMEOUT),
-        "load-establishment budget must dominate the client's connect and spawn allowances plus the snapshot allowance"
+        load_establishment_timeout("true_idle_work_held").expect("classified wait")
+            > load_establishment_timeout("mixed_queue_seed_active").expect("classified wait"),
+        "the two-client establishment wait must strictly dominate a single-client one"
     );
+    // Fail closed: a wait whose establishing clients nobody counted has no
+    // derived worst case, so it must not be handed a default budget.
     assert!(
-        load_establishment_timeout()
-            >= budgets
-                .connect
-                .saturating_add(budgets.spawn)
-                .saturating_add(SNAPSHOT_TIMEOUT)
-                .saturating_add(SNAPSHOT_TIMEOUT),
-        "load-establishment budget must also cover the coordinator's own in-flight observe poll"
-    );
-    // The exact defect: the flat budget bounded the whole establishing phase
-    // with the allowance the coordinator sizes for one observe worker.
-    assert!(
-        load_establishment_timeout() > SNAPSHOT_TIMEOUT,
-        "load-establishment budget must strictly dominate the flat snapshot wait it replaced"
+        load_establishment_timeout("true_idle_work_hel").is_err(),
+        "an unclassified wait must not resolve to a budget"
     );
     // Family ordering: a wait that needs a seeded queue rather than one
     // admission or lease carries the strictly larger queue-setup budget.
     assert!(
-        dead_client_setup_timeout() >= load_establishment_timeout(),
+        dead_client_setup_timeout() >= load_establishment_budget(1),
         "the seeded-queue budget must dominate the single-admission budget in the same wait family"
     );
+}
+
+/// Every snapshot wait in the driver that is not worker-driven load
+/// establishment, with the budget expression its call site must carry. Seeded
+/// queue waits bound a client filling a queue and take the queue-setup budget;
+/// observation waits hold no client ramp in the predicate path, so the flat
+/// snapshot budget dominates their honest chain and each site states why.
+const NON_LOAD_ESTABLISHMENT_WAITS: &[(&str, &str)] = &[
+    ("client_death_lease_active", "dead_client_setup_timeout()"),
+    ("mixed_queue_first_project_enqueued", "QUEUE_SETUP_TIMEOUT"),
+    ("mixed_queue_saturated", "QUEUE_SETUP_TIMEOUT"),
+    ("client_death_lease_reclaimed", "SNAPSHOT_TIMEOUT"),
+    ("frozen_owner_released", "SNAPSHOT_TIMEOUT"),
+    ("incompatible_owner_idle", "SNAPSHOT_TIMEOUT"),
+    ("mixed_queue_query_selected", "SNAPSHOT_TIMEOUT"),
+    ("true_idle_work_reclaimed", "SNAPSHOT_TIMEOUT"),
+];
+
+#[test]
+fn load_establishment_waits_are_classified_at_every_site() {
+    // The family split has to be auditable at the sites, not only in prose:
+    // every snapshot wait in the driver is either worker-driven load
+    // establishment — a budget derived from the number of clients its predicate
+    // gates on — or it is not, and then it is queue seeding or an observation
+    // whose predicate path holds no client ramp. Regression: the flat snapshot
+    // budget that killed calibration run 30238772170 at mixed_queue_seed_active
+    // could be restored at a single call site without touching any derivation,
+    // and no other assertion in this suite would notice.
+    let mut sited = BTreeSet::new();
+    for (file, source) in runner_sources() {
+        for (phase, _) in wait_sites(&source, "wait_for_established_load") {
+            assert!(
+                LOAD_ESTABLISHMENT_WAITS
+                    .iter()
+                    .any(|(wait, _)| *wait == phase),
+                "{file}: {phase} spends the load-establishment budget with no derived client count"
+            );
+            assert!(sited.insert(phase.clone()), "{file}: {phase} waits twice");
+        }
+        for call in [
+            "wait_for_snapshot",
+            "wait_for_control_snapshot",
+            "wait_for_true_idle_epoch",
+        ] {
+            for (phase, budget) in wait_sites(&source, call) {
+                let expected = NON_LOAD_ESTABLISHMENT_WAITS
+                    .iter()
+                    .find(|(wait, _)| *wait == phase)
+                    .map(|(_, budget)| *budget)
+                    .unwrap_or_else(|| {
+                        panic!("{file}: {phase} is an unclassified snapshot wait carrying {budget}")
+                    });
+                assert_eq!(
+                    budget, expected,
+                    "{file}: {phase} must carry {expected}, not {budget}"
+                );
+                assert!(sited.insert(phase.clone()), "{file}: {phase} waits twice");
+            }
+        }
+    }
+    for (phase, _) in LOAD_ESTABLISHMENT_WAITS {
+        assert!(
+            sited.contains(*phase),
+            "{phase} carries a derived load-establishment budget that no site spends"
+        );
+    }
+    for (phase, _) in NON_LOAD_ESTABLISHMENT_WAITS {
+        assert!(
+            sited.contains(*phase),
+            "{phase} is classified as a non-establishment wait that no site performs"
+        );
+    }
+}
+
+/// Every source file of the scenario driver, read from disk so a wait added in
+/// a file nobody remembered to list still has to be classified.
+fn runner_sources() -> Vec<(String, String)> {
+    let directory = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/codestory_embedding_qualification/scenarios/artifact/runner"
+    ));
+    let mut sources = std::fs::read_dir(directory)
+        .expect("read the scenario runner directory")
+        .map(|entry| entry.expect("scenario runner entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("scenario source name")
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path).expect("read a scenario source");
+            (name, source)
+        })
+        .collect::<Vec<_>>();
+    sources.sort();
+    assert!(
+        sources.len() >= 10,
+        "scenario driver sources went missing from the classification scan"
+    );
+    sources
+}
+
+/// The `(phase, budget)` pair of every `self.<call>(` site in `source` whose
+/// first argument is a phase literal. The budget is the next argument with its
+/// whitespace removed; sites that take no budget argument yield the text that
+/// follows the phase, which their caller ignores.
+fn wait_sites(source: &str, call: &str) -> Vec<(String, String)> {
+    let opening = format!("self.{call}(");
+    let mut sites = Vec::new();
+    let mut rest = source;
+    while let Some(index) = rest.find(&opening) {
+        rest = &rest[index.saturating_add(opening.len())..];
+        let Some(quoted) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = quoted.find('"') else {
+            continue;
+        };
+        let mut depth = 0_u32;
+        let mut budget = String::new();
+        for character in quoted[end.saturating_add(1)..]
+            .chars()
+            .skip_while(|character| *character != ',')
+            .skip(1)
+        {
+            match character {
+                '(' | '[' | '{' => depth = depth.saturating_add(1),
+                ')' | ']' | '}' if depth == 0 => break,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => break,
+                _ => {}
+            }
+            if !character.is_whitespace() {
+                budget.push(character);
+            }
+        }
+        sites.push((quoted[..end].to_owned(), budget));
+    }
+    sites
 }
 
 #[test]
