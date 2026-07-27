@@ -2,7 +2,8 @@ use super::super::{NORMAL_WORKER_TIMEOUT, SNAPSHOT_TIMEOUT, btree};
 use super::ScenarioRunner;
 use super::analysis::{consume_watchdog_marker, same_server_authority, scheduler_values};
 use super::process::{
-    require_worker_success, stall_worker_timeout, validate_replay_attempts, wait_for_process_exit,
+    load_establishment_timeout, require_worker_success, stall_worker_timeout,
+    validate_replay_attempts, wait_for_process_exit,
 };
 use crate::qualification::diagnostic_worker_stall_enabled;
 use crate::qualification::output::write_atomic_json;
@@ -44,14 +45,21 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        let active =
-            self.wait_for_snapshot("worker_stall_inflight", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment: the freshly spawned bulk client must start,
+        // capture its executable and transport, converge on the owner and be
+        // selected into the stalled native call before this predicate can turn
+        // true.
+        let active = self.wait_for_snapshot(
+            "worker_stall_inflight",
+            load_establishment_timeout(),
+            |snapshot| {
                 snapshot
                     .scheduler
                     .active_request
                     .as_ref()
                     .is_some_and(|active| active.class == "bulk")
-            })?;
+            },
+        )?;
         self.transition("stalled_request_observed", scheduler_values(&active));
         let output = self.finish_worker(worker, stall_worker_timeout())?;
         if diagnostic_worker_stall_enabled()? {
@@ -70,6 +78,9 @@ impl<'a> ScenarioRunner<'a> {
             .as_ref()
             .and_then(|result| (result.operations.len() == 1).then(|| &result.operations[0]))
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_stall_operation_missing"))?;
+        // Observation: a direct OS start-identity probe on the owner the
+        // watchdog already fail-stopped; it spawns no worker and waits on no
+        // client ramp.
         wait_for_process_exit(&self.clock, before.process.pid, SNAPSHOT_TIMEOUT)?;
         let (watchdog_marker, watchdog_marker_sha256) = consume_watchdog_marker(
             self.context.output_directory,

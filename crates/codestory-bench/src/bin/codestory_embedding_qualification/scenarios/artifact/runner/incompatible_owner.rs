@@ -3,7 +3,9 @@ use super::super::{
     btree,
 };
 use super::ScenarioRunner;
-use super::process::{query_parameters, require_worker_error, require_worker_success};
+use super::process::{
+    load_establishment_timeout, query_parameters, require_worker_error, require_worker_success,
+};
 use anyhow::{Result, bail};
 use codestory_retrieval::EmbeddingQualificationParameters;
 use serde_json::json;
@@ -22,9 +24,14 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        self.wait_for_snapshot("incompatible_owner_active", SNAPSHOT_TIMEOUT, |snapshot| {
-            snapshot.scheduler.lease_count > 0
-        })?;
+        // Load establishment: the freshly spawned lease client must start,
+        // capture its executable and transport and converge on the owner before
+        // its residency lease is visible.
+        self.wait_for_snapshot(
+            "incompatible_owner_active",
+            load_establishment_timeout(),
+            |snapshot| snapshot.scheduler.lease_count > 0,
+        )?;
         self.control("force_incompatible", None)?;
         let active = self.spawn_worker("activate_probe", query_parameters(1), None)?;
         let active_output = self.finish_worker(active, FROZEN_WORKER_TIMEOUT)?;
@@ -58,6 +65,9 @@ impl<'a> ScenarioRunner<'a> {
             ]),
         );
         self.terminate_worker(lease)?;
+        // Observation: the lease client is already terminated, so this only
+        // watches the owner's own peer-death sweep over the control channel and
+        // spawns no worker at all.
         self.wait_for_control_snapshot("incompatible_owner_idle", SNAPSHOT_TIMEOUT, |snapshot| {
             snapshot.scheduler.lease_count == 0 && snapshot.scheduler.active_request_count == 0
         })?;
@@ -87,6 +97,9 @@ impl<'a> ScenarioRunner<'a> {
                 ),
             ]),
         );
+        // Observation: the wait above already proved the owner drained, so the
+        // absence worker only confirms an exit already under way; no client
+        // ramp gates it.
         self.wait_for_absence("incompatible_owner_exited", SNAPSHOT_TIMEOUT)?;
         let replacement = self.spawn_worker("query", query_parameters(1), None)?;
         let replacement_output = self.finish_worker(replacement, NORMAL_WORKER_TIMEOUT)?;

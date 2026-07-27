@@ -7,7 +7,8 @@ use super::measurements::{
     declared_phase_boundaries, declared_workload_id, measurement_span_interval,
 };
 use super::process::{
-    busy_retry_worker_timeout, dead_client_setup_timeout, measurement_worker_timeout,
+    busy_retry_worker_timeout, dead_client_setup_timeout, load_establishment_timeout,
+    measurement_worker_timeout,
 };
 use super::{ScenarioEvidence, WorkerOutput, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_METRICS, REQUIRED_SCENARIOS};
@@ -112,6 +113,50 @@ fn dead_client_setup_budget_dominates_the_seeding_terms_the_flat_wait_undercut()
     assert!(
         dead_client_setup_timeout() >= QUEUE_SETUP_TIMEOUT,
         "dead-client load establishment is a queue-seeding phase and must carry the queue-setup budget"
+    );
+}
+
+#[test]
+fn load_establishment_budget_dominates_the_terms_the_flat_snapshot_wait_undercut() {
+    // The mixed_queue `mixed_queue_seed_active` wait — and every sibling that
+    // gates on a freshly spawned client reaching the owner — bounds a phase,
+    // not a single observation: the seed client pays its own process start and
+    // executable/transport captures, then its contract connect and
+    // spawn-convergence allowances, before its bulk request is admitted, and
+    // the coordinator's own in-flight poll is one more observe worker that can
+    // spend the whole snapshot allowance first. Regression: calibration run
+    // 30238772170 (hosted_linux_x64_cpu) died with
+    // embedding_qualification_snapshot_timeout:mixed_queue_seed_active at the
+    // flat 20s budget while the seed client was legitimately still starting.
+    let budgets = EmbeddingClientBudgets::current();
+    assert!(
+        load_establishment_timeout()
+            >= budgets
+                .connect
+                .saturating_add(budgets.spawn)
+                .saturating_add(SNAPSHOT_TIMEOUT),
+        "load-establishment budget must dominate the client's connect and spawn allowances plus the snapshot allowance"
+    );
+    assert!(
+        load_establishment_timeout()
+            >= budgets
+                .connect
+                .saturating_add(budgets.spawn)
+                .saturating_add(SNAPSHOT_TIMEOUT)
+                .saturating_add(SNAPSHOT_TIMEOUT),
+        "load-establishment budget must also cover the coordinator's own in-flight observe poll"
+    );
+    // The exact defect: the flat budget bounded the whole establishing phase
+    // with the allowance the coordinator sizes for one observe worker.
+    assert!(
+        load_establishment_timeout() > SNAPSHOT_TIMEOUT,
+        "load-establishment budget must strictly dominate the flat snapshot wait it replaced"
+    );
+    // Family ordering: a wait that needs a seeded queue rather than one
+    // admission or lease carries the strictly larger queue-setup budget.
+    assert!(
+        dead_client_setup_timeout() >= load_establishment_timeout(),
+        "the seeded-queue budget must dominate the single-admission budget in the same wait family"
     );
 }
 

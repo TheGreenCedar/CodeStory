@@ -311,6 +311,33 @@ pub(super) fn busy_retry_marker_timeout() -> Duration {
         .saturating_add(CONTROL_TIMEOUT)
 }
 
+/// Coordinator budget for one worker-driven load-establishment snapshot wait.
+/// These waits bound a phase, not an observation: the predicate cannot turn
+/// true until a freshly spawned client process has started and captured its own
+/// executable and transport, paid its contract connect and spawn-convergence
+/// allowances, and had its first request admitted or its residency lease
+/// granted — while every poll of the wait is itself a fresh observe worker that
+/// can spend the whole snapshot allowance before the predicate is next
+/// evaluated. So the budget is the establishing client's own start-and-capture
+/// chain (one snapshot allowance, the honest chain `observe_worker`
+/// documents), plus the contract connect and spawn-convergence terms, plus one
+/// more snapshot allowance for the poll already in flight. Waits whose
+/// predicate needs a seeded queue rather than a single admission carry the
+/// strictly larger queue-setup budget instead (`dead_client_setup_timeout` and
+/// mixed_queue's gated enqueue waits). Regression: calibration run 30238772170
+/// (hosted_linux_x64_cpu) died with
+/// `embedding_qualification_snapshot_timeout:mixed_queue_seed_active` at the
+/// flat 20s snapshot budget while the seed client was legitimately still
+/// starting; the capture-reuse optimization is unmerged, so every captured
+/// transport is still a full ~201MB hash of the packaged binary.
+pub(super) fn load_establishment_timeout() -> Duration {
+    let budgets = EmbeddingClientBudgets::current();
+    SNAPSHOT_TIMEOUT
+        .saturating_add(budgets.connect)
+        .saturating_add(budgets.spawn)
+        .saturating_add(SNAPSHOT_TIMEOUT)
+}
+
 /// Coordinator budget for observing the dead client's established load. The
 /// `client_death_lease_active` wait must see the lease plus the admitted and
 /// held query/bulk work in one snapshot, and that bounds a queue-seeding

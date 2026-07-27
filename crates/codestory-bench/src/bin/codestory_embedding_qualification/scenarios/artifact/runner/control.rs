@@ -213,6 +213,8 @@ impl<'a> ScenarioRunner<'a> {
         if self.observe(&format!("{phase}_before"))?.is_some() {
             self.control("crash_server", None)?;
         }
+        // Observation: any owner was just crash-stopped above, so the absence
+        // worker confirms an exit that has already happened; no client ramp.
         self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)
     }
 
@@ -227,8 +229,9 @@ impl<'a> ScenarioRunner<'a> {
         // One observe worker per poll: executable capture, connect, one
         // snapshot, no request work and no per-request transport fan-out, so
         // the flat snapshot budget dominates its honest chain. Waits that
-        // cover a client ramping queue load must carry the queue-setup
-        // budget instead (see dead_client_setup_timeout).
+        // cover a client establishing load must carry a derived budget
+        // instead: load_establishment_timeout for a single admission or lease,
+        // the queue-setup budget for a seeded queue (dead_client_setup_timeout).
         let worker = self.spawn_worker("observe", query_parameters(1), None)?;
         let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
         require_worker_success(&output, "observe")?;
