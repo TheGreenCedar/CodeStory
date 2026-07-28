@@ -9,6 +9,24 @@ from pathlib import Path
 from .contract_primitives import require_nonempty_string
 from .foundation import require
 
+# The single file a freeze commit is allowed to write between the tree that was
+# calibrated and the tree that is packaged.
+CONSTANT_SET_FREEZE_PATH = (
+    "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+)
+# Enforcing the freeze lineage decides the release sequencing: because the
+# freeze commit must be the only commit between calibration and the package,
+# the version bump cannot follow calibration. Every failure below repeats this
+# so a CI reader can act without opening this file.
+REQUIRED_RELEASE_ORDERING = (
+    "required release ordering is bump-then-calibrate: bump the version first "
+    "(node scripts/bump-version.mjs --version <version>), calibrate on the "
+    "bumped tree, then land the constant-set freeze commit as the only commit "
+    f"between calibration and the packaged release ({CONSTANT_SET_FREEZE_PATH} "
+    "is the only file it may write). A calibrate-then-bump ordering fails here: "
+    "move the bump ahead of calibration and recalibrate on the bumped tree"
+)
+
 
 def verify_calibration_source_lineage(
     calibration_source: dict,
@@ -43,11 +61,20 @@ def verify_calibration_source_lineage(
             capture_output=True,
             timeout=30,
         )
+        # `require`'s message argument is evaluated before the call, so the
+        # detail must not itself be a contract that a *successful* probe can
+        # violate. `git diff --name-only` legitimately prints nothing when the
+        # two trees are identical, and demanding non-empty output here replaced
+        # the actionable drift message below with "Git lineage failure must be a
+        # non-empty string".
         require(
             completed.returncode == 0,
             "calibration source-lineage probe failed: "
             + require_nonempty_string(
-                completed.stderr.strip() or completed.stdout.strip(),
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"git {' '.join(arguments)} exited {completed.returncode} "
+                "without output",
                 "Git lineage failure",
             ),
         )
@@ -77,7 +104,11 @@ def verify_calibration_source_lineage(
     )
     require(
         completed.returncode == 0,
-        "calibration source is not an ancestor of the frozen package source",
+        "calibration source "
+        f"{calibration_source['commit']} is not an ancestor of the frozen "
+        f"package source {frozen_source['commit']}; the packaged tree was not "
+        "grown from the calibrated tree, so the frozen constants were never "
+        f"measured on what ships. The {REQUIRED_RELEASE_ORDERING}.",
     )
     changed_paths = [
         path
@@ -89,10 +120,24 @@ def verify_calibration_source_lineage(
         ).splitlines()
         if path
     ]
+    offending_paths = [
+        path for path in changed_paths if path != CONSTANT_SET_FREEZE_PATH
+    ]
     require(
-        changed_paths
-        == ["crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"],
-        "post-calibration source drift exceeded the one allowed constant-set freeze file",
+        changed_paths == [CONSTANT_SET_FREEZE_PATH],
+        "post-calibration source drift exceeded the one allowed constant-set "
+        "freeze file: "
+        + (
+            "offending changed paths between calibration "
+            f"{calibration_source['commit']} and packaged "
+            f"{frozen_source['commit']}: " + ", ".join(offending_paths)
+            if offending_paths
+            else "the packaged source did not add the required "
+            f"{CONSTANT_SET_FREEZE_PATH} freeze commit "
+            f"(no path changed between calibration {calibration_source['commit']} "
+            f"and packaged {frozen_source['commit']})"
+        )
+        + f". The {REQUIRED_RELEASE_ORDERING}.",
     )
     return {
         "selection_commit": calibration_source["commit"],

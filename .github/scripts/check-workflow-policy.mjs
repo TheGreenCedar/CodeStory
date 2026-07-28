@@ -2759,6 +2759,7 @@ function validatePackagedProof(workflows, violations, graph) {
       '--calibration-bundle "$calibration_bundle"',
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
+      "--enforce-calibration-freeze-lineage",
       'test -f "$quality_path"',
       "--engine-policy cpu_explicit",
       "--expected-backend CPU",
@@ -2775,6 +2776,31 @@ function validatePackagedProof(workflows, violations, graph) {
   const packagedProof = namedStep(
     job,
     "Packaged per-user server calibration or qualification",
+  );
+  // The calibration-to-package source-lineage guard exists only when this flag
+  // reaches the frozen invocation. Without it the packaged release can ship a
+  // constant set measured on a materially different tree, so pin the flag to
+  // the hosted_package call rather than anywhere in the step, and keep the
+  // build checkout deep enough for the ancestor and diff probes it performs.
+  const packagedProofExecutable = executableRunText(packagedProofRun);
+  const frozenInvocationIndex = packagedProofExecutable
+    .indexOf("--proof-tier hosted_package");
+  add(
+    violations,
+    frozenInvocationIndex >= 0
+      && occurrenceCount(
+        packagedProofExecutable,
+        "--enforce-calibration-freeze-lineage",
+      ) === 1
+      && packagedProofExecutable
+        .slice(frozenInvocationIndex)
+        .includes("--enforce-calibration-freeze-lineage"),
+    `${file} frozen packaged qualification must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed`,
+  );
+  add(
+    violations,
+    object(namedStep(job, "Checkout")?.with)["fetch-depth"] === 0,
+    `${file} package build must keep full history for the calibration freeze lineage probe`,
   );
   const hostedCalibrationUpload = namedStep(job, "Upload hosted Linux calibration runs");
   add(

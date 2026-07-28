@@ -180,9 +180,25 @@ Frozen calibration bundles are accepted only from a successful
 `workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every
 consumer binds the run ID, exact `embedding-calibration-bundle-<source-sha>`
 artifact name, unexpired artifact record, source commit, and bundle producer
-identity before applying the frozen thresholds. The exact
-unfrozen-to-frozen source lineage is checked once at the freeze transition; it
-is not reinterpreted as a requirement for every later package proof.
+identity before applying the frozen thresholds.
+
+The frozen `hosted_package` qualification additionally passes
+`--enforce-calibration-freeze-lineage`, so the exact calibration-to-package
+source lineage is proved rather than assumed: the calibration commit must be an
+ancestor of the packaged commit, the verification checkout must be that packaged
+commit, and
+`crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` must be
+the only path that differs between them. The packaged proof therefore checks out
+full history.
+
+That rule fixes the release ordering to **bump-then-calibrate**: bump the
+version first with `node scripts/bump-version.mjs --version <version>`,
+calibrate on the bumped tree, then land the constant-set freeze commit as the
+only commit between calibration and the packaged release. Calibrating first and
+bumping afterwards puts a second commit in that range, and the guard rejects it
+by name -- the failure lists the offending paths and repeats this ordering. The
+fix is always to move the bump ahead of calibration and recalibrate on the
+bumped tree, never to widen the allowed path set.
 
 Platform proof boundaries:
 

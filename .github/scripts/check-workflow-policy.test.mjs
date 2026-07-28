@@ -734,6 +734,32 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       );
       step.if = "matrix.asset_target == 'linux-x64'";
     }, /packaged-platform-proof\.yml/u],
+    ["frozen qualification stops enforcing the calibration freeze lineage", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      const removed = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
+      assert.notEqual(removed, step.run, "freeze lineage flag was already absent");
+      step.run = removed;
+    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
+    ["freeze lineage enforcement moves onto the unfrozen calibration invocation", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      const moved = step.run
+        .replace("  --enforce-calibration-freeze-lineage \\\n", "")
+        .replace(
+          "      --proof-tier calibration \\\n",
+          "      --proof-tier calibration \\\n      --enforce-calibration-freeze-lineage \\\n",
+        );
+      assert.match(moved, /--proof-tier calibration \\\n\s+--enforce-calibration-freeze-lineage/u);
+      step.run = moved;
+    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
+    ["package build loses the history the freeze lineage probe reads", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Checkout").with["fetch-depth"] = 1;
+    }, /package build must keep full history for the calibration freeze lineage probe/u],
     ["package evaluation downloads calibration on the standard path", packagedProofFile, workflow => {
       draftStep(workflow.jobs.build, "Authenticate calibration bundle producer").if
         = "matrix.asset_target == 'linux-x64'";

@@ -218,6 +218,14 @@ claim.
 `--proof-tier calibration` may collect draft measurements, but cannot satisfy a
 package, hardware, installed, or release claim. A higher qualification tier
 requires a frozen constant set and a retained qualification record.
+`--proof-tier hosted_package` also passes
+`--enforce-calibration-freeze-lineage`, which requires the calibration commit to
+be an ancestor of the packaged commit with
+`crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` as the
+only differing path. Release ordering is therefore bump-then-calibrate: bump the
+version, calibrate on the bumped tree, then freeze and release. A
+calibrate-then-bump ordering fails the guard, which names the offending paths
+and the required ordering in its failure message.
 `--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through

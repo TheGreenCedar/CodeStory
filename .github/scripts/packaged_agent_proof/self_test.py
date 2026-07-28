@@ -1,5 +1,6 @@
 """Owner-oriented packaged-proof self-test aggregation."""
 
+from .self_test_calibration_lineage import run_calibration_lineage_self_tests
 from .self_test_cli import run_cli_self_tests
 from .self_test_contracts import run_contract_self_tests
 from .self_test_full_stack import run_full_stack_self_tests
@@ -14,6 +15,7 @@ from .self_test_server_idle import run_idle_boundary_self_tests
 
 def self_test() -> None:
     run_cli_self_tests()
+    run_calibration_lineage_self_tests()
     run_contract_self_tests()
     run_process_self_tests()
     run_producer_liveness_self_tests()

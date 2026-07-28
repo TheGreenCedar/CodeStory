@@ -905,6 +905,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "$CALIBRATION_RUN_ID" \
             --calibration-producer-artifact "$CALIBRATION_ARTIFACT" \
+            --enforce-calibration-freeze-lineage \
             --retrieval-quality-evidence "$quality_path" \
             --out-dir target/packaged-agent-proof
 
