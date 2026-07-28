@@ -60,9 +60,10 @@ use crate::search_intent::{
     exact_symbol_hit_count, language_filter_matches_path, parse_search_intent_query,
 };
 use crate::search_plan::{
-    SearchPlanActivePathEvidence, orientation_query, same_search_file, search_plan_anchor_groups,
-    search_plan_eligible, search_plan_next_actions, search_plan_path_is_test_or_bench,
-    search_plan_rejected_hits, search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    SearchPlanActivePathEvidence, graph_bridge_evidence_kind, orientation_query, same_search_file,
+    search_plan_anchor_groups, search_plan_eligible, search_plan_next_actions,
+    search_plan_path_is_test_or_bench, search_plan_rejected_hits,
+    search_plan_runtime_call_is_speculative, search_plan_subqueries,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,

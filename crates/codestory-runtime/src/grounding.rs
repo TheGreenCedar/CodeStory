@@ -12,8 +12,8 @@ use super::{
 };
 use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::root_rank::{
-    CallDegrees, DegreeTier, EntryEvidence, SUBSYSTEM_FILE_QUOTA, degree_tier,
-    diversify_root_order, entry_evidence, helper_like_name_or_path, is_production_file_role,
+    CallDegrees, DegreeTier, EntryEvidence, RootDiversityState, SUBSYSTEM_FILE_QUOTA, degree_tier,
+    diversify_root_order_within, entry_evidence, helper_like_name_or_path, is_production_file_role,
     structural_depth, structural_path_rank, subsystem_key_for_path,
 };
 use crate::trail_story::build_trail_story;
@@ -79,7 +79,13 @@ fn is_import_like_symbol(node: &codestory_contracts::graph::Node) -> bool {
     ) && is_import_like_name(&node_display_name(node))
 }
 
-fn is_import_like_name(name: &str) -> bool {
+/// True when a symbol's own name is spelled as an import path.
+///
+/// Kind-independent on purpose: the grounding surface reaches it through
+/// `is_import_like_symbol`, which also requires a module-shaped kind, while the
+/// search surface must apply it to a re-export the index resolved to a callable
+/// kind. Either way an alias must not be read as an entry point.
+pub(crate) fn is_import_like_name(name: &str) -> bool {
     let trimmed = name.trim();
     is_wrapped_import_name(trimmed) || is_relative_import_path(trimmed) || trimmed.contains('/')
 }
@@ -450,8 +456,18 @@ fn diversify_grounding_root_records(
             grounding_root_terminal_name(record),
         )
     };
-    let mut diversified = diversify_root_order(production, |_| false, surface_key);
-    diversified.extend(diversify_root_order(secondary, |_| false, surface_key));
+    // One diversity state across both tiers: a secondary candidate whose name a
+    // production root already spent must not consume a novel-name slot of its
+    // own, which is the duplicate-name diversity #1338 requires stay intact.
+    let mut state = RootDiversityState::default();
+    let mut diversified =
+        diversify_root_order_within(production, |_| false, surface_key, &mut state);
+    diversified.extend(diversify_root_order_within(
+        secondary,
+        |_| false,
+        surface_key,
+        &mut state,
+    ));
     diversified
 }
 
@@ -530,15 +546,21 @@ fn grounding_root_candidate_files(
                 summary.file.id,
             ));
     }
+    // Round-robin the quota rather than walking subsystems in key order and
+    // truncating: taking two files from each subsystem in turn would spend the
+    // whole half-limit on the alphabetically first twelve, and a repository's
+    // later-sorting source areas would be silently absent from the universe.
+    // One file per subsystem first means breadth survives the truncation.
     let mut quota_files = Vec::new();
-    for candidates in by_subsystem.values_mut() {
-        candidates.sort();
-        quota_files.extend(
-            candidates
-                .iter()
-                .take(SUBSYSTEM_FILE_QUOTA)
-                .map(|candidate| candidate.3),
-        );
+    for slot in 0..SUBSYSTEM_FILE_QUOTA {
+        for candidates in by_subsystem.values_mut() {
+            if slot == 0 {
+                candidates.sort();
+            }
+            if let Some(candidate) = candidates.get(slot) {
+                quota_files.push(candidate.3);
+            }
+        }
     }
     quota_files.truncate(ARCHITECTURE_ROOT_FILE_HALF_LIMIT);
 

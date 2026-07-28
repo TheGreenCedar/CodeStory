@@ -823,10 +823,28 @@ pub(super) fn search_plan_runtime_call_is_speculative(
     })
 }
 
+/// Per-request memo of which caller nodes are test- or benchmark-owned.
+///
+/// Each miss costs a node read plus a file-path resolution, and the orientation
+/// regime walks the callers of up to `SEARCH_ORIENTATION_WINDOW` hits, so a hub
+/// node's callers would otherwise be re-resolved once per inbound edge and once
+/// again for every other hit they call.
+pub(super) type SearchPlanCallerRoles = HashMap<GraphNodeId, bool>;
+
 pub(super) fn search_plan_caller_is_test_or_bench(
     storage: &Storage,
     caller_id: GraphNodeId,
+    memo: &mut SearchPlanCallerRoles,
 ) -> bool {
+    if let Some(known) = memo.get(&caller_id) {
+        return *known;
+    }
+    let resolved = search_plan_caller_role_is_test_or_bench(storage, caller_id);
+    memo.insert(caller_id, resolved);
+    resolved
+}
+
+fn search_plan_caller_role_is_test_or_bench(storage: &Storage, caller_id: GraphNodeId) -> bool {
     let Ok(Some(caller)) = storage.get_node(caller_id) else {
         return false;
     };
@@ -1304,6 +1322,7 @@ impl AppController {
         evidence: &mut OrientationEvidence,
     ) {
         let mut file_facts = HashMap::<String, (Option<FileRole>, String)>::new();
+        let mut caller_roles = SearchPlanCallerRoles::new();
         for hit in hits {
             if evidence.contains(&hit.node_id) {
                 continue;
@@ -1339,7 +1358,7 @@ impl AppController {
             // rather than as proven-unreferenced: `bounded_candidate_window`
             // reports the gap and the structural tie-breakers still apply.
             let degrees = if evidence.claim_graph_slot(SEARCH_ORIENTATION_WINDOW) {
-                self.search_plan_active_path_evidence_for_hit(storage, hit)
+                self.search_plan_active_path_evidence_for_hit(storage, hit, &mut caller_roles)
                     .map(SearchPlanActivePathEvidence::degrees)
                     .unwrap_or_default()
             } else {
@@ -1356,7 +1375,7 @@ impl AppController {
                     entry: entry_evidence(
                         matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD),
                         role,
-                        false,
+                        crate::grounding::is_import_like_name(&hit.display_name),
                         &terminal_symbol_segment(&hit.display_name),
                         degrees,
                     ),
@@ -1378,11 +1397,14 @@ impl AppController {
         I: IntoIterator<Item = &'a SearchHit>,
     {
         let mut evidence = HashMap::new();
+        let mut caller_roles = SearchPlanCallerRoles::new();
         for hit in hits {
             if evidence.contains_key(&hit.node_id) {
                 continue;
             }
-            if let Some(active_path) = self.search_plan_active_path_evidence_for_hit(storage, hit) {
+            if let Some(active_path) =
+                self.search_plan_active_path_evidence_for_hit(storage, hit, &mut caller_roles)
+            {
                 evidence.insert(hit.node_id.clone(), active_path);
             }
         }
@@ -1393,6 +1415,7 @@ impl AppController {
         &self,
         storage: &Storage,
         hit: &SearchHit,
+        caller_roles: &mut SearchPlanCallerRoles,
     ) -> Option<SearchPlanActivePathEvidence> {
         if !search_plan_callable_hit(hit) {
             return None;
@@ -1415,7 +1438,7 @@ impl AppController {
                 continue;
             }
             if target == node_id {
-                if !search_plan_caller_is_test_or_bench(storage, source) {
+                if !search_plan_caller_is_test_or_bench(storage, source, caller_roles) {
                     callers.insert(source);
                 }
             } else if source == node_id {

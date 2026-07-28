@@ -260,6 +260,17 @@ pub(crate) fn helper_like_name_or_path(display_name: &str, file_path: Option<&st
         })
 }
 
+/// Surfaces and names a diversification pass has already spent.
+///
+/// Carried across consecutive tiers of one list -- production before secondary,
+/// say -- so a later tier does not rediscover a name the earlier tier already
+/// emitted and re-spend a slot on the duplicate.
+#[derive(Debug, Default)]
+pub(crate) struct RootDiversityState {
+    seen_surfaces: HashSet<String>,
+    seen_names: HashSet<String>,
+}
+
 /// Reorder a pre-sorted candidate list so distinct subsystems and names reach
 /// the front, without taking a limit.
 ///
@@ -271,22 +282,35 @@ pub(crate) fn diversify_root_order<T>(
     pinned: impl Fn(&T) -> bool,
     surface_key: impl Fn(&T) -> (String, String),
 ) -> Vec<T> {
-    if items.len() <= 1 {
+    diversify_root_order_within(
+        items,
+        pinned,
+        surface_key,
+        &mut RootDiversityState::default(),
+    )
+}
+
+/// `diversify_root_order` continuing an existing tier's diversity state.
+pub(crate) fn diversify_root_order_within<T>(
+    items: Vec<T>,
+    pinned: impl Fn(&T) -> bool,
+    surface_key: impl Fn(&T) -> (String, String),
+    state: &mut RootDiversityState,
+) -> Vec<T> {
+    if items.is_empty() {
         return items;
     }
 
     let keys = items.iter().map(&surface_key).collect::<Vec<_>>();
     let mut passes = vec![3u8; items.len()];
-    let mut seen_surfaces = HashSet::new();
-    let mut seen_names = HashSet::new();
 
     // Pass 0 keeps pinned candidates where they are and seeds the seen sets, so
     // diversification never spends a slot repeating something already pinned.
     for (index, item) in items.iter().enumerate() {
         if pinned(item) {
             passes[index] = 0;
-            seen_surfaces.insert(keys[index].0.clone());
-            seen_names.insert(keys[index].1.clone());
+            state.seen_surfaces.insert(keys[index].0.clone());
+            state.seen_names.insert(keys[index].1.clone());
         }
     }
     for index in 0..items.len() {
@@ -294,9 +318,9 @@ pub(crate) fn diversify_root_order<T>(
             continue;
         }
         let (surface, name) = &keys[index];
-        if !seen_surfaces.contains(surface) && !seen_names.contains(name) {
-            seen_surfaces.insert(surface.clone());
-            seen_names.insert(name.clone());
+        if !state.seen_surfaces.contains(surface) && !state.seen_names.contains(name) {
+            state.seen_surfaces.insert(surface.clone());
+            state.seen_names.insert(name.clone());
             passes[index] = 1;
         }
     }
@@ -304,7 +328,7 @@ pub(crate) fn diversify_root_order<T>(
         if passes[index] != 3 {
             continue;
         }
-        if seen_names.insert(keys[index].1.clone()) {
+        if state.seen_names.insert(keys[index].1.clone()) {
             passes[index] = 2;
         }
     }

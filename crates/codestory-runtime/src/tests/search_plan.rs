@@ -1,10 +1,15 @@
 use super::{
     HashMap, HashSet, Path, SearchHitOrigin, SearchPlanActivePathEvidence, SearchPlanChannelDto,
-    fs, orientation_query, same_search_file, search_plan_anchor_groups, search_plan_eligible,
-    search_plan_path_is_test_or_bench, search_plan_rejected_hits,
+    fs, graph_bridge_evidence_kind, orientation_query, same_search_file, search_plan_anchor_groups,
+    search_plan_eligible, search_plan_path_is_test_or_bench, search_plan_rejected_hits,
     search_plan_runtime_call_is_speculative, search_plan_subqueries, search_plan_terms,
     search_plan_test_hit, tempdir,
 };
+use codestory_contracts::api::{
+    EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
+    SearchPlanBridgeEvidenceKindDto,
+};
+use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
 use crate::root_rank::{CallDegrees, EntryEvidence, diversify_root_order};
 use crate::search_plan::search_orientation_report;
 use crate::search_terms::search_plan_query_token_closure;
@@ -358,6 +363,59 @@ fn search_plan_speculation_policy_matches_hidden_trail_edges() {
         Some(codestory_contracts::graph::ResolutionCertainty::Certain),
         Some(codestory_contracts::graph::ResolutionCertainty::CERTAIN_MIN)
     ));
+}
+
+#[test]
+fn bridge_evidence_uses_collector_canonical_ids_not_display_labels() {
+    fn graph(callsite_identity: Option<&str>, label: &str) -> GraphResponse {
+        GraphResponse {
+            center_id: NodeId("n1".to_string()),
+            nodes: vec![GraphNodeDto {
+                id: NodeId("n1".to_string()),
+                label: label.to_string(),
+                kind: NodeKind::FUNCTION,
+                depth: 0,
+                label_policy: None,
+                badge_visible_members: None,
+                badge_total_members: None,
+                merged_symbol_examples: Vec::new(),
+                file_path: Some("src/handler.ts".to_string()),
+                qualified_name: None,
+                member_access: None,
+            }],
+            edges: vec![GraphEdgeDto {
+                id: EdgeId("e1".to_string()),
+                source: NodeId("n1".to_string()),
+                target: NodeId("n1".to_string()),
+                kind: EdgeKind::CALL,
+                confidence: None,
+                certainty: None,
+                callsite_identity: callsite_identity.map(str::to_string),
+                candidate_targets: Vec::new(),
+            }],
+            truncated: false,
+            omitted_edge_count: 0,
+            canonical_layout: None,
+        }
+    }
+
+    let structured = STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES
+        .first()
+        .map(|prefix| format!("{prefix}orders"))
+        .expect("at least one structural collection namespace");
+    assert_eq!(
+        graph_bridge_evidence_kind(&graph(Some(&structured), "run")),
+        SearchPlanBridgeEvidenceKindDto::DataCollectionUsage,
+        "a collector's canonical id is the evidence"
+    );
+
+    // The rendered label is what the deleted sniffs read. A node may say
+    // anything; only the structured id written by the collector counts.
+    assert_ne!(
+        graph_bridge_evidence_kind(&graph(None, "payload collection orders route; confidence=0.9")),
+        SearchPlanBridgeEvidenceKindDto::DataCollectionUsage,
+        "a display label must not stand in for collector evidence"
+    );
 }
 
 #[test]
