@@ -279,9 +279,8 @@ pub use symbol_query::{
     symbol_name_match_rank, symbol_query_tokens, terminal_symbol_segment,
 };
 pub(crate) use symbol_query::{
-    architecture_query_intents, compare_search_hits_with_project_root, exact_symbol_query_terms,
-    is_non_primary_source_term, looks_like_standalone_symbol_query,
-    query_mentions_non_primary_source,
+    compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_term,
+    looks_like_standalone_symbol_query, query_mentions_non_primary_source,
 };
 #[cfg(test)]
 pub(crate) use symbol_query::{is_non_primary_source_hit, mixed_natural_language_query};

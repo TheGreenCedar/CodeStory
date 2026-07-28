@@ -142,7 +142,7 @@ fn compare_nodes(
         .then(left.id.0.cmp(&right.id.0))
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()

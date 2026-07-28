@@ -778,6 +778,14 @@ pub struct SearchQueryAssessmentDto {
     pub repo_text_fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_next_action: Option<String>,
+    /// Orientation confidence and uncertainty for structure-shaped queries.
+    ///
+    /// Reuses the grounding orientation type deliberately: `ground` and
+    /// `search` then report one orientation vocabulary, and the generated
+    /// TypeScript the plugin consumes gains a field rather than a rename.
+    /// Absent when the request is not an orientation query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<GroundingOrientationDto>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]

@@ -1,6 +1,7 @@
-use codestory_contracts::api::{NodeKind, SearchHit, SearchHitOrigin};
+use crate::root_rank::{CallDegrees, EntryEvidence, degree_tier};
+use codestory_contracts::api::{NodeId, NodeKind, SearchHit, SearchHitOrigin};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +12,11 @@ pub struct SymbolNameMatchRank {
     pub exact_leading: u8,
 }
 
+/// Every field is higher-is-better; `compare_ranked_hits` reverses the whole
+/// tuple. Repository-derived orientation evidence sits below the exactness and
+/// non-primary-source buckets so it can never rescue a demoted hit, and above
+/// the name/path match buckets so entry points can actually outrank leaf
+/// aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SearchMatchRank {
     full_definition: u8,
@@ -20,16 +26,87 @@ struct SearchMatchRank {
     exact_terminal: u8,
     exact_leading: u8,
     source_bucket: u8,
+    entry_evidence: u8,
+    not_helper: u8,
+    reference_tier: u8,
+    reach_tier: u8,
+    structural_rank_inv: u8,
     camel_case_match: u8,
     compound_term_match: u8,
     path_term_match: u8,
-    architecture_role_intent: u8,
-    architecture_source_bucket: u8,
     query_kind_intent: u8,
     query_entrypoint_intent: u8,
     kind_bucket: u8,
     kind_tiebreak: u8,
     indexed_symbol: u8,
+}
+
+/// Repository-derived evidence for one candidate in the orientation regime.
+///
+/// Built once per request from the pinned publication and shared by every
+/// comparison, so the comparator itself performs no storage reads.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OrientationHitEvidence {
+    pub(crate) entry: EntryEvidence,
+    pub(crate) helper_like: bool,
+    pub(crate) degrees: CallDegrees,
+    pub(crate) structural_rank: u8,
+    pub(crate) subsystem: String,
+}
+
+/// The orientation-regime evidence map for one search request.
+///
+/// `None` at a call site means the request is not an orientation query, and
+/// every new rank field then takes a constant. A field constant across all
+/// candidates contributes `Ordering::Equal` to every comparison, so the induced
+/// order is exactly the order of the tuple without those fields.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OrientationEvidence {
+    by_node: HashMap<NodeId, OrientationHitEvidence>,
+}
+
+impl OrientationEvidence {
+    pub(crate) fn insert(&mut self, node_id: NodeId, evidence: OrientationHitEvidence) {
+        self.by_node.insert(node_id, evidence);
+    }
+
+    pub(crate) fn get(&self, node_id: &NodeId) -> Option<&OrientationHitEvidence> {
+        self.by_node.get(node_id)
+    }
+
+    /// True when nothing in the evaluated window carries any call degree, so
+    /// the order below role and structure is not backed by graph evidence.
+    pub(crate) fn graph_signal_thin(&self) -> bool {
+        !self.by_node.is_empty()
+            && self
+                .by_node
+                .values()
+                .all(|evidence| evidence.degrees.is_empty())
+    }
+
+    pub(crate) fn entrypoint_roots(&self, node_ids: impl Iterator<Item = NodeId>) -> usize {
+        node_ids
+            .filter(|node_id| {
+                self.get(node_id)
+                    .is_some_and(|evidence| evidence.entry != EntryEvidence::None)
+            })
+            .count()
+    }
+
+    pub(crate) fn entrypoint_roots_in_map(&self) -> usize {
+        self.by_node
+            .values()
+            .filter(|evidence| evidence.entry != EntryEvidence::None)
+            .count()
+    }
+
+    pub(crate) fn subsystems(&self) -> HashSet<&str> {
+        self.by_node
+            .values()
+            .map(|evidence| evidence.subsystem.as_str())
+            .filter(|subsystem| !subsystem.is_empty())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,292 +656,6 @@ fn terms_contain_phrase(terms: &[String], phrase: &[&str]) -> bool {
         .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArchitectureQueryIntent {
-    Orchestration,
-    Pipeline,
-    Entrypoint,
-    Handoff,
-    CliRuntime,
-    PageRender,
-    DataLoader,
-    Auth,
-    Feed,
-    Persistence,
-}
-
-impl ArchitectureQueryIntent {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Orchestration => "orchestration",
-            Self::Pipeline => "pipeline",
-            Self::Entrypoint => "entrypoint",
-            Self::Handoff => "handoff",
-            Self::CliRuntime => "cli-runtime",
-            Self::PageRender => "page-render",
-            Self::DataLoader => "data-loader",
-            Self::Auth => "auth",
-            Self::Feed => "feed",
-            Self::Persistence => "persistence",
-        }
-    }
-}
-
-pub(crate) fn architecture_query_intents(query: &str) -> Vec<ArchitectureQueryIntent> {
-    let terms = query_terms(query);
-    let mut intents = Vec::new();
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "architecture"
-                | "architectural"
-                | "orchestration"
-                | "orchestrator"
-                | "orchestrate"
-                | "coordinates"
-                | "coordinate"
-                | "workflow"
-                | "flow"
-                | "flows"
-                | "connect"
-                | "connects"
-                | "connected"
-        )
-    }) || terms_contain_phrase(&terms, &["explain", "how"])
-    {
-        intents.push(ArchitectureQueryIntent::Orchestration);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "pipeline" | "pipelines" | "stage" | "staged" | "staging"
-        )
-    }) {
-        intents.push(ArchitectureQueryIntent::Pipeline);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "entrypoint" | "entrypoints" | "entry" | "main" | "start" | "starts"
-        )
-    }) || terms_contain_phrase(&terms, &["entry", "point"])
-    {
-        intents.push(ArchitectureQueryIntent::Entrypoint);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "handoff" | "handoffs" | "dispatch" | "dispatches" | "bridge" | "bridges"
-        )
-    }) || terms_contain_phrase(&terms, &["hands", "off"])
-        || terms_contain_phrase(&terms, &["hand", "off"])
-    {
-        intents.push(ArchitectureQueryIntent::Handoff);
-    }
-    if terms
-        .iter()
-        .any(|term| matches!(term.as_str(), "cli" | "runtime" | "command" | "commands"))
-        || terms_contain_phrase(&terms, &["cli", "runtime"])
-    {
-        intents.push(ArchitectureQueryIntent::CliRuntime);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "page" | "render" | "renders" | "rendering" | "route" | "routes"
-        )
-    }) {
-        intents.push(ArchitectureQueryIntent::PageRender);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "loader" | "loaders" | "load" | "loads" | "fetch" | "fetches"
-        )
-    }) || terms_contain_phrase(&terms, &["data", "loader"])
-    {
-        intents.push(ArchitectureQueryIntent::DataLoader);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "auth" | "authentication" | "authorization" | "session" | "login"
-        )
-    }) {
-        intents.push(ArchitectureQueryIntent::Auth);
-    }
-    if terms
-        .iter()
-        .any(|term| matches!(term.as_str(), "feed" | "feeds" | "social" | "timeline"))
-    {
-        intents.push(ArchitectureQueryIntent::Feed);
-    }
-    if terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "persistence"
-                | "persist"
-                | "persists"
-                | "storage"
-                | "store"
-                | "stored"
-                | "snapshot"
-                | "publish"
-                | "publishes"
-                | "save"
-                | "saves"
-                | "write"
-                | "writes"
-        )
-    }) {
-        intents.push(ArchitectureQueryIntent::Persistence);
-    }
-    intents
-}
-
-fn architecture_query_has_intent(query: &str) -> bool {
-    !architecture_query_intents(query).is_empty()
-}
-
-fn architecture_candidate_source_bucket(query: &str, hit: &SearchHit, is_exact_match: bool) -> u8 {
-    if is_exact_match || !architecture_query_has_intent(query) {
-        return 1;
-    }
-    if is_non_primary_source_hit(hit) {
-        return 0;
-    }
-    if architecture_helper_like_hit(hit) {
-        return 1;
-    }
-    2
-}
-
-fn architecture_helper_like_hit(hit: &SearchHit) -> bool {
-    let text = format!(
-        "{} {}",
-        hit.display_name.to_ascii_lowercase(),
-        hit.file_path
-            .as_deref()
-            .unwrap_or_default()
-            .replace('\\', "/")
-            .to_ascii_lowercase()
-    );
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|term| {
-            matches!(
-                term,
-                "helper" | "helpers" | "mock" | "mocks" | "fake" | "fixture" | "fixtures"
-            )
-        })
-}
-
-fn architecture_role_intent_bucket(query: &str, hit: &SearchHit, is_exact_match: bool) -> u8 {
-    if is_exact_match {
-        return 0;
-    }
-    let intents = architecture_query_intents(query);
-    if intents.is_empty() || hit.origin == SearchHitOrigin::TextMatch {
-        return 0;
-    }
-    let candidate_terms = architecture_candidate_terms(hit);
-    let mut bucket = 0;
-    for intent in intents {
-        bucket = bucket.max(architecture_intent_candidate_bucket(
-            intent,
-            &candidate_terms,
-        ));
-    }
-    bucket
-}
-
-fn architecture_candidate_terms(hit: &SearchHit) -> Vec<String> {
-    let display = hit.display_name.replace("::", " ").replace('_', " ");
-    let mut terms = query_terms(&display);
-    if let Some(path) = hit.file_path.as_deref() {
-        let path = path.replace('\\', "/").replace(['/', '.', '-', '_'], " ");
-        terms.extend(query_terms(&path));
-    }
-    terms
-}
-
-fn architecture_intent_candidate_bucket(intent: ArchitectureQueryIntent, terms: &[String]) -> u8 {
-    let any = |needles: &[&str]| {
-        terms
-            .iter()
-            .any(|term| needles.iter().any(|needle| term == needle))
-    };
-    let phrase = |needles: &[&str]| terms_contain_phrase(terms, needles);
-    match intent {
-        ArchitectureQueryIntent::Orchestration => u8::from(any(&[
-            "orchestrate",
-            "orchestrator",
-            "run",
-            "execute",
-            "dispatch",
-            "handle",
-            "workflow",
-            "controller",
-            "manager",
-            "service",
-        ])),
-        ArchitectureQueryIntent::Pipeline => u8::from(any(&[
-            "pipeline", "stage", "staged", "prepare", "build", "finalize", "index", "publish",
-            "run",
-        ])),
-        ArchitectureQueryIntent::Entrypoint => u8::from(
-            any(&["main", "run", "start", "open", "handle", "index_full"])
-                || phrase(&["index", "full"]),
-        ),
-        ArchitectureQueryIntent::Handoff => u8::from(any(&[
-            "handoff", "dispatch", "route", "bridge", "ensure", "open", "call", "handle", "execute",
-        ])),
-        ArchitectureQueryIntent::CliRuntime => u8::from(any(&[
-            "cli", "runtime", "command", "run", "ensure", "open", "handler", "stdio", "snippet",
-            "trail", "search", "index",
-        ])),
-        ArchitectureQueryIntent::PageRender => u8::from(any(&[
-            "page",
-            "render",
-            "route",
-            "layout",
-            "component",
-            "home",
-            "view",
-        ])),
-        ArchitectureQueryIntent::DataLoader => u8::from(any(&[
-            "load", "loader", "get", "fetch", "query", "select", "find", "read",
-        ])),
-        ArchitectureQueryIntent::Auth => u8::from(any(&[
-            "auth",
-            "authentication",
-            "authorization",
-            "session",
-            "login",
-            "user",
-            "verify",
-        ])),
-        ArchitectureQueryIntent::Feed => u8::from(any(&[
-            "feed", "feeds", "social", "sync", "entry", "entries",
-        ])),
-        ArchitectureQueryIntent::Persistence => u8::from(any(&[
-            "persist",
-            "persistence",
-            "store",
-            "storage",
-            "snapshot",
-            "publish",
-            "save",
-            "write",
-            "flush",
-            "commit",
-            "upsert",
-            "insert",
-            "finalize",
-            "staged",
-        ])),
-    }
-}
-
 fn query_entrypoint_intent_bucket(query: &str, display_name: &str, is_exact_match: bool) -> u8 {
     if is_exact_match {
         return 0;
@@ -965,7 +756,12 @@ pub(crate) fn is_non_primary_source_hit(hit: &SearchHit) -> bool {
     retrieval_file_role_for_hit(hit).is_non_primary()
 }
 
-fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> SearchMatchRank {
+fn search_match_rank(
+    project_root: Option<&Path>,
+    query: &str,
+    hit: &SearchHit,
+    evidence: Option<&OrientationEvidence>,
+) -> SearchMatchRank {
     let (rank, matched_symbol_query) = best_symbol_name_match(query, &hit.display_name);
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
@@ -986,14 +782,15 @@ fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) 
     let query_kind_intent = query_kind_intent_bucket(query, hit.kind, is_exact_match);
     let query_entrypoint_intent =
         query_entrypoint_intent_bucket(query, &hit.display_name, is_exact_match);
-    let architecture_role_intent = architecture_role_intent_bucket(query, hit, is_exact_match);
-    let architecture_source_bucket =
-        architecture_candidate_source_bucket(query, hit, is_exact_match);
     let kind_tiebreak = if is_exact_match {
         search_kind_tiebreak(hit.kind)
     } else {
         0
     };
+    let orientation = evidence.and_then(|evidence| evidence.get(&hit.node_id));
+    // Graph evidence must never rescue a demoted test, vendor, or generated
+    // hit, so reference weight is forced off for non-primary sources.
+    let primary_source = source_bucket == 1 && !is_non_primary_source_hit(hit);
 
     SearchMatchRank {
         full_definition,
@@ -1003,11 +800,24 @@ fn search_match_rank(project_root: Option<&Path>, query: &str, hit: &SearchHit) 
         exact_terminal: rank.exact_terminal,
         exact_leading: rank.exact_leading,
         source_bucket,
+        entry_evidence: orientation.map_or(0, |orientation| orientation.entry.weight()),
+        not_helper: orientation.map_or(1, |orientation| u8::from(!orientation.helper_like)),
+        reference_tier: orientation.map_or(0, |orientation| {
+            if primary_source {
+                degree_tier(orientation.degrees.production_in_calls).0
+            } else {
+                0
+            }
+        }),
+        reach_tier: orientation.map_or(0, |orientation| {
+            degree_tier(orientation.degrees.out_calls).0
+        }),
+        structural_rank_inv: orientation.map_or(0, |orientation| {
+            3u8.saturating_sub(orientation.structural_rank)
+        }),
         camel_case_match: camel_case_match_bucket(query, &hit.display_name, is_exact_match),
         compound_term_match: compound_term_match_bucket(query, &hit.display_name, is_exact_match),
         path_term_match: path_term_match_bucket(query, hit, is_exact_match),
-        architecture_role_intent,
-        architecture_source_bucket,
         query_kind_intent,
         query_entrypoint_intent,
         kind_bucket,
@@ -1287,7 +1097,17 @@ fn read_source_line(project_root: Option<&Path>, path: &str, line: u32) -> Optio
 
 #[cfg(test)]
 pub(crate) fn compare_search_hits(query: &str, left: &SearchHit, right: &SearchHit) -> Ordering {
-    compare_search_hits_with_project_root(None, query, left, right)
+    compare_search_hits_with_project_root(None, query, left, right, None)
+}
+
+#[cfg(test)]
+pub(crate) fn compare_search_hits_with_project_root_for_test(
+    project_root: Option<&Path>,
+    query: &str,
+    left: &SearchHit,
+    right: &SearchHit,
+) -> Ordering {
+    compare_search_hits_with_project_root(project_root, query, left, right, None)
 }
 
 pub(crate) fn compare_search_hits_with_project_root(
@@ -1295,12 +1115,13 @@ pub(crate) fn compare_search_hits_with_project_root(
     query: &str,
     left: &SearchHit,
     right: &SearchHit,
+    evidence: Option<&OrientationEvidence>,
 ) -> Ordering {
     compare_ranked_hits(
         left,
         right,
-        search_match_rank(project_root, query, left),
-        search_match_rank(project_root, query, right),
+        search_match_rank(project_root, query, left, evidence),
+        search_match_rank(project_root, query, right, evidence),
     )
 }
 
@@ -1523,144 +1344,70 @@ mod tests {
     }
 
     #[test]
-    fn detects_architecture_query_intent_buckets() {
-        let labels = architecture_query_intents(
-            "How does the CLI runtime hand off to the page render data loader auth feed persistence pipeline entrypoint?",
-        )
-        .into_iter()
-        .map(|intent| intent.label())
-        .collect::<Vec<_>>();
-
-        for expected in [
-            "pipeline",
-            "entrypoint",
-            "handoff",
-            "cli-runtime",
-            "page-render",
-            "data-loader",
-            "auth",
-            "feed",
-            "persistence",
-        ] {
-            assert!(
-                labels.contains(&expected),
-                "missing {expected} in {labels:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn architecture_queries_prefer_production_entrypoints_over_helpers() {
+    fn orientation_evidence_keeps_helpers_and_test_owners_below_production_roots() {
         let production = hit_at_path(
-            "run_index_once",
-            "run_index_once",
+            "production",
+            "zqRunOnce",
             NodeKind::FUNCTION,
             0.40,
-            "crates/codestory-cli/src/main.rs",
+            "crates/some-crate/src/main.rs",
         );
         let helper = hit_at_path(
             "helper",
-            "run_index_once_helper",
+            "zqRunOnceHelper",
             NodeKind::FUNCTION,
             0.98,
-            "crates/codestory-cli/src/helpers.rs",
+            "crates/some-crate/src/helpers.rs",
         );
         let test = hit_at_path(
             "test",
-            "tests::run_index_once",
+            "tests::zqRunOnce",
             NodeKind::FUNCTION,
             0.99,
-            "crates/codestory-cli/tests/index_flow.rs",
+            "crates/some-crate/tests/flow.rs",
         );
+
+        let mut evidence = OrientationEvidence::default();
+        evidence.insert(
+            production.node_id.clone(),
+            OrientationHitEvidence {
+                entry: EntryEvidence::TopologicalRoot,
+                helper_like: false,
+                degrees: CallDegrees {
+                    production_in_calls: 0,
+                    out_calls: 4,
+                },
+                structural_rank: 1,
+                subsystem: "rust:crates/some-crate".to_string(),
+            },
+        );
+        for hit in [&helper, &test] {
+            evidence.insert(
+                hit.node_id.clone(),
+                OrientationHitEvidence {
+                    entry: EntryEvidence::None,
+                    helper_like: true,
+                    degrees: CallDegrees::default(),
+                    structural_rank: 1,
+                    subsystem: "rust:crates/some-crate".to_string(),
+                },
+            );
+        }
 
         let mut hits = [test, helper, production.clone()];
         hits.sort_by(|left, right| {
-            compare_search_hits("CLI runtime full index entrypoint handoff", left, right)
+            compare_search_hits_with_project_root(
+                None,
+                "explain how the modules connect end to end",
+                left,
+                right,
+                Some(&evidence),
+            )
         });
 
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&production.node_id)
-        );
-    }
-
-    #[test]
-    fn architecture_queries_surface_cross_repo_decisive_candidates() {
-        let sourcetrail = hit_at_path(
-            "sourcetrail",
-            "Project::buildIndex",
-            NodeKind::METHOD,
-            0.40,
-            "src/lib/project/Project.cpp",
-        );
-        let sourcetrail_helper = hit_at_path(
-            "sourcetrail_helper",
-            "buildIndexFixture",
-            NodeKind::FUNCTION,
-            0.99,
-            "tests/project/buildIndexFixture.cpp",
-        );
-        let mut sourcetrail_hits = [sourcetrail_helper, sourcetrail.clone()];
-        sourcetrail_hits.sort_by(|left, right| {
-            compare_search_hits(
-                "project indexing pipeline entrypoint build index",
-                left,
-                right,
-            )
-        });
-        assert_eq!(
-            sourcetrail_hits.first().map(|hit| &hit.node_id),
-            Some(&sourcetrail.node_id)
-        );
-
-        let rootandruntime = hit_at_path(
-            "rootandruntime",
-            "getElsewhereFeed",
-            NodeKind::FUNCTION,
-            0.40,
-            "src/lib/social-feed.ts",
-        );
-        let rootandruntime_helper = hit_at_path(
-            "rootandruntime_helper",
-            "mockElsewhereFeed",
-            NodeKind::FUNCTION,
-            0.99,
-            "src/lib/__fixtures__/social-feed.ts",
-        );
-        let mut rootandruntime_hits = [rootandruntime_helper, rootandruntime.clone()];
-        rootandruntime_hits.sort_by(|left, right| {
-            compare_search_hits("how does the public feed data loader work", left, right)
-        });
-        assert_eq!(
-            rootandruntime_hits.first().map(|hit| &hit.node_id),
-            Some(&rootandruntime.node_id)
-        );
-
-        let batcave = hit_at_path(
-            "batcave",
-            "RuntimeStore::snapshot",
-            NodeKind::METHOD,
-            0.40,
-            "src/BatCave.App/src-tauri/src/runtime_store.rs",
-        );
-        let batcave_test = hit_at_path(
-            "batcave_test",
-            "RuntimeStore::snapshot_fixture",
-            NodeKind::METHOD,
-            0.99,
-            "src/BatCave.App/src-tauri/tests/runtime_store.rs",
-        );
-        let mut batcave_hits = [batcave_test, batcave.clone()];
-        batcave_hits.sort_by(|left, right| {
-            compare_search_hits(
-                "runtime persistence snapshot handoff architecture",
-                left,
-                right,
-            )
-        });
-        assert_eq!(
-            batcave_hits.first().map(|hit| &hit.node_id),
-            Some(&batcave.node_id)
         );
     }
 
@@ -1756,7 +1503,7 @@ mod tests {
             target_definition.clone(),
         ];
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(
+            compare_search_hits_with_project_root_for_test(
                 Some(project_root),
                 "codex_exec::Cli",
                 left,
@@ -1806,7 +1553,7 @@ mod tests {
 
         let mut hits = [terminal_callable, exact_variant.clone()];
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(
+            compare_search_hits_with_project_root_for_test(
                 Some(project_root),
                 "Subcommand::Exec",
                 left,
@@ -2340,7 +2087,12 @@ mod tests {
 
         let mut hits = [forward, definition.clone()];
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(Some(temp.path()), "StorageAccess", left, right)
+            compare_search_hits_with_project_root_for_test(
+                Some(temp.path()),
+                "StorageAccess",
+                left,
+                right,
+            )
         });
 
         assert_eq!(

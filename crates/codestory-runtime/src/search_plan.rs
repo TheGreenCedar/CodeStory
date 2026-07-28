@@ -6,10 +6,14 @@ use super::{
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDto,
     SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
     SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, architecture_query_intents,
-    clamp_usize_to_u32, compare_search_hits_with_project_root, leading_symbol_segment,
-    looks_like_repo_text_query, normalize_symbol_query, retrieval_file_role_from_path,
+    SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, clamp_usize_to_u32,
+    compare_search_hits_with_project_root, leading_symbol_segment, looks_like_repo_text_query,
+    normalize_symbol_query, retrieval_file_role_from_path,
     retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
+};
+use crate::root_rank::{
+    self, CallDegrees, SEARCH_ORIENTATION_WINDOW, degree_tier, entry_evidence,
+    helper_like_name_or_path, structural_path_rank, subsystem_key_for_path,
 };
 use crate::search_intent::{
     SearchIntentFilter, SearchIntentQuery, annotate_search_hit_match_quality,
@@ -17,19 +21,97 @@ use crate::search_intent::{
     search_query_assessment,
 };
 use crate::search_scoring::{
-    ArchitectureCoverage, apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
     dedupe_inexact_search_hits_by_display_key, did_you_mean_suggestions,
     merge_search_hits_by_node_id, search_plan_subquery_candidate_limit,
 };
 use crate::search_terms::{
     SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS, SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER,
     SEARCH_PLAN_MAX_SEED_ANCHORS, SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT,
-    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_ROLE_SPECS,
-    SEARCH_PLAN_SEED_ANCHOR_MARKER, SEARCH_PLAN_SYMBOL_TERMS, search_plan_terms,
+    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER,
+    search_plan_identifier_shaped_term, search_plan_query_token_closure, search_plan_terms,
 };
+use crate::symbol_query::{OrientationEvidence, OrientationHitEvidence, is_non_primary_source_hit};
+use codestory_contracts::api::{GroundingOrientationDto, GroundingOrientationUncertaintyDto};
+use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
+use codestory_store::FileRole;
+use std::cmp::Reverse;
+use std::path::Path;
+
+/// The only search-plan intent label there is now.
+pub(super) const SEARCH_PLAN_ORIENTATION_INTENT: &str = "orientation";
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
     bridge.confidence == SearchPlanBridgeConfidenceDto::Low
+}
+
+/// Report what the orientation regime could and could not prove.
+///
+/// The same vocabulary the compact grounding map uses, so an agent reads one
+/// orientation contract across `ground` and `search`.
+pub(super) fn search_orientation_report(
+    evidence: &OrientationEvidence,
+    total_root_candidates: usize,
+    selected: &[SearchHit],
+) -> GroundingOrientationDto {
+    let evaluated = total_root_candidates.min(SEARCH_ORIENTATION_WINDOW);
+    let candidate_entrypoint_roots = evidence.entrypoint_roots_in_map();
+    let selected_entrypoint_roots =
+        evidence.entrypoint_roots(selected.iter().map(|hit| hit.node_id.clone()));
+    let candidate_subsystems = evidence.subsystems().len();
+    let selected_subsystems = selected
+        .iter()
+        .filter(|hit| !is_non_primary_source_hit(hit))
+        .filter_map(|hit| evidence.get(&hit.node_id))
+        .map(|evidence| evidence.subsystem.clone())
+        .collect::<HashSet<_>>()
+        .len();
+    let graph_signal_thin = evidence.graph_signal_thin();
+
+    let mut uncertainty = Vec::new();
+    if total_root_candidates > evaluated {
+        uncertainty.push(GroundingOrientationUncertaintyDto::BoundedCandidateWindow);
+    }
+    if candidate_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::NoEntrypointEvidence);
+    } else if selected_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::EntrypointEvidenceOmitted);
+    }
+    if candidate_subsystems > 1 && selected_subsystems < candidate_subsystems.min(selected.len()) {
+        uncertainty.push(GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth);
+    }
+    if graph_signal_thin {
+        uncertainty.push(GroundingOrientationUncertaintyDto::GraphSignalThin);
+    }
+    if graph_signal_thin && candidate_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::LexicalFallback);
+    }
+
+    GroundingOrientationDto {
+        confidence: crate::grounding::orientation_confidence(
+            &uncertainty,
+            selected.is_empty() || candidate_entrypoint_roots == 0,
+            selected_entrypoint_roots == 0,
+        ),
+        total_root_candidates: clamp_usize_to_u32(total_root_candidates),
+        evaluated_root_candidates: clamp_usize_to_u32(evaluated),
+        candidate_entrypoint_roots: clamp_usize_to_u32(candidate_entrypoint_roots),
+        selected_entrypoint_roots: clamp_usize_to_u32(selected_entrypoint_roots),
+        candidate_subsystems: clamp_usize_to_u32(candidate_subsystems),
+        selected_subsystems: clamp_usize_to_u32(selected_subsystems),
+        uncertainty,
+    }
+}
+
+/// Bridge a path-derived retrieval role onto the store's verified role vocabulary.
+fn store_file_role_from_retrieval_role(role: RetrievalFileRole) -> FileRole {
+    match role {
+        RetrievalFileRole::Source => FileRole::Source,
+        RetrievalFileRole::Test => FileRole::Test,
+        RetrievalFileRole::Docs => FileRole::Docs,
+        RetrievalFileRole::Benchmark => FileRole::Benchmark,
+        RetrievalFileRole::Generated => FileRole::Generated,
+        RetrievalFileRole::Vendor => FileRole::Vendor,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,6 +125,16 @@ pub(super) struct SearchPlanExecutedEvidence {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SearchPlanActivePathEvidence {
     pub(super) caller_count: u32,
+    pub(super) out_call_count: u32,
+}
+
+impl SearchPlanActivePathEvidence {
+    pub(super) fn degrees(self) -> CallDegrees {
+        CallDegrees {
+            production_in_calls: self.caller_count,
+            out_calls: self.out_call_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,67 +143,67 @@ pub(super) struct SearchPlanBuild {
     indexed_symbol_hits: Vec<SearchHit>,
 }
 
-pub(super) fn search_plan_eligible(
-    query: &str,
-    exact_symbol_hit_count: u32,
-    intents: &[String],
-) -> bool {
-    let broad_query = looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4;
-    let has_seed_anchors = query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER);
-    let broad_explanation_prompt =
-        search_plan_broad_explanation_prompt_with_architecture_terms(query);
-    !intents.is_empty()
-        && broad_query
-        && (exact_symbol_hit_count == 0 || has_seed_anchors || broad_explanation_prompt)
+/// The single orientation regime gate.
+///
+/// This replaces a ten-variant intent set whose *membership* -- page render,
+/// data loader, auth, feed, persistence -- tracked the holdout domains even
+/// though each variant's vocabulary read generic. The vocabulary below is
+/// structure shape only and contains no domain noun.
+pub(super) fn orientation_query(query: &str) -> bool {
+    let broad = looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4;
+    broad && asks_about_structure(query)
 }
 
-pub(super) fn search_plan_broad_explanation_prompt_with_architecture_terms(query: &str) -> bool {
+pub(super) fn asks_about_structure(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
-    let asks_for_flow = lower.contains("explain how")
+    if lower.contains("entry point")
+        || lower.contains("end to end")
+        || lower.contains("end-to-end")
+        || lower.contains("walk through")
+        || lower.contains("explain how")
         || lower.contains("trace how")
         || lower.starts_with("how ")
-        || lower.contains(" how ");
-    if !asks_for_flow {
-        return false;
+        || lower.contains(" how ")
+    {
+        return true;
     }
-    let tokens = lower
+    lower
         .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect::<HashSet<_>>();
-    [
-        "cli",
-        "command",
-        "runtime",
-        "workspace",
-        "indexer",
-        "indexing",
-        "store",
-        "storage",
-        "persistence",
-        "snapshot",
-        "search",
-        "trail",
-        "snippet",
-        "configuration",
-        "source",
-        "activation",
-        "host",
-        "execution",
-    ]
-    .iter()
-    .filter(|term| tokens.contains(**term))
-    .count()
-        >= 3
+        .any(|token| {
+            matches!(
+                token,
+                "architecture"
+                    | "architectural"
+                    | "overview"
+                    | "structure"
+                    | "entrypoint"
+                    | "entrypoints"
+                    | "subsystem"
+                    | "subsystems"
+                    | "module"
+                    | "modules"
+                    | "component"
+                    | "components"
+                    | "pipeline"
+                    | "pipelines"
+                    | "flow"
+                    | "flows"
+                    | "connect"
+                    | "connects"
+                    | "wired"
+            )
+        })
+}
+
+pub(super) fn search_plan_eligible(query: &str, exact_symbol_hit_count: u32) -> bool {
+    orientation_query(query)
+        && (exact_symbol_hit_count == 0 || query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER))
 }
 
 pub(super) fn search_plan_subqueries(
     query: &str,
     terms: &SearchPlanTermsDto,
-    intents: &[String],
 ) -> Vec<SearchPlanSubqueryDto> {
-    if intents.is_empty() {
-        return Vec::new();
-    }
     let mut subqueries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -128,7 +220,6 @@ pub(super) fn search_plan_subqueries(
     push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_explicit_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
-    push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_named_anchor_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
@@ -214,7 +305,7 @@ pub(super) fn push_search_plan_symbol_term_subquery(
         seen,
         symbol_terms
             .iter()
-            .take(8)
+            .take(6)
             .cloned()
             .collect::<Vec<_>>()
             .join(" "),
@@ -250,92 +341,42 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     }
 }
 
+/// Extracted terms that look like declared identifiers, in extraction order.
+///
+/// Extraction order is deliberate: the previous score-then-sort ranked a fixed
+/// list of domain nouns above everything else, which is how holdout vocabulary
+/// reached the front of a typed-symbol subquery.
 pub(super) fn sorted_search_plan_symbol_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
     let mut symbol_terms = terms
         .extracted
         .iter()
-        .filter(|term| search_plan_symbol_term(term))
-        .cloned()
+        .filter(|term| search_plan_identifier_shaped_term(term))
+        .enumerate()
         .collect::<Vec<_>>();
-    symbol_terms.sort_by(|left, right| {
-        search_plan_symbol_subquery_term_score(right)
-            .cmp(&search_plan_symbol_subquery_term_score(left))
-            .then_with(|| left.cmp(right))
-    });
+    // Sort by identifier *shape* only, then by extraction order. The replaced
+    // scorer added a bonus for membership in a fixed noun list, which is how
+    // holdout vocabulary reached the front of a typed-symbol subquery.
+    symbol_terms.sort_by_key(|(order, term)| (Reverse(search_plan_term_shape(term)), *order));
     symbol_terms
+        .into_iter()
+        .map(|(_, term)| term.clone())
+        .collect()
 }
 
-pub(super) fn search_plan_symbol_term(term: &str) -> bool {
-    term.chars().any(|ch| ch.is_ascii_uppercase())
-        || SEARCH_PLAN_SYMBOL_TERMS
-            .iter()
-            .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
-}
-
-pub(super) fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
-    let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count() as u32;
-    let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count() as u32;
-    let mut score = term.len().min(40) as u32;
-    if uppercase_count >= 2 && lowercase_count > 0 {
-        score += 120;
-    } else if uppercase_count > 0 && lowercase_count > 0 {
-        score += 40;
-    }
-    if term.contains('_') || term.contains('-') {
-        score += 35;
-    }
-    if SEARCH_PLAN_SYMBOL_TERMS
-        .iter()
-        .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
-    {
-        score += 20;
-    }
-    score
+/// 2 = separator or interior capital, 1 = a plain long word.
+fn search_plan_term_shape(term: &str) -> u8 {
+    let separated = term.contains('_') || term.contains("::") || term.contains('-');
+    let interior_uppercase = term
+        .chars()
+        .skip(1)
+        .any(|character| character.is_ascii_uppercase());
+    u8::from(separated || interior_uppercase) + 1
 }
 
 pub(super) fn search_plan_named_anchor_term(term: &str) -> bool {
     let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count();
     let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count();
     uppercase_count >= 1 && lowercase_count > 0 && term.len() >= 4
-}
-
-pub(super) fn push_search_plan_role_subqueries(
-    subqueries: &mut Vec<SearchPlanSubqueryDto>,
-    seen: &mut HashSet<String>,
-    terms: &SearchPlanTermsDto,
-) {
-    for (role, needles) in SEARCH_PLAN_ROLE_SPECS {
-        let role_terms = search_plan_matching_terms(terms, needles);
-        if role_terms.len() >= 2 {
-            push_search_plan_subquery(
-                subqueries,
-                seen,
-                role_terms.join(" "),
-                role,
-                vec![
-                    SearchPlanChannelDto::TypedSymbol,
-                    SearchPlanChannelDto::Lexical,
-                    SearchPlanChannelDto::RepoText,
-                ],
-            );
-        }
-    }
-}
-
-pub(super) fn search_plan_matching_terms(
-    terms: &SearchPlanTermsDto,
-    needles: &[&str],
-) -> Vec<String> {
-    terms
-        .extracted
-        .iter()
-        .filter(|term| {
-            needles
-                .iter()
-                .any(|needle| term.eq_ignore_ascii_case(needle))
-        })
-        .cloned()
-        .collect()
 }
 
 pub(super) fn push_search_plan_fallback_subquery(
@@ -549,7 +590,10 @@ pub(super) fn hit_exactly_matches_identifier(hit: &SearchHit, identifier: &str) 
         || terminal_symbol_segment(&hit.display_name) == normalized_identifier
 }
 
-pub(super) fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
+pub(super) fn repo_text_line_identifiers(
+    hit: &SearchHit,
+    query_closure: &HashSet<String>,
+) -> Vec<String> {
     let Some(path) = hit.file_path.as_deref() else {
         return Vec::new();
     };
@@ -572,13 +616,14 @@ pub(super) fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
         if token.len() < 3 {
             continue;
         }
+        // A bare lowercase word only counts when the query itself supplies it.
+        // The replaced domain whitelist admitted the holdout's nouns from any
+        // query at all.
+        let lower = token.to_ascii_lowercase();
         let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
             || token.contains('_')
-            || matches!(
-                token,
-                "auth" | "feed" | "posts" | "storage" | "indexer" | "service" | "trail" | "snippet"
-            );
-        if looks_symbolic && seen.insert(token.to_ascii_lowercase()) {
+            || query_closure.contains(&lower);
+        if looks_symbolic && seen.insert(lower) {
             identifiers.push(token.to_string());
         }
     }
@@ -792,6 +837,7 @@ pub(super) fn search_plan_path_is_test_or_bench(path: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn search_plan_anchor_groups(
     query: &str,
     terms: &SearchPlanTermsDto,
@@ -799,6 +845,7 @@ pub(super) fn search_plan_anchor_groups(
     repo_text_hits: &[SearchHit],
     suggestions: &[SearchHit],
     active_path_evidence: &HashMap<NodeId, SearchPlanActivePathEvidence>,
+    orientation: Option<&OrientationEvidence>,
 ) -> Vec<SearchPlanAnchorGroupDto> {
     let mut groups = Vec::new();
     let mut grouped_ids = HashSet::new();
@@ -808,11 +855,13 @@ pub(super) fn search_plan_anchor_groups(
         .chain(suggestions.iter())
         .cloned()
         .collect::<Vec<_>>();
-    all_symbol_hits
-        .sort_by(|left, right| compare_search_hits_with_project_root(None, query, left, right));
+    all_symbol_hits.sort_by(|left, right| {
+        compare_search_hits_with_project_root(None, query, left, right, orientation)
+    });
+    let query_closure = search_plan_query_token_closure(query);
     let repo_text_identifiers = repo_text_hits
         .iter()
-        .map(repo_text_line_identifiers)
+        .map(|hit| repo_text_line_identifiers(hit, &query_closure))
         .collect::<Vec<_>>();
 
     let mut grouped_anchor_names = HashSet::new();
@@ -936,45 +985,23 @@ pub(super) fn search_plan_rejected_hits(
     suggestions: &[SearchHit],
     indexed_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
+    evidence: Option<&OrientationEvidence>,
+    selected_subsystems: &HashSet<String>,
 ) -> Vec<SearchPlanRejectedHitDto> {
     let chosen = anchor_groups
         .iter()
         .filter_map(|group| group.chosen_symbol.as_ref().map(|hit| hit.node_id.clone()))
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
-    let mut rejected = suggestions
+    suggestions
         .iter()
         .chain(indexed_hits.iter())
         .chain(repo_text_hits.iter())
         .filter(|hit| !chosen.contains(&hit.node_id) && seen.insert(hit.node_id.clone()))
-        .map(|hit| {
-            let coverage = architecture_coverage_for_hit(hit);
-            let coverage_score = coverage
-                .as_ref()
-                .map(|coverage| coverage.score)
-                .unwrap_or(0);
-            (hit, coverage, coverage_score)
-        })
-        .collect::<Vec<_>>();
-
-    rejected.sort_by(
-        |(left, left_coverage, left_score), (right, right_coverage, right_score)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| right_coverage.is_some().cmp(&left_coverage.is_some()))
-                .then_with(|| {
-                    (right.origin == SearchHitOrigin::TextMatch)
-                        .cmp(&(left.origin == SearchHitOrigin::TextMatch))
-                })
-        },
-    );
-
-    rejected
-        .into_iter()
         .take(8)
-        .map(|(hit, coverage, _)| SearchPlanRejectedHitDto {
+        .map(|hit| SearchPlanRejectedHitDto {
             display_name: hit.display_name.clone(),
-            reason: search_plan_rejected_hit_reason(hit, coverage.as_ref()),
+            reason: search_plan_rejected_hit_reason(hit, evidence, selected_subsystems),
             origin: hit.origin,
             file_path: hit.file_path.clone(),
             line: hit.line,
@@ -984,20 +1011,23 @@ pub(super) fn search_plan_rejected_hits(
 
 pub(super) fn search_plan_rejected_hit_reason(
     hit: &SearchHit,
-    coverage: Option<&ArchitectureCoverage>,
+    evidence: Option<&OrientationEvidence>,
+    selected_subsystems: &HashSet<String>,
 ) -> String {
     let source = match hit.origin {
         SearchHitOrigin::IndexedSymbol => "indexed_symbol",
         SearchHitOrigin::TextMatch => "repo_text",
     };
-    if let Some(coverage) = coverage {
-        format!(
-            "not selected after anchor grouping and final coverage ranking; source={source}; coverage_key={}; coverage_score={}",
-            coverage.key, coverage.score
-        )
-    } else {
-        format!("not selected after anchor grouping and evidence ranking; source={source}")
-    }
+    let hit_evidence = evidence.and_then(|evidence| evidence.get(&hit.node_id));
+    let entry = hit_evidence.map_or("none", |evidence| evidence.entry.label());
+    let production_callers = hit_evidence.map_or(0, |evidence| {
+        degree_tier(evidence.degrees.production_in_calls).0
+    });
+    let subsystem_represented =
+        hit_evidence.is_some_and(|evidence| selected_subsystems.contains(&evidence.subsystem));
+    format!(
+        "not selected after anchor grouping and root ranking; source={source}; entry={entry}; production_callers={production_callers}; subsystem_represented={subsystem_represented}"
+    )
 }
 
 pub(super) fn search_plan_bridge_request(from: &NodeId, to: &NodeId) -> TrailConfigDto {
@@ -1032,23 +1062,23 @@ pub(super) fn graph_response_has_bridge(
 }
 
 pub(super) fn graph_bridge_evidence_kind(graph: &GraphResponse) -> SearchPlanBridgeEvidenceKindDto {
+    // Structured canonical ids written by a sanctioned structural collector are
+    // repository-derived evidence. The display-label substring checks that used
+    // to sit beside them were reading rendered text, which is both fragile and
+    // a place for a collector's name to hide in ranking code.
     if graph.edges.iter().any(|edge| {
-        edge.callsite_identity
-            .as_deref()
-            .is_some_and(|identity| identity.starts_with("payload:"))
-    }) || graph
-        .nodes
-        .iter()
-        .any(|node| node.label.contains("payload collection "))
-    {
+        edge.callsite_identity.as_deref().is_some_and(|identity| {
+            STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES
+                .iter()
+                .any(|prefix| identity.starts_with(prefix))
+        })
+    }) {
         return SearchPlanBridgeEvidenceKindDto::DataCollectionUsage;
     }
     if graph.nodes.iter().any(|node| {
-        node.label.contains(" route; confidence=")
-            || node
-                .qualified_name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("framework::"))
+        node.qualified_name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("framework::"))
     }) {
         return SearchPlanBridgeEvidenceKindDto::FrameworkRoute;
     }
@@ -1183,6 +1213,7 @@ impl AppController {
                         &subquery.query,
                         left,
                         right,
+                        None,
                     )
                 });
                 suggestions.sort_by(|left, right| {
@@ -1191,6 +1222,7 @@ impl AppController {
                         &subquery.query,
                         left,
                         right,
+                        None,
                     )
                 });
                 dedupe_inexact_search_hits_by_display_key(&subquery.query, &mut hits);
@@ -1247,6 +1279,77 @@ impl AppController {
         Ok(evidence)
     }
 
+    /// Build the orientation-regime evidence map once per request.
+    ///
+    /// Bounded to `SEARCH_ORIENTATION_WINDOW` deduped hits, and the resulting
+    /// map is shared by anchor grouping, the final root ordering, the rejected
+    /// hit reasons, and the reported orientation, so no stage repeats the edge
+    /// walk or the file lookup.
+    fn build_orientation_evidence(
+        &self,
+        storage: &Storage,
+        project_root: Option<&Path>,
+        hits: &[SearchHit],
+    ) -> OrientationEvidence {
+        let mut evidence = OrientationEvidence::default();
+        let mut file_facts = HashMap::<String, (Option<FileRole>, String)>::new();
+        for hit in hits.iter().take(SEARCH_ORIENTATION_WINDOW) {
+            let path = hit.file_path.as_deref();
+            let (role, language) = match path {
+                Some(path) => file_facts
+                    .entry(path.to_string())
+                    .or_insert_with(|| {
+                        // Prefer the role the indexer verified; fall back to the
+                        // free path classifier when the file is not in the store.
+                        match storage.get_file_by_path(Path::new(path)) {
+                            Ok(Some(file)) => (Some(file.file_role), file.language),
+                            _ => (
+                                Some(store_file_role_from_retrieval_role(
+                                    retrieval_file_role_from_path(path),
+                                )),
+                                String::new(),
+                            ),
+                        }
+                    })
+                    .clone(),
+                None => (None, String::new()),
+            };
+            let relative = match (project_root, path) {
+                (Some(root), Some(path)) => {
+                    Some(crate::grounding::relative_path(root, Path::new(path)))
+                }
+                (None, Some(path)) => Some(path.replace('\\', "/")),
+                _ => None,
+            };
+            let degrees = self
+                .search_plan_active_path_evidence_for_hit(storage, hit)
+                .map(SearchPlanActivePathEvidence::degrees)
+                .unwrap_or_default();
+            let language = if language.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                language
+            };
+            evidence.insert(
+                hit.node_id.clone(),
+                OrientationHitEvidence {
+                    entry: entry_evidence(
+                        matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD),
+                        role,
+                        false,
+                        &terminal_symbol_segment(&hit.display_name),
+                        degrees,
+                    ),
+                    helper_like: helper_like_name_or_path(&hit.display_name, relative.as_deref()),
+                    degrees,
+                    structural_rank: structural_path_rank(role, relative.as_deref()),
+                    subsystem: subsystem_key_for_path(&language, relative.as_deref()),
+                },
+            );
+        }
+        evidence
+    }
+
     fn search_plan_active_path_evidence<'a, I>(
         &self,
         storage: &Storage,
@@ -1278,6 +1381,9 @@ impl AppController {
         let node_id = hit.node_id.to_core().ok()?;
         let edges = storage.get_edges_for_node_id(node_id).ok()?;
         let mut callers = HashSet::new();
+        let mut callees = HashSet::new();
+        // One pass produces both directions so the orientation comparator and
+        // the anchor-group score share a single edge walk per hit.
         for edge in edges {
             if edge.kind != codestory_contracts::graph::EdgeKind::CALL {
                 continue;
@@ -1286,17 +1392,21 @@ impl AppController {
                 continue;
             }
             let (source, target) = edge.effective_endpoints();
-            if target != node_id || source == node_id {
+            if source == target {
                 continue;
             }
-            if search_plan_caller_is_test_or_bench(storage, source) {
-                continue;
+            if target == node_id {
+                if !search_plan_caller_is_test_or_bench(storage, source) {
+                    callers.insert(source);
+                }
+            } else if source == node_id {
+                callees.insert(target);
             }
-            callers.insert(source);
         }
 
         Some(SearchPlanActivePathEvidence {
             caller_count: callers.len().min(u32::MAX as usize) as u32,
+            out_call_count: callees.len().min(u32::MAX as usize) as u32,
         })
     }
 
@@ -1317,22 +1427,19 @@ impl AppController {
         allow_repo_text: bool,
         hybrid_weights: Option<AgentHybridWeightsDto>,
         hybrid_limits: Option<SearchHybridLimitsDto>,
+        orientation: Option<&OrientationEvidence>,
     ) -> Result<Option<SearchPlanBuild>, ApiError> {
-        let intents = architecture_query_intents(effective_query)
-            .into_iter()
-            .map(|intent| intent.label().to_string())
-            .collect::<Vec<_>>();
-        let eligible = search_plan_eligible(
-            effective_query,
-            query_assessment.exact_symbol_hit_count,
-            &intents,
-        );
+        let eligible =
+            search_plan_eligible(effective_query, query_assessment.exact_symbol_hit_count);
         if !eligible {
             return Ok(None);
         }
+        // The DTO field keeps its shape; only the value vocabulary changes, from
+        // ten holdout-tracking labels to the one regime that exists.
+        let intents = vec![SEARCH_PLAN_ORIENTATION_INTENT.to_string()];
         let terms = search_plan_terms(effective_query);
         let subqueries = search_plan_subqueries_for_repo_text_mode(
-            search_plan_subqueries(effective_query, &terms, &intents),
+            search_plan_subqueries(effective_query, &terms),
             allow_repo_text,
         );
         let mut executed = self.execute_search_plan_subqueries(
@@ -1362,7 +1469,14 @@ impl AppController {
             &plan_repo_text_hits,
             &plan_suggestions,
             &active_path_evidence,
+            orientation,
         );
+        let selected_subsystems = anchor_groups
+            .iter()
+            .filter_map(|group| group.chosen_symbol.as_ref())
+            .filter_map(|hit| orientation.and_then(|evidence| evidence.get(&hit.node_id)))
+            .map(|evidence| evidence.subsystem.clone())
+            .collect::<HashSet<_>>();
         let mut bridges = self.search_plan_bridges(&anchor_groups);
         let original_bridge_count = bridges.len();
         bridges.retain(|bridge| !is_low_confidence_search_plan_bridge(bridge));
@@ -1402,6 +1516,8 @@ impl AppController {
                 &plan_suggestions,
                 &plan_indexed_hits,
                 &plan_repo_text_hits,
+                orientation,
+                &selected_subsystems,
             ),
             next_actions,
             source_truth_checks,
@@ -1614,7 +1730,13 @@ impl AppController {
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
         let project_root = self.require_project_root().ok();
         indexed_symbol_hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            compare_search_hits_with_project_root(
+                project_root.as_deref(),
+                &query,
+                left,
+                right,
+                None,
+            )
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
@@ -1623,7 +1745,7 @@ impl AppController {
         let storage = self.open_storage_read_only()?;
         let retrieval = retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config)?;
         let freshness = self.index_freshness().ok();
-        let mut repo_text_hits = Vec::new();
+        let repo_text_hits = Vec::new();
         let mut suggestions = Vec::new();
         let query_assessment = search_query_assessment(
             &query,
@@ -1632,11 +1754,18 @@ impl AppController {
             repo_text_mode,
             false,
             None,
+            None,
         );
         let indexed_hit_ids = indexed_symbol_hits
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<HashSet<_>>();
+        // Build the shared orientation evidence once, inside the pinned
+        // publication, and only for queries that actually ask about structure.
+        let orientation_evidence = orientation_query(&query).then(|| {
+            self.build_orientation_evidence(&storage, project_root.as_deref(), &indexed_symbol_hits)
+        });
+        let orientation = orientation_evidence.as_ref();
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
         let search_plan = if expand_search_plan {
             match self.build_search_plan(
@@ -1654,6 +1783,7 @@ impl AppController {
                 false,
                 hybrid_weights,
                 hybrid_limits,
+                orientation,
             )? {
                 Some(plan_build) => {
                     for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
@@ -1689,19 +1819,40 @@ impl AppController {
                 (None, None) => std::cmp::Ordering::Equal,
             };
             anchor_order.then_with(|| {
-                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+                compare_search_hits_with_project_root(
+                    project_root.as_deref(),
+                    &query,
+                    left,
+                    right,
+                    orientation,
+                )
             })
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
-        let indexed_symbol_candidates = indexed_symbol_hits.clone();
-        apply_architecture_cross_source_coverage(
-            &query,
-            &mut indexed_symbol_hits,
-            &mut repo_text_hits,
-            &indexed_symbol_candidates,
-            &[],
-            limit_per_source,
-        );
+        let total_root_candidates = indexed_symbol_hits.len();
+        if let Some(orientation) = orientation {
+            // Diversify the whole list and let the limit truncate it, so results
+            // at a smaller limit stay an exact prefix of a larger one. Exact
+            // matches are pinned: breadth never displaces what the caller named.
+            indexed_symbol_hits = root_rank::diversify_root_order(
+                indexed_symbol_hits,
+                |hit| {
+                    matches!(
+                        search_hit_match_quality(&query, hit),
+                        SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
+                    )
+                },
+                |hit| {
+                    let evidence = orientation.get(&hit.node_id);
+                    (
+                        evidence
+                            .map(|evidence| evidence.subsystem.clone())
+                            .unwrap_or_default(),
+                        terminal_symbol_segment(&hit.display_name),
+                    )
+                },
+            );
+        }
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
         crate::search_evidence::attach_pinned_search_evidence(
@@ -1715,6 +1866,17 @@ impl AppController {
             &mut suggestions,
         );
         let hits = indexed_symbol_hits.clone();
+        let query_assessment = search_query_assessment(
+            &query,
+            &hits,
+            &repo_text_hits,
+            repo_text_mode,
+            false,
+            None,
+            orientation.map(|orientation| {
+                search_orientation_report(orientation, total_root_candidates, &hits)
+            }),
+        );
         let retrieval_shadow = Some(
             agent::retrieval_primary::shadow_from_query_result_with_candidate_admission_diagnostics(
                 self,
