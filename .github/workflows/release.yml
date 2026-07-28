@@ -213,7 +213,7 @@ jobs:
               https://github.com/TheGreenCedar/AgentPluginMarketplace.git \
               refs/heads/main | awk '{print $1}'
           )"
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
           rm -rf "$install_root"
           npm install \
@@ -235,7 +235,7 @@ jobs:
           # the fixture's own revision. The live revision above is still the one
           # the post-publish smoke consumes, so both are captured.
           fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"
-          test "$(printf '%s' "$fixture_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
@@ -531,6 +531,12 @@ jobs:
             --title "CodeStory $TAG" \
             --notes-file target/release-assets/release-notes.md
 
+  # Catalog publication is DELIVERY, not a release gate. It runs after the tag and the GitHub
+  # release already exist, so failing the release on a missing credential or a rejected push would
+  # only turn a recoverable delivery gap into an unrecoverable one -- and the catalog keeps serving
+  # the previous release either way, so no user is ever offered a plugin that does not exist.
+  # The price is that the run must SAY which state it ended in: this job always reports one of two
+  # explicit outcomes, and post-publish-smoke records that outcome in the release ledger.
   marketplace-publish:
     name: Publish the marketplace catalog
     if: inputs.publish_release
@@ -541,7 +547,8 @@ jobs:
     timeout-minutes: 10
     environment: marketplace-publish
     outputs:
-      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+      catalog_published: ${{ steps.delivery.outputs.catalog_published }}
+      marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
     steps:
       - name: Checkout exact release source
         uses: actions/checkout@v5
@@ -550,6 +557,7 @@ jobs:
 
       - name: Mint a scoped marketplace token
         id: token
+        continue-on-error: true
         uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
         with:
           app-id: ${{ secrets.MARKETPLACE_APP_ID }}
@@ -559,8 +567,11 @@ jobs:
 
       # Publication already happened, so a failure here leaves the catalog serving the previous
       # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      # One attempt only: a retry loop here would hide which failure the run actually hit.
       - name: Point the catalog at the published release
         id: publish
+        if: steps.token.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
@@ -571,9 +582,49 @@ jobs:
             --version "${{ needs.preflight.outputs.version }}" \
             --github-output "$GITHUB_OUTPUT"
 
+      # The only place the "catalog was updated" claim is ever minted. It requires the token, the
+      # push, AND an immutable revision to have all landed; anything else records deferred, so an
+      # unknown or half-finished state can never read as published.
+      - name: Record catalog delivery outcome
+        id: delivery
+        if: always()
+        env:
+          TOKEN_OUTCOME: ${{ steps.token.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          RECOVERY_WORKFLOW: marketplace-sync.yml
+        run: |
+          set -euo pipefail
+          catalog_published=false
+          marketplace_revision=""
+          if [ "$TOKEN_OUTCOME" = "success" ] \
+            && [ "$PUBLISH_OUTCOME" = "success" ] \
+            && printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            catalog_published=true
+            marketplace_revision="$PUBLISHED_REVISION"
+          fi
+          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
+          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          if [ "$catalog_published" = "true" ]; then
+            echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
+          # rejected push, not a missing credential. Saying so here keeps the recorded recovery
+          # instruction one that can actually be followed.
+          if [ "$TOKEN_OUTCOME" != "success" ]; then
+            recovery="provision the marketplace-publish credential, then run $RECOVERY_WORKFLOW (it mints the same token, so it defers as well when that credential is absent)"
+          else
+            recovery="re-run $RECOVERY_WORKFLOW with this version and commit"
+          fi
+          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW: $recovery."
+          echo "Catalog delivery: DEFERRED. The release is published; the catalog still serves the previous release. Recover with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
+
   post-publish-smoke:
     name: Post-publish release asset smoke
-    if: inputs.publish_release
+    # Deliberately not gated on marketplace-publish: a deferred catalog must not suppress proof of
+    # the assets that were actually published. The delivery state is carried in, not depended on.
+    if: always() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success'
     needs:
       - preflight
       - publish
@@ -581,6 +632,7 @@ jobs:
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
+      catalog_published: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
       marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true

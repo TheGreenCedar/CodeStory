@@ -76,7 +76,13 @@ function identityFor(cell, producerRunAttempt = "1") {
       case "host_arch": identity[key] = hostIdentity(target)[key]; break;
       case "runner": identity[key] = "hosted-runner"; break;
       case "backend": identity[key] = "CPU"; break;
-      case "installer": identity[key] = "managed_plugin"; break;
+      // The post-publish installed cells are where the closeout reads which catalog served the
+      // release, so their installer must be one of the two declared delivery identities.
+      case "installer":
+        identity[key] = cell.group_id === "installed_runtime_behavior"
+          ? "codex_marketplace_install"
+          : "managed_plugin";
+        break;
       case "profile": identity[key] = "codestory-release-evidence-linux-arm64-v2"; break;
       case "corpus_id": identity[key] = "v0.16-axios-js-ts-v1"; break;
       case "cache_id": identity[key] = "cold-full-retrieval-v1"; break;
@@ -919,4 +925,83 @@ test("native-fingerprint reuse is still refused, and refused for the tree it can
       `${cellId}: ${JSON.stringify(failures)}`,
     );
   }
+});
+
+// Catalog publication is delivery, not a release gate, so a release may legitimately end with the
+// public catalog untouched. The whole risk in allowing that is the deferred run reading as the
+// published one, and the installer identity in the post-publish cells is the only thing that
+// distinguishes them. Before these checks it was inert: a free-form string nothing read, so a
+// deferred release's verdict was identical in shape to a published one.
+test("the post-publish closeout resolves and records which catalog served the release", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+  const published = evaluate(
+    "post_publish",
+    manifestsFor("post_publish", prePublish.ledger),
+    prePublish.ledger,
+  );
+  assert.equal(published.decision, "accept");
+  assert.deepEqual(published.ledger.catalog_delivery, {
+    state: "published",
+    installer: "codex_marketplace_install",
+    live_catalog_revision: true,
+  });
+  assert.deepEqual(published.summary.catalog_delivery, published.ledger.catalog_delivery);
+
+  // A deferred release is accepted -- it published real artifacts -- but its verdict says so.
+  const deferredManifests = manifestsFor("post_publish", prePublish.ledger);
+  for (const manifest of deferredManifests) {
+    if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+      manifest.evidence.identity.installer = "codex_marketplace_deferred_fixture";
+    }
+  }
+  const deferred = evaluate("post_publish", deferredManifests, prePublish.ledger);
+  assert.equal(deferred.decision, "accept");
+  assert.deepEqual(deferred.ledger.catalog_delivery, {
+    state: "deferred",
+    installer: "codex_marketplace_deferred_fixture",
+    live_catalog_revision: false,
+  });
+  // The two states must be distinguishable in the signed verdict, not only to a human reading a
+  // warning in a log that expires.
+  assert.notDeepEqual(deferred.ledger.catalog_delivery, published.ledger.catalog_delivery);
+
+  // The pre-publish closeout has no post-publish installed cells, so it states nothing here
+  // rather than inventing a delivery state.
+  assert.equal(prePublish.ledger.catalog_delivery, undefined);
+});
+
+test("a post-publish closeout that cannot resolve one catalog delivery state is rejected", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+
+  // An installer identity no delivery state declares -- including the pre-publish lane's own
+  // candidate installer, which would otherwise sail through as a plausible-looking string.
+  for (const installer of ["candidate_managed_plugin", "managed_plugin", ""]) {
+    const manifests = manifestsFor("post_publish", prePublish.ledger);
+    for (const manifest of manifests) {
+      if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+        manifest.evidence.identity.installer = installer;
+      }
+    }
+    const rejected = evaluate("post_publish", manifests, prePublish.ledger);
+    assert.equal(rejected.decision, "reject", installer);
+    assert.equal(rejected.ledger.catalog_delivery.state, "unresolved", installer);
+    assert.ok(
+      rejected.ledger.input_errors.some((message) =>
+        message.includes("does not record a declared catalog delivery installer identity")),
+      `${installer}: ${JSON.stringify(rejected.ledger.input_errors)}`,
+    );
+  }
+
+  // Targets disagreeing about the delivery state is not a state; it is a broken release.
+  const split = manifestsFor("post_publish", prePublish.ledger);
+  split.find(({ cell_id: id }) => id === "installed_runtime_behavior:macos-arm64")
+    .evidence.identity.installer = "codex_marketplace_deferred_fixture";
+  const rejected = evaluate("post_publish", split, prePublish.ledger);
+  assert.equal(rejected.decision, "reject");
+  assert.equal(rejected.ledger.catalog_delivery.state, "unresolved");
+  assert.ok(
+    rejected.ledger.input_errors.some((message) =>
+      message.includes("disagree on the catalog delivery state")),
+    JSON.stringify(rejected.ledger.input_errors),
+  );
 });

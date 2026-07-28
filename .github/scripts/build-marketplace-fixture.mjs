@@ -15,6 +15,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+import {
+  FIXTURE_MARKER_FILENAME,
+  FIXTURE_MARKER_PURPOSE,
+} from "./marketplace-delivery-identity.mjs";
+
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
@@ -53,7 +58,8 @@ if (typeof manifest.version !== "string" || !manifest.version) {
   fail("pinned commit has no plugin version");
 }
 
-const catalogDirectory = path.join(path.resolve(args.out), ".agents", "plugins");
+const fixtureRoot = path.resolve(args.out);
+const catalogDirectory = path.join(fixtureRoot, ".agents", "plugins");
 mkdirSync(catalogDirectory, { recursive: true });
 // Mirrors the live catalog's shape at .agents/plugins/marketplace.json. The
 // resolver rejects a catalog missing `name`, and the live catalog carries no
@@ -87,9 +93,35 @@ writeFileSync(
   `${JSON.stringify(catalog, null, 2)}\n`,
 );
 
-// The fixture must be a git repository: the Codex resolver clones it like the live catalog.
+// A fixture catalog is a DISTINCT delivery state, not a stand-in that may pass for the live
+// catalog, so it says so in its own bytes. The installed-runtime predicate refuses to accept a
+// deferred installation unless the resolved marketplace root carries this marker naming the
+// exact commit the catalog pins -- an arbitrary local git directory, or a clone of the live
+// marketplace, cannot satisfy the deferred shape by accident.
+//
+// This file sits beside .agents/, not inside it: the resolver reads only
+// .agents/plugins/marketplace.json, so the catalog the resolver sees stays byte-identical in
+// shape to the live one.
+writeFileSync(
+  path.join(fixtureRoot, FIXTURE_MARKER_FILENAME),
+  `${JSON.stringify(
+    {
+      schema_version: 1,
+      purpose: FIXTURE_MARKER_PURPOSE,
+      pinned_commit: commit,
+      plugin_version: manifest.version,
+    },
+    null,
+    2,
+  )}\n`,
+);
+
+// The fixture must be a git repository: the Codex resolver reads it like the live catalog.
+// It deliberately has NO `origin` remote. Pointing one at the live marketplace URL would make
+// the fixture claim an identity it does not have, and the deferred predicate asserts the
+// absence positively rather than tolerating a failed probe.
 const git = (...command) =>
-  execFileSync("git", ["-C", path.resolve(args.out), ...command], { encoding: "utf8" });
+  execFileSync("git", ["-C", fixtureRoot, ...command], { encoding: "utf8" });
 git("init", "--quiet", "--initial-branch", "main");
 git("config", "user.email", "release@codestory.invalid");
 git("config", "user.name", "CodeStory release");
