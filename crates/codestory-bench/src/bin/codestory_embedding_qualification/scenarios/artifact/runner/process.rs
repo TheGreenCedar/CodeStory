@@ -422,8 +422,8 @@ pub(super) fn load_establishment_timeout(phase: &str) -> Result<Duration> {
 /// `client_death_lease_active` wait must see the lease plus the admitted and
 /// held query/bulk work in one snapshot, and that bounds a queue-seeding
 /// phase, not a single snapshot: the freshly spawned dead client first pays
-/// its contract connect and spawn-convergence allowances, then fans out one
-/// captured transport per held request before the seeded depths become
+/// its contract connect and spawn-convergence allowances, then fans every held
+/// request out over one captured transport before the seeded depths become
 /// visible, while every poll of the wait is itself a fresh observe worker
 /// spending part of the snapshot allowance. This is the same phase shape as
 /// mixed_queue's gated seeding, which already bounds a strictly larger 64+64
