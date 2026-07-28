@@ -759,6 +759,10 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["release workflow policy loses its full history", releaseFile, workflow => {
       delete workflow.jobs["workflow-policy"].steps[0].with;
     }, /workflow-policy must check out full history for the reuse-binding contracts/u],
+    ["marketplace preflight proves the live revision against a fixture", releaseFile, workflow => {
+      const step = draftStep(workflow.jobs["preflight"], "Prove the public marketplace install path");
+      step.run = step.run.replace('--marketplace-revision "$fixture_revision"', '--marketplace-revision "$marketplace_revision"');
+    }, /--marketplace-revision "\$fixture_revision"/u],
     ["source compiler restore becomes exact-SHA-only", sourceFile, workflow => {
       draftStep(sourceJob(workflow), "Restore compatible compiler objects")
         .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";
