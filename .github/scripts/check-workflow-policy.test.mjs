@@ -2407,12 +2407,12 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
       const step = draftStep(workflow.jobs.sync, guard);
       step.run = step.run.replace("(-[0-9A-Za-z.]+)?$'", "'");
     }, /must run version_shape='\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\(-\[0-9A-Za-z\.\]\+\)\?\$'/u],
-    // Substring assertions prove a string is present, not that it is consulted. Both of these keep
-    // every pinned regex verbatim while the guard stops rejecting anything.
-    ["the guard body becomes a no-op that still quotes its regexes", workflow => {
-      draftStep(workflow.jobs.sync, guard).run =
-        "set -euo pipefail\ntrue 'commit_shape=^[0-9a-fA-F]{7,40}$'"
-        + " 'version_shape=^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'\n";
+    // Substring assertions prove a string is present, not that it is consulted. This body satisfies
+    // every fragment above -- both anchored regexes, both comparisons, no grep -- and refuses
+    // nothing, so only a pin over the whole script can see it.
+    ["the guard keeps every pinned fragment and stops refusing anything", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replaceAll("exit 1", ":");
     }, /must match the reviewed dispatch coordinate guard script exactly/u],
     ["the commit comparison is rewired away from its regex", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
