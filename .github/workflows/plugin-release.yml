@@ -61,14 +61,17 @@ jobs:
           fi
 
       - name: Validate plugin-lane version synchronization
-        run: python .github/scripts/check-codestory-release.py --version "${{ inputs.version }}" --lane plugin
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: python .github/scripts/check-codestory-release.py --version "$INPUT_VERSION" --lane plugin
 
       - name: Refuse an existing plugin release
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tag="v${{ inputs.version }}"
+          tag="v$INPUT_VERSION"
           if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1; then
             echo "::error::$tag already exists."
             exit 1
@@ -122,9 +125,11 @@ jobs:
           fi
 
       - name: Extract plugin release notes
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          node .github/scripts/extract-codestory-release-notes.mjs --version "${{ inputs.version }}" > /tmp/plugin-release-notes.md
+          node .github/scripts/extract-codestory-release-notes.mjs --version "$INPUT_VERSION" > /tmp/plugin-release-notes.md
           test -s /tmp/plugin-release-notes.md
 
   plugin-proof:
@@ -179,13 +184,14 @@ jobs:
       - name: Publish the plugin release
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          node .github/scripts/extract-codestory-release-notes.mjs --version "${{ inputs.version }}" > /tmp/plugin-release-notes.md
-          gh release create "v${{ inputs.version }}" \
+          node .github/scripts/extract-codestory-release-notes.mjs --version "$INPUT_VERSION" > /tmp/plugin-release-notes.md
+          gh release create "v$INPUT_VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "CodeStory plugin ${{ inputs.version }}" \
+            --title "CodeStory plugin $INPUT_VERSION" \
             --notes-file /tmp/plugin-release-notes.md
 
   # The catalog is what a host installs from, so the plugin lane publishes it too. It is DELIVERY,
@@ -222,12 +228,13 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           node .github/scripts/publish-marketplace-catalog.mjs \
             --source-repository "$GITHUB_WORKSPACE" \
             --commit "$GITHUB_SHA" \
-            --version "${{ inputs.version }}" \
+            --version "$INPUT_VERSION" \
             --github-output "$GITHUB_OUTPUT"
 
       # The only place this lane's "catalog was updated" claim is ever minted.
@@ -373,6 +380,9 @@ jobs:
         env:
           CODEX_CLI_VERSION: "0.144.5"
           MARKETPLACE_REVISION: ${{ steps.delivery.outputs.marketplace_revision }}
+          MARKETPLACE_SOURCE: ${{ steps.delivery.outputs.marketplace_source }}
+          LOCAL_FIXTURE: ${{ steps.delivery.outputs.local_fixture }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-marketplace-postpublish"
@@ -387,10 +397,10 @@ jobs:
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source "${{ steps.delivery.outputs.marketplace_source }}" \
+            --marketplace-source "$MARKETPLACE_SOURCE" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$MARKETPLACE_REVISION" \
-            --local-fixture "${{ steps.delivery.outputs.local_fixture }}" \
-            --expected-version "${{ inputs.version }}" \
+            --local-fixture "$LOCAL_FIXTURE" \
+            --expected-version "$INPUT_VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json"

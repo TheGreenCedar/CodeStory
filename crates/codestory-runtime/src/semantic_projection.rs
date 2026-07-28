@@ -1998,6 +1998,11 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
     if !source_extension {
         return false;
     }
+    // Layout markers only. A file-name list used to sit here naming ten of the
+    // evaluation corpus's own entry files, which is expected-answer shape in
+    // production and what the widened generalization lint now refuses. Those
+    // files still qualify through the markers below whenever the repository
+    // actually lays them out as a package surface.
     normalized.contains("/lib/")
         || normalized.contains("/src/")
         || normalized.contains("/pkg/")

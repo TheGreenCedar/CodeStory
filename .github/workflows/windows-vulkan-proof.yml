@@ -125,8 +125,10 @@ jobs:
       - name: Validate candidate-installed mode
         if: inputs.candidate_installed_proof
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
-          if ("${{ inputs.server_behavior_only }}" -ne "true") {
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
             throw "candidate_installed_proof requires server_behavior_only"
           }
 
@@ -233,6 +235,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
           SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           $ErrorActionPreference = "Stop"
           $version = $env:VERSION.TrimStart('v')
@@ -261,8 +265,8 @@ jobs:
             )
             $calibrationArgs = @(
               "--calibration-bundle", $calibrationBundles[0].FullName,
-              "--calibration-producer-run-id", "${{ inputs.calibration_bundle_run_id }}",
-              "--calibration-producer-artifact", "${{ inputs.calibration_bundle_artifact }}"
+              "--calibration-producer-run-id", "$env:CALIBRATION_RUN_ID",
+              "--calibration-producer-artifact", "$env:CALIBRATION_ARTIFACT"
             )
           }
           python .github/scripts/check-packaged-agent-proof.py `
@@ -394,9 +398,12 @@ jobs:
       - name: Emit authenticated Vulkan release cell
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           jq -n \
             --arg native_engine coderank_q8_embedded \
@@ -404,7 +411,7 @@ jobs:
             > target/windows-vulkan-proof/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id accelerator_execution:windows-x64-vulkan \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \
@@ -428,13 +435,16 @@ jobs:
       - name: Emit authenticated Windows retrieval-readiness release cell
         if: inputs.emit_release_cells && inputs.server_behavior_only
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id retrieval_readiness:windows-x64 \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \
@@ -457,9 +467,12 @@ jobs:
       - name: Emit authenticated candidate-installed Windows release cell
         if: inputs.emit_release_cells && inputs.candidate_installed_proof
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           jq -n \
             --arg installer candidate_managed_plugin \
@@ -469,7 +482,7 @@ jobs:
             > target/candidate-installed-windows/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id candidate_installed_behavior:windows-x64 \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \

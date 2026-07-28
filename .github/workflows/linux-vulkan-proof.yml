@@ -127,7 +127,9 @@ jobs:
       - name: Validate candidate-installed mode
         if: inputs.candidate_installed_proof
         shell: bash
-        run: test "${{ inputs.server_behavior_only }}" = true
+        env:
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: test "$SERVER_BEHAVIOR_ONLY" = true
 
       - name: Download exact Linux package
         uses: actions/download-artifact@v8.0.1
@@ -174,24 +176,28 @@ jobs:
         shell: bash
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
+          INPUT_VERSION: ${{ inputs.version }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
           calibration_args=()
-          if [ "${{ inputs.server_behavior_only }}" = true ]; then
+          if [ "$SERVER_BEHAVIOR_ONLY" = true ]; then
             claim_args=(--server-behavior-only)
           else
             calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
             test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
             calibration_args=(
               --calibration-bundle "$calibration_bundle"
-              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
-              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
+              --calibration-producer-run-id "$CALIBRATION_RUN_ID"
+              --calibration-producer-artifact "$CALIBRATION_ARTIFACT"
             )
           fi
           python .github/scripts/check-packaged-agent-proof.py \
@@ -219,11 +225,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id || github.run_id }}
         run: |
           set -euo pipefail
           umask 077
           test -n "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
-          candidate_producer_run_id="${{ inputs.package_run_id || github.run_id }}"
+          candidate_producer_run_id="$PACKAGE_RUN_ID"
           run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$candidate_producer_run_id")"
           test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
           test "$(jq -r '.path' <<<"$run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
@@ -232,7 +240,7 @@ jobs:
           test "$candidate_producer_run_attempt" -ge 1
           echo "CODESTORY_CANDIDATE_PRODUCER_RUN_ID=$candidate_producer_run_id" >> "$GITHUB_ENV"
           echo "CODESTORY_CANDIDATE_PRODUCER_RUN_ATTEMPT=$candidate_producer_run_attempt" >> "$GITHUB_ENV"
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           candidate_root="$(mktemp -d "$RUNNER_TEMP/codestory-candidate-installed-linux.XXXXXX")"
@@ -266,9 +274,10 @@ jobs:
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           python .github/scripts/check-packaged-agent-proof.py \
@@ -307,9 +316,13 @@ jobs:
       - name: Emit authenticated Linux Vulkan release cells
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          CANDIDATE_INSTALLED_PROOF: ${{ inputs.candidate_installed_proof }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           mkdir -p target/release-cells
@@ -319,7 +332,7 @@ jobs:
             > target/linux-vulkan-proof/release-cell-identity.json
           common=(
             --repo "$GITHUB_WORKSPACE"
-            --expected-sha "${{ inputs.ref }}"
+            --expected-sha "$INPUT_REF"
             --version "$version"
             --producer-workflow .github/workflows/linux-vulkan-proof.yml
             --producer-job packaged-vulkan
@@ -339,7 +352,7 @@ jobs:
             --producer-artifact "release-cell-postpublish-retrieval-linux-x64-attempt-$GITHUB_RUN_ATTEMPT" \
             --archive "$archive" \
             --out target/release-cells/retrieval_readiness-linux-x64.json
-          if [ "${{ inputs.candidate_installed_proof }}" = true ]; then
+          if [ "$CANDIDATE_INSTALLED_PROOF" = true ]; then
             jq -n \
               --arg installer candidate_managed_plugin \
               --arg runtime_version "$version" \

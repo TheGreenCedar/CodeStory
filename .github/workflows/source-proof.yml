@@ -401,12 +401,15 @@ jobs:
       - name: Emit authenticated source release cell
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RESOLVED_REF: ${{ needs.resolve.outputs.ref }}
         run: |
           set -euo pipefail
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ needs.resolve.outputs.ref }}" \
-            --version "${{ inputs.version }}" \
+            --expected-sha "$RESOLVED_REF" \
+            --version "$INPUT_VERSION" \
             --cell-id source_behavior \
             --producer-workflow .github/workflows/source-proof.yml \
             --producer-job full-source-gate \

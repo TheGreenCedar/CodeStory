@@ -138,6 +138,30 @@ export function deriveReleaseCells(graph, phase) {
   cells.sort((left, right) => left.id.localeCompare(right.id));
   const ids = cells.map(({ id }) => id);
   if (new Set(ids).size !== ids.length) fail("release claim graph derives duplicate closeout cell ids");
+  const nonClaimHostByCell = new Map();
+  const nonClaimPolicy = graph.non_claim_policy;
+  for (const host of nonClaimPolicy?.hosts ?? []) {
+    for (const cellId of host.withheld_cells ?? []) nonClaimHostByCell.set(cellId, host);
+  }
+  for (const cell of cells) {
+    const host = nonClaimHostByCell.get(cell.id);
+    if (!host) continue;
+    cell.non_claim = {
+      host: host.id,
+      reason: nonClaimPolicy.reason,
+      runtime_execution: nonClaimPolicy.runtime_execution,
+      annotation: nonClaimPolicy.annotation,
+      maximum_run_attempts: nonClaimPolicy.maximum_run_attempts,
+      unavailable_producer_workflow: host.unavailable_producer_workflow,
+      unavailable_producer_job_name: host.unavailable_producer_job_name,
+      producer_workflow: nonClaimPolicy.producer_workflow,
+      producer_job: nonClaimPolicy.producer_job,
+      producer_job_name: nonClaimPolicy.producer_job_name,
+      // One container per phase: a phase's trusted producer map authorizes every manifest in the
+      // container it downloads, so a cross-phase container would carry an unowned manifest.
+      producer_artifact: host.producer_artifacts[cell.phase],
+    };
+  }
   return cells;
 }
 
@@ -203,6 +227,86 @@ export function resolveReleaseCellConstraints(cell, producerRunAttempt) {
   ]));
 }
 
+/// The producer identity a withheld cell is authenticated against. A dead host cannot sign its own
+/// absence, so the recorded non-claim is produced by a separate hosted job with its own artifact
+/// name; everything else about the cell's identity -- target, backend, runner, host -- still has to
+/// describe the proof that did not happen.
+export function resolveReleaseCellNonClaimConstraints(cell, producerRunAttempt) {
+  const attempt = text(producerRunAttempt, "producer run attempt");
+  if (!/^[1-9]\d*$/u.test(attempt)) fail("producer run attempt must be a positive integer");
+  if (!cell.non_claim) fail(`closeout cell ${cell.id} does not admit a withheld non-claim`);
+  return {
+    producer_workflow: cell.non_claim.producer_workflow,
+    producer_job: cell.non_claim.producer_job,
+    producer_job_name: cell.non_claim.producer_job_name,
+    producer_artifact: cell.non_claim.producer_artifact.replaceAll("{attempt}", attempt),
+  };
+}
+
+export function isWithheldManifest(manifest) {
+  return manifest?.evidence?.status === "withheld";
+}
+
+/// A withheld cell has to *say* what it is not claiming. The recorded non-claim names the host that
+/// never reported, quotes the exact Actions annotation the recovery contract keyed on, and lists
+/// every claim the missing proof would have carried. A cell that omits any of that, or that carries
+/// a non-claim while still asserting a pass, is a validation failure rather than a quiet downgrade.
+function nonClaimProblems({ manifest, cell, graph, withheld }) {
+  const problems = [];
+  if (!withheld) {
+    if (manifest.non_claim !== undefined) {
+      problems.push("only a withheld cell may carry a non-claim");
+    }
+    return problems;
+  }
+  if (!cell.non_claim) {
+    problems.push(`closeout cell ${cell.id} does not admit a withheld non-claim`);
+    return problems;
+  }
+  let nonClaim;
+  try {
+    nonClaim = object(manifest.non_claim, `${cell.id}.non_claim`);
+  } catch (error) {
+    problems.push(error.message);
+    return problems;
+  }
+  const expected = {
+    host: cell.non_claim.host,
+    runtime_execution: cell.non_claim.runtime_execution,
+    non_claim_reason: cell.non_claim.reason,
+    annotation: cell.non_claim.annotation,
+    unavailable_producer_workflow: cell.non_claim.unavailable_producer_workflow,
+    unavailable_producer_job_name: cell.non_claim.unavailable_producer_job_name,
+  };
+  for (const [key, value] of Object.entries(expected)) {
+    if (nonClaim[key] !== value) problems.push(`non-claim ${key} must equal ${String(value)}`);
+  }
+  let withheldClaims = [];
+  try {
+    withheldClaims = transitiveClaims(graph, cell.claim).map(({ id }) => id).sort();
+  } catch (error) {
+    problems.push(error.message);
+  }
+  const declared = Array.isArray(nonClaim.withheld_claims)
+    ? [...nonClaim.withheld_claims].map(String).sort()
+    : null;
+  if (declared === null || JSON.stringify(declared) !== JSON.stringify(withheldClaims)) {
+    problems.push(`non-claim withheld_claims must name ${withheldClaims.join(", ")}`);
+  }
+  // Withholding is the end of the bounded recovery path, never a shortcut around it: a non-claim
+  // recorded before the automatic reruns are spent would let one flaky minute drop a claim.
+  const attempt = String(nonClaim.run_attempt ?? "");
+  if (!/^[1-9]\d*$/u.test(attempt) || Number(attempt) < cell.non_claim.maximum_run_attempts) {
+    problems.push(
+      `non-claim run_attempt must reach the ${cell.non_claim.maximum_run_attempts} attempt recovery bound`,
+    );
+  }
+  if (manifest.evidence?.identity?.producer_run_attempt !== attempt) {
+    problems.push("non-claim run_attempt must match the producing run attempt");
+  }
+  return problems;
+}
+
 function manifestProblems({ manifest, cell, graph, graphSha256, version }) {
   const problems = [];
   if (manifest.schema !== graph.closeout.manifest_schema) {
@@ -234,12 +338,20 @@ function manifestProblems({ manifest, cell, graph, graphSha256, version }) {
       problems.push(`manifest identity ${key} does not match ${formats[key]}`);
     }
   }
+  const withheld = isWithheldManifest(manifest);
   let resolvedConstraints = cell.identity_constraints;
   try {
     resolvedConstraints = resolveReleaseCellConstraints(cell, identity.producer_run_attempt);
+    if (withheld) {
+      resolvedConstraints = {
+        ...resolvedConstraints,
+        ...resolveReleaseCellNonClaimConstraints(cell, identity.producer_run_attempt),
+      };
+    }
   } catch (error) {
     problems.push(error.message);
   }
+  problems.push(...nonClaimProblems({ manifest, cell, graph, withheld }));
   for (const [key, expected] of Object.entries(resolvedConstraints)) {
     if (identity[key] !== expected) {
       problems.push(`manifest identity ${key} must equal ${expected}`);
@@ -472,6 +584,13 @@ function trustedProducerIndex({
       errors.push(`trusted producer map is missing ${cell.id}`);
       continue;
     }
+    const nonClaimRow = row.non_claim === true;
+    if (row.non_claim !== undefined && typeof row.non_claim !== "boolean") {
+      errors.push(`trusted producer map ${cell.id} non_claim must be a boolean`);
+    }
+    if (nonClaimRow && !cell.non_claim) {
+      errors.push(`trusted producer map ${cell.id} does not admit a withheld non-claim`);
+    }
     for (const key of [
       "producer_workflow",
       "producer_job",
@@ -485,7 +604,12 @@ function trustedProducerIndex({
       }
       let constrained;
       try {
-        constrained = resolveReleaseCellConstraints(cell, row.producer_run_attempt)[key];
+        constrained = nonClaimRow && cell.non_claim
+          ? {
+            ...resolveReleaseCellConstraints(cell, row.producer_run_attempt),
+            ...resolveReleaseCellNonClaimConstraints(cell, row.producer_run_attempt),
+          }[key]
+          : resolveReleaseCellConstraints(cell, row.producer_run_attempt)[key];
       } catch (error) {
         errors.push(`trusted producer map ${cell.id} ${error.message}`);
       }
@@ -587,6 +711,11 @@ function producerAuthenticationProblems(manifest, trustedProducer, reusedCommit)
   if (!trustedProducer) return ["manifest producer is absent from the trusted producer map"];
   const identity = manifest.evidence?.identity ?? {};
   const problems = [];
+  // The producer map and the manifest have to agree about which one of the two is being recorded.
+  // Disagreement is how a real proof's producer could otherwise be paired with a withheld manifest.
+  if ((trustedProducer.non_claim === true) !== isWithheldManifest(manifest)) {
+    problems.push("manifest withheld state does not match the trusted producer map");
+  }
   for (const key of [
     "producer_workflow",
     "producer_job",
@@ -662,6 +791,66 @@ function trustedExceptionInput({ document, graph, graphSha256, gitIdentity, vers
     exceptions: canonicalReleaseClaimValue(exceptions),
     identity: canonicalReleaseClaimValue(trustedIdentity ?? {}),
     errors,
+  };
+}
+
+/// Every claim a cell carries, including the ones it only inherits. Withholding one accelerator
+/// proof therefore withholds the whole chain that rested on it, spelled out by name in the ledger.
+export function releaseCellWithheldClaims(graph, cell) {
+  return transitiveClaims(graph, cell.claim).map(({ id }) => id).sort();
+}
+
+const PASSING_CELL_STATUSES = new Set(["pass", "pass_with_exception"]);
+
+/// How much of a release may be unproven and still publish.
+///
+/// A single withheld host is a bounded, recorded loss: the other hosts still prove the claim, and
+/// the ledger says which one did not. Withholding *most* of a release is a different thing
+/// entirely -- a release nothing vouched for -- and the earlier shape of this closeout could not
+/// tell the two apart, because it only ever consulted missing and failed cells. Both bounds below
+/// come from `non_claim_policy.withhold_policy` in release-claims.json, so the threshold is data a
+/// reader can check against the ledger rather than a constant buried here.
+///
+/// The return value also splits the claims a withheld cell rests on into the ones nothing else
+/// proves and the ones another host still proves, because a single unioned list is false in one
+/// direction or the other for every release that withholds anything.
+function assessWithheldClaims({ graph, cells, ledgerCells, withheldHosts }) {
+  const policy = graph.non_claim_policy.withhold_policy;
+  const problems = [];
+  // A withheld row that names no host would not be counted against the cap at all, which is the
+  // one way a capped policy could still be evaded by an absence.
+  for (const row of ledgerCells.filter(({ status }) => status === "withheld")) {
+    const host = row.non_claim?.host;
+    if (typeof host !== "string" || host === "") {
+      problems.push(`withheld cell ${row.id} names no host to count against the withhold cap`);
+    }
+  }
+  const maximum = policy.maximum_withheld_hosts;
+  if (withheldHosts.length > maximum) {
+    problems.push(
+      `withheld hosts ${withheldHosts.join(", ")} exceed the ${maximum}-host withhold cap`,
+    );
+  }
+  const claimOfCell = new Map(cells.map(({ id, claim }) => [id, claim]));
+  const provenClaims = new Set(ledgerCells
+    .filter(({ status }) => PASSING_CELL_STATUSES.has(status))
+    .map(({ id }) => claimOfCell.get(id))
+    .filter((claim) => claim !== undefined));
+  const phaseClaims = new Set(cells.map(({ claim }) => claim));
+  for (const claimId of policy.claims_requiring_proof) {
+    // A claim this phase never closes cannot be withheld here either, so it is not this phase's
+    // business. Every claim the phase does close has to keep at least one cell that actually ran.
+    if (!phaseClaims.has(claimId)) continue;
+    if (provenClaims.has(claimId)) continue;
+    problems.push(`claim ${claimId} requires proof but no cell proved it`);
+  }
+  const touched = [...new Set(ledgerCells
+    .filter(({ status }) => status === "withheld")
+    .flatMap(({ withheld_claims: rows }) => rows ?? []))];
+  return {
+    problems,
+    withheld_claims: touched.filter((claimId) => !provenClaims.has(claimId)).sort(),
+    partially_withheld_claims: touched.filter((claimId) => provenClaims.has(claimId)).sort(),
   };
 }
 
@@ -781,6 +970,11 @@ function dependencyValidationProblems({ cell, cells, manifests, graph, problemsB
     const dependency = dependencyCell(cells, claim.id, focal.evidence.identity.target);
     if ((problemsByCell.get(dependency.id) ?? []).length > 0) {
       problems.push(`dependency cell ${dependency.id} failed closeout validation`);
+    }
+    // A withheld dependency is the whole point of the rule: a cell that still wants to pass while
+    // something it rests on was never proven has to fail loudly, not inherit a quiet pass.
+    if (isWithheldManifest(manifests.get(dependency.id)) && !isWithheldManifest(focal)) {
+      problems.push(`dependency cell ${dependency.id} is withheld`);
     }
   }
   return problems;
@@ -1106,6 +1300,17 @@ export function evaluateReleaseCloseout({
         status: "fail",
         failures: [...new Set(problems)].sort(),
       };
+    } else if (isWithheldManifest(manifest)) {
+      // A withheld cell is never handed to the claim evaluator: that evaluator only knows how to
+      // answer "is this claim proven", and the honest answer here is "nobody asked it".
+      evaluation = {
+        schema: MANIFEST_EVALUATION_SCHEMA,
+        cell_id: cell.id,
+        evidence_cells: [cell.id],
+        status: "withheld",
+        withheld_claims: transitiveClaims(graph, cell.claim).map(({ id }) => id).sort(),
+        non_claim: canonicalReleaseClaimValue(manifest.non_claim),
+      };
     } else {
       try {
         evaluation = evaluateCell({
@@ -1148,10 +1353,24 @@ export function evaluateReleaseCloseout({
       evaluation: evaluationRecord,
       ...(manifest.archive ? { archive: canonicalReleaseClaimValue(manifest.archive) } : {}),
       ...(manifest.comparison ? { comparison: canonicalReleaseClaimValue(manifest.comparison) } : {}),
+      ...(evaluation.status === "withheld"
+        ? {
+          non_claim: canonicalReleaseClaimValue(manifest.non_claim),
+          withheld_claims: [...evaluation.withheld_claims],
+        }
+        : {}),
     });
   }
   const missingCells = ledgerCells.filter(({ status }) => status === "missing").map(({ id }) => id);
   const failedCells = ledgerCells.filter(({ status }) => status === "fail").map(({ id }) => id);
+  const withheldRows = ledgerCells.filter(({ status }) => status === "withheld");
+  const withheldCells = withheldRows.map(({ id }) => id);
+  const withheldHosts = [...new Set(withheldRows.map(({ non_claim: nonClaim }) => nonClaim?.host)
+    .filter((host) => typeof host === "string" && host !== ""))].sort();
+  const withheld = assessWithheldClaims({ graph, cells, ledgerCells, withheldHosts });
+  const withheldClaims = withheld.withheld_claims;
+  const partiallyWithheldClaims = withheld.partially_withheld_claims;
+  inputErrors.push(...withheld.problems);
   const catalogDelivery = resolveCatalogDelivery({ graph, cells, manifests });
   inputErrors.push(...catalogDelivery.errors);
   inputErrors.sort();
@@ -1171,6 +1390,13 @@ export function evaluateReleaseCloseout({
     trusted_exceptions_sha256: digest(canonicalJson(trustedExceptionDocument)),
     ...(catalogDelivery.record ? { catalog_delivery: catalogDelivery.record } : {}),
     cells: ledgerCells,
+    withheld_cells: withheldCells,
+    withheld_hosts: withheldHosts,
+    // Literal in both directions: `withheld_claims` is what nothing in this phase proved, and
+    // `partially_withheld_claims` is what a withheld cell rested on but another cell still proved.
+    withheld_claims: withheldClaims,
+    partially_withheld_claims: partiallyWithheldClaims,
+    withhold_policy: canonicalReleaseClaimValue(graph.non_claim_policy.withhold_policy),
     input_errors: inputErrors,
   };
   const summary = {
@@ -1188,9 +1414,15 @@ export function evaluateReleaseCloseout({
       passed: ledgerCells.filter(({ status }) => new Set(["pass", "pass_with_exception"]).has(status)).length,
       failed: failedCells.length,
       missing: missingCells.length,
+      withheld: withheldCells.length,
     },
     failed_cells: failedCells,
     missing_cells: missingCells,
+    withheld_cells: withheldCells,
+    withheld_hosts: withheldHosts,
+    withheld_claims: withheldClaims,
+    partially_withheld_claims: partiallyWithheldClaims,
+    withhold_policy: canonicalReleaseClaimValue(graph.non_claim_policy.withhold_policy),
     input_errors: inputErrors,
   };
   return {

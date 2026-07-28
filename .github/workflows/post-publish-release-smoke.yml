@@ -89,9 +89,11 @@ jobs:
       - name: Normalize release version
         id: release
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           if [ -z "$version" ]; then
             echo "::error::version input is required"
@@ -186,27 +188,33 @@ jobs:
 
       - name: Prove packaged version, help, and stdio shape
         shell: bash
+        env:
+          ASSET_ARCHIVE: ${{ steps.asset.outputs.archive }}
+          ASSET_CHECKSUM: ${{ steps.asset.outputs.checksum }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
+          --archive "$ASSET_ARCHIVE"
+          --checksum-file "$ASSET_CHECKSUM"
+          --expected-version "$RELEASE_VERSION"
           --version-only
           --out-dir "target/post-publish-version-proof/${{ matrix.asset_target }}"
 
       - name: Prove published macOS signature, notarization, and quarantined execution
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          ASSET_ARCHIVE: ${{ steps.asset.outputs.archive }}
         run: |
           set -euo pipefail
           proof_dir="target/post-publish-macos-signing/${{ matrix.asset_target }}"
           unpacked="$proof_dir/unpacked"
           mkdir -p "$unpacked"
           quarantine="0083;$(date +%s);CodeStory;"
-          xattr -w com.apple.quarantine "$quarantine" "${{ steps.asset.outputs.archive }}"
-          xattr -p com.apple.quarantine "${{ steps.asset.outputs.archive }}" \
+          xattr -w com.apple.quarantine "$quarantine" "$ASSET_ARCHIVE"
+          xattr -p com.apple.quarantine "$ASSET_ARCHIVE" \
             > "$proof_dir/archive-quarantine.txt"
-          tar -xzf "${{ steps.asset.outputs.archive }}" -C "$unpacked"
+          tar -xzf "$ASSET_ARCHIVE" -C "$unpacked"
           bins="$(find "$unpacked" -type f -name codestory-cli -print)"
           count="$(printf '%s\n' "$bins" | sed '/^$/d' | wc -l | tr -d ' ')"
           if [ "$count" -ne 1 ]; then
@@ -308,12 +316,17 @@ jobs:
       - name: Resolve the published plugin through the marketplace catalog
         id: installed
         shell: bash
+        env:
+          MARKETPLACE_REVISION: ${{ steps.delivery.outputs.marketplace_revision }}
+          MARKETPLACE_SOURCE: ${{ steps.delivery.outputs.marketplace_source }}
+          LOCAL_FIXTURE: ${{ steps.delivery.outputs.local_fixture }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-installed-proof"
           codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
           isolated_home="$install_root/isolated-home"
-          marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"
+          marketplace_revision="$MARKETPLACE_REVISION"
           printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           rm -rf "$install_root"
           mkdir -p "$isolated_home"
@@ -326,11 +339,11 @@ jobs:
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source "${{ steps.delivery.outputs.marketplace_source }}" \
+            --marketplace-source "$MARKETPLACE_SOURCE" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$marketplace_revision" \
-            --local-fixture "${{ steps.delivery.outputs.local_fixture }}" \
-            --expected-version "${{ steps.release.outputs.version }}" \
+            --local-fixture "$LOCAL_FIXTURE" \
+            --expected-version "$RELEASE_VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json" \
             --github-output "$GITHUB_OUTPUT"
@@ -338,24 +351,30 @@ jobs:
       - name: Prove the catalog-resolved published runtime
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
+          ASSET_ARCHIVE: ${{ steps.asset.outputs.archive }}
+          ASSET_CHECKSUM: ${{ steps.asset.outputs.checksum }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          INSTALLED_PLUGIN_ROOT: ${{ steps.installed.outputs.plugin_root }}
+          INSTALLED_ATTESTATION: ${{ steps.installed.outputs.attestation }}
+          INSTALLED_PLUGIN_DATA: ${{ steps.installed.outputs.plugin_data }}
         shell: bash
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           python .github/scripts/check-packaged-agent-proof.py \
-            --archive "${{ steps.asset.outputs.archive }}" \
-            --checksum-file "${{ steps.asset.outputs.checksum }}" \
-            --expected-version "${{ steps.release.outputs.version }}" \
+            --archive "$ASSET_ARCHIVE" \
+            --checksum-file "$ASSET_CHECKSUM" \
+            --expected-version "$RELEASE_VERSION" \
             --project "${{ github.workspace }}" \
-            --plugin-root "${{ steps.installed.outputs.plugin_root }}" \
+            --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \
             --expected-backend "${{ matrix.backend }}" \
             --proof-tier installed_runtime \
             --server-behavior-only \
-            --installed-plugin-attestation "${{ steps.installed.outputs.attestation }}" \
-            --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
+            --installed-plugin-attestation "$INSTALLED_ATTESTATION" \
+            --installed-plugin-data "$INSTALLED_PLUGIN_DATA" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
             --timeout-secs 3600 \
@@ -364,17 +383,21 @@ jobs:
       - name: Emit authenticated post-publish release cells
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          ASSET_ARCHIVE: ${{ steps.asset.outputs.archive }}
+          DELIVERED_INSTALLER: ${{ steps.delivery.outputs.installer }}
         run: |
           set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          archive="${{ steps.asset.outputs.archive }}"
+          version="$RELEASE_VERSION"
+          archive="$ASSET_ARCHIVE"
           ledger="$(find target/pre-publish-closeout -type f -name ledger.json -print)"
           test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           mkdir -p target/release-cells
           # The installer identity is whatever the delivery state resolved, never a literal: a
           # deferred run must not be able to sign a cell that says the public catalog served it.
           jq -n \
-            --arg installer "${{ steps.delivery.outputs.installer }}" \
+            --arg installer "$DELIVERED_INSTALLER" \
             --arg native_engine coderank_q8_embedded \
             '{installer: $installer, native_engine: $native_engine}' \
             > target/release-cells/installed-identity.json

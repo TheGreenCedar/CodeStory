@@ -1,11 +1,11 @@
 use super::{
     LanguageSupportProfile, NodeKind, Path, SearchHit, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, architecture_query_intents,
-    exact_symbol_query_terms, language_support_profile_for_ext,
-    language_support_profile_for_language_name, leading_symbol_segment, normalize_symbol_query,
-    query_has_symbol_or_literal_signal, symbol_name_match_rank, symbol_query,
-    terminal_symbol_segment,
+    SearchQueryAssessmentDto, SearchRepoTextMode, exact_symbol_query_terms,
+    language_support_profile_for_ext, language_support_profile_for_language_name,
+    leading_symbol_segment, normalize_symbol_query, query_has_symbol_or_literal_signal,
+    symbol_name_match_rank, terminal_symbol_segment,
 };
+use codestory_contracts::api::{GroundingOrientationDto, GroundingOrientationUncertaintyDto};
 
 #[derive(Debug, Clone)]
 pub(super) struct SearchIntentQuery {
@@ -348,6 +348,7 @@ pub(super) fn repo_text_auto_fallback_reason(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn search_query_assessment(
     query: &str,
     indexed_hits: &[SearchHit],
@@ -355,12 +356,12 @@ pub(super) fn search_query_assessment(
     repo_text_mode: SearchRepoTextMode,
     repo_text_enabled: bool,
     repo_text_fallback_reason: Option<String>,
+    orientation: Option<GroundingOrientationDto>,
 ) -> SearchQueryAssessmentDto {
     let exact_symbol_hit_count = exact_symbol_hit_count(query, indexed_hits);
     let weak_top_hit = exact_symbol_hit_count == 0 && weak_search_top_hit(query, indexed_hits);
     let stale_or_missing_anchor =
         exact_symbol_hit_count == 0 && query_has_symbol_or_literal_signal(query);
-    let architecture_intents = architecture_query_intents(query);
 
     SearchQueryAssessmentDto {
         exact_symbol_hit_count,
@@ -369,38 +370,49 @@ pub(super) fn search_query_assessment(
         repo_text_fallback_reason,
         recommended_next_action: Some(search_query_recommended_next_action(
             exact_symbol_hit_count,
-            &architecture_intents,
+            crate::search_plan::orientation_query(query),
+            orientation.as_ref(),
             indexed_hits,
             repo_text_hits,
             repo_text_mode,
             repo_text_enabled,
         )),
+        orientation,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn search_query_recommended_next_action(
     exact_symbol_hit_count: u32,
-    architecture_intents: &[symbol_query::ArchitectureQueryIntent],
+    orientation_query: bool,
+    orientation: Option<&GroundingOrientationDto>,
     indexed_hits: &[SearchHit],
     repo_text_hits: &[SearchHit],
     repo_text_mode: SearchRepoTextMode,
     repo_text_enabled: bool,
 ) -> String {
-    if exact_symbol_hit_count > 0 && !architecture_intents.is_empty() {
-        return format!(
-            "Architecture intent detected ({}); open the strongest production entrypoint/orchestrator with symbol, trail, and function-body snippet before answering.",
-            architecture_intent_labels(architecture_intents)
-        );
+    // Naming the gap is the point: when the order is lexical, say so rather than
+    // implying the ranking proved a structure.
+    let lexical_fallback = orientation.is_some_and(|orientation| {
+        orientation
+            .uncertainty
+            .contains(&GroundingOrientationUncertaintyDto::LexicalFallback)
+    });
+    if orientation_query && lexical_fallback {
+        return "Graph evidence is thin; these results are lexically ranked. Open the top hit's callers with trail before making structure claims."
+            .to_string();
+    }
+    if exact_symbol_hit_count > 0 && orientation_query {
+        return "Orientation query with an exact anchor; open the strongest production entry point with symbol, trail, and function-body snippet before answering."
+            .to_string();
     }
     if exact_symbol_hit_count > 0 {
         return "Open the exact indexed hit with symbol, trail, and snippet before answering."
             .to_string();
     }
-    if !architecture_intents.is_empty() && !indexed_hits.is_empty() {
-        return format!(
-            "Architecture intent detected ({}) with no exact anchor; run drill with concrete anchors from ground/search, then inspect symbol, trail, and function-body snippets before answering. Treat broad search hits as leads only.",
-            architecture_intent_labels(architecture_intents)
-        );
+    if orientation_query && !indexed_hits.is_empty() {
+        return "Orientation query with no exact anchor; run drill with concrete anchors from ground/search, then inspect symbol, trail, and function-body snippets before answering. Treat broad search hits as leads only."
+            .to_string();
     }
     if !repo_text_hits.is_empty() {
         return "Use repo-text hits to choose a concrete identifier, then rerun symbol/trail/snippet."
@@ -410,14 +422,4 @@ pub(super) fn search_query_recommended_next_action(
         return "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string();
     }
     "Try a shorter symbol, file name, or literal from ground output.".to_string()
-}
-
-pub(super) fn architecture_intent_labels(
-    intents: &[symbol_query::ArchitectureQueryIntent],
-) -> String {
-    intents
-        .iter()
-        .map(|intent| intent.label())
-        .collect::<Vec<_>>()
-        .join(", ")
 }

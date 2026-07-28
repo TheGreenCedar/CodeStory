@@ -14,18 +14,17 @@ use super::{
     SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE,
     SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
     SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCompletion, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanAnchorGroupDto, SearchPlanChannelDto,
-    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SearchSymbolProjection,
-    SemanticDocAliasMode, SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
-    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc,
-    TrailConfigDto, WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
-    arm_full_refresh_staged_store_hook, arm_incremental_staged_store_hook,
-    arm_publication_test_fault, arm_semantic_projection_before_revalidate_hook,
-    arm_source_policy_after_plan_hook, arm_source_policy_before_revalidate_hook,
-    build_component_report_docs, build_llm_symbol_doc_text,
-    build_persisted_search_state_from_canonical_symbols, build_search_state,
-    build_semantic_file_text_cache_with_limits, clamp_usize_to_u32, compare_search_hits,
-    current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
+    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
+    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
+    SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
+    WorkspaceManifest, apply_hybrid_limits, arm_full_refresh_staged_store_hook,
+    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
+    arm_source_policy_before_revalidate_hook, build_component_report_docs,
+    build_llm_symbol_doc_text, build_persisted_search_state_from_canonical_symbols,
+    build_search_state, build_semantic_file_text_cache_with_limits, clamp_usize_to_u32,
+    compare_search_hits, current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
     extract_symbol_search_terms, file_text_match_line, finalize_staged_semantic_docs,
     flush_pending_dense_anchor_inputs, graph_edge_dto, index_freshness_from_storage,
     llm_doc_embed_batch_size, llm_indexable_kind, llm_indexable_kind_for_scope,
@@ -61,21 +60,20 @@ use crate::search_intent::{
     exact_symbol_hit_count, language_filter_matches_path, parse_search_intent_query,
 };
 use crate::search_plan::{
-    SearchPlanActivePathEvidence, same_search_file, search_plan_anchor_groups,
-    search_plan_eligible, search_plan_next_actions, search_plan_path_is_test_or_bench,
-    search_plan_rejected_hits, search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    SearchPlanActivePathEvidence, graph_bridge_evidence_kind, orientation_query, same_search_file,
+    search_plan_anchor_groups, search_plan_eligible, search_plan_next_actions,
+    search_plan_path_is_test_or_bench, search_plan_rejected_hits,
+    search_plan_runtime_call_is_speculative, search_plan_subqueries,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,
     search_index_path_for_publication, write_search_generation_completion,
 };
 use crate::search_scoring::{
-    HybridHitsContext, apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
-    dedupe_inexact_search_hits_by_display_key, exact_symbol_lexical_fast_path,
+    HybridHitsContext, dedupe_inexact_search_hits_by_display_key, exact_symbol_lexical_fast_path,
     exact_symbol_merged_lexical_hybrid_hits, hybrid_hits_for_retrieval_state,
     hybrid_search_config_for_request, merge_search_hits_by_node_id,
     primary_source_retention_threshold, should_pretruncate_primary_source_window,
-    truncate_repo_text_hits_for_query,
 };
 use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::{

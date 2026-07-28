@@ -5,6 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LineCounter, parseDocument } from "yaml";
 import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
+import {
+  LOST_RUNNER_ANNOTATION,
+  MAXIMUM_RUN_ATTEMPTS,
+} from "./lost-runner-recovery.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
@@ -180,6 +184,22 @@ function cachePathsExcludeExactOutputs(job) {
   const forbidden = /(^|[/\\])target($|[/\\])|release-dist|native-seeds|embedded-model|notarization|qualification|proof|\.tar\.gz$|\.zip$|sha256/iu;
   return cacheSteps(job).every(step =>
     cachePaths(step).every(cachePath => !forbidden.test(cachePath)));
+}
+
+/// Routing a dispatched value through `env:` moves it out of the script's text, and out of reach
+/// of a fragment pin that used to name it there: `--expected-sha "$INPUT_REF"` reads the same
+/// whether `INPUT_REF` carries `inputs.ref` or the pull request head an attacker controls. The
+/// fragment pin and this binding pin are two halves of one assertion -- the script names a
+/// variable, and the variable names the value the step was reviewed with.
+function requireStepEnv(violations, file, job, name, bindings) {
+  const env = object(namedStep(job, name)?.env);
+  for (const [key, expected] of Object.entries(bindings)) {
+    add(
+      violations,
+      env[key] === expected,
+      `${file} step ${name} must bind ${key} to ${expected}`,
+    );
+  }
 }
 
 function requireStepUses(violations, file, job, name, expected) {
@@ -1576,7 +1596,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "codestory-release-cell-manifest.mjs produce",
       "--cell-id source_behavior",
       "--producer-job full-source-gate",
+      '--expected-sha "$RESOLVED_REF"',
     ]);
+    requireStepEnv(violations, sourceFile, full, "Emit authenticated source release cell", {
+      RESOLVED_REF: "${{ needs.resolve.outputs.ref }}",
+    });
     const sourceCellUpload = namedStep(full, "Upload authenticated source release cell");
     add(
       violations,
@@ -1745,7 +1769,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
   ]);
-  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
+  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
+    "node .github/scripts/check-workflow-policy.mjs",
+    // The recovery contract decides whether a lost host may withhold a claim, so the release's own
+    // policy gate must execute its tests before any proof runs.
+    "node --test .github/scripts/lost-runner-recovery.test.mjs",
+  ]);
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
@@ -1944,10 +1973,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
+  // The producer map is the trust boundary between a real proof and a non-claim, so the closeout
+  // collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict.
   requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
     "producer-map",
     "--phase pre_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const preDownload = namedStep(preCloseout, "Download selected pre-publish release cells");
   add(
@@ -1965,7 +1998,13 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
     "--trusted-producers",
     "codestory-release-closeout.mjs evaluate",
+    '--version "$RELEASE_VERSION"',
   ]);
+  // The version the ledger is filed under reaches the evaluator as a variable, so the command text
+  // alone no longer says which release it closed out.
+  requireStepEnv(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   const devRevalidation = namedStep(preCloseout, "Revalidate proof-only dev head");
   add(
     violations,
@@ -1982,10 +2021,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const publish = requireJob(violations, releaseFile, release, "publish");
   add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
+  // The published platform table is a claim about this release, so it is rendered from the accepted
+  // ledger. Rendering it from the static graph is how a release whose accelerator proof was
+  // withheld still announced that accelerator as supported.
+  requireStepUses(
+    violations,
+    releaseFile,
+    publish,
+    "Download the accepted pre-publish closeout",
+    "actions/download-artifact@v8.0.1",
+  );
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
     "node scripts/codestory-release-claims.mjs release-platform-notes",
+    "--ledger target/release-closeout/pre_publish/ledger.json",
+  ]);
+  // The ledger the README tells readers to consult has to be reachable from the release itself.
+  requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
+    "target/release-closeout/pre_publish/summary.json",
+    '"$(jq -r .decision "$summary")" = accept',
+    "target/release-assets/release-closeout-summary.json",
   ]);
   requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
     'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
@@ -2037,6 +2093,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
   );
   violations.push(...catalogDeliveryOutcomeViolations(releaseFile, marketplacePublish, catalogDelivery));
+  // The version the catalog is pointed at reaches the push as a variable, so the command text no
+  // longer says which release it published. Both halves are pinned, as in the plugin lane.
+  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
+    '--version "$RELEASE_VERSION"',
+  ]);
+  requireStepEnv(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
     "build-marketplace-fixture.mjs",
     "--local-fixture true",
@@ -2097,6 +2161,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "producer-map",
     "--phase post_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
   add(
@@ -2115,7 +2181,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--trusted-producers",
     "--pre-publish-ledger",
     "codestory-release-closeout.mjs evaluate",
+    '--version "$RELEASE_VERSION"',
   ]);
+  requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   requireStepUses(violations, releaseFile, postCloseout, "Upload accepted post-publish closeout", "actions/upload-artifact@v7.0.1");
   for (const [jobName, job] of [
     ["Metal proof", metal],
@@ -2556,21 +2626,30 @@ function validatePackagedProof(workflows, violations, graph) {
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     "CXXFLAGS=-std=c++17",
   ]);
-  for (const smokeStep of [
-    "Smoke packaged release asset",
-    "Smoke packaged release asset on Windows",
+  // The identity the smoke reads is the one `source-identity` proved against the dispatched ref,
+  // and it now arrives through `env:` rather than spliced into the command. Both halves are pinned:
+  // the script names the variable, and the variable names that step's output.
+  const sourceIdentityBindings = {
+    SOURCE_SHA: "${{ steps.source-identity.outputs.sha }}",
+    SOURCE_TREE: "${{ steps.source-identity.outputs.tree }}",
+  };
+  for (const [smokeStep, sha, tree] of [
+    ["Smoke packaged release asset", '"$SOURCE_SHA"', '"$SOURCE_TREE"'],
+    ["Smoke packaged release asset on Windows", '"$env:SOURCE_SHA"', '"$env:SOURCE_TREE"'],
   ]) {
     requireStepRun(violations, file, job, smokeStep, [
-      '--expected-source-sha "${{ steps.source-identity.outputs.sha }}"',
-      '--expected-source-tree "${{ steps.source-identity.outputs.tree }}"',
+      `--expected-source-sha ${sha}`,
+      `--expected-source-tree ${tree}`,
     ]);
+    requireStepEnv(violations, file, job, smokeStep, sourceIdentityBindings);
   }
   requireStepRun(violations, file, job, "Report fresh package identity", [
     "archive_sha256=",
-    "Source SHA:",
-    "Source tree:",
+    "Source SHA: \\`$SOURCE_SHA\\`",
+    "Source tree: \\`$SOURCE_TREE\\`",
     "Archive SHA-256:",
   ]);
+  requireStepEnv(violations, file, job, "Report fresh package identity", sourceIdentityBindings);
   add(
     violations,
     stepIndex(job, "Report fresh package identity")
@@ -2761,7 +2840,11 @@ function validatePackagedProof(workflows, violations, graph) {
     "package_identity:${{ matrix.asset_target }}",
     "--producer-job build",
     "--archive",
+    '--expected-sha "$INPUT_REF"',
   ]);
+  requireStepEnv(violations, file, job, "Emit authenticated package release cell", {
+    INPUT_REF: "${{ inputs.ref }}",
+  });
   const packageCellUpload = namedStep(job, "Upload authenticated package release cell");
   add(
     violations,
@@ -2873,9 +2956,15 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
     );
   }
   requireStepRun(violations, file, job, installStepName, [
-    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
-    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
+    '--marketplace-source "$MARKETPLACE_SOURCE"',
+    '--local-fixture "$LOCAL_FIXTURE"',
   ]);
+  // The install arguments arrive as variables now, so the command text no longer says which
+  // delivery state they came from. This binds each variable back to that step's own output.
+  requireStepEnv(violations, file, job, installStepName, {
+    MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
+    LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
+  });
   return violations;
 }
 
@@ -2974,7 +3063,9 @@ function validatePostPublish(workflows, violations, graph) {
   );
   add(
     violations,
-    identityRun.includes('--arg installer "${{ steps.delivery.outputs.installer }}"'),
+    identityRun.includes('--arg installer "$DELIVERED_INSTALLER"')
+      && object(namedStep(job, "Emit authenticated post-publish release cells")?.env)
+        .DELIVERED_INSTALLER === "${{ steps.delivery.outputs.installer }}",
     `${file} post-publish cells must record the resolved delivery installer identity`,
   );
   for (const state of catalogDelivery.states) {
@@ -2986,25 +3077,48 @@ function validatePostPublish(workflows, violations, graph) {
   }
   const resolveInstalled = namedStep(job, resolveStepName);
   requireStepRun(violations, file, job, resolveStepName, [
-    'marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"',
+    'marketplace_revision="$MARKETPLACE_REVISION"',
     // Re-checked here as an immutable identity, not merely as 40 characters: this job is
     // dispatchable, so the published branch's revision can arrive from a human.
     `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
     '"@openai/codex@$CODEX_CLI_VERSION"',
     "install-codestory-marketplace-proof.mjs",
-    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+    '--marketplace-source "$MARKETPLACE_SOURCE"',
     '--marketplace-revision "$marketplace_revision"',
-    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
+    '--local-fixture "$LOCAL_FIXTURE"',
     '--source-repository "$GITHUB_WORKSPACE"',
     "install-attestation-v2.json",
     'isolated_home="$install_root/isolated-home"',
     'HOME="$isolated_home" node',
   ]);
+  // The install arguments arrive as variables, so the command text no longer says which delivery
+  // state produced them. Each variable is bound back to the step that resolved it.
+  requireStepEnv(violations, file, job, resolveStepName, {
+    MARKETPLACE_REVISION: "${{ steps.delivery.outputs.marketplace_revision }}",
+    MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
+    LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
+  });
   add(
     violations,
     namedStep(job, "Prove packaged version, help, and stdio shape")?.shell === "bash",
     `${file} packaged Python proof must use Bash on every protected platform`,
   );
+  // The published asset this proof reads now arrives through `env:`, so the command text alone no
+  // longer says which archive or version it proved.
+  requireStepRun(violations, file, job, "Prove packaged version, help, and stdio shape", [
+    '--archive "$ASSET_ARCHIVE"',
+    '--checksum-file "$ASSET_CHECKSUM"',
+    '--expected-version "$RELEASE_VERSION"',
+  ]);
+  requireStepEnv(violations, file, job, "Prove packaged version, help, and stdio shape", {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+    ASSET_CHECKSUM: "${{ steps.asset.outputs.checksum }}",
+    RELEASE_VERSION: "${{ steps.release.outputs.version }}",
+  });
+  // The macOS signing proof quarantines and unpacks the same published archive.
+  requireStepEnv(violations, file, job, "Prove published macOS signature, notarization, and quarantined execution", {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+  });
   const resolveRun = executableRunText(String(resolveInstalled?.run ?? ""));
   for (const forbidden of [
     "git archive",
@@ -3026,7 +3140,8 @@ function validatePostPublish(workflows, violations, graph) {
       && resolveInstalled?.["continue-on-error"] === undefined,
     `${file} installed plugin resolution must be unconditional and fail closed`,
   );
-  const installed = namedStep(job, "Prove the catalog-resolved published runtime");
+  const installedProofName = "Prove the catalog-resolved published runtime";
+  const installed = namedStep(job, installedProofName);
   add(violations, installed !== undefined, `${file} installed runtime proof step is missing`);
   add(
     violations,
@@ -3042,7 +3157,7 @@ function validatePostPublish(workflows, violations, graph) {
   const installedRun = executableRunText(String(installed?.run ?? ""));
   for (const fragment of [
     "python .github/scripts/check-packaged-agent-proof.py",
-    '--archive "${{ steps.asset.outputs.archive }}"',
+    '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
     '--expected-backend "${{ matrix.backend }}"',
@@ -3059,6 +3174,16 @@ function validatePostPublish(workflows, violations, graph) {
       `${file} installed runtime proof must run ${fragment}`,
     );
   }
+  // The archive and the resolved installation now reach the proof as variables. Without these the
+  // command text would read the same whether it proved the published asset or something else.
+  requireStepEnv(violations, file, job, installedProofName, {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+    ASSET_CHECKSUM: "${{ steps.asset.outputs.checksum }}",
+    RELEASE_VERSION: "${{ steps.release.outputs.version }}",
+    INSTALLED_PLUGIN_ROOT: "${{ steps.installed.outputs.plugin_root }}",
+    INSTALLED_ATTESTATION: "${{ steps.installed.outputs.attestation }}",
+    INSTALLED_PLUGIN_DATA: "${{ steps.installed.outputs.plugin_data }}",
+  });
   for (const fragment of ["--engine-policy cpu_explicit", "--expected-backend CPU", "--ground-only"]) {
     add(
       violations,
@@ -3200,15 +3325,20 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
     'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
-    'elif [ "${{ steps.resolve.outputs.mode }}" = "package" ]; then',
+    'elif [ "$RESOLVED_MODE" = "package" ]; then',
     'test "$REQUESTED_SCOPE" != none',
     'if [ "$REQUESTED_SCOPE" = auto ]; then',
-    'elif [ "${{ steps.resolve.outputs.mode }}" = "qualification" ]; then',
+    'elif [ "$RESOLVED_MODE" = "qualification" ]; then',
     'test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full',
     'scope="$REQUESTED_SCOPE"',
     "scope=full",
     "node .github/scripts/route-ci-proof.mjs --stdin",
   ]);
+  // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
+  // longer says which mode it read. This binds the variable back to the resolver's own output.
+  requireStepEnv(violations, file, route, "Select change-aware proof scope", {
+    RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
+  });
   add(
     violations,
     String(namedStep(route, "Select change-aware proof scope")?.run ?? "")
@@ -3610,9 +3740,13 @@ function validateRemainingWorkflows(workflows, violations) {
       `${metalFile} candidate-installed validation must be an explicit Bash boundary`,
     );
     requireStepRun(violations, metalFile, job, "Validate candidate-installed mode", [
-      'test "${{ inputs.server_behavior_only }}" = true',
-      'test "${{ inputs.calibration_mode }}" = false',
+      'test "$SERVER_BEHAVIOR_ONLY" = true',
+      'test "$CALIBRATION_MODE" = false',
     ]);
+    requireStepEnv(violations, metalFile, job, "Validate candidate-installed mode", {
+      SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
+      CALIBRATION_MODE: "${{ inputs.calibration_mode }}",
+    });
     requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
     add(
@@ -3747,7 +3881,20 @@ function validateRemainingWorkflows(workflows, violations) {
       "codestory-release-cell-manifest.mjs produce",
       "accelerator_execution:macos-arm64-metal",
       "--producer-job packaged-metal",
+      '--expected-sha "$INPUT_REF"',
     ]);
+    requireStepRun(violations, metalFile, job, "Emit authenticated macOS retrieval-readiness release cell", [
+      "retrieval_readiness:macos-arm64",
+      "--producer-job packaged-metal",
+      '--expected-sha "$INPUT_REF"',
+    ]);
+    for (const cell of [
+      "Emit authenticated Metal release cell",
+      "Emit authenticated macOS retrieval-readiness release cell",
+      "Emit authenticated candidate-installed macOS release cell",
+    ]) {
+      requireStepEnv(violations, metalFile, job, cell, { INPUT_REF: "${{ inputs.ref }}" });
+    }
     const metalCellUpload = namedStep(job, "Upload authenticated Metal release cell");
     add(
       violations,
@@ -3760,6 +3907,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "candidate_installed_behavior:macos-arm64",
       "--producer-job packaged-metal",
       "candidate_managed_plugin",
+      '--expected-sha "$INPUT_REF"',
     ]);
     forbidStepRun(
       violations,
@@ -3894,9 +4042,12 @@ function validateRemainingWorkflows(workflows, violations) {
       `${vulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
     requireStepRun(violations, vulkanFile, job, "Validate candidate-installed mode", [
-      'if ("${{ inputs.server_behavior_only }}" -ne "true")',
+      'if ($env:SERVER_BEHAVIOR_ONLY -ne "true")',
       "candidate_installed_proof requires server_behavior_only",
     ]);
+    requireStepEnv(violations, vulkanFile, job, "Validate candidate-installed mode", {
+      SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
+    });
     const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
     add(
       violations,
@@ -4046,7 +4197,15 @@ function validateRemainingWorkflows(workflows, violations) {
       "codestory-release-cell-manifest.mjs produce",
       "accelerator_execution:windows-x64-vulkan",
       "--producer-job packaged-vulkan",
+      '--expected-sha "$INPUT_REF"',
     ]);
+    for (const cell of [
+      "Emit authenticated Vulkan release cell",
+      "Emit authenticated Windows retrieval-readiness release cell",
+      "Emit authenticated candidate-installed Windows release cell",
+    ]) {
+      requireStepEnv(violations, vulkanFile, job, cell, { INPUT_REF: "${{ inputs.ref }}" });
+    }
     const releaseCell = namedStep(job, "Emit authenticated Vulkan release cell");
     add(
       violations,
@@ -4066,6 +4225,12 @@ function validateRemainingWorkflows(workflows, violations) {
       "candidate_installed_behavior:windows-x64",
       "--producer-job packaged-vulkan",
       "candidate_managed_plugin",
+      '--expected-sha "$INPUT_REF"',
+    ]);
+    requireStepRun(violations, vulkanFile, job, "Emit authenticated Windows retrieval-readiness release cell", [
+      "retrieval_readiness:windows-x64",
+      "--producer-job packaged-vulkan",
+      '--expected-sha "$INPUT_REF"',
     ]);
     forbidStepRun(
       violations,
@@ -4158,8 +4323,11 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} candidate-installed validation must require explicit candidate mode`,
     );
     requireStepRun(violations, linuxVulkanFile, job, "Validate candidate-installed mode", [
-      'test "${{ inputs.server_behavior_only }}" = true',
+      'test "$SERVER_BEHAVIOR_ONLY" = true',
     ]);
+    requireStepEnv(violations, linuxVulkanFile, job, "Validate candidate-installed mode", {
+      SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
+    });
     const packageDownload = namedStep(job, "Download exact Linux package");
     add(
       violations,
@@ -4250,7 +4418,11 @@ function validateRemainingWorkflows(workflows, violations) {
       "retrieval_readiness:linux-x64",
       "candidate_installed_behavior:linux-x64",
       "--producer-job packaged-vulkan",
+      '--expected-sha "$INPUT_REF"',
     ]);
+    requireStepEnv(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", {
+      INPUT_REF: "${{ inputs.ref }}",
+    });
     forbidStepRun(
       violations,
       linuxVulkanFile,
@@ -4468,12 +4640,466 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-linux-x64-attempt-${{ github.run_attempt }}",
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-linux-x64-attempt-${{ github.run_attempt }}",
     "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
+    // The withheld-claim producer is the one job allowed to write a cell it did not prove, and it
+    // owns exactly one attempt-qualified artifact per protected host and closeout phase.
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
   ];
   add(
     violations,
     JSON.stringify(actual.sort()) === JSON.stringify(expected.sort()),
     "release-cell Actions artifact names must have one graph-owned producer job and attempt suffix",
   );
+}
+
+/// Every `${{ ... }}` in a piece of text, bounded by the `}}` that actually closes it.
+///
+/// A non-greedy `/\$\{\{[\s\S]*?\}\}/` stops at the first `}}` it sees, which is not always the
+/// terminator. GitHub's expression grammar puts braces inside expressions -- `fromJSON('{"a":1}')`
+/// carries one, and `format('{{Hello {0}}}', ...)`, the brace escape from GitHub's own expression
+/// documentation, carries a run of them. Against `${{ format('{{Hello {0}}}', inputs.ref) }}` the
+/// non-greedy form returned `${{ format('{{Hello {0}}`, which names no context at all, so a rule
+/// reading these spans saw a clean file and GitHub still spliced the input. Braces are counted
+/// here and the span ends at the `}}` that closes the expression itself.
+///
+/// Single-quoted literals are skipped whole, with `''` read as GitHub's escape for one quote, so a
+/// brace inside a string cannot move the count in either direction. Text that opens an expression
+/// and never closes it yields the rest of the text rather than nothing: an unreadable expression is
+/// not evidence that it is harmless.
+export function interpolationSpans(text) {
+  const source = String(text);
+  const spans = [];
+  let cursor = 0;
+  for (;;) {
+    const start = source.indexOf("${{", cursor);
+    if (start === -1) return spans;
+    let depth = 0;
+    let quoted = false;
+    let end = -1;
+    for (let index = start + 3; index < source.length; index += 1) {
+      const character = source[index];
+      if (quoted) {
+        if (character !== "'") continue;
+        if (source[index + 1] === "'") index += 1;
+        else quoted = false;
+        continue;
+      }
+      if (character === "'") quoted = true;
+      else if (character === "{") depth += 1;
+      else if (character === "}") {
+        if (depth > 0) depth -= 1;
+        else if (source[index + 1] === "}") {
+          end = index + 2;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      spans.push(source.slice(start));
+      return spans;
+    }
+    spans.push(source.slice(start, end));
+    cursor = end;
+  }
+}
+
+/// Any mention of the `inputs` context, however it is spelled. GitHub serves the same dispatched
+/// value under `inputs.version`, `github.event.inputs.version`, and `inputs['version']`, and an
+/// expression can bury it in a function call, so this matches the context name itself rather than
+/// any one path through it. `outputs` does not contain `inputs`, and a word character before it
+/// (`my_inputs`) is not the context.
+const namesADispatchInput = /\binputs\b/u;
+
+/// The contexts a dispatched value can be standing in when a script reads it one hop later. Each
+/// one is a channel, not a value: nothing at the reading site says what was put into it.
+///
+/// `env` -- a workflow-, job-, or step-level `env:` entry may be bound to `${{ inputs.x }}`, and
+///   `${{ env.NAME }}` in a script is then the input, spliced as text. This PR alone created 117
+///   step-level `env:` bindings carrying inputs, so this is the shape the next author reaches for.
+/// `steps.*.outputs.*` -- a step that receives an input can write it to `$GITHUB_OUTPUT`, and the
+///   consuming `${{ steps.x.outputs.y }}` is again text.
+/// `needs.*.outputs.*` -- a job output is a step output that crossed a job boundary.
+///
+/// The remedy is the same one #1566 applied 117 times: bind the value in `env:` and read `$NAME`.
+/// For `env` specifically it costs nothing at all -- a workflow- or job-level `env:` entry is
+/// already exported into the shell, so `$NAME` is available with no new binding.
+///
+/// Not claimed here: `github.*` can carry attacker-authored text (a pull request title), which is a
+/// different surface with a different argument. `matrix.*` can be built from an input, which is
+/// pinned where the matrix is built (`fromJSON` over a fixed set of literals) rather than here.
+const launderingContexts = [
+  [/\benv\b/u, "env"],
+  [/\bsteps\b[\s\S]*\boutputs\b/u, "a step output"],
+  [/\bneeds\b[\s\S]*\boutputs\b/u, "a job output"],
+  // For `workflow_dispatch`, `github.event` *is* the inputs container, so serialising the event
+  // carries every dispatched value into script text without the word `inputs` ever appearing --
+  // `toJSON` preserves `$(` and backticks intact. `\bevent\b` does not match inside
+  // `github.event_name`, because `_` is a word character, so the ordinary trigger read is untouched.
+  [/\bgithub\b[\s\S]*\bevent\b/u, "the event payload"],
+];
+
+export function interpolatedDispatchInputs(run) {
+  return interpolationSpans(run).filter(expression => namesADispatchInput.test(expression));
+}
+
+/// Every interpolation in `run` that reaches a dispatched value, paired with why it can.
+export function interpolatedInputChannels(run) {
+  const found = [];
+  for (const expression of interpolationSpans(run)) {
+    if (namesADispatchInput.test(expression)) {
+      found.push([expression, "a dispatch input"]);
+      continue;
+    }
+    const laundering = launderingContexts.find(([pattern]) => pattern.test(expression));
+    if (laundering !== undefined) found.push([expression, laundering[1]]);
+  }
+  return found;
+}
+
+/// Dispatched values must reach a script through `env:`, never through the script's own text.
+///
+/// Expression interpolation happens before any shell exists: GitHub splices the value into the
+/// `run:` body as characters, and the shell then parses the result. Double quotes do not stop
+/// `$(...)` or backticks, so a dispatcher who can name the value can run commands on the runner --
+/// beside whatever `GH_TOKEN`, environment secret, or self-hosted host state that step carries.
+/// `env:` is not textual: the value arrives as a variable and `"$VAR"` is inert.
+///
+/// #1554 fixed this in marketplace-sync.yml and pinned the fix with `validateMarketplaceSync`, a
+/// validator named after one file. That shape cannot fail on a second file no matter how many
+/// times the same splice is written, and eight other workflows carried it. This rule is driven by
+/// the loaded workflow set instead, so it reads whatever workflows exist at the time it runs and a
+/// workflow added tomorrow is covered without anyone editing this function.
+///
+/// The rule reads `run:` only. A dispatched value in an action input (`with.ref`) or an `if:` is a
+/// different surface with a different argument, pinned separately where it belongs.
+///
+/// Naming the `inputs` context alone was not enough. The context is only where the value is at the
+/// moment the rule looks: an author who binds it into `env:` and reads `${{ env.NAME }}` one line
+/// later, or writes it to `$GITHUB_OUTPUT` and reads `${{ steps.x.outputs.y }}` one step later, has
+/// rebuilt #1566 with the gate green. The channels a dispatched value can be sitting in are refused
+/// with it, so closing the surface does not depend on spotting where the value came from.
+export function dispatchInputInterpolationViolations(workflows) {
+  const violations = [];
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      for (const [index, rawStep] of list(object(job).steps).entries()) {
+        const step = object(rawStep);
+        if (typeof step.run !== "string") continue;
+        const named = step.name ? ` (${step.name})` : "";
+        const seen = new Set();
+        for (const [expression, channel] of interpolatedInputChannels(step.run)) {
+          if (seen.has(expression)) continue;
+          seen.add(expression);
+          violations.push(
+            `${file} jobs.${jobId}.steps.${index}${named} must read ${expression}`
+              + ` from step env, not interpolated script text: it carries ${channel}`,
+          );
+        }
+      }
+    }
+  }
+  return violations;
+}
+
+/// Routing a value through `env:` moves the read from GitHub's interpolator into the shell, so the
+/// script stops being shell-independent the moment it does.
+///
+/// `${{ env.NAME }}` is spliced before any shell exists and reads the same everywhere. `"$NAME"` is
+/// a bash read; under pwsh -- the runner default on Windows -- it is the literal `$NAME` if it
+/// resolves to anything at all, and the correct read is `$env:NAME`. So a step that consumes a
+/// binding on a job that can land on a Windows runner has to say which shell it was written for.
+/// Every affected step in this repository declares one; this keeps that true, because the failure
+/// mode is a proof that silently compares against an empty string rather than an error.
+export function shellDependentBindingViolations(workflows) {
+  const violations = [];
+  const bashRead = name => new RegExp(`\\$\\{?${name}\\b`, "u");
+  for (const [file, workflow] of workflows) {
+    const workflowShell = at(workflow, "defaults", "run", "shell");
+    for (const [jobId, rawJob] of Object.entries(object(workflow.jobs))) {
+      const job = object(rawJob);
+      // `runs-on` is often an expression, so the platform is not always readable here. Anything
+      // that is not a literal non-Windows label is treated as reaching Windows.
+      const label = JSON.stringify(job["runs-on"] ?? "");
+      const known = /^"(ubuntu|macos)[\w.-]*"$/u.test(label);
+      if (known) continue;
+      const jobShell = at(job, "defaults", "run", "shell") ?? workflowShell;
+      for (const [index, rawStep] of list(job.steps).entries()) {
+        const step = object(rawStep);
+        if (typeof step.run !== "string") continue;
+        if ((step.shell ?? jobShell) !== undefined) continue;
+        const bound = Object.keys(object(step.env))
+          .concat(Object.keys(object(job.env)), Object.keys(object(workflow.env)))
+          .filter(name => bashRead(name).test(step.run)
+            && !new RegExp(`\\$env:${name}\\b`, "u").test(step.run));
+        if (bound.length === 0) continue;
+        const named = step.name ? ` (${step.name})` : "";
+        violations.push(
+          `${file} jobs.${jobId}.steps.${index}${named} reads ${bound.sort().join(", ")}`
+            + " as a shell variable on a job that can run on Windows and must declare its shell",
+        );
+      }
+    }
+  }
+  return violations;
+}
+
+/// A script that absorbs its own failure has to hand that failure to something that does not.
+///
+/// `continue-on-error` lives outside the script, so nothing the script's own text asserts can see
+/// it, and it turns a gate's `exit 1` into advice. Putting it on plugin-static.yml's
+/// `Check workflow policy` step would silence this file and its whole test suite while the run
+/// still reported green -- the commands that step runs are pinned, its blocking-ness was not.
+///
+/// The rule is not "gates must be blocking", because the repository has scripts that deliberately
+/// are not: source-proof compiles and lints under `continue-on-error` so a later step can save the
+/// cache before failing the job, and both release lanes push the marketplace catalog that way so a
+/// credential problem cannot strand an already-published release. What those have and a silenced
+/// gate does not is a *successor*: an `id:`, and another step that reads `steps.<id>.outcome` and
+/// fails on it. So absorbing a failure is allowed exactly when the failure is still required
+/// somewhere, and a step that absorbs its failure into nothing is refused.
+///
+/// Scoped to `run:` steps. The optional cache restores are `uses:` steps whose miss is the normal
+/// path and carries no outcome to require -- their non-blocking-ness is separately required, and
+/// this rule must not contradict that.
+export function absorbedFailureViolations(workflows) {
+  const violations = [];
+  const absorbs = value => value !== undefined && value !== false;
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, rawJob] of Object.entries(object(workflow.jobs))) {
+      const job = object(rawJob);
+      // A job-level `continue-on-error` downgrades every step it contains at once, and the only
+      // thing that can still require the failure is a downstream job reading `needs.<id>.result`.
+      if (absorbs(job["continue-on-error"])) {
+        add(
+          violations,
+          scalarStrings(workflow.jobs).some(text => text.includes(`needs.${jobId}.result`)),
+          `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
+        );
+      }
+      const steps = list(job.steps).map(step => object(step));
+      // Reading the outcome is not requiring it. `if: steps.x.outcome == 'success'` only decides
+      // whether the reader runs, and a skipped step is not a failed job; a reader that absorbs its
+      // own failure cannot fail the job on what it read either, so it just moves the same question
+      // one step along. A successor is therefore a blocking step that receives the outcome
+      // somewhere other than its own `if:` -- where a script can still `test` it and exit non-zero.
+      const requires = outcome => steps.some(other => {
+        if (absorbs(other["continue-on-error"])) return false;
+        const consumed = { ...other };
+        delete consumed.if;
+        return scalarStrings(consumed).some(text => text.includes(outcome));
+      });
+      for (const [index, step] of steps.entries()) {
+        if (typeof step.run !== "string") continue;
+        if (!absorbs(step["continue-on-error"])) continue;
+        const named = step.name ? ` (${step.name})` : "";
+        add(
+          violations,
+          typeof step.id === "string" && requires(`steps.${step.id}.outcome`),
+          `${file} jobs.${jobId}.steps.${index}${named} absorbs its own failure and must have`
+            + " an id whose outcome a later blocking step requires",
+        );
+      }
+    }
+  }
+  return violations;
+}
+
+const JOB_EVIDENCE_COLLECTOR = ".github/scripts/collect-actions-job-evidence.sh";
+
+/// `checks: read` is the token scope that makes the lost-runner signature readable at all.
+///
+/// The signature's first part is a job annotation, and GET /repos/{o}/{r}/check-runs/{id}/annotations
+/// is gated on that scope. A workflow that runs the collector without it gets a 403, which the
+/// collector now refuses rather than reporting as "no annotations" -- so the missing scope stops a
+/// release instead of quietly making recovery impossible. This rule catches it before the release,
+/// in every workflow that reaches the collector, including the reusable-workflow callers whose own
+/// grant is the ceiling for everything they call.
+export function annotationScopeViolations(workflows) {
+  const violations = [];
+  const grantsChecksRead = permissions => object(permissions).checks === "read";
+  const collectorWorkflows = new Set();
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const runsCollector = list(object(job).steps)
+        .some(step => String(object(step).run ?? "").includes(JOB_EVIDENCE_COLLECTOR));
+      if (!runsCollector) continue;
+      collectorWorkflows.add(file);
+      // A job-level `permissions:` block replaces the workflow-level one outright, so the effective
+      // grant is whichever of the two the job actually has.
+      const effective = object(job).permissions !== undefined
+        ? object(job).permissions
+        : object(workflow).permissions;
+      add(
+        violations,
+        grantsChecksRead(effective),
+        `${file} job ${jobId} reads Actions job annotations and must grant checks: read`,
+      );
+    }
+  }
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const uses = String(object(job).uses ?? "");
+      if (!uses.startsWith("./.github/workflows/")) continue;
+      if (!collectorWorkflows.has(uses.slice(uses.lastIndexOf("/") + 1))) continue;
+      add(
+        violations,
+        grantsChecksRead(object(job).permissions),
+        `${file} job ${jobId} calls a workflow that reads job annotations and must pass checks: read`,
+      );
+    }
+  }
+  add(
+    violations,
+    collectorWorkflows.size > 0,
+    `no workflow runs ${JOB_EVIDENCE_COLLECTOR}, so the lost-runner signature is never collected`,
+  );
+  return violations;
+}
+
+/// The two halves of the lost-runner contract: a bounded automatic re-dispatch, and a withheld
+/// claim once that bound is spent.
+///
+/// Both are places where a gate is being relaxed, so the policy pins the shapes that keep the
+/// relaxation honest: the rerun names individual lost jobs instead of asking Actions to rerun every
+/// failure, the recovery never waits on a human, and the withheld-claim producer decides from the
+/// shared classifier rather than from "the proof job went red".
+export function lostRunnerRecoveryViolations(workflows, graph) {
+  const violations = [];
+  const policy = graph.non_claim_policy;
+  const rerunFile = "lost-runner-rerun.yml";
+  const rerun = workflows.get(rerunFile);
+  add(
+    violations,
+    MAXIMUM_RUN_ATTEMPTS === policy.maximum_run_attempts,
+    `${rerunFile} recovery bound must equal the release claim graph maximum_run_attempts`,
+  );
+  add(
+    violations,
+    LOST_RUNNER_ANNOTATION === policy.annotation,
+    `${rerunFile} recovery contract must key on the annotation the release claim graph records`,
+  );
+  if (!rerun) {
+    violations.push(`${rerunFile} must exist`);
+  } else {
+    const trigger = object(at(rerun, "on", "workflow_run"));
+    add(
+      violations,
+      includesAll(trigger.workflows, ["Auto Release", "Release"])
+        && includesAll(trigger.types, ["completed"]),
+      `${rerunFile} must observe completed release runs`,
+    );
+    add(
+      violations,
+      JSON.stringify(Object.entries(object(rerun.permissions)).sort())
+        === JSON.stringify([["actions", "write"], ["checks", "read"], ["contents", "read"]]),
+      `${rerunFile} must hold only the Actions write and annotation read scopes its recovery needs`,
+    );
+    const job = requireJob(violations, rerunFile, rerun, "rerun-lost-jobs");
+    // The repository requires machine recovery: an environment on this job would put a human click
+    // between a dropped connection and the retry, which is the failure this workflow exists to fix.
+    add(
+      violations,
+      object(job).environment === undefined,
+      `${rerunFile} recovery must not wait on an approval environment`,
+    );
+    add(
+      violations,
+      String(object(job).if ?? "").includes("github.event.workflow_run.conclusion == 'failure'"),
+      `${rerunFile} must act only on a failed release run`,
+    );
+    requireStepRun(violations, rerunFile, job, "Collect Actions failure evidence", [
+      "bash .github/scripts/collect-actions-job-evidence.sh",
+    ]);
+    requireStepRun(violations, rerunFile, job, "Plan the bounded rerun", [
+      "node .github/scripts/lost-runner-recovery.mjs plan-rerun",
+    ]);
+    const dispatch = namedStep(job, "Re-dispatch only the lost jobs");
+    add(
+      violations,
+      dispatch?.if === "steps.plan.outputs.rerun == 'true'",
+      `${rerunFile} re-dispatch must be gated on the classified recovery plan`,
+    );
+    requireStepRun(violations, rerunFile, job, "Re-dispatch only the lost jobs", [
+      "actions/jobs/$job_id/rerun",
+    ]);
+    // Re-running every failed job would sweep an assertion failure back into the queue alongside
+    // the lost one; the plan names ids, so the API call must be the per-job endpoint.
+    add(
+      violations,
+      !scalarStrings(rerun).some(value => value.includes("rerun-failed-jobs")),
+      `${rerunFile} must re-dispatch named lost jobs, never every failed job`,
+    );
+  }
+
+  const releaseFile = "release.yml";
+  const release = workflows.get(releaseFile);
+  if (!release) return violations;
+  const job = requireJob(violations, releaseFile, release, "accelerator-non-claim");
+  add(
+    violations,
+    sameMembers(needs(job), graph.workflow_policy.release_chain.dependencies["accelerator-non-claim"]),
+    `${releaseFile} non-claim dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    job.name === policy.producer_job_name,
+    `${releaseFile} non-claim job name must equal the release claim graph producer_job_name`,
+  );
+  add(
+    violations,
+    object(job).environment === undefined,
+    `${releaseFile} non-claim producer must not wait on an approval environment`,
+  );
+  add(
+    violations,
+    String(object(job).if ?? "").startsWith("always()"),
+    `${releaseFile} non-claim producer must observe every accelerator outcome`,
+  );
+  requireStepRun(violations, releaseFile, job, "Collect protected accelerator job evidence", [
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "non_claim_policy.hosts",
+  ]);
+  requireStepRun(violations, releaseFile, job, "Decide withheld accelerator hosts", [
+    "node .github/scripts/lost-runner-recovery.mjs plan-non-claim",
+  ]);
+  const record = namedStep(job, "Record populated accelerator non-claims");
+  add(
+    violations,
+    record?.if === "steps.non-claim.outputs.withheld_hosts != ''",
+    `${releaseFile} non-claim cells must be written only for hosts the classifier withheld`,
+  );
+  requireStepRun(violations, releaseFile, job, "Record populated accelerator non-claims", [
+    "scripts/codestory-release-cell-manifest.mjs withhold",
+    '--producer-run-attempt "$GITHUB_RUN_ATTEMPT"',
+  ]);
+  // A non-claim producer that emitted evidence for a host that reported would overwrite a real
+  // proof, so every upload is bound to the classifier's own withheld list. Each closeout phase gets
+  // its own container: a phase authorizes every manifest inside the container it downloads, so a
+  // container mixing phases would carry a manifest that phase's producer map never selected.
+  for (const host of policy.hosts) {
+    for (const [phase, artifact] of Object.entries(host.producer_artifacts)) {
+      const prefix = artifact.replace("-attempt-{attempt}", "");
+      const upload = [...list(job.steps)].find(step =>
+        String(object(object(step).with).name ?? "").startsWith(prefix));
+      add(
+        violations,
+        upload?.if === `contains(steps.non-claim.outputs.withheld_hosts, '${host.id}')`
+          && String(object(object(upload).with).path ?? "").endsWith(`/${host.id}/${phase}`),
+        `${releaseFile} withheld ${host.id} ${phase} cells must upload only that phase for a withheld host`,
+      );
+    }
+  }
+  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  add(
+    violations,
+    String(object(closeout).if ?? "").includes("needs.accelerator-non-claim.result == 'success'"),
+    `${releaseFile} pre-publish closeout must require a decided non-claim outcome`,
+  );
+  return violations;
 }
 
 function validateReleaseArtifactRerunSafety(workflows, violations) {
@@ -4835,8 +5461,11 @@ export function validatePluginRelease(workflows, violations, graph) {
   );
   requireStepRun(violations, file, marketplacePublish, "Point the catalog at the published release", [
     "publish-marketplace-catalog.mjs",
-    '--version "${{ inputs.version }}"',
+    '--version "$INPUT_VERSION"',
   ]);
+  requireStepEnv(violations, file, marketplacePublish, "Point the catalog at the published release", {
+    INPUT_VERSION: "${{ inputs.version }}",
+  });
   // Same contract as the native lane: the catalog push is delivery after an irreversible tag, so
   // it may not fail the release, and the run must record which state it ended in.
   const catalogDelivery = object(at(graph, "workflow_policy", "catalog_delivery"));
@@ -4929,7 +5558,7 @@ export function validateMarketplaceSync(workflows, violations) {
   add(
     violations,
     scalarStrings(workflow)
-      .flatMap(text => [...text.matchAll(/\$\{\{[^}]*\binputs\b[^}]*\}\}/gu)].map(match => match[0]))
+      .flatMap(text => interpolatedDispatchInputs(text))
       .every(expression => Object.values(bindings).includes(expression)),
     `${file} must name a dispatch input only as ${bindings.INPUT_COMMIT} or ${bindings.INPUT_VERSION}`,
   );
@@ -4987,7 +5616,7 @@ export function validateMarketplaceSync(workflows, violations) {
       }
       add(
         violations,
-        !scalarStrings(surfaces).some(text => /\$\{\{[^}]*\binputs\b/u.test(text)),
+        !scalarStrings(surfaces).some(text => interpolatedDispatchInputs(text).length > 0),
         `${where} must not splice a dispatch input into an action input`,
       );
       for (const [name, expected] of Object.entries(bindings)) {
@@ -5060,6 +5689,11 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validateRemainingWorkflows(workflows, violations);
   validateReleaseCellUploadOwnership(workflows, violations);
   validateReleaseArtifactRerunSafety(workflows, violations);
+  violations.push(...dispatchInputInterpolationViolations(workflows));
+  violations.push(...shellDependentBindingViolations(workflows));
+  violations.push(...absorbedFailureViolations(workflows));
+  violations.push(...annotationScopeViolations(workflows));
+  violations.push(...lostRunnerRecoveryViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }
