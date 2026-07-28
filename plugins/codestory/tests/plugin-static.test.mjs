@@ -874,14 +874,25 @@ function semverGreater(left, right) {
 }
 
 test("the CLI version pin decides what the managed path provisions", async () => {
-  // With a valid pin, the launcher resolves the pinned version and its published digest.
-  assert.equal(launcherTest.pinnedCliVersion(), "0.16.1");
+  // Read the version out of the pin rather than restating it: a release bump
+  // rewrites the pin, and a test that hardcodes the old number fails the bump
+  // instead of the behaviour it is guarding.
   const pin = launcherTest.pinnedCliContract();
-  assert.equal(pin.release_tag, "v0.16.1");
-  assert.equal(
-    launcherTest.pinnedArchiveSha256("macos-arm64"),
-    pin.archives["macos-arm64"],
-  );
+  assert.match(pin.cli_version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+  assert.equal(launcherTest.pinnedCliVersion(), pin.cli_version);
+  assert.equal(pin.release_tag, `v${pin.cli_version}`);
+
+  // A native bump drops the digests: they cannot exist until that release
+  // publishes its archives, and the plugin lane re-adds them when it pins an
+  // already-published CLI.
+  if (pin.archives) {
+    assert.equal(
+      launcherTest.pinnedArchiveSha256("macos-arm64"),
+      pin.archives["macos-arm64"],
+    );
+  } else {
+    assert.equal(launcherTest.pinnedArchiveSha256("macos-arm64"), null);
+  }
   assert.equal(launcherTest.pinnedArchiveSha256("no-such-target"), null);
 });
 
