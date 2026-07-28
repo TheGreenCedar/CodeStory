@@ -1463,4 +1463,125 @@ mod tests {
              be exercising them (checked {checked_pairs})"
         );
     }
+
+    /// Symbols of the kind retrieval turns up in any repository, none of which prove anything about
+    /// any flow requirement in the tables.
+    ///
+    /// The positive witnesses above only show each predicate accepts *one* hand-picked anchor. They
+    /// cannot see a predicate that also accepts everything else, and that is exactly what happened:
+    /// `citation_owns_format_errors` matched any symbol whose name contained "error" anywhere in
+    /// the repository, `citation_owns_hook_public_export` matched any name starting with the three
+    /// letters "use", and `citation_owns_form_native_constraint` matched the unanchored substring
+    /// "min" — so `CliParseError`, `userProfile` and `adminPanel` each closed a requirement they
+    /// have nothing to do with, and packets carrying them published as sufficient.
+    ///
+    /// Every entry must be rejected by every requirement. Adding a needle to a carrier without
+    /// checking it here is how the next false-safe verdict gets in.
+    fn unrelated_repository_symbols() -> Vec<AgentCitationDto> {
+        vec![
+            witness("CliParseError", "src/cli/parse.cc", NodeKind::FUNCTION),
+            witness("assert_valid_utf8", "src/text/utf8.rs", NodeKind::FUNCTION),
+            witness("panic_hook", "src/runtime/panic.rs", NodeKind::FUNCTION),
+            witness("failToOpenSocket", "src/net/socket.go", NodeKind::FUNCTION),
+            witness("userProfile", "src/session/user.ts", NodeKind::FUNCTION),
+            witness("useragentString", "src/http/headers.ts", NodeKind::FUNCTION),
+            witness("determineFieldOrder", "src/layout.js", NodeKind::FUNCTION),
+            witness("adminPanel", "src/admin.js", NodeKind::FUNCTION),
+            witness("terminalWidth", "src/tty.js", NodeKind::FUNCTION),
+            witness("submitTelemetry", "src/telemetry.js", NodeKind::FUNCTION),
+            witness("Cache.write", "lib/cache.rb", NodeKind::METHOD),
+            witness("Uri.prepare", "lib/uri.dart", NodeKind::METHOD),
+            witness("ProjectSettings", "src/settings.rs", NodeKind::STRUCT),
+            witness("parseTimestamp", "src/time/parse.ts", NodeKind::FUNCTION),
+            witness("RowIterator", "src/db/rows.rs", NodeKind::STRUCT),
+            witness("MigrationRunner", "src/db/migrate.rb", NodeKind::CLASS),
+        ]
+    }
+
+    #[test]
+    fn no_requirement_is_closed_by_an_unrelated_repository_symbol() {
+        let mut checked = 0;
+        for requirement in all_flow_requirements() {
+            // `CitedRoles` requirements delegate to the evidence-role classifier, which is coarse
+            // on purpose: it answers "is this source evidence at all", not "does this prove my
+            // step". The carriers are the per-requirement checks and the only predicates that
+            // claim to separate one requirement from everything else, so they are what this
+            // corpus holds to account.
+            if !matches!(requirement.evidence, EvidencePredicate::CitedCarrier(_)) {
+                continue;
+            }
+            for symbol in unrelated_repository_symbols() {
+                checked += 1;
+                assert!(
+                    !requirement.evidence.citation_proves(&symbol),
+                    "requirement {} is closed by `{}` at `{}`, which has nothing to do with it: a \
+                     predicate that accepts arbitrary repository symbols reports sufficient on \
+                     packets that proved nothing",
+                    requirement.id,
+                    symbol.display_name,
+                    symbol.file_path.as_deref().unwrap_or_default()
+                );
+            }
+        }
+        assert!(
+            checked >= 300,
+            "the negative corpus must actually be exercised against the tables (checked {checked})"
+        );
+    }
+
+    /// Stronger than the same-role test above: inside one flow, *no* requirement may be closed by
+    /// another requirement's evidence, whatever roles the two wear. Roles were never the thing that
+    /// separated requirements; their evidence is.
+    #[test]
+    fn no_requirement_in_a_flow_is_closed_by_another_requirements_witness() {
+        let witnesses = requirement_witnesses();
+        let witness_for = |requirement: &FlowRequirement| {
+            let key = (requirement.id, requirement.role_id());
+            witnesses
+                .iter()
+                .find(|(witness_key, _)| *witness_key == key)
+                .map(|(_, citation)| citation.clone())
+                .unwrap_or_else(|| panic!("missing witness for {key:?}"))
+        };
+
+        let mut checked_pairs = 0;
+        for (group, requirements) in all_flow_requirement_groups() {
+            for (index, left) in requirements.iter().enumerate() {
+                for right in requirements.iter().skip(index + 1) {
+                    if left.id == right.id {
+                        continue;
+                    }
+                    // Role-classified predicates are deliberately coarse; the carriers are the
+                    // per-requirement checks, so they are what this invariant holds to account.
+                    if !matches!(left.evidence, EvidencePredicate::CitedCarrier(_))
+                        || !matches!(right.evidence, EvidencePredicate::CitedCarrier(_))
+                    {
+                        continue;
+                    }
+                    checked_pairs += 1;
+                    let left_witness = witness_for(left);
+                    let right_witness = witness_for(right);
+                    assert!(
+                        !right.evidence.citation_proves(&left_witness),
+                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
+                         not close two requirements",
+                        left.id,
+                        right.id
+                    );
+                    assert!(
+                        !left.evidence.citation_proves(&right_witness),
+                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
+                         not close two requirements",
+                        right.id,
+                        left.id
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_pairs >= 15,
+            "this invariant must actually be exercising carrier-backed requirement pairs (checked \
+             {checked_pairs})"
+        );
+    }
 }

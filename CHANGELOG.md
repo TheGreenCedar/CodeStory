@@ -22,6 +22,17 @@
   architecture questions did; every other kind could answer around a requested
   path and still report itself complete. Each unproven path is now reported on
   its own, with its own follow-up, for every kind of question.
+- Evidence for a step now has to come from the part of the codebase that step is
+  about. A step was matched by looking for a word anywhere inside a symbol's
+  name, so a symbol could close a step it had nothing to do with whenever its
+  letters happened to line up — a command-line parser error standing in for a
+  formatter's failure path, or a page-layout helper standing in for a form's
+  input constraints, because "adminPanel" contains "min". Words are now matched
+  whole, and a step also checks that the symbol belongs to the subsystem in
+  question, so unrelated results no longer make a packet look complete.
+- When a question names more files than fit in the follow-up list, the missing
+  parts of the flow are no longer pushed out of it. Follow-ups for requested
+  files and for unproven steps now alternate, so both survive the limit.
 
 ## 0.16.2
 

@@ -113,6 +113,14 @@ fn assemble_packet_sufficiency_with_route_probes(
     assemble_packet_sufficiency_with_probe_context(input, selected_probes, &[])
 }
 
+#[cfg(test)]
+fn assemble_packet_sufficiency_with_exact_paths(
+    input: PacketSufficiencyInput<'_>,
+    exact_probe_paths: &[String],
+) -> PacketSufficiencyDto {
+    assemble_packet_sufficiency_with_probe_context(input, &[], exact_probe_paths)
+}
+
 fn assemble_packet_sufficiency_with_probe_context(
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
@@ -247,21 +255,24 @@ fn assemble_packet_sufficiency_with_probe_context(
     // A requested path the packet never proved anything about is the most specific thing a caller
     // can act on, so it leads the follow-up list. Appending it last let the command cap drop it
     // whenever enough flow probes were also missing — exactly when the caller needed it most.
-    let mut blocking_follow_up_probe_queries = Vec::new();
-    for path in &missing_exact_path_claims {
-        push_unique_term(&mut blocking_follow_up_probe_queries, path);
-    }
+    // Putting every path first only moved the loss: with enough unproven paths, the flow probes
+    // fell off the end instead. Interleaving keeps a path in front and starves neither kind.
+    let mut blocking_follow_up_probe_query_seeds = Vec::new();
     for query in &blocking_probe_queries {
-        push_unique_term(&mut blocking_follow_up_probe_queries, query);
+        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
     if blocking_probe_queries.is_empty() {
         for query in &missing_required_probe_queries {
-            push_unique_term(&mut blocking_follow_up_probe_queries, query);
+            push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
         }
     }
     for query in &route_proof.follow_up_queries {
-        push_unique_term(&mut blocking_follow_up_probe_queries, query);
+        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
+    let blocking_follow_up_probe_queries = packet_interleave_follow_up_queries(
+        &missing_exact_path_claims,
+        &blocking_follow_up_probe_query_seeds,
+    );
     let follow_up_probe_queries = if blocking_follow_up_probe_queries.is_empty() {
         &missing_required_probe_queries
     } else {
@@ -6703,6 +6714,234 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_flow_probe_survives_the_follow_up_cap_when_exact_paths_fill_it() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        // Enough unproven exact paths to fill the eight-command cap on their own. Leading with the
+        // paths fixed one drop and created its mirror image: the flow probe the packet is actually
+        // missing fell off the end instead. Both kinds have to survive.
+        let exact_paths = [
+            "src/one.rs",
+            "src/two.rs",
+            "src/three.rs",
+            "src/four.rs",
+            "src/five.rs",
+            "src/six.rs",
+            "src/seven.rs",
+            "src/eight.rs",
+            "src/nine.rs",
+        ]
+        .map(str::to_string);
+        let claims = vec![
+            evidence_claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+                anchor_at("basic_format_args", "include/fmt/base.h"),
+            ),
+            evidence_claim(
+                "Runtime formatting writes formatted output through output iterator helpers.",
+                anchor_at("vformat_to", "include/fmt/format.h"),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency_with_exact_paths(
+            PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                answer: &answer,
+                budget: &budget,
+                supported_claims: claims,
+                missing_required_probe_queries: vec!["format error".to_string()],
+                targeted_follow_up_queries: Vec::new(),
+            },
+            &exact_paths,
+        );
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'format error'")),
+            "the missing flow probe must survive the command cap even when unproven exact paths \
+             could fill it: {:?}",
+            sufficiency.follow_up_commands
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("src/one.rs")),
+            "an unproven exact path must still lead the follow-up list: {:?}",
+            sufficiency.follow_up_commands
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Off-subject anchors must not close a requirement.
+    //
+    // The per-requirement carriers read the citation, which is the right shape, but a carrier that
+    // matches an unanchored substring of the symbol name accepts anchors from anywhere in the
+    // repository. These fixtures plant exactly that shape: a packet that genuinely proves some of
+    // its flow, plus one anchor whose name merely *contains* another requirement's needle while
+    // belonging to an unrelated subsystem. Each of these returned `Sufficient` before the carriers
+    // were scoped.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_unrelated_error_type_does_not_close_the_runtime_formatting_error_requirement() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        // `CliParseError` is a command-line parser error in a different subsystem. Its name contains
+        // "error", which is all the `format_errors` carrier used to ask for.
+        let claims = vec![
+            evidence_claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+                anchor_at("basic_format_args", "include/fmt/base.h"),
+            ),
+            evidence_claim(
+                "Runtime formatting writes formatted output through output iterator helpers.",
+                anchor_at("vformat_to", "include/fmt/format.h"),
+            ),
+            evidence_claim(
+                "Command-line parsing reports malformed arguments to the caller.",
+                anchor_at("CliParseError", "src/cli/parse.cc"),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "an error type from an unrelated subsystem must not prove the formatting error path: \
+             {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.iter().any(|gap| gap == "format_errors"),
+            "the formatting error requirement must still be named as missing: {report:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_use_prefixed_symbol_does_not_close_the_hook_export_requirement() {
+        let question =
+            "Explain how the data fetching hook serializes cache keys and applies mutations.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        // `userProfile` is a session model. It starts with "use", which is all the
+        // `hook_public_export` carrier used to ask for.
+        let claims = vec![
+            evidence_claim(
+                "Cache keys are serialized to a stable string before lookup.",
+                anchor_at("serializeKey", "src/_internal/utils/serialize.ts"),
+            ),
+            evidence_claim(
+                "A cache helper owns the shared store the hook reads through.",
+                anchor_at("makeCacheHelper", "src/_internal/utils/helper.ts"),
+            ),
+            evidence_claim(
+                "Mutations revalidate the cached entry after they apply.",
+                anchor_at("applyMutation", "src/_internal/utils/mutate.ts"),
+            ),
+            evidence_claim(
+                "The session model describes the signed-in user.",
+                anchor_at("userProfile", "src/session/user.ts"),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "a session model that merely starts with `use` must not prove the hook's public \
+             export: {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.iter().any(|gap| gap == "hook_public_export"),
+            "the hook export requirement must still be named as missing: {report:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_javascript_symbols_do_not_close_the_form_validation_flow() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        // Form-shaped prose over anchors that touch no form at all. This is the shape that evades:
+        // the wording clears the claim-family floor, so nothing else holds the packet back, and the
+        // anchors match only because their names *contain* a needle — "determineFieldOrder"
+        // contains "min", "invalidateRecordCache" contains "validate", "submitTelemetry" contains
+        // "submit". Together they closed the entire flow and the packet published as sufficient.
+        let claims = vec![
+            evidence_claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+                anchor_at("determineFieldOrder", "src/layout.js"),
+            ),
+            evidence_claim(
+                "A custom validation example applies script-driven validity checks before rendering messages.",
+                anchor_at("invalidateRecordCache", "src/cache.js"),
+            ),
+            evidence_claim(
+                "Submit handlers prevent submission when the form is invalid.",
+                anchor_at("submitTelemetry", "src/telemetry.js"),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "layout, cache, and telemetry symbols prove nothing about form validation: \
+             {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        for requirement in [
+            "form_native_constraints",
+            "form_custom_validation",
+            "form_submit_guard",
+        ] {
+            assert!(
+                report.missing.iter().any(|gap| gap == requirement),
+                "{requirement} must still be named as missing: {report:?}"
+            );
+        }
+    }
 }
 
 fn packet_has_sufficiency_blocking_budget_omission(
@@ -6834,6 +7073,30 @@ fn packet_follow_up_trail_commands(quoted_project: &str, queries: &[String]) -> 
         );
     }
     commands
+}
+
+/// Merge unproven exact paths with missing flow probes so the eight-command cap cannot silently
+/// drop either kind. Taking one from each list in turn keeps a path in the lead — it is the most
+/// specific thing a caller can act on — while guaranteeing the probes the packet is actually
+/// missing are still represented once the list is truncated.
+fn packet_interleave_follow_up_queries(paths: &[String], probes: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut paths = paths.iter();
+    let mut probes = probes.iter();
+    loop {
+        let path = paths.next();
+        let probe = probes.next();
+        if path.is_none() && probe.is_none() {
+            break;
+        }
+        if let Some(path) = path {
+            push_unique_term(&mut merged, path);
+        }
+        if let Some(probe) = probe {
+            push_unique_term(&mut merged, probe);
+        }
+    }
+    merged
 }
 
 fn packet_follow_up_search_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
