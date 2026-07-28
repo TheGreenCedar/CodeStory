@@ -4956,6 +4956,7 @@ mod tests {
                     "Open the exact indexed hit with symbol, trail, and snippet before answering."
                         .to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,
@@ -5040,6 +5041,7 @@ mod tests {
                     "Open the exact indexed hit with symbol, trail, and snippet before answering."
                         .to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,
@@ -5389,6 +5391,7 @@ mod tests {
                 recommended_next_action: Some(
                     "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,

@@ -22,7 +22,7 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 root: `codestory`
 budget: `balanced`
 coverage: files 187/187 symbols 1200/4231 compressed_files=42
-orientation: confidence=partial entrypoints=1/2 subsystems=4/7 candidates=224/816 uncertainty=bounded_candidate_window,compressed_presentation
+orientation: confidence=partial entrypoints=1/2 subsystems=4/7 candidates=224/816 uncertainty=bounded_candidate_window,graph_signal_thin,compressed_presentation
 stats: nodes=4231 edges=8452 files=187 errors=3
 recommended_queries: WorkspaceIndexer, AppController, TrailResult
 notes:
@@ -39,9 +39,13 @@ coverage_buckets:
 entrypoints and architecture subsystems. Its confidence is specific to compact
 repository orientation; it does not upgrade source coverage or retrieval
 sufficiency. Typed uncertainty names bounded candidate evaluation, missing or
-omitted entrypoint evidence, limited subsystem breadth, and budget-driven
-presentation compression. `ground --why` includes the same limitations in its
-confidence and gap notes.
+omitted entrypoint evidence, limited subsystem breadth, budget-driven
+presentation compression, and two graph-coverage limits: `graph_signal_thin`
+when no evaluated candidate carried call-graph evidence, and
+`lexical_fallback` when the order rests on names and layout alone. Read either
+as a reason to verify structure with `trail` before making a structure claim,
+not as evidence about the repository. `ground --why` includes the same
+limitations in its confidence and gap notes.
 
 ## Examples
 
