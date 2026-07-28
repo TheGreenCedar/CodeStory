@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixed
+
+- A packet no longer reports a step of a flow as covered because a different
+  step was. Coverage was decided by the kind of position a step occupies —
+  entrypoint, dispatch, terminal boundary — so when a question asked about two
+  steps of the same kind, evidence for one closed both, and an answer that only
+  used the right words could close either. Each step now has to be backed by
+  evidence for that step. Asking about an HTTP client that runs interceptors
+  before dispatching a request, for instance, no longer counts as answered when
+  the interceptor owner was never found.
+- A packet only repeats back the claims it proved. Claims the same packet
+  reported as unproven — an unsupported sentence, evidence it had already ruled
+  diagnostic, or prose that points at a file without explaining it — were still
+  published as covered, and the files behind them were listed as not worth
+  opening. Both lists now come from proven claims; the coverage report still
+  names every dropped claim and why.
+- Naming an exact file in a question holds the answer to that file. Only
+  architecture questions did; every other kind could answer around a requested
+  path and still report itself complete. Each unproven path is now reported on
+  its own, with its own follow-up, for every kind of question.
+
 ## 0.16.2
 
 ### Fixed
