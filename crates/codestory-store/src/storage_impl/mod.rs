@@ -251,6 +251,93 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     }
 }
 
+/// SQL for the directed CALL degrees of one bounded node chunk.
+///
+/// A read surface must cost what its bounded input costs, not what the
+/// repository happens to contain, so the candidate ids sit inside each `edge`
+/// predicate rather than in an outer filter over a repository-wide CALL scan.
+/// `COALESCE(resolved, raw) IN (ids)` is spelled as two branches because only a
+/// branch is index-seekable; the branches stay disjoint on `resolved IS NULL`,
+/// and `COUNT(DISTINCT ...)` runs over their union so an endpoint reachable
+/// through both a resolved and an unresolved edge still counts once.
+///
+/// The branches pin their index because both edge indexes match the kind
+/// prefix, and without pinning SQLite reads `resolved_target_node_id IS NULL` as
+/// the more selective equality and seeks every unresolved CALL edge in the
+/// repository. `grounding_call_degree_plan_seeks_the_candidate_chunk` holds the
+/// shape. Every pinned index is created for any live store (schema.rs:392-415).
+fn grounding_call_degree_query(ids: &str, certainty: &str) -> String {
+    let call_kind = EdgeKind::CALL as i32;
+    format!(
+        "WITH inbound_call AS (
+            SELECT
+                e.resolved_target_node_id AS node_id,
+                COALESCE(e.resolved_source_node_id, e.source_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_resolved_target
+            WHERE e.kind = {call_kind}
+              AND e.resolved_target_node_id IN ({ids})
+              AND {certainty} = 'certain'
+            UNION ALL
+            SELECT
+                e.target_node_id AS node_id,
+                COALESCE(e.resolved_source_node_id, e.source_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_target
+            WHERE e.kind = {call_kind}
+              AND e.target_node_id IN ({ids})
+              AND e.resolved_target_node_id IS NULL
+              AND {certainty} = 'certain'
+        ),
+        inbound AS (
+            SELECT
+                inbound_call.node_id AS node_id,
+                COUNT(DISTINCT inbound_call.other_id) AS in_degree,
+                0 AS out_degree
+            FROM inbound_call
+            LEFT JOIN node caller ON caller.id = inbound_call.other_id
+            LEFT JOIN file caller_file ON caller_file.id = caller.file_node_id
+            WHERE inbound_call.other_id != inbound_call.node_id
+              AND COALESCE(caller_file.file_role, 'source') NOT IN ('test', 'benchmark')
+            GROUP BY inbound_call.node_id
+        ),
+        outbound_call AS (
+            SELECT
+                e.resolved_source_node_id AS node_id,
+                COALESCE(e.resolved_target_node_id, e.target_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_resolved_source
+            WHERE e.resolved_source_node_id IN ({ids})
+              AND e.kind = {call_kind}
+              AND {certainty} = 'certain'
+            UNION ALL
+            SELECT
+                e.source_node_id AS node_id,
+                COALESCE(e.resolved_target_node_id, e.target_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_source
+            WHERE e.kind = {call_kind}
+              AND e.source_node_id IN ({ids})
+              AND e.resolved_source_node_id IS NULL
+              AND {certainty} = 'certain'
+        ),
+        outbound AS (
+            SELECT
+                outbound_call.node_id AS node_id,
+                0 AS in_degree,
+                COUNT(DISTINCT outbound_call.other_id) AS out_degree
+            FROM outbound_call
+            WHERE outbound_call.other_id != outbound_call.node_id
+            GROUP BY outbound_call.node_id
+        ),
+        combined AS (
+            SELECT node_id, in_degree, out_degree FROM inbound
+            UNION ALL
+            SELECT node_id, in_degree, out_degree FROM outbound
+        )
+        SELECT node_id, SUM(in_degree), SUM(out_degree)
+        FROM combined
+        GROUP BY node_id
+        ORDER BY node_id"
+    )
+}
+
 fn canonical_search_symbol_batch_limit(
     operation: &'static str,
     limit: usize,
@@ -10650,43 +10737,7 @@ impl Storage {
                 certain_min = ResolutionCertainty::CERTAIN_MIN,
                 probable_min = ResolutionCertainty::PROBABLE_MIN,
             );
-            let query = format!(
-                "WITH call_edge AS (
-                    SELECT
-                        COALESCE(e.resolved_source_node_id, e.source_node_id) AS src,
-                        COALESCE(e.resolved_target_node_id, e.target_node_id) AS tgt
-                    FROM edge e
-                    WHERE e.kind = {call_kind}
-                      AND {certainty} = 'certain'
-                ),
-                inbound AS (
-                    SELECT call_edge.tgt AS node_id, COUNT(DISTINCT call_edge.src) AS degree
-                    FROM call_edge
-                    LEFT JOIN node caller ON caller.id = call_edge.src
-                    LEFT JOIN file caller_file ON caller_file.id = caller.file_node_id
-                    WHERE call_edge.tgt IN ({ids})
-                      AND call_edge.src != call_edge.tgt
-                      AND COALESCE(caller_file.file_role, 'source') NOT IN ('test', 'benchmark')
-                    GROUP BY call_edge.tgt
-                ),
-                outbound AS (
-                    SELECT call_edge.src AS node_id, COUNT(DISTINCT call_edge.tgt) AS degree
-                    FROM call_edge
-                    WHERE call_edge.src IN ({ids})
-                      AND call_edge.src != call_edge.tgt
-                    GROUP BY call_edge.src
-                ),
-                combined AS (
-                    SELECT node_id, degree AS in_degree, 0 AS out_degree FROM inbound
-                    UNION ALL
-                    SELECT node_id, 0 AS in_degree, degree AS out_degree FROM outbound
-                )
-                SELECT node_id, SUM(in_degree), SUM(out_degree)
-                FROM combined
-                GROUP BY node_id
-                ORDER BY node_id",
-                call_kind = EdgeKind::CALL as i32,
-            );
+            let query = grounding_call_degree_query(&ids, &certainty);
             let mut stmt = self.conn.prepare(&query)?;
             let mut rows = stmt.query(params_from_iter(chunk.iter().map(|id| id.0)))?;
             while let Some(row) = rows.next()? {
@@ -11954,6 +12005,40 @@ mod grounding_snapshot_fast_path_tests {
     }
 
     #[test]
+    fn call_degrees_count_an_endpoint_once_across_resolved_and_unresolved_edges()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::FUNCTION, "caller", 1),
+                (102, NodeKind::FUNCTION, "callee", 5),
+                (103, NodeKind::FUNCTION, "caller_alias", 9),
+                (104, NodeKind::FUNCTION, "callee_alias", 13),
+            ],
+        )?;
+        // The seeking query reads resolved and unresolved edges through separate
+        // index branches; one endpoint pair reachable through both must still
+        // count once, or a re-resolved call would inflate its own evidence.
+        storage.insert_edges_batch(&[
+            call_edge(1, 101, 102, None),
+            Edge {
+                resolved_source: Some(NodeId(101)),
+                resolved_target: Some(NodeId(102)),
+                certainty: Some(ResolutionCertainty::Certain),
+                ..call_edge(2, 103, 104, None)
+            },
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101), NodeId(102)])?;
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(0, 1)));
+        assert_eq!(degrees.get(&NodeId(102)), Some(&(1, 0)));
+        Ok(())
+    }
+
+    #[test]
     fn call_degrees_return_rows_in_node_id_order_across_chunk_boundaries()
     -> Result<(), StorageError> {
         let mut storage = Storage::new_in_memory()?;
@@ -11995,6 +12080,49 @@ mod grounding_snapshot_fast_path_tests {
             degrees
                 .iter()
                 .all(|degree| degree.production_in_calls == 1 && degree.out_calls == 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grounding_call_degree_plan_seeks_the_candidate_chunk() -> Result<(), StorageError> {
+        let storage = Storage::new_in_memory()?;
+        let certainty = format!(
+            "COALESCE(
+                e.certainty,
+                CASE
+                    WHEN e.confidence IS NULL THEN 'certain'
+                    WHEN e.confidence >= {certain_min} THEN 'certain'
+                    WHEN e.confidence >= {probable_min} THEN 'probable'
+                    ELSE 'uncertain'
+                END
+             )",
+            certain_min = ResolutionCertainty::CERTAIN_MIN,
+            probable_min = ResolutionCertainty::PROBABLE_MIN,
+        );
+        let query = grounding_call_degree_query(&numbered_placeholders(1, 3), &certainty);
+        let plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+            .query_map(params![1_i64, 2_i64, 3_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Every step that touches `edge` is aliased `e` by the query above.
+        let edge_steps = plan
+            .iter()
+            .filter(|line| line.contains(" e USING "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edge_steps.len(),
+            4,
+            "expected one seek per directed branch: {plan:?}"
+        );
+        assert!(
+            edge_steps
+                .iter()
+                .all(|line| line.contains("node_id=?") && !line.ends_with("(kind=?)")),
+            "an edge branch seeks on kind alone, so its cost grows with the repository's \
+             CALL edge count instead of with the candidate chunk: {plan:?}"
         );
         Ok(())
     }
