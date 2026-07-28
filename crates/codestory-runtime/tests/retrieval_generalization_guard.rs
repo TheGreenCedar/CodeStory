@@ -875,13 +875,10 @@ fn run_lint_with_fixture_and_task_root(contents: &str, task_root: Option<&Path>)
         .lock()
         .expect("lock lint script subprocess");
     let mut command = Command::new("node");
-    command
-        .arg(&script)
-        .current_dir(&repo_root)
-        .env(
-            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
-            fixture_root.path(),
-        );
+    command.arg(&script).current_dir(&repo_root).env(
+        "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+        fixture_root.path(),
+    );
     if let Some(task_root) = task_root {
         command.env(
             "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS",
@@ -972,8 +969,14 @@ fn derived_patterns_with_extra_task(manifest: &str) -> Vec<String> {
         .arg(&script)
         .current_dir(&repo_root)
         .env("CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS", &scan_root)
-        .env("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS", &task_root)
-        .env("CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS", &dump_path)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS",
+            &task_root,
+        )
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS",
+            &dump_path,
+        )
         .output()
         .expect("run lint with self-subject probe");
     assert!(
@@ -1136,7 +1139,12 @@ fn lint_guarded_paths() -> Vec<String> {
         serde_json::from_str(&std::fs::read_to_string(&dump_path).expect("read guarded paths"))
             .expect("parse guarded paths");
     let mut guarded = Vec::new();
-    for group in ["productionDirs", "productionFiles", "corpusDirs", "lintFiles"] {
+    for group in [
+        "productionDirs",
+        "productionFiles",
+        "corpusDirs",
+        "lintFiles",
+    ] {
         for entry in doc
             .get(group)
             .and_then(|value| value.as_array())
@@ -1157,7 +1165,9 @@ fn lint_guarded_paths() -> Vec<String> {
 /// to this crate for one assertion.
 fn workflow_trigger_paths(workflow: &str, trigger: &str) -> Vec<String> {
     let header = format!("  {trigger}:");
-    let mut lines = workflow.lines().skip_while(|line| line.trim_end() != header);
+    let mut lines = workflow
+        .lines()
+        .skip_while(|line| line.trim_end() != header);
     assert!(
         lines.next().is_some(),
         "workflow has no `{trigger}:` trigger"
@@ -1325,7 +1335,13 @@ fn ban_fired_for(
 fn corpus_manifest_names(corpus: &Path) -> Vec<String> {
     let mut names = std::fs::read_dir(corpus)
         .expect("read benchmark task corpus")
-        .map(|entry| entry.expect("corpus entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("corpus entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     names.sort();
     names
@@ -1398,10 +1414,7 @@ const CORPUS_NAMES_RULED_OUT_OF_THE_BAN: &[(&str, &str)] = &[
         "CodeStory",
         "this repository is its own benchmark subject; banning it forbids the product from naming itself",
     ),
-    (
-        "codestory",
-        "same subject under its lowercase slug",
-    ),
+    ("codestory", "same subject under its lowercase slug"),
     (
         "express",
         "codestory-indexer/src/framework_routes.rs extracts Express routes as a parser-backed product feature and has to name the framework it parses",
@@ -1455,9 +1468,7 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
         ];
         // The identifier shapes need a name that is legal identifier text; the
         // hyphenated slugs (`chinook-database`) can only be planted as literals.
-        if name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             && name.starts_with(|c: char| c.is_ascii_alphabetic())
         {
             shapes.push((
@@ -1470,10 +1481,7 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
             ));
             shapes.push((
                 format!("repo_const_{index}.rs"),
-                format!(
-                    "pub const {}_PATH_BOOST: f32 = 1.5;\n",
-                    name.to_uppercase()
-                ),
+                format!("pub const {}_PATH_BOOST: f32 = 1.5;\n", name.to_uppercase()),
                 format!("{}_PATH_BOOST", name.to_uppercase()),
             ));
         }

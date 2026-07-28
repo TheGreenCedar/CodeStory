@@ -60,9 +60,7 @@ pub(super) fn search_plan_eligible(
     let has_seed_anchors = query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER);
     !intents.is_empty()
         && broad_query
-        && (exact_symbol_hit_count == 0
-            || has_seed_anchors
-            || search_plan_prose_flow_prompt(query))
+        && (exact_symbol_hit_count == 0 || has_seed_anchors || search_plan_prose_flow_prompt(query))
 }
 
 /// A flow question that names no identifier of its own: every exact symbol hit
