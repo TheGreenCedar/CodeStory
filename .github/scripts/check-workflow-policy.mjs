@@ -1611,6 +1611,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   requireNoCalibrationReferences(violations, releaseFile, release);
   const policy = requireJob(violations, releaseFile, release, "workflow-policy");
+  // The reuse-binding contracts resolve real release commits, which a depth-1
+  // clone does not carry: it answered only while the referenced commit happened
+  // to be HEAD.
+  add(
+    violations,
+    list(object(policy).steps).some(
+      (step) =>
+        object(step).uses?.startsWith("actions/checkout")
+        && object(object(step).with)["fetch-depth"] === 0,
+    ),
+    `${releaseFile} workflow-policy must check out full history for the reuse-binding contracts`,
+  );
   requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
   requireStepRun(violations, releaseFile, policy, "Check workflow syntax", [
     "node --test .github/scripts/run-actionlint.test.mjs",
