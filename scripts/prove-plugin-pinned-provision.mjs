@@ -7,6 +7,10 @@
 // own archive digest, and the provisioned binary must report the pinned version.
 //
 //   node scripts/prove-plugin-pinned-provision.mjs [--timeout-ms 600000]
+//
+// This file is an entry point and nothing else imports it, so its body runs unconditionally.
+// The bounded wait lives in scripts/lib/wait-for-managed-runtime.mjs, which the test imports
+// without running the proof.
 
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -14,120 +18,87 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const scriptPath = fileURLToPath(import.meta.url);
-const repositoryRoot = path.resolve(path.dirname(scriptPath), "..");
+import { waitForManagedRuntime } from "./lib/wait-for-managed-runtime.mjs";
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(repositoryRoot, "plugins/codestory/scripts/codestory-mcp.cjs");
+const pin = JSON.parse(
+  fs.readFileSync(path.join(repositoryRoot, "plugins/codestory/cli-version.json"), "utf8"),
+);
 
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
 }
 
-// Wait for the launcher to publish managed runtime metadata. The liveness guards run on every
-// tick and never sit behind the metadata read: a launcher that resolves to a non-managed source
-// (pin or archive digest drift) keeps writing a readable file, so guards nested in the read's
-// catch would never fire and the proof would hang until the CI job timeout.
-export function waitForManagedRuntime({ child, runtimeMetadata, timeoutMs, intervalMs = 250 }) {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const poll = setInterval(() => {
-      if (child.exitCode !== null) {
-        clearInterval(poll);
-        reject(new Error(`launcher exited ${child.exitCode} before provisioning finished.`));
-        return;
-      }
-      if (Date.now() > deadline) {
-        clearInterval(poll);
-        child.kill();
-        reject(new Error(`provisioning did not finish within ${timeoutMs}ms.`));
-        return;
-      }
-      let metadata;
-      try {
-        metadata = JSON.parse(fs.readFileSync(runtimeMetadata, "utf8"));
-      } catch {
-        // Not written yet, or caught mid-write. Read again on the next tick.
-        return;
-      }
-      if (metadata.source !== "managed") return;
-      clearInterval(poll);
-      resolve(metadata);
-    }, intervalMs);
-  });
-}
-
-function verifyProvision(dataDir, pin) {
-  const versionDir = path.join(dataDir, "codestory-cli", pin.cli_version);
-  const manifest = JSON.parse(fs.readFileSync(path.join(versionDir, "manifest.json"), "utf8"));
-  const target =
-    process.platform === "darwin"
-      ? "macos-arm64"
-      : process.platform === "win32"
-        ? "windows-x64"
-        : "linux-x64";
-  if (manifest.version !== pin.cli_version) {
-    fail(`provisioned ${manifest.version}, pin names ${pin.cli_version}.`);
-  }
-  if (manifest.build_source !== "github_release") {
-    fail(`expected a github_release provision, observed ${manifest.build_source}.`);
-  }
-  if (pin.archives?.[target] && manifest.archive_sha256 !== pin.archives[target]) {
-    fail(
-      `provisioned archive digest ${manifest.archive_sha256} does not match the pin's ` +
-        `${target} digest ${pin.archives[target]}.`,
-    );
-  }
-  const binary = path.join(versionDir, manifest.path);
-  const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim();
-  if (!reported.includes(pin.cli_version)) {
-    fail(`provisioned binary reports "${reported}", expected ${pin.cli_version}.`);
-  }
-  console.log(
-    `Pinned provision proven: ${target} ${pin.cli_version} from github_release, ` +
-      `archive ${manifest.archive_sha256.slice(0, 12)}…, binary reports "${reported}".`,
+// A missing or non-numeric value used to yield NaN, and every `Date.now() > NaN` comparison is
+// false, so the one flag that declares the bound silently removed it. Refuse the argument
+// instead: an unbounded gate is the failure this timeout exists to prevent.
+const timeoutIndex = process.argv.indexOf("--timeout-ms");
+const timeoutMs = timeoutIndex >= 0 ? Number(process.argv[timeoutIndex + 1]) : 600_000;
+if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+  fail(
+    `--timeout-ms needs a positive number of milliseconds, got ` +
+      `${JSON.stringify(process.argv[timeoutIndex + 1] ?? null)}.`,
   );
 }
 
-async function main() {
-  const pin = JSON.parse(
-    fs.readFileSync(path.join(repositoryRoot, "plugins/codestory/cli-version.json"), "utf8"),
-  );
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-pin-proof-"));
+const runtimeMetadata = path.join(dataDir, ".codestory-mcp-runtime.json");
 
-  const timeoutIndex = process.argv.indexOf("--timeout-ms");
-  const timeoutMs = timeoutIndex >= 0 ? Number(process.argv[timeoutIndex + 1]) : 600_000;
+const child = spawn(process.execPath, [launcher], {
+  env: { ...process.env, CODESTORY_CLI: "", PLUGIN_DATA: dataDir },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+let stderr = "";
+child.stderr.on("data", (chunk) => {
+  stderr += chunk;
+});
+child.stdout.resume();
+child.stdin.write(
+  `${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "resources/read",
+    params: { uri: `codestory://status?project=${encodeURIComponent(repositoryRoot)}` },
+  })}\n`,
+);
 
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-pin-proof-"));
-  const runtimeMetadata = path.join(dataDir, ".codestory-mcp-runtime.json");
-
-  const child = spawn(process.execPath, [launcher], {
-    env: { ...process.env, CODESTORY_CLI: "", PLUGIN_DATA: dataDir },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
-  child.stdout.resume();
-  child.stdin.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "resources/read",
-      params: { uri: `codestory://status?project=${encodeURIComponent(repositoryRoot)}` },
-    })}\n`,
-  );
-
-  try {
-    await waitForManagedRuntime({ child, runtimeMetadata, timeoutMs });
-  } catch (error) {
-    fail(`${error.message}\n${stderr}`);
-  }
-  child.kill();
-  verifyProvision(dataDir, pin);
-  fs.rmSync(dataDir, { recursive: true, force: true });
-  process.exit(0);
+try {
+  await waitForManagedRuntime({ child, runtimeMetadata, timeoutMs });
+} catch (error) {
+  fail(`${error.message}\n${stderr}`);
 }
+child.kill();
 
-if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
-  await main();
+const versionDir = path.join(dataDir, "codestory-cli", pin.cli_version);
+const manifest = JSON.parse(fs.readFileSync(path.join(versionDir, "manifest.json"), "utf8"));
+const target =
+  process.platform === "darwin"
+    ? "macos-arm64"
+    : process.platform === "win32"
+      ? "windows-x64"
+      : "linux-x64";
+if (manifest.version !== pin.cli_version) {
+  fail(`provisioned ${manifest.version}, pin names ${pin.cli_version}.`);
 }
+if (manifest.build_source !== "github_release") {
+  fail(`expected a github_release provision, observed ${manifest.build_source}.`);
+}
+if (pin.archives?.[target] && manifest.archive_sha256 !== pin.archives[target]) {
+  fail(
+    `provisioned archive digest ${manifest.archive_sha256} does not match the pin's ` +
+      `${target} digest ${pin.archives[target]}.`,
+  );
+}
+const binary = path.join(versionDir, manifest.path);
+const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim();
+if (!reported.includes(pin.cli_version)) {
+  fail(`provisioned binary reports "${reported}", expected ${pin.cli_version}.`);
+}
+console.log(
+  `Pinned provision proven: ${target} ${pin.cli_version} from github_release, ` +
+    `archive ${manifest.archive_sha256.slice(0, 12)}…, binary reports "${reported}".`,
+);
+fs.rmSync(dataDir, { recursive: true, force: true });
+process.exit(0);

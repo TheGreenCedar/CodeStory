@@ -62,6 +62,9 @@ on:
       - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
+      - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   push:
     branches:
@@ -127,6 +130,9 @@ on:
       - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
+      - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   workflow_dispatch:
 
@@ -153,6 +159,12 @@ jobs:
 
       - name: Check embedded model preparation
         run: node --test scripts/tests/prepare-embedded-model.test.mjs
+
+      # plugin-release.yml gates the `v*` tag on prove-plugin-pinned-provision.mjs, so its
+      # bounded wait and its refusal to run vacuously are checked here on every PR rather
+      # than discovered on the release lane.
+      - name: Check the pinned provision proof
+        run: node --test scripts/tests/prove-plugin-pinned-provision.test.mjs
 
       - name: Check workflow syntax
         run: |
