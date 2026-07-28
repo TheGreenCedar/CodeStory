@@ -25,8 +25,7 @@ use crate::search_scoring::{
 use crate::search_terms::{
     SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS, SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER,
     SEARCH_PLAN_MAX_SEED_ANCHORS, SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT,
-    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_ROLE_SPECS,
-    SEARCH_PLAN_SEED_ANCHOR_MARKER, SEARCH_PLAN_SYMBOL_TERMS, search_plan_terms,
+    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER, search_plan_terms,
 };
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
@@ -129,7 +128,6 @@ pub(super) fn search_plan_subqueries(
     push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_explicit_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
-    push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_named_anchor_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
@@ -206,7 +204,7 @@ pub(super) fn push_search_plan_symbol_term_subquery(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_symbol_terms(terms);
+    let symbol_terms = sorted_search_plan_query_terms(terms);
     if symbol_terms.is_empty() {
         return;
     }
@@ -232,7 +230,7 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_symbol_terms(terms);
+    let symbol_terms = sorted_search_plan_query_terms(terms);
     for term in symbol_terms
         .iter()
         .filter(|term| search_plan_named_anchor_term(term))
@@ -251,26 +249,18 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     }
 }
 
-pub(super) fn sorted_search_plan_symbol_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
-    let mut symbol_terms = terms
-        .extracted
-        .iter()
-        .filter(|term| search_plan_symbol_term(term))
-        .cloned()
-        .collect::<Vec<_>>();
-    symbol_terms.sort_by(|left, right| {
+// Every asked term reaches the typed-symbol channel, identifier-shaped terms
+// first. Which of them name real symbols is decided by the indexed repository,
+// which is the only place that knows; a term vocabulary in this crate can only
+// know the repositories it was written against.
+pub(super) fn sorted_search_plan_query_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
+    let mut query_terms = terms.extracted.clone();
+    query_terms.sort_by(|left, right| {
         search_plan_symbol_subquery_term_score(right)
             .cmp(&search_plan_symbol_subquery_term_score(left))
             .then_with(|| left.cmp(right))
     });
-    symbol_terms
-}
-
-pub(super) fn search_plan_symbol_term(term: &str) -> bool {
-    term.chars().any(|ch| ch.is_ascii_uppercase())
-        || SEARCH_PLAN_SYMBOL_TERMS
-            .iter()
-            .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+    query_terms
 }
 
 pub(super) fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
@@ -285,12 +275,6 @@ pub(super) fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
     if term.contains('_') || term.contains('-') {
         score += 35;
     }
-    if SEARCH_PLAN_SYMBOL_TERMS
-        .iter()
-        .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
-    {
-        score += 20;
-    }
     score
 }
 
@@ -298,45 +282,6 @@ pub(super) fn search_plan_named_anchor_term(term: &str) -> bool {
     let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count();
     let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count();
     uppercase_count >= 1 && lowercase_count > 0 && term.len() >= 4
-}
-
-pub(super) fn push_search_plan_role_subqueries(
-    subqueries: &mut Vec<SearchPlanSubqueryDto>,
-    seen: &mut HashSet<String>,
-    terms: &SearchPlanTermsDto,
-) {
-    for (role, needles) in SEARCH_PLAN_ROLE_SPECS {
-        let role_terms = search_plan_matching_terms(terms, needles);
-        if role_terms.len() >= 2 {
-            push_search_plan_subquery(
-                subqueries,
-                seen,
-                role_terms.join(" "),
-                role,
-                vec![
-                    SearchPlanChannelDto::TypedSymbol,
-                    SearchPlanChannelDto::Lexical,
-                    SearchPlanChannelDto::RepoText,
-                ],
-            );
-        }
-    }
-}
-
-pub(super) fn search_plan_matching_terms(
-    terms: &SearchPlanTermsDto,
-    needles: &[&str],
-) -> Vec<String> {
-    terms
-        .extracted
-        .iter()
-        .filter(|term| {
-            needles
-                .iter()
-                .any(|needle| term.eq_ignore_ascii_case(needle))
-        })
-        .cloned()
-        .collect()
 }
 
 pub(super) fn push_search_plan_fallback_subquery(

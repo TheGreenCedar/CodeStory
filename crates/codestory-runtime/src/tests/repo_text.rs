@@ -248,9 +248,21 @@ fn architecture_repo_text_window_preserves_non_crate_source_surfaces() {
         .filter_map(|hit| hit.file_path.as_deref())
         .collect::<Vec<_>>();
 
-    assert!(paths.contains(&"src/lib_cxx/project/SourceGroupCxxCdb.cpp"));
-    assert!(paths.contains(&"src/lib/data/storage/StorageAccess.h"));
-    assert!(paths.contains(&"src/lib/data/storage/StorageAccessProxy.cpp"));
+    assert!(
+        paths.contains(&"src/lib_cxx/project/SourceGroupCxxCdb.cpp"),
+        "a late surface the question named should displace a crowded bucket: {paths:#?}"
+    );
+    // The question never says "storage", so nothing admits a storage surface on
+    // its behalf; only the words the question used can pull a late hit forward.
+    for unasked in [
+        "src/lib/data/storage/StorageAccess.h",
+        "src/lib/data/storage/StorageAccessProxy.cpp",
+    ] {
+        assert!(
+            !paths.contains(&unasked),
+            "unasked surface `{unasked}` should stay out of the window: {paths:#?}"
+        );
+    }
     assert_eq!(paths.len(), 10);
 }
 

@@ -65,101 +65,62 @@ fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
 }
 
 #[test]
-fn sourcetrail_style_architecture_prompt_expands_flow_roles() {
-    let query = "Explain how Sourcetrail turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Cite the source files that support the path.";
+fn search_plan_terms_never_name_a_symbol_the_question_did_not() {
+    for query in [
+        "Explain how ProjectForge turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Cite the source files that support the path.",
+        "Explain how `forge exec --json` flows from the top-level CLI into the exec runtime, thread and turn start requests, and JSONL event output.",
+        "Explain how Root & Runtime public writing and social surfaces connect through collections, comment auth, RSS, and the elsewhere feed.",
+    ] {
+        let terms = search_plan_terms(query);
+        let lower = query.to_ascii_lowercase();
+        for term in &terms.extracted {
+            assert!(
+                lower.contains(&term.to_ascii_lowercase()),
+                "extracted term `{term}` was never asked for in `{query}`: {:?}",
+                terms.extracted
+            );
+        }
+        for dropped in &terms.dropped {
+            assert!(
+                lower.contains(&dropped.term.to_ascii_lowercase()),
+                "dropped term `{}` was never asked for in `{query}`: {:?}",
+                dropped.term,
+                terms.dropped
+            );
+        }
+    }
+}
+
+#[test]
+fn content_flow_questions_keep_every_word_the_question_used() {
+    let query = "Explain how Root & Runtime public writing and social surfaces connect through collections, comment auth, RSS, and the elsewhere feed.";
     let terms = search_plan_terms(query);
-    assert!(
-        terms
-            .dropped
-            .iter()
-            .any(|term| term.term.eq_ignore_ascii_case("cite")),
-        "citation instruction should not become a named anchor: {:?}",
-        terms.dropped
-    );
     for expected in [
-        "BuildIndex",
-        "SourceGroup",
-        "IndexerCommand",
-        "build",
-        "index",
-        "storage",
-        "persistence",
+        "root",
+        "runtime",
+        "collections",
+        "comment",
+        "auth",
+        "elsewhere",
+        "feed",
     ] {
         assert!(
             terms
                 .extracted
                 .iter()
                 .any(|term| term.eq_ignore_ascii_case(expected)),
-            "expected inferred architecture term `{expected}` in {:?}",
+            "asked term `{expected}` should survive extraction: {:?}",
             terms.extracted
         );
     }
-
-    let intents = architecture_query_intents(query)
-        .into_iter()
-        .map(|intent| intent.label().to_string())
-        .collect::<Vec<_>>();
-    assert!(!intents.is_empty(), "query should have architecture intent");
-
-    let subqueries = search_plan_subqueries(query, &terms, &intents);
-    assert!(
-        !subqueries
-            .iter()
-            .any(|subquery| subquery.role == "named_anchor" && subquery.query == "Cite"),
-        "generic citation wording should not consume a named-anchor slot: {subqueries:#?}"
-    );
-    for expected_role in [
-        "build_index_entrypoint",
-        "source_group_configuration",
-        "indexing_work",
-        "storage_access_surface",
-    ] {
+    for dropped in &terms.dropped {
         assert!(
-            subqueries
-                .iter()
-                .any(|subquery| subquery.role == expected_role),
-            "expected role subquery `{expected_role}` in {subqueries:#?}"
+            ["too_short", "natural_language_filler"].contains(&dropped.reason.as_str()),
+            "terms may only be dropped for length or filler, got `{}` for `{}`",
+            dropped.reason,
+            dropped.term
         );
     }
-    let typed_anchor_terms = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "typed_anchor_terms")
-        .map(|subquery| subquery.query.as_str())
-        .expect("typed anchor terms");
-    for expected in ["BuildIndex", "SourceGroup", "IndexerCommand"] {
-        assert!(
-            typed_anchor_terms.contains(expected),
-            "typed anchor terms should contain `{expected}`, got `{typed_anchor_terms}`"
-        );
-    }
-}
-
-#[test]
-fn event_output_architecture_prompt_expands_processor_abstraction() {
-    let query = "Explain how codex exec --json flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.";
-    let terms = search_plan_terms(query);
-    assert!(
-        terms.extracted.iter().any(|term| term == "EventProcessor"),
-        "event-output architecture prompt should infer source-truth abstraction: {:?}",
-        terms.extracted
-    );
-
-    let intents = architecture_query_intents(query)
-        .into_iter()
-        .map(|intent| intent.label().to_string())
-        .collect::<Vec<_>>();
-    assert!(!intents.is_empty(), "query should have architecture intent");
-
-    let subqueries = search_plan_subqueries(query, &terms, &intents);
-    let typed_anchor_terms = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "typed_anchor_terms")
-        .map(|subquery| subquery.query.as_str())
-        .expect("typed anchor terms");
-    assert!(
-        typed_anchor_terms.contains("EventProcessor"),
-        "typed anchor terms should include EventProcessor, got `{typed_anchor_terms}`"
-    );
 }
 
 #[test]
@@ -237,20 +198,18 @@ fn broad_explain_how_search_plan_survives_generic_exact_hits() {
         "generic exact hits such as CLI should not suppress broad architecture search plans"
     );
     let terms = search_plan_terms(query);
-    let roles = search_plan_subqueries(query, &terms, &intents)
-        .into_iter()
-        .map(|subquery| subquery.role)
+    let subqueries = search_plan_subqueries(query, &terms, &intents);
+    let roles = subqueries
+        .iter()
+        .map(|subquery| subquery.role.as_str())
         .collect::<Vec<_>>();
-    for expected in [
-        "workspace_discovery",
-        "symbol_extraction",
-        "persistence_surface",
-    ] {
-        assert!(
-            roles.iter().any(|role| role == expected),
-            "broad explain-how prompt should expand architecture role `{expected}`: {roles:#?}"
-        );
-    }
+    // A prompt that names no identifier still gets the asked question plus its
+    // own words as repo text; it does not get roles a term catalog invented.
+    assert_eq!(
+        roles,
+        vec!["original_question", "typed_anchor_terms", "repo_text_terms"],
+        "broad explain-how prompt should plan from its own words: {subqueries:#?}"
+    );
 
     let ordinary_exact_query =
         "Explain how run_index RuntimeContext::ensure_open_from_summary moves through runtime.";
@@ -293,7 +252,7 @@ fn search_plan_preserves_seed_anchor_line_exactly() {
 
 #[test]
 fn public_surface_question_keeps_short_pascal_case_named_anchor() {
-    let query = "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed. Anchor the answer around Posts, getElsewhereFeed, and getCommentAuth.";
+    let query = "Explain how public writing/social surfaces connect to content collections, comment auth, and the elsewhere feed. Anchor the answer around Notes, getElsewhereFeed, and getCommentAuth.";
     let intents = architecture_query_intents(query)
         .into_iter()
         .map(|intent| intent.label().to_string())
@@ -302,179 +261,12 @@ fn public_surface_question_keeps_short_pascal_case_named_anchor() {
 
     let terms = search_plan_terms(query);
     let subqueries = search_plan_subqueries(query, &terms, &intents);
-    for expected in ["Posts", "getElsewhereFeed", "getCommentAuth"] {
+    for expected in ["Notes", "getElsewhereFeed", "getCommentAuth"] {
         assert!(
             subqueries
                 .iter()
                 .any(|subquery| subquery.role == "named_anchor" && subquery.query == expected),
             "expected named-anchor subquery for `{expected}`: {subqueries:#?}"
-        );
-    }
-}
-
-#[test]
-fn payload_content_flow_prompt_expands_source_truth_anchors() {
-    let query = "Explain how Root & Runtime public writing and social surfaces connect through Payload collections, post rendering, comment auth/submission, RSS, and the Elsewhere feed. Cite the source files that support the path.";
-    let terms = search_plan_terms(query);
-    for noisy in ["root", "runtime"] {
-        assert!(
-            !terms
-                .extracted
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case(noisy)),
-            "brand phrase term `{noisy}` should not dominate Payload content-flow search: {:?}",
-            terms.extracted
-        );
-        assert!(
-            terms
-                .dropped
-                .iter()
-                .any(|term| term.term.eq_ignore_ascii_case(noisy)
-                    && term.reason == "brand_phrase_in_content_flow"),
-            "brand phrase term `{noisy}` should be explained as dropped: {:?}",
-            terms.dropped
-        );
-    }
-    for expected in [
-        "content config",
-        "collection config",
-        "Posts",
-        "Comments",
-        "social entries",
-        "post page",
-        "content client",
-        "comment submission",
-        "comment auth",
-        "feed",
-    ] {
-        assert!(
-            terms
-                .extracted
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case(expected)),
-            "expected Payload content-flow term `{expected}` in {:?}",
-            terms.extracted
-        );
-    }
-
-    let intents = architecture_query_intents(query)
-        .into_iter()
-        .map(|intent| intent.label().to_string())
-        .collect::<Vec<_>>();
-    assert!(!intents.is_empty(), "query should have architecture intent");
-
-    let subqueries = search_plan_subqueries(query, &terms, &intents);
-    let typed_anchor_terms = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "typed_anchor_terms")
-        .map(|subquery| subquery.query.as_str())
-        .expect("typed anchor terms");
-    for expected in ["Posts", "Comments", "feed"] {
-        assert!(
-            typed_anchor_terms.contains(expected),
-            "typed anchor terms should include `{expected}`, got `{typed_anchor_terms}`"
-        );
-    }
-    assert!(
-        subqueries.iter().any(|subquery| {
-            subquery.role == "content_surface"
-                && subquery.query.to_ascii_lowercase().contains("comments")
-        }),
-        "content role subquery should preserve comment wording: {subqueries:#?}"
-    );
-    for expected_role in [
-        "collection_config_surface",
-        "comment_submission_surface",
-        "public_feed_surface",
-    ] {
-        assert!(
-            subqueries
-                .iter()
-                .any(|subquery| subquery.role == expected_role),
-            "expected role subquery `{expected_role}` in {subqueries:#?}"
-        );
-    }
-    let comment_role_query = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "comment_submission_surface")
-        .map(|subquery| subquery.query.to_ascii_lowercase())
-        .expect("comment submission role query");
-    for expected in ["comment", "auth", "submission"] {
-        assert!(
-            comment_role_query.contains(expected),
-            "comment role query should contain `{expected}`, got `{comment_role_query}`"
-        );
-    }
-}
-
-#[test]
-fn codex_exec_json_prompt_expands_source_truth_anchors() {
-    let query = "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output. Cite the source files that support the path.";
-    let terms = search_plan_terms(query);
-    for expected in [
-        "EventProcessor",
-        "exec cli",
-        "exec runtime",
-        "exec session",
-        "event processor",
-        "event output",
-        "thread start",
-        "turn start",
-    ] {
-        assert!(
-            terms
-                .extracted
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case(expected)),
-            "expected Codex exec-flow term `{expected}` in {:?}",
-            terms.extracted
-        );
-    }
-
-    let intents = architecture_query_intents(query)
-        .into_iter()
-        .map(|intent| intent.label().to_string())
-        .collect::<Vec<_>>();
-    assert!(!intents.is_empty(), "query should have architecture intent");
-
-    let subqueries = search_plan_subqueries(query, &terms, &intents);
-    let typed_anchor_terms = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "typed_anchor_terms")
-        .map(|subquery| subquery.query.as_str())
-        .expect("typed anchor terms");
-    assert!(
-        typed_anchor_terms.contains("EventProcessor"),
-        "typed anchor terms should include EventProcessor, got `{typed_anchor_terms}`"
-    );
-    for expected_role in ["exec_cli_surface", "exec_event_output_surface"] {
-        assert!(
-            subqueries
-                .iter()
-                .any(|subquery| subquery.role == expected_role),
-            "expected role subquery `{expected_role}` in {subqueries:#?}"
-        );
-    }
-    let exec_cli_query = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "exec_cli_surface")
-        .map(|subquery| subquery.query.to_ascii_lowercase())
-        .expect("exec CLI role query");
-    for expected in ["exec", "cli", "runtime"] {
-        assert!(
-            exec_cli_query.contains(expected),
-            "exec CLI role query should contain `{expected}`, got `{exec_cli_query}`"
-        );
-    }
-    let event_output_query = subqueries
-        .iter()
-        .find(|subquery| subquery.role == "exec_event_output_surface")
-        .map(|subquery| subquery.query.to_ascii_lowercase())
-        .expect("event output role query");
-    for expected in ["event", "output", "processor"] {
-        assert!(
-            event_output_query.contains(expected),
-            "event-output role query should contain `{expected}`, got `{event_output_query}`"
         );
     }
 }
