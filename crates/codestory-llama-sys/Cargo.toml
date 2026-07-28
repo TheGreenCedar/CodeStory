@@ -1,6 +1,6 @@
 [package]
 name = "codestory-llama-sys"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2024"
 build = "build.rs"
 

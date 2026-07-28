@@ -2,10 +2,11 @@
 
 ## Unreleased
 
+## 0.16.2
+
 ### Fixed
 
-- Fixed semantic sidecar publication failing with `unable to open database file` on Windows under deep cache roots (service profiles, redirected homes): sidecar SQLite opens now use extended-length paths and the staged vector index no longer creates a rollback journal.
-- Windows projects whose cache root sits deep in the filesystem can index, search, and publish again. Indexing, status, and snapshot publication could fail with `unable to open database file` once the project database path approached 260 characters — reachable with a long user name, a redirected or roaming home directory, or a service account — because the database's write-ahead-log companion files were a few characters longer still. Every core database open now handles long paths, so no change to the cache location or Windows settings is needed.
+- Windows projects whose cache root sits deep in the filesystem can index, search, and publish again. Indexing, status, semantic publication, and snapshot publication could fail with `unable to open database file` once a database path approached 260 characters — reachable with a long user name, a redirected or roaming home directory, or a service account — because the companion files SQLite derives by appending to that path were longer still. Every database open now handles long paths, so no change to the cache location or Windows settings is needed.
 - First use completes on Linux hosts that keep `/tmp` on its own filesystem.
   Setup previously downloaded the runtime, failed to install it, and started the
   download again until it gave up.
