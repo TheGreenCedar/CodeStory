@@ -923,15 +923,29 @@ fn search_plan_subqueries_contain_only_tokens_from_the_query_closure() {
         let terms = search_plan_terms(query);
         let closure = search_plan_query_token_closure(query);
         for subquery in search_plan_subqueries(query, &terms) {
-            if subquery.role == "original_question" || subquery.role == "named_anchor" {
+            if subquery.role == "original_question" {
+                // The one subquery that may carry filler: it is the question
+                // verbatim. Pinning it to the question keeps the exemption from
+                // becoming a role name any future expansion can adopt to leave
+                // the closure invariant.
+                assert_eq!(
+                    subquery.query,
+                    query.trim(),
+                    "`original_question` must be the question itself, not an expansion"
+                );
                 continue;
             }
             for token in subquery.query.split_whitespace() {
-                assert!(
-                    closure.contains(&token.to_ascii_lowercase()),
-                    "subquery role `{}` injected `{token}`, which the query never supplied: {closure:?}",
-                    subquery.role
-                );
+                // A qualified anchor the question spelled out (`zarq_store::open`)
+                // reaches the closure as its segments, so compare segment by
+                // segment rather than exempting the role that carries it.
+                for segment in token.split("::").filter(|segment| !segment.is_empty()) {
+                    assert!(
+                        closure.contains(&segment.to_ascii_lowercase()),
+                        "subquery role `{}` injected `{segment}`, which the query never supplied: {closure:?}",
+                        subquery.role
+                    );
+                }
             }
         }
     }
