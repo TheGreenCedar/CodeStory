@@ -237,9 +237,10 @@ adapter to compensate for incorrect upstream state.
   hardware, post-publish, installed-runtime, and live behavior evidence for the
   claims being shipped. A merge, tag, or downloadable archive alone is not
   release completion.
-- The release workflow owns marketplace publication. Its `marketplace-publish`
-  job points `TheGreenCedar/AgentPluginMarketplace` at the published commit
-  after the release exists, and post-publish smoke proves that catalog. Do not
+- Both release lanes own marketplace publication. The `marketplace-publish` job
+  in `release.yml` and in `plugin-release.yml` points
+  `TheGreenCedar/AgentPluginMarketplace` at the published commit after the
+  release exists, and post-publish smoke proves that catalog. Do not
   hand-edit the catalog before a release; preflight proves the install path
   against a candidate-pinned fixture and no longer requires the live catalog to
   match an unreleased commit. If the catalog push fails, the release is still

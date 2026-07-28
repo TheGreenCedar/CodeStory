@@ -2325,3 +2325,98 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     assert.notDeepEqual(validateWorkflows(workflows), [], label);
   }
 });
+
+test("the plugin lane publishes the catalog it then smoke-installs", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "plugin-release.yml";
+  const smokeStep = workflow =>
+    draftStep(workflow.jobs["post-publish-smoke"], "Prove the public marketplace install path");
+  const tokenStep = workflow =>
+    draftStep(workflow.jobs["marketplace-publish"], "Mint a scoped marketplace token");
+  const catalogStep = workflow =>
+    draftStep(workflow.jobs["marketplace-publish"], "Point the catalog at the published release");
+  const mutations = [
+    ["smoke installs the revision preflight saw before publication", workflow => {
+      workflow.jobs.preflight.outputs.marketplace_revision
+        = "${{ steps.marketplace.outputs.marketplace_revision }}";
+      smokeStep(workflow).env.MARKETPLACE_REVISION
+        = "${{ needs.preflight.outputs.marketplace_revision }}";
+    }, /post-publish smoke must install from the marketplace revision this release published/u],
+    ["preflight resurrects a pre-publication revision", workflow => {
+      workflow.jobs.preflight.outputs.marketplace_revision
+        = "${{ steps.marketplace.outputs.marketplace_revision }}";
+    }, /preflight must not capture a marketplace revision that predates publication/u],
+    ["catalog publication is dropped from the lane", workflow => {
+      delete workflow.jobs["marketplace-publish"];
+      workflow.jobs["post-publish-smoke"].needs = ["preflight", "publish"];
+    }, /must keep exactly the plugin lane the release claim graph declares/u],
+    ["smoke stops waiting on catalog publication", workflow => {
+      workflow.jobs["post-publish-smoke"].needs = ["preflight", "publish"];
+    }, /post-publish-smoke dependencies must match the release claim graph/u],
+    ["catalog publication races the release it advertises", workflow => {
+      workflow.jobs["marketplace-publish"].needs = ["preflight"];
+    }, /marketplace-publish dependencies must match the release claim graph/u],
+    ["catalog publication loses its credential environment", workflow => {
+      delete workflow.jobs["marketplace-publish"].environment;
+    }, /marketplace publication must hold its cross-repository credential in its own environment/u],
+    ["the marketplace token is unpinned", workflow => {
+      tokenStep(workflow).uses = "actions/create-github-app-token@v1";
+    }, /marketplace token must be a SHA-pinned app token scoped to the marketplace repository/u],
+    ["the marketplace token widens beyond the catalog repository", workflow => {
+      tokenStep(workflow).with.repositories = "CodeStory";
+    }, /marketplace token must be a SHA-pinned app token scoped to the marketplace repository/u],
+    ["the catalog is pointed at an unbound version", workflow => {
+      const step = catalogStep(workflow);
+      step.run = step.run.replace('--version "${{ inputs.version }}"', '--version "$LATEST"');
+    }, /Point the catalog at the published release must run --version/u],
+    ["catalog publication hides the revision it pushed", workflow => {
+      delete workflow.jobs["marketplace-publish"].outputs;
+    }, /marketplace publication must publish the revision it pushed/u],
+    ["a secret leaks outside the token step", workflow => {
+      catalogStep(workflow).env.APP_ID = "${{ secrets.MARKETPLACE_APP_ID }}";
+    }, /must not receive or forward secrets beyond the minted marketplace app identity/u],
+    ["the lane opens a callable secret surface", workflow => {
+      workflow.on.workflow_call.secrets = { MARKETPLACE_APP_ID: { required: true } };
+    }, /must not receive or forward secrets beyond the minted marketplace app identity/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("the plugin lane still forbids building, signing, and forwarded secrets", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const mutations = [
+    ["auto-release forwards secrets to the plugin lane", workflows => {
+      workflows.get("auto-release.yml").jobs["plugin-release"].secrets = "inherit";
+    }, /auto-release\.yml must route the plugin lane without forwarding secrets/u],
+    ["the plugin lane reaches for Apple signing material", workflows => {
+      draftStep(
+        workflows.get("plugin-release.yml").jobs["marketplace-publish"],
+        "Point the catalog at the published release",
+      ).env.APPLE_ID = "signing@example.com";
+    }, /must never reference Apple signing material/u],
+    ["the plugin lane builds native code", workflows => {
+      const step = draftStep(
+        workflows.get("plugin-release.yml").jobs["plugin-proof"],
+        "Provision the pinned CLI end to end",
+      );
+      step.run = `${step.run}\ncargo build --locked -p codestory-cli\n`;
+    }, /must not build native code/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
