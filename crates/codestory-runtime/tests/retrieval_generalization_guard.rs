@@ -74,7 +74,7 @@ fn run_lint_with_scan_root(repo_root: &Path, script: &Path, scan_root: &Path) ->
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(script)
         .current_dir(repo_root)
@@ -116,7 +116,7 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -151,7 +151,7 @@ fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -176,7 +176,7 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)

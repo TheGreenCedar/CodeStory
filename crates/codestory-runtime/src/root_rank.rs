@@ -263,8 +263,8 @@ pub(crate) fn helper_like_name_or_path(display_name: &str, file_path: Option<&st
 /// Surfaces and names a diversification pass has already spent.
 ///
 /// Carried across consecutive tiers of one list -- production before secondary,
-/// say -- so a later tier does not rediscover a name the earlier tier already
-/// emitted and re-spend a slot on the duplicate.
+/// say -- so a later tier does not treat a name the earlier tier already emitted
+/// as novel and spend a diversity slot on the duplicate.
 #[derive(Debug, Default)]
 pub(crate) struct RootDiversityState {
     seen_surfaces: HashSet<String>,
@@ -453,8 +453,7 @@ mod tests {
             );
         }
         assert_ne!(
-            full,
-            items,
+            full, items,
             "the fixture must actually be reordered, or the prefix claim is empty"
         );
     }

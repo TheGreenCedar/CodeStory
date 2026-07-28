@@ -5,11 +5,6 @@ use super::{
     search_plan_runtime_call_is_speculative, search_plan_subqueries, search_plan_terms,
     search_plan_test_hit, tempdir,
 };
-use codestory_contracts::api::{
-    EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
-    SearchPlanBridgeEvidenceKindDto,
-};
-use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
 use crate::root_rank::{CallDegrees, EntryEvidence, diversify_root_order};
 use crate::search_plan::search_orientation_report;
 use crate::search_terms::search_plan_query_token_closure;
@@ -17,8 +12,13 @@ use crate::symbol_query::{
     OrientationEvidence, OrientationHitEvidence, compare_search_hits_with_project_root,
 };
 use codestory_contracts::api::{
+    EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
+    SearchPlanBridgeEvidenceKindDto,
+};
+use codestory_contracts::api::{
     GroundingOrientationConfidenceDto, GroundingOrientationUncertaintyDto, SearchHit,
 };
+use codestory_contracts::graph::STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES;
 
 #[test]
 fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
@@ -412,7 +412,10 @@ fn bridge_evidence_uses_collector_canonical_ids_not_display_labels() {
     // The rendered label is what the deleted sniffs read. A node may say
     // anything; only the structured id written by the collector counts.
     assert_ne!(
-        graph_bridge_evidence_kind(&graph(None, "payload collection orders route; confidence=0.9")),
+        graph_bridge_evidence_kind(&graph(
+            None,
+            "payload collection orders route; confidence=0.9"
+        )),
         SearchPlanBridgeEvidenceKindDto::DataCollectionUsage,
         "a display label must not stand in for collector evidence"
     );
@@ -1018,8 +1021,18 @@ fn duplicate_name_diversity_and_non_primary_deprioritization_are_preserved() {
     // Three candidates share one surface and two of them share a name, so a
     // diversification that ignored names would leave the duplicate second.
     let repeated = vec![
-        orientation_hit("dup-1", "zzShared", "src/one.ts", SearchHitOrigin::IndexedSymbol),
-        orientation_hit("dup-2", "zzShared", "src/two.ts", SearchHitOrigin::IndexedSymbol),
+        orientation_hit(
+            "dup-1",
+            "zzShared",
+            "src/one.ts",
+            SearchHitOrigin::IndexedSymbol,
+        ),
+        orientation_hit(
+            "dup-2",
+            "zzShared",
+            "src/two.ts",
+            SearchHitOrigin::IndexedSymbol,
+        ),
         orientation_hit(
             "distinct",
             "zzDistinct",
