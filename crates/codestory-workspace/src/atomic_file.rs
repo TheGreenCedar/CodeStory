@@ -80,6 +80,9 @@ pub fn write_file_atomic(
 pub enum PublishNewFileError {
     /// The destination has no parent directory to publish into.
     NoParent,
+    /// The temporary prefix contained a path separator or traversal component,
+    /// so the temporary file would not have been a sibling of the destination.
+    UnsafeTempPrefix,
     /// No collision-free temporary name was available beside the destination.
     TempNamesExhausted,
     /// The temporary file could not be created.
@@ -93,6 +96,9 @@ impl std::fmt::Display for PublishNewFileError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoParent => formatter.write_str("destination has no parent directory"),
+            Self::UnsafeTempPrefix => {
+                formatter.write_str("temporary prefix is not a plain file-name component")
+            }
             Self::TempNamesExhausted => {
                 formatter.write_str("no free temporary name beside the destination")
             }
@@ -105,7 +111,7 @@ impl std::fmt::Display for PublishNewFileError {
 impl std::error::Error for PublishNewFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NoParent | Self::TempNamesExhausted => None,
+            Self::NoParent | Self::TempNamesExhausted | Self::UnsafeTempPrefix => None,
             Self::CreateTemp(error) | Self::Publish(error) => Some(error),
         }
     }
@@ -144,6 +150,19 @@ pub fn publish_new_private_file_atomic(
     content: &[u8],
 ) -> std::result::Result<(), PublishNewFileError> {
     let parent = path.parent().ok_or(PublishNewFileError::NoParent)?;
+    // The prefix reaches a filename that is joined onto the destination's
+    // parent, so a separator or traversal component in it would place the
+    // temporary file outside the directory the caller validated.
+    // `..` is a single component too, so the component must also be a normal
+    // one rather than a traversal or a root.
+    let mut components = Path::new(temp_prefix).components();
+    let plain_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if temp_prefix.contains(['/', '\\']) || !plain_component {
+        return Err(PublishNewFileError::UnsafeTempPrefix);
+    }
     for _ in 0..PRIVATE_PUBLISH_ATTEMPTS {
         let sequence = PRIVATE_PUBLISH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp = parent.join(format!(
@@ -546,5 +565,26 @@ mod tests {
         write_bytes_atomic(&path, "state", b"new").expect("atomic long-path write");
 
         assert_eq!(fs::read(&path).expect("read new file"), b"new");
+    }
+
+    #[test]
+    fn a_temp_prefix_that_escapes_the_directory_is_refused() {
+        // The prefix reaches a filename joined onto the destination's parent, so
+        // anything that is not a plain component could publish the temporary file
+        // outside the directory the caller validated.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("published.json");
+        for prefix in ["../escape", "nested/prefix", "..", "", "a\\b"] {
+            let error = publish_new_private_file_atomic(&destination, prefix, b"{}")
+                .expect_err("an escaping prefix must be refused");
+            assert!(
+                matches!(error, PublishNewFileError::UnsafeTempPrefix),
+                "prefix {prefix:?} produced {error:?}"
+            );
+        }
+        assert!(
+            !destination.exists(),
+            "a refused publish must write nothing"
+        );
     }
 }

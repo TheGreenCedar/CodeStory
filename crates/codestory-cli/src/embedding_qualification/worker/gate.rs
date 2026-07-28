@@ -130,6 +130,9 @@ pub(super) fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<(
         Err(PublishNewFileError::NoParent) => {
             bail!("atomic qualification output has no parent")
         }
+        Err(PublishNewFileError::UnsafeTempPrefix) => {
+            bail!("embedding_qualification_temp_prefix_unsafe")
+        }
         Err(PublishNewFileError::TempNamesExhausted) => {
             bail!("embedding_qualification_temp_name_exhausted")
         }
