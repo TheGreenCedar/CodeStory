@@ -1,5 +1,11 @@
 use super::{HashSet, SearchPlanDroppedTermDto, SearchPlanTermsDto};
 
+// Search-plan terms come from the asked question only. Domain vocabulary,
+// inferred symbol names, and repository-specific term expansion belong to the
+// indexed repository, not to a table in this crate: a curated vocabulary here
+// can only encode the corpora it was written against.
+// Stopwords stay language-level: instruction and filler words that carry no
+// repository meaning in any repository.
 pub(super) const SEARCH_PLAN_STOPWORDS: &[&str] = &[
     "a",
     "an",
@@ -40,134 +46,16 @@ pub(super) const SEARCH_PLAN_STOPWORDS: &[&str] = &[
     "this",
     "through",
     "to",
-    "turns",
     "what",
     "where",
     "which",
     "why",
     "with",
 ];
-pub(super) const SEARCH_PLAN_SYMBOL_TERMS: &[&str] = &[
-    "indexer",
-    "service",
-    "storage",
-    "store",
-    "posts",
-    "feed",
-    "auth",
-    "trail",
-    "snippet",
-    "workspace",
-    "persistence",
-    "snapshot",
-];
 pub(super) const SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT: usize = 8;
 pub(super) const SEARCH_PLAN_MAX_SEED_ANCHORS: usize = 32;
 pub(super) const SEARCH_PLAN_SEED_ANCHOR_MARKER: &str = "Seed anchors:";
 pub(super) const SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER: &str = "Anchor the answer around";
-pub(super) const SEARCH_PLAN_ROLE_SPECS: &[(&str, &[&str])] = &[
-    (
-        "indexing_pipeline",
-        &["full", "index", "indexing", "indexer", "workspace", "store"],
-    ),
-    (
-        "build_index_entrypoint",
-        &["project", "indexing", "build", "index"],
-    ),
-    (
-        "source_group_configuration",
-        &[
-            "project",
-            "source-group",
-            "source",
-            "group",
-            "configuration",
-        ],
-    ),
-    (
-        "indexing_work",
-        &["indexing", "indexed", "indexer", "command", "work"],
-    ),
-    (
-        "storage_access_surface",
-        &[
-            "storage",
-            "access",
-            "accessed",
-            "data",
-            "application",
-            "persistence",
-        ],
-    ),
-    (
-        "workspace_discovery",
-        &["workspace", "file", "discovery", "source"],
-    ),
-    (
-        "symbol_extraction",
-        &["symbol", "extraction", "indexer", "indexing"],
-    ),
-    (
-        "runtime_boundary",
-        &["cli", "runtime", "command", "service"],
-    ),
-    (
-        "exec_cli_surface",
-        &["exec", "cli", "json", "subcommand", "runtime"],
-    ),
-    (
-        "exec_event_output_surface",
-        &[
-            "exec",
-            "event",
-            "events",
-            "json",
-            "jsonl",
-            "output",
-            "event processor",
-        ],
-    ),
-    (
-        "read_surface",
-        &["search", "trail", "snippet", "context", "explore"],
-    ),
-    (
-        "collection_config_surface",
-        &[
-            "payload",
-            "collection",
-            "collections",
-            "schema",
-            "hooks",
-            "access",
-            "config",
-        ],
-    ),
-    (
-        "comment_submission_surface",
-        &["comments", "comment", "auth", "submission", "guard"],
-    ),
-    (
-        "public_feed_surface",
-        &["feed", "rss", "elsewhere", "social", "entries"],
-    ),
-    (
-        "content_surface",
-        &["posts", "comments", "auth", "feed", "elsewhere"],
-    ),
-    (
-        "persistence_surface",
-        &[
-            "storage",
-            "store",
-            "persistence",
-            "payload",
-            "collection",
-            "snapshot",
-            "refresh",
-        ],
-    ),
-];
 pub(super) const SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS: &[&str] = &[
     "Draft the CodeStory-only answer from selected anchors, bridge status, symbol, trail, and snippet evidence before opening source.",
     "Open the cited source files after the CodeStory-only draft and classify each claim as correct, partial, misleading, or unsupported.",
@@ -233,147 +121,8 @@ pub(super) fn search_plan_terms(query: &str) -> SearchPlanTermsDto {
             }
         }
     }
-    drop_search_plan_brand_terms_for_content_flow(query, &mut extracted, &mut dropped);
-    add_search_plan_inferred_architecture_terms(
-        query,
-        &mut extracted,
-        &mut seen,
-        &mut dropped,
-        &mut dropped_seen,
-    );
 
     SearchPlanTermsDto { extracted, dropped }
-}
-
-pub(super) fn add_search_plan_inferred_architecture_terms(
-    query: &str,
-    extracted: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    dropped: &mut Vec<SearchPlanDroppedTermDto>,
-    dropped_seen: &mut HashSet<String>,
-) {
-    let lower = query.to_ascii_lowercase();
-    let has_source_group = lower.contains("source-group")
-        || (search_plan_query_has_token(&lower, "source")
-            && search_plan_query_has_token(&lower, "group"));
-    if has_source_group {
-        add_search_plan_term("SourceGroup", extracted, seen, dropped, dropped_seen);
-    }
-
-    let has_indexing_work = search_plan_query_has_token(&lower, "indexing")
-        && (search_plan_query_has_token(&lower, "work")
-            || search_plan_query_has_token(&lower, "command")
-            || has_source_group);
-    if has_indexing_work {
-        add_search_plan_term("build", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("index", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("BuildIndex", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("indexer", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("IndexerCommand", extracted, seen, dropped, dropped_seen);
-    }
-
-    let has_data_access = search_plan_query_has_token(&lower, "data")
-        && (search_plan_query_has_token(&lower, "access")
-            || search_plan_query_has_token(&lower, "accessed"))
-        && search_plan_query_has_token(&lower, "application");
-    if has_data_access {
-        add_search_plan_term("access", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("storage", extracted, seen, dropped, dropped_seen);
-        add_search_plan_term("persistence", extracted, seen, dropped, dropped_seen);
-    }
-
-    let has_event_output = search_plan_query_has_token(&lower, "event")
-        && (search_plan_query_has_token(&lower, "output")
-            || search_plan_query_has_token(&lower, "notification")
-            || search_plan_query_has_token(&lower, "notifications")
-            || search_plan_query_has_token(&lower, "jsonl"));
-    if has_event_output {
-        add_search_plan_term("EventProcessor", extracted, seen, dropped, dropped_seen);
-    }
-
-    if search_plan_query_has_exec_json_flow(&lower) {
-        for term in [
-            "exec cli",
-            "exec runtime",
-            "exec session",
-            "event processor",
-            "event output",
-            "thread start",
-            "turn start",
-        ] {
-            add_search_plan_term(term, extracted, seen, dropped, dropped_seen);
-        }
-    }
-
-    if search_plan_query_has_payload_content_flow(&lower) {
-        for term in [
-            "content config",
-            "collection config",
-            "Posts",
-            "Comments",
-            "social entries",
-            "post page",
-            "content client",
-            "comment submission",
-            "comment auth",
-            "feed",
-        ] {
-            add_search_plan_term(term, extracted, seen, dropped, dropped_seen);
-        }
-    }
-}
-
-pub(super) fn search_plan_query_has_exec_json_flow(lower_query: &str) -> bool {
-    search_plan_query_has_token(lower_query, "exec")
-        && (search_plan_query_has_token(lower_query, "json")
-            || search_plan_query_has_token(lower_query, "jsonl"))
-        && (search_plan_query_has_token(lower_query, "event")
-            || search_plan_query_has_token(lower_query, "events")
-            || search_plan_query_has_token(lower_query, "output"))
-}
-
-pub(super) fn search_plan_query_has_token(lower_query: &str, token: &str) -> bool {
-    lower_query
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|part| part == token)
-}
-
-pub(super) fn search_plan_query_has_payload_content_flow(lower_query: &str) -> bool {
-    search_plan_query_has_token(lower_query, "payload")
-        && (search_plan_query_has_token(lower_query, "posts")
-            || search_plan_query_has_token(lower_query, "post")
-            || search_plan_query_has_token(lower_query, "writing"))
-        && (search_plan_query_has_token(lower_query, "comments")
-            || search_plan_query_has_token(lower_query, "comment")
-            || search_plan_query_has_token(lower_query, "feed")
-            || search_plan_query_has_token(lower_query, "rss")
-            || search_plan_query_has_token(lower_query, "elsewhere")
-            || search_plan_query_has_token(lower_query, "social"))
-}
-
-pub(super) fn drop_search_plan_brand_terms_for_content_flow(
-    query: &str,
-    extracted: &mut Vec<String>,
-    dropped: &mut Vec<SearchPlanDroppedTermDto>,
-) {
-    let lower = query.to_ascii_lowercase();
-    if !(search_plan_query_has_payload_content_flow(&lower)
-        && search_plan_query_has_token(&lower, "root")
-        && search_plan_query_has_token(&lower, "runtime"))
-    {
-        return;
-    }
-
-    extracted.retain(|term| {
-        let is_brand = term.eq_ignore_ascii_case("root") || term.eq_ignore_ascii_case("runtime");
-        if is_brand {
-            dropped.push(SearchPlanDroppedTermDto {
-                term: term.clone(),
-                reason: "brand_phrase_in_content_flow".to_string(),
-            });
-        }
-        !is_brand
-    });
 }
 
 pub(super) fn add_search_plan_term(

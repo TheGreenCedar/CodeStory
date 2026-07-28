@@ -24,8 +24,8 @@ use crate::search_scoring::{
 use crate::search_terms::{
     SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS, SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER,
     SEARCH_PLAN_MAX_SEED_ANCHORS, SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT,
-    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_ROLE_SPECS,
-    SEARCH_PLAN_SEED_ANCHOR_MARKER, SEARCH_PLAN_SYMBOL_TERMS, search_plan_terms,
+    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER,
+    SEARCH_PLAN_STOPWORDS, search_plan_terms,
 };
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
@@ -58,14 +58,20 @@ pub(super) fn search_plan_eligible(
 ) -> bool {
     let broad_query = looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4;
     let has_seed_anchors = query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER);
-    let broad_explanation_prompt =
-        search_plan_broad_explanation_prompt_with_architecture_terms(query);
     !intents.is_empty()
         && broad_query
-        && (exact_symbol_hit_count == 0 || has_seed_anchors || broad_explanation_prompt)
+        && (exact_symbol_hit_count == 0
+            || has_seed_anchors
+            || search_plan_prose_flow_prompt(query))
 }
 
-pub(super) fn search_plan_broad_explanation_prompt_with_architecture_terms(query: &str) -> bool {
+/// A flow question that names no identifier of its own: every exact symbol hit
+/// it produced came from a word the asker used as prose, so exact-first ranking
+/// answers a question nobody asked. Asking whether the question names an
+/// identifier is a property of the question; the alternative is a table of
+/// architecture nouns, and such a table can only recognise the repositories it
+/// was written against.
+pub(super) fn search_plan_prose_flow_prompt(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
     let asks_for_flow = lower.contains("explain how")
         || lower.contains("trace how")
@@ -74,34 +80,21 @@ pub(super) fn search_plan_broad_explanation_prompt_with_architecture_terms(query
     if !asks_for_flow {
         return false;
     }
-    let tokens = lower
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect::<HashSet<_>>();
-    [
-        "cli",
-        "command",
-        "runtime",
-        "workspace",
-        "indexer",
-        "indexing",
-        "store",
-        "storage",
-        "persistence",
-        "snapshot",
-        "search",
-        "trail",
-        "snippet",
-        "configuration",
-        "source",
-        "activation",
-        "host",
-        "execution",
-    ]
-    .iter()
-    .filter(|term| tokens.contains(**term))
-    .count()
-        >= 3
+    if query.split_whitespace().any(query_word_names_identifier) {
+        return false;
+    }
+    search_plan_terms(query).extracted.len() >= 3
+}
+
+fn query_word_names_identifier(word: &str) -> bool {
+    let trimmed =
+        word.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'));
+    trimmed.contains("::")
+        || trimmed.contains('_')
+        || trimmed
+            .chars()
+            .zip(trimmed.chars().skip(1))
+            .any(|(previous, next)| previous.is_ascii_lowercase() && next.is_ascii_uppercase())
 }
 
 pub(super) fn search_plan_subqueries(
@@ -128,7 +121,6 @@ pub(super) fn search_plan_subqueries(
     push_search_plan_seed_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_explicit_anchor_subqueries(&mut subqueries, &mut seen, query);
     push_search_plan_symbol_term_subquery(&mut subqueries, &mut seen, terms);
-    push_search_plan_role_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_named_anchor_subqueries(&mut subqueries, &mut seen, terms);
     push_search_plan_fallback_subquery(&mut subqueries, &mut seen, terms);
     subqueries
@@ -205,14 +197,14 @@ pub(super) fn push_search_plan_symbol_term_subquery(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_symbol_terms(terms);
-    if symbol_terms.is_empty() {
+    let query_terms = sorted_search_plan_query_terms(terms);
+    if query_terms.is_empty() {
         return;
     }
     push_search_plan_subquery(
         subqueries,
         seen,
-        symbol_terms
+        query_terms
             .iter()
             .take(8)
             .cloned()
@@ -231,8 +223,8 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_symbol_terms(terms);
-    for term in symbol_terms
+    let query_terms = sorted_search_plan_query_terms(terms);
+    for term in query_terms
         .iter()
         .filter(|term| search_plan_named_anchor_term(term))
         .take(5)
@@ -250,26 +242,18 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     }
 }
 
-pub(super) fn sorted_search_plan_symbol_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
-    let mut symbol_terms = terms
-        .extracted
-        .iter()
-        .filter(|term| search_plan_symbol_term(term))
-        .cloned()
-        .collect::<Vec<_>>();
-    symbol_terms.sort_by(|left, right| {
+// Every asked term reaches the typed-symbol channel, identifier-shaped terms
+// first. Which of them name real symbols is decided by the indexed repository,
+// which is the only place that knows; a term vocabulary in this crate can only
+// know the repositories it was written against.
+pub(super) fn sorted_search_plan_query_terms(terms: &SearchPlanTermsDto) -> Vec<String> {
+    let mut query_terms = terms.extracted.clone();
+    query_terms.sort_by(|left, right| {
         search_plan_symbol_subquery_term_score(right)
             .cmp(&search_plan_symbol_subquery_term_score(left))
             .then_with(|| left.cmp(right))
     });
-    symbol_terms
-}
-
-pub(super) fn search_plan_symbol_term(term: &str) -> bool {
-    term.chars().any(|ch| ch.is_ascii_uppercase())
-        || SEARCH_PLAN_SYMBOL_TERMS
-            .iter()
-            .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
+    query_terms
 }
 
 pub(super) fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
@@ -284,12 +268,6 @@ pub(super) fn search_plan_symbol_subquery_term_score(term: &str) -> u32 {
     if term.contains('_') || term.contains('-') {
         score += 35;
     }
-    if SEARCH_PLAN_SYMBOL_TERMS
-        .iter()
-        .any(|symbol_term| term.eq_ignore_ascii_case(symbol_term))
-    {
-        score += 20;
-    }
     score
 }
 
@@ -297,45 +275,6 @@ pub(super) fn search_plan_named_anchor_term(term: &str) -> bool {
     let uppercase_count = term.chars().filter(|ch| ch.is_ascii_uppercase()).count();
     let lowercase_count = term.chars().filter(|ch| ch.is_ascii_lowercase()).count();
     uppercase_count >= 1 && lowercase_count > 0 && term.len() >= 4
-}
-
-pub(super) fn push_search_plan_role_subqueries(
-    subqueries: &mut Vec<SearchPlanSubqueryDto>,
-    seen: &mut HashSet<String>,
-    terms: &SearchPlanTermsDto,
-) {
-    for (role, needles) in SEARCH_PLAN_ROLE_SPECS {
-        let role_terms = search_plan_matching_terms(terms, needles);
-        if role_terms.len() >= 2 {
-            push_search_plan_subquery(
-                subqueries,
-                seen,
-                role_terms.join(" "),
-                role,
-                vec![
-                    SearchPlanChannelDto::TypedSymbol,
-                    SearchPlanChannelDto::Lexical,
-                    SearchPlanChannelDto::RepoText,
-                ],
-            );
-        }
-    }
-}
-
-pub(super) fn search_plan_matching_terms(
-    terms: &SearchPlanTermsDto,
-    needles: &[&str],
-) -> Vec<String> {
-    terms
-        .extracted
-        .iter()
-        .filter(|term| {
-            needles
-                .iter()
-                .any(|needle| term.eq_ignore_ascii_case(needle))
-        })
-        .cloned()
-        .collect()
 }
 
 pub(super) fn push_search_plan_fallback_subquery(
@@ -568,17 +507,20 @@ pub(super) fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
         .join("\n");
     let mut identifiers = Vec::new();
     let mut seen = HashSet::new();
+    // Every candidate is answered by the repository: callers keep only the ones
+    // that match a symbol indexed in this same file. Pre-filtering to
+    // camel/snake shapes would drop the lowercase single-word names that Go, C,
+    // and Python declare, and the noun list that used to rescue them named the
+    // domains of four repositories instead of any repository's own symbols.
     for token in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         if token.len() < 3 {
             continue;
         }
-        let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
-            || token.contains('_')
-            || matches!(
-                token,
-                "auth" | "feed" | "posts" | "storage" | "indexer" | "service" | "trail" | "snippet"
-            );
-        if looks_symbolic && seen.insert(token.to_ascii_lowercase()) {
+        let lower = token.to_ascii_lowercase();
+        if SEARCH_PLAN_STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower) {
             identifiers.push(token.to_string());
         }
     }

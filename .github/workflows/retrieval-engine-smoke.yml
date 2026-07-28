@@ -85,6 +85,9 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
+      - name: Generalization lint self-repository contracts
+        run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
+
       - name: Release evidence gate contracts
         run: node --test scripts/tests/codestory-release-evidence-gate.test.mjs
 

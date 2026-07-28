@@ -7,19 +7,13 @@
  * corpus dependencies. Explicit benchmark/proof harnesses remain outside the
  * protected scan because they must load those corpora.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { sourcetrailQueries } from "./cross-repo-sourcetrail-queries.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-/// Slugs that identify this repository as a benchmark subject. Kept explicit rather
-/// than read from a git remote so the lint is deterministic in a detached CI checkout.
-const SELF_REPOSITORY_SLUGS = new Set([
-  "thegreencedar/codestory",
-  "codestory",
-]);
 const extraScanRoots = (
   process.env.CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS ?? ""
 )
@@ -198,7 +192,76 @@ const requiredScanDirs = [
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [];
+// The product's own crate vocabulary: a benchmark task that runs against this
+// repository names these, and the product has to keep naming itself.
+const crateNameTokens = readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name.split(/[^A-Za-z0-9]+/).filter(Boolean));
+const productIdentityTokens = new Set(
+  crateNameTokens.flat().map((token) => token.toLowerCase()),
+);
+
+// This repository's own name, read from the crates rather than written down:
+// every crate is `codestory-<layer>`, so the token they all share is what the
+// repository is called. Deciding self-subjecthood on any crate-name token
+// instead would hand the exclusion to a holdout that happened to be called
+// `store`, `runtime`, or `bench`, and silently switch this lint off for it.
+const productRepositoryNames = new Set(
+  crateNameTokens.length === 0
+    ? []
+    : crateNameTokens
+      .map((tokens) => tokens[0]?.toLowerCase())
+      .filter((token, _index, tokens) =>
+        token != null && tokens.every((other) => other === token)
+      ),
+);
+if (productRepositoryNames.size === 0) {
+  console.error(
+    "lint-retrieval-generalization: crate names share no common prefix, so this "
+    + "repository's own name cannot be derived",
+  );
+  process.exit(2);
+}
+
+// Words this product already writes in the layers that never see a query. A
+// corpus that happens to share one of them -- `fmt`, `serialize`, `subcommand`
+// -- stays covered by its other markers, because banning a word the product
+// uses on its own terms would only teach people to spell around the ban.
+// Reading the vocabulary out of those layers keeps the exclusion derived: it
+// cannot be widened by hand to excuse a corpus symbol somebody wants to keep
+// writing, and the retrieval and packet surfaces this lint guards are not in it,
+// so steering code cannot vouch for its own words.
+const productVocabularyRoots = [
+  path.join(repoRoot, "crates", "codestory-contracts", "src"),
+  path.join(repoRoot, "crates", "codestory-workspace", "src"),
+  path.join(repoRoot, "crates", "codestory-store", "src"),
+  path.join(repoRoot, "crates", "codestory-indexer", "src"),
+  path.join(repoRoot, "crates", "codestory-cli", "src"),
+];
+
+// Search-plan term extraction is where holdout symbol injection lived before
+// the v0.16.1 audit, and the planner beside it consumes those terms, so both are
+// scanned by name even though the search modules around them are not yet under
+// the corpus scan.
+const requiredProductionOnlyFiles = [
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "search_plan.rs"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "search_scoring.rs"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "search_terms.rs"),
+];
+
+// Term extraction decides which words become queries, so a word table there is
+// the injection this lint exists to catch. The language-level stopword list is
+// the one table that cannot encode a repository: it names question filler.
+const vocabularyTableFileNames = new Set(["search_terms.rs"]);
+const vocabularyTableExemptConstants = ["SEARCH_PLAN_STOPWORDS"];
+const vocabularyTableWindowLines = 40;
+const vocabularyTableLiteralFloor = 5;
+
+// File names that name a build convention rather than a repository. A corpus
+// path ending in one of these contributes its path windows and nothing else.
+const buildLayoutFileStems = new Set([
+  "index", "init", "lib", "main", "mod", "setup", "app",
+]);
 
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
@@ -243,6 +306,16 @@ const benchmarkPromptScriptFiles = [
   },
 ];
 const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
+// Additive only: an extra root can add a task's markers, never drop the checked-in
+// corpus. A test proving that a new task extends the ban therefore never writes
+// into the corpus every other run reads.
+const benchmarkTaskRoots = [
+  benchmarkTaskRoot,
+  ...(process.env.CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS ?? "")
+    .split(path.delimiter)
+    .filter((root) => root && existsSync(root)),
+];
+const pendingSurfacePath = path.join(repoRoot, "scripts", "retrieval-generalization-pending.json");
 const benchmarkEvalProbeManifestPath = path.join(benchmarkTaskRoot, "eval-probes.json");
 const benchmarkEvalProbeSourcePath = path.join(
   repoRoot,
@@ -292,126 +365,98 @@ const corpusHarnessCompactPatternList = compactBoundaryPatterns(
   corpusHarnessDependencyPatternList,
 );
 
-const bannedPatterns = [
-  "payload_config",
-  "freelancer",
-  "traderotate",
-  "vscode",
-  "codex-rs",
-  "sourcetrail",
-  "extHostCommands",
-  "extensionService",
-  "workbench\\.ts",
-  "codex_exec::",
-  "exec_events",
-  "StorageAccess",
-  "PersistentStorage",
-  "SourceGroupCxxCdb",
-  "IndexerJava",
-  "data[/\\\\]indexer",
-  "ExecSharedCliOptions",
-  "EventProcessorWithJsonOutput",
-  "Subcommand::Exec",
-  "ThreadStartParams",
-  "TurnStartParams",
-  "chinook",
-  "mdn",
-  "okio",
-  "monolog",
-  "alamofire",
-  "ChinookDatabase",
-  "form-validation",
-  "commonMain/kotlin/okio",
-  "src/Monolog",
-  "Source/Core/Session\\.swift",
-  "SocialEntries",
-  "ElsewhereFeed",
-  "src/lib_cxx",
-  "src/lib_java",
-  "src/lib/data/storage",
-  "getPayloadClient",
-  "comment_submission_guard",
-  "axios",
-  "redis",
-  "ripgrep",
-  "createInstance",
-  "InterceptorManager",
-  "dispatchRequest",
-  "readQueryFromClient",
-  "processCommand",
-  "aeMain",
-  "aeProcessEvents",
-  "HiArgs",
-  "SearchWorker",
-  "search_parallel",
-  "adapters\\.js",
-  "server\\.c",
-  "ae\\.c",
-  "networking\\.c",
-  "core/main\\.rs",
-  "flags/hiargs\\.rs",
-  "haystack\\.rs",
-  "lib/axios\\.js",
-  "lib/core/Axios\\.js",
-  "StringUtils",
-  "commons-lang",
-  "PreparedRequest",
-  "HTTPAdapter",
-  "createApplication",
-  "app\\.use",
-  "lib/express\\.js",
-  "Jekyll",
-  "LogRecord",
-  "AbstractProcessingHandler",
-  "useSWR",
-  "swr",
-  "gin\\.go",
-  "RouterGroup\\.Handle",
-  "Engine\\.addRoute",
-  "Engine\\.handleHTTPRequest",
-  "AutoMapper",
-  "TypeMapPlanBuilder",
-  "RealBufferedSource",
-  "RealBufferedSink",
-  "DataRequest",
-  "SessionDelegate",
-  "novalidate",
-  "showError",
-  "source/animate\\.css",
-  "nvm",
-  "install\\.sh\\s+nvm",
-  "bash_completion\\s+__nvm",
-  "--with-holdout-clone",
+const productVocabulary = readProductVocabulary();
+
+// Every banned corpus token is read out of the checked-in benchmark surfaces,
+// so adding a task manifest extends the ban with that task's repository,
+// symbols, and files instead of waiting for someone to remember this file.
+const benchmarkCorpusMarkerSet = benchmarkCorpusMarkers();
+
+// Bans that derivation cannot reach, kept as literals on purpose and named one
+// by one. Everything else in this lint is read out of the checked-in benchmark
+// surfaces; these eight are what is left when that reading stops, and each says
+// why. Deleting an entry lowers the ban set, so
+// `scripts/tests/lint-retrieval-generalization.test.mjs` pins every one of them
+// and also fails if an entry becomes derivable and should therefore go.
+const residualBannedLiterals = [
+  {
+    pattern: "freelancer",
+    reason:
+      "Retired sibling holdout app. benchmarks/tasks/README.md names it as removed, and no manifest, prompt, or query catalog mentions it, so there is nothing left to derive it from.",
+  },
+  {
+    pattern: "traderotate",
+    reason:
+      "Retired sibling holdout app, in the same README sentence as `freelancer` and in no other corpus surface.",
+  },
+  {
+    pattern: "chinook",
+    reason:
+      "Bare nickname of the `lerocha/chinook-database` holdout. Deriving it means splitting repository names into parts, which also yields `animate` (from `animate.css`) and `commons` (from `commons-lang`) - ordinary words this lint must not ban.",
+  },
+  {
+    pattern: "mdn",
+    reason:
+      "Owner segment and nickname of `mdn/learning-area`. Owner segments are deliberately not corpus identity, because banning one fails an Apache licence header rather than a corpus dependency.",
+  },
+  {
+    pattern: "ElsewhereFeed",
+    reason:
+      "Symbol of a retired holdout app. No manifest carries it any more, so only a literal keeps it out of production.",
+  },
+  {
+    pattern: "HiArgs",
+    reason:
+      "Written only into ripgrep claim prose, never into an `expected_symbols` entry. Prose identifiers are derived from camelCase and snake_case words alone, because PascalCase prose words are as often proper nouns - `SQLite` is this product's own storage engine, `JavaScript` is a language, `URLSession` and `ValidityState` are platform APIs.",
+  },
+  {
+    pattern: "server\\.c",
+    reason:
+      "Corpus file name whose stem is a word this product writes on its own account, so `corpusFileNameMarkers` declines it. Its sibling `ae.c` is derived, because `ae` is nobody's vocabulary.",
+  },
+  {
+    pattern: "--with-holdout-clone",
+    reason:
+      "Flag of a benchmark clone harness that no longer exists in this tree. Nothing derives a flag that has no declaring script left.",
+  },
+];
+
+// Corpora overlap by design, so the same marker arrives from several of them;
+// one pattern per marker keeps the report readable.
+const bannedPatterns = [...new Set([
+  ...residualBannedLiterals.map(({ pattern }) => pattern),
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
   ...benchmarkScriptPromptDerivedPatterns(),
   ...benchmarkQueryCatalogDerivedPatterns(),
-];
+  ...benchmarkIdentityDerivedPatterns(),
+])];
 
 const bannedLiteralPatterns = [
   "payload_collection",
 ];
 
-const bannedCompactPatterns = [
-  "swr",
-  "useswr",
-  "stringutils",
-  "charsequenceutils",
-  "preparedrequest",
-  "httpadapter",
-  "createapplication",
-  "appuse",
-  "jekyll",
-  "logrecord",
-  "automapper",
-  "realbufferedsource",
-  "realbufferedsink",
-  "datarequest",
-  "sessiondelegate",
-  "sourceanimatecss",
+const bannedCompactPatterns = [...new Set([
+  ...benchmarkCorpusCompactPatterns(),
   ...evalCorpusCompactPatternList,
-];
+])];
+
+// Derivation-only view of the ban set, for the tests that have to tell a derived
+// ban from a residual literal. It writes to the file the caller names, so the
+// tests read the same construction the scan below uses and there is no second
+// code path to drift. A file rather than stdout because the dump outgrew what a
+// synchronous exit can flush through a pipe.
+const dumpPatternsPath = process.env.CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS;
+if (dumpPatternsPath) {
+  const residual = new Set(residualBannedLiterals.map(({ pattern }) => pattern));
+  writeFileSync(dumpPatternsPath, JSON.stringify({
+    residual: residualBannedLiterals,
+    derived: bannedPatterns.filter((pattern) => !residual.has(pattern)),
+    compact: bannedCompactPatterns,
+  }));
+  process.exit(0);
+}
 
 const allowedPatternLines = [
   {
@@ -461,17 +506,89 @@ function compactBoundaryPatterns(boundaryPatterns) {
 }
 
 function benchmarkManifestDerivedPatterns() {
+  return [...benchmarkCorpusMarkerSet.descriptive].sort().map(escapeRegExp);
+}
+
+// Repository identity is short enough ("swr", "okio", "mdn") that substring
+// matching would flag unrelated words, so identity tokens carry their own
+// boundaries instead of relying on length.
+function benchmarkIdentityDerivedPatterns() {
+  return [...benchmarkCorpusMarkerSet.identity]
+    .sort()
+    .map((token) => `(?:^|[^A-Za-z0-9_])${escapeRegExp(token)}(?![A-Za-z0-9_])`);
+}
+
+// Split string literals rejoin into the same marker, so the compact scan needs
+// the same corpus vocabulary the line scan uses.
+function benchmarkCorpusCompactPatterns() {
+  const compact = new Set();
+  for (const marker of benchmarkCorpusMarkerSet.descriptive) {
+    const normalized = compactProductionSource(marker);
+    // `useSWR` rejoins from "use" and "SWR", and `app.use` rejoins from "app"
+    // and ".use"; the compact scan needs the short identifiers too, and it
+    // compares whole literals so it can afford them.
+    const floor = identifierShapedMarker(marker) || memberSymbolMarker(marker) ? 6 : 8;
+    if (normalized.length >= floor) {
+      compact.add(normalized);
+    }
+  }
+  for (const token of benchmarkCorpusMarkerSet.identity) {
+    const normalized = compactProductionSource(token);
+    if (normalized.length >= 3) {
+      compact.add(normalized);
+    }
+  }
+  return [...compact].sort();
+}
+
+function benchmarkCorpusMarkers() {
+  const records = [
+    ...benchmarkManifestMarkerRecords(),
+    ...benchmarkScriptRepoMarkerRecords(),
+    ...benchmarkFixtureNameMarkerRecords(),
+  ];
+  const descriptive = new Set();
+  const identity = new Set();
+  const coverage = new Map();
+  for (const record of records) {
+    if (!coverage.has(record.family)) {
+      coverage.set(record.family, 0);
+    }
+    const accepted = record.kind === "identity"
+      ? addIdentityMarker(identity, record.marker)
+      : addSpecificMarker(descriptive, record.marker, record.options);
+    if (accepted) {
+      coverage.set(record.family, coverage.get(record.family) + 1);
+    }
+  }
+  if (coverage.size === 0 || descriptive.size === 0 || identity.size === 0) {
+    throw new Error("benchmark corpora produced no generalization markers");
+  }
+  // A family whose every marker was filtered out is invisible to this lint, and
+  // a silent gap is worse than a loud one: name it instead of shipping it.
+  const uncovered = [...coverage]
+    .filter(([, count]) => count === 0)
+    .map(([family]) => family)
+    .sort();
+  if (uncovered.length > 0) {
+    throw new Error(
+      `benchmark corpus families produced no generalization markers: ${uncovered.join(", ")}`,
+    );
+  }
+  return { descriptive, identity };
+}
+
+function benchmarkManifestMarkerRecords() {
   if (!existsSync(benchmarkTaskRoot)) {
     throw new Error(`benchmark task root is missing: ${benchmarkTaskRoot}`);
   }
-  const markers = new Set();
-  const manifestFiles = walkFiles(
-    benchmarkTaskRoot,
-    (candidate) => candidate.endsWith(".task.json"),
+  const manifestFiles = benchmarkTaskRoots.flatMap((root) =>
+    walkFiles(root, (candidate) => candidate.endsWith(".task.json"))
   );
   if (manifestFiles.length === 0) {
     throw new Error(`benchmark task root has no .task.json manifests: ${benchmarkTaskRoot}`);
   }
+  const records = [];
   let parsedTaskCount = 0;
   for (const filePath of manifestFiles) {
     let manifest;
@@ -482,42 +599,282 @@ function benchmarkManifestDerivedPatterns() {
     }
     for (const task of benchmarkManifestTasks(manifest)) {
       parsedTaskCount += 1;
-      addSpecificMarker(markers, task.id);
-      addSpecificMarker(markers, task.prompt, { allowExactPhrase: true });
-      // A task whose subject is this repository names our own symbols and paths.
-      // Banning those would forbid the product from containing itself, so only its
-      // benchmark-specific parts (id, prompt, claims) contribute markers.
-      const subjectIsSelf = taskSubjectIsThisRepository(task.repo);
-      if (!subjectIsSelf) {
-        addRepoMarkers(markers, task.repo);
-        for (const expectedFile of task.expected_files ?? []) {
-          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      const family = benchmarkTaskFamily(task, filePath);
+      const push = (marker, options) => records.push({ family, marker, options });
+      push(task.id);
+      push(task.prompt, { allowExactPhrase: true });
+      for (const claim of [...task.expected_claims ?? [], ...task.forbidden_claims ?? []]) {
+        push(claim?.text, { allowExactPhrase: true });
+      }
+      for (const marker of repoIdentityMarkers(task.repo)) {
+        records.push({ family, ...marker });
+      }
+      // A task on this repository lists the product's own files and symbols;
+      // banning those would ban the product from naming itself. Its prompt and
+      // claims still may not appear in production as whole phrases, but the
+      // identifiers inside them are ours, so they stop here.
+      if (benchmarkRepoIsProduct(task.repo)) {
+        continue;
+      }
+      // A claim is the only place some corpus symbols are written down:
+      // `HiArgs`, `aeProcessEvents`, and `search_parallel` appear in prose and
+      // in no `expected_symbols` entry. The phrase ban cannot reach them
+      // because production would quote the symbol, never the sentence.
+      for (const claim of [...task.expected_claims ?? [], ...task.forbidden_claims ?? []]) {
+        for (const identifier of proseIdentifierMarkers(claim?.text)) {
+          push(identifier, { allowIdentifier: true });
         }
-        for (const expectedFile of task.expected_verification_files ?? []) {
-          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      }
+      const expectedFiles = [
+        ...task.expected_files ?? [],
+        ...task.expected_verification_files ?? [],
+      ];
+      for (const expectedFile of expectedFiles) {
+        for (const variant of pathMarkerVariants(expectedFile)) {
+          push(variant, { allowSpecificComposite: true });
         }
-        for (const symbol of task.expected_symbols ?? []) {
-          if (typeof symbol === "string") {
-            addSpecificMarker(markers, symbol);
-          } else {
-            addSpecificMarker(markers, symbol?.name);
-            addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
-            addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+        for (const basename of corpusFileNameMarkers(expectedFile)) {
+          records.push({ family, kind: "identity", marker: basename });
+        }
+      }
+      for (const symbol of task.expected_symbols ?? []) {
+        const name = typeof symbol === "string" ? symbol : symbol?.name;
+        for (const variant of symbolMarkerVariants(name)) {
+          push(variant, { allowIdentifier: true });
+        }
+        if (memberSymbolMarker(name)) {
+          push(name.trim(), { allowMemberSymbol: true });
+        }
+        if (typeof symbol !== "string") {
+          push(symbol?.qualified_name, { allowSpecificComposite: true });
+          for (const variant of pathMarkerVariants(symbol?.path)) {
+            push(variant, { allowSpecificComposite: true });
+          }
+          for (const basename of corpusFileNameMarkers(symbol?.path)) {
+            records.push({ family, kind: "identity", marker: basename });
           }
         }
       }
-      for (const claim of task.expected_claims ?? []) {
-        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
-      }
-      for (const claim of task.forbidden_claims ?? []) {
-        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
+    }
+  }
+  if (parsedTaskCount === 0) {
+    throw new Error("benchmark manifests produced no tasks");
+  }
+  return records;
+}
+
+// The A/B harness carries repositories that have no manifest of their own; they
+// are corpus identity all the same.
+function benchmarkScriptRepoMarkerRecords() {
+  const records = [];
+  for (const { filePath, startMarker, endMarker } of benchmarkPromptScriptFiles) {
+    const source = readFileSync(filePath, "utf8");
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start + startMarker.length);
+    if (start < 0 || end < 0 || end <= start) {
+      throw new Error(
+        `benchmark prompt script is missing corpus boundary markers: ${filePath}`,
+      );
+    }
+    const corpusSource = source.slice(start, end);
+    const repoEntries = [...corpusSource.matchAll(/^ {2}([A-Za-z][A-Za-z0-9_-]*):\s*\{/gm)];
+    if (repoEntries.length === 0) {
+      throw new Error(`benchmark prompt script declared no repositories: ${filePath}`);
+    }
+    for (const [index, entry] of repoEntries.entries()) {
+      const family = entry[1];
+      const entryEnd = index + 1 < repoEntries.length
+        ? repoEntries[index + 1].index
+        : corpusSource.length;
+      const entrySource = corpusSource.slice(entry.index, entryEnd);
+      records.push({ family, kind: "identity", marker: family });
+      const url = entrySource.match(/\burl\s*:\s*"([^"]*)"/);
+      for (const marker of repoIdentityMarkers({ url: url?.[1] })) {
+        records.push({ family, ...marker });
       }
     }
   }
-  if (parsedTaskCount === 0 || markers.size === 0) {
-    throw new Error("benchmark manifests produced no generalization markers");
+  return records;
+}
+
+// Fixture file names identify their corpus repository even when the fixture
+// carries no manifest fields at all.
+function benchmarkFixtureNameMarkerRecords() {
+  const fixtures = benchmarkTaskRoots.flatMap((root) =>
+    walkFiles(
+      root,
+      (candidate) => candidate.endsWith(".json") && !candidate.endsWith(".schema.json"),
+    )
+  );
+  if (fixtures.length === 0) {
+    throw new Error(`benchmark task root has no corpus fixtures: ${benchmarkTaskRoot}`);
   }
-  return [...markers].sort().map(escapeRegExp);
+  return fixtures.map((filePath) => ({
+    family: "benchmark fixture names",
+    marker: path.basename(filePath).replace(/\.[^.]+$/, "").replace(/\.task$/, ""),
+    options: { allowSpecificComposite: true },
+  }));
+}
+
+function benchmarkTaskFamily(task, filePath) {
+  const name = typeof task?.repo?.name === "string" ? task.repo.name.trim() : "";
+  if (name.length > 0) {
+    return name;
+  }
+  return typeof task?.id === "string" && task.id.trim().length > 0
+    ? task.id.trim()
+    : path.relative(repoRoot, filePath).replaceAll(path.sep, "/");
+}
+
+function benchmarkRepoIsProduct(repo) {
+  return [repo?.name, ...repoUrlSlugs(repo?.url)]
+    .filter((value) => typeof value === "string")
+    .some((value) => productRepositoryNames.has(value.split("/").pop().toLowerCase()));
+}
+
+// An `owner/repo` slug identifies the corpus whole, but the owner segment alone
+// names a hosting account: banning `apache` or `square` on its own would fail an
+// Apache licence header rather than a corpus dependency. Only the repository
+// segment is corpus identity.
+function repoIdentityMarkers(repo) {
+  const markers = [];
+  const slugs = repoUrlSlugs(repo?.url);
+  for (const value of [repo?.name, ...slugs]) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      continue;
+    }
+    if (value.includes("/")) {
+      markers.push({ marker: value, options: { allowSpecificComposite: true } });
+      markers.push({ kind: "identity", marker: value.split("/").pop() });
+      continue;
+    }
+    markers.push({ kind: "identity", marker: value });
+  }
+  return markers;
+}
+
+// Identifier-shaped words written into corpus prose, restricted to the two
+// casings that only ever come from code. A lower-first camelCase word
+// (`aeProcessEvents`) or a snake_case word (`search_parallel`) is somebody's
+// symbol; PascalCase is not safe to take, because proper nouns wear it too --
+// `SQLite` is this product's own storage engine, `JavaScript` is a language,
+// and `URLSession` and `ValidityState` are platform APIs. Those stay out and
+// are covered, where they must be, by the residual list below.
+function proseIdentifierMarkers(text) {
+  if (typeof text !== "string") {
+    return [];
+  }
+  return [...new Set(
+    text.split(/[^A-Za-z0-9_]+/).filter(codeCasedProseWord),
+  )];
+}
+
+function codeCasedProseWord(word) {
+  if (!/^[a-z][A-Za-z0-9_]*$/.test(word)) {
+    return false;
+  }
+  const snakeCased = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(word);
+  const camelCased = /^[a-z][a-z0-9]*(?:[A-Z][A-Za-z0-9]*)+$/.test(word);
+  return snakeCased || camelCased;
+}
+
+// A corpus file is quoted in pieces as often as whole, so windows of the path
+// count too. `src/main/java` or `index.js` name a build layout rather than a
+// repository, so a window has to carry a segment that could only have come from
+// this corpus.
+function pathMarkerVariants(filePath) {
+  if (typeof filePath !== "string" || filePath.trim().length === 0) {
+    return [];
+  }
+  const segments = filePath.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (segments.length === 0) {
+    return [];
+  }
+  const windows = [segments[segments.length - 1]];
+  for (let index = 0; index + 1 < segments.length; index += 1) {
+    windows.push(`${segments[index]}/${segments[index + 1]}`);
+  }
+  // A directory such as `form-validation` or `lib_cxx` is quoted on its own as
+  // readily as with its neighbours. Two joined words are the bar: `Execution`
+  // and `_internal` are words any tree may use.
+  windows.push(...segments.filter(pathSegmentNamesTwoWords));
+  return [
+    segments.join("/"),
+    ...windows.filter(pathWindowIsDistinctive),
+  ];
+}
+
+function pathWindowIsDistinctive(window) {
+  if (window.split("/").some(pathSegmentIsDistinctive)) {
+    return true;
+  }
+  // `src/main` and `index.js` are build layout; `data/indexer` and
+  // `core/main.rs` are only long enough to be somebody's actual tree.
+  return compactProductionSource(window).length >= 10;
+}
+
+function pathSegmentNamesTwoWords(segment) {
+  return /[_-]/.test(segment)
+    && segment.split(/[^A-Za-z0-9]+/).filter((word) => word.length >= 3).length >= 2;
+}
+
+function pathSegmentIsDistinctive(segment) {
+  if (/[_-]/.test(segment) || /[A-Z]/.test(segment)) {
+    return true;
+  }
+  return segment.replace(/\.[^.]+$/, "").length >= 8;
+}
+
+// A corpus file is cited by its own name far more often than by its full path:
+// `server.c` and `ae.c` are how anything talks about the redis event loop.
+// `pathWindowIsDistinctive` refuses them because they are short, so they get an
+// identity marker instead, which carries word boundaries rather than length.
+// `main.rs`, `index.js`, and the other build-layout names name a convention
+// rather than a repository and stay out.
+function corpusFileNameMarkers(filePath) {
+  if (typeof filePath !== "string" || filePath.trim().length === 0) {
+    return [];
+  }
+  const segments = filePath.replaceAll("\\", "/").split("/").filter(Boolean);
+  const basename = segments[segments.length - 1];
+  if (basename == null || !basename.includes(".")) {
+    return [];
+  }
+  const stem = basename.slice(0, basename.lastIndexOf("."));
+  if (
+    stem.length === 0
+    || buildLayoutFileStems.has(stem.toLowerCase())
+    || stem.split(/[^A-Za-z0-9]+/).every((word) => productVocabulary.has(word.toLowerCase()))
+  ) {
+    return [];
+  }
+  return [basename];
+}
+
+// `app.use` is an `expected_symbols` name, and it is the whole symbol: a member
+// reached through its receiver. Eight characters is the floor for a descriptive
+// marker because a shorter one is usually a word, but `receiver.member` is two
+// identifiers joined and cannot be a word at any length.
+function memberSymbolMarker(name) {
+  return typeof name === "string"
+    && /^[A-Za-z][A-Za-z0-9_]*(?:\.|::|#)[A-Za-z][A-Za-z0-9_]*$/.test(name.trim());
+}
+
+// A qualified symbol carries its own member name, but only an identifier-shaped
+// member is corpus identity: `DataRequest.validate` names one repository,
+// `validate` names half the trade.
+function symbolMarkerVariants(name) {
+  if (typeof name !== "string" || name.trim().length === 0) {
+    return [];
+  }
+  const trimmed = name.trim();
+  return [
+    trimmed,
+    ...trimmed
+      .split(/::|[.#]/)
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0 && identifierShapedMarker(part)),
+  ];
 }
 
 function benchmarkScriptPromptDerivedPatterns() {
@@ -702,33 +1059,19 @@ function benchmarkManifestTasks(manifest) {
   return [];
 }
 
-/// A task manifest may name this repository as its subject: the readme-with-without
-/// suite asks CodeStory questions about CodeStory. Its expected symbols and paths are
-/// then our own product identifiers by construction, so deriving bans from them makes
-/// the product illegal to itself - `RefreshMode` is a codestory-workspace type, and
-/// `crates/.../lib.rs` is where our code lives. Only the benchmark-specific parts of
-/// such a task (its id, prompt, and claim texts) remain bannable.
-function taskSubjectIsThisRepository(repo) {
-  return repoUrlSlugs(repo?.url)
-    .concat(typeof repo?.name === "string" ? [repo.name] : [])
-    .some((slug) => SELF_REPOSITORY_SLUGS.has(slug.trim().toLowerCase()));
-}
-
-function addRepoMarkers(markers, repo) {
-  addSpecificMarker(markers, repo?.name);
-  for (const slug of repoUrlSlugs(repo?.url)) {
-    addSpecificMarker(markers, slug);
-  }
-}
-
 function repoUrlSlugs(url) {
   if (typeof url !== "string" || url.trim().length === 0) {
     return [];
   }
   const trimmed = url.trim().replace(/\.git$/i, "");
-  let pathname;
+  let pathname = trimmed;
+  // A hosted URL owns its owner segment; a local clone path does not, and its
+  // parent directory names a checkout layout rather than a repository.
+  let hosted = false;
   try {
-    pathname = new URL(trimmed).pathname;
+    const parsed = new URL(trimmed);
+    pathname = parsed.pathname;
+    hosted = parsed.host.length > 0;
   } catch {
     pathname = trimmed;
   }
@@ -740,7 +1083,7 @@ function repoUrlSlugs(url) {
     return [];
   }
   const repoName = parts[parts.length - 1];
-  const ownerName = parts.length >= 2
+  const ownerName = hosted && parts.length >= 2
     ? `${parts[parts.length - 2]}/${repoName}`
     : null;
   return [ownerName, repoName].filter(Boolean);
@@ -793,17 +1136,61 @@ function walkProtectedNonRustFiles(root) {
 
 function addSpecificMarker(markers, value, options = {}) {
   if (typeof value !== "string") {
-    return;
+    return false;
   }
   const marker = value.trim();
-  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker, options)) {
-    return;
+  if (marker.length < markerLengthFloor(marker, options)) {
+    return false;
+  }
+  if (benchmarkMarkerTooGeneric(marker, options)) {
+    return false;
   }
   markers.add(marker);
+  return true;
+}
+
+// Identifiers such as `useSWR` or `aeMain` are shorter than descriptive markers
+// and still name exactly one corpus repository, and `app.use` is two of them
+// joined through a receiver.
+function markerLengthFloor(marker, options) {
+  if (options.allowIdentifier && identifierShapedMarker(marker)) {
+    return 5;
+  }
+  if (options.allowMemberSymbol && memberSymbolMarker(marker)) {
+    return 5;
+  }
+  return 8;
+}
+
+// Multi-word identifiers only: `HTTPAdapter` and `use_swr` name something,
+// `Session` and `validate` are vocabulary every repository shares.
+function identifierShapedMarker(marker) {
+  return /^[A-Za-z][A-Za-z0-9_]*$/.test(marker)
+    && (marker.includes("_") || /[a-z][A-Z]/.test(marker) || /[A-Z][A-Z][a-z]/.test(marker));
+}
+
+function addIdentityMarker(markers, value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const token = value.trim().toLowerCase();
+  if (
+    token.length < 3
+    || !/^[a-z0-9][a-z0-9._-]*$/.test(token)
+    || productIdentityTokens.has(token)
+    || productVocabulary.has(token)
+  ) {
+    return false;
+  }
+  markers.add(token);
+  return true;
 }
 
 function benchmarkMarkerTooGeneric(marker, options = {}) {
   if (options.allowExactPhrase && marker.split(/\s+/).length >= 5) {
+    return false;
+  }
+  if (options.allowMemberSymbol && memberSymbolMarker(marker)) {
     return false;
   }
   if (
@@ -815,47 +1202,87 @@ function benchmarkMarkerTooGeneric(marker, options = {}) {
   }
   const normalized = marker.toLowerCase().replace(/[^a-z0-9]+/g, "");
   return (
-    normalized.length < 8 ||
-    [
-      "codestory",
-      "request",
-      "requests",
-      "response",
-      "responses",
-      "dispatch",
-      "router",
-      "routepath",
-      "approute",
-      "comments",
-      "indexfile",
-      "runindex",
-      "buildindex",
-      "servicesrs",
-      "sourcegroup",
-      "indexercommand",
-      "subcommand",
-      "eventprocessor",
-      "jsonoutput",
-      "jsonlevent",
-      "schema",
-      "source",
-      "storage",
-      "indexing",
-      "configuration",
-      "validation",
-      "serialize",
-      "serializes",
-      "serialized",
-      "serialization",
-      "foreignkey",
-      "references",
-      "formatto",
-      "formaterror",
-      "formaterrorcode",
-      "formatwindowserror",
-      "internalmutate",
-    ].includes(normalized)
+    normalized.length < markerLengthFloor(marker, options)
+    || markerIsProductVocabulary(marker)
   );
+}
+
+// One plain word that this product already writes elsewhere is vocabulary, not
+// identity: `serialize` and `subcommand` belong to the trade. A marker that
+// joins two words -- `SourceGroup`, `event_processor`, `FOREIGN KEY`,
+// `buildIndex` -- was somebody's symbol before it was anybody's vocabulary, and
+// a single word the product never uses -- `novalidate`, `exthostcommands` --
+// only ever arrived from a corpus. Neither is excused.
+function markerIsProductVocabulary(marker) {
+  const trimmed = marker.trim();
+  return (
+    /^[A-Za-z][a-z0-9]*$/.test(trimmed)
+    && productVocabulary.has(trimmed.toLowerCase())
+  );
+}
+
+// Identifiers only. A word the product merely mentions -- in prose ("mirrors
+// the Sourcetrail-style database format") or in a string it prints ("Restart the
+// Codex host") -- is not a word the product's code is built from, and excusing
+// corpus names on the strength of a comment or a message would let either one
+// unlock a ban.
+function readProductVocabulary() {
+  const words = new Set();
+  for (const root of productVocabularyRoots) {
+    if (!existsSync(root)) {
+      throw new Error(`product vocabulary root is missing: ${root}`);
+    }
+    const files = walkFiles(
+      root,
+      (candidate) => candidate.endsWith(".rs") && !isExcludedRustFile(candidate),
+    );
+    for (const filePath of files) {
+      const code = rustIdentifierSource(productionSource(filePath));
+      for (const token of code.split(/[^A-Za-z0-9]+/)) {
+        if (token.length >= 3) {
+          words.add(token.toLowerCase());
+        }
+      }
+    }
+  }
+  if (words.size === 0) {
+    throw new Error("product vocabulary roots produced no words");
+  }
+  return words;
+}
+
+function rustIdentifierSource(text) {
+  let code = "";
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index];
+    if (character === "/" && text[index + 1] === "/") {
+      index = endOfLine(text, index);
+      code += "\n";
+      continue;
+    }
+    if (character === "/" && text[index + 1] === "*") {
+      index = rustBlockCommentEnd(text, index + 2);
+      code += " ";
+      continue;
+    }
+    if (character === "r" || character === "b") {
+      const rawEnd = rustRawStringEnd(text, index);
+      if (rawEnd !== null) {
+        index = rawEnd;
+        code += " ";
+        continue;
+      }
+    }
+    if (character === '"') {
+      index = rustStringEnd(text, index + 1, '"');
+      code += " ";
+      continue;
+    }
+    code += character;
+    index += 1;
+  }
+  return code;
 }
 
 function escapeRegExp(value) {
@@ -1905,6 +2332,195 @@ function isEvalOnlyProductionFile(filePath) {
   return evalOnlyProductionFiles.has(path.resolve(filePath));
 }
 
+// The inventory records the benchmark-family surfaces that already exist, down
+// to how many lines each marker occupies. It never grants a file blanket cover:
+// one more occurrence of a listed marker fails, and an entry that stops matching
+// fails, so both adding to a listed surface and deleting one must edit this
+// file.
+//
+// It is also bounded and attributable. Every surface has to carry a reason and
+// the issue that tracks its deletion, and the declared `total_markers` has to
+// equal the number of markers actually listed - no slack in either direction.
+// Recording one more marker is therefore a reviewable diff that raises a stated
+// number and answers "why is this still here", and deleting a surface forces
+// that number down.
+const pendingSurfaceIssuePattern =
+  /^https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+$/;
+const pendingSurfaceReasonFloor = 60;
+
+function loadPendingSurfaces() {
+  let inventory;
+  try {
+    inventory = JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
+  } catch (error) {
+    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
+    process.exit(2);
+  }
+  const surfaces = new Map();
+  let declaredMarkers = 0;
+  for (const [file, entry] of Object.entries(inventory?.surfaces ?? {})) {
+    const problem = pendingSurfaceEntryProblem(entry);
+    if (problem != null) {
+      console.error(`lint-retrieval-generalization: invalid pending entry for ${file}: ${problem}`);
+      process.exit(2);
+    }
+    const counts = Object.entries(entry.markers);
+    declaredMarkers += counts.length;
+    surfaces.set(path.resolve(repoRoot, file), new Map(counts));
+  }
+  if (inventory?.total_markers !== declaredMarkers) {
+    console.error(
+      `lint-retrieval-generalization: pending inventory declares total_markers `
+      + `${JSON.stringify(inventory?.total_markers)} but lists ${declaredMarkers}; `
+      + `the declared total is the bound on this file and must match it exactly`,
+    );
+    process.exit(2);
+  }
+  return surfaces;
+}
+
+function pendingSurfaceEntryProblem(entry) {
+  if (typeof entry !== "object" || entry == null || Array.isArray(entry)) {
+    return "entry must be an object";
+  }
+  if (typeof entry.reason !== "string" || entry.reason.trim().length < pendingSurfaceReasonFloor) {
+    return `reason must be at least ${pendingSurfaceReasonFloor} characters saying why the surface still exists`;
+  }
+  if (typeof entry.issue !== "string" || !pendingSurfaceIssuePattern.test(entry.issue.trim())) {
+    return "issue must be a CodeStory issue URL tracking the surface's deletion";
+  }
+  const markers = entry.markers;
+  if (typeof markers !== "object" || markers == null || Array.isArray(markers)) {
+    return "markers must be an object";
+  }
+  const counts = Object.entries(markers);
+  if (counts.length === 0) {
+    return "markers must not be empty";
+  }
+  if (counts.some(([, count]) => !Number.isInteger(count) || count < 1)) {
+    return "every marker count must be a positive integer";
+  }
+  return null;
+}
+
+function pendingSurfaceCovers(filePath, marker, hitCount) {
+  const markers = pendingSurfaces.get(path.resolve(filePath));
+  const recorded = markers?.get(marker);
+  if (recorded === undefined) {
+    return false;
+  }
+  observedPendingSurfaces.set(pendingSurfaceKey(path.resolve(filePath), marker), hitCount);
+  return hitCount <= recorded;
+}
+
+function pendingSurfaceKey(filePath, marker) {
+  return `${filePath} :: ${marker}`;
+}
+
+function stalePendingSurfaces() {
+  // The inventory describes the shipped tree; a caller-supplied scan root has
+  // no reason to reach any of it.
+  if (!usesDefaultScanRoots) {
+    return [];
+  }
+  const stale = [];
+  for (const [filePath, markers] of pendingSurfaces) {
+    for (const [marker, recorded] of markers) {
+      const observed = observedPendingSurfaces.get(pendingSurfaceKey(filePath, marker));
+      if (observed === undefined) {
+        stale.push(`${path.relative(repoRoot, filePath)}: ${marker} (recorded ${recorded}, no longer matches)`);
+        continue;
+      }
+      if (observed !== recorded) {
+        stale.push(
+          `${path.relative(repoRoot, filePath)}: ${marker} (recorded ${recorded}, tree has ${observed})`,
+        );
+      }
+    }
+  }
+  return stale.sort();
+}
+
+// A vocabulary table is the shape the v0.16.1 audit found: a run of bare word
+// literals that term extraction compares the question against. Individually
+// those words are ordinary -- `storage`, `posts`, `exec cli` -- so no ban list
+// can catch them; together, in a file that decides which words become queries,
+// they are a repository's domain written into this crate.
+function scanVocabularyTable(prepared) {
+  if (!vocabularyTableFileNames.has(path.basename(prepared.filePath))) {
+    return [];
+  }
+  const exemptLines = vocabularyTableExemptLines(prepared.lines);
+  const entries = [];
+  for (const [index, line] of prepared.lines.entries()) {
+    if (exemptLines.has(index)) {
+      continue;
+    }
+    for (const literal of staticStringLiteralsOnLine(line)) {
+      const content = staticStringLiteralContent(literal);
+      if (literalIsBareVocabulary(content)) {
+        entries.push({ line: index + 1, content: content.toLowerCase() });
+      }
+    }
+  }
+  for (const [index, entry] of entries.entries()) {
+    const window = new Set();
+    for (const candidate of entries.slice(index)) {
+      if (candidate.line - entry.line >= vocabularyTableWindowLines) {
+        break;
+      }
+      window.add(candidate.content);
+    }
+    if (window.size >= vocabularyTableLiteralFloor) {
+      return [
+        `${prepared.filePath}:${entry.line}: ${window.size} bare word literals within `
+        + `${vocabularyTableWindowLines} lines name a vocabulary, not a question: `
+        + `${[...window].sort().join(", ")}`,
+      ];
+    }
+  }
+  return [];
+}
+
+// Only the declaration is exempt, never a mention of the constant's name: a
+// planted table that happens to sit after `if SEARCH_PLAN_STOPWORDS.contains(..)`
+// must not inherit the exemption.
+function vocabularyTableExemptLines(lines) {
+  const exempt = new Set();
+  let open = false;
+  for (const [index, line] of lines.entries()) {
+    if (
+      !open
+      && /=\s*&\[/.test(line)
+      && vocabularyTableExemptConstants.some((name) => line.includes(name))
+    ) {
+      open = true;
+    }
+    if (open) {
+      exempt.add(index);
+      if (line.includes("];")) {
+        open = false;
+      }
+    }
+  }
+  return exempt;
+}
+
+// Words and short phrases only. A snake_case tag, a path, or a sentence is
+// something other than vocabulary: reasons, roles, and prose instructions all
+// have to keep their literals.
+function literalIsBareVocabulary(content) {
+  if (typeof content !== "string") {
+    return false;
+  }
+  const words = content.trim().split(/[ -]+/);
+  return (
+    content.trim().length >= 3
+    && words.length <= 3
+    && words.every((word) => /^[A-Za-z][A-Za-z0-9]*$/.test(word))
+  );
+}
+
 function scanRankerFilenameLiterals(prepared) {
   const lines = prepared.lines;
   const hits = [];
@@ -1917,6 +2533,9 @@ function scanRankerFilenameLiterals(prepared) {
 }
 
 let failed = false;
+
+const pendingSurfaces = loadPendingSurfaces();
+const observedPendingSurfaces = new Map();
 
 const scanFiles = new Set(productionOnlyFiles);
 for (const root of scanDirs) {
@@ -1953,7 +2572,7 @@ for (const filePath of [...scanFiles].sort()) {
     );
     for (const { pattern } of bannedRegexPatterns) {
       const hits = productionHits.get(pattern) ?? [];
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern, hits.length)) {
         console.error(
           `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -1962,7 +2581,7 @@ for (const filePath of [...scanFiles].sort()) {
     }
     for (const { pattern, re } of bannedLiteralRegexPatterns) {
       const hits = scanProductionStringLiterals(prepared, pattern, re);
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern, hits.length)) {
         console.error(
           `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -1971,7 +2590,7 @@ for (const filePath of [...scanFiles].sort()) {
     }
     for (const pattern of bannedCompactPatterns) {
       const hits = scanProductionCompactPatterns(prepared, pattern);
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern, hits.length)) {
         console.error(
           `Banned compact benchmark marker /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -1987,6 +2606,13 @@ for (const filePath of [...scanFiles].sort()) {
       );
       failed = true;
     }
+  }
+  const vocabularyTableHits = scanVocabularyTable(prepared);
+  if (vocabularyTableHits.length > 0) {
+    console.error(
+      `Term vocabulary table in ${path.relative(repoRoot, filePath)} (production slice):\n${vocabularyTableHits.join("\n")}\n`,
+    );
+    failed = true;
   }
 }
 
@@ -2087,6 +2713,14 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
   }
 }
 
+const stalePending = stalePendingSurfaces();
+if (stalePending.length > 0) {
+  console.error(
+    `Pending benchmark-family surfaces no longer match the tree; correct or delete them in ${path.relative(repoRoot, pendingSurfacePath)}:\n${stalePending.join("\n")}\n`,
+  );
+  failed = true;
+}
+
 if (failed) {
   console.error(
     "retrieval generalization lint failed: remove eval/query dependencies from protected product paths",
@@ -2094,6 +2728,8 @@ if (failed) {
   process.exit(1);
 }
 
+const pendingSurfaceCount = [...pendingSurfaces.values()]
+  .reduce((total, markers) => total + markers.size, 0);
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) in ${pendingSurfaces.size} file(s) awaiting deletion)`,
 );

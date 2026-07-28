@@ -280,6 +280,26 @@ paths, and adjacent/split literal construction. It also scans the following
 repository-controlled non-Rust surfaces for direct and adjacent/split
 dependencies on every inventoried evaluation/query corpus:
 
+The banned corpus vocabulary is derived, not curated: repository names, task
+ids, expected symbols, expected file paths, prompts, claims, and fixture file
+names are read out of `benchmarks/tasks/**` and the benchmark harness
+repositories on every run, so a new task manifest extends the ban without a
+lint edit. The exclusions are derived too. A repository's owner segment names a
+hosting account rather than a corpus, so only the repository segment is
+identity; and a single word this product already writes as code in its
+non-retrieval crates is trade vocabulary rather than corpus identity, read from
+those crates' identifiers alone, so neither a comment nor a printed message can
+unlock a ban. Term extraction is additionally checked for word tables: a run of
+bare word literals outside the language-level stopword list is the injection
+shape the v0.16.1 audit found, and no per-word ban can catch it.
+
+Benchmark-family surfaces that already exist in agent packet code are listed in
+`scripts/retrieval-generalization-pending.json` with the number of production
+lines each marker occupies, and are reported on every run. The lint fails on any
+banned marker outside that inventory, on one more occurrence of a marker inside
+it, and on any listed entry that stops matching, so both growing and deleting
+such a surface must edit the inventory.
+
 The inventory is executable rather than documentation-only. Supported text and
 configuration files under `scripts/`, `.github/scripts/`,
 `.github/workflows/`, the shipped plugin, and native backend metadata enter the

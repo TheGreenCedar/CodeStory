@@ -307,7 +307,19 @@ pub fn leaked_holdout_probe() -> &'static [&'static str] {
         !output.status.success(),
         "fixture with current holdout literals should fail lint; stderr={stderr}"
     );
-    for expected in ["dispatchRequest", "readQueryFromClient", "core/main.rs"] {
+    // Every planted literal, not a sample of them: asserting on three of nine
+    // let the other six stop being banned without this test noticing.
+    for expected in [
+        "axios",
+        "redis",
+        "ripgrep",
+        "dispatchRequest",
+        "readQueryFromClient",
+        "HiArgs",
+        "server.c",
+        "core/main.rs",
+        "haystack.rs",
+    ] {
         assert!(
             stderr.contains(expected),
             "lint failure should report current holdout literal {expected}, stderr={stderr}"
@@ -632,11 +644,14 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
 
 #[test]
 fn linter_fails_closed_when_one_prompt_corpus_entry_is_not_a_literal() {
+    // The repository keys have to be words this product never writes, or the
+    // corpus coverage check fails first and hides the parser drift under a
+    // different error.
     let output = run_lint_with_prompt_script_fixture(
         r#"
 const PUBLIC_REPOS = {
-  first: { prompt: "first benchmark prompt remains a static literal for the guard" },
-  second: { prompt: buildPromptAtRuntime() },
+  alphaprobe: { prompt: "first benchmark prompt remains a static literal for the guard" },
+  betaprobe: { prompt: buildPromptAtRuntime() },
 };
 const ALL_REPOS = { ...PUBLIC_REPOS };
 "#,
@@ -810,4 +825,532 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
             "lint should report banned literals in {file}, stderr={stderr}"
         );
     }
+}
+
+/// Writes one task manifest into a corpus root of its own. The lint reads extra
+/// task roots additively, so the probe never touches the checked-in corpus that
+/// every other run -- and every concurrent test -- derives its bans from.
+fn probe_task_manifest(symbol: &str) -> String {
+    format!(
+        r#"{{
+  "id": "generalization-lint-probe",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {{
+    "name": "generalization-lint-probe-repo",
+    "url": "https://github.com/generalization-probe-owner/generalization-lint-probe.git",
+    "ref": "{ref_sha}"
+  }},
+  "prompt": "Explain how the probe repository moves a request into its own storage layer.",
+  "expected_files": ["src/probe/generalization_probe_surface.ts"],
+  "expected_symbols": [
+    {{ "name": "{symbol}", "path": "src/probe/generalization_probe_surface.ts" }}
+  ],
+  "expected_claims": [{{ "text": "The probe repository owns its own request path." }}],
+  "forbidden_claims": [],
+  "quality_thresholds": {{
+    "min_expected_anchor_recall": 0.8,
+    "min_expected_file_recall": 0.8,
+    "min_expected_symbol_recall": 0.8,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.8,
+    "max_forbidden_claims": 0
+  }}
+}}
+"#,
+        ref_sha = "0".repeat(40),
+        symbol = symbol,
+    )
+}
+
+fn run_lint_with_fixture_and_task_root(contents: &str, task_root: Option<&Path>) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    std::fs::write(fixture_root.path().join("fixture.rs"), contents).expect("write fixture");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    let mut command = Command::new("node");
+    command
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        );
+    if let Some(task_root) = task_root {
+        command.env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS",
+            task_root,
+        );
+    }
+    command.output().expect("run lint with probe task root")
+}
+
+#[test]
+fn adding_a_benchmark_task_bans_its_symbols_without_editing_the_lint() {
+    let fixture = r#"pub const PLANTED: &str = "GeneralizationProbeAnchor";"#;
+    let before = run_lint_with_fixture_and_task_root(fixture, None);
+    assert!(
+        before.status.success(),
+        "the probe symbol should be unknown before its task manifest exists, stderr={}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    let task_root = TempDir::new().expect("create probe task root");
+    std::fs::write(
+        task_root.path().join("generalization-lint-probe.task.json"),
+        probe_task_manifest("GeneralizationProbeAnchor"),
+    )
+    .expect("write probe manifest");
+
+    let after = run_lint_with_fixture_and_task_root(fixture, Some(task_root.path()));
+    let stderr = String::from_utf8_lossy(&after.stderr);
+    assert!(
+        !after.status.success(),
+        "a new task manifest should extend the ban on its own, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("GeneralizationProbeAnchor"),
+        "lint should report the symbol the new manifest introduced, stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_probe_task_root_never_writes_into_the_checked_in_corpus() {
+    let corpus = workspace_root().join("benchmarks/tasks");
+    let before = corpus_manifest_names(&corpus);
+    let task_root = TempDir::new().expect("create probe task root");
+    std::fs::write(
+        task_root.path().join("generalization-lint-probe.task.json"),
+        probe_task_manifest("GeneralizationProbeAnchor"),
+    )
+    .expect("write probe manifest");
+    let output = run_lint_with_fixture_and_task_root(
+        r#"pub const PLANTED: &str = "GeneralizationProbeAnchor";"#,
+        Some(task_root.path()),
+    );
+    assert!(
+        !output.status.success(),
+        "the probe manifest should have extended the ban, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        before,
+        corpus_manifest_names(&corpus),
+        "the checked-in corpus must be untouched by a lint probe"
+    );
+}
+
+fn corpus_manifest_names(corpus: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(corpus)
+        .expect("read benchmark task corpus")
+        .map(|entry| entry.expect("corpus entry").file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// Every repository named by a manifest under `benchmarks/tasks/**`, by
+/// `repo.name` and by the last segment of `repo.url`.
+fn corpus_repository_names() -> Vec<String> {
+    let root = workspace_root().join("benchmarks/tasks");
+    let mut manifests = Vec::new();
+    collect_task_manifests(&root, &mut manifests);
+    assert!(
+        !manifests.is_empty(),
+        "benchmark task corpus has no .task.json manifests at {}",
+        root.display()
+    );
+
+    let mut names = std::collections::BTreeSet::new();
+    for manifest_path in manifests {
+        let text = std::fs::read_to_string(&manifest_path).expect("read task manifest");
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("parse task manifest");
+        let tasks = match doc.get("tasks").and_then(|tasks| tasks.as_array()) {
+            Some(tasks) => tasks.clone(),
+            None => vec![doc.clone()],
+        };
+        for task in tasks {
+            let Some(repo) = task.get("repo") else {
+                continue;
+            };
+            if let Some(name) = repo.get("name").and_then(|name| name.as_str()) {
+                names.insert(name.trim().to_owned());
+            }
+            if let Some(url) = repo.get("url").and_then(|url| url.as_str()) {
+                let slug = url
+                    .trim()
+                    .trim_end_matches('/')
+                    .trim_end_matches(".git")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                if !slug.is_empty() {
+                    names.insert(slug.to_owned());
+                }
+            }
+        }
+    }
+    names.into_iter().filter(|name| !name.is_empty()).collect()
+}
+
+fn collect_task_manifests(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_task_manifests(&path, out);
+        } else if path.to_string_lossy().ends_with(".task.json") {
+            out.push(path);
+        }
+    }
+}
+
+/// Corpus repository names the lint deliberately does not ban, and why. This is
+/// a ruling, not an accident: the test below fails if one of these becomes
+/// banned (the entry is then stale and must go) and fails if any other corpus
+/// repository name is not banned.
+const CORPUS_NAMES_RULED_OUT_OF_THE_BAN: &[(&str, &str)] = &[
+    (
+        "CodeStory",
+        "this repository is its own benchmark subject; banning it forbids the product from naming itself",
+    ),
+    (
+        "codestory",
+        "same subject under its lowercase slug",
+    ),
+    (
+        "express",
+        "codestory-indexer/src/framework_routes.rs extracts Express routes as a parser-backed product feature and has to name the framework it parses",
+    ),
+    (
+        "fmt",
+        "std::fmt; banning it would forbid every Display and Debug implementation in the tree",
+    ),
+    (
+        "http",
+        "the product speaks HTTP in its own adapters and writes the word as an identifier",
+    ),
+    (
+        "requests",
+        "plural of a word the product's own request plumbing is built from",
+    ),
+];
+
+#[test]
+fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
+    let ruled_out: std::collections::BTreeMap<&str, &str> =
+        CORPUS_NAMES_RULED_OUT_OF_THE_BAN.iter().copied().collect();
+    let names = corpus_repository_names();
+    assert!(
+        names.len() > 20,
+        "expected the corpus to name many repositories, found {names:?}"
+    );
+
+    let mut fixtures = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        fixtures.push((
+            format!("repo_name_{index}.rs"),
+            format!("pub const PLANTED: &str = \"{name} cache key\";\n"),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = fixtures
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let output = run_lint_with_named_fixtures(&borrowed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut unbanned = Vec::new();
+    let mut stale_rulings = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let reported = stderr.contains(&format!("repo_name_{index}.rs"));
+        match (reported, ruled_out.contains_key(name.as_str())) {
+            (false, false) => unbanned.push(name.clone()),
+            (true, true) => stale_rulings.push(name.clone()),
+            _ => {}
+        }
+    }
+    assert!(
+        unbanned.is_empty(),
+        "these corpus repository names are not banned and are not ruled out in \
+         CORPUS_NAMES_RULED_OUT_OF_THE_BAN: {unbanned:?}"
+    );
+    assert!(
+        stale_rulings.is_empty(),
+        "these names are ruled out of the ban but the lint bans them anyway; delete the stale \
+         rulings: {stale_rulings:?}"
+    );
+
+    let unrelated = run_lint_with_fixture(r#"pub const PROSE: &str = "answers welcome";"#);
+    assert!(
+        unrelated.status.success(),
+        "a repository name must not match inside ordinary words, stderr={}",
+        String::from_utf8_lossy(&unrelated.stderr)
+    );
+}
+
+#[test]
+fn linter_bans_the_audited_injection_symbols_wherever_they_regrow() {
+    for symbol in [
+        "SourceGroup",
+        "BuildIndex",
+        "IndexerCommand",
+        "EventProcessor",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            r#"pub fn planted_term() -> &'static str {{ "{symbol}" }}"#
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "the deleted injection symbol `{symbol}` must fail lint wherever it regrows, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_leaves_words_this_product_writes_in_its_own_code() {
+    let output = run_lint_with_fixture(
+        r#"use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct SubcommandStorage {
+    pub subcommand: String,
+    pub storage: String,
+}
+
+pub fn serialize_subcommand(value: &SubcommandStorage) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "words the product's own upstream crates write must stay usable, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn linter_does_not_ban_the_hosting_account_a_corpus_lives_under() {
+    let output = run_lint_with_fixture(
+        r#"//! Licensed under the Apache License, Version 2.0.
+
+pub fn licence_notice() -> &'static str {
+    "apache square gorilla pallets"
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "an owner segment names a hosting account, not a corpus, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn linter_rejects_a_word_table_in_term_extraction() {
+    let planted = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const PLANTED_SYMBOL_TERMS: &[&str] = &[
+    "indexer",
+    "service",
+    "storage",
+    "store",
+    "posts",
+    "feed",
+    "auth",
+    "trail",
+];
+"#,
+    )]);
+    let stderr = String::from_utf8_lossy(&planted.stderr);
+    assert!(
+        !planted.status.success(),
+        "a domain word table in term extraction must fail lint, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Term vocabulary table"),
+        "lint should name the vocabulary table it found, stderr={stderr}"
+    );
+
+    let stopwords = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const SEARCH_PLAN_STOPWORDS: &[&str] = &[
+    "and",
+    "explain",
+    "from",
+    "how",
+    "into",
+    "show",
+    "then",
+    "with",
+];
+
+pub const REASON: &str = "natural_language_filler";
+"#,
+    )]);
+    assert!(
+        stopwords.status.success(),
+        "the language-level stopword list is not a repository's vocabulary, stderr={}",
+        String::from_utf8_lossy(&stopwords.stderr)
+    );
+}
+
+/// The ban set this lint had before its corpus was derived, as literal text a
+/// production file could plausibly contain. Deriving the corpus is only an
+/// improvement if it loses nothing, and the only way to know that is to plant
+/// the old set and demand a report for every entry. Deleting a line here lowers
+/// the floor, so a line may only go when the corpus surface it came from goes.
+const PRE_DERIVATION_BAN_FLOOR: &[&str] = &[
+    "payload_config",
+    "freelancer",
+    "traderotate",
+    "vscode",
+    "codex-rs",
+    "sourcetrail",
+    "extHostCommands",
+    "extensionService",
+    "workbench.ts",
+    "codex_exec::run",
+    "exec_events",
+    "StorageAccess",
+    "PersistentStorage",
+    "SourceGroupCxxCdb",
+    "IndexerJava",
+    "data/indexer",
+    "ExecSharedCliOptions",
+    "EventProcessorWithJsonOutput",
+    "Subcommand::Exec",
+    "ThreadStartParams",
+    "TurnStartParams",
+    "chinook",
+    "mdn",
+    "okio",
+    "monolog",
+    "alamofire",
+    "ChinookDatabase",
+    "form-validation",
+    "commonMain/kotlin/okio",
+    "src/Monolog",
+    "Source/Core/Session.swift",
+    "SocialEntries",
+    "ElsewhereFeed",
+    "src/lib_cxx",
+    "src/lib_java",
+    "src/lib/data/storage",
+    "getPayloadClient",
+    "comment_submission_guard",
+    "axios",
+    "redis",
+    "ripgrep",
+    "createInstance",
+    "InterceptorManager",
+    "dispatchRequest",
+    "readQueryFromClient",
+    "processCommand",
+    "aeMain",
+    "aeProcessEvents",
+    "HiArgs",
+    "SearchWorker",
+    "search_parallel",
+    "adapters.js",
+    "server.c",
+    "ae.c",
+    "networking.c",
+    "core/main.rs",
+    "flags/hiargs.rs",
+    "haystack.rs",
+    "lib/axios.js",
+    "lib/core/Axios.js",
+    "StringUtils",
+    "commons-lang",
+    "PreparedRequest",
+    "HTTPAdapter",
+    "createApplication",
+    "app.use",
+    "lib/express.js",
+    "Jekyll",
+    "LogRecord",
+    "AbstractProcessingHandler",
+    "useSWR",
+    "swr",
+    "gin.go",
+    "RouterGroup.Handle",
+    "Engine.addRoute",
+    "Engine.handleHTTPRequest",
+    "AutoMapper",
+    "TypeMapPlanBuilder",
+    "RealBufferedSource",
+    "RealBufferedSink",
+    "DataRequest",
+    "SessionDelegate",
+    "novalidate",
+    "showError",
+    "source/animate.css",
+    "nvm",
+    "install.sh nvm",
+    "bash_completion __nvm",
+    "--with-holdout-clone",
+    "payload_collection",
+];
+
+/// The same floor for the compact scan, which rejoins split literals. Each entry
+/// is written as a production file would have to write it to evade the line scan.
+const PRE_DERIVATION_SPLIT_BAN_FLOOR: &[&str] = &[
+    r#""CharSequence", "Utils""#,
+    r#""app", ".use""#,
+    r#""source/animate", ".css""#,
+];
+
+#[test]
+fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
+    let mut fixtures = Vec::new();
+    for (index, planted) in PRE_DERIVATION_BAN_FLOOR.iter().enumerate() {
+        fixtures.push((
+            format!("floor_{index}.rs"),
+            format!("pub fn planted_{index}() -> &'static str {{ \"{planted}\" }}\n"),
+        ));
+    }
+    for (index, planted) in PRE_DERIVATION_SPLIT_BAN_FLOOR.iter().enumerate() {
+        fixtures.push((
+            format!("split_floor_{index}.rs"),
+            format!("pub fn split_planted_{index}() -> [&'static str; 2] {{ [{planted}] }}\n"),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = fixtures
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let output = run_lint_with_named_fixtures(&borrowed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the pre-derivation ban floor must fail lint, stderr={stderr}"
+    );
+
+    let mut lost = Vec::new();
+    for (index, planted) in PRE_DERIVATION_BAN_FLOOR.iter().enumerate() {
+        if !stderr.contains(&format!("floor_{index}.rs")) {
+            lost.push(*planted);
+        }
+    }
+    for (index, planted) in PRE_DERIVATION_SPLIT_BAN_FLOOR.iter().enumerate() {
+        if !stderr.contains(&format!("split_floor_{index}.rs")) {
+            lost.push(*planted);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "deriving the corpus lost these bans; derive them again or add them to \
+         residualBannedLiterals in scripts/lint-retrieval-generalization.mjs: {lost:?}"
+    );
 }
