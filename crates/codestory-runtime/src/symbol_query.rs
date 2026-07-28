@@ -360,7 +360,6 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
         || marked.contains("/schema/typescript/")
         || marked.contains(".generated.")
         || file_name.contains("generated")
-        || file_name.contains("payload-types")
         || file_name.ends_with(".g.cs")
     {
         return RetrievalFileRole::Generated;

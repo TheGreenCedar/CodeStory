@@ -811,3 +811,58 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
         );
     }
 }
+
+#[test]
+fn linter_catches_framework_filename_shapes_the_ranking_rebuild_deleted() {
+    for probe in [
+        "payload.config.ts",
+        "payload-types.ts",
+        "next.config.ts",
+        "app.svelte",
+        "/src/collections/posts",
+        "/exec/src/cli.rs",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_framework_shape() -> &'static str {{ {probe:?} }}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "framework filename shape `{probe}` must not be reintroducible, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_scans_the_runtime_ranking_surfaces_for_holdout_names() {
+    // The scope hole this lane closed: the ranking files decide root order but
+    // were outside the banned-name scan, so an entry-point name catalog shipped
+    // with this lint green.
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .output()
+        .expect("run generalization lint");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scanned = stdout
+        .split(" retrieval file(s)")
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().last())
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("parse retrieval file count from lint stdout");
+    assert!(
+        scanned >= 88,
+        "ranking surfaces must stay inside the banned-name scan, stdout={stdout}"
+    );
+}

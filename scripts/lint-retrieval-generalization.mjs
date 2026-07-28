@@ -191,7 +191,22 @@ const requiredScanDirs = [
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [];
+// The retrieval ranking surfaces. Corpus-derived patterns already reach every
+// `crates/*/src` file, but the holdout *names* only ever reached the two
+// required directories above -- which is exactly why a banned entry-point name
+// literal sat in grounding.rs for a release with this lint green. These files
+// decide root order, so they carry the same name ban as the agent surface.
+const requiredProductionOnlyFiles = [
+  ["codestory-runtime", "grounding.rs"],
+  ["codestory-runtime", "root_rank.rs"],
+  ["codestory-runtime", "search_intent.rs"],
+  ["codestory-runtime", "search_plan.rs"],
+  ["codestory-runtime", "search_scoring.rs"],
+  ["codestory-runtime", "search_terms.rs"],
+  ["codestory-runtime", "symbol_query.rs"],
+  ["codestory-runtime", "repo_text.rs"],
+  ["codestory-runtime", "controller_symbols.rs"],
+].map(([crateName, fileName]) => path.join(repoRoot, "crates", crateName, "src", fileName));
 
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
@@ -375,6 +390,15 @@ const bannedPatterns = [
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
   "--with-holdout-clone",
+  // Framework-filename and path-fragment shapes the ranking rebuild deleted.
+  // Each sat below the specificity threshold of the holdout *name* patterns
+  // above, which is how they survived the v0.16.1 audit inside ranking code.
+  "payload-types",
+  "payload\\.config",
+  "next\\.config",
+  "app\\.svelte",
+  "/src/collections/",
+  "/exec/src/",
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
@@ -403,6 +427,14 @@ const bannedCompactPatterns = [
   "datarequest",
   "sessiondelegate",
   "sourceanimatecss",
+  // Punctuation-free forms of the framework-filename shapes this ranking
+  // rebuild removed, so a decomposed spelling cannot bring them back.
+  "payloadtypes",
+  "payloadconfig",
+  "nextconfig",
+  "appsvelte",
+  "srccollections",
+  "execsrc",
   ...evalCorpusCompactPatternList,
 ];
 
