@@ -186,32 +186,20 @@ const structuralScanDirs = readdirSync(path.join(repoRoot, "crates"), { withFile
   .map((entry) => path.join(repoRoot, "crates", entry.name, "src"))
   .filter(existsSync);
 
+// Corpus-derived patterns already reach every `crates/*/src` file, but the
+// holdout *names* only ever reached the agent and retrieval directories --
+// which is why a banned entry-point name literal sat in grounding.rs for a
+// release with this lint green. The whole runtime crate now carries the name
+// ban, so a ranking module added tomorrow is covered on the day it is written
+// rather than on the day someone remembers to list it.
 const requiredScanDirs = [
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-// The retrieval ranking surfaces. Corpus-derived patterns already reach every
-// `crates/*/src` file, but the holdout *names* only ever reached the two
-// required directories above -- which is exactly why a banned entry-point name
-// literal sat in grounding.rs for a release with this lint green. These files
-// decide root order, so they carry the same name ban as the agent surface.
-const requiredProductionOnlyFiles = [
-  ["codestory-runtime", "grounding.rs"],
-  ["codestory-runtime", "root_rank.rs"],
-  ["codestory-runtime", "search_intent.rs"],
-  ["codestory-runtime", "search_plan.rs"],
-  ["codestory-runtime", "search_scoring.rs"],
-  ["codestory-runtime", "search_terms.rs"],
-  ["codestory-runtime", "symbol_query.rs"],
-  ["codestory-runtime", "repo_text.rs"],
-  ["codestory-runtime", "controller_symbols.rs"],
-].map(([crateName, fileName]) => path.join(repoRoot, "crates", crateName, "src", fileName));
-
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
-  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
-    .filter((requiredPath) => !existsSync(requiredPath))
+  ? requiredScanDirs.filter((requiredPath) => !existsSync(requiredPath))
   : [];
 if (missingRequiredPaths.length > 0) {
   console.error("lint-retrieval-generalization: missing required production scan path(s)");
@@ -227,8 +215,6 @@ const scanDirs = [
     : explicitScanRoots.filter((root) => root && existsSync(root))),
   ...extraScanRoots.filter((root) => root && existsSync(root)),
 ];
-
-const productionOnlyFiles = usesDefaultScanRoots ? requiredProductionOnlyFiles : [];
 
 const evalOnlyProductionFiles = new Set([
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
@@ -283,7 +269,7 @@ if (missingBenchmarkBoundaryFiles.length > 0) {
   process.exit(2);
 }
 
-if (scanDirs.length === 0 && productionOnlyFiles.length === 0) {
+if (scanDirs.length === 0) {
   console.error("lint-retrieval-generalization: no scan roots found");
   process.exit(2);
 }
@@ -399,6 +385,12 @@ const bannedPatterns = [
   "app\\.svelte",
   "/src/collections/",
   "/exec/src/",
+  // The decomposed-evasion shape itself: a holdout type name spelled as two
+  // generic tokens tested close together, which is how `SourceGroup` steering
+  // stayed under a literal-name ban. Catching the adjacency, not the spelling,
+  // is what stops the same trick returning under a different pair of words.
+  "\"source\"[^\\n]{0,80}\"group\"",
+  "\"group\"[^\\n]{0,80}\"source\"",
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
@@ -510,19 +502,26 @@ function benchmarkManifestDerivedPatterns() {
       addSpecificMarker(markers, task.id);
       addRepoMarkers(markers, task.repo);
       addSpecificMarker(markers, task.prompt, { allowExactPhrase: true });
-      for (const expectedFile of task.expected_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
-      }
-      for (const expectedFile of task.expected_verification_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
-      }
-      for (const symbol of task.expected_symbols ?? []) {
-        if (typeof symbol === "string") {
-          addSpecificMarker(markers, symbol);
-        } else {
-          addSpecificMarker(markers, symbol?.name);
-          addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
-          addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+      // A task whose repository is this one names CodeStory's own product
+      // symbols and paths as its expected answer. Those are the product, not an
+      // answer smuggled into production, so banning them would ban the code
+      // under test. Its prompt and claim phrasing stay banned: production must
+      // still not contain the evaluation's own wording.
+      if (!benchmarkTaskTargetsThisRepository(task)) {
+        for (const expectedFile of task.expected_files ?? []) {
+          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+        }
+        for (const expectedFile of task.expected_verification_files ?? []) {
+          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+        }
+        for (const symbol of task.expected_symbols ?? []) {
+          if (typeof symbol === "string") {
+            addSpecificMarker(markers, symbol);
+          } else {
+            addSpecificMarker(markers, symbol?.name);
+            addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
+            addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+          }
         }
       }
       for (const claim of task.expected_claims ?? []) {
@@ -721,6 +720,13 @@ function benchmarkManifestTasks(manifest) {
   return [];
 }
 
+/// True when the manifest's target repository is the CodeStory repository.
+function benchmarkTaskTargetsThisRepository(task) {
+  return repoUrlSlugs(task?.repo?.url).some(
+    (slug) => slug.toLowerCase() === "thegreencedar/codestory",
+  );
+}
+
 function addRepoMarkers(markers, repo) {
   addSpecificMarker(markers, repo?.name);
   for (const slug of repoUrlSlugs(repo?.url)) {
@@ -876,6 +882,10 @@ function isExcludedRustFile(filePath) {
   return (
     segments.includes("tests")
     || baseName.endsWith("_tests.rs")
+    // A `tests.rs` beside a `mod tests;` is the module's test body, the same
+    // test surface as a `tests/` directory. `maskCfgTestItems` cannot see it
+    // because the `#[cfg(test)]` sits on the `mod` in the parent file.
+    || baseName === "tests.rs"
   );
 }
 
@@ -1925,7 +1935,7 @@ function scanRankerFilenameLiterals(prepared) {
 
 let failed = false;
 
-const scanFiles = new Set(productionOnlyFiles);
+const scanFiles = new Set();
 for (const root of scanDirs) {
   for (const filePath of walkRustProductionFiles(root)) {
     scanFiles.add(filePath);
