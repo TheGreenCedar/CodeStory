@@ -125,6 +125,7 @@ fn main() {
              pub const MODEL_CONFIG_SHA256: &str = {:?};\n\
              pub const MODEL_PRODUCER_NAME: &str = {:?};\n\
              pub const MODEL_PRODUCER_VERSION: &str = {:?};\n\
+             pub const MODEL_PRODUCER_EMBEDDING_REVISION: &str = {:?};\n\
              pub const MODEL_LICENSE_SPDX_ID: &str = {:?};\n\
              pub const MODEL_LICENSE_SOURCE_URL: &str = {:?};\n\
              pub const NATIVE_ENGINE_BUILD_CONTRACT_SCHEMA_VERSION: u32 = 2;\n\
@@ -149,6 +150,7 @@ fn main() {
             contract.config_sha256,
             contract.producer_name,
             contract.producer_version,
+            contract.producer_embedding_revision,
             contract.license_spdx_id,
             contract.license_source_url,
         ),
