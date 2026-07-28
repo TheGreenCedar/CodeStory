@@ -193,17 +193,20 @@ const structuralScanDirs = readdirSync(path.join(repoRoot, "crates"), { withFile
   .map((entry) => path.join(repoRoot, "crates", entry.name, "src"))
   .filter(existsSync);
 
+// Corpus-derived patterns already reach every `crates/*/src` file, but the
+// holdout *names* only ever reached the agent and retrieval directories --
+// which is why a banned entry-point name literal sat in grounding.rs for a
+// release with this lint green. The whole runtime crate now carries the name
+// ban, so a ranking module added tomorrow is covered on the day it is written
+// rather than on the day someone remembers to list it.
 const requiredScanDirs = [
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [];
-
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
-  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
-    .filter((requiredPath) => !existsSync(requiredPath))
+  ? requiredScanDirs.filter((requiredPath) => !existsSync(requiredPath))
   : [];
 if (missingRequiredPaths.length > 0) {
   console.error("lint-retrieval-generalization: missing required production scan path(s)");
@@ -219,8 +222,6 @@ const scanDirs = [
     : explicitScanRoots.filter((root) => root && existsSync(root))),
   ...extraScanRoots.filter((root) => root && existsSync(root)),
 ];
-
-const productionOnlyFiles = usesDefaultScanRoots ? requiredProductionOnlyFiles : [];
 
 const evalOnlyProductionFiles = new Set([
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
@@ -275,7 +276,7 @@ if (missingBenchmarkBoundaryFiles.length > 0) {
   process.exit(2);
 }
 
-if (scanDirs.length === 0 && productionOnlyFiles.length === 0) {
+if (scanDirs.length === 0) {
   console.error("lint-retrieval-generalization: no scan roots found");
   process.exit(2);
 }
@@ -382,6 +383,21 @@ const bannedPatterns = [
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
   "--with-holdout-clone",
+  // Framework-filename and path-fragment shapes the ranking rebuild deleted.
+  // Each sat below the specificity threshold of the holdout *name* patterns
+  // above, which is how they survived the v0.16.1 audit inside ranking code.
+  "payload-types",
+  "payload\\.config",
+  "next\\.config",
+  "app\\.svelte",
+  "/src/collections/",
+  "/exec/src/",
+  // The decomposed-evasion shape itself: a holdout type name spelled as two
+  // generic tokens tested close together, which is how `SourceGroup` steering
+  // stayed under a literal-name ban. Catching the adjacency, not the spelling,
+  // is what stops the same trick returning under a different pair of words.
+  "\"source\"[^\\n]{0,80}\"group\"",
+  "\"group\"[^\\n]{0,80}\"source\"",
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
@@ -410,6 +426,14 @@ const bannedCompactPatterns = [
   "datarequest",
   "sessiondelegate",
   "sourceanimatecss",
+  // Punctuation-free forms of the framework-filename shapes this ranking
+  // rebuild removed, so a decomposed spelling cannot bring them back.
+  "payloadtypes",
+  "payloadconfig",
+  "nextconfig",
+  "appsvelte",
+  "srccollections",
+  "execsrc",
   ...evalCorpusCompactPatternList,
 ];
 
@@ -862,17 +886,127 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isExcludedRustFile(filePath) {
+function isExcludedRustFile(filePath, { excludeCfgTestModuleBodies = false } = {}) {
   const relative = path.relative(repoRoot, filePath);
   const segments = relative.split(path.sep);
   const baseName = path.basename(filePath);
   return (
     segments.includes("tests")
     || baseName.endsWith("_tests.rs")
+    // An out-of-line module body whose declaration carries `#[cfg(test)]` is
+    // compiled out of the product, exactly like the inline `#[cfg(test)] mod`
+    // items `maskCfgTestItems` already blanks. `maskCfgTestItems` cannot reach
+    // it because the attribute lives in the *parent* file, so the holdout-name
+    // pass has to read the declaration. It must read the declaration and
+    // nothing else: excluding by file name instead (any `tests.rs`) would let a
+    // shipped module opt out of the whole lint by being renamed. The
+    // corpus-dependency pass keeps scanning these bodies, so this narrows one
+    // pass rather than shrinking the linted file set.
+    || (excludeCfgTestModuleBodies && isCfgTestModuleFile(filePath))
   );
 }
 
-function walkRustProductionFiles(root) {
+const cfgTestModuleFileCache = new Map();
+
+/// True when `filePath` is the body of a module whose declaration in its parent
+/// file is annotated `#[cfg(test)]`, or whose parent is itself such a body.
+function isCfgTestModuleFile(filePath) {
+  const cached = cfgTestModuleFileCache.get(filePath);
+  if (cached !== undefined) {
+    return cached;
+  }
+  // Seeded before recursing so a malformed `a.rs`/`a/mod.rs` cycle terminates.
+  cfgTestModuleFileCache.set(filePath, false);
+  const resolved = resolveCfgTestModuleFile(filePath);
+  cfgTestModuleFileCache.set(filePath, resolved);
+  return resolved;
+}
+
+function resolveCfgTestModuleFile(filePath) {
+  const baseName = path.basename(filePath);
+  if (!baseName.endsWith(".rs") || baseName === "lib.rs" || baseName === "main.rs") {
+    // Crate roots are named by Cargo, not declared by a parent module.
+    return false;
+  }
+  const directory = path.dirname(filePath);
+  const moduleName = baseName === "mod.rs" ? path.basename(directory) : baseName.slice(0, -3);
+  const parentDirectory = baseName === "mod.rs" ? path.dirname(directory) : directory;
+  if (!isRustIdentifier(moduleName)) {
+    return false;
+  }
+  // `mod foo;` in `<dir>/{mod,lib,main}.rs` and in the 2018-edition sibling
+  // `<dir>.rs` all resolve to the same child module.
+  const parentCandidates = [
+    path.join(parentDirectory, "mod.rs"),
+    path.join(parentDirectory, "lib.rs"),
+    path.join(parentDirectory, "main.rs"),
+    `${parentDirectory}.rs`,
+  ];
+  for (const parent of parentCandidates) {
+    if (parent === filePath || !existsSync(parent) || !statSync(parent).isFile()) {
+      continue;
+    }
+    const declarations = outOfLineModuleDeclarations(parent);
+    const declaration = declarations.get(moduleName);
+    if (declaration === undefined) {
+      continue;
+    }
+    if (declaration.cfgTest) {
+      return true;
+    }
+    // A module reached only through a parent that is itself compiled out under
+    // `#[cfg(test)]` is test-only too, however it is spelled.
+    if (isCfgTestModuleFile(parent)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const outOfLineModuleDeclarationCache = new Map();
+
+/// Map of `mod <name>;` declarations in one file to whether the declaration is
+/// annotated `#[cfg(test)]`.
+function outOfLineModuleDeclarations(filePath) {
+  const cached = outOfLineModuleDeclarationCache.get(filePath);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const text = readFileSync(filePath, "utf8");
+  const declarations = new Map();
+  for (const [, visibility, name] of text.matchAll(outOfLineModuleDeclarationPattern)) {
+    if (!declarations.has(name)) {
+      declarations.set(name, { cfgTest: false, visibility });
+    }
+  }
+  for (const group of findAttributeGroups(text)) {
+    if (!group.attributes.some((attribute) => attributeIsCfgTest(attribute.content))) {
+      continue;
+    }
+    const declared = declaredOutOfLineModuleName(text, group.itemStart);
+    if (declared !== null) {
+      declarations.set(declared, { cfgTest: true, visibility: null });
+    }
+  }
+  outOfLineModuleDeclarationCache.set(filePath, declarations);
+  return declarations;
+}
+
+const outOfLineModuleDeclarationPattern =
+  /(?:^|[;{}\s])(pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;/g;
+
+function declaredOutOfLineModuleName(text, itemStart) {
+  const match = /^(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;/.exec(
+    text.slice(itemStart, itemStart + 256),
+  );
+  return match ? match[1] : null;
+}
+
+function isRustIdentifier(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+function walkRustProductionFiles(root, options = {}) {
   if (!existsSync(root)) {
     return [];
   }
@@ -887,7 +1021,7 @@ function walkRustProductionFiles(root) {
       }
       continue;
     }
-    if (stat.isFile() && current.endsWith(".rs") && !isExcludedRustFile(current)) {
+    if (stat.isFile() && current.endsWith(".rs") && !isExcludedRustFile(current, options)) {
       files.push(current);
     }
   }
@@ -1918,9 +2052,11 @@ function scanRankerFilenameLiterals(prepared) {
 
 let failed = false;
 
-const scanFiles = new Set(productionOnlyFiles);
+// The holdout-name pass now covers whole crates, so it is the pass that has to
+// tell a shipped module from a `#[cfg(test)]` module body written out of line.
+const scanFiles = new Set();
 for (const root of scanDirs) {
-  for (const filePath of walkRustProductionFiles(root)) {
+  for (const filePath of walkRustProductionFiles(root, { excludeCfgTestModuleBodies: true })) {
     scanFiles.add(filePath);
   }
 }

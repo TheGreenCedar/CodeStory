@@ -11,6 +11,11 @@ use super::{
     retrieval_state_from_storage_for_runtime, terminal_symbol_segment,
 };
 use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
+use crate::root_rank::{
+    CallDegrees, DegreeTier, EntryEvidence, RootDiversityState, SUBSYSTEM_FILE_QUOTA, degree_tier,
+    diversify_root_order_within, entry_evidence, helper_like_name_or_path, is_production_file_role,
+    structural_depth, structural_path_rank, subsystem_key_for_path,
+};
 use crate::trail_story::build_trail_story;
 use codestory_contracts::api::{
     PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
@@ -26,43 +31,9 @@ const FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES: usize = 40;
 const ROOT_CANDIDATE_MULTIPLIER: usize = 8;
 const ARCHITECTURE_ROOT_FILE_LIMIT: usize = 48;
 const ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT: usize = 16;
-const ARCHITECTURE_NAMED_ROOTS_PER_FILE: usize = 8;
-const ARCHITECTURE_ROOT_EXACT_NAMES: &[&str] = &[
-    "main",
-    "run",
-    "start",
-    "bootstrap",
-    "launch",
-    "mount",
-    "serve",
-    "init",
-    "initialize",
-    "createapp",
-    "createapplication",
-    "createserver",
-    "createrouter",
-    "createruntime",
-    "runapp",
-    "runapplication",
-    "runserver",
-    "runruntime",
-    "runservice",
-    "runcli",
-    "startapp",
-    "startapplication",
-    "startserver",
-    "startruntime",
-    "startservice",
-    "get",
-    "post",
-    "put",
-    "patch",
-    "delete",
-    "head",
-    "options",
-];
-const ARCHITECTURE_ROOT_UPPERCASE_GLOBS: &[&str] =
-    &["Page", "Layout", "[A-Z]*Page", "[A-Z]*Layout"];
+/// Half of the candidate-file budget for declared entry files, half for the
+/// per-subsystem quota, so neither supplement can starve the other.
+const ARCHITECTURE_ROOT_FILE_HALF_LIMIT: usize = ARCHITECTURE_ROOT_FILE_LIMIT / 2;
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -108,7 +79,13 @@ fn is_import_like_symbol(node: &codestory_contracts::graph::Node) -> bool {
     ) && is_import_like_name(&node_display_name(node))
 }
 
-fn is_import_like_name(name: &str) -> bool {
+/// True when a symbol's own name is spelled as an import path.
+///
+/// Kind-independent on purpose: the grounding surface reaches it through
+/// `is_import_like_symbol`, which also requires a module-shaped kind, while the
+/// search surface must apply it to a re-export the index resolved to a callable
+/// kind. Either way an alias must not be read as an entry point.
+pub(crate) fn is_import_like_name(name: &str) -> bool {
     let trimmed = name.trim();
     is_wrapped_import_name(trimmed) || is_relative_import_path(trimmed) || trimmed.contains('/')
 }
@@ -171,7 +148,7 @@ fn compare_nodes(
         .then(left.id.0.cmp(&right.id.0))
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -350,10 +327,6 @@ fn dedupe_grounding_node_records(nodes: Vec<GroundingNodeRecord>) -> Vec<Groundi
     deduped
 }
 
-fn is_production_file_role(role: Option<FileRole>) -> bool {
-    matches!(role, Some(FileRole::Source | FileRole::Entrypoint))
-}
-
 fn grounding_root_file_role_rank(role: Option<FileRole>) -> u8 {
     match role {
         Some(FileRole::Entrypoint) => 0,
@@ -371,13 +344,33 @@ fn grounding_root_terminal_name(record: &GroundingNodeRecord) -> String {
     }
 }
 
-fn grounding_root_path_rank(root: &Path, record: &GroundingNodeRecord) -> u8 {
+fn grounding_root_relative_path(root: &Path, record: &GroundingNodeRecord) -> Option<String> {
     record
         .file_path
         .as_deref()
         .map(|path| relative_path(root, path))
-        .as_deref()
-        .map_or(3, |path| architecture_path_rank(Some(path)))
+}
+
+fn grounding_root_file_role(
+    record: &GroundingNodeRecord,
+    file_roles: &HashMap<i64, FileRole>,
+) -> Option<FileRole> {
+    record
+        .node
+        .file_node_id
+        .and_then(|file_id| file_roles.get(&file_id.0).copied())
+}
+
+fn grounding_root_language(
+    record: &GroundingNodeRecord,
+    file_languages: &HashMap<i64, String>,
+) -> String {
+    record
+        .node
+        .file_node_id
+        .and_then(|file_id| file_languages.get(&file_id.0))
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn grounding_root_subsystem_key(
@@ -385,68 +378,22 @@ fn grounding_root_subsystem_key(
     record: &GroundingNodeRecord,
     file_languages: &HashMap<i64, String>,
 ) -> String {
-    let language = record
-        .node
-        .file_node_id
-        .and_then(|file_id| file_languages.get(&file_id.0))
-        .map(String::as_str)
-        .unwrap_or("unknown");
-    let Some(path) = record.file_path.as_deref() else {
-        return format!("{language}:unknown");
-    };
-    let relative = relative_path(root, path).to_ascii_lowercase();
-    let segments = relative
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-
-    if let Some(index) = segments.iter().position(|segment| *segment == "crates")
-        && let Some(crate_name) = segments.get(index + 1)
-    {
-        return format!("{language}:crates/{crate_name}");
-    }
-    if let Some(index) = segments.iter().position(|segment| *segment == "plugins")
-        && let Some(plugin_name) = segments.get(index + 1)
-    {
-        return format!("{language}:plugins/{plugin_name}");
-    }
-    if segments.contains(&"src-tauri") {
-        return format!("{language}:src-tauri");
-    }
-    if let Some(index) = segments.iter().rposition(|segment| *segment == "src") {
-        if let Some(next) = segments.get(index + 1)
-            && !next.contains('.')
-        {
-            return format!("{language}:{}", segments[..=index + 1].join("/"));
-        }
-        return format!("{language}:{}", segments[..=index].join("/"));
-    }
-
-    let top = segments.first().copied().unwrap_or("root");
-    format!("{language}:{top}")
-}
-
-fn build_grounding_edge_degree_map(
-    counts: Vec<GroundingEdgeKindCount>,
-) -> HashMap<codestory_contracts::graph::NodeId, u32> {
-    let mut degrees = HashMap::new();
-    for count in counts {
-        degrees
-            .entry(count.node_id)
-            .and_modify(|total: &mut u32| *total = total.saturating_add(count.count))
-            .or_insert(count.count);
-    }
-    degrees
+    subsystem_key_for_path(
+        &grounding_root_language(record, file_languages),
+        grounding_root_relative_path(root, record).as_deref(),
+    )
 }
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GroundingRootSortKey {
     import_like: bool,
-    entrypoint: Reverse<bool>,
+    entry: Reverse<EntryEvidence>,
     file_role_rank: u8,
-    path_rank: u8,
-    edge_degree: Reverse<u32>,
+    helper_like: bool,
+    reference_tier: Reverse<DegreeTier>,
+    reach_tier: Reverse<DegreeTier>,
     member_count: Reverse<u32>,
+    structural_path_rank: u8,
     node_rank: u8,
     start_line: u32,
     relative_path: Option<String>,
@@ -459,62 +406,30 @@ impl GroundingRootSortKey {
         record: &GroundingNodeRecord,
         root: &Path,
         file_roles: &HashMap<i64, FileRole>,
-        edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
+        degrees: &HashMap<codestory_contracts::graph::NodeId, CallDegrees>,
         member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
     ) -> Self {
-        let role = record
-            .node
-            .file_node_id
-            .and_then(|file_id| file_roles.get(&file_id.0).copied());
+        let role = grounding_root_file_role(record, file_roles);
+        let relative = grounding_root_relative_path(root, record);
+        let call_degrees = degrees.get(&record.node.id).copied().unwrap_or_default();
         Self {
             import_like: is_import_like_symbol(&record.node),
-            entrypoint: Reverse(is_grounding_entrypoint_root(root, record, file_roles)),
+            // Role stays the band frame; directed graph evidence refines within
+            // the band; structure only breaks ties.
+            entry: Reverse(grounding_entry_evidence(record, file_roles, call_degrees)),
             file_role_rank: grounding_root_file_role_rank(role),
-            path_rank: grounding_root_path_rank(root, record),
-            edge_degree: Reverse(edge_degrees.get(&record.node.id).copied().unwrap_or(0)),
+            helper_like: helper_like_name_or_path(&record.display_name, relative.as_deref()),
+            reference_tier: Reverse(degree_tier(call_degrees.production_in_calls)),
+            reach_tier: Reverse(degree_tier(call_degrees.out_calls)),
             member_count: Reverse(member_counts.get(&record.node.id).copied().unwrap_or(0)),
+            structural_path_rank: structural_path_rank(role, relative.as_deref()),
             node_rank: node_rank(&record.node),
             start_line: record.node.start_line.unwrap_or(u32::MAX),
-            relative_path: record
-                .file_path
-                .as_deref()
-                .map(|path| relative_path(root, path)),
+            relative_path: relative,
             display_name: record.display_name.clone(),
             node_id: record.node.id.0,
         }
     }
-}
-
-fn append_diversified_grounding_root_tier(
-    records: Vec<GroundingNodeRecord>,
-    root: &Path,
-    file_languages: &HashMap<i64, String>,
-    seen_surfaces: &mut HashSet<String>,
-    seen_names: &mut HashSet<String>,
-    diversified: &mut Vec<GroundingNodeRecord>,
-) {
-    let mut repeated_surfaces = Vec::new();
-    for record in records {
-        let surface = grounding_root_subsystem_key(root, &record, file_languages);
-        let name = grounding_root_terminal_name(&record);
-        if !seen_surfaces.contains(&surface) && !seen_names.contains(&name) {
-            seen_surfaces.insert(surface);
-            seen_names.insert(name);
-            diversified.push(record);
-        } else {
-            repeated_surfaces.push(record);
-        }
-    }
-
-    let mut duplicate_names = Vec::new();
-    for record in repeated_surfaces {
-        if seen_names.insert(grounding_root_terminal_name(&record)) {
-            diversified.push(record);
-        } else {
-            duplicate_names.push(record);
-        }
-    }
-    diversified.extend(duplicate_names);
 }
 
 fn diversify_grounding_root_records(
@@ -522,134 +437,144 @@ fn diversify_grounding_root_records(
     root: &Path,
     file_roles: &HashMap<i64, FileRole>,
     file_languages: &HashMap<i64, String>,
-    edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
+    degrees: &HashMap<codestory_contracts::graph::NodeId, CallDegrees>,
     member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
 ) -> Vec<GroundingNodeRecord> {
     records.sort_by_cached_key(|record| {
-        GroundingRootSortKey::new(record, root, file_roles, edge_degrees, member_counts)
+        GroundingRootSortKey::new(record, root, file_roles, degrees, member_counts)
     });
-    let (production, secondary): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
-        is_production_file_role(
-            record
-                .node
-                .file_node_id
-                .and_then(|file_id| file_roles.get(&file_id.0).copied()),
-        )
-    });
+    let (production, secondary): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|record| is_production_file_role(grounding_root_file_role(record, file_roles)));
 
     // Spend the compact budget on distinct production language/subsystem
     // surfaces, then distinct names, before compatibility-only candidates.
     // Every budget truncates this one stable order.
-    let mut seen_surfaces = HashSet::new();
-    let mut seen_names = HashSet::new();
-    let mut diversified = Vec::with_capacity(production.len() + secondary.len());
-    append_diversified_grounding_root_tier(
-        production,
-        root,
-        file_languages,
-        &mut seen_surfaces,
-        &mut seen_names,
-        &mut diversified,
-    );
-    append_diversified_grounding_root_tier(
+    let surface_key = |record: &GroundingNodeRecord| {
+        (
+            grounding_root_subsystem_key(root, record, file_languages),
+            grounding_root_terminal_name(record),
+        )
+    };
+    // One diversity state across both tiers: a secondary candidate whose name a
+    // production root already spent must not consume a novel-name slot of its
+    // own, which is the duplicate-name diversity #1338 requires stay intact.
+    let mut state = RootDiversityState::default();
+    let mut diversified =
+        diversify_root_order_within(production, |_| false, surface_key, &mut state);
+    diversified.extend(diversify_root_order_within(
         secondary,
-        root,
-        file_languages,
-        &mut seen_surfaces,
-        &mut seen_names,
-        &mut diversified,
-    );
+        |_| false,
+        surface_key,
+        &mut state,
+    ));
     diversified
 }
 
-fn is_grounding_entrypoint_root(
-    root: &Path,
+/// Entry-point evidence for one grounding root candidate.
+///
+/// Every name catalog that used to live here is gone; the only surviving name
+/// literal is the language contract `main`, and it lives in `root_rank`.
+fn grounding_entry_evidence(
     record: &GroundingNodeRecord,
     file_roles: &HashMap<i64, FileRole>,
-) -> bool {
-    let role = record
-        .node
-        .file_node_id
-        .and_then(|file_id| file_roles.get(&file_id.0).copied());
-    if is_import_like_symbol(&record.node)
-        || !is_production_file_role(role)
-        || !matches!(
+    degrees: CallDegrees,
+) -> EntryEvidence {
+    entry_evidence(
+        matches!(
             record.node.kind,
             codestory_contracts::graph::NodeKind::FUNCTION
                 | codestory_contracts::graph::NodeKind::METHOD
-        )
-    {
-        return false;
-    }
-    let has_entrypoint_file_evidence =
-        role == Some(FileRole::Entrypoint) || grounding_root_path_rank(root, record) == 0;
-    if !has_entrypoint_file_evidence {
-        return false;
-    }
-
-    let name = grounding_root_terminal_name(record)
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect::<String>();
-    if [
-        "main",
-        "run",
-        "start",
-        "bootstrap",
-        "launch",
-        "mount",
-        "serve",
-        "init",
-        "initialize",
-        "createapp",
-        "createapplication",
-        "get",
-        "post",
-        "put",
-        "patch",
-        "delete",
-        "head",
-        "options",
-    ]
-    .iter()
-    .any(|candidate| name == *candidate)
-    {
-        return true;
-    }
-
-    [
-        (
-            "start",
-            &["app", "application", "server", "runtime", "service"][..],
         ),
-        (
-            "run",
-            &["app", "application", "server", "runtime", "service", "cli"][..],
-        ),
-        (
-            "create",
-            &["app", "application", "server", "router", "runtime"][..],
-        ),
-    ]
-    .iter()
-    .any(|(prefix, suffixes)| {
-        name.strip_prefix(prefix)
-            .is_some_and(|suffix| suffixes.contains(&suffix))
-    }) || {
-        let terminal = record
-            .display_name
-            .rsplit([':', '.', '/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .trim();
-        terminal
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_uppercase())
-            && (name.ends_with("page") || name.ends_with("layout"))
-    }
+        grounding_root_file_role(record, file_roles),
+        is_import_like_symbol(&record.node),
+        &grounding_root_terminal_name(record),
+        degrees,
+    )
 }
 
+/// Choose the bounded file set that supplements the stored root-candidate
+/// window.
+///
+/// The stored order is symbol kind first, which is precisely why `main()` — a
+/// FUNCTION — sits below every type in a file. Two structure-only supplements
+/// fix that without consulting any name: files the indexer verified as entry
+/// points, and a small per-subsystem quota so no major source area can be
+/// missing from a strict map. Both are budget-independent, so every budget
+/// truncates one order.
+fn grounding_root_candidate_files(
+    root: &Path,
+    file_summaries: &[codestory_store::GroundingFileSummary],
+    file_roles: &HashMap<i64, FileRole>,
+    file_languages: &HashMap<i64, String>,
+) -> Vec<i64> {
+    let production = file_summaries
+        .iter()
+        .filter(|summary| is_production_file_role(file_roles.get(&summary.file.id).copied()))
+        .map(|summary| (summary, relative_path(root, &summary.file.path)))
+        .collect::<Vec<_>>();
+
+    let mut declared_entries = production
+        .iter()
+        .filter(|(summary, _)| {
+            file_roles.get(&summary.file.id).copied() == Some(FileRole::Entrypoint)
+        })
+        .map(|(summary, relative)| {
+            (
+                structural_depth(relative),
+                relative.clone(),
+                summary.file.id,
+            )
+        })
+        .collect::<Vec<_>>();
+    declared_entries.sort();
+    declared_entries.truncate(ARCHITECTURE_ROOT_FILE_HALF_LIMIT);
+
+    let mut by_subsystem = BTreeMap::<String, Vec<(u8, Reverse<u32>, String, i64)>>::new();
+    for (summary, relative) in &production {
+        let language = file_languages
+            .get(&summary.file.id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        by_subsystem
+            .entry(subsystem_key_for_path(language, Some(relative)))
+            .or_default()
+            .push((
+                summary.best_node_rank,
+                Reverse(summary.symbol_count),
+                relative.clone(),
+                summary.file.id,
+            ));
+    }
+    // Round-robin the quota rather than walking subsystems in key order and
+    // truncating: taking two files from each subsystem in turn would spend the
+    // whole half-limit on the alphabetically first twelve, and a repository's
+    // later-sorting source areas would be silently absent from the universe.
+    // One file per subsystem first means breadth survives the truncation.
+    let mut quota_files = Vec::new();
+    for slot in 0..SUBSYSTEM_FILE_QUOTA {
+        for candidates in by_subsystem.values_mut() {
+            if slot == 0 {
+                candidates.sort();
+            }
+            if let Some(candidate) = candidates.get(slot) {
+                quota_files.push(candidate.3);
+            }
+        }
+    }
+    quota_files.truncate(ARCHITECTURE_ROOT_FILE_HALF_LIMIT);
+
+    let mut seen = HashSet::new();
+    declared_entries
+        .into_iter()
+        .map(|entry| entry.2)
+        .chain(quota_files)
+        .filter(|file_id| seen.insert(*file_id))
+        .take(ARCHITECTURE_ROOT_FILE_LIMIT)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn grounding_orientation(
     root: &Path,
     evaluated: &[GroundingNodeRecord],
@@ -658,41 +583,37 @@ fn grounding_orientation(
     compressed_files: u32,
     file_roles: &HashMap<i64, FileRole>,
     file_languages: &HashMap<i64, String>,
+    degrees: &HashMap<codestory_contracts::graph::NodeId, CallDegrees>,
 ) -> GroundingOrientationDto {
-    let candidate_entrypoint_roots = evaluated
-        .iter()
-        .filter(|record| is_grounding_entrypoint_root(root, record, file_roles))
-        .count();
-    let selected_entrypoint_roots = selected
-        .iter()
-        .filter(|record| is_grounding_entrypoint_root(root, record, file_roles))
-        .count();
-    let candidate_subsystems = evaluated
-        .iter()
-        .filter(|record| {
-            is_production_file_role(
-                record
-                    .node
-                    .file_node_id
-                    .and_then(|file_id| file_roles.get(&file_id.0).copied()),
-            )
-        })
-        .map(|record| grounding_root_subsystem_key(root, record, file_languages))
-        .collect::<HashSet<_>>()
-        .len();
-    let selected_subsystems = selected
-        .iter()
-        .filter(|record| {
-            is_production_file_role(
-                record
-                    .node
-                    .file_node_id
-                    .and_then(|file_id| file_roles.get(&file_id.0).copied()),
-            )
-        })
-        .map(|record| grounding_root_subsystem_key(root, record, file_languages))
-        .collect::<HashSet<_>>()
-        .len();
+    let has_entry_evidence = |record: &GroundingNodeRecord| {
+        grounding_entry_evidence(
+            record,
+            file_roles,
+            degrees.get(&record.node.id).copied().unwrap_or_default(),
+        ) != EntryEvidence::None
+    };
+    let candidate_entrypoint_roots = evaluated.iter().filter(|r| has_entry_evidence(r)).count();
+    let selected_entrypoint_roots = selected.iter().filter(|r| has_entry_evidence(r)).count();
+    let subsystem_count = |records: &[GroundingNodeRecord]| {
+        records
+            .iter()
+            .filter(|record| is_production_file_role(grounding_root_file_role(record, file_roles)))
+            .map(|record| grounding_root_subsystem_key(root, record, file_languages))
+            .collect::<HashSet<_>>()
+            .len()
+    };
+    let candidate_subsystems = subsystem_count(evaluated);
+    let selected_subsystems = subsystem_count(selected);
+    // Thin means the whole evaluated window carries no non-speculative CALL
+    // degree at all, so the order below role and structure is unproven.
+    let graph_signal_thin = !evaluated.is_empty()
+        && evaluated.iter().all(|record| {
+            degrees
+                .get(&record.node.id)
+                .copied()
+                .unwrap_or_default()
+                .is_empty()
+        });
 
     let mut uncertainty = Vec::new();
     if evaluated.len() < total_root_candidates {
@@ -706,23 +627,25 @@ fn grounding_orientation(
     if candidate_subsystems > 1 && selected_subsystems < candidate_subsystems.min(selected.len()) {
         uncertainty.push(GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth);
     }
+    if graph_signal_thin {
+        uncertainty.push(GroundingOrientationUncertaintyDto::GraphSignalThin);
+    }
+    if graph_signal_thin && candidate_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::LexicalFallback);
+    }
     if compressed_files > 0 {
         uncertainty.push(GroundingOrientationUncertaintyDto::CompressedPresentation);
     }
 
-    let confidence = if selected.is_empty()
-        || candidate_entrypoint_roots == 0
-        || (candidate_subsystems > 1 && selected_subsystems <= 1)
-    {
-        GroundingOrientationConfidenceDto::Weak
-    } else if evaluated.len() < total_root_candidates
-        || selected_entrypoint_roots == 0
-        || (candidate_subsystems > 1 && selected_subsystems < 2)
-    {
-        GroundingOrientationConfidenceDto::Partial
-    } else {
-        GroundingOrientationConfidenceDto::Strong
-    };
+    let confidence = orientation_confidence(
+        &uncertainty,
+        selected.is_empty()
+            || candidate_entrypoint_roots == 0
+            || (candidate_subsystems > 1 && selected_subsystems <= 1),
+        evaluated.len() < total_root_candidates
+            || selected_entrypoint_roots == 0
+            || (candidate_subsystems > 1 && selected_subsystems < 2),
+    );
 
     GroundingOrientationDto {
         confidence,
@@ -734,6 +657,31 @@ fn grounding_orientation(
         selected_subsystems: selected_subsystems.min(u32::MAX as usize) as u32,
         uncertainty,
     }
+}
+
+/// Apply the shared evidence-class confidence invariant.
+///
+/// `Strong` is impossible while any evidence-class uncertainty is reported,
+/// `GraphSignalThin` caps at `Partial`, and `LexicalFallback` caps at `Weak`.
+/// `CompressedPresentation` is deliberately excluded: it fires on every strict
+/// budget by construction, so folding it in would pin every strict read to
+/// `Partial`.
+pub(crate) fn orientation_confidence(
+    uncertainty: &[GroundingOrientationUncertaintyDto],
+    weak: bool,
+    partial: bool,
+) -> GroundingOrientationConfidenceDto {
+    if weak || uncertainty.contains(&GroundingOrientationUncertaintyDto::LexicalFallback) {
+        return GroundingOrientationConfidenceDto::Weak;
+    }
+    if partial
+        || uncertainty
+            .iter()
+            .any(|variant| variant.is_evidence_class())
+    {
+        return GroundingOrientationConfidenceDto::Partial;
+    }
+    GroundingOrientationConfidenceDto::Strong
 }
 
 fn build_edge_digest_map(
@@ -852,44 +800,6 @@ fn low_value_recommendation_name(name: &str) -> bool {
     normalized.starts_with("std::") || normalized.starts_with("std.")
 }
 
-fn architecture_path_rank(path: Option<&str>) -> u8 {
-    let Some(path) = path else {
-        return 3;
-    };
-    let path = path.replace('\\', "/").to_ascii_lowercase();
-    if path.ends_with("/src/lib.rs")
-        || path.ends_with("/src/main.rs")
-        || path.ends_with("/src/mod.rs")
-        || path == "src/lib.rs"
-        || path == "src/main.rs"
-        || path.ends_with("/main.ts")
-        || path.ends_with("/main.tsx")
-        || path.ends_with("/main.js")
-        || path.ends_with("/main.jsx")
-        || path.ends_with("/app.svelte")
-        || path.ends_with("/page.tsx")
-        || path.ends_with("/layout.tsx")
-        || path.ends_with("/route.ts")
-        || path.ends_with("payload.config.ts")
-        || path.ends_with("next.config.ts")
-    {
-        return 0;
-    }
-    if path.contains("/src/app/")
-        || path.contains("/src/collections/")
-        || path.contains("/src/components/")
-        || path.contains("/src/runtime/")
-        || path.contains("/src-tauri/src/")
-        || path.contains("/src/index")
-    {
-        return 1;
-    }
-    if path.contains("/src/") || path.starts_with("src/") {
-        return 2;
-    }
-    3
-}
-
 fn architecture_kind_rank(kind: NodeKind) -> u8 {
     match kind {
         NodeKind::STRUCT
@@ -915,8 +825,8 @@ fn compare_recommendation_candidates(
     low_value_recommendation_path(left.path.as_deref())
         .cmp(&low_value_recommendation_path(right.path.as_deref()))
         .then(
-            architecture_path_rank(left.path.as_deref())
-                .cmp(&architecture_path_rank(right.path.as_deref())),
+            structural_path_rank(None, left.path.as_deref())
+                .cmp(&structural_path_rank(None, right.path.as_deref())),
         )
         .then(
             architecture_kind_rank(left.symbol.kind)
@@ -1110,38 +1020,8 @@ impl AppController {
             .iter()
             .filter_map(|summary| summary.file_role.map(|role| (summary.file.id, role)))
             .collect::<HashMap<_, _>>();
-        let mut architecture_root_files = file_summaries
-            .iter()
-            .filter_map(|summary| {
-                let relative = relative_path(&root, &summary.file.path);
-                let path_rank = architecture_path_rank(Some(&relative));
-                let role = file_roles.get(&summary.file.id).copied();
-                (is_production_file_role(role)
-                    && (role == Some(FileRole::Entrypoint) || path_rank <= 1))
-                    .then_some((
-                        grounding_root_file_role_rank(role),
-                        path_rank,
-                        summary.best_node_rank,
-                        summary.symbol_count,
-                        relative,
-                        summary.file.id,
-                    ))
-            })
-            .collect::<Vec<_>>();
-        architecture_root_files.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then(left.1.cmp(&right.1))
-                .then(left.2.cmp(&right.2))
-                .then(right.3.cmp(&left.3))
-                .then(left.4.cmp(&right.4))
-                .then(left.5.cmp(&right.5))
-        });
-        architecture_root_files.truncate(ARCHITECTURE_ROOT_FILE_LIMIT);
-        let architecture_root_file_ids = architecture_root_files
-            .into_iter()
-            .map(|candidate| candidate.5)
-            .collect::<Vec<_>>();
+        let architecture_root_file_ids =
+            grounding_root_candidate_files(&root, &file_summaries, &file_roles, &file_languages);
         let derived_file_count = if stats.file_count > 0 {
             stats.file_count
         } else {
@@ -1231,38 +1111,16 @@ impl AppController {
         let root_fetch_limit = max_root_symbols
             .saturating_mul(ROOT_CANDIDATE_MULTIPLIER)
             .max(max_root_symbols);
-        let architecture_exact_names = ARCHITECTURE_ROOT_EXACT_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
-        let architecture_uppercase_globs = ARCHITECTURE_ROOT_UPPERCASE_GLOBS
-            .iter()
-            .map(|glob| (*glob).to_string())
-            .collect::<Vec<_>>();
         let mut root_records = storage
-            .get_grounding_named_root_symbols_for_files(
+            .get_grounding_root_symbols_for_files(
                 &architecture_root_file_ids,
-                &architecture_exact_names,
-                &architecture_uppercase_globs,
-                ARCHITECTURE_NAMED_ROOTS_PER_FILE,
+                ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT,
             )
             .map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to load named architecture grounding roots: {e}"
+                    "Failed to load architecture grounding root symbols: {e}"
                 ))
             })?;
-        root_records.extend(
-            storage
-                .get_grounding_root_symbols_for_files(
-                    &architecture_root_file_ids,
-                    ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT,
-                )
-                .map_err(|e| {
-                    ApiError::internal(format!(
-                        "Failed to load architecture grounding root symbols: {e}"
-                    ))
-                })?,
-        );
         root_records.extend(
             storage
                 .get_grounding_root_symbol_candidates(root_fetch_limit, 0)
@@ -1276,13 +1134,14 @@ impl AppController {
             .iter()
             .map(|record| record.node.id)
             .collect::<Vec<_>>();
-        let candidate_edge_degrees = build_grounding_edge_degree_map(
-            storage
-                .get_grounding_edge_digest_counts(&candidate_node_ids)
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to load grounding root graph evidence: {e}"))
-                })?,
-        );
+        let candidate_call_degrees = storage
+            .get_grounding_call_degrees(&candidate_node_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load grounding root graph evidence: {e}"))
+            })?
+            .into_iter()
+            .map(|degree| (degree.node_id, CallDegrees::from(degree)))
+            .collect::<HashMap<_, _>>();
         let candidate_member_counts = storage
             .get_grounding_member_counts(&candidate_node_ids)
             .map_err(|e| {
@@ -1295,7 +1154,7 @@ impl AppController {
             &root,
             &file_roles,
             &file_languages,
-            &candidate_edge_degrees,
+            &candidate_call_degrees,
             &candidate_member_counts,
         );
         root_records.truncate(config.root_symbols);
@@ -1406,6 +1265,7 @@ impl AppController {
             compressed_files,
             &file_roles,
             &file_languages,
+            &candidate_call_degrees,
         );
 
         let mut root_symbols = Vec::new();
@@ -1980,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn grounding_entrypoint_evidence_requires_production_callable_name_evidence() {
+    fn grounding_entrypoint_evidence_requires_production_callable_topology_or_language_main() {
         let root = Path::new("/repo");
         let record = |name: &str| GroundingNodeRecord {
             node: Node {
@@ -1997,35 +1857,290 @@ mod tests {
         let mut roles = [(10, FileRole::Entrypoint)]
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let fans_out = CallDegrees {
+            production_in_calls: 0,
+            out_calls: 3,
+        };
+        let called_leaf = CallDegrees {
+            production_in_calls: 4,
+            out_calls: 1,
+        };
 
-        assert!(is_grounding_entrypoint_root(
-            root,
-            &record("startApplication"),
-            &roles
-        ));
-        assert!(!is_grounding_entrypoint_root(
-            root,
-            &record("helper"),
-            &roles
-        ));
-        assert!(!is_grounding_entrypoint_root(
-            root,
-            &record("startupCache"),
-            &roles
-        ));
-        assert!(is_grounding_entrypoint_root(
-            root,
-            &record("ComicPage"),
-            &roles
-        ));
-        assert!(!is_grounding_entrypoint_root(
-            root,
-            &record("isHomepage"),
-            &roles
-        ));
+        // Topology, not vocabulary, decides: any invented name qualifies when
+        // nothing calls it and it reaches into the graph.
+        assert_eq!(
+            grounding_entry_evidence(&record("qwlfDispatch"), &roles, fans_out),
+            EntryEvidence::TopologicalRoot
+        );
+        // The same name buried under callers is a leaf, however entry-like the
+        // old catalog thought it read.
+        assert_eq!(
+            grounding_entry_evidence(&record("startApplication"), &roles, called_leaf),
+            EntryEvidence::None
+        );
+        // The language contract still carries orientation when graph coverage
+        // cannot prove topology.
+        assert_eq!(
+            grounding_entry_evidence(&record("main"), &roles, called_leaf),
+            EntryEvidence::LanguageMain
+        );
+        assert_eq!(
+            grounding_entry_evidence(&record("ComicPage"), &roles, CallDegrees::default()),
+            EntryEvidence::None
+        );
 
         roles.insert(10, FileRole::Test);
-        assert!(!is_grounding_entrypoint_root(root, &record("main"), &roles));
+        assert_eq!(
+            grounding_entry_evidence(&record("main"), &roles, fans_out),
+            EntryEvidence::None
+        );
+    }
+
+    #[test]
+    fn a_leaf_alias_never_outranks_a_referenced_subsystem_root() {
+        let root = Path::new("/repo");
+        let roles = [(10, FileRole::Source)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let record = |id: i64, name: &str| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(10)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: name.to_string(),
+            file_path: Some(root.join("src/service.ts")),
+        };
+        let degrees = [
+            (
+                CoreNodeId(1),
+                CallDegrees {
+                    production_in_calls: 0,
+                    out_calls: 6,
+                },
+            ),
+            (
+                CoreNodeId(2),
+                CallDegrees {
+                    production_in_calls: 0,
+                    out_calls: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let ordered = diversify_grounding_root_records(
+            vec![record(2, "zzHelperAlias"), record(1, "aaSubsystemRoot")],
+            root,
+            &roles,
+            &HashMap::new(),
+            &degrees,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|record| record.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["aaSubsystemRoot", "zzHelperAlias"]
+        );
+    }
+
+    #[test]
+    fn orientation_confidence_is_never_strong_with_an_evidence_class_uncertainty() {
+        for variant in [
+            GroundingOrientationUncertaintyDto::BoundedCandidateWindow,
+            GroundingOrientationUncertaintyDto::NoEntrypointEvidence,
+            GroundingOrientationUncertaintyDto::EntrypointEvidenceOmitted,
+            GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth,
+            GroundingOrientationUncertaintyDto::GraphSignalThin,
+            GroundingOrientationUncertaintyDto::LexicalFallback,
+        ] {
+            assert_ne!(
+                orientation_confidence(&[variant], false, false),
+                GroundingOrientationConfidenceDto::Strong,
+                "{variant:?} must not coexist with strong confidence"
+            );
+        }
+        assert_eq!(
+            orientation_confidence(
+                &[GroundingOrientationUncertaintyDto::LexicalFallback],
+                false,
+                false
+            ),
+            GroundingOrientationConfidenceDto::Weak
+        );
+        assert_eq!(
+            orientation_confidence(
+                &[GroundingOrientationUncertaintyDto::GraphSignalThin],
+                false,
+                false
+            ),
+            GroundingOrientationConfidenceDto::Partial
+        );
+    }
+
+    fn file_summary(
+        file_id: i64,
+        relative: &str,
+        language: &str,
+        best_node_rank: u8,
+        symbol_count: u32,
+    ) -> codestory_store::GroundingFileSummary {
+        let path = Path::new("/repo").join(relative);
+        codestory_store::GroundingFileSummary {
+            file_role: Some(FileRole::classify_path(Path::new(relative))),
+            file: FileInfo {
+                id: file_id,
+                path,
+                language: language.to_string(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 32,
+                file_role: FileRole::classify_path(Path::new(relative)),
+            },
+            symbol_count,
+            best_node_rank,
+        }
+    }
+
+    fn candidate_universe(
+        summaries: &[codestory_store::GroundingFileSummary],
+    ) -> (Vec<i64>, HashMap<i64, FileRole>) {
+        let roles = summaries
+            .iter()
+            .filter_map(|summary| summary.file_role.map(|role| (summary.file.id, role)))
+            .collect::<HashMap<_, _>>();
+        let languages = summaries
+            .iter()
+            .map(|summary| (summary.file.id, summary.file.language.clone()))
+            .collect::<HashMap<_, _>>();
+        (
+            grounding_root_candidate_files(Path::new("/repo"), summaries, &roles, &languages),
+            roles,
+        )
+    }
+
+    #[test]
+    fn entrypoint_role_files_reach_the_candidate_universe_despite_kind_ordered_storage() {
+        // Stored root candidates are ordered by symbol kind first, so a file
+        // whose only root is a FUNCTION never reaches the window on its own.
+        let summaries = (0..40_i64)
+            .map(|index| {
+                file_summary(
+                    500 + index,
+                    &format!("src/types/leaf_{index}.ts"),
+                    "typescript",
+                    0,
+                    64,
+                )
+            })
+            .chain([file_summary(
+                9,
+                "src/deep/nested/main.ts",
+                "typescript",
+                9,
+                1,
+            )])
+            .collect::<Vec<_>>();
+
+        let (universe, roles) = candidate_universe(&summaries);
+        assert_eq!(roles.get(&9), Some(&FileRole::Entrypoint));
+        assert!(
+            universe.contains(&9),
+            "declared entry file lost to kind-ordered leaf files: {universe:?}"
+        );
+    }
+
+    #[test]
+    fn every_production_subsystem_reaches_the_candidate_universe_through_its_file_quota() {
+        let mut summaries = Vec::new();
+        for subsystem in 0..4_i64 {
+            for file in 0..6_i64 {
+                summaries.push(file_summary(
+                    subsystem * 100 + file,
+                    &format!("crates/sub_{subsystem}/src/file_{file}.rs"),
+                    "rust",
+                    file as u8,
+                    10,
+                ));
+            }
+        }
+
+        let (universe, _) = candidate_universe(&summaries);
+        for subsystem in 0..4_i64 {
+            assert!(
+                universe.iter().any(|id| id / 100 == subsystem),
+                "subsystem {subsystem} missing from the candidate universe: {universe:?}"
+            );
+        }
+        assert!(universe.len() <= ARCHITECTURE_ROOT_FILE_LIMIT);
+    }
+
+    #[test]
+    fn orientation_reports_graph_signal_thin_when_no_candidate_has_call_degrees() {
+        let root = Path::new("/repo");
+        let roles = [(10, FileRole::Source)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let languages = [(10, "rust".to_string())]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let record = GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "someCallable".to_string(),
+                file_node_id: Some(CoreNodeId(10)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: "someCallable".to_string(),
+            file_path: Some(root.join("src/thing.rs")),
+        };
+        let evaluated = vec![record];
+        let orientation = grounding_orientation(
+            root,
+            &evaluated,
+            &evaluated,
+            evaluated.len(),
+            0,
+            &roles,
+            &languages,
+            &HashMap::new(),
+        );
+
+        assert!(
+            orientation
+                .uncertainty
+                .contains(&GroundingOrientationUncertaintyDto::GraphSignalThin)
+        );
+        assert!(
+            orientation
+                .uncertainty
+                .contains(&GroundingOrientationUncertaintyDto::LexicalFallback)
+        );
+        assert_eq!(
+            orientation.confidence,
+            GroundingOrientationConfidenceDto::Weak
+        );
+    }
+
+    #[test]
+    fn compressed_presentation_alone_does_not_cap_orientation_confidence() {
+        assert_eq!(
+            orientation_confidence(
+                &[GroundingOrientationUncertaintyDto::CompressedPresentation],
+                false,
+                false
+            ),
+            GroundingOrientationConfidenceDto::Strong
+        );
     }
 
     fn grounding_symbol(
@@ -2946,9 +3061,6 @@ mod tests {
             storage
                 .insert_nodes_batch(&frontend_nodes)
                 .expect("insert frontend graph");
-            storage
-                .insert_edges_batch(&frontend_edges)
-                .expect("insert frontend graph evidence");
 
             for (file_id, node_id, path, language, name) in [
                 (
@@ -2984,6 +3096,29 @@ mod tests {
                 )
                 .expect("insert architecture boundary");
             }
+
+            // The entry point is the only production callable nothing calls
+            // that reaches into the graph; the boundaries it wires each gain a
+            // production caller. No name in this fixture carries any meaning.
+            for (offset, boundary) in [2_001_i64, 3_001, 4_001].into_iter().enumerate() {
+                frontend_edges.push(Edge {
+                    id: EdgeId(1_600 + offset as i64),
+                    source: CoreNodeId(1_002),
+                    target: CoreNodeId(boundary),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(101)),
+                    line: Some(110 + offset as u32),
+                    resolved_source: None,
+                    resolved_target: None,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                });
+            }
+            storage
+                .insert_edges_batch(&frontend_edges)
+                .expect("insert frontend graph evidence");
 
             for index in 0..12_i64 {
                 let file_id = 500 + index;

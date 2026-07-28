@@ -1,5 +1,6 @@
 //! Ensures the retrieval generalization lint script stays runnable from the workspace root.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
@@ -95,7 +96,10 @@ fn run_lint_with_named_fixtures(fixtures: &[(&str, &str)]) -> Output {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
     for (name, contents) in fixtures {
-        std::fs::write(fixture_root.path().join(name), contents).expect("write fixture");
+        let file_path = fixture_root.path().join(name);
+        std::fs::create_dir_all(file_path.parent().expect("fixture parent"))
+            .expect("create fixture parent");
+        std::fs::write(file_path, contents).expect("write fixture");
     }
     run_lint_with_scan_root(&repo_root, &script, fixture_root.path())
 }
@@ -172,19 +176,24 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
-    let output = Command::new("node")
-        .arg(&script)
-        .current_dir(&repo_root)
-        .env(
-            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
-            fixture_root.path(),
-        )
-        .output()
-        .expect("run lint-retrieval-generalization.mjs");
+    // The lock is released before the assertions: a failing assertion must
+    // report itself, not poison the mutex and turn every later guard test into
+    // a lock error that hides its own result.
+    let output = {
+        let _guard = LINT_SCRIPT_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock lint script subprocess");
+        Command::new("node")
+            .arg(&script)
+            .current_dir(&repo_root)
+            .env(
+                "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
+                fixture_root.path(),
+            )
+            .output()
+            .expect("run lint-retrieval-generalization.mjs")
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -810,4 +819,215 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
             "lint should report banned literals in {file}, stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn linter_catches_framework_filename_shapes_the_ranking_rebuild_deleted() {
+    for probe in [
+        "payload.config.ts",
+        "payload-types.ts",
+        "next.config.ts",
+        "app.svelte",
+        "/src/collections/posts",
+        "/exec/src/cli.rs",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_framework_shape() -> &'static str {{ {probe:?} }}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "framework filename shape `{probe}` must not be reintroducible, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_scans_every_runtime_source_file_for_holdout_names() {
+    // The scope hole this lane closed: the ranking files decide root order but
+    // were outside the banned-name scan, so an entry-point name catalog shipped
+    // with this lint green. A file count cannot hold the scope -- any set of
+    // files satisfies a count -- so assert that a file the lint has never been
+    // told about is scanned the moment it exists. Only a file inside the real
+    // default scan roots can prove that; a temp fixture root proves the rule,
+    // not the scope, because it replaces those roots outright.
+    let repo_root = workspace_root();
+    let (baseline, planted_output) = run_default_lint_with_planted_source(
+        &repo_root,
+        Path::new("crates/codestory-runtime/src/ranking_scope_probe_generated.rs"),
+        "pub fn unlisted_ranking_module() -> &'static str { \"createApplication\" }\n",
+    );
+
+    assert!(
+        baseline.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&planted_output.stderr);
+    assert!(
+        !planted_output.status.success(),
+        "a runtime source file nobody listed must still be scanned, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ranking_scope_probe_generated.rs"),
+        "the lint should name the unlisted file it rejected, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_scans_a_tests_dot_rs_that_no_parent_declares_cfg_test() {
+    // The hole a `baseName == "tests.rs"` exclusion would open: any shipped
+    // module named `tests.rs` would leave the lint entirely, with nothing in
+    // the file itself marking it test-only. This probe is a plain module body
+    // that nothing declares under `#[cfg(test)]`, carrying both a holdout name
+    // and an eval-corpus path, so both passes have to reject it.
+    let repo_root = workspace_root();
+    let (baseline, planted_output) = run_default_lint_with_planted_source(
+        &repo_root,
+        Path::new("crates/codestory-runtime/src/ranking_probe/tests.rs"),
+        concat!(
+            "pub fn ranking_probe_entry_points() -> [&'static str; 2] {\n",
+            "    [\"createApplication\", \"benchmarks/tasks\"]\n",
+            "}\n"
+        ),
+    );
+
+    assert!(
+        baseline.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&planted_output.stderr);
+    assert!(
+        !planted_output.status.success(),
+        "a `tests.rs` no parent marks `#[cfg(test)]` must stay linted, stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("Banned pattern") && line.contains("ranking_probe/tests.rs")
+        }),
+        "the holdout-name pass must report the planted module, stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("Production dependency on eval/query corpus")
+                && line.contains("ranking_probe/tests.rs")
+        }),
+        "the corpus pass must report the planted module, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_excludes_only_module_bodies_their_parent_declares_cfg_test() {
+    // The exclusion has to read the declaration, not the file name. Same file
+    // name, same banned contents, opposite verdicts - the only difference is
+    // whether the parent's `mod` item carries `#[cfg(test)]`.
+    let excluded = run_lint_with_named_fixtures(&[
+        (
+            "app.rs",
+            "pub fn shipped_entry() {}\n#[cfg(test)]\nmod tests;\n",
+        ),
+        (
+            "app/tests.rs",
+            "const HOLDOUT: &str = \"createApplication\";\n",
+        ),
+    ]);
+    assert!(
+        excluded.status.success(),
+        "a module body declared `#[cfg(test)] mod tests;` is compiled out of the product, stderr={}",
+        String::from_utf8_lossy(&excluded.stderr)
+    );
+
+    let shipped = run_lint_with_named_fixtures(&[
+        ("app.rs", "pub fn shipped_entry() {}\nmod tests;\n"),
+        (
+            "app/tests.rs",
+            "const HOLDOUT: &str = \"createApplication\";\n",
+        ),
+    ]);
+    let stderr = String::from_utf8_lossy(&shipped.stderr);
+    assert!(
+        !shipped.status.success(),
+        "a module body declared with a plain `mod tests;` ships, so it stays linted, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("app/tests.rs"),
+        "the lint should name the shipped module body, stderr={stderr}"
+    );
+
+    let orphan = run_lint_with_named_fixtures(&[(
+        "app/tests.rs",
+        "const HOLDOUT: &str = \"createApplication\";\n",
+    )]);
+    let stderr = String::from_utf8_lossy(&orphan.stderr);
+    assert!(
+        !orphan.status.success(),
+        "a `tests.rs` with no declaring parent at all must stay linted, stderr={stderr}"
+    );
+}
+
+/// Writes `contents` at `relative_path` inside the repository, runs the lint
+/// with its real default scan roots before and after, and removes the planted
+/// file (and any directory created for it) again, including on panic.
+fn run_default_lint_with_planted_source(
+    repo_root: &Path,
+    relative_path: &Path,
+    contents: &str,
+) -> (Output, Output) {
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    let baseline = run_default_lint(repo_root);
+    let planted = PlantedSource::write(repo_root.join(relative_path), contents);
+    let planted_output = run_default_lint(repo_root);
+    drop(planted);
+    (baseline, planted_output)
+}
+
+/// A source file planted in the real tree for the duration of one assertion.
+/// `Drop` runs while a failing assertion unwinds, so a red test cannot leave a
+/// stray module behind for the next `cargo build` to trip over.
+struct PlantedSource {
+    path: PathBuf,
+    created_directory: Option<PathBuf>,
+}
+
+impl PlantedSource {
+    fn write(path: PathBuf, contents: &str) -> Self {
+        assert!(
+            !path.exists(),
+            "planted probe would overwrite an existing file: {}",
+            path.display()
+        );
+        let parent = path.parent().expect("planted probe parent").to_path_buf();
+        let created_directory = if parent.exists() {
+            None
+        } else {
+            fs::create_dir_all(&parent).expect("create planted probe directory");
+            Some(parent)
+        };
+        fs::write(&path, contents).expect("plant probe source file");
+        Self {
+            path,
+            created_directory,
+        }
+    }
+}
+
+impl Drop for PlantedSource {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(directory) = &self.created_directory {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
+fn run_default_lint(repo_root: &Path) -> Output {
+    Command::new("node")
+        .arg(lint_script(repo_root))
+        .current_dir(repo_root)
+        .output()
+        .expect("run generalization lint")
 }
