@@ -2325,3 +2325,77 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     assert.notDeepEqual(validateWorkflows(workflows), [], label);
   }
 });
+
+test("plugin publish must actually wait on preflight and plugin proof", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "plugin-release.yml";
+  const expected = /plugin-release\.yml publish must wait on preflight and plugin proof/u;
+  const mutations = [
+    ["publish drops plugin proof", workflow => {
+      workflow.jobs.publish.needs = ["preflight"];
+    }],
+    ["publish waits on nothing", workflow => {
+      delete workflow.jobs.publish.needs;
+    }],
+    ["publish waits on a single scalar", workflow => {
+      workflow.jobs.publish.needs = "preflight";
+    }],
+    ["publish waits on an unrelated job", workflow => {
+      workflow.jobs.publish.needs = ["preflight", "post-publish-smoke"];
+    }],
+    ["a scalar needs spells the gate as one string", workflow => {
+      workflow.jobs.publish.needs = "preflight, plugin-proof";
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "marketplace-sync.yml";
+  const guard = "Validate the dispatched release coordinates";
+  const mutations = [
+    ["the untokened check interpolates the commit", workflow => {
+      const step = draftStep(workflow.jobs.sync, "Require a published release for this commit");
+      step.run = step.run.replace('"$INPUT_COMMIT^{commit}"', '"${{ inputs.commit }}^{commit}"');
+    }, /steps\.2 must read dispatch inputs from env/u],
+    ["the tokened publish interpolates the version", workflow => {
+      const step = draftStep(workflow.jobs.sync, "Point the catalog at the published release");
+      step.run = step.run.replace('"$INPUT_VERSION"', '"${{ inputs.version }}"');
+    }, /steps\.4 must read dispatch inputs from env/u],
+    ["a consumed input loses its env binding", workflow => {
+      delete draftStep(workflow.jobs.sync, "Point the catalog at the published release")
+        .env.INPUT_COMMIT;
+    }, /steps\.4 must bind INPUT_COMMIT/u],
+    ["an env binding is rewired to another value", workflow => {
+      draftStep(workflow.jobs.sync, guard).env.INPUT_VERSION = "${{ github.ref_name }}";
+    }, /steps\.0 must bind INPUT_VERSION/u],
+    ["the commit shape check disappears", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("^[0-9a-fA-F]{7,40}$", "^.*$");
+    }, /step Validate the dispatched release coordinates must run \^\[0-9a-fA-F\]\{7,40\}\$/u],
+    ["the version shape check disappears", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("^[0-9]+\\.[0-9]+\\.[0-9]+", "^.+");
+    }, /step Validate the dispatched release coordinates must run \^\[0-9\]\+/u],
+    ["validation moves behind the minted token", workflow => {
+      moveNamedStepAfter(workflow.jobs.sync, guard, "Mint a scoped marketplace token");
+    }, /must validate the dispatched coordinates before any other step/u],
+    ["a third dispatch input appears", workflow => {
+      workflow.on.workflow_dispatch.inputs.ref = { required: false, type: "string" };
+    }, /must dispatch on exactly a version and a commit/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});

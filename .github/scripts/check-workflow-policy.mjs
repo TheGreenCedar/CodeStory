@@ -4473,8 +4473,7 @@ export function validatePluginRelease(workflows, violations) {
   ]);
   add(
     violations,
-    sameStrings(nonCommentLines(object(jobs.publish).needs === undefined ? "" : ""), []) ||
-      JSON.stringify(object(jobs.publish).needs) === JSON.stringify(["preflight", "plugin-proof"]),
+    sameStrings(needs(jobs.publish), ["preflight", "plugin-proof"]),
     `${file} publish must wait on preflight and plugin proof`,
   );
   add(
@@ -4499,6 +4498,55 @@ export function validatePluginRelease(workflows, violations) {
   );
 }
 
+export function validateMarketplaceSync(workflows, violations) {
+  const file = "marketplace-sync.yml";
+  const workflow = workflows.get(file);
+  if (!workflow) {
+    violations.push(`${file} must exist`);
+    return;
+  }
+  add(
+    violations,
+    hasExactKeys(at(workflow, "on", "workflow_dispatch", "inputs"), ["version", "commit"]),
+    `${file} must dispatch on exactly a version and a commit`,
+  );
+  const job = requireJob(violations, file, workflow, "sync");
+  const bindings = {
+    INPUT_COMMIT: "${{ inputs.commit }}",
+    INPUT_VERSION: "${{ inputs.version }}",
+  };
+  for (const [index, rawStep] of list(job.steps).entries()) {
+    const step = object(rawStep);
+    if (typeof step.run !== "string") continue;
+    // Interpolation is textual and quoting does not stop command substitution, so a dispatched
+    // value spliced into script text executes on the runner -- here beside repository tokens.
+    add(
+      violations,
+      !step.run.includes("${{"),
+      `${file} jobs.sync.steps.${index} must read dispatch inputs from env, not interpolated script text`,
+    );
+    for (const [name, expected] of Object.entries(bindings)) {
+      if (!step.run.includes(`$${name}`)) continue;
+      add(
+        violations,
+        object(step.env)[name] === expected,
+        `${file} jobs.sync.steps.${index} must bind ${name} to ${expected}`,
+      );
+    }
+  }
+  // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
+  const guard = "Validate the dispatched release coordinates";
+  requireStepRun(violations, file, job, guard, [
+    "^[0-9a-fA-F]{7,40}$",
+    "^[0-9]+\\.[0-9]+\\.[0-9]+",
+  ]);
+  add(
+    violations,
+    stepIndex(job, guard) === 0,
+    `${file} must validate the dispatched coordinates before any other step`,
+  );
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -4506,6 +4554,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   }
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations);
+  validateMarketplaceSync(workflows, violations);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);
