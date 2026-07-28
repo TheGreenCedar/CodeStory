@@ -4416,6 +4416,29 @@ export function validateCargoTestFilters(
   }
 }
 
+// The only secret read the plugin lane is allowed is the marketplace app identity, and only in the
+// step that mints the scoped token. Return a copy of the workflow with exactly that read removed,
+// so whatever still names the secrets context afterwards is a read nobody sanctioned. Both the key
+// and the expression must match exactly: swapping either value for a different secret leaves the
+// mention in place rather than inheriting the exemption.
+const MARKETPLACE_IDENTITY_READS = new Map([
+  ["app-id", "${{ secrets.MARKETPLACE_APP_ID }}"],
+  ["private-key", "${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}"],
+]);
+
+function withoutMarketplaceIdentity(workflow) {
+  const redacted = JSON.parse(JSON.stringify(workflow));
+  const tokenStep = namedStep(
+    object(object(redacted.jobs)["marketplace-publish"]),
+    "Mint a scoped marketplace token",
+  );
+  const inputs = object(tokenStep?.with);
+  for (const [key, expression] of MARKETPLACE_IDENTITY_READS) {
+    if (inputs[key] === expression) delete inputs[key];
+  }
+  return redacted;
+}
+
 export function validatePluginRelease(workflows, violations, graph) {
   const file = "plugin-release.yml";
   const workflow = workflows.get(file);
@@ -4429,30 +4452,18 @@ export function validatePluginRelease(workflows, violations, graph) {
   // Nothing is built or signed on the plugin lane, so it declares no callable secret surface and
   // its caller forwards none. The one credential it may read is the marketplace app identity, and
   // only where the scoped token is minted.
-  const marketplaceTokenIndex = list(object(object(workflow.jobs)["marketplace-publish"]).steps)
-    .findIndex(step => object(step).name === "Mint a scoped marketplace token");
-  const marketplaceIdentityKeys = new Map([
-    ["${{ secrets.MARKETPLACE_APP_ID }}", "app-id"],
-    ["${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}", "private-key"],
-  ]);
-  walk(workflow, (key, value, trail) => {
-    const mentionsSecret = key === "secrets"
-      || (typeof value === "string" && value.includes("secrets."));
-    if (!mentionsSecret) return;
-    const mintsMarketplaceIdentity = marketplaceTokenIndex >= 0
-      && trail.length === 6
-      && trail[0] === "jobs"
-      && trail[1] === "marketplace-publish"
-      && trail[2] === "steps"
-      && trail[3] === marketplaceTokenIndex
-      && trail[4] === "with"
-      && marketplaceIdentityKeys.get(value) === key;
-    add(
-      violations,
-      mintsMarketplaceIdentity,
-      `${file} must not receive or forward secrets beyond the minted marketplace app identity: nothing is built or signed on the plugin lane`,
-    );
-  });
+  //
+  // The rule stays a whole-workflow substring scan, no weaker than the blanket ban it replaces,
+  // because "secrets." is not the only way to reach the context: `toJSON(secrets)`,
+  // `secrets['NAME']`, a `secrets:` key, a secret smuggled through a bare array element, and
+  // `SECRETS.NAME` (contexts are case-insensitive) all name it without that substring. Instead of
+  // pattern-matching the smuggling shapes, redact the two permitted identity reads at their exact
+  // position and require the remainder to mention secrets nowhere at all.
+  add(
+    violations,
+    !/secrets/iu.test(JSON.stringify(withoutMarketplaceIdentity(workflow))),
+    `${file} must not receive or forward secrets beyond the minted marketplace app identity: nothing is built or signed on the plugin lane`,
+  );
   walk(workflow, (key, value) => {
     if (/^APPLE_/u.test(key) || (typeof value === "string" && /\bAPPLE_[A-Z0-9_]+\b/u.test(value))) {
       violations.push(`${file} must never reference Apple signing material`);
