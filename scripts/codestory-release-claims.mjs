@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
-const GRAPH_VERSION = 7;
+const GRAPH_VERSION = 8;
 const KNOWN_PACKAGE_TARGETS = new Set([
   "linux-arm64",
   "linux-x64",
@@ -225,6 +225,156 @@ function uniqueById(values, label) {
     found.set(id, row);
   }
   return found;
+}
+
+/// Every closeout cell one protected job produces, keyed by the leaf Actions job name that produces
+/// it. A host that goes missing takes its whole column with it, so the withheld set is derived from
+/// the graph instead of listed by hand: adding a cell to a protected job cannot leave a stale
+/// non-claim behind that quietly keeps claiming something.
+function cellsByProducerJobName(cellGroups) {
+  const byJobName = new Map();
+  const record = (jobName, cellId) => {
+    if (typeof jobName !== "string" || jobName === "") return;
+    if (!byJobName.has(jobName)) byJobName.set(jobName, []);
+    byJobName.get(jobName).push(cellId);
+  };
+  for (const [groupId, group] of cellGroups) {
+    if (group.expansion === "instances") {
+      for (const instance of group.instances) {
+        record(
+          instance.identity_constraints?.producer_job_name
+            ?? group.identity_constraints?.producer_job_name,
+          `${groupId}:${instance.id}`,
+        );
+      }
+    }
+  }
+  return byJobName;
+}
+
+/// How much of a release may go unproven and still publish. Withholding exists so one dead host
+/// cannot cost a release its other nine cells -- it is not a way to publish a release nothing
+/// vouched for. The two numbers below are the whole policy and they live in the graph rather than
+/// in the closeout, because a reader deciding whether to trust a release reads the graph:
+///
+///   * `maximum_withheld_hosts` bounds how many of the protected hosts may be silent at once. It
+///     must stay strictly below the number of hosts, so "every accelerator was withheld" is
+///     unrepresentable rather than merely discouraged.
+///   * `claims_requiring_proof` names the claims that must retain at least one *passing* cell in
+///     any phase that requires them. A withheld cell records a non-claim, so it can never be the
+///     thing that satisfies one of these.
+function validateWithholdPolicy(policy, hosts, cellGroups) {
+  const withhold = object(
+    policy.withhold_policy,
+    "release claim graph.non_claim_policy.withhold_policy",
+  );
+  const maximum = withhold.maximum_withheld_hosts;
+  if (!Number.isInteger(maximum) || maximum < 1) {
+    fail("non_claim_policy.withhold_policy.maximum_withheld_hosts must be a positive integer");
+  }
+  if (maximum >= hosts.size) {
+    fail(
+      "non_claim_policy.withhold_policy.maximum_withheld_hosts must leave at least one protected "
+      + `host proven (${hosts.size} hosts are declared)`,
+    );
+  }
+  const required = stringArray(
+    withhold.claims_requiring_proof,
+    "non_claim_policy.withhold_policy.claims_requiring_proof",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(required) !== JSON.stringify([...required].sort())) {
+    fail("non_claim_policy.withhold_policy.claims_requiring_proof must be sorted");
+  }
+  const claimOfCellGroup = new Map(
+    [...cellGroups].map(([groupId, group]) => [groupId, group.claim]),
+  );
+  const closeoutClaims = new Set(claimOfCellGroup.values());
+  for (const claimId of required) {
+    if (!closeoutClaims.has(claimId)) {
+      fail(`non_claim_policy.withhold_policy.claims_requiring_proof names unclosed claim ${claimId}`);
+    }
+  }
+  const withheldClaims = new Set();
+  for (const host of hosts.values()) {
+    for (const cellId of host.withheld_cells ?? []) {
+      const claimId = claimOfCellGroup.get(String(cellId).split(":")[0]);
+      if (claimId !== undefined) withheldClaims.add(claimId);
+    }
+  }
+  // Every claim a host can withhold has to be one the policy insists stays proven somewhere,
+  // otherwise the cap would be silent about exactly the claims withholding can erase.
+  for (const claimId of [...withheldClaims].sort()) {
+    if (!required.includes(claimId)) {
+      fail(
+        `non_claim_policy.withhold_policy.claims_requiring_proof must include ${claimId}, `
+        + "which a withheld host can erase",
+      );
+    }
+  }
+}
+
+function validateNonClaimPolicy(graph, cellGroups) {
+  const policy = object(graph.non_claim_policy, "release claim graph.non_claim_policy");
+  if (policy.schema !== "codestory.release-non-claim/v1") {
+    fail("release claim graph.non_claim_policy.schema must be codestory.release-non-claim/v1");
+  }
+  // The recorded state mirrors the package manifest's own accelerator non-claim, so a reader who
+  // already understands `not_proven_by_package` reads a withheld release cell the same way.
+  if (policy.runtime_execution !== "not_proven_by_package") {
+    fail("release claim graph.non_claim_policy.runtime_execution must be not_proven_by_package");
+  }
+  nonEmptyText(policy.reason, "release claim graph.non_claim_policy.reason");
+  nonEmptyText(policy.annotation, "release claim graph.non_claim_policy.annotation");
+  nonEmptyText(policy.recovery_contract, "release claim graph.non_claim_policy.recovery_contract");
+  if (policy.maximum_run_attempts !== 2) {
+    fail("release claim graph.non_claim_policy.maximum_run_attempts must be 2");
+  }
+  for (const key of ["producer_workflow", "producer_job", "producer_job_name"]) {
+    nonEmptyText(policy[key], `release claim graph.non_claim_policy.${key}`);
+  }
+  const producedCells = cellsByProducerJobName(cellGroups);
+  const hosts = uniqueById(policy.hosts, "release claim graph.non_claim_policy.hosts");
+  validateWithholdPolicy(policy, hosts, cellGroups);
+  const artifacts = new Set();
+  const accelerator = cellGroups.get("accelerator_execution");
+  const acceleratorInstances = (accelerator?.instances ?? []).map(({ id }) => id).sort();
+  if (JSON.stringify([...hosts.keys()].sort()) !== JSON.stringify(acceleratorInstances)) {
+    fail("non_claim_policy.hosts must name exactly the protected accelerator instances");
+  }
+  for (const [hostId, host] of hosts) {
+    nonEmptyText(host.unavailable_producer_workflow, `non_claim_policy.hosts ${hostId}.unavailable_producer_workflow`);
+    const jobName = nonEmptyText(
+      host.unavailable_producer_job_name,
+      `non_claim_policy.hosts ${hostId}.unavailable_producer_job_name`,
+    );
+    // One artifact container may only hold cells of a single closeout phase, because the phase's
+    // trusted producer map is what authorizes every manifest inside the container it downloads.
+    const hostArtifacts = object(
+      host.producer_artifacts,
+      `non_claim_policy.hosts ${hostId}.producer_artifacts`,
+    );
+    if (JSON.stringify(Object.keys(hostArtifacts).sort()) !== JSON.stringify(["post_publish", "pre_publish"])) {
+      fail(`non_claim_policy.hosts ${hostId}.producer_artifacts must name one artifact per closeout phase`);
+    }
+    for (const [phase, artifact] of Object.entries(hostArtifacts)) {
+      nonEmptyText(artifact, `non_claim_policy.hosts ${hostId}.producer_artifacts.${phase}`);
+      if (!artifact.includes("{attempt}")) {
+        fail(`non_claim_policy.hosts ${hostId}.producer_artifacts.${phase} must be attempt-qualified`);
+      }
+      if (artifacts.has(artifact)) fail(`non_claim_policy.hosts duplicates artifact ${artifact}`);
+      artifacts.add(artifact);
+    }
+    const declared = stringArray(
+      host.withheld_cells,
+      `non_claim_policy.hosts ${hostId}.withheld_cells`,
+      { nonEmpty: true },
+    );
+    const derived = producedCells.get(jobName) ?? [];
+    if (JSON.stringify([...declared].sort()) !== JSON.stringify([...derived].sort())) {
+      fail(`non_claim_policy host ${hostId} must withhold exactly the cells ${jobName} produces`);
+    }
+  }
 }
 
 function validatePublicSupport(graph, packageTargets, cellGroups) {
@@ -707,6 +857,8 @@ export function validateReleaseClaimGraph(graph) {
     }
   }
 
+  validateNonClaimPolicy(graph, cellGroups);
+
   const policy = object(graph.workflow_policy, "release claim graph.workflow_policy");
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
@@ -889,6 +1041,8 @@ export function validatePlatformNarrativeDocuments(graph, repoRoot) {
   }
 }
 
+export const RELEASE_CLOSEOUT_SUMMARY_ASSET = "release-closeout-summary.json";
+
 export function releaseAssetNames(graph, version) {
   validateReleaseClaimGraph(graph);
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
@@ -900,23 +1054,66 @@ export function releaseAssetNames(graph, version) {
         `codestory-cli-v${version}-${target}.${extension}`,
     ),
     "SHA256SUMS.txt",
+    // The one machine-readable statement of what this release did and did not prove. It ships with
+    // the release because the README tells readers to consult the ledger rather than the platform
+    // table, and an Actions artifact with a 30-day retention is not something a release consumer
+    // can reach.
+    RELEASE_CLOSEOUT_SUMMARY_ASSET,
   ];
 }
 
-export function renderReleasePlatformNotes(graph) {
+/// Which package target each protected accelerator host speaks for, derived from the cells the host
+/// withholds rather than from a second copy of the mapping.
+function acceleratorHostByTarget(graph) {
+  const byTarget = new Map();
+  for (const host of graph.non_claim_policy.hosts) {
+    for (const cellId of host.withheld_cells) {
+      const [group, instance] = cellId.split(":");
+      if (group === "candidate_installed_behavior") byTarget.set(instance, host);
+    }
+  }
+  return byTarget;
+}
+
+/// The platform table that goes into the published GitHub release notes.
+///
+/// This is the surface a release consumer actually reads, so it is rendered from the accepted
+/// closeout ledger, never from the static graph alone. Rendering it from the graph is how a release
+/// whose Vulkan proof was withheld still announced "supported with Vulkan": the graph says what the
+/// repository intends to support, and only the ledger says what this release proved. A withheld
+/// accelerator is stated in the notes, in the same words the ledger recorded it in.
+export function renderReleasePlatformNotes(graph, ledger) {
   validateReleaseClaimGraph(graph);
-  const packages = graph.public_support.packages.map(
-    ({ label, accelerator_claim: claim }) =>
-      `- ${label}: supported with ${claim === "metal" ? "Metal" : "Vulkan"}`,
-  );
+  const closeout = object(ledger, "closeout ledger");
+  const withheldCells = new Set(stringArray(closeout.withheld_cells, "closeout ledger.withheld_cells"));
+  const hostByTarget = acceleratorHostByTarget(graph);
+  const reason = graph.non_claim_policy.reason;
+  const packages = graph.public_support.packages.map(({ label, target, accelerator_claim: claim }) => {
+    const accelerator = claim === "metal" ? "Metal" : "Vulkan";
+    const host = hostByTarget.get(target);
+    const withheld = host !== undefined
+      && host.withheld_cells.some((cellId) =>
+        cellId.startsWith("accelerator_execution:") && withheldCells.has(cellId));
+    return withheld
+      ? `- ${label}: ${accelerator} not proven for this release (${reason})`
+      : `- ${label}: supported with ${accelerator}`;
+  });
   const unsupported = graph.public_support.unsupported.map(
     ({ label }) => `- ${label}: unsupported`,
   );
+  const withheldNote = withheldCells.size === 0
+    ? []
+    : [
+      "",
+      `This release withheld ${withheldCells.size} evidence cell(s); `
+      + "release-closeout-summary.json names every one of them.",
+    ];
   return [
     "## Platform support",
     "",
     ...packages,
     ...unsupported,
+    ...withheldNote,
   ].join("\n");
 }
 
@@ -1403,7 +1600,10 @@ function main() {
     return;
   }
   if (command === "release-platform-notes") {
-    console.log(renderReleasePlatformNotes(graph));
+    // The ledger is required, not optional: an optional ledger would mean the published notes can
+    // still be produced from the graph alone, which is the exact fail-open this command had.
+    const ledgerPath = nonEmptyText(values.ledger, "--ledger");
+    console.log(renderReleasePlatformNotes(graph, JSON.parse(readFileSync(ledgerPath, "utf8"))));
     return;
   }
   if (command === "evaluate") {

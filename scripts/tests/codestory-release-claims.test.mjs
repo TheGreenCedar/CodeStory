@@ -103,7 +103,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 7);
+  assert.equal(graph.graph_version, 8);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -177,15 +177,37 @@ test("public support, assets, and release notes derive from the package and clos
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
       "codestory-cli-v0.16.0-linux-x64.tar.gz",
       "SHA256SUMS.txt",
+      // The README tells a reader to consult the ledger rather than the platform table, so the
+      // machine-readable closeout summary has to ship with the release itself.
+      "release-closeout-summary.json",
     ],
   );
-  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Supported with Metal/u);
-  assert.match(renderPublicSupport(graph), /Windows x64 \\| Supported with Vulkan/u);
-  assert.match(renderPublicSupport(graph), /Linux x64 \\| Supported with Vulkan/u);
-  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \\| Unsupported/u);
-  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: supported with Metal/u);
-  assert.match(renderReleasePlatformNotes(graph), /Windows x64: supported with Vulkan/u);
-  assert.match(renderReleasePlatformNotes(graph), /Linux x64: supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Apple Silicon \| Supported with Metal/u);
+  assert.match(renderPublicSupport(graph), /Windows x64 \| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Linux x64 \| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \| Unsupported/u);
+
+  // The release notes are a claim about one release, so they are rendered from that release's
+  // ledger. The graph alone can no longer produce them.
+  const proven = renderReleasePlatformNotes(graph, { withheld_cells: [] });
+  assert.match(proven, /macOS 15\+ on Apple Silicon: supported with Metal/u);
+  assert.match(proven, /Windows x64: supported with Vulkan/u);
+  assert.match(proven, /Linux x64: supported with Vulkan/u);
+  assert.throws(() => renderReleasePlatformNotes(graph), /closeout ledger/u);
+  assert.throws(() => renderReleasePlatformNotes(graph, {}), /withheld_cells/u);
+
+  const withheld = renderReleasePlatformNotes(graph, {
+    withheld_cells: [
+      "accelerator_execution:linux-x64-vulkan",
+      "candidate_installed_behavior:linux-x64",
+    ],
+  });
+  assert.match(
+    withheld,
+    /Linux x64: Vulkan not proven for this release \(accelerator_host_unavailable\)/u,
+  );
+  assert.equal(/Linux x64: supported with Vulkan/u.test(withheld), false);
+  assert.match(withheld, /Windows x64: supported with Vulkan/u);
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -244,6 +266,70 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(aggregateCell),
     /identity undeclared_identity must declare a format/u,
+  );
+
+  // A non-claim that withholds less than the lost host actually produced would leave a live claim
+  // resting on a proof that never ran, so the withheld set is checked against the graph itself.
+  const partialNonClaim = structuredClone(graph);
+  partialNonClaim.non_claim_policy.hosts.find(({ id }) => id === "linux-x64-vulkan")
+    .withheld_cells = ["accelerator_execution:linux-x64-vulkan"];
+  assert.throws(
+    () => validateReleaseClaimGraph(partialNonClaim),
+    /must withhold exactly the cells Packaged Linux Vulkan engine produces/u,
+  );
+
+  const unboundedRecovery = structuredClone(graph);
+  unboundedRecovery.non_claim_policy.maximum_run_attempts = 12;
+  assert.throws(
+    () => validateReleaseClaimGraph(unboundedRecovery),
+    /maximum_run_attempts must be 2/u,
+  );
+
+  const softenedNonClaim = structuredClone(graph);
+  softenedNonClaim.non_claim_policy.runtime_execution = "assumed_from_prior_release";
+  assert.throws(
+    () => validateReleaseClaimGraph(softenedNonClaim),
+    /runtime_execution must be not_proven_by_package/u,
+  );
+
+  // The withhold cap is data, and the graph refuses a cap that could leave nothing proven. A cap
+  // equal to the number of protected hosts makes "no accelerator was proven anywhere" a legal
+  // release, which is the whole thing the cap exists to make unrepresentable.
+  const uncappedWithholding = structuredClone(graph);
+  uncappedWithholding.non_claim_policy.withhold_policy.maximum_withheld_hosts =
+    uncappedWithholding.non_claim_policy.hosts.length;
+  assert.throws(
+    () => validateReleaseClaimGraph(uncappedWithholding),
+    /must leave at least one protected host proven/u,
+  );
+
+  const noCap = structuredClone(graph);
+  delete noCap.non_claim_policy.withhold_policy;
+  assert.throws(() => validateReleaseClaimGraph(noCap), /withhold_policy must be an object/u);
+
+  const zeroCap = structuredClone(graph);
+  zeroCap.non_claim_policy.withhold_policy.maximum_withheld_hosts = 0;
+  assert.throws(
+    () => validateReleaseClaimGraph(zeroCap),
+    /maximum_withheld_hosts must be a positive integer/u,
+  );
+
+  // Dropping a claim a lost host can erase would make the cap silent about exactly that claim.
+  const unguardedClaim = structuredClone(graph);
+  unguardedClaim.non_claim_policy.withhold_policy.claims_requiring_proof =
+    unguardedClaim.non_claim_policy.withhold_policy.claims_requiring_proof
+      .filter((claimId) => claimId !== "accelerator_execution");
+  assert.throws(
+    () => validateReleaseClaimGraph(unguardedClaim),
+    /claims_requiring_proof must include accelerator_execution/u,
+  );
+
+  const unmatchedHosts = structuredClone(graph);
+  unmatchedHosts.non_claim_policy.hosts = unmatchedHosts.non_claim_policy.hosts
+    .filter(({ id }) => id !== "linux-x64-vulkan");
+  assert.throws(
+    () => validateReleaseClaimGraph(unmatchedHosts),
+    /must name exactly the protected accelerator instances/u,
   );
 
   const mismatchedSupport = structuredClone(graph);

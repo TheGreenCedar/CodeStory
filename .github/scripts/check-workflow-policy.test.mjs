@@ -5,11 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
 import {
+  LOST_RUNNER_ANNOTATION,
+  MAXIMUM_RUN_ATTEMPTS,
+} from "./lost-runner-recovery.mjs";
+import {
+  annotationScopeViolations,
   basicWorkflowViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
   loadWorkflows,
+  lostRunnerRecoveryViolations,
   macosCliDistributionViolations,
   notaryStepViolations,
   packagedPrSigningViolations,
@@ -2469,4 +2476,204 @@ test("the plugin lane still forbids building, signing, and forwarded secrets", a
       assert.match(violations.join("\n"), expected);
     });
   }
+});
+
+test("every lane that reads job annotations holds the checks: read scope", async (t) => {
+  // The recovery path was inert in production because none of the three permission blocks that
+  // govern the annotations call granted `checks: read`. The live repository now does, in all three
+  // -- including auto-release.yml, the lane that actually publishes.
+  const workflows = loadWorkflows();
+  assert.deepEqual(annotationScopeViolations(workflows), []);
+  assert.equal(workflows.get("release.yml").permissions.checks, "read");
+  assert.equal(workflows.get("lost-runner-rerun.yml").permissions.checks, "read");
+  assert.equal(workflows.get("auto-release.yml").jobs.release.permissions.checks, "read");
+
+  const mutations = [
+    ["release.yml loses the scope", live => {
+      delete live.get("release.yml").permissions.checks;
+    }, /release\.yml job accelerator-non-claim .*checks: read/u],
+    ["auto-release.yml loses the scope", live => {
+      delete live.get("auto-release.yml").jobs.release.permissions.checks;
+    }, /auto-release\.yml job release .*checks: read/u],
+    ["lost-runner-rerun.yml loses the scope", live => {
+      delete live.get("lost-runner-rerun.yml").permissions.checks;
+    }, /lost-runner-rerun\.yml job rerun-lost-jobs .*checks: read/u],
+    // A job-level block replaces the workflow-level one, so a narrower job grant is a real loss.
+    ["a job-level block drops the scope", live => {
+      live.get("release.yml").jobs["accelerator-non-claim"].permissions = {
+        actions: "read",
+        contents: "read",
+      };
+    }, /release\.yml job accelerator-non-claim .*checks: read/u],
+    ["write is not read", live => {
+      live.get("release.yml").permissions.checks = "write";
+    }, /release\.yml job accelerator-non-claim .*checks: read/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const live = loadWorkflows();
+      mutate(live);
+      const violations = annotationScopeViolations(live);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+      // The whole gate must refuse too, not only the isolated predicate.
+      assert.notDeepEqual(validateWorkflows(live), []);
+    });
+  }
+});
+
+test("the closeout collects the lost-runner evidence itself and publishes from the ledger", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const mutations = [
+    // The trust boundary that decides proof-versus-non-claim must not inherit the producer's
+    // verdict, so the closeout's own producer-map call carries evidence it collected.
+    ["pre-publish closeout stops collecting its own evidence", live => {
+      const step = live.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Authenticate pre-publish Actions provenance");
+      step.run = step.run
+        .replace(/\s*bash \.github\/scripts\/collect-actions-job-evidence\.sh[^\n]*\n[^\n]*\n/u, "\n")
+        .replace(/\s*--job-evidence [^\n]*\n/u, "\n");
+    }, /must contain --job-evidence|collect-actions-job-evidence/u],
+    ["post-publish closeout stops collecting its own evidence", live => {
+      const step = live.get("release.yml").jobs["post-publish-closeout"].steps
+        .find(({ name }) => name === "Authenticate post-publish Actions provenance");
+      step.run = step.run.replace(/\s*--job-evidence [^\n]*\n/u, "\n");
+    }, /--job-evidence/u],
+    // Release notes rendered from the static graph are how a withheld accelerator was still
+    // announced as supported.
+    ["release notes rendered without the ledger", live => {
+      const step = live.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Compose versioned GitHub release notes");
+      step.run = step.run.replace(/ \\\n\s*--ledger [^\n]*/u, "");
+    }, /--ledger target\/release-closeout\/pre_publish\/ledger\.json/u],
+    ["the accepted ledger is never downloaded", live => {
+      const job = live.get("release.yml").jobs.publish;
+      job.steps = job.steps.filter(({ name }) => name !== "Download the accepted pre-publish closeout");
+    }, /Download the accepted pre-publish closeout/u],
+    // The ledger the README points readers at has to reach a release consumer.
+    ["the closeout summary stops shipping", live => {
+      const job = live.get("release.yml").jobs.publish;
+      job.steps = job.steps
+        .filter(({ name }) => name !== "Ship the accepted closeout summary with the release");
+    }, /Ship the accepted closeout summary with the release/u],
+    ["a rejected closeout is shipped anyway", live => {
+      const step = live.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Ship the accepted closeout summary with the release");
+      step.run = step.run.replace(/\s*test "\$\(jq -r \.decision "\$summary"\)" = accept\n/u, "\n");
+    }, /= accept/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const live = loadWorkflows();
+      mutate(live);
+      const violations = validateWorkflows(live);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("lost-runner recovery stays automatic, bounded, and blind to job names", () => {
+  const graph = loadReleaseClaimGraph(root);
+  const rerunFile = "lost-runner-rerun.yml";
+
+  // Both halves agree on the same live repository shape today.
+  assert.deepEqual(lostRunnerRecoveryViolations(loadWorkflows(), graph), []);
+  assert.equal(MAXIMUM_RUN_ATTEMPTS, graph.non_claim_policy.maximum_run_attempts);
+  assert.equal(LOST_RUNNER_ANNOTATION, graph.non_claim_policy.annotation);
+
+  const mutations = [
+    // Recovery that waits on a human is the failure this workflow exists to remove.
+    ["approval-gated rerun", workflows => {
+      workflows.get(rerunFile).jobs["rerun-lost-jobs"].environment = "release-recovery";
+    }],
+    ["approval-gated non-claim", workflows => {
+      workflows.get("release.yml").jobs["accelerator-non-claim"].environment = "release-recovery";
+    }],
+    // Re-running every failed job would sweep an assertion failure along with the lost one.
+    ["blanket failed-job rerun", workflows => {
+      const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs");
+      step.run = step.run.replace(
+        "actions/jobs/$job_id/rerun",
+        "actions/runs/$FAILED_RUN_ID/rerun-failed-jobs",
+      );
+    }],
+    ["ungated re-dispatch", workflows => {
+      delete workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs").if;
+    }],
+    ["unclassified re-dispatch", workflows => {
+      const job = workflows.get(rerunFile).jobs["rerun-lost-jobs"];
+      job.steps = job.steps.filter(({ name }) => name !== "Plan the bounded rerun");
+    }],
+    ["rerun on every conclusion", workflows => {
+      delete workflows.get(rerunFile).jobs["rerun-lost-jobs"].if;
+    }],
+    ["missing release observation", workflows => {
+      workflows.get(rerunFile).on.workflow_run.workflows = ["Auto Release"];
+    }],
+    ["broadened recovery permissions", workflows => {
+      workflows.get(rerunFile).permissions.contents = "write";
+    }],
+    // The withheld-claim producer must decide from the classifier, not from a red proof job.
+    ["unclassified non-claim", workflows => {
+      const job = workflows.get("release.yml").jobs["accelerator-non-claim"];
+      job.steps = job.steps.filter(({ name }) => name !== "Decide withheld accelerator hosts");
+    }],
+    ["unconditional non-claim cells", workflows => {
+      delete workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ name }) => name === "Record populated accelerator non-claims").if;
+    }],
+    ["non-claim upload for a host that reported", workflows => {
+      workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ with: options }) => String(options?.name ?? "")
+          .startsWith("release-cell-nonclaim-prepublish-linux-x64-vulkan")).if = "always()";
+    }],
+    // One container per closeout phase: a phase's producer map authorizes only the manifests it
+    // selected, so a container carrying another phase's cell is rejected at download time.
+    ["phase-mixed non-claim container", workflows => {
+      workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ with: options }) => String(options?.name ?? "")
+          .startsWith("release-cell-nonclaim-postpublish-linux-x64-vulkan"))
+        .with.path = "target/release-non-claim/cells/linux-x64-vulkan";
+    }],
+    ["closeout ignores the non-claim outcome", workflows => {
+      const job = workflows.get("release.yml").jobs["pre-publish-closeout"];
+      job.if = job.if.replace(
+        " && (needs.accelerator-non-claim.result == 'success' || needs.accelerator-non-claim.result == 'skipped')",
+        "",
+      );
+    }],
+    ["non-claim skips the accelerator hosts", workflows => {
+      workflows.get("release.yml").jobs["accelerator-non-claim"].needs = ["preflight", "packaged-proof"];
+    }],
+    ["non-claim producer job renamed away from the graph", workflows => {
+      workflows.get("release.yml").jobs["accelerator-non-claim"].name = "Skip accelerator proof";
+    }],
+    ["forged withheld cell producer", workflows => {
+      workflows.get("release.yml").jobs.publish.steps.push({
+        name: "Upload forged withheld cell",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+        },
+      });
+    }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const workflows = loadWorkflows();
+    mutate(workflows);
+    assert.notDeepEqual(validateWorkflows(workflows), [], label);
+  }
+
+  // A recovery bound that drifts from the release claim graph is caught even when the workflows
+  // are untouched: the two numbers are the same fact.
+  const drifted = structuredClone(graph);
+  drifted.non_claim_policy.maximum_run_attempts = 5;
+  assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), drifted), []);
+  const rephrased = structuredClone(graph);
+  rephrased.non_claim_policy.annotation = "The runner went away.";
+  assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), rephrased), []);
 });

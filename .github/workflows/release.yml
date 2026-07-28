@@ -30,6 +30,10 @@ on:
 
 permissions:
   actions: read
+  # accelerator-non-claim reads the job annotation that identifies a lost runner, which the Actions
+  # annotations endpoint gates on `checks: read`. Without it the collector fails closed and this
+  # workflow stops rather than mistaking an unreadable signature for an ordinary failure.
+  checks: read
   contents: read
   pull-requests: read
 
@@ -72,6 +76,7 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+          node --test .github/scripts/lost-runner-recovery.test.mjs
 
   preflight:
     name: Release preflight
@@ -327,9 +332,155 @@ jobs:
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
       emit_release_cells: true
 
+  # The repository owns one host per accelerator. When a host drops its connection instead of
+  # reporting, .github/scripts/lost-runner-rerun.yml re-dispatches it once; if the second attempt is
+  # lost the same way, this job records a populated non-claim for that host so the closeout has a
+  # visible withheld claim to accept instead of an unexplained gap. It refuses -- and fails the run
+  # -- for every other shape of failure, so a proof that ran and disagreed can never be withheld.
+  accelerator-non-claim:
+    name: Withhold unproven accelerator claims
+    if: always() && needs.preflight.result == 'success' && needs.packaged-proof.result == 'success'
+    needs:
+      - preflight
+      - packaged-proof
+      - macos-metal-proof
+      - windows-vulkan-proof
+      - linux-vulkan-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Collect protected accelerator job evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-non-claim/jobs.json
+          jq -n \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile graph release-claims.json \
+            --slurpfile jobs target/release-non-claim/jobs.json \
+            '{
+               run_attempt: $run_attempt,
+               hosts: [$graph[0].non_claim_policy.hosts[]
+                 | {id: .id, job_name: .unavailable_producer_job_name}],
+               jobs: $jobs[0]
+             }' > target/release-non-claim/plan-input.json
+
+      - name: Decide withheld accelerator hosts
+        id: non-claim
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/lost-runner-recovery.mjs plan-non-claim \
+            --input target/release-non-claim/plan-input.json \
+            --out target/release-non-claim/plan.json
+
+      - name: Download release packages for withheld identity
+        if: steps.non-claim.outputs.withheld_hosts != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: codestory-cli-*
+          path: target/release-dist
+          merge-multiple: false
+
+      - name: Record populated accelerator non-claims
+        if: steps.non-claim.outputs.withheld_hosts != ''
+        env:
+          WITHHELD_HOSTS: ${{ steps.non-claim.outputs.withheld_hosts }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          jq -n \
+            --arg installer candidate_managed_plugin \
+            --arg native_engine coderank_q8_embedded \
+            '{installer: $installer, native_engine: $native_engine}' \
+            > target/release-non-claim/identity.json
+          for host in $WITHHELD_HOSTS; do
+            case "$host" in
+              macos-arm64-metal) target=macos-arm64; extension=tar.gz ;;
+              windows-x64-vulkan) target=windows-x64; extension=zip ;;
+              linux-x64-vulkan) target=linux-x64; extension=tar.gz ;;
+              *) echo "::error::unknown non-claim host $host"; exit 1 ;;
+            esac
+            node scripts/codestory-release-cell-manifest.mjs withhold \
+              --repo "$GITHUB_WORKSPACE" \
+              --expected-sha "$GITHUB_SHA" \
+              --version "$version" \
+              --host "$host" \
+              --producer-run-id "$GITHUB_RUN_ID" \
+              --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --identity target/release-non-claim/identity.json \
+              --archive "target/release-dist/codestory-cli-$target/codestory-cli-v$version-$target.$extension" \
+              --out-dir "target/release-non-claim/cells/$host"
+          done
+
+      - name: Upload withheld pre-publish macOS accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'macos-arm64-metal')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/macos-arm64-metal/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish macOS accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'macos-arm64-metal')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/macos-arm64-metal/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld pre-publish Windows accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'windows-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/windows-x64-vulkan/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish Windows accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'windows-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/windows-x64-vulkan/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld pre-publish Linux accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'linux-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/linux-x64-vulkan/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish Linux accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'linux-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/linux-x64-vulkan/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
   pre-publish-closeout:
     name: Authenticate pre-publish release cells
-    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped')
+    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped') && (needs.accelerator-non-claim.result == 'success' || needs.accelerator-non-claim.result == 'skipped')
     needs:
       - preflight
       - source-proof
@@ -337,6 +488,7 @@ jobs:
       - macos-metal-proof
       - windows-vulkan-proof
       - linux-vulkan-proof
+      - accelerator-non-claim
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -354,6 +506,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The closeout reads the lost-runner signature itself rather than trusting the non-claim
+          # producer's verdict, so it collects the same Actions evidence independently.
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
@@ -361,6 +517,7 @@ jobs:
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --reuse "$REUSE_SELECTION" \
+            --job-evidence target/release-closeout/job-evidence.json \
             --out target/release-closeout/trusted-pre-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-pre-publish-producers.json)"
           test -n "$artifact_ids"
@@ -455,12 +612,28 @@ jobs:
           pattern: codestory-cli-*
           merge-multiple: true
 
+      # The published notes and the shipped summary both have to say what this release proved, so
+      # they are rendered from the accepted ledger rather than from the static claim graph.
+      - name: Download the accepted pre-publish closeout
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          path: target/release-closeout
+
       - name: Combine and verify checksums
         run: |
           set -euo pipefail
           find target/release-assets -name '*.sha256' -print0 | sort -z | xargs -0 cat > target/release-assets/SHA256SUMS.txt
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
+
+      - name: Ship the accepted closeout summary with the release
+        run: |
+          set -euo pipefail
+          summary=target/release-closeout/pre_publish/summary.json
+          test -f "$summary"
+          test "$(jq -r .decision "$summary")" = accept
+          cp "$summary" target/release-assets/release-closeout-summary.json
 
       - name: Compose versioned GitHub release notes
         env:
@@ -472,7 +645,8 @@ jobs:
             --output target/release-assets/release-notes.md
           {
             printf '\n'
-            node scripts/codestory-release-claims.mjs release-platform-notes
+            node scripts/codestory-release-claims.mjs release-platform-notes \
+              --ledger target/release-closeout/pre_publish/ledger.json
             printf '\n'
           } >> target/release-assets/release-notes.md
 
@@ -514,7 +688,8 @@ jobs:
           actual_file="$(mktemp)"
           printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
           find target/release-assets -maxdepth 1 -type f \
-            \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' -o -name 'SHA256SUMS.txt' \) \
+            \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' \
+               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \) \
             -exec basename {} \; | sort > "$actual_file"
           if ! diff -u "$expected_file" "$actual_file"; then
             echo "::error::Release assets differ from the release claim graph."
@@ -611,12 +786,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
             --phase post_publish \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job-evidence target/release-closeout/job-evidence.json \
             --out target/release-closeout/trusted-post-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-post-publish-producers.json)"
           test -n "$artifact_ids"
