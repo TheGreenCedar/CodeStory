@@ -631,7 +631,26 @@ function downloadFileOnce(url, destination, options = {}) {
           callback(null, chunk);
         },
       });
-      output = fs.createWriteStream(destination, appendFrom > 0 ? { flags: 'a' } : { flags: 'w' });
+      // Open the partial through an explicit no-follow descriptor rather than by path. The stat that
+      // chose `appendFrom` happened earlier, so a symlink planted in between would otherwise still be
+      // followed here; refusing the open keeps every provisioning byte inside the managed cache.
+      let partialFd;
+      try {
+        partialFd = fs.openSync(
+          destination,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT |
+            (appendFrom > 0 ? fs.constants.O_APPEND : fs.constants.O_TRUNC) |
+            (fs.constants.O_NOFOLLOW || 0),
+        );
+      } catch (error) {
+        response.resume();
+        finish(downloadError(
+          'partial_open',
+          `download_partial_open_failed:${error?.code || 'unknown'}`,
+        ));
+        return;
+      }
+      output = fs.createWriteStream(destination, { fd: partialFd });
       pipeline(response, limiter, output, (error) => finish(error || null));
     };
     // Only pass a request-options object when a Range header is actually needed: the two-argument
@@ -666,13 +685,24 @@ function publishDownloadedFile(partialPath, destination) {
   }
 }
 
+// The partial is the one attacker-reachable name in the provisioning path, so it is measured with
+// `lstat`: a symlink planted there would otherwise report the target's size and make the transfer
+// resume *through* the link into a file outside the managed cache. Anything that is not a regular
+// file can never be resumed, so it is dropped and the transfer restarts from zero.
 function partialDownloadBytes(partialPath) {
+  let metadata = null;
   try {
-    const metadata = fs.statSync(partialPath);
-    return metadata.isFile() ? metadata.size : 0;
+    metadata = fs.lstatSync(partialPath);
   } catch {
     return 0;
   }
+  if (metadata.isFile()) return metadata.size;
+  try {
+    fs.rmSync(partialPath, { force: true });
+  } catch {
+    // Best effort. The no-follow open below is what actually refuses to write through the link.
+  }
+  return 0;
 }
 
 // Downloads into `<destination>.part` and only publishes `destination` once the transfer
@@ -1521,6 +1551,7 @@ const downloadFailureKinds = new Set([
   'transport',
   'range',
   'redirect',
+  'partial_open',
   'network',
 ]);
 
@@ -1577,6 +1608,7 @@ function managedCliDownloadHint(context, code) {
       return `The release download was blocked because it was not served over HTTPS. ${manualInstallHint}`;
     case 'range':
     case 'redirect':
+    case 'partial_open':
       return 'The release download could not be resumed and was reset. Retry the tool to start it again.';
     default:
       return null;
@@ -2462,13 +2494,18 @@ function managedCliRetentionReportUnlocked(resolved, probe, options = {}) {
     reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_unverified');
     return report;
   }
-  if (probe.version !== resolved.version) {
+  // Retention is keyed on CLI identity, not plugin identity. The probe reports the CLI's own version
+  // and the cache is laid out by CLI version, so comparing either against `resolved.version` (the
+  // plugin's version) disables retention outright on every plugin-only release, where the plugin
+  // moves ahead of the pinned CLI.
+  const activeCliVersion = resolved.cliVersion || resolved.version;
+  if (probe.version !== activeCliVersion) {
     report.warnings.push('managed_cli_retention_active_version_mismatch');
     reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_version_mismatch');
     return report;
   }
 
-  const active = inventory.entries.find((entry) => entry.version === resolved.version);
+  const active = inventory.entries.find((entry) => entry.version === activeCliVersion);
   if (!active) {
     report.warnings.push('managed_cli_retention_active_directory_missing');
     reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_directory_missing');
