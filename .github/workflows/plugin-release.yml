@@ -144,6 +144,11 @@ jobs:
       - name: Run the plugin static suite
         run: node --test plugins/codestory/tests/plugin-static.test.mjs
 
+      # Prove the gate below can still fail before trusting it to pass: its wait must bound
+      # itself on readable non-managed metadata, and it must refuse to exit 0 without proving.
+      - name: Check the pinned provision proof
+        run: node --test scripts/tests/prove-plugin-pinned-provision.test.mjs
+
       # The launcher provisions the pinned, already-published CLI over the real
       # github_release path, which is the one place the pin's content addressing
       # is enforced. A digest drift between the pin and the published archive

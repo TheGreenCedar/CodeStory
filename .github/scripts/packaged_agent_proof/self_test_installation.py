@@ -15,7 +15,13 @@ class ScriptedMcpProcess(McpProcess):
         self.calls: list[tuple[str, dict, str]] = []
         self.tool_attempt_counts: dict[str, int] = {}
 
-    def tool(self, name: str, arguments: dict, request_id: str) -> dict:
+    def tool(
+        self,
+        name: str,
+        arguments: dict,
+        request_id: str,
+        deadline: float | None = None,
+    ) -> dict:
         self.calls.append((name, arguments, request_id))
         try:
             return next(self.responses)

@@ -1250,6 +1250,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/install-codestory.ps1",
       "scripts/prepare-embedded-model.mjs",
       "scripts/tests/prepare-embedded-model.test.mjs",
+      "scripts/prove-plugin-pinned-provision.mjs",
+      "scripts/lib/wait-for-managed-runtime.mjs",
+      "scripts/tests/prove-plugin-pinned-provision.test.mjs",
       "crates/codestory-llama-sys/model-contract.json",
       "crates/codestory-llama-sys/build.rs",
       "crates/codestory-llama-sys/model_staging.rs",
@@ -1272,6 +1275,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
+    // The pinned-provision proof is the plugin lane's tag gate. Its own suite has to run
+    // somewhere, or a gate that exits 0 without proving anything reads as a pass.
+    requireStepRun(violations, pluginFile, job, "Check the pinned provision proof", [
+      "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
+    ]);
     requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
       "scripts/tests/release-evidence-runner-contract.test.mjs",
     ]);
@@ -4505,6 +4513,9 @@ export function validatePluginRelease(workflows, violations, graph) {
   ]);
   requireStepRun(violations, file, preflight, "Refuse a changed tool surface", [
     "generated-mcp-catalog.json",
+  ]);
+  requireStepRun(violations, file, object(jobs["plugin-proof"]), "Check the pinned provision proof", [
+    "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
   ]);
   requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
     "scripts/prove-plugin-pinned-provision.mjs",
