@@ -2014,6 +2014,86 @@ fn published_full_retrieval_manifest(project_root: &Path) -> RetrievalIndexManif
     manifest
 }
 
+/// Publish the full fixture manifest together with the storage rows strict
+/// sidecar admission re-derives freshness from.
+///
+/// Admission (`manifest_unavailable_reason_for_runtime`) recounts the symbol
+/// docs, dense anchors, and dense-reason histogram in the store and refuses a
+/// manifest that disagrees with them. A fixture that publishes only the
+/// manifest row is therefore a publication the sidecar would *not* serve, so
+/// it cannot stand in for a healthy project when asserting that readiness
+/// reports hybrid.
+fn publish_admissible_full_retrieval_manifest(
+    storage: &mut Storage,
+    project_root: &Path,
+) -> RetrievalIndexManifest {
+    let mut manifest = published_full_retrieval_manifest(project_root);
+    manifest.dense_reason_counts_json =
+        Some(serde_json::json!({ DenseAnchorReason::PublicApi.as_str(): 2 }).to_string());
+    let symbol_doc_count = manifest.symbol_doc_count.expect("fixture symbol doc count");
+    let dense_count = manifest
+        .dense_projection_count
+        .expect("fixture dense projection count");
+    let nodes = (1..=symbol_doc_count)
+        .map(|id| Node {
+            id: CoreNodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("admissible_{id:02}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let symbol_docs = (1..=symbol_doc_count)
+        .map(|id| SymbolSearchDoc {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: format!("admissible_{id:02}"),
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: format!("admissible-doc-{id:02}"),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    let dense_inputs = (1..=dense_count)
+        .map(|id| DenseAnchorInput {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            file_role: codestory_store::FileRole::Source,
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: format!("admissible_{id:02}"),
+            document_hash: format!("admissible-anchor-{id:02}"),
+            selection_reason: DenseAnchorReason::PublicApi.as_str().to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: format!("core:admissible_{id:02}"),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .insert_nodes_batch(&nodes)
+        .expect("seed admissible publication nodes");
+    storage
+        .upsert_symbol_search_docs_batch(&symbol_docs)
+        .expect("seed admissible publication symbol docs");
+    storage
+        .upsert_dense_anchor_inputs_batch(&dense_inputs)
+        .expect("seed admissible publication dense anchors");
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .expect("publish retrieval manifest");
+    manifest
+}
+
 #[test]
 fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_docs() {
     // Regression: a fresh auto-bootstrap publishes semantic vectors through the
@@ -2027,9 +2107,7 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
     fs::create_dir_all(&project_root).expect("project root");
     let storage_path = temp.path().join("codestory.db");
     let mut storage = Storage::open(&storage_path).expect("open storage");
-    storage
-        .upsert_retrieval_index_manifest(&published_full_retrieval_manifest(&project_root))
-        .expect("publish retrieval manifest");
+    publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
     assert_eq!(
         storage
             .get_llm_symbol_doc_stats()
@@ -2088,6 +2166,113 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
     assert_eq!(wire["mode"], serde_json::json!("hybrid"));
     assert_eq!(wire["semantic_ready"], serde_json::json!(true));
     assert!(wire.get("fallback_reason").is_none());
+}
+
+#[test]
+fn core_only_refresh_keeps_readiness_and_sidecar_admission_in_agreement() {
+    // Regression: readiness derived freshness from manifest *shape* while
+    // strict sidecar admission derives staleness from *storage*. A core-only
+    // refresh moves the indexed-file mtimes underneath an untouched manifest,
+    // so the shape-only projection kept reporting hybrid / semantic_ready with
+    // no fallback for a publication admission simultaneously refused to serve
+    // — the agent got an error contradicting what readiness had just promised.
+    //
+    // Both directions matter: readiness must not over-claim once admission
+    // refuses, and must not newly under-claim while admission still serves.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let manifest = publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
+    let runtime = test_sidecar_runtime_from_env();
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
+    let source_path = project_root.join("core.rs");
+    fs::write(&source_path, "pub fn core() {}\n").expect("write core source");
+
+    // Direction one: a core publication that predates the sidecar leaves
+    // admission serving, so readiness must keep reporting hybrid.
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 100_001,
+            path: source_path.clone(),
+            language: "rust".to_string(),
+            modification_time: manifest.built_at_epoch_ms - 1_000,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }])
+        .expect("seed indexed core file");
+    assert_eq!(
+        codestory_retrieval::manifest_unavailable_reason_for_runtime(
+            &project_id,
+            &storage,
+            &manifest,
+            &runtime,
+        ),
+        None,
+        "admission must still serve a sidecar published after the core index"
+    );
+    let served = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("served retrieval state");
+    assert_eq!(served.mode, RetrievalModeDto::Hybrid);
+    assert!(served.semantic_ready);
+    assert_eq!(served.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(served.fallback_reason, None);
+    assert_eq!(served.fallback_message, None);
+
+    // Direction two: a core-only refresh republishes the core index without
+    // rebuilding the sidecar, so admission refuses the untouched manifest.
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 100_002,
+            path: project_root.join("refreshed.rs"),
+            language: "rust".to_string(),
+            modification_time: manifest.built_at_epoch_ms + 60_000,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }])
+        .expect("seed core-only refresh file");
+    let refusal = codestory_retrieval::manifest_unavailable_reason_for_runtime(
+        &project_id,
+        &storage,
+        &manifest,
+        &runtime,
+    )
+    .expect("core-only refresh must make admission refuse the stale sidecar");
+    assert!(
+        refusal.contains("indexed_file_newer_than_retrieval_manifest"),
+        "unexpected admission refusal: {refusal}"
+    );
+
+    let refused = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("refused retrieval state");
+    assert_eq!(
+        refused.mode,
+        RetrievalModeDto::Symbolic,
+        "readiness must not promise hybrid retrieval admission refuses to serve"
+    );
+    assert!(!refused.semantic_ready);
+    assert_ne!(refused.semantic_mode, SemanticModeDto::Enabled);
+    assert!(
+        refused.fallback_reason.is_some(),
+        "a refused publication must state why retrieval is not full"
+    );
+    let wire = serde_json::to_value(&refused).expect("serialize refused retrieval state");
+    assert_ne!(wire["mode"], serde_json::json!("hybrid"));
+    assert_eq!(wire["semantic_ready"], serde_json::json!(false));
 }
 
 #[test]

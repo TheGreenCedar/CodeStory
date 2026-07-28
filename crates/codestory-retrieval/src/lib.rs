@@ -76,6 +76,7 @@ pub use executor::{
 };
 pub use generation::{
     SEMANTIC_POLICY_VERSION, SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    manifest_unavailable_reason_for_runtime,
 };
 pub use health::{
     ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,

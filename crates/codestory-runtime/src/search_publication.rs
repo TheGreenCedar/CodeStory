@@ -751,12 +751,18 @@ pub(super) fn retrieval_state_from_storage(
 /// `sidecar_project_id_for_root`, which re-observes project identity with
 /// three git subprocesses per call (`config --get remote.origin.url`,
 /// `rev-parse HEAD^{tree}`, and a workload-dependent `status --porcelain`)
-/// before the single indexed manifest-row lookup and pure contract checks.
-/// That is deliberately the same uncached helper per-search sidecar admission
-/// uses (`retrieval_primary::retrieval_manifest_exists`), so this projection
-/// and admission can never disagree about which manifest row is current. Do
-/// not substitute a cached identity here without proving admission reads the
-/// same cache. The read stays observational: no probing, repair, or refresh.
+/// before the manifest-row lookup, the pure contract checks, and the
+/// storage-derived staleness scan. That is deliberately the same uncached
+/// helper per-search sidecar admission uses
+/// (`retrieval_primary::retrieval_manifest_exists`), so this projection and
+/// admission can never disagree about which manifest row is current. Do not
+/// substitute a cached identity here without proving admission reads the same
+/// cache. The staleness scan is likewise the same helper admission gates on
+/// (`manifest_unavailable_reason_for_runtime`) and costs the same per-call
+/// symbol-doc count and dense-anchor sweep admission already pays: freshness
+/// derived from manifest shape alone would let readiness promise semantic
+/// retrieval that admission then refuses. The read stays observational: no
+/// probing, repair, or refresh.
 pub(super) fn retrieval_state_from_storage_for_runtime(
     storage: &Storage,
     project_root: &Path,
@@ -778,10 +784,25 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         .map(published_dense_projection_count)
         .unwrap_or(0);
     // Fail closed: published vectors count as semantic readiness only while the
-    // manifest still classifies as a current, non-degraded full publication.
-    let stale_publication = manifest
-        .as_ref()
-        .is_some_and(|manifest| !codestory_retrieval::manifest_classifies_full(manifest));
+    // manifest still classifies as a current, non-degraded full publication
+    // *and* the store the sidecar would be served from still agrees with it.
+    // Manifest shape alone is not enough: a core-only refresh leaves the
+    // manifest untouched while moving the symbol docs, dense anchors, and
+    // indexed-file mtimes underneath it, so admission
+    // (`manifest_unavailable_reason_for_runtime`) refuses to serve a
+    // publication that a shape-only projection still advertises as hybrid.
+    // Consulting the same storage-derived staleness admission uses is what
+    // keeps the two surfaces from contradicting each other.
+    let stale_publication = manifest.as_ref().is_some_and(|manifest| {
+        !codestory_retrieval::manifest_classifies_full(manifest)
+            || codestory_retrieval::manifest_unavailable_reason_for_runtime(
+                &project_id,
+                storage,
+                manifest,
+                runtime,
+            )
+            .is_some()
+    });
     let contract_mismatch = manifest
         .as_ref()
         .is_some_and(|manifest| !manifest_matches_current_embedding_contract(manifest, runtime));
