@@ -291,6 +291,78 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   }
 });
 
+// Catalog publication is delivery rather than a release gate, which is only honest if the run
+// records which of the two states it ended in. The graph is where that vocabulary lives, so
+// deleting it, reinstating the gate, or collapsing the two installer identities onto one -- which
+// is exactly how a deferred run would come to read as a published one -- must be refusals here,
+// not merely in the workflow policy that consumes them.
+test("catalog delivery declares two distinguishable states and no release gate", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  assert.equal(delivery.release_gate, false);
+  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published"]);
+  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 2);
+
+  const missing = structuredClone(graph);
+  delete missing.workflow_policy.catalog_delivery;
+  assert.throws(
+    () => validateReleaseClaimGraph(missing),
+    /workflow_policy\.catalog_delivery must be an object/u,
+  );
+
+  const gated = structuredClone(graph);
+  gated.workflow_policy.catalog_delivery.release_gate = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(gated),
+    /release_gate must be false: catalog publication is delivery, not a release gate/u,
+  );
+
+  const collapsed = structuredClone(graph);
+  const [first, second] = collapsed.workflow_policy.catalog_delivery.states;
+  second.installer = first.installer;
+  assert.throws(
+    () => validateReleaseClaimGraph(collapsed),
+    /must record distinct installer identities/u,
+  );
+
+  const renamed = structuredClone(graph);
+  renamed.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").id = "unknown";
+  assert.throws(
+    () => validateReleaseClaimGraph(renamed),
+    /must declare the deferred state/u,
+  );
+
+  const inverted = structuredClone(graph);
+  inverted.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").live_catalog_revision = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(inverted),
+    /deferred state must not consume a live catalog revision/u,
+  );
+
+  const unpublished = structuredClone(graph);
+  unpublished.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "published").live_catalog_revision = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(unpublished),
+    /published state must consume the live catalog revision/u,
+  );
+
+  const detached = structuredClone(graph);
+  detached.workflow_policy.catalog_delivery.publish_job = "no-such-job";
+  assert.throws(
+    () => validateReleaseClaimGraph(detached),
+    /publish_job no-such-job must be a release chain job/u,
+  );
+
+  const unrecoverable = structuredClone(graph);
+  delete unrecoverable.workflow_policy.catalog_delivery.recovery_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(unrecoverable),
+    /workflow_policy\.catalog_delivery\.recovery_workflow/u,
+  );
+});
+
 // check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
 // chain that parses but orders nothing would let both gates pass while `gh release create` ran
 // detached from the release-authority checks and the plugin-proof matrix. Every mutation below

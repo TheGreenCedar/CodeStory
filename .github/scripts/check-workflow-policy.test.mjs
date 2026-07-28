@@ -23,6 +23,7 @@ import {
   validateWorkflows,
   windowsManifestProofPolicyViolations,
 } from "./check-workflow-policy.mjs";
+import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
 const proofTopology = "proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5";
@@ -2369,9 +2370,9 @@ test("the plugin lane publishes the catalog it then smoke-installs", async (t) =
       const step = catalogStep(workflow);
       step.run = step.run.replace('--version "${{ inputs.version }}"', '--version "$LATEST"');
     }, /Point the catalog at the published release must run --version/u],
-    ["catalog publication hides the revision it pushed", workflow => {
+    ["catalog publication hides the delivery state it recorded", workflow => {
       delete workflow.jobs["marketplace-publish"].outputs;
-    }, /marketplace publication must publish the revision it pushed/u],
+    }, /marketplace publication must publish the recorded delivery state/u],
   ];
   for (const [name, mutate, expected] of mutations) {
     await t.test(name, () => {
@@ -2467,6 +2468,371 @@ test("the plugin lane still forbids building, signing, and forwarded secrets", a
       const violations = validateWorkflows(workflows);
       assert.notDeepEqual(violations, []);
       assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+// Catalog publication is delivery, not a release gate. Relaxing a gate is exactly where a vacuous
+// pass gets built by accident, so these tests attack the three shapes that would produce one: a
+// claim that becomes true on its own, a smoke that passes because it stopped checking anything,
+// and a retry that hides which failure actually happened.
+function runStepBash(run, environment) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-catalog-delivery-"));
+  const output = path.join(directory, "github-output");
+  const summary = path.join(directory, "github-step-summary");
+  writeFileSync(output, "");
+  writeFileSync(summary, "");
+  const executable = process.platform === "win32" ? "wsl.exe" : "bash";
+  const args = process.platform === "win32"
+    ? ["--exec", "/bin/bash", "-c", run]
+    : ["-c", run];
+  const result = spawnSync(executable, args, {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: summary,
+      GITHUB_WORKSPACE: root,
+      RUNNER_TEMP: directory,
+      ...environment,
+    },
+  });
+  const outputs = Object.fromEntries(
+    readFileSync(output, "utf8")
+      .split(/\r?\n/u)
+      .filter(line => line.includes("="))
+      .map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+  return { ...result, outputs, summary: readFileSync(summary, "utf8") };
+}
+
+// Both lanes tag irreversibly and then point the catalog at what they published, so both are
+// exercised here rather than only the one the issue named.
+const catalogOutcomeLanes = [
+  ["release.yml", "marketplace-publish"],
+  ["plugin-release.yml", "marketplace-publish"],
+];
+const catalogStateLanes = [
+  ["post-publish-release-smoke.yml", "smoke"],
+  ["plugin-release.yml", "post-publish-smoke"],
+];
+
+function runCatalogDeliveryOutcome(environment, [file, jobName] = catalogOutcomeLanes[0]) {
+  const step = draftStep(loadWorkflows().get(file).jobs[jobName], "Record catalog delivery outcome");
+  // Every GitHub expression in this step lives in env, so the body is executable bash.
+  assert.ok(!step.run.includes("${{"), "delivery outcome body must not embed workflow expressions");
+  return runStepBash(step.run, { RECOVERY_WORKFLOW: step.env.RECOVERY_WORKFLOW, ...environment });
+}
+
+function runCatalogDeliveryState(environment, [file, jobName] = catalogStateLanes[0]) {
+  const step = draftStep(loadWorkflows().get(file).jobs[jobName], "Record catalog delivery state");
+  assert.ok(!step.run.includes("${{"), "delivery state body must not embed workflow expressions");
+  return runStepBash(step.run, environment);
+}
+
+test("a release records catalog publication only when the catalog push actually landed", () => {
+  const revision = "a".repeat(40);
+
+  for (const lane of catalogOutcomeLanes) {
+    const published = runCatalogDeliveryOutcome({
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      PUBLISHED_REVISION: revision,
+    }, lane);
+    assert.equal(published.status, 0, published.stderr);
+    assert.deepEqual(published.outputs, {
+      catalog_published: "true",
+      marketplace_revision: revision,
+    }, lane.join("/"));
+    assert.doesNotMatch(published.stdout, /::warning::/u, lane.join("/"));
+  }
+
+  // Each of these is a real way this job has failed or could fail. None may report published, and
+  // none may fail the release: the tag and the GitHub release already exist by this point.
+  const deferrals = [
+    ["missing credential", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "", PUBLISHED_REVISION: "" }],
+    ["push rejected", { TOKEN_OUTCOME: "success", PUBLISH_OUTCOME: "failure", PUBLISHED_REVISION: "" }],
+    ["push skipped", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "skipped", PUBLISHED_REVISION: "" }],
+    ["push reported success without a revision", {
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      PUBLISHED_REVISION: "",
+    }],
+    ["push reported a mutable ref", {
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      PUBLISHED_REVISION: "main",
+    }],
+    ["push reported a truncated revision", {
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      PUBLISHED_REVISION: "a".repeat(39),
+    }],
+  ];
+  for (const lane of catalogOutcomeLanes) {
+    for (const [label, environment] of deferrals) {
+      const deferred = runCatalogDeliveryOutcome(environment, lane);
+      const where = `${lane.join("/")}: ${label}`;
+      assert.equal(deferred.status, 0, `${where}: ${deferred.stderr}`);
+      assert.deepEqual(deferred.outputs, {
+        catalog_published: "false",
+        marketplace_revision: "",
+      }, where);
+      assert.match(deferred.stdout, /::warning::Catalog publication deferred/u, where);
+      assert.match(deferred.stdout, /marketplace-sync\.yml/u, where);
+      assert.match(deferred.summary, /DEFERRED/u, where);
+    }
+  }
+});
+
+test("the post-publish smoke cannot record a public catalog install it did not perform", () => {
+  const graph = loadReleaseClaimGraph(root);
+  const { states } = graph.workflow_policy.catalog_delivery;
+  const publishedInstaller = states.find(({ id }) => id === "published").installer;
+  const deferredInstaller = states.find(({ id }) => id === "deferred").installer;
+  const liveRevision = "b".repeat(40);
+  const head = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+
+  for (const lane of catalogStateLanes) {
+    const where = lane.join("/");
+    const published = runCatalogDeliveryState({
+      CATALOG_PUBLISHED: "true",
+      INPUT_MARKETPLACE_REVISION: liveRevision,
+    }, lane);
+    assert.equal(published.status, 0, published.stderr);
+    assert.equal(published.outputs.state, "published", where);
+    assert.equal(published.outputs.installer, publishedInstaller, where);
+    assert.equal(published.outputs.marketplace_source, "TheGreenCedar/AgentPluginMarketplace", where);
+    assert.equal(published.outputs.marketplace_revision, liveRevision, where);
+    assert.equal(published.outputs.local_fixture, "false", where);
+
+    // Deferred still proves a real Codex install of the real published artifacts -- it changes only
+    // WHICH catalog served it -- and it says so with an installer identity that cannot be confused
+    // for the public one.
+    const deferred = runCatalogDeliveryState({
+      CATALOG_PUBLISHED: "false",
+      INPUT_MARKETPLACE_REVISION: "",
+    }, lane);
+    assert.equal(deferred.status, 0, deferred.stderr);
+    assert.equal(deferred.outputs.state, "deferred", where);
+    assert.equal(deferred.outputs.installer, deferredInstaller, where);
+    assert.notEqual(deferred.outputs.installer, publishedInstaller, where);
+    assert.notEqual(deferred.outputs.marketplace_source, "TheGreenCedar/AgentPluginMarketplace", where);
+    assert.equal(deferred.outputs.local_fixture, "true", where);
+    assert.match(deferred.outputs.marketplace_revision, /^[0-9a-f]{40}$/u, where);
+    assert.match(deferred.stdout, /::warning::Catalog publication was deferred/u, where);
+    const catalog = JSON.parse(readFileSync(
+      path.join(deferred.outputs.marketplace_source, ".agents", "plugins", "marketplace.json"),
+      "utf8",
+    ));
+    assert.equal(catalog.plugins[0].source.sha, head, `${where}: fixture must pin the released commit`);
+
+    // Refusals. A handoff that is inconsistent, absent, or merely truthy-looking must stop the
+    // smoke rather than fall through into the published identity.
+    for (const [label, environment] of [
+      ["deferred with a live revision", { CATALOG_PUBLISHED: "false", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["absent handoff", { CATALOG_PUBLISHED: "", INPUT_MARKETPLACE_REVISION: "" }],
+      ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      // Published demands an immutable revision: an empty or mutable one is not a catalog install.
+      ["published without a revision", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "" }],
+      ["published with a mutable ref", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "main" }],
+      ["published with a truncated revision", {
+        CATALOG_PUBLISHED: "true",
+        INPUT_MARKETPLACE_REVISION: "b".repeat(39),
+      }],
+    ]) {
+      const refused = runCatalogDeliveryState(environment, lane);
+      assert.notEqual(refused.status, 0, `${where}: ${label}`);
+      assert.notEqual(refused.outputs.installer, publishedInstaller, `${where}: ${label}`);
+    }
+  }
+});
+
+test("catalog publication cannot be reinstated as a gate or claimed without happening", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const releaseFile = "release.yml";
+  const smokeFile = "post-publish-release-smoke.yml";
+  const pluginFile = "plugin-release.yml";
+  const publishJob = workflows => workflows.get(releaseFile).jobs["marketplace-publish"];
+  const smokeJob = workflows => workflows.get(smokeFile).jobs.smoke;
+  const smokeCall = workflows => workflows.get(releaseFile).jobs["post-publish-smoke"];
+  const pluginPublishJob = workflows => workflows.get(pluginFile).jobs["marketplace-publish"];
+  const pluginSmokeJob = workflows => workflows.get(pluginFile).jobs["post-publish-smoke"];
+
+  const mutations = [
+    // --- The claim silently becoming true ---
+    ["release hard-codes the catalog claim", workflows => {
+      smokeCall(workflows).with.catalog_published = true;
+    }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
+    ["release hard-codes the catalog claim as a string", workflows => {
+      smokeCall(workflows).with.catalog_published = "true";
+    }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
+    ["catalog claim is read from an unrelated input", workflows => {
+      smokeCall(workflows).with.catalog_published = "${{ inputs.publish_release }}";
+    }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
+    ["catalog claim is read from the job result instead of the recorded outcome", workflows => {
+      smokeCall(workflows).with.catalog_published
+        = "${{ needs.marketplace-publish.result == 'success' }}";
+    }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
+    ["catalog claim is dropped entirely", workflows => {
+      delete smokeCall(workflows).with.catalog_published;
+    }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
+    ["delivery outcome ignores whether the push ran", workflows => {
+      const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace('&& [ "$PUBLISH_OUTCOME" = "success" ] \\\n', "");
+    }, /must run \[ "\$PUBLISH_OUTCOME" = "success" \]/u],
+    ["delivery outcome accepts any revision the push printed", workflows => {
+      const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace(
+        `&& printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
+        "&& true",
+      );
+    }, /grep -Eq/u],
+    ["delivery outcome defaults to published", workflows => {
+      const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace("catalog_published=false", "catalog_published=true");
+    }, /must run catalog_published=false/u],
+    ["job publishes the raw push result instead of the recorded outcome", workflows => {
+      publishJob(workflows).outputs.catalog_published = "${{ steps.publish.outcome == 'success' }}";
+    }, /must publish the recorded delivery state/u],
+    ["delivery outcome is skipped when the push failed", workflows => {
+      draftStep(publishJob(workflows), "Record catalog delivery outcome").if = "success()";
+    }, /catalog delivery outcome must be recorded whatever the catalog push did/u],
+    ["deferred publication stops naming its recovery path", workflows => {
+      delete draftStep(publishJob(workflows), "Record catalog delivery outcome").env.RECOVERY_WORKFLOW;
+    }, /must name marketplace-sync\.yml as the recovery path/u],
+
+    // --- The smoke passing because it stopped checking anything ---
+    ["deferred smoke records the public catalog installer", workflows => {
+      const step = draftStep(smokeJob(workflows), "Emit authenticated post-publish release cells");
+      step.run = step.run.replace(
+        '--arg installer "${{ steps.delivery.outputs.installer }}"',
+        "--arg installer codex_marketplace_install",
+      );
+    }, /must not hard-code the published installer identity/u],
+    ["both delivery states collapse onto one installer identity", workflows => {
+      const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        "installer=codex_marketplace_deferred_fixture",
+        "installer=codex_marketplace_install",
+      );
+    }, /published installer identity must be reachable only from the published branch/u],
+    ["deferred branch accepts a live catalog revision", workflows => {
+      const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace('if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then', "if false; then");
+    }, /must run if \[ -n "\$INPUT_MARKETPLACE_REVISION" \]/u],
+    ["unknown delivery states fall through instead of failing", workflows => {
+      const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace("catalog_published must be true or false", "unreachable");
+    }, /must run catalog_published must be true or false/u],
+    ["delivery state becomes conditional", workflows => {
+      draftStep(smokeJob(workflows), "Record catalog delivery state").if = "inputs.catalog_published";
+    }, /catalog delivery state must be unconditional and fail closed/u],
+    ["delivery state stops reading the caller's handoff", workflows => {
+      delete draftStep(smokeJob(workflows), "Record catalog delivery state").env.CATALOG_PUBLISHED;
+    }, /must read the recorded publication handoff/u],
+    ["smoke resolves whatever catalog it likes", workflows => {
+      const step = draftStep(smokeJob(workflows), "Resolve the published plugin through the marketplace catalog");
+      step.run = step.run.replace(
+        '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+        "--marketplace-source TheGreenCedar/AgentPluginMarketplace",
+      );
+    }, /must run --marketplace-source "\$\{\{ steps\.delivery\.outputs\.marketplace_source \}\}"/u],
+    ["smoke fakes the fixture catalog by cloning it", workflows => {
+      draftStep(smokeJob(workflows), "Record catalog delivery state").run
+        += "\ngit clone https://github.com/TheGreenCedar/AgentPluginMarketplace.git";
+    }, /must not fabricate installation with git clone/u],
+    ["catalog delivery state stops being a required handoff", workflows => {
+      workflows.get(smokeFile).on.workflow_call.inputs.catalog_published.required = false;
+    }, /workflow_call catalog_published must be a required boolean/u],
+
+    // --- The gate coming back, or a retry hiding which failure happened ---
+    ["token failure fails the published release again", workflows => {
+      delete draftStep(publishJob(workflows), "Mint a scoped marketplace token")["continue-on-error"];
+    }, /marketplace token failure must not fail an already-published release/u],
+    ["catalog push failure fails the published release again", workflows => {
+      delete draftStep(publishJob(workflows), "Point the catalog at the published release")["continue-on-error"];
+    }, /catalog push must run only with a minted token and must not fail the release/u],
+    ["catalog push runs without a minted token", workflows => {
+      delete draftStep(publishJob(workflows), "Point the catalog at the published release").if;
+    }, /catalog push must run only with a minted token and must not fail the release/u],
+    ["smoke waits for the catalog job to succeed", workflows => {
+      smokeCall(workflows).if
+        = "inputs.publish_release && needs.marketplace-publish.result == 'success'";
+    }, /must not gate on marketplace-publish succeeding/u],
+    ["smoke is skipped whenever the catalog job did not run cleanly", workflows => {
+      smokeCall(workflows).if = "inputs.publish_release";
+    }, /post-publish smoke must require trusted publication authority and a successful publish/u],
+    ["smoke stops requiring a real published release", workflows => {
+      smokeCall(workflows).if = "always() && inputs.publish_release && needs.preflight.result == 'success'";
+    }, /post-publish smoke must require trusted publication authority and a successful publish/u],
+    ["catalog push retries until it passes", workflows => {
+      const step = draftStep(publishJob(workflows), "Point the catalog at the published release");
+      step.run = `until node .github/scripts/publish-marketplace-catalog.mjs; do sleep 5; done\n${step.run}`;
+    }, /must not retry a recorded delivery outcome/u],
+    ["post-publish closeout reintroduces the catalog gate through its condition", workflows => {
+      workflows.get(releaseFile).jobs["post-publish-closeout"].if
+        = "inputs.publish_release && needs.marketplace-publish.result == 'success'";
+    }, /post-publish closeout must not gate on marketplace-publish succeeding/u],
+
+    // --- The plugin fast lane, which tags and publishes the same catalog ---
+    ["plugin lane token failure fails its tagged release again", workflows => {
+      delete draftStep(pluginPublishJob(workflows), "Mint a scoped marketplace token")["continue-on-error"];
+    }, /plugin-release\.yml marketplace token failure must not fail an already-published release/u],
+    ["plugin lane catalog push failure fails its tagged release again", workflows => {
+      delete draftStep(pluginPublishJob(workflows), "Point the catalog at the published release")["continue-on-error"];
+    }, /plugin-release\.yml catalog push must run only with a minted token/u],
+    ["plugin lane stops recording its delivery outcome", workflows => {
+      const job = pluginPublishJob(workflows);
+      job.steps = job.steps.filter(({ name }) => name !== "Record catalog delivery outcome");
+    }, /plugin-release\.yml must contain named step Record catalog delivery outcome/u],
+    ["plugin lane delivery outcome defaults to published", workflows => {
+      const step = draftStep(pluginPublishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace("catalog_published=false", "catalog_published=true");
+    }, /plugin-release\.yml step Record catalog delivery outcome must run catalog_published=false/u],
+    ["plugin lane smoke waits for the catalog job to succeed", workflows => {
+      pluginSmokeJob(workflows).if = "needs.marketplace-publish.result == 'success'";
+    }, /plugin-release\.yml post-publish smoke must require a successful publish without gating/u],
+    ["plugin lane smoke stops requiring a real published release", workflows => {
+      delete pluginSmokeJob(workflows).if;
+    }, /plugin-release\.yml post-publish smoke must require a successful publish without gating/u],
+    ["plugin lane hard-codes its catalog claim", workflows => {
+      draftStep(pluginSmokeJob(workflows), "Record catalog delivery state").env.CATALOG_PUBLISHED = "true";
+    }, /plugin-release\.yml catalog delivery state must read the recorded publication handoff/u],
+    ["plugin lane collapses both delivery states onto one installer identity", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        "installer=codex_marketplace_deferred_fixture",
+        "installer=codex_marketplace_install",
+      );
+    }, /plugin-release\.yml the published installer identity must be reachable only from the published branch/u],
+    ["plugin lane deferred branch accepts a live catalog revision", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace('if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then', "if false; then");
+    }, /plugin-release\.yml step Record catalog delivery state must run if \[ -n "\$INPUT_MARKETPLACE_REVISION" \]/u],
+    ["plugin lane installs from a catalog the delivery state did not resolve", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path");
+      step.run = step.run.replace(
+        '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+        "--marketplace-source TheGreenCedar/AgentPluginMarketplace",
+      );
+    }, /plugin-release\.yml step Prove the public marketplace install path must run --marketplace-source/u],
+    ["plugin lane smoke installs the revision the job failed to publish", workflows => {
+      draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path")
+        .env.MARKETPLACE_REVISION = "${{ needs.marketplace-publish.outputs.marketplace_revision }}";
+    }, /plugin-release\.yml post-publish smoke must install from the marketplace revision this release published/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, [], name);
+      assert.match(violations.join("\n"), expectedReason, name);
     });
   }
 });

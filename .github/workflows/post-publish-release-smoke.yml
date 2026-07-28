@@ -7,9 +7,14 @@ on:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
-      marketplace_revision:
-        description: Immutable marketplace catalog revision proved before release.
+      catalog_published:
+        description: Whether marketplace-publish actually updated the public catalog for this release.
         required: true
+        type: boolean
+      marketplace_revision:
+        description: Immutable published catalog revision. Empty exactly when publication was deferred.
+        required: false
+        default: ""
         type: string
       pre_publish_closeout_artifact:
         description: Accepted pre-publish closeout artifact from this release run.
@@ -27,9 +32,14 @@ on:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
-      marketplace_revision:
-        description: Immutable marketplace catalog revision proved before release.
+      catalog_published:
+        description: Whether marketplace-publish actually updated the public catalog for this release.
         required: true
+        type: boolean
+      marketplace_revision:
+        description: Immutable published catalog revision. Empty exactly when publication was deferred.
+        required: false
+        default: ""
         type: string
       pre_publish_closeout_artifact:
         description: Accepted pre-publish closeout artifact from this release run.
@@ -210,6 +220,61 @@ jobs:
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: "& scripts/install-codestory.ps1 -SelfTest"
 
+      # Catalog publication is delivery, not a gate, so this smoke must run in both states -- but it
+      # must never let the deferred state read as the published one. Each state gets its own catalog
+      # source AND its own installer identity, and the two are decided here, once, from the caller's
+      # explicit handoff. The handoff is checked both ways: published demands an immutable live
+      # revision, deferred demands the absence of one.
+      - name: Record catalog delivery state
+        id: delivery
+        shell: bash
+        env:
+          CATALOG_PUBLISHED: ${{ inputs.catalog_published }}
+          INPUT_MARKETPLACE_REVISION: ${{ inputs.marketplace_revision }}
+        run: |
+          set -euo pipefail
+          fixture_root="$RUNNER_TEMP/codestory-marketplace-delivery/fixture"
+          rm -rf "$fixture_root"
+          if [ "$CATALOG_PUBLISHED" = "true" ]; then
+            marketplace_source=TheGreenCedar/AgentPluginMarketplace
+            marketplace_revision="$INPUT_MARKETPLACE_REVISION"
+            local_fixture=false
+            installer=codex_marketplace_install
+            state=published
+          elif [ "$CATALOG_PUBLISHED" = "false" ]; then
+            # The public catalog still points at the previous release, so resolving against it would
+            # prove the PREVIOUS release. Pin a catalog to this exact published commit instead: same
+            # resolver, same pinned git-subdir source, only the catalog host differs.
+            if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then
+              echo "::error::Deferred catalog publication must not carry a live catalog revision."
+              exit 1
+            fi
+            node .github/scripts/build-marketplace-fixture.mjs \
+              --out "$fixture_root" \
+              --source-repository "$GITHUB_WORKSPACE" \
+              --commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+            marketplace_source="$fixture_root"
+            marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"
+            local_fixture=true
+            installer=codex_marketplace_deferred_fixture
+            state=deferred
+          else
+            echo "::error::catalog_published must be true or false, not '$CATALOG_PUBLISHED'."
+            exit 1
+          fi
+          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          {
+            echo "marketplace_source=$marketplace_source"
+            echo "marketplace_revision=$marketplace_revision"
+            echo "local_fixture=$local_fixture"
+            echo "installer=$installer"
+            echo "state=$state"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$state" = "deferred" ]; then
+            echo "::warning::Catalog publication was deferred for this release. This smoke proves the published assets against a candidate-pinned catalog fixture and records installer $installer; recover the public catalog with marketplace-sync.yml."
+          fi
+          echo "Catalog delivery state: $state (installer $installer, catalog revision $marketplace_revision)." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve the published plugin through the marketplace catalog
         id: installed
         shell: bash
@@ -218,7 +283,7 @@ jobs:
           install_root="$RUNNER_TEMP/codestory-installed-proof"
           codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
           isolated_home="$install_root/isolated-home"
-          marketplace_revision="${{ inputs.marketplace_revision }}"
+          marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"
           test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
           rm -rf "$install_root"
           mkdir -p "$isolated_home"
@@ -231,9 +296,10 @@ jobs:
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-source "${{ steps.delivery.outputs.marketplace_source }}" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$marketplace_revision" \
+            --local-fixture "${{ steps.delivery.outputs.local_fixture }}" \
             --expected-version "${{ steps.release.outputs.version }}" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json" \
@@ -275,8 +341,10 @@ jobs:
           ledger="$(find target/pre-publish-closeout -type f -name ledger.json -print)"
           test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           mkdir -p target/release-cells
+          # The installer identity is whatever the delivery state resolved, never a literal: a
+          # deferred run must not be able to sign a cell that says the public catalog served it.
           jq -n \
-            --arg installer codex_marketplace_install \
+            --arg installer "${{ steps.delivery.outputs.installer }}" \
             --arg native_engine coderank_q8_embedded \
             '{installer: $installer, native_engine: $native_engine}' \
             > target/release-cells/installed-identity.json

@@ -240,12 +240,23 @@ adapter to compensate for incorrect upstream state.
 - Both release lanes own marketplace publication. The `marketplace-publish` job
   in `release.yml` and in `plugin-release.yml` points
   `TheGreenCedar/AgentPluginMarketplace` at the published commit after the
-  release exists, and post-publish smoke proves that catalog. Do not
-  hand-edit the catalog before a release; preflight proves the install path
-  against a candidate-pinned fixture and no longer requires the live catalog to
-  match an unreleased commit. If the catalog push fails, the release is still
-  complete and the catalog still serves the previous release: recover with the
-  `marketplace-sync` workflow rather than editing by hand.
+  release exists. Do not hand-edit the catalog before a release; preflight proves
+  the install path against a candidate-pinned fixture and no longer requires the
+  live catalog to match an unreleased commit.
+- Catalog publication is delivery, not a release gate. It runs after an
+  irreversible tag, so a missing credential or a rejected push must not fail the
+  release; `release-claims.json` records that with
+  `workflow_policy.catalog_delivery.release_gate: false`. The job absorbs its own
+  failure and records one of two explicit states, and post-publish smoke runs
+  either way: `published` resolves the live catalog, `deferred` resolves a catalog
+  pinned to the released commit and stamps the distinct installer identity
+  `codex_marketplace_deferred_fixture` into the release ledger. A release may say
+  the catalog was updated only when the push actually landed; the honest outcome
+  otherwise is "released, catalog sync deferred".
+- `marketplace-sync.yml` is the recovery path for a deferred catalog. Re-run it
+  with the published version and commit rather than editing the catalog by hand;
+  it is idempotent, so re-running it against an already-synced catalog succeeds
+  without pushing.
 - For a local plugin-source change Codex must observe outside a release, refresh
   the installed package and verify the managed runtime path/version plus
   project-scoped status. CodeStory repository state alone does not update an
