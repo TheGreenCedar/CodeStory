@@ -16,6 +16,7 @@ import {
   renderReleasePlatformNotes,
   validatePublicSupportDocuments,
   validateReleaseClaimGraph,
+  verifyReuseBinding,
 } from "../codestory-release-claims.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -496,4 +497,50 @@ test("CLI derives repository and tree identity from repo and rejects nonexistent
   ], { encoding: "utf8" });
   assert.notEqual(nonexistent.status, 0);
   assert.match(nonexistent.stderr, /git cat-file -e/u);
+});
+
+test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
+  // Both sides of the ledger prove reuse with this one function -- the producer before it admits
+  // cross-run evidence, the closeout before it anchors a row onto the earlier run -- so it is
+  // proved here, against real history, in the suite pull requests actually run.
+  //
+  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
+  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
+  // accelerator inheritance is exactly what version_only_delta authorizes).
+  const releaseTag = "00121349"; // v0.16.1 release commit
+  const priorTag = "29bd4795"; // v0.16.0 release commit
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_tree",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /does not match release tree/u,
+  );
+  const fingerprint = verifyReuseBinding({
+    binding: "native_fingerprint",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: priorTag,
+  });
+  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
+  // Identical commits always satisfy the tree binding.
+  const tree = verifyReuseBinding({
+    binding: "source_tree",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: releaseTag,
+  });
+  assert.match(tree, /^[0-9a-f]{40}$/u);
+  // A binding name the claim graph never declared proves nothing.
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_history",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /unknown reuse binding source_history/u,
+  );
 });
