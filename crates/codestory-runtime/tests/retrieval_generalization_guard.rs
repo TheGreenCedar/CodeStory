@@ -632,11 +632,14 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
 
 #[test]
 fn linter_fails_closed_when_one_prompt_corpus_entry_is_not_a_literal() {
+    // The repository keys have to be words this product never writes, or the
+    // corpus coverage check fails first and hides the parser drift under a
+    // different error.
     let output = run_lint_with_prompt_script_fixture(
         r#"
 const PUBLIC_REPOS = {
-  first: { prompt: "first benchmark prompt remains a static literal for the guard" },
-  second: { prompt: buildPromptAtRuntime() },
+  alphaprobe: { prompt: "first benchmark prompt remains a static literal for the guard" },
+  betaprobe: { prompt: buildPromptAtRuntime() },
 };
 const ALL_REPOS = { ...PUBLIC_REPOS };
 "#,
@@ -812,23 +815,19 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
     }
 }
 
-/// Removes a probe manifest from the checked-in corpus even if the test panics.
-struct ProbeManifest {
-    path: PathBuf,
-}
-
-impl ProbeManifest {
-    fn write(repo_root: &Path, symbol: &str) -> Self {
-        let path = repo_root.join("benchmarks/tasks/generalization-lint-probe.task.json");
-        let manifest = format!(
-            r#"{{
+/// Writes one task manifest into a corpus root of its own. The lint reads extra
+/// task roots additively, so the probe never touches the checked-in corpus that
+/// every other run -- and every concurrent test -- derives its bans from.
+fn probe_task_manifest(symbol: &str) -> String {
+    format!(
+        r#"{{
   "id": "generalization-lint-probe",
   "version": 1,
   "suite": "public-core",
   "task_class": "architecture_explanation",
   "repo": {{
     "name": "generalization-lint-probe-repo",
-    "url": "https://github.com/example/generalization-lint-probe.git",
+    "url": "https://github.com/generalization-probe-owner/generalization-lint-probe.git",
     "ref": "{ref_sha}"
   }},
   "prompt": "Explain how the probe repository moves a request into its own storage layer.",
@@ -848,32 +847,56 @@ impl ProbeManifest {
   }}
 }}
 "#,
-            ref_sha = "0".repeat(40),
-            symbol = symbol,
-        );
-        std::fs::write(&path, manifest).expect("write probe manifest");
-        Self { path }
-    }
+        ref_sha = "0".repeat(40),
+        symbol = symbol,
+    )
 }
 
-impl Drop for ProbeManifest {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+fn run_lint_with_fixture_and_task_root(contents: &str, task_root: Option<&Path>) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    std::fs::write(fixture_root.path().join("fixture.rs"), contents).expect("write fixture");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    let mut command = Command::new("node");
+    command
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        );
+    if let Some(task_root) = task_root {
+        command.env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS",
+            task_root,
+        );
     }
+    command.output().expect("run lint with probe task root")
 }
 
 #[test]
 fn adding_a_benchmark_task_bans_its_symbols_without_editing_the_lint() {
     let fixture = r#"pub const PLANTED: &str = "GeneralizationProbeAnchor";"#;
-    let before = run_lint_with_fixture(fixture);
+    let before = run_lint_with_fixture_and_task_root(fixture, None);
     assert!(
         before.status.success(),
         "the probe symbol should be unknown before its task manifest exists, stderr={}",
         String::from_utf8_lossy(&before.stderr)
     );
 
-    let _manifest = ProbeManifest::write(&workspace_root(), "GeneralizationProbeAnchor");
-    let after = run_lint_with_fixture(fixture);
+    let task_root = TempDir::new().expect("create probe task root");
+    std::fs::write(
+        task_root.path().join("generalization-lint-probe.task.json"),
+        probe_task_manifest("GeneralizationProbeAnchor"),
+    )
+    .expect("write probe manifest");
+
+    let after = run_lint_with_fixture_and_task_root(fixture, Some(task_root.path()));
     let stderr = String::from_utf8_lossy(&after.stderr);
     assert!(
         !after.status.success(),
@@ -883,6 +906,41 @@ fn adding_a_benchmark_task_bans_its_symbols_without_editing_the_lint() {
         stderr.contains("GeneralizationProbeAnchor"),
         "lint should report the symbol the new manifest introduced, stderr={stderr}"
     );
+}
+
+#[test]
+fn a_probe_task_root_never_writes_into_the_checked_in_corpus() {
+    let corpus = workspace_root().join("benchmarks/tasks");
+    let before = corpus_manifest_names(&corpus);
+    let task_root = TempDir::new().expect("create probe task root");
+    std::fs::write(
+        task_root.path().join("generalization-lint-probe.task.json"),
+        probe_task_manifest("GeneralizationProbeAnchor"),
+    )
+    .expect("write probe manifest");
+    let output = run_lint_with_fixture_and_task_root(
+        r#"pub const PLANTED: &str = "GeneralizationProbeAnchor";"#,
+        Some(task_root.path()),
+    );
+    assert!(
+        !output.status.success(),
+        "the probe manifest should have extended the ban, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        before,
+        corpus_manifest_names(&corpus),
+        "the checked-in corpus must be untouched by a lint probe"
+    );
+}
+
+fn corpus_manifest_names(corpus: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(corpus)
+        .expect("read benchmark task corpus")
+        .map(|entry| entry.expect("corpus entry").file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 #[test]
@@ -903,5 +961,113 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
         unrelated.status.success(),
         "a repository name must not match inside ordinary words, stderr={}",
         String::from_utf8_lossy(&unrelated.stderr)
+    );
+}
+
+#[test]
+fn linter_bans_the_audited_injection_symbols_wherever_they_regrow() {
+    for symbol in [
+        "SourceGroup",
+        "BuildIndex",
+        "IndexerCommand",
+        "EventProcessor",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            r#"pub fn planted_term() -> &'static str {{ "{symbol}" }}"#
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "the deleted injection symbol `{symbol}` must fail lint wherever it regrows, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_leaves_words_this_product_writes_in_its_own_code() {
+    let output = run_lint_with_fixture(
+        r#"use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct SubcommandStorage {
+    pub subcommand: String,
+    pub storage: String,
+}
+
+pub fn serialize_subcommand(value: &SubcommandStorage) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "words the product's own upstream crates write must stay usable, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn linter_does_not_ban_the_hosting_account_a_corpus_lives_under() {
+    let output = run_lint_with_fixture(
+        r#"//! Licensed under the Apache License, Version 2.0.
+
+pub fn licence_notice() -> &'static str {
+    "apache square gorilla pallets"
+}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "an owner segment names a hosting account, not a corpus, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn linter_rejects_a_word_table_in_term_extraction() {
+    let planted = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const PLANTED_SYMBOL_TERMS: &[&str] = &[
+    "indexer",
+    "service",
+    "storage",
+    "store",
+    "posts",
+    "feed",
+    "auth",
+    "trail",
+];
+"#,
+    )]);
+    let stderr = String::from_utf8_lossy(&planted.stderr);
+    assert!(
+        !planted.status.success(),
+        "a domain word table in term extraction must fail lint, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Term vocabulary table"),
+        "lint should name the vocabulary table it found, stderr={stderr}"
+    );
+
+    let stopwords = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const SEARCH_PLAN_STOPWORDS: &[&str] = &[
+    "and",
+    "explain",
+    "from",
+    "how",
+    "into",
+    "show",
+    "then",
+    "with",
+];
+
+pub const REASON: &str = "natural_language_filler";
+"#,
+    )]);
+    assert!(
+        stopwords.status.success(),
+        "the language-level stopword list is not a repository's vocabulary, stderr={}",
+        String::from_utf8_lossy(&stopwords.stderr)
     );
 }
