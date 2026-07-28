@@ -2441,9 +2441,23 @@ mod tests {
         ));
         assert_eq!(MODEL_PRODUCER_NAME, env!("CARGO_PKG_NAME"));
         assert_eq!(MODEL_PRODUCER_VERSION, env!("CARGO_PKG_VERSION"));
+        // The runtime id keys every persisted vector, so it carries the
+        // embedding revision rather than the crate version. Asserting the crate
+        // version here held only while the two happened to be equal, and broke
+        // on the first release that bumped one without the other - which is
+        // exactly the decoupling this identity exists to provide.
         assert!(PRODUCT_EMBEDDING_RUNTIME_ID.contains(&format!(
-            "producer-{MODEL_PRODUCER_NAME}@{MODEL_PRODUCER_VERSION}"
+            "producer-{MODEL_PRODUCER_NAME}@{MODEL_PRODUCER_EMBEDDING_REVISION}"
         )));
+        // The decoupling itself: a release may move the crate version without
+        // moving the embedding revision, and when it does the runtime id must
+        // follow the revision. Otherwise a version bump silently discards every
+        // user's persisted vectors.
+        if MODEL_PRODUCER_VERSION != MODEL_PRODUCER_EMBEDDING_REVISION {
+            assert!(!PRODUCT_EMBEDDING_RUNTIME_ID.contains(&format!(
+                "producer-{MODEL_PRODUCER_NAME}@{MODEL_PRODUCER_VERSION}"
+            )));
+        }
         assert_eq!(MODEL_LICENSE_SPDX_ID, "MIT");
         assert!(MODEL_LICENSE_SOURCE_URL.starts_with("https://"));
 
