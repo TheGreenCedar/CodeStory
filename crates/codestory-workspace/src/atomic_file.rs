@@ -73,6 +73,130 @@ pub fn write_file_atomic(
     result
 }
 
+/// The stage at which [`publish_new_private_file_atomic`] gave up, so a caller
+/// can attach its own vocabulary to each outcome without repeating the
+/// mechanism that produced it.
+#[derive(Debug)]
+pub enum PublishNewFileError {
+    /// The destination has no parent directory to publish into.
+    NoParent,
+    /// The temporary prefix contained a path separator or traversal component,
+    /// so the temporary file would not have been a sibling of the destination.
+    UnsafeTempPrefix,
+    /// No collision-free temporary name was available beside the destination.
+    TempNamesExhausted,
+    /// The temporary file could not be created.
+    CreateTemp(std::io::Error),
+    /// Writing, syncing, renaming, or making the rename durable failed. The
+    /// temporary file has already been removed.
+    Publish(std::io::Error),
+}
+
+impl std::fmt::Display for PublishNewFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoParent => formatter.write_str("destination has no parent directory"),
+            Self::UnsafeTempPrefix => {
+                formatter.write_str("temporary prefix is not a plain file-name component")
+            }
+            Self::TempNamesExhausted => {
+                formatter.write_str("no free temporary name beside the destination")
+            }
+            Self::CreateTemp(error) => write!(formatter, "create temporary file: {error}"),
+            Self::Publish(error) => write!(formatter, "publish temporary file: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishNewFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoParent | Self::TempNamesExhausted | Self::UnsafeTempPrefix => None,
+            Self::CreateTemp(error) | Self::Publish(error) => Some(error),
+        }
+    }
+}
+
+/// How many temporary names are tried before giving up, so a wedged or hostile
+/// directory cannot spin forever.
+const PRIVATE_PUBLISH_ATTEMPTS: usize = 32;
+
+/// Kept apart from [`TEMP_COUNTER`] so publications through this entry point
+/// cannot perturb the names [`atomic_temp_path`] hands out.
+static PRIVATE_PUBLISH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Publish `content` at `path` through an owner-only temporary file beside it.
+///
+/// The caller owns the directory, and must have proven it private before
+/// calling: the content is written there in the clear before the rename, and
+/// this never creates the directory. The caller also owns the check that
+/// `path` does not already exist - the rename is what publishes, and this
+/// reports only how that publication went.
+///
+/// The order is load-bearing. The content is written, `fsync`ed, and the
+/// handle dropped *before* [`fs::rename`], so the rename can only ever expose
+/// a complete file: a reader at the destination sees the old name or the whole
+/// new one, never a partial write, on every platform. The rename stays a plain
+/// [`fs::rename`] rather than the `ReplaceFileW` path in [`write_file_atomic`],
+/// which exists to swap a destination that is already published. Afterwards
+/// `sync_parent_directory` makes the new entry durable where the platform
+/// supports it - and is the single place that decision is made, so it is not
+/// linked here: it is private, and a public doc link to it fails the
+/// deny-rustdoc-warnings gate. Any failure removes the temporary file and
+/// leaves the destination as it was.
+pub fn publish_new_private_file_atomic(
+    path: &Path,
+    temp_prefix: &str,
+    content: &[u8],
+) -> std::result::Result<(), PublishNewFileError> {
+    let parent = path.parent().ok_or(PublishNewFileError::NoParent)?;
+    // The prefix reaches a filename that is joined onto the destination's
+    // parent, so a separator or traversal component in it would place the
+    // temporary file outside the directory the caller validated.
+    // `..` is a single component too, so the component must also be a normal
+    // one rather than a traversal or a root.
+    let mut components = Path::new(temp_prefix).components();
+    let plain_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if temp_prefix.contains(['/', '\\']) || !plain_component {
+        return Err(PublishNewFileError::UnsafeTempPrefix);
+    }
+    for _ in 0..PRIVATE_PUBLISH_ATTEMPTS {
+        let sequence = PRIVATE_PUBLISH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{temp_prefix}-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(PublishNewFileError::CreateTemp(error)),
+        };
+        let result = (|| {
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, path)?;
+            sync_parent_directory(path)
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(PublishNewFileError::Publish(error));
+        }
+        return Ok(());
+    }
+    Err(PublishNewFileError::TempNamesExhausted)
+}
+
 /// Reserve a collision-free temporary file beside `path` using create-new semantics.
 pub fn create_unique_temp_file(path: &Path, stem: &str) -> Result<(PathBuf, File)> {
     loop {
@@ -204,6 +328,35 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     unreachable!("replacement attempts always return")
 }
 
+/// Make an already-published name durable.
+///
+/// The rename is what makes a publication atomic; this step only decides
+/// whether the new directory entry survives a crash, so it must never be able
+/// to fail a publication that already happened.
+///
+/// Unix fsyncs the parent directory. Windows skips it, because `File::open`
+/// does not pass `FILE_FLAG_BACKUP_SEMANTICS` and `CreateFileW` therefore
+/// refuses a directory with `ERROR_ACCESS_DENIED`. That denial, not the
+/// rename, is what failed the windows-x64 vulkan cell of calibration run
+/// 30304210146 with `publish atomic qualification output: Access is denied.
+/// (os error 5)` - in the two hand-rolled copies of this step that used to sit
+/// in the embedding-qualification worker and its benchmark driver, and that
+/// now publish through [`publish_new_private_file_atomic`] instead.
+///
+/// Opening the directory properly is not the alternative. Windows documents no
+/// directory-fsync contract, and the behaviour bears that out: measured on
+/// windows 11 26200 / NTFS, with and without backup-class privileges,
+/// `FlushFileBuffers` on a backup-semantics handle is denied when the handle
+/// is `GENERIC_READ` and accepted when it is `GENERIC_WRITE`, so what it would
+/// commit is an accident of access mode rather than a guarantee. Windows
+/// rename durability, if it is ever wanted, comes from
+/// `MoveFileExW(.., MOVEFILE_WRITE_THROUGH)` - which
+/// `codestory_cli::native_launcher` already uses - not from a directory fsync.
+///
+/// The other atomic publishers here already skip the step the same way
+/// (`codestory_cli::native_launcher`, `codestory_llama_sys::native_staging`,
+/// `codestory_store::sync_promotion_parent`,
+/// `codestory_retrieval::sync_qualification_directory`).
 #[cfg(not(windows))]
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     match path.parent() {
@@ -264,6 +417,103 @@ mod tests {
     }
 
     #[test]
+    fn publishing_a_new_private_file_succeeds_and_leaves_only_the_complete_file() {
+        // Regression: calibration run 30304210146, windows-x64 vulkan cell.
+        // The embedding-qualification worker serialized, synced and renamed
+        // `publication-fault-residency-1-worker-output.json` into place and
+        // then exited 1 with `publish atomic qualification output: Access is
+        // denied. (os error 5)`, because its own copy of the post-rename
+        // durability step opened the parent directory with `File::open`, which
+        // Windows refuses without FILE_FLAG_BACKUP_SEMANTICS. The preserved
+        // failure evidence holds the complete published output next to the
+        // failed command, so the publication had already happened when the
+        // step reported denial.
+        //
+        // That copy and its twin in the benchmark driver now publish through
+        // here, so `sync_parent_directory` is the single place the decision is
+        // made. Reverting it to an unconditional `File::open(parent)?
+        // .sync_all()` fails this test with the calibration error.
+        //
+        // The revert value is windows-only. On unix the reverted body is
+        // exactly the `#[cfg(not(windows))]` arm this already exercises, so a
+        // unix-only lane passes with or without the fix; the revert-proof is
+        // run on windows.
+        let directory = tempfile::tempdir().expect("publication directory");
+        // Callers publish into a directory they have proven private; reproduce
+        // that here so the publish is exercised under its real preconditions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("make the publication directory private");
+        }
+        let path = directory.path().join("worker-output.json");
+
+        publish_new_private_file_atomic(&path, "codestory-test", b"{\"schema_version\":2}\n")
+            .expect("publish new private file");
+
+        assert_eq!(
+            fs::read(&path).expect("read published file"),
+            b"{\"schema_version\":2}\n"
+        );
+        // The rename carries the temporary file's inode, so the published mode
+        // is the 0o600 the temporary was created with.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("published metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let residue = fs::read_dir(directory.path())
+            .expect("list publication directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .filter(|name| name != "worker-output.json")
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "publish left temporaries beside the file: {residue:?}"
+        );
+    }
+
+    #[test]
+    fn failed_publication_removes_the_temporary_and_spares_the_destination() {
+        let directory = tempfile::tempdir().expect("publication directory");
+        // A non-empty directory at the destination is a rename target no
+        // platform will accept, which fails the publish after the temporary
+        // file has been written and synced.
+        let destination = directory.path().join("occupied");
+        fs::create_dir(&destination).expect("destination directory");
+        fs::write(destination.join("resident"), b"resident").expect("resident file");
+
+        let error = publish_new_private_file_atomic(&destination, "codestory-test", b"new")
+            .expect_err("publishing onto a non-empty directory must fail");
+
+        assert!(
+            matches!(error, PublishNewFileError::Publish(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(destination.join("resident")).expect("read resident file"),
+            b"resident"
+        );
+        let residue = fs::read_dir(directory.path())
+            .expect("list publication directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .filter(|name| name != "occupied")
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "failed publish left temporaries behind: {residue:?}"
+        );
+    }
+
+    #[test]
     fn unique_temp_creation_skips_stale_collision() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
@@ -315,5 +565,26 @@ mod tests {
         write_bytes_atomic(&path, "state", b"new").expect("atomic long-path write");
 
         assert_eq!(fs::read(&path).expect("read new file"), b"new");
+    }
+
+    #[test]
+    fn a_temp_prefix_that_escapes_the_directory_is_refused() {
+        // The prefix reaches a filename joined onto the destination's parent, so
+        // anything that is not a plain component could publish the temporary file
+        // outside the directory the caller validated.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("published.json");
+        for prefix in ["../escape", "nested/prefix", "..", "", "a\\b"] {
+            let error = publish_new_private_file_atomic(&destination, prefix, b"{}")
+                .expect_err("an escaping prefix must be refused");
+            assert!(
+                matches!(error, PublishNewFileError::UnsafeTempPrefix),
+                "prefix {prefix:?} produced {error:?}"
+            );
+        }
+        assert!(
+            !destination.exists(),
+            "a refused publish must write nothing"
+        );
     }
 }
