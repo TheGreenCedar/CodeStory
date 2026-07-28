@@ -16,18 +16,18 @@ use codestory_contracts::api::{
     GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingOrientationConfidenceDto,
     GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
     GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexedFileRoleDto, IndexingPhaseTimings,
-    NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointKindDto,
-    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
-    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
-    StoredSemanticDocsContractDto, SymbolContextDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, WorkspaceMemberIndexDto,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto,
+    IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
+    RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
+    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
+    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, SystemActionResponse,
+    TrailConfigDto, TrailContextDto, WorkspaceMemberIndexDto,
 };
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
@@ -132,6 +132,64 @@ use semantic_projection::edge_digest_for_node;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use semantic_projection::stored_semantic_embeddings_for_test;
+
+/// Test-support: publish a retrieval manifest fixture into the store at
+/// `storage_path`. Consumer crates (for example the CLI, whose architecture
+/// contract forbids direct `codestory_store` access) use this to stage
+/// manifest-published stores for readiness regression tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn publish_retrieval_manifest_for_test(
+    storage_path: &Path,
+    manifest: &codestory_retrieval::RetrievalIndexManifest,
+) -> Result<(), ApiError> {
+    let mut storage = Storage::open(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to open storage for manifest fixture: {error}"
+        ))
+    })?;
+    storage
+        .upsert_retrieval_index_manifest(manifest)
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to publish manifest fixture: {error}"))
+        })?;
+    Ok(())
+}
+
+/// Test-support: run the production manifest-derived retrieval readiness
+/// projection against a storage path, exactly as the search/ground/index
+/// surfaces do. Consumer-side regression tests (for example the CLI doctor)
+/// use this so their fixtures cannot drift from the real producer vocabulary.
+///
+/// The projection runs under a deterministic Local-profile sidecar runtime:
+/// empty process defaults (no ambient environment reads) with hybrid
+/// retrieval explicitly enabled and `cache_root` as the isolated cache root.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn retrieval_state_from_manifest_storage_for_test(
+    storage_path: &Path,
+    project_root: &Path,
+    cache_root: &Path,
+) -> Result<RetrievalStateDto, ApiError> {
+    let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        codestory_retrieval::SidecarRuntimeDefaults::default(),
+    );
+    let overrides = codestory_retrieval::SidecarRuntimeOverrides {
+        hybrid_retrieval_enabled: Some(true),
+        ..Default::default()
+    };
+    let runtime =
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            None,
+            codestory_retrieval::SidecarProfile::Local,
+            None,
+            &process_defaults,
+            &overrides,
+        );
+    let storage = open_storage_for_read(storage_path)?;
+    search_publication::retrieval_state_from_storage_for_runtime(&storage, project_root, &runtime)
+}
 #[cfg(test)]
 use semantic_projection::{
     DENSE_CENTRAL_RELATIONSHIP_THRESHOLD, DENSE_CENTRAL_SCORE_THRESHOLD, DenseAnchorCentrality,

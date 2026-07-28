@@ -501,6 +501,12 @@ impl EmbeddingVectorProducerEvidenceDto {
 ///
 /// `mixed_*` flags are diagnostic evidence that the cache was built from more
 /// than one profile/model/backend/dimension/doc-shape and may need repair.
+///
+/// Producers that project this contract from a publication pointer (the
+/// retrieval index manifest) carry only the fields that pointer records — the
+/// embedding runtime id as `cache_key`, the dimension, and the semantic
+/// policy version. Optional fields the publication contract does not carry
+/// stay `None`; consumers must not read an absent optional field as drift.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct StoredSemanticDocsContractDto {
     pub doc_count: u32,
@@ -542,6 +548,19 @@ pub enum IndexFreshnessStatusDto {
     NotChecked,
 }
 
+/// Why a freshness check could not reach a verdict.
+///
+/// `NotChecked` conflates two very different situations. `BoundedInventory` means discovery hit a
+/// deliberate size bound, so drift is unknown but the publication itself is complete and usable.
+/// `InventoryUnavailable` means the check could not run at all, which proves nothing about the
+/// publication. Only the second may block agent-facing retrieval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFreshnessNotCheckedCauseDto {
+    BoundedInventory,
+    InventoryUnavailable,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexFreshnessChangeKindDto {
@@ -567,6 +586,9 @@ pub struct IndexFreshnessDto {
     pub duration_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Set only when `status` is `NotChecked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_checked_cause: Option<IndexFreshnessNotCheckedCauseDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<IndexFreshnessSampleDto>,
 }

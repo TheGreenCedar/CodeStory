@@ -113,6 +113,57 @@ function pluginVersion() {
   return manifest && typeof manifest.version === 'string' ? manifest.version : null;
 }
 
+const SEMVER_SHAPE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+const SHA256_SHAPE = /^[0-9a-f]{64}$/u;
+const PINNED_CLI_TARGETS = ['macos-arm64', 'windows-x64', 'linux-x64'];
+
+// The plugin's own version names the package; the pin names the CLI it runs. Splitting them is
+// what lets a plugin-only release ship without cutting new native archives: the plugin version
+// moves, the pin keeps naming the already-published, already-proven CLI. When the file is absent
+// the two are the same, which is exactly the pre-pin behavior.
+//
+// A malformed pin fails closed rather than falling back: a pin that no longer parses must not
+// silently change which binary every session runs.
+function pinnedCliContract() {
+  const pinPath = path.join(pluginRoot, 'cli-version.json');
+  if (!fs.existsSync(pinPath)) return null;
+  const pin = readJson(pinPath);
+  const validShape =
+    pin &&
+    pin.schema_version === 1 &&
+    typeof pin.cli_version === 'string' &&
+    SEMVER_SHAPE.test(pin.cli_version) &&
+    pin.release_tag === `v${pin.cli_version}` &&
+    (pin.archives === undefined ||
+      (pin.archives &&
+        typeof pin.archives === 'object' &&
+        !Array.isArray(pin.archives) &&
+        Object.keys(pin.archives).every(
+          (target) =>
+            PINNED_CLI_TARGETS.includes(target) && SHA256_SHAPE.test(String(pin.archives[target])),
+        )));
+  if (!validShape) {
+    const error = new Error('managed_cli_pin_invalid');
+    error.pinInvalid = true;
+    throw error;
+  }
+  return pin;
+}
+
+function pinnedCliVersion() {
+  const pin = pinnedCliContract();
+  return pin ? pin.cli_version : pluginVersion();
+}
+
+// The expected archive digest for this target when the pin carries one. Content-addressing on top
+// of SHA256SUMS.txt: the checksums file arrives over the same channel as the archive, while the
+// pin ships inside the reviewed plugin package.
+function pinnedArchiveSha256(target) {
+  const pin = pinnedCliContract();
+  const digest = pin?.archives?.[target];
+  return typeof digest === 'string' ? digest.toLowerCase() : null;
+}
+
 function pluginCacheVersion() {
   const parent = path.basename(path.dirname(pluginRoot)).toLowerCase();
   return parent === 'codestory' ? path.basename(pluginRoot) : null;
@@ -348,6 +399,40 @@ function managedCliDownloadProgressReport() {
   };
 }
 
+// Preparing responses derive their agent retry hint from the provisioning state this launcher
+// actually observes instead of a fixed placeholder: a fixed delay makes agents busy-poll a
+// multi-minute archive download and oversleep when readiness is imminent. While a transfer is
+// measurable, the hint is the estimated remaining transfer time at the observed throughput. The
+// clamp keeps degenerate estimates sane: the floor matches the runtime's own minimum activation
+// retry delay, and the ceiling bounds how long an agent sleeps past a completion, failure, or
+// stall the estimate could not foresee.
+const provisioningRetryHintMinMs = 250;
+const provisioningRetryHintMaxMs = 10000;
+// Provisioning states carrying no measurable transfer keep the historical fixed hint.
+const provisioningRetryHintFallbackMs = 1500;
+
+function provisioningRetryHintMs(progress = managedCliDownloadProgress) {
+  const { receivedBytes, totalBytes, startedAt, updatedAt } = progress;
+  if (
+    !Number.isSafeInteger(totalBytes) || totalBytes <= 0
+    || !Number.isSafeInteger(receivedBytes) || receivedBytes <= 0
+  ) {
+    return provisioningRetryHintFallbackMs;
+  }
+  const remainingBytes = Math.max(0, totalBytes - receivedBytes);
+  // Throughput is measured over the window that actually transferred the received bytes; a
+  // wall-clock "now" would decay the rate during a stall and inflate the estimate open-endedly.
+  const observedMs = Number.isFinite(startedAt) && Number.isFinite(updatedAt)
+    ? updatedAt - startedAt
+    : 0;
+  if (remainingBytes > 0 && observedMs <= 0) return provisioningRetryHintFallbackMs;
+  const estimatedRemainingMs = remainingBytes === 0 ? 0 : remainingBytes * (observedMs / receivedBytes);
+  return Math.min(
+    provisioningRetryHintMaxMs,
+    Math.max(provisioningRetryHintMinMs, Math.round(estimatedRemainingMs)),
+  );
+}
+
 function copyLocalReleaseFile(releaseDir, name, destination, maxBytes) {
   const source = path.join(releaseDir, name);
   try {
@@ -386,7 +471,9 @@ function downloadFailureKind(error) {
 // before showing the same error, so the retry loop stops at the first one.
 function downloadFailurePermanent(error) {
   const kind = downloadFailureKind(error);
-  if (['size_limit', 'content_length', 'transport'].includes(kind)) return true;
+  // `publish` is a local filesystem failure after a complete transfer. Retrying re-downloads the
+  // whole asset only to fail identically at the same step, so it stops here.
+  if (['size_limit', 'content_length', 'transport', 'publish'].includes(kind)) return true;
   if (kind !== 'http_status') return false;
   const status = Number(error?.httpStatus);
   // 408/425/429 are explicitly "come back later"; every other 4xx is a fixed answer.
@@ -558,6 +645,27 @@ function downloadFileOnce(url, destination, options = {}) {
   });
 }
 
+// `rename` cannot cross filesystems, and the partial deliberately lives under the managed CLI root
+// so it survives a restart while the caller's destination may sit in a temp directory on another
+// mount. Falling back to copy-then-unlink keeps publication correct wherever the two land.
+function publishDownloadedFile(partialPath, destination) {
+  try {
+    fs.rmSync(destination, { force: true });
+    fs.renameSync(partialPath, destination);
+    return;
+  } catch (error) {
+    if (error?.code !== 'EXDEV') {
+      throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+    }
+  }
+  try {
+    fs.copyFileSync(partialPath, destination);
+    fs.rmSync(partialPath, { force: true });
+  } catch (error) {
+    throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+  }
+}
+
 function partialDownloadBytes(partialPath) {
   try {
     const metadata = fs.statSync(partialPath);
@@ -599,8 +707,7 @@ async function downloadFile(url, destination, options = {}) {
           ? (progress) => onProgress({ ...progress, attempt })
           : undefined,
       });
-      fs.rmSync(destination, { force: true });
-      fs.renameSync(partialPath, destination);
+      publishDownloadedFile(partialPath, destination);
       return;
     } catch (error) {
       lastError = error;
@@ -1684,7 +1791,10 @@ function trimManagedCliQuarantines(root, version, options = {}) {
 // Partial archives live under the managed root rather than an ephemeral temp dir so an interrupted
 // first run resumes after an MCP restart instead of starting the whole transfer over. The name is
 // dot-prefixed, so version enumeration and retention already skip it.
-function managedCliDownloadCacheDir(root, version) {
+// Every path that reads or deletes inside the download cache resolves it through here first. The
+// cache is recursively deleted from, so a symlinked `.download` would make provisioning delete
+// through it into whatever it points at.
+function managedCliDownloadCacheRoot(root) {
   const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
   if (fs.existsSync(cacheRoot)) {
     const metadata = fs.lstatSync(cacheRoot);
@@ -1692,20 +1802,28 @@ function managedCliDownloadCacheDir(root, version) {
       throw new Error('managed_cli_download_cache_not_direct');
     }
   }
-  const dir = path.join(cacheRoot, version);
+  return cacheRoot;
+}
+
+function managedCliDownloadCacheDir(root, version) {
+  const dir = path.join(managedCliDownloadCacheRoot(root), version);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
 
 function trimManagedCliDownloadCache(root, version) {
-  const cacheRoot = path.join(root, managedCliDownloadCacheDirName);
+  let cacheRoot;
   let children;
   try {
+    cacheRoot = managedCliDownloadCacheRoot(root);
     children = fs.readdirSync(cacheRoot, { withFileTypes: true });
   } catch {
     return;
   }
   for (const child of children) {
+    // A symlinked version entry is not a partial this process created, so it is never ours to
+    // delete through.
+    if (child.isSymbolicLink()) continue;
     const childPath = path.join(cacheRoot, child.name);
     try {
       // Partials for a version we are no longer provisioning can never be resumed, and even the
@@ -1721,10 +1839,9 @@ function trimManagedCliDownloadCache(root, version) {
 
 function removeManagedCliDownloadCache(root, version) {
   try {
-    fs.rmSync(path.join(root, managedCliDownloadCacheDirName, version), {
-      recursive: true,
-      force: true,
-    });
+    const versionDir = path.join(managedCliDownloadCacheRoot(root), version);
+    if (fs.lstatSync(versionDir).isSymbolicLink()) return;
+    fs.rmSync(versionDir, { recursive: true, force: true });
   } catch {
     // Best effort: a leftover partial is trimmed on the next provisioning run.
   }
@@ -1793,16 +1910,20 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     warnings.push('managed_cli_publication:publisher');
     tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
     const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
-    const archivePath = path.join(tempRoot, asset);
     const extractDir = path.join(tempRoot, 'extract');
     trimManagedCliDownloadCache(root, version);
-    let archivePartialPath;
+    // Keep the completed archive on the same filesystem as its own partial so publication is a
+    // same-directory rename. The temp root frequently sits on a different mount from the managed
+    // root, and a cross-device rename fails after the whole transfer has already succeeded.
+    let archivePath = path.join(tempRoot, asset);
+    let archivePartialPath = `${archivePath}.part`;
     try {
-      archivePartialPath = path.join(managedCliDownloadCacheDir(root, version), `${asset}.part`);
+      const downloadCacheDir = managedCliDownloadCacheDir(root, version);
+      archivePath = path.join(downloadCacheDir, asset);
+      archivePartialPath = path.join(downloadCacheDir, `${asset}.part`);
     } catch (error) {
       // A cache we cannot use costs resume, not correctness: fall back to the temp dir.
       warnings.push(`managed_cli_publication:download_cache_unavailable:${managedCliFailureCode(error)}`);
-      archivePartialPath = `${archivePath}.part`;
     }
     const resumeBytes = partialDownloadBytes(archivePartialPath);
     if (resumeBytes > 0) warnings.push(`managed_cli_publication:resume_bytes:${resumeBytes}`);
@@ -1814,6 +1935,16 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     const actual = fileSha256(archivePath);
     if (actual !== expected) {
       throw new Error(`archive_checksum_mismatch:${asset}`);
+    }
+    // SHA256SUMS.txt travels over the same channel as the archive; the pin ships inside the
+    // reviewed plugin package. When the pin names this version's digest, a real release download
+    // must match it. Explicit packages (CODESTORY_PLUGIN_RELEASE_DIR and test fixtures) are
+    // legitimately different bytes, the same relaxation the manifest metadata checks apply.
+    if (buildSource === 'github_release') {
+      const pinned = pinnedArchiveSha256(target);
+      if (pinned && pinned !== actual) {
+        throw new Error(`archive_pin_mismatch:${asset}`);
+      }
     }
     extractArchive(archivePath, extractDir);
 
@@ -1898,8 +2029,32 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
 async function resolveCli(options = {}) {
   const version = pluginVersion();
   const warnings = [];
+  let managedVersion;
+  try {
+    managedVersion = pinnedCliVersion();
+  } catch {
+    // A pin that no longer parses must not silently change which binary runs.
+    const reason = 'managed_cli_pin_invalid';
+    warnings.push(reason);
+    return {
+      source: 'managed_unavailable',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'managed_unavailable',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      managedFailure: reason,
+      warnings,
+    };
+  }
   const devReceipt = validateDevCliReceipt(pluginRoot, {
     expectedPluginVersion: version,
+    expectedCliVersion: managedVersion,
   });
   if (process.env.CODESTORY_CLI && devReceipt.state !== 'absent') {
     const reason = 'codestory_dev_cli_ambiguous_override';
@@ -1982,7 +2137,7 @@ async function resolveCli(options = {}) {
     };
   }
 
-  const managed = await resolveManagedCli(pluginDataDir(), version, warnings, options);
+  const managed = await resolveManagedCli(pluginDataDir(), managedVersion, warnings, options);
   if (managed && managed.warning) warnings.push(managed.warning);
   if (managed && managed.path) {
     return { source: 'managed', version, warnings, ...managed };
@@ -2566,8 +2721,10 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
       automatic: true,
     },
     allowed_surfaces: Object.fromEntries(surfaces.map((surface) => [surface, blockedSurface()])),
+    // `after_ms` matches the field the CLI runtime attaches to its own preparing
+    // recommended-next-call, so agents see one timing contract across the handoff boundary.
     recommended_next_calls: preparing
-      ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', retry_after_ms: 1500 }]
+      ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', after_ms: provisioningRetryHintMs() }]
       : projectRoot
         ? [{
             method: 'resources/read',
@@ -2820,7 +2977,7 @@ function managedProvisioningOperation() {
     state: 'preparing',
     stage: progress?.stage || 'downloading_runtime',
     attempt: progress?.attempt ?? 1,
-    retry_after_ms: 1500,
+    retry_after_ms: provisioningRetryHintMs(),
     failure: null,
     progress: progress
       ? {
@@ -2882,17 +3039,20 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   const project = selection.project;
   if (tool === 'status') {
     const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
+    // The top-level hint repeats the operation snapshot's so one status response never carries
+    // two disagreeing delays.
+    const currentOperation = preparing ? managedProvisioningOperation() : null;
     const structuredContent = {
       project,
       state: preparing ? 'preparing' : 'unavailable',
       degraded_reason: degradedReason,
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
-      current_operation: preparing ? managedProvisioningOperation() : null,
+      current_operation: currentOperation,
       failure: preparing ? null : primaryFailure,
       failure_context: !preparing && managedFailure ? managedCliProvisionFailure.context : null,
       hint: !preparing && managedFailure ? managedCliProvisionFailure.hint : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
-      retry_after_ms: preparing ? 1500 : null,
+      retry_after_ms: currentOperation ? currentOperation.retry_after_ms : null,
       diagnostics_uri: diagnosticsUri,
     };
     return {
@@ -2902,6 +3062,9 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   }
   const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
   const failureHint = managedFailure ? managedCliProvisionFailure.hint : null;
+  // The top-level hint repeats the operation snapshot's so one preparing response never carries
+  // two disagreeing delays.
+  const provisioningOperation = preparing ? managedProvisioningOperation() : null;
   const structuredContent = preparing ? {
     code: 'codestory_preparing',
     message: managedProvisioningMessage(),
@@ -2909,8 +3072,8 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     project,
     state: 'preparing',
     retry_tool: tool,
-    retry_after_ms: 1500,
-    operation: managedProvisioningOperation(),
+    retry_after_ms: provisioningOperation.retry_after_ms,
+    operation: provisioningOperation,
     diagnostics_uri: diagnosticsUri,
   } : {
     code: 'codestory_unavailable',
@@ -3151,11 +3314,18 @@ function runFailOpenMcp(status, options = {}) {
           statusValue.project_root_source = parsedResource.projectSource;
           statusValue.diagnostics_uri = parsedResource.uri;
           if (Array.isArray(statusValue.recommended_next_calls)) {
-            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
-              call?.method === 'resources/read'
-                && call?.uri_template === 'codestory://status{?project}'
-                ? { method: call.method, uri: parsedResource.uri }
-                : call);
+            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) => {
+              if (call?.method === 'resources/read'
+                && call?.uri_template === 'codestory://status{?project}') {
+                return { method: call.method, uri: parsedResource.uri };
+              }
+              // The preparing diagnostic is snapshotted when provisioning starts; the retry hint
+              // must track the download progress observed at this read, not that initial instant.
+              if (call?.method === 'tools/call' && Number.isSafeInteger(call.after_ms)) {
+                return { ...call, after_ms: provisioningRetryHintMs() };
+              }
+              return call;
+            });
           }
           response = jsonrpcResult(
             request.id,
@@ -3386,10 +3556,19 @@ if (require.main === module) {
       cleanPublicProjectPath,
       downloadFile,
       downloadFailurePermanent,
+      pinnedCliContract,
+      pinnedCliVersion,
+      pinnedArchiveSha256,
+      publishDownloadedFile,
+      removeManagedCliDownloadCache,
       managedCliDownloadHint,
       managedCliDownloadProgress,
       managedCliProvisionFailure,
       managedProvisioningOperation,
+      provisioningRetryHintMs,
+      provisioningRetryHintMinMs,
+      provisioningRetryHintMaxMs,
+      provisioningRetryHintFallbackMs,
       sanitizeDownloadFailure,
       releaseDownloadStallTimeoutMs,
       releaseArchiveTotalTimeoutMs,

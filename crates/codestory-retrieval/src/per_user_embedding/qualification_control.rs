@@ -17,15 +17,18 @@ use uuid::Uuid;
 
 mod server;
 
+#[cfg(all(test, windows))]
+pub(super) use server::native_path_identity;
+#[cfg(test)]
+pub(super) use server::{
+    CommandAbsence, MAX_DENIED_COMMAND_TICKS, absent_command, read_server_qualification_command,
+    server_qualification_control_from_values,
+};
 pub(super) use server::{
     ServerQualificationControl, ServerQualificationEvent, ServerQualificationEventClock,
     poll_server_qualification_command, server_qualification_control_from_env,
     sync_qualification_directory, validate_private_qualification_file_metadata,
     write_server_qualification_event,
-};
-#[cfg(test)]
-pub(super) use server::{
-    read_server_qualification_command, server_qualification_control_from_values,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +77,11 @@ pub struct EmbeddingQualificationAttemptResult {
     pub submitted_ns: u64,
     pub completed_ns: u64,
     pub outcome: String,
+    /// The typed code behind a `server_loss` outcome, so retained replay
+    /// evidence can distinguish a classified transport disconnect from an
+    /// unresponsive-owner timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_code: Option<String>,
 }
 
 pub(super) type EmbeddingQualificationAttemptExchange = (

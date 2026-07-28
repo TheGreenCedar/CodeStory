@@ -37,17 +37,12 @@ fn prepare_runtime() -> io::Result<PathBuf> {
 }
 
 fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join(STAGING_LOCK))?;
-    FileExt::lock_exclusive(&lock)?;
-
+    // Installed archives ship a published generation and no build-tree candidate, so the common
+    // case stages nothing. Deciding that before taking the lock keeps every ordinary invocation off
+    // a machine-wide exclusive lock, and lets an install the caller cannot write to still run.
     let candidate = root.join(NATIVE_RUNTIME_EXECUTABLE);
-    let seed_id = match fs::symlink_metadata(&candidate) {
-        Ok(_) => runtime_seed_id(&candidate)?,
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return pinned_current_runtime(root)?.ok_or_else(|| {
                 io::Error::new(
@@ -57,7 +52,18 @@ fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
             });
         }
         Err(error) => return Err(error),
-    };
+    }
+
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(STAGING_LOCK))
+        .map_err(|error| staging_lock_error(root, error))?;
+    FileExt::lock_exclusive(&lock)?;
+
+    let seed_id = runtime_seed_id(&candidate)?;
     let seed_dir = root.join(NATIVE_RUNTIME_SEEDS_DIR).join(&seed_id);
     if !seed_dir.is_dir() {
         return Err(io::Error::new(
@@ -105,9 +111,8 @@ fn pinned_current_runtime(root: &Path) -> io::Result<Option<PathBuf>> {
         .join(NATIVE_RUNTIME_GENERATIONS_DIR)
         .join(&generation_id);
     let runtime = generation_dir.join(NATIVE_RUNTIME_EXECUTABLE);
-    let seed_id = runtime_seed_id(&runtime)?;
-    let runtime_sha256 = file_sha256(&runtime)?;
-    if final_generation_id(&seed_id, &runtime_sha256) != generation_id {
+    let identity = RuntimeIdentity::read(&runtime)?;
+    if final_generation_id(&identity.seed_id, &identity.sha256) != generation_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -116,8 +121,86 @@ fn pinned_current_runtime(root: &Path) -> io::Result<Option<PathBuf>> {
             ),
         ));
     }
-    verify_complete_generation(&generation_dir, &runtime_sha256)?;
+    verify_complete_generation_with(&generation_dir, &identity)?;
     Ok(Some(runtime))
+}
+
+fn staging_lock_error(root: &Path, error: io::Error) -> io::Error {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "cannot write the native staging lock in {}. A shared or read-only install must \
+             already contain a published generation; reinstall as the user that runs CodeStory, \
+             or grant that user write access to this directory.",
+            root.display()
+        ),
+    )
+}
+
+/// The runtime executable's seed marker and digest, read in one pass.
+///
+/// Both were previously computed by separate whole-file reads, and the pinned path did each of them
+/// twice. The executable carries the embedded model in a release build, so each read is hundreds of
+/// megabytes.
+struct RuntimeIdentity {
+    seed_id: String,
+    sha256: [u8; 32],
+}
+
+impl RuntimeIdentity {
+    fn read(path: &Path) -> io::Result<Self> {
+        require_regular_file(path, "native runtime executable")?;
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        // The seed marker can straddle a read boundary, so each pass keeps the last
+        // marker-length-minus-one bytes of the previous chunk.
+        let overlap = NATIVE_RUNTIME_SEED_MARKER_PREFIX.len().saturating_sub(1);
+        let mut carry: Vec<u8> = Vec::with_capacity(overlap + buffer.len());
+        let mut consumed = 0_usize;
+        let mut offsets = Vec::new();
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            let base = consumed.saturating_sub(carry.len());
+            carry.extend_from_slice(&buffer[..count]);
+            for (offset, window) in carry
+                .windows(NATIVE_RUNTIME_SEED_MARKER_PREFIX.len())
+                .enumerate()
+            {
+                if window == NATIVE_RUNTIME_SEED_MARKER_PREFIX {
+                    offsets.push(base + offset);
+                    // More than one marker is already a failure; stop growing the list.
+                    if offsets.len() > 1 {
+                        break;
+                    }
+                }
+            }
+            consumed += count;
+            let keep = carry.len().min(overlap);
+            carry.drain(..carry.len() - keep);
+        }
+        if offsets.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime executable has no unique native seed marker: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let seed_id = read_seed_id_at(path, offsets[0])?;
+        Ok(Self {
+            seed_id,
+            sha256: hasher.finalize().into(),
+        })
+    }
 }
 
 fn final_generation_id(seed_id: &str, runtime_sha256: &[u8; 32]) -> String {
@@ -170,24 +253,34 @@ fn publish_complete_generation(
 }
 
 fn verify_complete_generation(generation_dir: &Path, runtime_sha256: &[u8; 32]) -> io::Result<()> {
-    let seed_id = native_seed_id(generation_dir)?;
     let runtime = generation_dir.join(NATIVE_RUNTIME_EXECUTABLE);
-    require_regular_file(&runtime, "native runtime executable")?;
-    if runtime_seed_id(&runtime)? != seed_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native generation files do not match the executable seed marker: {}",
-                generation_dir.display()
-            ),
-        ));
-    }
-    if &file_sha256(&runtime)? != runtime_sha256 {
+    let identity = RuntimeIdentity::read(&runtime)?;
+    if &identity.sha256 != runtime_sha256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "immutable native generation has unexpected executable bytes: {}",
                 runtime.display()
+            ),
+        ));
+    }
+    verify_complete_generation_with(generation_dir, &identity)
+}
+
+/// Check a generation against an executable identity the caller already computed.
+///
+/// The executable is the expensive artifact to read, so it is never re-read here.
+fn verify_complete_generation_with(
+    generation_dir: &Path,
+    identity: &RuntimeIdentity,
+) -> io::Result<()> {
+    let seed_id = native_seed_id(generation_dir)?;
+    if identity.seed_id != seed_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "native generation files do not match the executable seed marker: {}",
+                generation_dir.display()
             ),
         ));
     }
@@ -251,6 +344,36 @@ fn runtime_seed_id(path: &Path) -> io::Result<String> {
             ),
         )
     })
+}
+
+/// Read and validate the seed id that follows a marker at `offset`.
+fn read_seed_id_at(path: &Path, offset: usize) -> io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime executable has no unique native seed marker: {}",
+                path.display()
+            ),
+        )
+    };
+    let id_start = offset + NATIVE_RUNTIME_SEED_MARKER_PREFIX.len();
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(
+        u64::try_from(id_start).map_err(|_| invalid())?,
+    ))?;
+    let mut framed = vec![0_u8; 64 + NATIVE_RUNTIME_SEED_MARKER_SUFFIX.len()];
+    file.read_exact(&mut framed).map_err(|_| invalid())?;
+    if &framed[64..] != NATIVE_RUNTIME_SEED_MARKER_SUFFIX {
+        return Err(invalid());
+    }
+    std::str::from_utf8(&framed[..64])
+        .ok()
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .ok_or_else(invalid)
 }
 
 fn seed_id_from_bytes(bytes: &[u8]) -> Option<String> {
@@ -438,11 +561,44 @@ mod tests {
     use super::{
         NATIVE_RUNTIME_CURRENT_FILE, NATIVE_RUNTIME_EXECUTABLE, NATIVE_RUNTIME_FILE_LIST,
         NATIVE_RUNTIME_GENERATIONS_DIR, NATIVE_RUNTIME_SEEDS_DIR, final_generation_id,
-        native_seed_id, prepare_runtime_at, seed_id_from_bytes,
+        job_step_error, native_seed_id, prepare_runtime_at, raw_exit_evidence, seed_id_from_bytes,
     };
     use std::fs;
 
     const SEED: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Build a root that has already published one generation, as an install would.
+    pub(super) fn install_fixture(root: &std::path::Path) {
+        let staging = root.join("seed-staging");
+        fs::create_dir(&staging).expect("seed staging directory");
+        fs::write(staging.join("libggml.so"), b"ggml").expect("ggml runtime");
+        fs::write(staging.join("libllama.so"), b"llama").expect("llama runtime");
+        fs::write(
+            staging.join(NATIVE_RUNTIME_FILE_LIST),
+            "libggml.so\nlibllama.so\n",
+        )
+        .expect("runtime manifest");
+        let seed_id = native_seed_id(&staging).expect("seed identity");
+        let seed = root.join(NATIVE_RUNTIME_SEEDS_DIR).join(&seed_id);
+        fs::create_dir_all(seed.parent().expect("seed parent")).expect("seed root");
+        fs::rename(staging, &seed).expect("publish seed");
+        let candidate = root.join(NATIVE_RUNTIME_EXECUTABLE);
+        fs::write(
+            &candidate,
+            format!("codestory-native-runtime-seed-v1|id={seed_id}|end-installed"),
+        )
+        .expect("runtime candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&candidate)
+                .expect("runtime candidate metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&candidate, permissions).expect("executable runtime candidate");
+        }
+        prepare_runtime_at(root).expect("publish the installed generation");
+    }
 
     #[test]
     fn parses_one_exact_native_seed_marker() {
@@ -457,6 +613,39 @@ mod tests {
         assert!(
             seed_id_from_bytes(b"codestory-native-runtime-seed-v1|id=not-a-sha256|end").is_none()
         );
+    }
+
+    #[test]
+    fn records_raw_exit_codes_that_do_not_fit_the_launcher_status() {
+        let evidence =
+            raw_exit_evidence(Some(-1073741819)).expect("ntstatus-shaped code leaves evidence");
+        assert!(evidence.contains("-1073741819"), "raw value survives");
+        assert!(
+            evidence.contains("0xc0000005"),
+            "ntstatus form accompanies it"
+        );
+        assert!(raw_exit_evidence(Some(256)).is_some());
+    }
+
+    #[test]
+    fn forwardable_exit_codes_leave_no_raw_evidence() {
+        assert_eq!(raw_exit_evidence(Some(0)), None);
+        assert_eq!(raw_exit_evidence(Some(255)), None);
+        assert_eq!(raw_exit_evidence(None), None);
+    }
+
+    #[test]
+    fn job_object_failures_name_the_step_that_failed() {
+        let denied = std::io::Error::from_raw_os_error(5);
+        let kind = denied.kind();
+        let error = job_step_error("assign runtime child to its job object", denied);
+        assert!(
+            error
+                .to_string()
+                .starts_with("assign runtime child to its job object: "),
+            "the failing step survives into the rendered failure"
+        );
+        assert_eq!(error.kind(), kind, "the classification is preserved");
     }
 
     #[test]
@@ -583,13 +772,159 @@ mod tests {
     }
 }
 
+#[cfg(any(windows, test))]
+fn raw_exit_evidence(code: Option<i32>) -> Option<String> {
+    let code = code?;
+    // Codes outside the launcher's 8-bit exit status — NTSTATUS crash values
+    // arrive as negatives — would otherwise vanish behind the generic failure
+    // classification, so the raw value is recorded before that collapse.
+    u8::try_from(code).is_err().then(|| {
+        format!(
+            "native runtime exited with raw code {code} (0x{:08x})",
+            code as u32
+        )
+    })
+}
+
+#[cfg(any(windows, test))]
+fn job_step_error(step: &str, error: io::Error) -> io::Error {
+    // Every job-object failure surfaces through the launcher's single
+    // activation message, so the failing step has to be named here for a
+    // field report to distinguish creation, configuration, and assignment
+    // problems.
+    io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
 #[cfg(windows)]
 fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
-    let status = Command::new(path)
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    // Windows has no process-group teardown on parent death, so the runtime
+    // child is tethered to a kill-on-close job: when this launcher exits or is
+    // killed, its job handle closes and the kernel reaps the child tree.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(job_step_error(
+            "create runtime job object",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: the job handle is non-null, live, and owned by nothing else.
+    let job = unsafe { OwnedHandle::from_raw_handle(job.cast()) };
+    // SAFETY: all-zero extended limits are the documented "no limits" state;
+    // only the two flags below are raised on top of it.
+    let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+    // Kill-on-close scopes the runtime tree to this launcher invocation.
+    // Breakaway stays permitted because the per-user embedding server outlives
+    // any single invocation by design — its idle timeout owns its lifetime and
+    // later commands reconnect to it instead of reloading the model — so its
+    // spawn opts out of the job explicitly. Nothing else the runtime starts
+    // asks to break away.
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    // SAFETY: limits is a live extended-limit block passed with its exact size
+    // for this information class.
+    let configured = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle().cast(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(job_step_error(
+            "configure runtime job object limits",
+            io::Error::last_os_error(),
+        ));
+    }
+
+    let mut child = Command::new(path)
         .args(std::env::args_os().skip(1))
-        .status()?;
+        .spawn()?;
+    // Command cannot expose a suspended primary thread to resume later, so the
+    // job assignment lands immediately after spawn instead — the same
+    // adopt-right-after-acquisition pattern the embedding transport uses for
+    // peer process handles. The unassigned window is a few launcher
+    // instructions wide and only reproduces the old orphaning if the launcher
+    // dies inside it.
+    // SAFETY: both handles are live; the child has not been waited on yet.
+    let assigned = unsafe {
+        AssignProcessToJobObject(job.as_raw_handle().cast(), child.as_raw_handle().cast())
+    };
+    if assigned == 0 {
+        let error = job_step_error(
+            "assign runtime child to its job object",
+            io::Error::last_os_error(),
+        );
+        // A child left outside the job would outlive this failed activation
+        // unmanaged, which is exactly what the job exists to prevent.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let status = child.wait()?;
+    if let Some(evidence) = raw_exit_evidence(status.code()) {
+        eprintln!("codestory-cli: {evidence}");
+    }
     Ok(status
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .map_or(ExitCode::FAILURE, ExitCode::from))
+}
+
+#[cfg(test)]
+mod installed_layout_tests {
+    use super::tests::install_fixture;
+    use super::{NATIVE_RUNTIME_EXECUTABLE, STAGING_LOCK, prepare_runtime_at};
+    use std::fs;
+
+    #[test]
+    fn an_installed_generation_activates_without_taking_the_staging_lock() {
+        // Installed archives carry a published generation and no build-tree candidate, so nothing
+        // is staged. Taking a machine-wide exclusive lock anyway serialized every invocation and
+        // made a read-only or shared install unusable for anyone who could not write to it.
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let root = temp.path();
+        install_fixture(root);
+        fs::remove_file(root.join(NATIVE_RUNTIME_EXECUTABLE)).expect("remove build-tree candidate");
+        fs::remove_file(root.join(STAGING_LOCK)).expect("clear the lock left by staging");
+
+        let runtime = prepare_runtime_at(root).expect("installed activation");
+        assert!(runtime.is_file(), "installed generation resolves");
+        assert!(
+            !root.join(STAGING_LOCK).exists(),
+            "an installed activation must not create the staging lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_install_still_activates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let root = temp.path();
+        install_fixture(root);
+        fs::remove_file(root.join(NATIVE_RUNTIME_EXECUTABLE)).expect("remove build-tree candidate");
+        fs::remove_file(root.join(STAGING_LOCK)).expect("clear the lock left by staging");
+
+        let original = fs::metadata(root).expect("root metadata").permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(root, read_only).expect("make the install read-only");
+
+        let activation = prepare_runtime_at(root);
+
+        fs::set_permissions(root, original).expect("restore permissions for cleanup");
+        assert!(
+            activation.expect("read-only install activates").is_file(),
+            "a shared or read-only install must still run"
+        );
+    }
 }

@@ -42,8 +42,8 @@ pages, runbooks, and workflows own detailed mechanics.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
   grounding, search, packet construction, and agent flows belong here.
 - `codestory-cli`: command and transport parsing, output rendering, process
-  configuration capture, readiness-broker integration, and managed sidecar
-  lifecycle boundaries. Do not move product orchestration into adapters.
+  configuration capture, and managed sidecar lifecycle boundaries. Do not move
+  product orchestration into adapters.
 - `plugins/codestory`: host hooks, the packaged launcher, MCP routing, and the
   canonical agent skill. Plugin routing selects a project per request and
   reaches product behavior through the version-matched CLI.
@@ -202,10 +202,17 @@ adapter to compensate for incorrect upstream state.
   the selected claim is proved or the user says the evidence is sufficient,
   preserve the artifacts and stop. Signing, notarization, checksums, and
   publication remain owned by the canonical release workflow.
-- `crates/codestory-cli/Cargo.toml` is the release version source. Synchronize
-  every `codestory-*` workspace crate, `Cargo.lock`, the
-  `producer.version` in `crates/codestory-llama-sys/model-contract.json`, and
-  these plugin manifests:
+- `crates/codestory-cli/Cargo.toml` is the release version source. Bump every
+  surface with `node scripts/bump-version.mjs --version <version>`, which writes
+  all of them and then runs the release validator; `--check` reports drift
+  without writing. Do not edit them by hand. The surfaces are every
+  `codestory-*` workspace crate, `Cargo.lock`, the `producer.version` in
+  `crates/codestory-llama-sys/model-contract.json`, the CLI version pin in
+  `plugins/codestory/cli-version.json`, and these plugin manifests:
+  (`producer.embedding_revision` is deliberately not a release surface: it keys
+  persisted vectors, so bumping it discards every user's dense sidecars. Move it
+  only when the embeddings themselves change -- model, llama.cpp commit,
+  pooling, normalization, dimension, prefixes, or vector schema.)
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
@@ -230,10 +237,18 @@ adapter to compensate for incorrect upstream state.
   hardware, post-publish, installed-runtime, and live behavior evidence for the
   claims being shipped. A merge, tag, or downloadable archive alone is not
   release completion.
-- When Codex must observe a plugin-source change, publish the corresponding
-  update to `TheGreenCedar/AgentPluginMarketplace`, refresh the marketplace,
-  and verify the installed managed runtime path/version plus project-scoped
-  status. CodeStory repository state alone does not update the marketplace.
+- The release workflow owns marketplace publication. Its `marketplace-publish`
+  job points `TheGreenCedar/AgentPluginMarketplace` at the published commit
+  after the release exists, and post-publish smoke proves that catalog. Do not
+  hand-edit the catalog before a release; preflight proves the install path
+  against a candidate-pinned fixture and no longer requires the live catalog to
+  match an unreleased commit. If the catalog push fails, the release is still
+  complete and the catalog still serves the previous release: recover with the
+  `marketplace-sync` workflow rather than editing by hand.
+- For a local plugin-source change Codex must observe outside a release, refresh
+  the installed package and verify the managed runtime path/version plus
+  project-scoped status. CodeStory repository state alone does not update an
+  already-installed host.
 
 ## Platform and Security Notes
 

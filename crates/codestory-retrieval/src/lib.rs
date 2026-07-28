@@ -79,8 +79,8 @@ pub use generation::{
 };
 pub use health::{
     ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
-    RetrievalManifestLaneProvenance, RetrievalStatusReport, probe_infrastructure_health,
-    probe_sidecar_health,
+    RetrievalManifestLaneProvenance, RetrievalStatusReport, manifest_classifies_full,
+    probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
     FinalizeIndexOutcome, RetrievalIndexCancelled, SidecarInputChanged, finalize_index,
@@ -107,7 +107,8 @@ pub use per_user_embedding::{
     EmbeddingQualificationOperationResult, EmbeddingQualificationParameters,
     EmbeddingQualificationRequest, EmbeddingQualificationResult,
     EmbeddingQualificationWatchdogClock, EmbeddingQualificationWatchdogMarker,
-    EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerOutput,
+    EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurement,
+    EmbeddingQualificationWorkerMeasurementSpan, EmbeddingQualificationWorkerOutput,
     EmbeddingQualificationWorkerProtocolExchange, EmbeddingQualificationWorkerQueueOperation,
     EmbeddingQualificationWorkerRequest, EmbeddingResult, EmbeddingRetryStateWire,
     EmbeddingServerActiveRequestSnapshot, EmbeddingServerAuthoritySnapshot,
@@ -127,7 +128,8 @@ pub use per_user_embedding::{
     PerUserEmbeddingError, PerUserEmbeddingResidencyLease, PerUserEmbeddingServerConfig,
     embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
     embedding_retry_state, install_embedding_client_transport,
-    run_per_user_embedding_qualification, run_per_user_embedding_server,
+    install_embedding_client_transport_factory, run_per_user_embedding_qualification,
+    run_per_user_embedding_server,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{

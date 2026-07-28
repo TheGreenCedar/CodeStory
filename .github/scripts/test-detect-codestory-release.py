@@ -86,6 +86,25 @@ class AutoReleaseDecisionTest(unittest.TestCase):
             )
 
 
+class ReleaseLaneTest(unittest.TestCase):
+    def test_equal_versions_are_the_native_lane(self) -> None:
+        self.assertEqual(
+            detector.classify_release_lane(cli_version="0.16.1", plugin_version="0.16.1"),
+            "native",
+        )
+
+    def test_plugin_ahead_routes_to_the_plugin_lane(self) -> None:
+        self.assertEqual(
+            detector.classify_release_lane(cli_version="0.16.1", plugin_version="0.16.2"),
+            "plugin",
+        )
+
+    def test_plugin_behind_is_a_synchronization_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            detector.classify_release_lane(cli_version="0.16.2", plugin_version="0.16.1")
+        self.assertIn("bump-version.mjs", str(caught.exception))
+
+
 class ReleaseSynchronizationTest(unittest.TestCase):
     def test_refuses_embedded_model_producer_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

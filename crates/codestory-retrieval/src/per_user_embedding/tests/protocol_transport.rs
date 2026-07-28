@@ -65,7 +65,7 @@ fn response_correlation_and_protocol_hashes_are_enforced() {
 #[test]
 fn checked_in_protocol_hash_flows_into_the_build_marker() {
     let expected = hex_sha256(include_bytes!(
-        "../../../../../docs/testing/per-user-embedding-server-protocol.json"
+        "../../../../codestory-llama-sys/per-user-embedding-server-protocol.json"
     ));
     assert_eq!(PER_USER_EMBEDDING_PROTOCOL_SHA256, expected);
 
@@ -185,6 +185,35 @@ fn bounded_exchange_maps_normalized_disconnect_and_retains_peer_evidence() {
             .contains("source=read embedding control length")
     );
     assert_eq!(exchange_raw_os_error(&error), Some(233));
+}
+
+#[test]
+fn bounded_exchange_maps_the_write_side_pipe_closing_code_and_retains_exit_evidence() {
+    // ERROR_NO_DATA (232) is the only signal a Windows named-pipe writer
+    // receives when the peer end is gone; the platform surfaces it with the
+    // portable BrokenPipe kind and the raw code retained.
+    let raw_error = io::Error::from_raw_os_error(232);
+    let normalized = io::Error::new(io::ErrorKind::BrokenPipe, raw_error);
+    let source = anyhow::Error::new(normalized).context("write embedding control length");
+    let (mut stream, _) = MemoryStream::new(Vec::new(), false);
+    stream.exit_codes = Mutex::new(vec![Some(1)]);
+
+    let error = map_bounded_exchange_error(source, &stream);
+    let retry = embedding_retry_state(&error).expect("typed connection loss");
+
+    assert_eq!(retry.code, "embedding_server_connection_lost");
+    assert_eq!(retry.retry_class, "same_rpc_once");
+    assert!(retry.message.contains("raw_os_error=232"));
+    assert!(retry.message.contains("peer_pid=42"));
+    assert!(retry.message.contains("peer_process_start_id=server-start"));
+    assert!(retry.message.contains("peer_state=exited"));
+    assert!(retry.message.contains("peer_exit_code=1"));
+    assert!(
+        retry
+            .message
+            .contains("source=write embedding control length")
+    );
+    assert_eq!(exchange_raw_os_error(&error), Some(232));
 }
 
 #[test]

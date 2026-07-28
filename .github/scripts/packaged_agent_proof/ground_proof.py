@@ -17,8 +17,13 @@ from .contract_primitives import (
     write_private_json,
 )
 from .foundation import LOWER_TIER_NONCLAIMS, require
-from .installation_support import assert_no_legacy_state, qualification_environment
+from .installation_support import (
+    assert_no_legacy_state,
+    qualification_environment,
+    same_existing_path,
+)
 from .installed_identity import installed_plugin_identity
+from .managed_layout import verify_flat_managed_layout
 from .managed_runtime import verify_managed_runtime_status
 from .server_engine_identity import engine_identity
 from .server_identity import server_snapshot
@@ -97,6 +102,15 @@ def _managed_ground_runtime(
     require(
         managed_binary.is_relative_to(args.installed_plugin_data.resolve()),
         "installed managed executable is outside the installed plugin data root",
+    )
+    staged_launcher = verify_flat_managed_layout(
+        args.installed_plugin_data.resolve(),
+        manifest["release_version"],
+        manifest["asset_target"],
+    )
+    require(
+        same_existing_path(managed_binary, staged_launcher),
+        "installed managed executable is not the flat provisioned launcher",
     )
     require(
         managed_binary != cli.resolve(),

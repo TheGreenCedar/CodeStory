@@ -266,8 +266,7 @@ impl NativeEmbeddingClientTransport {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        platform::detach_command(&mut command);
-        let mut child = command.spawn().with_context(|| {
+        let mut child = spawn_detached(&mut command).with_context(|| {
             format!(
                 "spawn exact executable {}",
                 self.executable.path().display()
@@ -325,6 +324,23 @@ impl NativeEmbeddingClientTransport {
     }
 }
 
+fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child> {
+    platform::detach_command(command);
+    let spawned = command.spawn();
+    #[cfg(windows)]
+    if let Err(error) = &spawned
+        && platform::job_breakaway_denied(error)
+    {
+        // An enclosing job outside CodeStory's control can veto the breakaway
+        // that the launcher's own job permits. Staying inside that job matches
+        // the server's pre-job lifetime in such environments and beats
+        // refusing to serve embeddings at all.
+        platform::detach_command_without_breakaway(command);
+        return command.spawn();
+    }
+    spawned
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeEmbeddingListener {
     inner: platform::Listener,
@@ -371,6 +387,10 @@ impl NativeEmbeddingListener {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        // Give up the endpoint and the lifetime authority now, not at process exit. A client that
+        // arrives during the drain must observe no owner and start a replacement; while the
+        // authority is still held it instead waits for a hello this server will never send.
+        self.inner.release();
     }
 }
 
@@ -472,9 +492,14 @@ fn run_retrieval_server(
 }
 
 pub(crate) fn install_client_transport(mode: ClientTransportMode) -> Result<()> {
-    codestory_retrieval::install_embedding_client_transport(Arc::new(
-        NativeEmbeddingClientTransport::capture_with_mode(mode)?,
-    ))
+    // Registered, not captured: capture_with_mode hashes the whole executable, and a release build
+    // embeds the model. Commands that never embed must not pay for it.
+    codestory_retrieval::install_embedding_client_transport_factory(Box::new(move || {
+        Ok(
+            Arc::new(NativeEmbeddingClientTransport::capture_with_mode(mode)?)
+                as Arc<dyn codestory_retrieval::EmbeddingClientTransport>,
+        )
+    }))
 }
 
 pub(crate) fn clock_domain() -> &'static str {
@@ -839,6 +864,41 @@ fn classify_windows_data_pipe_open_error(
     })
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_PIPE_BUSY_CODE: u32 = 231;
+
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_NO_DATA_CODE: u32 = 232;
+
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_PIPE_LISTENING_CODE: u32 = 536;
+
+/// Whether a failed nonblocking named-pipe ReadFile may keep polling inside
+/// its configured deadline. ERROR_NO_DATA on a read only reports an empty
+/// pipe; a peer that closed its end surfaces as ERROR_BROKEN_PIPE or
+/// ERROR_PIPE_NOT_CONNECTED, which must escape the poll loop.
+#[cfg(any(windows, test))]
+fn windows_pipe_read_failure_is_pollable(error_code: u32) -> bool {
+    matches!(
+        error_code,
+        WINDOWS_ERROR_PIPE_BUSY_CODE
+            | WINDOWS_ERROR_NO_DATA_CODE
+            | WINDOWS_ERROR_PIPE_LISTENING_CODE
+    )
+}
+
+/// Whether a failed nonblocking named-pipe WriteFile may keep polling inside
+/// its configured deadline. ERROR_NO_DATA is deliberately not pollable on a
+/// write: a full kernel buffer surfaces as a successful zero-byte write, so
+/// a failing write with this code means the peer end of the pipe is gone.
+/// Polling it would burn the whole write deadline and then misreport a real
+/// disconnect as an unresponsive owner instead of a connection loss carrying
+/// its raw code and peer-exit evidence.
+#[cfg(any(windows, test))]
+fn windows_pipe_write_failure_is_pollable(error_code: u32) -> bool {
+    error_code == WINDOWS_ERROR_PIPE_BUSY_CODE
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableFileIdentity {
     native_identity: codestory_workspace::WorkspacePathIdentity,
@@ -920,13 +980,11 @@ mod platform {
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{
-        DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-    };
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     const SERVER_DIR_NAME: &str = "codestory-embedding-v1";
@@ -1105,11 +1163,36 @@ mod platform {
         socket_name: String,
         socket_identity: (u64, u64),
         identity: TransportIdentity,
+        released: AtomicBool,
     }
 
     impl Listener {
         pub(super) fn identity(&self) -> &TransportIdentity {
             &self.identity
+        }
+
+        /// Remove this listener's socket entry and release the lifetime authority.
+        ///
+        /// Draining must do this immediately rather than at process exit: while the authority is
+        /// still held a client sees an owner, waits for a hello that will never come, and fails
+        /// instead of electing a replacement. Idempotent, so `Drop` can call it again.
+        pub(super) fn release(&self) {
+            if self.released.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // Hold the lifetime authority until the exact listener entry has
+            // been removed. Releasing it first lets a replacement bind and
+            // then lose its fresh socket to this old listener's destructor.
+            if runtime_directory_matches(&self.authority_directory)
+                && runtime_directory_matches(&self.runtime)
+                && socket_identity_at(&self.runtime, &self.socket_name)
+                    .ok()
+                    .flatten()
+                    == Some(self.socket_identity)
+            {
+                let _ = unlink_socket_at(&self.runtime, &self.socket_name);
+            }
+            let _ = unlock(self.authority.as_raw_fd());
         }
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<Option<Stream>> {
@@ -1163,19 +1246,7 @@ mod platform {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            // Hold the lifetime authority until the exact listener entry has
-            // been removed. Releasing it first lets a replacement bind and
-            // then lose its fresh socket to this old listener's destructor.
-            if runtime_directory_matches(&self.authority_directory)
-                && runtime_directory_matches(&self.runtime)
-                && socket_identity_at(&self.runtime, &self.socket_name)
-                    .ok()
-                    .flatten()
-                    == Some(self.socket_identity)
-            {
-                let _ = unlink_socket_at(&self.runtime, &self.socket_name);
-            }
-            let _ = unlock(self.authority.as_raw_fd());
+            self.release();
         }
     }
 
@@ -1402,13 +1473,13 @@ mod platform {
 
         let socket_path = runtime.path.join(&paths.socket_name);
         remove_stale_socket(&runtime, &socket_path, &paths.socket_name)?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("bind embedding socket {}", socket_path.display()))?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-            .with_context(|| format!("secure embedding socket {}", socket_path.display()))?;
+        let (listener, bound_identity) = bind_private_socket(&runtime, &paths.socket_name)?;
         let listener_id = validate_socket_path(&socket_path, runtime.uid)?
             .context("bound embedding socket disappeared")?;
         let socket_identity = socket_identity(&socket_path)?;
+        if socket_identity != bound_identity {
+            bail!("embedding_endpoint_replaced: published socket identity changed after rename");
+        }
         ensure_runtime_directory_matches(&runtime)?;
         listener
             .set_nonblocking(true)
@@ -1430,6 +1501,7 @@ mod platform {
             socket_name: paths.socket_name,
             socket_identity,
             identity,
+            released: AtomicBool::new(false),
         }))
     }
 
@@ -2298,6 +2370,88 @@ mod platform {
         ensure_runtime_directory_matches(runtime)
     }
 
+    /// Bind the endpoint at a unique temporary name, restrict it to the
+    /// private mode, re-verify it through the held directory handle, and only
+    /// then rename it onto the canonical socket name.
+    ///
+    /// `UnixListener::bind` creates the socket entry with the kernel default
+    /// mode (`0o777 & !umask`, `0o755` under the near-universal umask `022`)
+    /// and only a later chmod makes it private. Binding at the canonical name
+    /// directly therefore exposes a transient that a client's single-shot
+    /// trust probe (`validate_socket_path`) rejects terminally as
+    /// `embedding_endpoint_untrusted`. Publishing by same-directory rename
+    /// keeps that transient off the canonical name: rename(2) within one
+    /// directory is atomic and preserves the inode, so the canonical entry is
+    /// either absent or already a fully private socket, and the identity
+    /// captured before the rename stays valid afterwards.
+    fn bind_private_socket(
+        runtime: &RuntimeDirectory,
+        socket_name: &str,
+    ) -> Result<(UnixListener, (u64, u64))> {
+        static NEXT_BIND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let temp_name = format!(
+            ".b{:x}.{:x}",
+            std::process::id(),
+            NEXT_BIND_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let temp_path = runtime.path.join(&temp_name);
+        validate_unix_socket_path(&temp_path).map_err(anyhow::Error::new)?;
+        let temp = UnixCString::new(temp_name.as_str())
+            .context("temporary embedding endpoint name contains NUL")?;
+        let destination =
+            UnixCString::new(socket_name).context("embedding endpoint name contains NUL")?;
+        ensure_runtime_directory_matches(runtime)?;
+        // A binder that crashed mid-publication and whose PID was later reused
+        // can leave a dead entry at this name. The name is derived from our
+        // own live PID plus a process-global sequence inside the private
+        // runtime directory, so no live binder can own it and removing it is
+        // safe.
+        if unsafe { libc::unlinkat(runtime.handle.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::NotFound {
+                return Err(error).context("remove leftover temporary embedding endpoint");
+            }
+        }
+        let listener = UnixListener::bind(&temp_path)
+            .with_context(|| format!("bind embedding socket {}", temp_path.display()))?;
+        let published = (|| {
+            if unsafe {
+                libc::fchmodat(
+                    runtime.handle.as_raw_fd(),
+                    temp.as_ptr(),
+                    PRIVATE_FILE_MODE as libc::mode_t,
+                    0,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("secure embedding socket {}", temp_path.display()));
+            }
+            let identity = socket_identity_at(runtime, &temp_name)?
+                .context("embedding socket disappeared before publication")?;
+            ensure_runtime_directory_matches(runtime)?;
+            if unsafe {
+                libc::renameat(
+                    runtime.handle.as_raw_fd(),
+                    temp.as_ptr(),
+                    runtime.handle.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).context("publish embedding socket");
+            }
+            Ok(identity)
+        })();
+        match published {
+            Ok(identity) => Ok((listener, identity)),
+            Err(error) => {
+                let _ = unsafe { libc::unlinkat(runtime.handle.as_raw_fd(), temp.as_ptr(), 0) };
+                Err(error)
+            }
+        }
+    }
+
     fn socket_identity_at(
         runtime: &RuntimeDirectory,
         socket_name: &str,
@@ -2533,7 +2687,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
         use std::time::Instant;
 
         fn private_directory(path: &Path) {
@@ -2632,6 +2786,7 @@ mod platform {
                     peer_pid: None,
                     peer_process_start_id: None,
                 },
+                released: AtomicBool::new(false),
             };
             drop(listener);
             assert!(!socket_path.exists(), "owner drop must unlink its endpoint");
@@ -2714,6 +2869,87 @@ mod platform {
             assert!(!socket_path.exists());
             unlock(second.as_raw_fd()).expect("release second authority");
             drop(stale_listener);
+        }
+
+        #[test]
+        fn embedding_endpoint_publication_never_exposes_an_untrusted_transient() {
+            let root = tempfile::tempdir().expect("create test root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("secure test root");
+            let runtime_path = root.path().join(SERVER_DIR_NAME);
+            private_directory(&runtime_path);
+            let runtime = validate_private_directory(&runtime_path, false)
+                .expect("validate runtime")
+                .expect("runtime exists");
+            let socket_path = runtime.path.join(SOCKET_NAME);
+
+            // Poll the canonical path exactly like a client's single-shot
+            // trust probe: any sighting that validate_socket_path would
+            // reject terminally is a publication defect. The pre-rename
+            // sequence (bind at the canonical name, then chmod) exposes the
+            // kernel's default bind mode on essentially every cycle.
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let observer = {
+                let stop = stop.clone();
+                let socket_path = socket_path.clone();
+                std::thread::spawn(move || -> Option<u32> {
+                    while !stop.load(Ordering::Acquire) {
+                        if let Ok(metadata) = fs::symlink_metadata(&socket_path)
+                            && (!metadata.file_type().is_socket() || metadata.mode() & 0o077 != 0)
+                        {
+                            return Some(metadata.mode());
+                        }
+                    }
+                    None
+                })
+            };
+
+            for cycle in 0..200 {
+                let (listener, identity) = bind_private_socket(&runtime, SOCKET_NAME)
+                    .unwrap_or_else(|error| panic!("publish endpoint on cycle {cycle}: {error:#}"));
+                assert_eq!(
+                    socket_identity_at(&runtime, SOCKET_NAME).expect("inspect published endpoint"),
+                    Some(identity),
+                    "published entry must carry the bound socket identity"
+                );
+                drop(listener);
+                unlink_socket_at(&runtime, SOCKET_NAME).expect("remove published endpoint");
+            }
+            stop.store(true, Ordering::Release);
+            let sighting = observer.join().expect("join endpoint observer");
+            assert_eq!(
+                sighting,
+                None,
+                "the canonical endpoint must never be observable in a state the trust \
+                 predicate rejects (saw mode {:o})",
+                sighting.unwrap_or(0)
+            );
+        }
+
+        #[test]
+        fn embedding_endpoint_publication_replaces_a_crash_leftover_entry() {
+            let root = tempfile::tempdir().expect("create test root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("secure test root");
+            let runtime_path = root.path().join(SERVER_DIR_NAME);
+            private_directory(&runtime_path);
+            let runtime = validate_private_directory(&runtime_path, false)
+                .expect("validate runtime")
+                .expect("runtime exists");
+            let socket_path = runtime.path.join(SOCKET_NAME);
+            let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("secure stale socket");
+            let stale_identity = socket_identity(&socket_path).expect("stale socket identity");
+
+            let (listener, identity) =
+                bind_private_socket(&runtime, SOCKET_NAME).expect("publish over crash leftover");
+            assert_ne!(identity, stale_identity, "rename must replace the leftover");
+            assert_eq!(
+                socket_identity_at(&runtime, SOCKET_NAME).expect("inspect published endpoint"),
+                Some(identity)
+            );
+            drop((listener, stale_listener));
         }
 
         #[test]
@@ -2840,6 +3076,7 @@ mod platform {
                     peer_pid: None,
                     peer_process_start_id: None,
                 },
+                released: AtomicBool::new(false),
             };
             let started = Instant::now();
             assert!(
@@ -2881,6 +3118,7 @@ mod platform {
         ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
         QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, RetainedWindowsAuthorityState,
         TransportIdentity, awake_deadline_ns, classify_windows_data_pipe_open_error, sha256_fields,
+        windows_pipe_read_failure_is_pollable, windows_pipe_write_failure_is_pollable,
     };
     use anyhow::{Context, Result, bail};
     use std::ffi::c_void;
@@ -2889,6 +3127,7 @@ mod platform {
     use std::path::PathBuf;
     use std::process::Command;
     use std::ptr::{null, null_mut};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
@@ -2924,11 +3163,22 @@ mod platform {
     };
     use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise;
 
+    // The host-testable poll classification must decide on the exact Win32
+    // values the platform calls below observe.
+    const _: () = {
+        assert!(super::WINDOWS_ERROR_PIPE_BUSY_CODE == ERROR_PIPE_BUSY);
+        assert!(super::WINDOWS_ERROR_NO_DATA_CODE == ERROR_NO_DATA);
+        assert!(super::WINDOWS_ERROR_PIPE_LISTENING_CODE == ERROR_PIPE_LISTENING);
+    };
+
     const NO_TIMEOUT: u64 = u64::MAX;
     const PIPE_BUFFER_BYTES: usize = 1024 * 1024;
     const PIPE_IO_POLL: Duration = Duration::from_millis(1);
     const PIPE_CONNECT_POLL: Duration = Duration::from_millis(25);
     const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     pub(super) struct NativeExecutableAttestationStore;
 
@@ -2963,14 +3213,27 @@ mod platform {
         pipe_name: Vec<u16>,
         security_sddl: Vec<u16>,
         current_sid: SidBuffer,
-        _authority_server: OwnedHandle,
-        _authority_client: OwnedHandle,
+        authority_server: Mutex<Option<OwnedHandle>>,
+        authority_client: Mutex<Option<OwnedHandle>>,
         identity: TransportIdentity,
     }
 
     impl Listener {
         pub(super) fn identity(&self) -> &TransportIdentity {
             &self.identity
+        }
+
+        /// Drop the retained first pipe instance so the lifetime authority is observably gone.
+        ///
+        /// Draining must do this immediately rather than at process exit: while the authority
+        /// handles are still open a client sees an owner, waits for a hello that will never come,
+        /// and fails instead of electing a replacement. Idempotent.
+        pub(super) fn release(&self) {
+            for handle in [&self.authority_server, &self.authority_client] {
+                if let Ok(mut slot) = handle.lock() {
+                    drop(slot.take());
+                }
+            }
         }
 
         pub(super) fn accept(&self, timeout: Duration) -> Result<Option<Stream>> {
@@ -3121,7 +3384,7 @@ mod platform {
                 let error = std::io::Error::last_os_error();
                 match error.raw_os_error().map(|code| code as u32) {
                     Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => return Ok(()),
-                    Some(ERROR_NO_DATA) | Some(ERROR_PIPE_BUSY) | Some(ERROR_PIPE_LISTENING) => {
+                    Some(code) if windows_pipe_read_failure_is_pollable(code) => {
                         wait_pipe_io(
                             started,
                             self.read_timeout_ns.load(Ordering::Acquire),
@@ -3168,11 +3431,7 @@ mod platform {
                 if !error
                     .raw_os_error()
                     .map(|code| code as u32)
-                    .is_some_and(|code| {
-                        code == ERROR_NO_DATA
-                            || code == ERROR_PIPE_BUSY
-                            || code == ERROR_PIPE_LISTENING
-                    })
+                    .is_some_and(windows_pipe_read_failure_is_pollable)
                 {
                     return Err(normalize_windows_pipe_io_error(error));
                 }
@@ -3226,7 +3485,7 @@ mod platform {
                 if !error
                     .raw_os_error()
                     .map(|code| code as u32)
-                    .is_some_and(|code| code == ERROR_NO_DATA || code == ERROR_PIPE_BUSY)
+                    .is_some_and(windows_pipe_write_failure_is_pollable)
                 {
                     return Err(normalize_windows_pipe_io_error(error));
                 }
@@ -3424,8 +3683,8 @@ mod platform {
             pipe_name,
             security_sddl,
             current_sid,
-            _authority_server: authority_server,
-            _authority_client: authority_client,
+            authority_server: Mutex::new(Some(authority_server)),
+            authority_client: Mutex::new(Some(authority_client)),
             identity: TransportIdentity {
                 endpoint_namespace_id,
                 lifetime_authority_id,
@@ -3439,9 +3698,26 @@ mod platform {
 
     pub(super) fn detach_command(command: &mut Command) {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        // The native launcher tethers each runtime tree to a kill-on-close
+        // job so a dying launcher cannot orphan it. This server's lifetime is
+        // owned by its idle timeout, not by the invocation that spawned it —
+        // later commands reconnect instead of reloading the model — so it
+        // breaks away from that job, whose limits permit exactly this spawn
+        // through JOB_OBJECT_LIMIT_BREAKAWAY_OK.
+        command.creation_flags(
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    }
+
+    pub(super) fn detach_command_without_breakaway(command: &mut Command) {
+        use std::os::windows::process::CommandExt;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    pub(super) fn job_breakaway_denied(error: &std::io::Error) -> bool {
+        // CreateProcess reports a job chain that withholds
+        // JOB_OBJECT_LIMIT_BREAKAWAY_OK as plain access denial.
+        error.raw_os_error().map(|code| code as u32) == Some(ERROR_ACCESS_DENIED)
     }
 
     pub(super) fn clock_api() -> &'static str {
@@ -4008,6 +4284,99 @@ mod platform {
                  peer_state=running peer_exit_code=none",
                 ERROR_PIPE_NOT_CONNECTED,
                 error.kind()
+            );
+        }
+
+        #[test]
+        fn write_to_a_closed_named_pipe_surfaces_the_pipe_closing_code_immediately() {
+            let current_sid = current_process_sid().expect("current process SID");
+            let sid_string = sid_string(&current_sid).expect("current SID string");
+            let security_sddl = wide(&format!(
+                "O:{sid_string}D:P(A;;GA;;;{sid_string})(A;;GA;;;SY)"
+            ));
+            let pipe_name = wide(&format!(
+                r"\\.\pipe\codestory-write-disconnect-test-{}-{}",
+                unsafe { GetCurrentProcessId() },
+                awake_now_ns()
+            ));
+            let server = create_pipe_instance(&pipe_name, &security_sddl, true, true)
+                .expect("create named-pipe server");
+            let client = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE, "connect named-pipe client");
+            let client = unsafe { OwnedHandle::from_raw_handle(client.cast()) };
+            let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+            assert_ne!(
+                unsafe { SetNamedPipeHandleState(raw(&client), &nonblocking, null(), null()) },
+                0,
+                "set named-pipe client nonblocking"
+            );
+            if unsafe { ConnectNamedPipe(raw(&server), null_mut()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_PIPE_CONNECTED),
+                    "client connection must be the only failed accept state"
+                );
+            }
+
+            let peer_pid = unsafe { GetCurrentProcessId() };
+            let peer_process_start_id =
+                canonical_process_start_identity(peer_pid).expect("current process start identity");
+            let mut stream = Stream::new(
+                client,
+                false,
+                TransportIdentity {
+                    endpoint_namespace_id: "test-endpoint".into(),
+                    lifetime_authority_id: "test-authority".into(),
+                    listener_id: "test-listener".into(),
+                    peer_verified: true,
+                    peer_pid: Some(peer_pid),
+                    peer_process_start_id: Some(peer_process_start_id),
+                },
+            )
+            .expect("retain named-pipe client stream");
+            stream
+                .set_write_timeout(Some(
+                    codestory_retrieval::EmbeddingClientBudgets::current().query_request,
+                ))
+                .expect("bound request write");
+            // Close the raw server handle without DisconnectNamedPipe so the
+            // writer observes the peer-close code rather than the explicit
+            // disconnect code already covered above.
+            drop(server);
+
+            let started = std::time::Instant::now();
+            let error = stream
+                .write(&[7_u8; 8])
+                .expect_err("a write to a closed named pipe must fail");
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "a real disconnect must escape the write poll loop instead of \
+                 burning the configured write deadline"
+            );
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_NO_DATA)
+            );
+            assert!(stream.peer_is_alive().expect("probe retained peer"));
+            eprintln!(
+                "named-pipe write disconnect evidence: raw_os_error={} normalized_kind={:?} \
+                 elapsed_ms={} peer_state=running",
+                ERROR_NO_DATA,
+                error.kind(),
+                started.elapsed().as_millis()
             );
         }
 
@@ -4591,6 +4960,38 @@ mod tests {
         )
         .expect("missing data pipe is classified");
         assert!(matches!(outcome, NativeConnectOutcome::NoOwner));
+    }
+
+    #[test]
+    fn windows_pipe_closing_write_code_escapes_the_poll_loop_while_empty_reads_wait() {
+        // ERROR_NO_DATA reports an empty pipe to a nonblocking reader but a
+        // vanished peer to a writer, so only the read side may keep polling.
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_NO_DATA_CODE
+        ));
+        assert!(!windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_NO_DATA_CODE
+        ));
+
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_BUSY_CODE
+        ));
+        assert!(windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_BUSY_CODE
+        ));
+        assert!(windows_pipe_read_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_LISTENING_CODE
+        ));
+        assert!(!windows_pipe_write_failure_is_pollable(
+            WINDOWS_ERROR_PIPE_LISTENING_CODE
+        ));
+
+        // ERROR_BROKEN_PIPE and ERROR_PIPE_NOT_CONNECTED are disconnects on
+        // both directions and must surface with their raw code retained.
+        for disconnect_code in [109, 233] {
+            assert!(!windows_pipe_read_failure_is_pollable(disconnect_code));
+            assert!(!windows_pipe_write_failure_is_pollable(disconnect_code));
+        }
     }
 
     #[test]

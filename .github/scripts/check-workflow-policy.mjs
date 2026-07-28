@@ -13,6 +13,8 @@ const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
 const sccacheVersion = "v0.16.0";
+const nextestVersion = "0.9.98";
+const nextestLinuxSha256 = "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7";
 const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
@@ -280,6 +282,13 @@ const draftCacheRestoreKeys = [
   `${retrievalCachePrefix}-`,
 ];
 const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
+const draftCompilerCachePath = "${{ runner.temp }}/codestory-draft-sccache";
+const draftCompilerCachePrefix =
+  "${{ runner.os }}-draft-sccache-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}";
+const draftCompilerCachePrimary = `${draftCompilerCachePrefix}-${cacheLock}`;
+const draftCompilerSaveCondition =
+  "success() && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''";
+const draftCompilerSaveKey = "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}";
 const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
 const draftWorkflowPaths = [
   "Cargo.lock",
@@ -371,9 +380,15 @@ const draftStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
   { name: "Install Rust stable", keys: ["name", "run"] },
   { name: "Install Linux Vulkan build dependencies", keys: ["name", "run"] },
+  { name: "Install pinned sccache", keys: ["name", "uses", "with"] },
+  { name: "Configure bounded compiler cache", keys: ["name", "shell", "run"] },
   { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
   {
     name: "Restore Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  {
+    name: "Restore compiler objects",
     keys: ["name", "id", "uses", "continue-on-error", "with"],
   },
   { name: "Check formatting", keys: ["name", "run"] },
@@ -386,8 +401,22 @@ const draftStepSequence = [
     name: "Save Cargo inputs and output",
     keys: ["name", "if", "uses", "continue-on-error", "with"],
   },
+  {
+    name: "Save compiler objects",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
 ];
 const draftRunCommands = new Map([
+  ["Configure bounded compiler cache", [
+    "{",
+    'echo "SCCACHE_DIR=$RUNNER_TEMP/codestory-draft-sccache"',
+    'echo "SCCACHE_CACHE_SIZE=1G"',
+    'echo "RUSTC_WRAPPER=sccache"',
+    'echo "CARGO_INCREMENTAL=0"',
+    'echo "CMAKE_C_COMPILER_LAUNCHER=sccache"',
+    'echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"',
+    '} >> "$GITHUB_ENV"',
+  ]],
   ["Install Rust stable", [
     "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
     "rustup default stable",
@@ -757,6 +786,31 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, target, proof topology, feature, manifest, and lock identity");
   add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact seeded retrieval, prior draft, then prior retrieval order and omit only the lock identity from prior prefixes");
 
+  const sccache = namedStep(job, "Install pinned sccache");
+  add(violations, sccache?.uses === sccacheAction, "draft source sccache must use the pinned mozilla-actions release");
+  add(
+    violations,
+    object(sccache?.with).version === sccacheVersion
+      && object(sccache?.with).disable_annotations === true,
+    "draft source sccache must pin the shared sccache version without annotations",
+  );
+
+  const compilerRestore = namedStep(job, "Restore compiler objects");
+  const compilerRestoreWith = object(compilerRestore?.with);
+  add(violations, compilerRestore?.id === "compiler-cache-restore", "draft compiler cache restore must keep its stable step id");
+  add(violations, compilerRestore?.uses === "actions/cache/restore@v5", "draft compiler cache restore must use actions/cache/restore@v5");
+  add(violations, compilerRestore?.["continue-on-error"] === true && compilerRestore?.if === undefined, "draft compiler cache restore must remain optional without conditional bypasses");
+  add(violations, compilerRestoreWith.path === draftCompilerCachePath, "draft compiler cache must live in the runner-temp sccache directory");
+  add(violations, compilerRestoreWith.key === draftCompilerCachePrimary, "draft compiler cache primary must bind platform, toolchain, target, and lock identity");
+  add(violations, sameStrings(nonCommentLines(compilerRestoreWith["restore-keys"]), [`${draftCompilerCachePrefix}-`]), "draft compiler cache fallback must omit only the lock identity");
+
+  const compilerSave = namedStep(job, "Save compiler objects");
+  const compilerSaveWith = object(compilerSave?.with);
+  add(violations, compilerSave?.uses === "actions/cache/save@v5", "draft compiler cache save must use actions/cache/save@v5");
+  add(violations, compilerSave?.["continue-on-error"] === true, "draft compiler cache save must remain non-blocking");
+  add(violations, compilerSave?.if === draftCompilerSaveCondition, "draft compiler cache must save only on a successful run that missed its primary key");
+  add(violations, compilerSaveWith.path === draftCompilerCachePath && compilerSaveWith.key === draftCompilerSaveKey, "draft compiler cache save must publish the restored primary key path");
+
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
   const retrievalRestoreWith = object(retrievalRestore?.with);
   add(
@@ -980,6 +1034,25 @@ export function basicWorkflowViolations(file, workflow) {
     );
   }
 
+  // Least privilege is not the repository default, so every workflow states its own scopes.
+  add(
+    violations,
+    workflow.permissions !== undefined,
+    `${file} must declare a top-level permissions block`,
+  );
+
+  // Reusable-workflow callers inherit the callee's budget and cannot set one themselves, so the
+  // rule applies only to jobs that own steps.
+  for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+    const job = object(rawJob);
+    if (!Array.isArray(job.steps)) continue;
+    add(
+      violations,
+      job["timeout-minutes"] !== undefined,
+      `${file} jobs.${jobName} must declare timeout-minutes`,
+    );
+  }
+
   walk(workflow, (key, value, trail) => {
     if (key === "key" && typeof value === "string" && value.includes("github.sha")) {
       violations.push(`${file} ${trail.join(".")} Cargo cache key must not include commit SHA`);
@@ -1171,7 +1244,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ".github/workflows/windows-vulkan-proof.yml",
       ".github/workflows/retrieval-engine-smoke.yml",
       ".github/workflows/source-proof.yml",
-      ".github/workflows/repo-scale-stats.yml",
       "package.json",
       "package-lock.json",
       "scripts/codex-worktree-setup.*",
@@ -1454,7 +1526,25 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && lint?.if === "steps.compile-workspace.outcome == 'success'",
       `${sourceFile} compilation and lint must preserve cache state before reporting failure`,
     );
-    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
+    // nextest owns unit/integration execution; the doc pass rides along so a future doctest can
+    // never silently stop being run (nextest does not execute doctests).
+    requireStepRun(violations, sourceFile, full, "Test the complete workspace once", [
+      "cargo nextest run --workspace --locked",
+      "cargo test --workspace --doc --locked",
+    ]);
+    requireStepRun(violations, sourceFile, full, "Install pinned cargo-nextest", [
+      `cargo-nextest-${nextestVersion}-x86_64-unknown-linux-gnu.tar.gz`,
+      `${nextestLinuxSha256}  $RUNNER_TEMP/cargo-nextest.tar.gz`,
+      "sha256sum --check --strict",
+      "cargo nextest --version",
+    ]);
+    add(
+      violations,
+      stepIndex(full, "Install pinned cargo-nextest") > stepIndex(full, "Install pinned sccache")
+        && stepIndex(full, "Install pinned cargo-nextest")
+          < stepIndex(full, "Test the complete workspace once"),
+      `${sourceFile} must install the pinned test runner before the workspace test step`,
+    );
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
     requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
       "codestory-release-cell-manifest.mjs produce",
@@ -1593,6 +1683,30 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, source.uses === "./.github/workflows/source-proof.yml", `${releaseFile} must call exact source proof`);
   add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
   add(violations, object(source.with).ref === "${{ github.sha }}", `${releaseFile} source proof must receive the exact release SHA`);
+  // Reuse is admissible only through the authenticated closeout binding, never by simply
+  // dropping the gate: the job may be skipped, and only when preflight resolved reusable
+  // evidence for this exact tree.
+  add(
+    violations,
+    String(source.if ?? "") === "needs.preflight.outputs.source_proof_reused != 'true'",
+    `${releaseFile} source proof may be skipped only when preflight resolved reusable evidence`,
+  );
+  requireStepRun(violations, releaseFile, requireJob(violations, releaseFile, release, "preflight"), "Resolve reusable prior evidence", [
+    'git rev-parse "$GITHUB_SHA^{tree}"',
+    "merge-base --is-ancestor",
+    "full-source-gate",
+    '.path == ".github/workflows/source-proof.yml"',
+  ]);
+  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
+    '--reuse "$REUSE_SELECTION"',
+  ]);
+  add(
+    violations,
+    String(closeout.if ?? "").includes("needs.source-proof.result == 'skipped'")
+      && String(closeout.if ?? "").includes("needs.preflight.result == 'success'"),
+    `${releaseFile} closeout must accept a skipped source gate only alongside a successful preflight`,
+  );
   add(violations, object(source.with).version === "${{ needs.preflight.outputs.version }}" && object(source.with).emit_release_cells === true, `${releaseFile} source proof must emit its authenticated release cell`);
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
@@ -1668,6 +1782,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--cell-id retrieval_readiness:windows-x64",
     "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
   ]);
+  // The self-hosted Windows service account runs under the default Restricted execution
+  // policy, so a run step left on the default shell dies before executing anything:
+  // every step must pick bash or a powershell invocation that bypasses the policy.
+  for (const step of at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan", "steps") ?? []) {
+    if (typeof object(step).run !== "string") continue;
+    const shell = object(step).shell;
+    add(
+      violations,
+      typeof shell === "string" && (shell === "bash" || shell.includes("-ExecutionPolicy Bypass")),
+      `windows-vulkan-proof.yml step ${object(step).name ?? "<unnamed>"} must declare the bypass shell for the locked-down service account`,
+    );
+  }
 
   const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
   add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
@@ -1747,6 +1873,46 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
+  const marketplacePublish = requireJob(violations, releaseFile, release, "marketplace-publish");
+  add(
+    violations,
+    marketplacePublish.if === "inputs.publish_release",
+    `${releaseFile} marketplace publication must require trusted publication authority`,
+  );
+  add(
+    violations,
+    sameMembers(needs(marketplacePublish), releaseChain.dependencies["marketplace-publish"]),
+    `${releaseFile} marketplace publication dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    marketplacePublish.environment === "marketplace-publish",
+    `${releaseFile} marketplace publication must hold its cross-repository credential in its own environment`,
+  );
+  add(
+    violations,
+    marketplacePublish.permissions === undefined,
+    `${releaseFile} marketplace publication must not hold repository write permission`,
+  );
+  // The credential is minted per run and scoped to the one external repository; it must never
+  // exist in a job that also runs release code.
+  const tokenStep = namedStep(marketplacePublish, "Mint a scoped marketplace token");
+  add(
+    violations,
+    String(tokenStep?.uses ?? "").startsWith("actions/create-github-app-token@")
+      && fullSha.test(String(tokenStep?.uses ?? "").split("@")[1] ?? "")
+      && object(tokenStep?.with).owner === "TheGreenCedar"
+      && object(tokenStep?.with).repositories === "AgentPluginMarketplace",
+    `${releaseFile} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
+  );
+  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+  ]);
+  requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
+    "build-marketplace-fixture.mjs",
+    "--local-fixture true",
+  ]);
+
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
   add(violations, post.if === "inputs.publish_release", `${releaseFile} post-publish smoke must require trusted publication authority`);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
@@ -1755,7 +1921,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations,
     object(post.with).emit_release_cells === true
       && object(post.with).marketplace_revision
-        === "${{ needs.preflight.outputs.marketplace_revision }}"
+        === "${{ needs.marketplace-publish.outputs.marketplace_revision }}"
       && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
     `${releaseFile} post-publish smoke must consume the proved marketplace revision and accepted pre-publish ledger`,
   );
@@ -2354,6 +2520,8 @@ function validatePackagedProof(workflows, violations, graph) {
       "--expected-backend CPU",
       "--produce-qualification-evidence",
       "--timeout-secs 1800",
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen',
     ],
   );
   const packagedProofRun = stepRun(
@@ -2371,6 +2539,20 @@ function validatePackagedProof(workflows, violations, graph) {
       && hostedCalibrationUpload?.if
         === "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode",
     `${file} hosted calibration artifact must remain calibration-only`,
+  );
+  const hostedCalibrationFailureUpload = namedStep(
+    job,
+    "Upload hosted Linux calibration failure evidence",
+  );
+  add(
+    violations,
+    hostedCalibrationFailureUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hostedCalibrationFailureUpload?.if
+        === "failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode"
+      && object(hostedCalibrationFailureUpload?.with).path
+        === "target/calibration-runs/linux"
+      && object(hostedCalibrationFailureUpload?.with)["if-no-files-found"] === "warn",
+    `${file} hosted calibration failure evidence must stay a failure-only best-effort upload`,
   );
   const hostedEvaluationUpload = namedStep(job, "Upload packaged agent proof artifacts");
   add(
@@ -2756,9 +2938,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    at(workflow, "jobs", "macos-source") === undefined
-      && at(workflow, "jobs", "repo-scale-stats") === undefined,
-    `${file} standard coordinator must not add macOS source or repo-scale hard gates`,
+    at(workflow, "jobs", "macos-source") === undefined,
+    `${file} standard coordinator must not add a macOS source hard gate`,
   );
   const calibrationAssemble = requireJob(
     violations,
@@ -3159,6 +3340,9 @@ function validateRemainingWorkflows(workflows, violations) {
       job,
       "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
     );
+    requireStepRun(violations, metalFile, job, "Collect three independent Metal calibration runs", [
+      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+    ]);
     const engine = namedStep(job, "Prove protected Metal runtime");
     requireStepRun(violations, metalFile, job, "Prove protected Metal runtime", [
       "--engine-policy accelerated",
@@ -3775,18 +3959,6 @@ function validateRemainingWorkflows(workflows, violations) {
     }
   }
 
-  const statsFile = "repo-scale-stats.yml";
-  const stats = workflows.get(statsFile);
-  if (!stats) {
-    violations.push(`${statsFile} must exist`);
-  } else {
-    const job = requireJob(violations, statsFile, stats, "stats");
-    requireStepRun(violations, statsFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
-    requireStepRun(violations, statsFile, job, "Build the release CLI", ["cargo build --release --locked -p codestory-cli"]);
-    requireStepRun(violations, statsFile, job, "Run mandatory repo-scale stats once", ["cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture"]);
-    requireStepUses(violations, statsFile, job, "Upload repo-scale stats output", "actions/upload-artifact@v7.0.1");
-  }
-
   const retrieval = workflows.get(retrievalFile);
   if (!retrieval) {
     violations.push(`${retrievalFile} must exist`);
@@ -4064,11 +4236,257 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
   }
 }
 
+// Cargo test-name filters are substring matches: a filter that names nothing selects zero tests and
+// still exits 0, so a renamed test turns its proof lane green without running anything. `--exact`
+// does not help — libtest also exits 0 when an exact filter matches nothing. These names are
+// therefore checked statically against the crate sources they claim to select.
+const cargoValueOptions = new Set([
+  "-p",
+  "--package",
+  "--test",
+  "--bench",
+  "--example",
+  "--bin",
+  "--features",
+  "--target",
+  "--target-dir",
+  "--manifest-path",
+  "--profile",
+  "--jobs",
+  "-j",
+]);
+
+const expressionPlaceholder = "__CODESTORY_GITHUB_EXPRESSION__";
+const harnessValueOptions = new Set(["--color", "--format", "--skip", "--test-threads"]);
+
+function cargoTestFilterNames(line) {
+  // GitHub expressions expand at run time; treat each as one opaque token so an option that takes a
+  // value consumes it instead of leaving `matrix.foo` behind as a bare positional.
+  const tokens = line
+    .replace(/\$\{\{.*?\}\}/gu, expressionPlaceholder)
+    .trim()
+    .split(/\s+/u)
+    .filter(token => token !== "\\");
+  const start = tokens.findIndex(token => token === "test");
+  if (start < 0) return { package: null, filters: [], exact: false };
+  const separator = tokens.indexOf("--", start + 1);
+  const cargoTokens = tokens.slice(start + 1, separator < 0 ? undefined : separator);
+  const harnessTokens = separator < 0 ? [] : tokens.slice(separator + 1);
+
+  let packageName = null;
+  const filters = [];
+  for (let index = 0; index < cargoTokens.length; index += 1) {
+    const token = cargoTokens[index];
+    if (cargoValueOptions.has(token)) {
+      if (token === "-p" || token === "--package") packageName = cargoTokens[index + 1] ?? null;
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      const [name, value] = token.split("=");
+      if ((name === "-p" || name === "--package") && value) packageName = value;
+      continue;
+    }
+    if (token.includes(expressionPlaceholder)) continue;
+    // Cargo accepts at most one positional TESTNAME filter.
+    filters.push(token);
+    break;
+  }
+  for (let index = 0; index < harnessTokens.length; index += 1) {
+    const token = harnessTokens[index];
+    if (harnessValueOptions.has(token)) {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-") || token.includes(expressionPlaceholder)) continue;
+    filters.push(token);
+  }
+  return { package: packageName, filters, exact: harnessTokens.includes("--exact") };
+}
+
+function crateDirectories() {
+  const crateRoot = path.join(repositoryRoot, "crates");
+  const directories = new Map();
+  if (!fs.existsSync(crateRoot)) return directories;
+  for (const entry of fs.readdirSync(crateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifest = path.join(crateRoot, entry.name, "Cargo.toml");
+    if (!fs.existsSync(manifest)) continue;
+    const name = /^\s*name\s*=\s*"([^"]+)"/mu.exec(fs.readFileSync(manifest, "utf8"))?.[1];
+    if (name) directories.set(name, path.join(crateRoot, entry.name));
+  }
+  return directories;
+}
+
+function rustSourceIdentifiers(directory) {
+  const identifiers = new Set();
+  const stack = [directory];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "target") stack.push(entryPath);
+        continue;
+      }
+      if (!entry.name.endsWith(".rs")) continue;
+      const source = fs.readFileSync(entryPath, "utf8");
+      for (const match of source.matchAll(/\b(?:fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)/gu)) {
+        identifiers.add(match[1]);
+      }
+    }
+  }
+  return identifiers;
+}
+
+export function validateCargoTestFilters(
+  workflows,
+  violations,
+  directories = crateDirectories(),
+  readIdentifiers = rustSourceIdentifiers,
+) {
+  const identifierCache = new Map();
+  const identifiersFor = packageName => {
+    if (!identifierCache.has(packageName)) {
+      const directory = directories.get(packageName);
+      identifierCache.set(packageName, directory ? readIdentifiers(directory) : null);
+    }
+    return identifierCache.get(packageName);
+  };
+
+  for (const [file, workflow] of workflows) {
+    for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+      for (const [stepIndex, step] of list(object(rawJob).steps).entries()) {
+        if (typeof step?.run !== "string") continue;
+        for (const { line, number } of executableCargoLines(step.run)) {
+          if (!/^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:sudo\s+)?cargo\s+test\b/u.test(line)) continue;
+          const { package: packageName, filters, exact } = cargoTestFilterNames(line);
+          if (filters.length === 0) continue;
+          // A workspace-wide run resolves names across every crate, which this guard does not model.
+          if (!packageName) continue;
+          const identifiers = identifiersFor(packageName);
+          const location = `${file} jobs.${jobName}.steps.${stepIndex}.run:${number}`;
+          if (!identifiers) {
+            violations.push(`${location} names unknown package ${packageName}`);
+            continue;
+          }
+          for (const filter of filters) {
+            for (const segment of filter.split("::").filter(Boolean)) {
+              // Without `--exact` cargo matches substrings, so mirror that rather than demanding a
+              // whole identifier: `publication_transitions_...` legitimately selects both the
+              // `full_` and `incremental_` variants.
+              const resolved = exact
+                ? identifiers.has(segment)
+                : [...identifiers].some(identifier => identifier.includes(segment));
+              add(
+                violations,
+                resolved,
+                `${location} cargo test filter "${filter}" selects no test: ${segment} matches no fn or mod in ${packageName}`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+export function validatePluginRelease(workflows, violations) {
+  const file = "plugin-release.yml";
+  const workflow = workflows.get(file);
+  if (!workflow) {
+    violations.push(`${file} must exist`);
+    return;
+  }
+  const scalars = scalarStrings(workflow);
+  add(violations, hasExactKeys(object(workflow.on), ["workflow_call"]), `${file} must be callable only`);
+  add(
+    violations,
+    !JSON.stringify(workflow).includes("secrets"),
+    `${file} must not receive or forward secrets: nothing is built or signed on the plugin lane`,
+  );
+  walk(workflow, (key, value) => {
+    if (/^APPLE_/u.test(key) || (typeof value === "string" && /\bAPPLE_[A-Z0-9_]+\b/u.test(value))) {
+      violations.push(`${file} must never reference Apple signing material`);
+    }
+  });
+  const jobs = object(workflow.jobs);
+  add(
+    violations,
+    hasExactKeys(jobs, ["workflow-policy", "preflight", "plugin-proof", "publish", "post-publish-smoke"]),
+    `${file} must keep its exact five-job plugin lane`,
+  );
+  for (const [name, job] of Object.entries(jobs)) {
+    const permissions = object(job).permissions;
+    add(
+      violations,
+      name === "publish" ? object(permissions).contents === "write" : permissions === undefined,
+      `${file} only the publish job may hold write permission`,
+    );
+  }
+  const preflight = object(jobs.preflight);
+  requireStepRun(violations, file, preflight, "Validate release authority", [
+    "auto-release.yml@refs/heads/main",
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+  ]);
+  requireStepRun(violations, file, preflight, "Validate plugin-lane version synchronization", [
+    "check-codestory-release.py",
+    "--lane plugin",
+  ]);
+  requireStepRun(violations, file, preflight, "Bind the pin to the published CLI release", [
+    "cli-version.json",
+    "SHA256SUMS.txt",
+  ]);
+  requireStepRun(violations, file, preflight, "Refuse a changed tool surface", [
+    "generated-mcp-catalog.json",
+  ]);
+  requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
+    "scripts/prove-plugin-pinned-provision.mjs",
+  ]);
+  requireStepRun(violations, file, object(jobs.publish), "Re-verify main before tagging", [
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+  ]);
+  add(
+    violations,
+    sameStrings(nonCommentLines(object(jobs.publish).needs === undefined ? "" : ""), []) ||
+      JSON.stringify(object(jobs.publish).needs) === JSON.stringify(["preflight", "plugin-proof"]),
+    `${file} publish must wait on preflight and plugin proof`,
+  );
+  add(
+    violations,
+    !scalars.some((value) => /cargo\s+(?:build|test)/u.test(value)),
+    `${file} must not build native code`,
+  );
+
+  const auto = workflows.get("auto-release.yml");
+  const pluginCaller = object(at(auto, "jobs", "plugin-release"));
+  add(
+    violations,
+    pluginCaller.uses === "./.github/workflows/plugin-release.yml"
+      && String(pluginCaller.if ?? "").includes("release_lane == 'plugin'")
+      && pluginCaller.secrets === undefined,
+    "auto-release.yml must route the plugin lane without forwarding secrets",
+  );
+  add(
+    violations,
+    String(object(at(auto, "jobs", "release")).if ?? "").includes("release_lane == 'native'"),
+    "auto-release.yml native release must be gated on the native lane",
+  );
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
   }
+  validateCargoTestFilters(workflows, violations);
+  validatePluginRelease(workflows, violations);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);

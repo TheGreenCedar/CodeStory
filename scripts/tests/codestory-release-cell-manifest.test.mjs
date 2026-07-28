@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   buildTrustedProducerMap,
+  verifyReuseBinding,
   produceReleaseCellManifest,
 } from "../codestory-release-cell-manifest.mjs";
 import {
@@ -285,4 +286,144 @@ test("Actions provenance rejects missing, expired, malformed, stale, and future 
     currentRunAttempt: "1",
     ...future,
   }), /no execution/u);
+});
+
+// ── Cross-run evidence reuse ────────────────────────────────────────────────────────────────
+
+/// Metadata for a prior, binding-verified run that produced the reused cells.
+function reusedRunMetadata(groupId, { runId = 777, headSha = "b".repeat(40), conclusion = "success", expired = false } = {}) {
+  const artifacts = [];
+  const jobs = [];
+  let nextId = 5000;
+  for (const selected of deriveReleaseCells(graph, "pre_publish")) {
+    if (selected.group_id !== groupId) continue;
+    const constraints = resolveReleaseCellConstraints(selected, "1");
+    if (!jobs.some((job) => job.name.endsWith(constraints.producer_job_name))) {
+      jobs.push({
+        id: nextId++,
+        run_id: runId,
+        run_attempt: "1",
+        head_sha: headSha,
+        name: `Release / ${constraints.producer_job_name}`,
+        status: "completed",
+        conclusion,
+        started_at: "2026-07-10T12:00:00.000Z",
+        completed_at: "2026-07-10T12:10:00.000Z",
+      });
+    }
+    if (conclusion === "success" && !artifacts.some(({ name }) => name === constraints.producer_artifact)) {
+      artifacts.push({
+        id: nextId++,
+        name: constraints.producer_artifact,
+        digest: `sha256:${String(nextId).padStart(64, "0")}`,
+        size_in_bytes: 2048,
+        expired,
+        created_at: "2026-07-10T12:05:00.000Z",
+        expires_at: "2026-08-09T12:05:00.000Z",
+        workflow_run: { id: runId, head_sha: headSha },
+      });
+    }
+  }
+  return { runId: String(runId), headSha, bindingValue: "t".repeat(64), artifacts, jobsByAttempt: jobs };
+}
+
+test("a reuse-bound group accepts binding-verified evidence from a prior run", () => {
+  const metadata = actionsMetadata("pre_publish");
+  // The current run did not execute the source gate at all.
+  metadata.jobsByAttempt["1"] = metadata.jobsByAttempt["1"].filter(
+    (job) => !job.name.endsWith("full-source-gate"),
+  );
+  metadata.artifacts = metadata.artifacts.filter(
+    ({ name }) => !name.startsWith("release-cell-prepublish-source"),
+  );
+  const map = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...metadata,
+    reuse: { source_behavior: reusedRunMetadata("source_behavior") },
+  });
+  const row = map.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
+  assert.equal(row.producer_run_id, "777");
+  assert.equal(row.reused_from.binding, "source_tree");
+  assert.equal(row.reused_from.head_sha, "b".repeat(40));
+  assert.equal(row.artifact.workflow_run_id, "777");
+  // Non-reused cells stay bound to the current run.
+  const packaged = map.producers.find(({ cell_id: cellId }) => cellId.startsWith("package_identity"));
+  assert.equal(packaged.producer_run_id, "12345");
+});
+
+test("cross-run evidence is refused for groups without a reuse binding", () => {
+  const metadata = actionsMetadata("pre_publish");
+  assert.throws(() => buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...metadata,
+    reuse: { package_identity: reusedRunMetadata("package_identity") },
+  }), /package_identity does not admit cross-run evidence/u);
+});
+
+test("reused evidence keeps every same-run trust requirement", () => {
+  const base = actionsMetadata("pre_publish");
+  const withReuse = (reused) => () => buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...base,
+    reuse: { source_behavior: reused },
+  });
+
+  assert.throws(
+    withReuse(reusedRunMetadata("source_behavior", { conclusion: "failure" })),
+    /did not succeed/u,
+  );
+  assert.throws(
+    withReuse(reusedRunMetadata("source_behavior", { expired: true })),
+    /stale run provenance/u,
+  );
+  const wrongRun = reusedRunMetadata("source_behavior");
+  for (const artifact of wrongRun.artifacts) artifact.workflow_run.id = 999;
+  assert.throws(withReuse(wrongRun), /stale run provenance/u);
+  const missing = reusedRunMetadata("source_behavior");
+  missing.artifacts = [];
+  assert.throws(withReuse(missing), /must retain one/u);
+});
+
+test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
+  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
+  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
+  // accelerator inheritance is exactly what version_only_delta authorizes).
+  const releaseTag = "00121349"; // v0.16.1 release commit
+  const priorTag = "29bd4795"; // v0.16.0 release commit
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_tree",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /does not match release tree/u,
+  );
+  const fingerprint = verifyReuseBinding({
+    binding: "native_fingerprint",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: priorTag,
+  });
+  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
+  // Identical commits always satisfy the tree binding.
+  const tree = verifyReuseBinding({
+    binding: "source_tree",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: releaseTag,
+  });
+  assert.match(tree, /^[0-9a-f]{40}$/u);
 });

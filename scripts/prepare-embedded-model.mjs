@@ -14,7 +14,11 @@ import {
 import { constants as fsConstants } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+
+const downloadAttemptsPerSource = 3;
+const downloadBackoffMs = 500;
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultContract = resolve(
@@ -237,6 +241,31 @@ async function download(url, destination, contract) {
   }
 }
 
+async function downloadWithRetry(url, destination, contract, failures) {
+  for (let attempt = 1; attempt <= downloadAttemptsPerSource; attempt += 1) {
+    try {
+      await download(url, destination, contract);
+      return true;
+    } catch (error) {
+      failures.push({ attempt, error, url });
+      if (attempt < downloadAttemptsPerSource) {
+        await delay(downloadBackoffMs * attempt);
+      }
+    }
+  }
+  return false;
+}
+
+function aggregatedDownloadError(failures) {
+  const details = failures
+    .map(({ attempt, error, url }) => `${url} attempt ${attempt}: ${error?.message ?? error}`)
+    .join("; ");
+  return new AggregateError(
+    failures.map(({ error }) => error),
+    `model download failed after ${failures.length} attempts: ${details}`,
+  );
+}
+
 async function destinationMetadata(path) {
   try {
     return await lstat(path);
@@ -287,17 +316,15 @@ if (!(await valid(destination, contract))) {
   } else if (process.argv.includes("--offline")) {
     throw new Error(`offline model preparation requires a valid --source or existing ${destination}`);
   } else {
-    let lastError;
+    const failures = [];
+    let published = false;
     for (const url of contract.urls) {
-      try {
-        await download(url, destination, contract);
-        lastError = undefined;
+      if (await downloadWithRetry(url, destination, contract, failures)) {
+        published = true;
         break;
-      } catch (error) {
-        lastError = error;
       }
     }
-    if (lastError) throw lastError;
+    if (!published) throw aggregatedDownloadError(failures);
   }
 }
 

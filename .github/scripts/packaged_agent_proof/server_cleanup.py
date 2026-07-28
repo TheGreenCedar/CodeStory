@@ -81,15 +81,49 @@ def native_server_exit_wait_required(target_os: str, proof_tier: str) -> bool:
     }
 
 
-def native_server_exit_wait_budget(manifest: dict) -> dict:
+def native_server_exit_wait_budget(manifest: dict, constant_set: dict) -> dict:
     product_idle_timeout_ms = require_positive_int(
         manifest["server_proof"].get("idle_timeout_ms"),
         "native server product idle timeout",
     )
+    # Re-derived for the drain-time endpoint release (PR #1452). The exit tail
+    # after the unchanged 60s idle deadline used to hold the endpoint until
+    # process exit behind an uninterruptible watchdog cadence (frozen at
+    # 19,271ms) plus native engine teardown; the endpoint is now released the
+    # moment draining starts and the watchdog wakes within a 100ms slice, so
+    # the grace funds exactly one remaining phase: Windows-native engine
+    # teardown, the span that held the AMD Vulkan pipeline cache open past
+    # candidate cleanup (WinError 32). No frozen contract measures that phase
+    # -- the calibration matrix has no Windows cell, and since the drain-time
+    # release the calibrated true_idle_exit threshold ends at owner absence
+    # rather than process exit -- so the conservative grace frozen by #1397
+    # stays. The frozen threshold still binds this budget as a floor: the
+    # receipt must never hold the exact process to a bound tighter than the
+    # whole-idle-exit claim the release itself makes.
+    timeout_ms = product_idle_timeout_ms + NATIVE_SERVER_TEARDOWN_GRACE_MS
+    require(
+        isinstance(constant_set, dict),
+        "native server exit-wait budget requires the verified constant set",
+    )
+    if constant_set.get("status") == "frozen":
+        thresholds = constant_set.get("qualification_thresholds")
+        require(
+            isinstance(thresholds, dict),
+            "frozen embedding server constants omit qualification thresholds",
+        )
+        true_idle_exit_ms = require_positive_int(
+            thresholds.get("true_idle_exit"),
+            "frozen true-idle exit qualification threshold",
+        )
+        require(
+            timeout_ms >= true_idle_exit_ms,
+            f"native server exit-wait bound {timeout_ms}ms is tighter than the"
+            f" frozen {true_idle_exit_ms}ms true-idle exit claim",
+        )
     return {
         "product_idle_timeout_ms": product_idle_timeout_ms,
         "native_teardown_grace_ms": NATIVE_SERVER_TEARDOWN_GRACE_MS,
-        "timeout_ms": product_idle_timeout_ms + NATIVE_SERVER_TEARDOWN_GRACE_MS,
+        "timeout_ms": timeout_ms,
     }
 
 
@@ -275,10 +309,11 @@ def _wait_for_pinned_servers(
     entries: list,
     final_entry: dict | None,
     manifest: dict,
+    constant_set: dict,
     *,
     require_final_server: bool,
 ) -> tuple[dict, dict, int, list[str]]:
-    wait_budget = native_server_exit_wait_budget(manifest)
+    wait_budget = native_server_exit_wait_budget(manifest, constant_set)
     timeout_ms = wait_budget["timeout_ms"]
     final_identity = final_entry.get("identity") if final_entry is not None else None
     entries.sort(
@@ -326,6 +361,7 @@ def wait_for_final_temporary_package_server(
     env: dict[str, str],
     control: dict,
     manifest: dict,
+    constant_set: dict,
     *,
     require_final_server: bool,
 ) -> dict | None:
@@ -368,6 +404,7 @@ def wait_for_final_temporary_package_server(
         entries,
         final_entry,
         manifest,
+        constant_set,
         require_final_server=require_final_server,
     )
     failures = []

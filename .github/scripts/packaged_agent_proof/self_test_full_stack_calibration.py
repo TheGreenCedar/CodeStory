@@ -6,12 +6,20 @@ import argparse
 import json
 
 from .calibration_assembly import assemble_calibration_bundle
-from .calibration_self_test import build_calibration_self_test_bundle
+from .calibration_self_test import (
+    SelfTestRunContext,
+    _self_test_sample,
+    build_calibration_self_test_bundle,
+)
 from .calibration_verification import verify_calibration_bundle
 from .contract_primitives import canonical_sha256, write_json
-from .foundation import ProofFailure, require
+from .foundation import TARGET_CONTRACTS, ProofFailure, require
 from .measurement_samples import selected_qualification_matrix_cell
 from .package_contracts import verify_package_server_contracts
+from .qualification_measurements import (
+    MeasurementValidationContract,
+    _qualification_measurement_sample,
+)
 from .self_test_full_stack_types import CalibrationFixture, FullStackFixture
 
 
@@ -142,6 +150,107 @@ def _calibration_bundle_tests(
     )
 
 
+def _measurement_window_semantics_tests(
+    fixture: FullStackFixture,
+    calibration: CalibrationFixture,
+) -> None:
+    """The declared measurement windows are the checker's contract.
+
+    Regression for calibration run 30205779627: the per-sample worker driver
+    stamped every metric with the generic whole-worker phase pair
+    ``packaged_worker_operation_started`` ->
+    ``packaged_worker_operation_validated`` and three non-protocol workload
+    ids. This drives the retained-sample validator directly so nothing else
+    (digest lineage, freeze records) can mask the two gates: a sample labeled
+    with the protocol's declared phase boundaries and workload id passes,
+    while the generic pair and the regressed workload ids stay rejected.
+    """
+    del fixture
+    protocol = calibration.frozen_measurement_contract["measurement_protocol"]
+    cell_id, cell = sorted(protocol["calibration_matrix"].items())[0]
+    target_os = TARGET_CONTRACTS[cell["asset_target"]]["target_os"]
+    awake_api = protocol["clock_policy"]["platform_apis"][target_os][0]
+    inclusive_api = protocol["clock_policy"]["suspend_detection"]["platform_apis"][
+        target_os
+    ]
+    raw_metric_names = frozenset(
+        set(protocol["required_metrics"])
+        - {"retrieval_quality", "total_codestory_process_memory"}
+    )
+    validation = MeasurementValidationContract(
+        contracts={},
+        protocol=protocol,
+        metric_contracts=protocol["metric_contracts"],
+        phase_boundaries=protocol["phase_boundaries"],
+        matrix_cell_id=cell_id,
+        matrix_cell=cell,
+        expected_policy=cell["policy"],
+        expected_backend=cell["backend"],
+        raw_metric_names=raw_metric_names,
+        allowed_awake_apis=frozenset({awake_api}),
+        inclusive_api=inclusive_api,
+        maximum_suspend_ns=protocol["clock_policy"]["suspend_detection"][
+            "maximum_inclusive_minus_awake_ns"
+        ],
+    )
+    context = SelfTestRunContext(
+        protocol,
+        {},
+        {},
+        cell_id,
+        cell,
+        0,
+        1,
+        awake_api,
+        inclusive_api,
+    )
+    regressed_workloads = {
+        "spawn_convergence": "compatible_query_absent_owner_v1",
+        "existing_owner_connect": "observe_existing_owner_v1",
+        "busy_retry_usefulness": "held_query_release_v1",
+    }
+    for position, metric in enumerate(sorted(raw_metric_names)):
+        declared = _self_test_sample(context, metric, position, 1)
+        _qualification_measurement_sample(
+            metric,
+            declared,
+            sample_index=0,
+            validation=validation,
+        )
+        generic = json.loads(json.dumps(declared))
+        generic["start"]["phase"] = "packaged_worker_operation_started"
+        generic["end"]["phase"] = "packaged_worker_operation_validated"
+        try:
+            _qualification_measurement_sample(
+                metric,
+                generic,
+                sample_index=0,
+                validation=validation,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"generic whole-worker measurement phases were accepted for {metric}"
+            )
+        if metric in regressed_workloads:
+            wrong_workload = json.loads(json.dumps(declared))
+            wrong_workload["workload_id"] = regressed_workloads[metric]
+            try:
+                _qualification_measurement_sample(
+                    metric,
+                    wrong_workload,
+                    sample_index=0,
+                    validation=validation,
+                )
+            except ProofFailure:
+                pass
+            else:
+                raise ProofFailure(
+                    f"non-protocol workload id was accepted for {metric}"
+                )
+
+
 def _calibration_hostile_tests(
     fixture: FullStackFixture,
     calibration: CalibrationFixture,
@@ -227,5 +336,6 @@ def _calibration_hostile_tests(
 def run_calibration_self_tests(fixture: FullStackFixture) -> dict:
     measurement_contract = _qualification_matrix_tests(fixture)
     calibration = _calibration_bundle_tests(fixture, measurement_contract)
+    _measurement_window_semantics_tests(fixture, calibration)
     _calibration_hostile_tests(fixture, calibration)
     return measurement_contract

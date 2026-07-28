@@ -4,7 +4,7 @@ use super::super::{
 };
 use super::ScenarioRunner;
 use super::analysis::{project_identity_sha256, scheduler_values};
-use super::process::{query_parameters, require_worker_success};
+use super::process::{dead_client_setup_timeout, query_parameters, require_worker_success};
 use anyhow::{Result, bail};
 use codestory_retrieval::EmbeddingQualificationParameters;
 use serde_json::json;
@@ -25,13 +25,20 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        let lease_snapshot =
-            self.wait_for_snapshot("client_death_lease_active", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment is queue seeding by a freshly spawned client, so
+        // it gets the queue-setup budget; the lease-reclaim wait below stays
+        // on the flat snapshot budget because the peer-death sweep needs no
+        // new client ramp.
+        let lease_snapshot = self.wait_for_snapshot(
+            "client_death_lease_active",
+            dead_client_setup_timeout(),
+            |snapshot| {
                 snapshot.scheduler.lease_count > 0
                     && snapshot.scheduler.query_depth > 0
                     && snapshot.scheduler.bulk_depth > 0
                     && snapshot.scheduler.active_request_count > 0
-            })?;
+            },
+        )?;
         self.transition(
             "dead_client_work_observed",
             scheduler_values(&lease_snapshot),

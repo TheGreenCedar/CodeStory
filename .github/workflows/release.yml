@@ -74,6 +74,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      source_proof_reused: ${{ steps.reuse.outputs.source_proof_reused }}
       tag: ${{ steps.version.outputs.tag }}
       marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
@@ -152,6 +154,44 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve reusable prior evidence
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          entries=()
+
+          # The source gate proves a tree. When dev was already gated and promoted without
+          # changing the tree, re-running it for an hour cannot reach a different answer.
+          release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          while IFS= read -r run_id; do
+            head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
+            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
+            test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
+            git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name | endswith("full-source-gate")) | select(.conclusion == "success") | .id' \
+              | grep -q . || continue
+            entries+=("source_behavior=$run_id:$head_sha")
+            echo "Reusing source proof from run $run_id (tree $release_tree)."
+            break
+          done < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+              | jq -r --arg repo "$GITHUB_REPOSITORY" \
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .conclusion == "success") | .id'
+          )
+
+          reuse="$(IFS=,; echo "${entries[*]:-}")"
+          echo "reuse=${reuse:--}" >> "$GITHUB_OUTPUT"
+          if [ -n "$reuse" ]; then
+            echo "source_proof_reused=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_proof_reused=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prove the public marketplace install path
         if: inputs.publish_release
         id: marketplace
@@ -175,13 +215,24 @@ jobs:
             --no-audit \
             --no-fund \
             "@openai/codex@$CODEX_CLI_VERSION"
+          # Fixture mode proves the install mechanics against a catalog pinned to THIS
+          # candidate. The live catalog still points at the previous release at this point --
+          # it is updated by marketplace-publish after publication -- so requiring a live
+          # tree match here is what forced a human to edit another repository before every
+          # merge to main.
+          fixture_root="$install_root/marketplace-fixture"
+          node .github/scripts/build-marketplace-fixture.mjs \
+            --out "$fixture_root" \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA"
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-source "$fixture_root" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$marketplace_revision" \
+            --local-fixture true \
             --expected-version "$VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json" \
@@ -189,6 +240,9 @@ jobs:
 
   source-proof:
     needs: preflight
+    # A completed gate for this exact tree is already authenticated evidence; the closeout
+    # consumes it through the reuse binding instead of re-running an hour of compilation.
+    if: needs.preflight.outputs.source_proof_reused != 'true'
     uses: ./.github/workflows/source-proof.yml
     with:
       ref: ${{ github.sha }}
@@ -264,6 +318,7 @@ jobs:
 
   pre-publish-closeout:
     name: Authenticate pre-publish release cells
+    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped')
     needs:
       - preflight
       - source-proof
@@ -284,6 +339,7 @@ jobs:
         id: pre-publish-provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSE_SELECTION: ${{ needs.preflight.outputs.reuse }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,6 +349,7 @@ jobs:
             --phase pre_publish \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --reuse "$REUSE_SELECTION" \
             --out target/release-closeout/trusted-pre-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-pre-publish-producers.json)"
           test -n "$artifact_ids"
@@ -463,16 +520,57 @@ jobs:
             --title "CodeStory $TAG" \
             --notes-file target/release-assets/release-notes.md
 
+  marketplace-publish:
+    name: Publish the marketplace catalog
+    if: inputs.publish_release
+    needs:
+      - preflight
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: marketplace-publish
+    outputs:
+      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Mint a scoped marketplace token
+        id: token
+        uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
+        with:
+          app-id: ${{ secrets.MARKETPLACE_APP_ID }}
+          private-key: ${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}
+          owner: TheGreenCedar
+          repositories: AgentPluginMarketplace
+
+      # Publication already happened, so a failure here leaves the catalog serving the previous
+      # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      - name: Point the catalog at the published release
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+
   post-publish-smoke:
     name: Post-publish release asset smoke
     if: inputs.publish_release
     needs:
       - preflight
       - publish
+      - marketplace-publish
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      marketplace_revision: ${{ needs.preflight.outputs.marketplace_revision }}
+      marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true
     permissions:

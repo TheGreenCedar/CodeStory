@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+## 0.16.2
+
+### Fixed
+
+- Windows projects whose cache root sits deep in the filesystem can index, search, and publish again. Indexing, status, semantic publication, and snapshot publication could fail with `unable to open database file` once a database path approached 260 characters — reachable with a long user name, a redirected or roaming home directory, or a service account — because the companion files SQLite derives by appending to that path were longer still. Every database open now handles long paths, so no change to the cache location or Windows settings is needed.
+- First use completes on Linux hosts that keep `/tmp` on its own filesystem.
+  Setup previously downloaded the runtime, failed to install it, and started the
+  download again until it gave up.
+- Repositories over 25,000 files can use broad search. Packet, search, context,
+  and drill were refused on them permanently, and re-indexing did not help.
+- A question asked while the local model is still starting waits for it instead
+  of reporting the project as unavailable. Slower machines, encrypted or network
+  disks, and hosts running antivirus were most affected.
+- Search results say whether they used full retrieval. Results that fell back to
+  symbolic matching reported themselves as complete, so an agent could cite
+  partial evidence as if it were whole.
+- Search, ground, index, and doctor surfaces recognize the semantic index a
+  fresh install builds automatically. They previously reported retrieval as
+  symbolic with missing or stale semantic docs forever — even right after a
+  successful build — and the suggested repair, `retrieval index --refresh
+  full`, could never clear the message. Readiness now reflects the published
+  retrieval index itself, so a healthy project reports full hybrid retrieval
+  and a healthy doctor semantic check without any manual command. Projects
+  small enough to publish a semantic index with zero dense entries report that
+  truthfully as ready instead of prescribing the same impossible repair.
+- CodeStory installed somewhere shared or read-only runs for people who cannot
+  write to that location.
+- On Windows, ending the CodeStory process also ends the runtime it launched.
+  A launcher that was killed or crashed previously left that runtime running in
+  the background. The model keeps running between commands as before, so later
+  commands do not reload it. A runtime crash now also reports the raw Windows
+  exit code instead of a bare failure.
+- On Windows, losing the connection to the embedding runtime while sending it a
+  request is recognized as a disconnect and retried once against the
+  replacement, instead of waiting out the full request deadline and failing as
+  an unresponsive runtime. The recorded failure keeps the raw Windows error
+  code and whether the runtime exited, so a crash can be told apart from an
+  external kill.
+
+### Faster
+
+- Commands that do not search — indexing, symbol lookup, call trails,
+  `--version` — start immediately. Only the first command that needs the model
+  waits for it.
+- Windows and Linux start faster, and commands run at the same time no longer
+  queue behind one another.
+
+### For operators
+
+- `CODESTORY_INDEX_FRESHNESS_INDEXED_FILE_CAP` and
+  `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the repository size at which
+  CodeStory stops checking for changes.
+
+||||||| parent of e925d6da (note the windows deep-cache-root publication fix in the changelog)
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.
@@ -105,7 +159,17 @@ paths more accurately.
 
 Update the CodeStory plugin and start a fresh session in your agent host. The
 first broad question may take a little longer while CodeStory updates the
-repository's local index. No manual migration or cleanup is required.
+repository's local index. Your existing index migrates in place; no manual
+migration step is required.
+
+If you ran 0.15, its retrieval sidecars are no longer used and 0.16 does not
+remove them, because CodeStory only deletes resources it can prove it owns.
+Two Docker containers, `codestory-qdrant` and `codestory-embed` (or your
+`CODESTORY_SIDECAR_NAMESPACE` prefix instead of `codestory`), were started with
+`restart: unless-stopped` and so survive reboots while holding ports 6333, 6334,
+and 8080. The directory `qdrant` under your CodeStory cache root is likewise
+orphaned and includes a downloaded model. Both are safe to remove once you are
+on 0.16.
 
 ## 0.15.0
 

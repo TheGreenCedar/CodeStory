@@ -28,15 +28,13 @@ use uuid::Uuid;
 
 pub mod atomic_file;
 pub mod owned_deletion;
+pub mod paths;
 mod repository_identity;
 pub use repository_identity::{
-    PROJECT_IDENTITY_SCHEMA_VERSION, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV2,
-    ProjectIdentityV3, REPOSITORY_IDENTITY_SCHEMA_VERSION, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
-    RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, WorkspacePathIdentity,
-    WorkspacePathLexicalIdentity, cached_project_identity_v2, cached_project_identity_v3,
-    inspect_repository_identity, inspect_repository_identity_v2, project_identity_v2,
-    project_identity_v3, project_identity_v3_from_repository, same_workspace_path,
-    sidecar_project_identity, workspace_file_identity, workspace_id_for_root,
+    PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
+    RepositoryIdentityV2, WorkspacePathIdentity, WorkspacePathLexicalIdentity,
+    cached_project_identity_v3, inspect_repository_identity_v2, project_identity_v3,
+    project_identity_v3_from_repository, same_workspace_path, workspace_file_identity,
     workspace_id_v3_for_root, workspace_path_identity, workspace_path_lexical_identity,
 };
 

@@ -90,6 +90,7 @@ def run_runtime_proof(
             env,
             server_cleanup_control,
             manifest,
+            measurement_contract["constant_set"],
             require_final_server=runtime_error is None and not args.ground_only,
         )
     except BaseException as error:

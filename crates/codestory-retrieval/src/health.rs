@@ -207,7 +207,14 @@ fn parse_degraded_modes(manifest: &codestory_store::RetrievalIndexManifest) -> V
         .unwrap_or_else(|_| vec!["degraded_modes_json_invalid".into()])
 }
 
-fn manifest_classifies_full(manifest: &codestory_store::RetrievalIndexManifest) -> bool {
+/// Whether a published manifest classifies as a current, non-degraded full
+/// sidecar publication.
+///
+/// This is the manifest-only admission check: it validates the sidecar
+/// generation contract and requires an empty degraded-mode list without
+/// probing artifacts or the embedding runtime. Readiness projections use it
+/// so observational reads stay a single indexed manifest-row lookup.
+pub fn manifest_classifies_full(manifest: &codestory_store::RetrievalIndexManifest) -> bool {
     manifest_has_current_sidecar_contract(&manifest.project_id, manifest)
         && parse_degraded_modes(manifest).is_empty()
 }

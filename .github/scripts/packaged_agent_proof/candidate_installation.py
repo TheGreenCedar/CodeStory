@@ -17,6 +17,12 @@ from .archive_io import (
 from .contract_primitives import sha256, write_json
 from .foundation import CANDIDATE_PRODUCER_WORKFLOW_PATHS, REPOSITORY_ROOT, require
 from .installation_support import directory_contract_sha256, same_existing_path
+from .managed_layout import (
+    managed_archive_name,
+    managed_binary_name,
+    require_provisioner_package_root,
+    stage_flat_managed_install,
+)
 from .native_manifest import load_native_manifest
 
 
@@ -73,20 +79,14 @@ def _verify_candidate_checkout(source_plugin: Path, manifest: dict) -> None:
     )
 
 
-def _expected_archive_name(version: str, asset_target: str) -> str:
-    suffix = "zip" if asset_target.startswith("windows-") else "tar.gz"
-    return f"codestory-cli-v{version}-{asset_target}.{suffix}"
-
-
 def _managed_manifest(
     archive: Path,
     manifest: dict,
-    relative_cli: str,
     version: str,
 ) -> dict:
     archive_sha256 = sha256(archive)
     return {
-        "path": relative_cli,
+        "path": managed_binary_name(manifest["asset_target"]),
         "sha256": manifest["binary"]["sha256"],
         "version": version,
         "build_source": "candidate_archive",
@@ -114,25 +114,25 @@ def _stage_candidate_installation(
         manifest = load_native_manifest(unpacked, cli, version)
         _verify_candidate_checkout(source_plugin, manifest)
         require(
-            archive.name == _expected_archive_name(version, manifest["asset_target"]),
+            archive.name == managed_archive_name(version, manifest["asset_target"]),
             "candidate install archive name does not match its package target",
         )
-        package_root = cli.parent
+        package_root = require_provisioner_package_root(
+            unpacked,
+            archive.name,
+            manifest["asset_target"],
+        )
         require(
-            package_root.parent == unpacked,
-            "candidate install archive must contain one package root",
+            cli == package_root / managed_binary_name(manifest["asset_target"]),
+            "candidate install launcher is not the package root launcher",
         )
         shutil.copytree(source_plugin, plugin_output)
-        version_root = data_output / "codestory-cli" / version
-        shutil.copytree(package_root, version_root)
-        write_json(
-            version_root / "manifest.json",
-            _managed_manifest(
-                archive,
-                manifest,
-                cli.relative_to(package_root).as_posix(),
-                version,
-            ),
+        stage_flat_managed_install(
+            package_root,
+            data_output,
+            version,
+            manifest["asset_target"],
+            _managed_manifest(archive, manifest, version),
         )
         return manifest
 

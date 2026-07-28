@@ -17,6 +17,7 @@ mod transport;
 
 pub use client::{
     PerUserEmbeddingClient, PerUserEmbeddingResidencyLease, install_embedding_client_transport,
+    install_embedding_client_transport_factory,
 };
 pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
@@ -25,6 +26,7 @@ pub use qualification_control::{
 };
 pub use qualification_worker::{
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
+    EmbeddingQualificationWorkerMeasurement, EmbeddingQualificationWorkerMeasurementSpan,
     EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
     EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
 };
@@ -71,9 +73,12 @@ pub use protocol::{
     embedding_qualification_watchdog_marker_filename, embedding_retry_state,
 };
 use qualification_control::ServerQualificationControl;
+#[cfg(all(test, windows))]
+use qualification_control::native_path_identity;
 #[cfg(test)]
 use qualification_control::{
-    ServerQualificationEvent, ServerQualificationEventClock, read_server_qualification_command,
+    CommandAbsence, MAX_DENIED_COMMAND_TICKS, ServerQualificationEvent,
+    ServerQualificationEventClock, absent_command, read_server_qualification_command,
     server_qualification_control_from_values,
 };
 #[cfg(test)]

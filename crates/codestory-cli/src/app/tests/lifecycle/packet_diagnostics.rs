@@ -4,8 +4,8 @@ use crate::app::diagnostics::{index_next_commands, semantic_contract_check};
 use crate::app::{packet_budget_mode_label, packet_task_class_label, render_packet_markdown};
 use crate::output::REPO_CONTENT_BOUNDARY_LINE;
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessStatusDto, PacketBudgetModeDto, PacketTaskClassDto,
-    RetrievalFallbackReasonDto, SearchHitOrigin,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto,
+    PacketBudgetModeDto, PacketTaskClassDto, RetrievalFallbackReasonDto, SearchHitOrigin,
 };
 use std::path::Path;
 
@@ -68,7 +68,7 @@ fn packet_markdown_labels_context_blocks_when_no_covered_claims() {
 }
 
 #[test]
-fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
+fn index_next_commands_allow_proof_after_bounded_inventory() {
     let freshness = IndexFreshnessDto {
         status: IndexFreshnessStatusDto::NotChecked,
         changed_file_count: 0,
@@ -78,6 +78,7 @@ fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
         indexed_file_count: 1,
         duration_ms: 0,
         reason: Some("bounded inventory overflow".to_string()),
+        not_checked_cause: Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
         samples: Vec::new(),
     };
 
@@ -85,16 +86,13 @@ fn index_next_commands_stop_at_check_index_when_freshness_not_checked() {
     let joined = commands.join("\n");
 
     assert!(
-        joined.contains("codestory-cli index")
-            && joined.contains("--refresh full")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
-        "not-checked freshness should recommend index verification before proof commands: {joined}"
+        !joined.contains("codestory-cli index") && !joined.contains("codestory-cli doctor"),
+        "a bounded inventory cannot be repaired by repeating the same refresh: {joined}"
     );
-    for blocked in ["ground", "search", "context"] {
+    for proof in ["ground", "search", "context"] {
         assert!(
-            !joined.contains(&format!("codestory-cli {blocked} ")),
-            "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
+            joined.contains(&format!("codestory-cli {proof} ")),
+            "the last complete publication should remain usable for `{proof}`: {joined}"
         );
     }
 }
@@ -111,6 +109,96 @@ fn index_next_commands_use_sidecar_repair_for_missing_embedding_runtime() {
     assert!(
         joined.contains("codestory-cli retrieval index --project")
             && joined.contains("--refresh full")
+    );
+}
+
+/// Publish `manifest` for a fresh temp project and run the production
+/// readiness projection against it, exactly as `doctor` consumes it.
+fn doctor_retrieval_state_for_manifest(
+    mutate: impl FnOnce(&mut codestory_retrieval::RetrievalIndexManifest),
+) -> codestory_contracts::api::RetrievalStateDto {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
+    let mut manifest =
+        codestory_retrieval::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
+    manifest.projection_count = Some(2);
+    manifest.symbol_doc_count = Some(8);
+    manifest.dense_projection_count = Some(2);
+    mutate(&mut manifest);
+    codestory_runtime::publish_retrieval_manifest_for_test(&storage_path, &manifest)
+        .expect("publish retrieval manifest");
+    codestory_runtime::retrieval_state_from_manifest_storage_for_test(
+        &storage_path,
+        &project_root,
+        &temp.path().join("cache"),
+    )
+    .expect("retrieval state")
+}
+
+#[test]
+fn doctor_semantic_check_is_healthy_for_fresh_manifest_published_store() {
+    // Regression: a healthy fresh install publishes semantic readiness through
+    // the retrieval manifest. The manifest records one opaque embedding
+    // runtime id plus a dimension; projecting that id into the stored
+    // contract's `embedding_backend`/leaving profile and doc-shape `None` made
+    // this doctor check report "semantic stale" with `retrieval index
+    // --refresh full` advice forever, even though a refresh republishes the
+    // identical manifest.
+    let retrieval = doctor_retrieval_state_for_manifest(|_| {});
+
+    assert!(
+        retrieval.stored_embedding.is_some(),
+        "build_doctor_output only includes the semantic check when a stored contract exists"
+    );
+    let check = semantic_contract_check(&retrieval);
+
+    assert_eq!(
+        check.status, "ok",
+        "a healthy manifest-published store must not report semantic stale: {}",
+        check.message
+    );
+    assert!(
+        check.message.contains("semantic ok"),
+        "unexpected doctor message: {}",
+        check.message
+    );
+}
+
+#[test]
+fn doctor_semantic_check_stays_warn_for_mismatched_manifest_backend() {
+    let retrieval = doctor_retrieval_state_for_manifest(|manifest| {
+        manifest.embedding_backend = Some("legacy-backend".to_string());
+    });
+
+    let check = semantic_contract_check(&retrieval);
+
+    assert_eq!(check.status, "warn", "{}", check.message);
+    assert!(
+        check.message.contains("semantic stale"),
+        "a mismatched publication must keep failing closed: {}",
+        check.message
+    );
+}
+
+#[test]
+fn doctor_semantic_check_stays_warn_for_degraded_manifest_with_matching_contract() {
+    // The degraded manifest still carries the current embedding runtime id and
+    // dimension, so field comparison alone would call it healthy. The doctor
+    // must honor the readiness projection's degraded verdict instead.
+    let retrieval = doctor_retrieval_state_for_manifest(|manifest| {
+        manifest.degraded_modes_json = r#"["embedded_vector_index_unavailable"]"#.to_string();
+    });
+
+    let check = semantic_contract_check(&retrieval);
+
+    assert_eq!(check.status, "warn", "{}", check.message);
+    assert!(
+        check.message.contains("semantic stale"),
+        "a degraded publication must keep failing closed: {}",
+        check.message
     );
 }
 

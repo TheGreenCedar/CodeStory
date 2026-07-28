@@ -31,6 +31,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 
@@ -47,8 +48,10 @@ jobs:
   resolve:
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
     steps:
       - name: Resolve trusted exact head
         id: resolve
@@ -113,9 +116,44 @@ jobs:
             echo "ref=$CALLER_REF" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Reuse a completed gate for this exact head
+        id: reuse
+        # Only the label and dispatch paths. workflow_call always supplies `ref`, and the release
+        # chain requires full-source-gate to actually run.
+        if: inputs.ref == ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          reuse=false
+          while IFS= read -r run_id; do
+            test "$run_id" != "$GITHUB_RUN_ID" || continue
+            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
+              | grep -q .
+            then
+              reuse=true
+              echo "Reusing full-source-gate from run $run_id for exact head $HEAD_SHA."
+              break
+            fi
+          done < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
+              | jq -r --arg repo "$GITHUB_REPOSITORY" \
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and (.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success") | .id'
+          )
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
   full-source-gate:
     name: full-source-gate
     needs: resolve
+    # A completed gate for this exact head already proves this tree. Re-running it costs an hour
+    # and cannot reach a different answer, which is what made re-labelling a PR expensive. Release
+    # runs (workflow_call, which always supplies `ref`) never take this path: their chain requires
+    # the job to execute.
+    if: needs.resolve.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -136,6 +174,18 @@ jobs:
         with:
           version: ${{ env.SCCACHE_VERSION }}
           disable_annotations: true
+
+      # Checksum-pinned official archive, same trust model as the actionlint gate. nextest
+      # schedules test binaries in parallel across the whole workspace, which measured 3.9x
+      # faster than `cargo test --workspace` on an identical tree with identical test parity.
+      - name: Install pinned cargo-nextest
+        shell: bash
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/cargo-nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.98/cargo-nextest-0.9.98-x86_64-unknown-linux-gnu.tar.gz"
+          echo "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6dda1ba61b2a7  $RUNNER_TEMP/cargo-nextest.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/cargo-nextest" "$HOME/.cargo/bin/cargo-nextest"
+          cargo nextest --version
 
       - name: Configure bounded compiler cache
         shell: bash
@@ -341,8 +391,12 @@ jobs:
           test "$COMPILE_OUTCOME" = success
           test "$LINT_OUTCOME" = success
 
+      # nextest does not execute doctests, so the doc pass stays: today it is empty and costs
+      # seconds, and it means a future doctest can never silently stop being run.
       - name: Test the complete workspace once
-        run: cargo test --workspace --locked
+        run: |
+          cargo nextest run --workspace --locked
+          cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
         if: inputs.emit_release_cells

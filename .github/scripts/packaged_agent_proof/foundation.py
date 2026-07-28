@@ -28,7 +28,35 @@ STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
 SERVER_PROOF_SCHEMA_VERSION = 1
 QUALIFICATION_SCHEMA_VERSION = 1
+# Outer wire contract of the packaged CLI qualification worker. This must
+# equal EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION in
+# EMBEDDING_QUALIFICATION_WORKER_CONTRACT_SOURCE below: the harness asserts
+# the version its own tree compiled, exactly like the codestory-bench driver,
+# so a stale runtime can never make a mismatch self-consistent. The packaged
+# proof self-test pins the two declarations together; bump them in the same
+# change. This is distinct from QUALIFICATION_SCHEMA_VERSION, which is the
+# inner EmbeddingQualificationResult contract.
+EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION = 2
 NATIVE_SERVER_TEARDOWN_GRACE_MS = 60_000
+# The product's frozen per-user embedding server idle timeout, mirrored so a
+# harness wait can be bounded by the budget that actually governs the server it
+# waits on. This is not a competing source of truth: the packaged proof marker
+# is verified to carry exactly this value in `native_contract_identity`, the
+# frozen constant set declares it, and the self-test pins this constant to that
+# declaration. It is mirrored here, never chosen here, and it must never be
+# changed to make a proof pass -- it is hashed into `constant_set_sha256` and
+# `measurement_protocol_sha256`, and `true_idle_exit` measures it.
+PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS = 60_000
+# A resident server consumes a qualification control at the top of its accept
+# loop, one 25ms poll at a time, so it answers in milliseconds. A control still
+# unanswered after the idle timeout plus this grace therefore has no resident
+# server to answer it and never will: the wait is deadlocked, not slow. Spending
+# the whole proof budget on it turns a deterministic deadlock into an anonymous
+# half-hour timeout, which is exactly what this defect cost to diagnose.
+SERVER_QUALIFICATION_CONTROL_GRACE_MS = 30_000
+SERVER_QUALIFICATION_CONTROL_TIMEOUT_SECS = (
+    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS + SERVER_QUALIFICATION_CONTROL_GRACE_MS
+) // 1000
 PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
 FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
 RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
@@ -119,8 +147,8 @@ EXTERNAL_QUALIFICATION_METRICS = {
 }
 MEASUREMENT_PROTOCOL = (
     REPOSITORY_ROOT
-    / "docs"
-    / "testing"
+    / "crates"
+    / "codestory-llama-sys"
     / "per-user-embedding-server-measurement-protocol.json"
 )
 SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
@@ -128,6 +156,14 @@ SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
 )
 SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name(
     "per-user-embedding-server-constant-set.json"
+)
+EMBEDDING_QUALIFICATION_WORKER_CONTRACT_SOURCE = (
+    REPOSITORY_ROOT
+    / "crates"
+    / "codestory-retrieval"
+    / "src"
+    / "per_user_embedding"
+    / "qualification_worker.rs"
 )
 HOLDOUT_TASK_ROOT = REPOSITORY_ROOT / "benchmarks" / "tasks" / "holdout-retrieval"
 DEFAULT_QUERY = "RuntimeContext"

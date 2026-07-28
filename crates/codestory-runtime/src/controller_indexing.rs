@@ -90,6 +90,7 @@ impl AppController {
             members,
             retrieval: Some(retrieval_state_from_storage_for_runtime(
                 storage,
+                root,
                 &self.runtime_config,
             )?),
             freshness: Some(freshness),
@@ -157,6 +158,7 @@ impl AppController {
         let mut summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
         summary.retrieval = Some(retrieval_state_from_storage_for_runtime(
             &storage,
+            &root,
             &self.runtime_config,
         )?);
 

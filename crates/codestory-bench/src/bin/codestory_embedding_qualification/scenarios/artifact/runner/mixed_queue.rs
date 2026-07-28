@@ -24,7 +24,11 @@ impl<'a> ScenarioRunner<'a> {
         self.control("hold_class", Some("bulk"))?;
         self.control("hold_class", Some("query"))?;
         let seed = self.spawn_worker("long_protocol_bulk", query_parameters(1), None)?;
-        self.wait_for_snapshot("mixed_queue_seed_active", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment, one client: the freshly spawned seed client must
+        // start, capture its executable and transport, converge on the owner
+        // and have its bulk request admitted before this predicate can turn
+        // true.
+        self.wait_for_established_load("mixed_queue_seed_active", |snapshot| {
             snapshot
                 .scheduler
                 .active_request
@@ -64,6 +68,9 @@ impl<'a> ScenarioRunner<'a> {
             Some(second_gate.clone()),
         )?;
         write_atomic_json(&first_gate, &json!({"schema_version": 1}))?;
+        // Load establishment: gated seeding of a 32+32 enqueue by one freshly
+        // released client, already on the queue-setup budget rather than the
+        // single-admission one.
         self.wait_for_snapshot(
             "mixed_queue_first_project_enqueued",
             QUEUE_SETUP_TIMEOUT,
@@ -73,6 +80,8 @@ impl<'a> ScenarioRunner<'a> {
             },
         )?;
         write_atomic_json(&second_gate, &json!({"schema_version": 1}))?;
+        // Load establishment: the second client's gated seeding fills both
+        // queues to capacity, so it carries the same queue-setup budget.
         let saturated =
             self.wait_for_snapshot("mixed_queue_saturated", QUEUE_SETUP_TIMEOUT, |snapshot| {
                 snapshot.scheduler.query_capacity == QUALIFICATION_QUEUE_CAPACITY
@@ -99,6 +108,9 @@ impl<'a> ScenarioRunner<'a> {
         })?;
         require_pre_release_capacity_overflow(&overflow_operations)?;
         self.control("release_class", Some("bulk"))?;
+        // Observation: both queue-load clients already ramped and their work is
+        // already enqueued, so this only watches the owner's own class
+        // selection after the bulk release; no client ramp in the predicate path.
         let query_selected =
             self.wait_for_snapshot("mixed_queue_query_selected", SNAPSHOT_TIMEOUT, |snapshot| {
                 snapshot.scheduler.bulk_depth > 0

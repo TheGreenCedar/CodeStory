@@ -9,6 +9,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+from .failure_evidence import register_failure_evidence_secret
 from .foundation import (
     LEGACY_TOKENS,
     QUALIFICATION_SCHEMA_VERSION,
@@ -119,6 +120,7 @@ def qualification_environment(
     proof_root.mkdir(parents=True, exist_ok=True)
     proof_root.chmod(0o700)
     nonce = secrets.token_hex(32)
+    register_failure_evidence_secret(nonce)
     qualified = dict(env)
     qualified["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(proof_root)
     qualified["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce

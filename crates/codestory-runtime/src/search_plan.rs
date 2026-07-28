@@ -8,9 +8,8 @@ use super::{
     SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
     SearchRequest, SearchResultsDto, Storage, TrailConfigDto, agent, architecture_query_intents,
     clamp_usize_to_u32, compare_search_hits_with_project_root, leading_symbol_segment,
-    looks_like_repo_text_query, normalize_path_key, normalize_symbol_query,
-    retrieval_file_role_from_path, retrieval_state_from_storage_for_runtime,
-    should_expand_symbol_query, terminal_symbol_segment,
+    looks_like_repo_text_query, normalize_symbol_query, retrieval_file_role_from_path,
+    retrieval_state_from_storage_for_runtime, should_expand_symbol_query, terminal_symbol_segment,
 };
 use crate::search_intent::{
     SearchIntentFilter, SearchIntentQuery, annotate_search_hit_match_quality,
@@ -523,7 +522,14 @@ pub(super) fn same_search_file(left: &SearchHit, right: &SearchHit) -> bool {
     let Some(right_path) = right.file_path.as_deref() else {
         return false;
     };
-    normalize_path_key(left_path) == normalize_path_key(right_path)
+    // Identical spellings need no filesystem observation. Distinct spellings
+    // compare by native filesystem identity so Unix stays case-sensitive and
+    // only real aliases (Windows case folds, links) group as one file.
+    left_path == right_path
+        || codestory_workspace::same_workspace_path(
+            std::path::Path::new(left_path),
+            std::path::Path::new(right_path),
+        )
 }
 
 pub(super) fn hit_matches_identifier(hit: &SearchHit, identifier: &str) -> bool {
@@ -1606,16 +1612,20 @@ impl AppController {
         let initial_sidecar_hits = indexed_symbol_hits.clone();
 
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
-        let project_root = self.require_project_root().ok();
+        let project_root = self.require_project_root()?;
         indexed_symbol_hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+            compare_search_hits_with_project_root(Some(project_root.as_path()), &query, left, right)
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
 
         let storage = self.open_storage_read_only()?;
-        let retrieval = retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config)?;
+        let retrieval = retrieval_state_from_storage_for_runtime(
+            &storage,
+            &project_root,
+            &self.runtime_config,
+        )?;
         let freshness = self.index_freshness().ok();
         let mut repo_text_hits = Vec::new();
         let mut suggestions = Vec::new();
@@ -1683,7 +1693,12 @@ impl AppController {
                 (None, None) => std::cmp::Ordering::Equal,
             };
             anchor_order.then_with(|| {
-                compare_search_hits_with_project_root(project_root.as_deref(), &query, left, right)
+                compare_search_hits_with_project_root(
+                    Some(project_root.as_path()),
+                    &query,
+                    left,
+                    right,
+                )
             })
         });
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
@@ -1700,12 +1715,12 @@ impl AppController {
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
         crate::search_evidence::attach_pinned_search_evidence(
             &storage,
-            project_root.as_deref(),
+            Some(project_root.as_path()),
             &mut indexed_symbol_hits,
         );
         crate::search_evidence::attach_pinned_search_evidence(
             &storage,
-            project_root.as_deref(),
+            Some(project_root.as_path()),
             &mut suggestions,
         );
         let hits = indexed_symbol_hits.clone();

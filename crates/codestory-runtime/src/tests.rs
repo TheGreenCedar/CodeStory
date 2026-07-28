@@ -9,16 +9,16 @@ use super::{
     LEGACY_OVERSIZED_SOURCE_POLICY_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,
     LLM_SYMBOL_DOC_SCHEMA_VERSION, NodeId, OVERSIZED_SOURCE_POLICY_VERSION, PUBLICATION_TEST_FAULT,
     PendingLlmSymbolDoc, PublicationTestAction, PublicationTestBoundary, RefreshExecutionPlan,
-    RepoTextScanStatsDto, RetrievalIndexManifest, RetrievalModeDto, RetrievalStateDto,
-    SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV,
-    SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_STREAM_PENDING_DOCS_ENV,
-    SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV, SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine,
-    SearchGenerationCompletion, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchPlanAnchorGroupDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
-    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
-    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
-    SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
-    WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
+    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalIndexManifest, RetrievalModeDto,
+    RetrievalStateDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS,
+    SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+    SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
+    SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCompletion, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanAnchorGroupDto, SearchPlanChannelDto,
+    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SearchSymbolProjection,
+    SemanticDocAliasMode, SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
+    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc,
+    TrailConfigDto, WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
     arm_full_refresh_staged_store_hook, arm_incremental_staged_store_hook,
     arm_publication_test_fault, arm_semantic_projection_before_revalidate_hook,
     arm_source_policy_after_plan_hook, arm_source_policy_before_revalidate_hook,
@@ -61,9 +61,9 @@ use crate::search_intent::{
     exact_symbol_hit_count, language_filter_matches_path, parse_search_intent_query,
 };
 use crate::search_plan::{
-    SearchPlanActivePathEvidence, search_plan_anchor_groups, search_plan_eligible,
-    search_plan_next_actions, search_plan_path_is_test_or_bench, search_plan_rejected_hits,
-    search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    SearchPlanActivePathEvidence, same_search_file, search_plan_anchor_groups,
+    search_plan_eligible, search_plan_next_actions, search_plan_path_is_test_or_bench,
+    search_plan_rejected_hits, search_plan_runtime_call_is_speculative, search_plan_subqueries,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,
@@ -1999,6 +1999,247 @@ fn core_dense_anchor_publication_succeeds_when_embedding_backend_is_unavailable(
             .get_all_llm_symbol_docs()
             .expect("legacy vectors")
             .is_empty()
+    );
+}
+
+/// A retrieval manifest that classifies as a current, non-degraded full
+/// publication for `project_root` under the current sidecar contract.
+fn published_full_retrieval_manifest(project_root: &Path) -> RetrievalIndexManifest {
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(project_root);
+    let mut manifest =
+        codestory_retrieval::test_support::retrieval_manifest_fixture(&project_id, &"a".repeat(64));
+    manifest.projection_count = Some(2);
+    manifest.symbol_doc_count = Some(8);
+    manifest.dense_projection_count = Some(2);
+    manifest
+}
+
+#[test]
+fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_docs() {
+    // Regression: a fresh auto-bootstrap publishes semantic vectors through the
+    // retrieval manifest while intentionally clearing the legacy
+    // `llm_symbol_doc` table. Deriving `semantic_doc_count` from that legacy
+    // table pinned every honest projection at missing_semantic_docs even
+    // though sidecar-primary retrieval was fully live.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    storage
+        .upsert_retrieval_index_manifest(&published_full_retrieval_manifest(&project_root))
+        .expect("publish retrieval manifest");
+    assert_eq!(
+        storage
+            .get_llm_symbol_doc_stats()
+            .expect("legacy stats")
+            .doc_count,
+        0,
+        "modern publications keep the legacy core-vector table empty"
+    );
+
+    let retrieval = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &test_sidecar_runtime_from_env(),
+    )
+    .expect("retrieval state");
+
+    assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+    assert!(retrieval.semantic_ready);
+    assert_eq!(retrieval.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(retrieval.semantic_doc_count, 2);
+    assert_eq!(retrieval.fallback_reason, None);
+    assert_eq!(retrieval.fallback_message, None);
+    assert_eq!(
+        retrieval
+            .stored_embedding
+            .as_ref()
+            .map(|stored| stored.doc_count),
+        Some(2),
+        "the stored contract reports the published dense projection count"
+    );
+    let stored = retrieval
+        .stored_embedding
+        .as_ref()
+        .expect("stored contract");
+    let current = retrieval
+        .current_embedding
+        .as_ref()
+        .expect("current contract");
+    assert_eq!(
+        stored.cache_key.as_deref(),
+        Some(current.cache_key.as_str()),
+        "the manifest's embedding runtime id must project into the current \
+         contract's cache-key identity space so consumers (doctor) can compare it"
+    );
+    assert_eq!(
+        stored.embedding_backend, None,
+        "the manifest carries no per-doc backend label; projecting the runtime \
+         id into that field made doctor report semantic stale forever"
+    );
+    assert_eq!(stored.embedding_profile, None);
+    assert_eq!(stored.doc_shape, None);
+
+    // The stdio host compaction projects {"state":"ready"} from exactly these
+    // wire fields: mode == "hybrid" with no stated fallback.
+    let wire = serde_json::to_value(&retrieval).expect("serialize retrieval state");
+    assert_eq!(wire["mode"], serde_json::json!("hybrid"));
+    assert_eq!(wire["semantic_ready"], serde_json::json!(true));
+    assert!(wire.get("fallback_reason").is_none());
+}
+
+#[test]
+fn zero_dense_full_publication_reports_ready_without_missing_docs() {
+    // A tiny project can legally publish a current, non-degraded full sidecar
+    // with zero dense anchors (generation only requires the dense projection
+    // count to equal the projection count). Admission serves that sidecar as
+    // full, so readiness must report the lane as published-and-empty rather
+    // than unbuilt: `retrieval index --refresh full` would republish the
+    // identical zero-anchor manifest and could never clear the message.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let mut manifest = published_full_retrieval_manifest(&project_root);
+    manifest.projection_count = Some(0);
+    manifest.symbol_doc_count = Some(0);
+    manifest.dense_projection_count = Some(0);
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .expect("publish zero-dense manifest");
+    let runtime = test_sidecar_runtime_from_env();
+
+    let retrieval = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("retrieval state");
+
+    assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+    assert!(retrieval.semantic_ready);
+    assert_eq!(retrieval.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(retrieval.semantic_doc_count, 0);
+    assert_eq!(retrieval.fallback_reason, None);
+    assert_eq!(retrieval.fallback_message, None);
+    assert_eq!(
+        retrieval
+            .stored_embedding
+            .as_ref()
+            .map(|stored| stored.doc_count),
+        Some(0),
+        "the truthful published state remains visible as a zero dense count"
+    );
+
+    // A zero-dense manifest that is stale or mismatched keeps the unbuilt
+    // classification: there a refresh genuinely rebuilds the publication, so
+    // the repair advice stays truthful and the state stays fail-closed.
+    let mut mismatched = manifest.clone();
+    mismatched.embedding_backend = Some("legacy-backend".to_string());
+    storage
+        .upsert_retrieval_index_manifest(&mismatched)
+        .expect("publish mismatched zero-dense manifest");
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("mismatched zero-dense retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Symbolic);
+    assert!(!state.semantic_ready);
+    assert_eq!(
+        state.fallback_reason,
+        Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
+    );
+}
+
+#[test]
+fn retrieval_state_without_manifest_reports_missing_semantic_docs() {
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let storage = Storage::open(&storage_path).expect("open storage");
+
+    let retrieval = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &test_sidecar_runtime_from_env(),
+    )
+    .expect("retrieval state");
+
+    assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+    assert!(!retrieval.semantic_ready);
+    assert_eq!(retrieval.semantic_doc_count, 0);
+    assert_eq!(
+        retrieval.fallback_reason,
+        Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
+    );
+    assert!(
+        retrieval
+            .fallback_message
+            .as_deref()
+            .is_some_and(|message| message.contains("retrieval index --refresh full")),
+        "the genuinely-unbuilt case is where the CLI repair advice is truthful"
+    );
+    assert!(retrieval.stored_embedding.is_none());
+}
+
+#[test]
+fn degraded_or_mismatched_manifest_does_not_report_hybrid_ready() {
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let runtime = test_sidecar_runtime_from_env();
+
+    let mut degraded = published_full_retrieval_manifest(&project_root);
+    degraded.degraded_modes_json = r#"["embedded_vector_index_unavailable"]"#.to_string();
+    storage
+        .upsert_retrieval_index_manifest(&degraded)
+        .expect("publish degraded manifest");
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("degraded retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Symbolic);
+    assert!(!state.semantic_ready);
+    assert_eq!(
+        state.fallback_reason,
+        Some(RetrievalFallbackReasonDto::DegradedRuntime)
+    );
+
+    let mut mismatched = published_full_retrieval_manifest(&project_root);
+    mismatched.embedding_backend = Some("legacy-backend".to_string());
+    storage
+        .upsert_retrieval_index_manifest(&mismatched)
+        .expect("publish mismatched manifest");
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("mismatched retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Symbolic);
+    assert!(!state.semantic_ready);
+    assert_eq!(
+        state.fallback_reason,
+        Some(RetrievalFallbackReasonDto::DegradedRuntime)
+    );
+    assert!(
+        state
+            .fallback_message
+            .as_deref()
+            .is_some_and(|message| message.contains("embedding contract"))
     );
 }
 

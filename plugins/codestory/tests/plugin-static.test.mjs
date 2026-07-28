@@ -617,6 +617,103 @@ test("managed probe failures stay sanitized through fail-open output", () => {
   }
 });
 
+test("provisioning retry hints derive remaining transfer time within documented bounds", () => {
+  const hint = launcherTest.provisioningRetryHintMs;
+  // States carrying no measurable transfer keep the documented fallback.
+  assert.equal(launcherTest.provisioningRetryHintFallbackMs, 1500);
+  assert.equal(hint({ receivedBytes: 0, totalBytes: null, startedAt: null, updatedAt: null }), 1500);
+  assert.equal(hint({ receivedBytes: 4096, totalBytes: null, startedAt: 0, updatedAt: 1000 }), 1500);
+  assert.equal(hint({ receivedBytes: 0, totalBytes: 1024, startedAt: 0, updatedAt: 1000 }), 1500);
+  assert.equal(hint({ receivedBytes: 10, totalBytes: 100, startedAt: 500, updatedAt: 500 }), 1500);
+  // A quarter received in one second forecasts three more seconds of transfer.
+  assert.equal(hint({ receivedBytes: 25, totalBytes: 100, startedAt: 0, updatedAt: 1000 }), 3000);
+  // A slow large download clamps to the ceiling instead of parking the agent for minutes.
+  assert.equal(
+    hint({ receivedBytes: 1024, totalBytes: 1024 * 1024 * 1024, startedAt: 0, updatedAt: 1000 }),
+    launcherTest.provisioningRetryHintMaxMs,
+  );
+  // An almost-finished transfer clamps to the floor instead of oversleeping readiness.
+  assert.equal(
+    hint({ receivedBytes: 1_048_575, totalBytes: 1_048_576, startedAt: 0, updatedAt: 10 }),
+    launcherTest.provisioningRetryHintMinMs,
+  );
+  // A completed asset needs no rate to forecast: the next provisioning stage is imminent.
+  assert.equal(
+    hint({ receivedBytes: 2048, totalBytes: 2048, startedAt: 100, updatedAt: 100 }),
+    launcherTest.provisioningRetryHintMinMs,
+  );
+});
+
+test("preparing fail-open surfaces share one progress-derived retry hint", () => {
+  const original = { ...launcherTest.managedCliDownloadProgress };
+  try {
+    Object.assign(launcherTest.managedCliDownloadProgress, {
+      stage: "downloading_runtime",
+      asset: "codestory-cli-v0.0.0-test.tar.gz",
+      attempt: 2,
+      receivedBytes: 25,
+      totalBytes: 100,
+      startedAt: 0,
+      updatedAt: 1000,
+    });
+    const operation = launcherTest.managedProvisioningOperation();
+    assert.equal(operation.retry_after_ms, 3000);
+    const preparingStatus = {
+      plugin_runtime: { plugin_version: "test" },
+      managed_retrieval: { state: "preparing" },
+      degraded_reason: "managed_cli_provisioning",
+      warnings: [],
+      readiness: [],
+    };
+    const ground = launcherTest.failOpenToolResult("ground", preparingStatus, { project: repoRoot });
+    assert.equal(ground.structuredContent.retry_after_ms, 3000);
+    assert.equal(ground.structuredContent.operation.retry_after_ms, 3000);
+    const status = launcherTest.failOpenToolResult("status", preparingStatus, { project: repoRoot });
+    assert.equal(status.structuredContent.retry_after_ms, 3000);
+    assert.equal(status.structuredContent.current_operation.retry_after_ms, 3000);
+  } finally {
+    Object.assign(launcherTest.managedCliDownloadProgress, original);
+  }
+});
+
+test("fail-open status reads refresh the preparing retry hint from live download progress", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    `const launcherModule=require(${JSON.stringify(launcher)})._test;`,
+    // The diagnostic snapshot predates the transfer, so its recommended call still carries the
+    // no-signal fallback; only the read below observes the in-flight download.
+    "const status={",
+    'plugin_runtime:{plugin_version:"test"},',
+    'managed_retrieval:{state:"preparing"},',
+    'degraded_reason:"managed_cli_provisioning",',
+    "readiness:[],",
+    "recommended_next_calls:[",
+    '{method:"tools/call",instruction:"Retry the intended CodeStory tool shortly.",after_ms:launcherModule.provisioningRetryHintFallbackMs},',
+    '{method:"resources/read",uri_template:"codestory://status{?project}"}',
+    "]};",
+    'Object.assign(launcherModule.managedCliDownloadProgress,{stage:"downloading_runtime",asset:"archive.tar.gz",attempt:1,receivedBytes:25,totalBytes:100,startedAt:0,updatedAt:1000});',
+    "launcherModule.runFailOpenMcp(()=>status);",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.end(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "resources/read",
+    params: { uri: statusUri },
+  })}\n`);
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  const status = JSON.parse(responses.find((response) => response.id === 1).result.contents[0].text);
+  assert.deepEqual(status.recommended_next_calls, [
+    { method: "tools/call", instruction: "Retry the intended CodeStory tool shortly.", after_ms: 3000 },
+    { method: "resources/read", uri: statusUri },
+  ]);
+});
+
 async function writeAttestedDevPluginFixture(root, version) {
   const { cp } = await import("node:fs/promises");
   const installRoot = join(
@@ -731,17 +828,72 @@ test("plugin package version tracks the codestory-cli release version", async ()
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
     "utf8",
   );
-  const expectedVersion = readCargoVersion(cliManifest);
+  const workspaceVersion = readCargoVersion(cliManifest);
   const manifestPaths = [
     join(pluginRoot, ".codex-plugin", "plugin.json"),
     join(pluginRoot, ".claude-plugin", "plugin.json"),
     join(pluginRoot, ".github", "plugin", "plugin.json"),
   ];
 
+  // The three host manifests always agree with each other; that is the plugin's identity.
+  const versions = [];
   for (const manifestPath of manifestPaths) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(manifest.version, expectedVersion);
+    versions.push(manifest.version);
   }
+  assert.equal(new Set(versions).size, 1, `host manifests disagree: ${versions}`);
+
+  // The pin names the CLI the plugin runs. The workspace builds that CLI, so the pin and the
+  // workspace version move together; the plugin version may only run ahead of them once the
+  // plugin-only release lane exists, and never behind.
+  const pin = JSON.parse(await readFile(join(pluginRoot, "cli-version.json"), "utf8"));
+  assert.equal(pin.schema_version, 1);
+  assert.equal(pin.cli_version, workspaceVersion, "pin must name the workspace CLI version");
+  assert.equal(pin.release_tag, `v${pin.cli_version}`);
+  const [pluginVersion] = versions;
+  assert.ok(
+    pluginVersion === pin.cli_version || semverGreater(pluginVersion, pin.cli_version),
+    `plugin ${pluginVersion} must not trail its pinned CLI ${pin.cli_version}`,
+  );
+  if (pin.archives !== undefined) {
+    const targets = Object.keys(pin.archives).sort();
+    assert.deepEqual(targets, ["linux-x64", "macos-arm64", "windows-x64"]);
+    for (const digest of Object.values(pin.archives)) {
+      assert.match(digest, /^[0-9a-f]{64}$/u);
+    }
+  }
+});
+
+function semverGreater(left, right) {
+  const parse = (value) => value.split("-")[0].split(".").map(Number);
+  const [lmaj, lmin, lpat] = parse(left);
+  const [rmaj, rmin, rpat] = parse(right);
+  if (lmaj !== rmaj) return lmaj > rmaj;
+  if (lmin !== rmin) return lmin > rmin;
+  return lpat > rpat;
+}
+
+test("the CLI version pin decides what the managed path provisions", async () => {
+  // Read the version out of the pin rather than restating it: a release bump
+  // rewrites the pin, and a test that hardcodes the old number fails the bump
+  // instead of the behaviour it is guarding.
+  const pin = launcherTest.pinnedCliContract();
+  assert.match(pin.cli_version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+  assert.equal(launcherTest.pinnedCliVersion(), pin.cli_version);
+  assert.equal(pin.release_tag, `v${pin.cli_version}`);
+
+  // A native bump drops the digests: they cannot exist until that release
+  // publishes its archives, and the plugin lane re-adds them when it pins an
+  // already-published CLI.
+  if (pin.archives) {
+    assert.equal(
+      launcherTest.pinnedArchiveSha256("macos-arm64"),
+      pin.archives["macos-arm64"],
+    );
+  } else {
+    assert.equal(launcherTest.pinnedArchiveSha256("macos-arm64"), null);
+  }
+  assert.equal(launcherTest.pinnedArchiveSha256("no-such-target"), null);
 });
 
 test("source setup adapters prepare and pass the canonical embedded model", async () => {
@@ -3701,14 +3853,20 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
     const { progress, ...operationCore } = coldGround.result.structuredContent.operation;
+    // The gated release server withholds every asset byte here, so no transfer is measurable and
+    // the retry hint must be the documented no-signal fallback.
     assert.deepEqual(operationCore, {
       operation_id: "managed-runtime-provisioning",
       state: "preparing",
       stage: "downloading_runtime",
       attempt: 1,
-      retry_after_ms: 1500,
+      retry_after_ms: launcherTest.provisioningRetryHintFallbackMs,
       failure: null,
     });
+    assert.equal(
+      coldGround.result.structuredContent.retry_after_ms,
+      coldGround.result.structuredContent.operation.retry_after_ms,
+    );
     // Progress appears once a release asset fetch is in flight; the request can land just before
     // the background provisioner gets that far, so null is the only other legal value.
     if (progress !== null) {
@@ -4494,6 +4652,104 @@ test("release asset downloader keeps a resumable partial across separate runs", 
     assert.equal(fs.existsSync(partialPath), false);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Provisioning downloads into a partial under the managed CLI root but published into a temp-dir
+// destination, so on any host whose temp dir is a separate mount (tmpfs /tmp, a redirected TMPDIR,
+// $HOME on another volume) every completed transfer died at the rename. The other download tests
+// put both paths under one mkdtemp root and cannot observe it. CI cannot either: the packaged
+// proof pins TMPDIR next to the plugin data.
+test("release asset publication survives a partial and destination on different filesystems", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-exdev-"));
+  const destination = join(dataDir, "dest", "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  await mkdir(join(dataDir, "dest"), { recursive: true });
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  let served = 0;
+  const server = createServer((request, response) => {
+    served += 1;
+    const start = Number(/^bytes=(\d+)-$/u.exec(request.headers.range || "")?.[1] ?? 0);
+    if (start >= body.length) {
+      response.writeHead(416, { "content-range": `bytes */${body.length}` });
+      response.end();
+      return;
+    }
+    response.writeHead(start > 0 ? 206 : 200, {
+      "content-length": String(body.length - start),
+      ...(start > 0
+        ? { "content-range": `bytes ${start}-${body.length - 1}/${body.length}` }
+        : {}),
+    });
+    response.end(body.subarray(start));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/runtime`;
+  const realRename = fs.renameSync;
+  try {
+    // Stand in for a cross-device publication: the transfer completes, the rename cannot.
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath) {
+        const error = new Error("EXDEV: cross-device link not permitted");
+        error.code = "EXDEV";
+        throw error;
+      }
+      return realRename(from, to);
+    };
+    await launcherTest.downloadFile(url, destination, {
+      attempts: 3,
+      timeoutMs: 5000,
+      retryDelayMs: () => 1,
+      partialPath,
+    });
+    assert.deepEqual(await readFile(destination), body);
+    assert.equal(fs.existsSync(partialPath), false);
+    // The payload transfers once. Before the fix each publication failure was classified as a
+    // retryable network error and re-downloaded the whole asset.
+    assert.equal(served, 1);
+  } finally {
+    fs.renameSync = realRename;
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a publication failure is permanent instead of restarting the transfer", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "nope", "runtime.bin");
+  await writeFile(partialPath, "payload");
+  try {
+    assert.throws(
+      () => launcherTest.publishDownloadedFile(partialPath, destination),
+      /download_publish_failed:ENOENT/u,
+    );
+    assert.equal(
+      launcherTest.downloadFailurePermanent({ downloadKind: "publish" }),
+      true,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("download cache trimming refuses to delete through a symlinked cache root", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-symlink-"));
+  const root = join(dataDir, "codestory-cli");
+  const outside = join(dataDir, "outside");
+  await mkdir(root, { recursive: true });
+  await mkdir(outside, { recursive: true });
+  await writeFile(join(outside, "keep.txt"), "precious");
+  await symlink(outside, join(root, ".download"), "dir");
+  try {
+    // Both cleanup paths resolve the cache root through the same guard, so neither follows the link.
+    launcherTest.trimManagedCliDownloadCache(root, "0.16.1");
+    launcherTest.removeManagedCliDownloadCache(root, "0.16.1");
+    assert.equal(fs.existsSync(join(outside, "keep.txt")), true);
+  } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });

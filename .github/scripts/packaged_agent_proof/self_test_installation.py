@@ -77,6 +77,53 @@ def _readiness_convergence_test(query: str, ready_retrieval: dict) -> None:
     )
 
 
+def _degraded_convergence_test(query: str, ready_retrieval: dict) -> None:
+    # The truthful projection answers lexically while the semantic sidecar is
+    # still publishing; that window must read as convergence, not failure.
+    degraded = {
+        "result": {
+            "structuredContent": {
+                "query": query,
+                "hits": [],
+                "retrieval": {
+                    "state": "degraded",
+                    "mode": "lexical",
+                    "fallback_reason": "semantic_unpublished",
+                },
+            }
+        }
+    }
+    ready = {
+        "result": {
+            "structuredContent": {
+                "query": query,
+                "hits": [],
+                "retrieval": ready_retrieval,
+            }
+        }
+    }
+    scripted = ScriptedMcpProcess([degraded, ready])
+    _, attempts = scripted.search_until_ready({"query": query}, "self-test-degraded")
+    require(attempts == 2, "degraded search did not converge on its second poll")
+    require(
+        scripted.tool_attempt_counts.get("self-test-degraded") == 2,
+        "degraded search attempt count was not retained",
+    )
+
+    # A host that never converges must fail loud at the deadline, never hang
+    # and never pass on a degraded answer.
+    stuck = ScriptedMcpProcess([degraded] * 8)
+    try:
+        stuck.search_until_ready({"query": query}, "self-test-degraded-stuck")
+    except ProofFailure as exc:
+        require(
+            "never became ready" in str(exc),
+            f"stuck degraded projection omitted its diagnostics: {exc}",
+        )
+    else:
+        raise ProofFailure("a projection stuck degraded was accepted as ready")
+
+
 def _terminal_unavailable_test(query: str) -> None:
     unavailable = ScriptedMcpProcess(
         [
@@ -149,5 +196,6 @@ def run_installation_self_tests() -> None:
     query = "scripted-search"
     ready_retrieval = _ready_retrieval_fixture()
     _readiness_convergence_test(query, ready_retrieval)
+    _degraded_convergence_test(query, ready_retrieval)
     _terminal_unavailable_test(query)
     _hostile_result_tests(query, ready_retrieval)

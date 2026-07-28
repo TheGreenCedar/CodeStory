@@ -80,6 +80,16 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
     let mut connections = Vec::new();
     let serve_result = (|| -> Result<()> {
         loop {
+            // Deliberately fail-stop. The transient class -- a command file the
+            // proof harness took back mid-consume, including a Windows
+            // delete-pending entry -- is classified inside the consume itself
+            // and returns "no command this tick" rather than an error. What
+            // reaches here is the fatal remainder: untrusted control metadata,
+            // a substituted command file, a replaced pinned directory, or a
+            // failed durable event append. Continuing past any of those would
+            // keep serving with a compromised or unrecordable qualification
+            // control plane, which produces an unfalsifiable proof instead of a
+            // failure -- strictly worse than stopping.
             poll_server_qualification_command(&state, config.transport.as_ref())?;
             if state
                 .qualification

@@ -19,6 +19,7 @@ import {
   releaseWorkflowContractViolations,
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
+  validateCargoTestFilters,
   validateWorkflows,
   windowsManifestProofPolicyViolations,
 } from "./check-workflow-policy.mjs";
@@ -247,11 +248,76 @@ test("release workflows retain the closeout coordinator contract test", () => {
   }
 });
 
+test("workflow hygiene requires declared permissions and step-job timeouts", () => {
+  const valid = parseWorkflow(`
+on: { workflow_dispatch: null }
+permissions: { contents: read }
+jobs:
+  work:
+    timeout-minutes: 5
+    steps:
+      - run: echo ok
+  call:
+    uses: ./.github/workflows/other.yml
+`);
+  assert.deepEqual(basicWorkflowViolations("fixture.yml", valid), []);
+
+  const withoutPermissions = structuredClone(valid);
+  delete withoutPermissions.permissions;
+  assert.match(
+    basicWorkflowViolations("fixture.yml", withoutPermissions).join("\n"),
+    /must declare a top-level permissions block/u,
+  );
+
+  const withoutTimeout = structuredClone(valid);
+  delete withoutTimeout.jobs.work["timeout-minutes"];
+  assert.match(
+    basicWorkflowViolations("fixture.yml", withoutTimeout).join("\n"),
+    /jobs\.work must declare timeout-minutes/u,
+  );
+});
+
+test("cargo test filters must select at least one real test", () => {
+  const identifiers = new Map([["demo-crate", "/unused"]]);
+  const known = new Set(["tests", "demo_tests", "full_publication_survives_restart"]);
+  const originalReaddir = known;
+  const workflows = new Map([
+    [
+      "fixture.yml",
+      parseWorkflow(`
+on: { workflow_dispatch: null }
+permissions: { contents: read }
+jobs:
+  proof:
+    timeout-minutes: 5
+    steps:
+      - run: |
+          cargo test --locked -p demo-crate --lib publication_survives
+          cargo test --locked -p demo-crate --lib -- --exact tests::demo_tests::full_publication_survives_restart
+          cargo test --locked -p demo-crate --target \${{ matrix.rust_target }} --lib tests
+          cargo test --locked -p demo-crate --lib publication_survives -- --test-threads 1
+`),
+    ],
+  ]);
+  // Substring semantics: `publication_survives` legitimately selects the `full_…_restart` test.
+  const violations = [];
+  validateCargoTestFilters(workflows, violations, identifiers, () => originalReaddir);
+  assert.deepEqual(violations, []);
+
+  const renamed = new Set(["tests", "demo_tests", "renamed_publication_check"]);
+  const afterRename = [];
+  validateCargoTestFilters(workflows, afterRename, identifiers, () => renamed);
+  assert.match(afterRename.join("\n"), /selects no test: publication_survives/u);
+  assert.match(afterRename.join("\n"), /selects no test: full_publication_survives_restart/u);
+});
+
 test("third-party action policy reads only parsed uses values", () => {
   const valid = parseWorkflow(`
 on: { workflow_dispatch: null }
+permissions: { contents: read }
 jobs:
   check:
+    timeout-minutes: 5
     steps:
       - uses: vendor/action@${fullSha}
 # uses: vendor/action@main
@@ -460,6 +526,8 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
   const packagedCoordinatorFile = "packaged-platform-pr.yml";
   const packagedProofFile = "packaged-platform-proof.yml";
   const linuxVulkanFile = "linux-vulkan-proof.yml";
+  const windowsVulkanFile = "windows-vulkan-proof.yml";
+  const metalProofFile = "macos-metal-proof.yml";
   const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
   const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
 
@@ -613,6 +681,18 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs.build, "Upload hosted Linux calibration runs").if
         = "success() && matrix.asset_target == 'linux-x64'";
     }, /hosted calibration artifact must remain calibration-only/u],
+    ["package calibration failure evidence removed", packagedProofFile, workflow => {
+      workflow.jobs.build.steps = workflow.jobs.build.steps
+        .filter(({ name }) => name !== "Upload hosted Linux calibration failure evidence");
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence becomes success-gated", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence").if
+        = "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
+    ["package calibration failure evidence fails closed", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence")
+        .with["if-no-files-found"] = "error";
+    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
     ["package evaluation becomes a standard server-behavior proof", packagedProofFile, workflow => {
       draftStep(
         workflow.jobs.build,
@@ -626,6 +706,29 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
         type: "boolean",
       };
     }, /package-only workflow must not define candidate_installed_proof/u],
+    ["package evaluation reads the calibration contract from an unpinned location", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      step.run = step.run.replaceAll(
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "per-user-embedding-server-constant-set.json",
+      );
+    }, /must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
+    ["Metal calibration reads the calibration contract from an unpinned location", metalProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs["packaged-metal"],
+        "Collect three independent Metal calibration runs",
+      );
+      step.run = step.run.replaceAll(
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "per-user-embedding-server-constant-set.json",
+      );
+    }, /Collect three independent Metal calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
+    ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
+      delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
+    }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
@@ -850,6 +953,12 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"].with.hermetic_linux = true;
     }, /hosted Linux calibration must call packaged proof in calibration mode/u],
+    ["coordinator adds a macOS source hard gate", coordinatorFile, workflow => {
+      workflow.jobs["macos-source"] = {
+        "runs-on": "macos-14",
+        steps: [],
+      };
+    }, /packaged-platform-pr\.yml standard coordinator must not add a macOS source hard gate/u],
     ["package matrix repeats frozen Linux qualification", packagedFile, workflow => {
       packagedJob(workflow).steps.push(structuredClone(draftStep(
         workflow.jobs["frozen-linux-qualification"],
@@ -950,8 +1059,10 @@ test("standard release paths reject calibration plumbing", async (t) => {
 test("Cargo lock policy reads executable step commands", () => {
   const workflow = parseWorkflow(`
 on: { workflow_dispatch: null }
+permissions: { contents: read }
 jobs:
   check:
+    timeout-minutes: 5
     steps:
       - run: |
           # cargo test --workspace

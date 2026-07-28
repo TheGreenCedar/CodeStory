@@ -21,6 +21,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
+#[derive(Debug, Default)]
+pub(super) struct WorkerSpawnExtras {
+    pub(super) start_gate: Option<PathBuf>,
+    pub(super) workload_id: Option<String>,
+    pub(super) repeat: Option<u32>,
+    pub(super) retry_marker: Option<PathBuf>,
+}
+
 impl<'a> ScenarioRunner<'a> {
     pub(super) fn spawn_worker(
         &mut self,
@@ -42,6 +50,49 @@ impl<'a> ScenarioRunner<'a> {
         operation: &str,
         parameters: EmbeddingQualificationParameters,
         start_gate: Option<PathBuf>,
+    ) -> Result<RunningWorker> {
+        self.spawn_worker_with(
+            project_index,
+            operation,
+            parameters,
+            WorkerSpawnExtras {
+                start_gate,
+                ..WorkerSpawnExtras::default()
+            },
+        )
+    }
+
+    /// Spawn one measurement worker carrying the protocol workload id and
+    /// repeat ordinal that seed the deterministic input generator, plus the
+    /// busy-retry marker path when the driver must observe the typed-retry
+    /// signal before releasing held classes.
+    pub(super) fn spawn_measure_worker(
+        &mut self,
+        operation: &str,
+        parameters: EmbeddingQualificationParameters,
+        workload_id: &str,
+        repeat: u32,
+        retry_marker: Option<PathBuf>,
+    ) -> Result<RunningWorker> {
+        self.spawn_worker_with(
+            self.context.primary_index,
+            operation,
+            parameters,
+            WorkerSpawnExtras {
+                start_gate: None,
+                workload_id: Some(workload_id.into()),
+                repeat: Some(repeat),
+                retry_marker,
+            },
+        )
+    }
+
+    fn spawn_worker_with(
+        &mut self,
+        project_index: usize,
+        operation: &str,
+        parameters: EmbeddingQualificationParameters,
+        extras: WorkerSpawnExtras,
     ) -> Result<RunningWorker> {
         let runtime = self
             .context
@@ -71,17 +122,23 @@ impl<'a> ScenarioRunner<'a> {
             project: project.clone(),
             operation: operation.into(),
             parameters,
-            start_gate: start_gate.clone(),
-            start_gate_timeout_ms: start_gate.as_ref().map(|_| {
+            start_gate: extras.start_gate.clone(),
+            start_gate_timeout_ms: extras.start_gate.as_ref().map(|_| {
                 if self.context.scenario == "worker_stall" {
                     stall_worker_timeout().as_millis() as u64
                 } else {
                     QUEUE_SETUP_TIMEOUT.as_millis() as u64
                 }
             }),
+            workload_id: extras.workload_id,
+            repeat: extras.repeat,
+            retry_marker: extras.retry_marker.clone(),
         };
-        if let Some(gate) = start_gate.as_ref() {
+        if let Some(gate) = extras.start_gate.as_ref() {
             self.active_gates.insert(gate.clone());
+        }
+        if let Some(marker) = extras.retry_marker.as_ref() {
+            self.active_gates.insert(marker.clone());
         }
         write_atomic_json(&request_path, &request)?;
         let started_ns = self.clock.now_ns();

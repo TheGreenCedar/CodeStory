@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -163,7 +164,55 @@ def decide_release(
     return ReleaseDecision(True, f"codestory-cli version changed to {new_version}.")
 
 
-def write_outputs(output_path: str, *, version: str, tag: str, decision: ReleaseDecision) -> None:
+def read_plugin_version(path: Path) -> str:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"{path} must declare a string version")
+    return version
+
+
+def read_previous_plugin_version(before_sha: str, manifest_path: str) -> str:
+    if not before_sha or set(before_sha) == {"0"}:
+        return ""
+    try:
+        shown = subprocess.run(
+            ["git", "show", f"{before_sha}:{manifest_path}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return ""
+    version = json.loads(shown).get("version")
+    return version if isinstance(version, str) else ""
+
+
+def classify_release_lane(*, cli_version: str, plugin_version: str) -> str:
+    """Which release lane a head describes.
+
+    Equal versions release through the native chain. A plugin version ahead of the CLI is
+    the plugin fast lane: the plugin ships alone and runs the already-published CLI named by
+    its pin. A plugin behind the CLI is always a synchronization error.
+    """
+    if plugin_version == cli_version:
+        return "native"
+    if compare_semver(plugin_version, cli_version) > 0:
+        return "plugin"
+    raise ValueError(
+        f"plugin version {plugin_version} is behind codestory-cli {cli_version}; "
+        "synchronize them with scripts/bump-version.mjs."
+    )
+
+
+def write_outputs(
+    output_path: str,
+    *,
+    version: str,
+    tag: str,
+    decision: ReleaseDecision,
+    release_lane: str = "native",
+) -> None:
     if not output_path:
         return
 
@@ -171,6 +220,7 @@ def write_outputs(output_path: str, *, version: str, tag: str, decision: Release
         output.write(f"version={version}\n")
         output.write(f"tag={tag}\n")
         output.write(f"should_release={str(decision.should_release).lower()}\n")
+        output.write(f"release_lane={release_lane}\n")
 
 
 def main() -> None:
@@ -181,6 +231,11 @@ def main() -> None:
         default="crates/codestory-cli/Cargo.toml",
         help="Path to the codestory-cli Cargo manifest.",
     )
+    parser.add_argument(
+        "--plugin-manifest-path",
+        default="plugins/codestory/.codex-plugin/plugin.json",
+        help="Path to the plugin manifest that names the published plugin version.",
+    )
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT", ""))
     args = parser.parse_args()
@@ -188,6 +243,17 @@ def main() -> None:
     try:
         new_version = read_current_version(Path(args.package_path))
         old_version = read_previous_version(args.before_sha, args.package_path)
+        plugin_version = read_plugin_version(Path(args.plugin_manifest_path))
+        release_lane = classify_release_lane(
+            cli_version=new_version, plugin_version=plugin_version
+        )
+        # The released artifact on the plugin lane is the plugin, so its version and its
+        # previous value drive the decision; the CLI version did not move.
+        if release_lane == "plugin":
+            old_version = read_previous_plugin_version(
+                args.before_sha, args.plugin_manifest_path
+            )
+            new_version = plugin_version
         tag = f"v{new_version}"
         tag_exists = remote_tag_exists(tag)
         release_exists = github_release_exists(tag, args.repo) if args.repo else False
@@ -205,8 +271,11 @@ def main() -> None:
     print(f"Current codestory-cli version: {new_version}")
     print(f"Release tag exists: {str(tag_exists).lower()}")
     print(f"GitHub release exists: {str(release_exists).lower()}")
+    print(f"Release lane: {release_lane}")
     print(f"Auto release decision: {decision.reason}")
-    write_outputs(args.output, version=new_version, tag=tag, decision=decision)
+    write_outputs(
+        args.output, version=new_version, tag=tag, decision=decision, release_lane=release_lane
+    )
 
 
 if __name__ == "__main__":

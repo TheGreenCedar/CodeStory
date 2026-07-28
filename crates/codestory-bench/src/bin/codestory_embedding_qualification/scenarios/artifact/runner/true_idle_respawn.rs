@@ -4,7 +4,9 @@ use super::super::{
 };
 use super::ScenarioRunner;
 use super::analysis::{elapsed, same_server_authority, scheduler_values, validated_idle_epoch};
-use super::process::{query_parameters, require_protocol_success, require_worker_success};
+use super::process::{
+    measurement_worker_timeout, query_parameters, require_protocol_success, require_worker_success,
+};
 use anyhow::{Result, bail};
 use codestory_retrieval::{
     EmbeddingQualificationParameters, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
@@ -29,11 +31,17 @@ impl<'a> ScenarioRunner<'a> {
             },
             None,
         )?;
-        self.wait_for_snapshot("true_idle_lease_active", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment, one client: the freshly spawned lease client must
+        // start, capture its executable and transport and converge on the owner
+        // before its residency lease is visible.
+        self.wait_for_established_load("true_idle_lease_active", |snapshot| {
             snapshot.scheduler.lease_count > 0
         })?;
         let active_bulk = self.spawn_worker("long_protocol_bulk", query_parameters(1), None)?;
-        self.wait_for_snapshot("true_idle_active_bulk", SNAPSHOT_TIMEOUT, |snapshot| {
+        // Load establishment, one client: a second freshly spawned client must
+        // run the same start-capture-converge chain before its bulk request is
+        // admitted.
+        self.wait_for_established_load("true_idle_active_bulk", |snapshot| {
             snapshot
                 .scheduler
                 .active_request
@@ -47,13 +55,17 @@ impl<'a> ScenarioRunner<'a> {
             None,
         )?;
         let queued_bulk = self.spawn_worker("long_protocol_bulk", query_parameters(1), None)?;
-        let anti_idle =
-            self.wait_for_snapshot("true_idle_work_held", SNAPSHOT_TIMEOUT, |snapshot| {
-                snapshot.scheduler.lease_count > 0
-                    && snapshot.scheduler.active_request_count > 0
-                    && snapshot.scheduler.query_depth > 0
-                    && snapshot.scheduler.bulk_depth > 0
-            })?;
+        // Load establishment, two clients: both clients spawned just above, one
+        // per project, must each start, capture, converge and enqueue before
+        // the lease, active request and both queue depths are visible in one
+        // snapshot, so this wait carries both start-and-capture allowances
+        // rather than the single-client budget its siblings take.
+        let anti_idle = self.wait_for_established_load("true_idle_work_held", |snapshot| {
+            snapshot.scheduler.lease_count > 0
+                && snapshot.scheduler.active_request_count > 0
+                && snapshot.scheduler.query_depth > 0
+                && snapshot.scheduler.bulk_depth > 0
+        })?;
         self.transition("anti_idle_work_observed", scheduler_values(&anti_idle));
         let wait = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
             .saturating_add(IDLE_EXIT_GRACE);
@@ -96,6 +108,9 @@ impl<'a> ScenarioRunner<'a> {
         require_protocol_success(&query_output, "true_idle_queued_query")?;
         require_protocol_success(&bulk_output, "true_idle_queued_bulk")?;
         self.terminate_worker(lease)?;
+        // Observation: every held worker already finished above and the lease
+        // client is terminated, so this only watches the owner's own quiescence
+        // over the control channel and spawns no worker.
         let (reclaimed, idle_epoch_ns, _) =
             self.wait_for_true_idle_epoch("true_idle_work_reclaimed", SNAPSHOT_TIMEOUT)?;
         self.transition("anti_idle_work_reclaimed", scheduler_values(&reclaimed));
@@ -128,6 +143,9 @@ impl<'a> ScenarioRunner<'a> {
                 .try_into()
                 .unwrap_or(u64::MAX);
             let observer = self.spawn_worker("observe", query_parameters(1), None)?;
+            // Observation: one capture-connect-snapshot chain against a
+            // resident owner, with no request work and no transport fan-out,
+            // so the flat snapshot budget dominates it.
             let observer_output = self.finish_worker(observer, SNAPSHOT_TIMEOUT)?;
             require_worker_success(&observer_output, "true_idle_observe")?;
             let observer_snapshot =
@@ -235,7 +253,18 @@ impl<'a> ScenarioRunner<'a> {
             anyhow::anyhow!("embedding_qualification_true_idle_respawn_engine_missing")
         })?;
         let identity_worker = self.spawn_worker("resident_identity", query_parameters(1), None)?;
-        let identity_output = self.finish_worker(identity_worker, SNAPSHOT_TIMEOUT)?;
+        // Load establishment by a worker rather than a snapshot wait: this
+        // probe's whole body is one `EnsureResident` exchange against the
+        // just-respawned owner, and the client configures both that exchange's
+        // timeout and its wire deadline from the contract bulk deadline. So the
+        // kill budget is the per-operation worker budget for that operation
+        // name, which `measurement_worker_timeout` must classify into its bulk
+        // arm; the flat snapshot bound it replaced undercut the worker's own
+        // deadline by an order of magnitude.
+        let identity_output = self.finish_worker(
+            identity_worker,
+            measurement_worker_timeout("resident_identity"),
+        )?;
         let respawn_identity = identity_output.engine_identity.as_ref().ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_true_idle_respawn_identity_missing")
         })?;

@@ -4,8 +4,8 @@ use super::super::{
 };
 use super::analysis::{control_key, elapsed, same_server_authority, validated_idle_epoch};
 use super::process::{
-    existing_control_events, qualification_command_path, qualification_nonce, query_parameters,
-    require_worker_success,
+    existing_control_events, load_establishment_timeout, qualification_command_path,
+    qualification_nonce, query_parameters, require_worker_success,
 };
 use super::{ControlCommand, ControlCommandParameters, ScenarioRunner, WorkerOutput};
 use crate::qualification::output::write_atomic_json;
@@ -80,6 +80,20 @@ impl<'a> ScenarioRunner<'a> {
             }
             self.clock.sleep(POLL);
         }
+    }
+
+    /// Snapshot wait whose predicate gates on worker-driven load
+    /// establishment. The budget comes from the named entry in
+    /// `LOAD_ESTABLISHMENT_WAITS`, so the number of establishing clients a
+    /// site depends on is declared once and derived once instead of being
+    /// re-guessed per call site.
+    pub(super) fn wait_for_established_load(
+        &mut self,
+        phase: &str,
+        predicate: impl Fn(&EmbeddingServerSnapshot) -> bool,
+    ) -> Result<EmbeddingServerSnapshot> {
+        let timeout = load_establishment_timeout(phase)?;
+        self.wait_for_snapshot(phase, timeout, predicate)
     }
 
     pub(super) fn wait_for_control_snapshot(
@@ -213,6 +227,15 @@ impl<'a> ScenarioRunner<'a> {
         if self.observe(&format!("{phase}_before"))?.is_some() {
             self.control("crash_server", None)?;
         }
+        // Not a poll budget and not load establishment: `wait_for_absence`
+        // spawns a fresh worker and this value is that worker's kill budget,
+        // covering its start, captures, connect and absence loop. The worker's
+        // own self-enforced bound for the operation is the contract idle
+        // timeout plus its 30s absence grace (90s), and that longer bound is
+        // deliberately not honored here: `crash_server` is only accepted
+        // asynchronously, so the shorter flat budget is the driver asserting
+        // that an already-triggered exit lands promptly rather than waiting out
+        // an idle exit that is not being tested.
         self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)
     }
 
@@ -224,6 +247,13 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     fn observe_worker(&mut self) -> Result<Option<EmbeddingServerSnapshot>> {
+        // One observe worker per poll: executable capture, connect, one
+        // snapshot, no request work and no per-request transport fan-out, so
+        // the flat snapshot budget dominates its honest chain. Waits that
+        // cover clients establishing load must carry a derived budget instead:
+        // `load_establishment_timeout` for admissions and leases (one
+        // start-and-capture allowance per establishing client), the queue-setup
+        // budget for a seeded queue (`dead_client_setup_timeout`).
         let worker = self.spawn_worker("observe", query_parameters(1), None)?;
         let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
         require_worker_success(&output, "observe")?;

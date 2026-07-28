@@ -113,20 +113,28 @@ def _true_idle_witnesses(
         absent_transition.get("observed_ns"),
         "true idle absence transition time",
     )
+    respawn_observed_ns = require_nonnegative_int(
+        respawn_observations[0].get("observed_ns"),
+        "true idle replacement witness time",
+    )
     respawn_transition_ns = require_nonnegative_int(
         respawn_transition.get("observed_ns"),
         "true idle respawn transition time",
     )
+    # The consentless-respawn proof needs exactly one product operation
+    # between the absent-owner witness and the replacement-engine witness.
+    # The proof window therefore closes at the replacement-engine witness,
+    # not at the later server_respawned transition: the driver's
+    # resident-identity re-check starts strictly after the replacement engine
+    # is witnessed, so it cannot be the operation that caused or consented
+    # the respawn and is legitimately outside the window.
     return TrueIdleWitnesses(
         absent_observed_ns=require_nonnegative_int(
             absent_observations[0].get("observed_ns"),
             "true idle absent-owner witness time",
         ),
         absent_transition_ns=absent_transition_ns,
-        respawn_observed_ns=require_nonnegative_int(
-            respawn_observations[0].get("observed_ns"),
-            "true idle replacement witness time",
-        ),
+        respawn_observed_ns=respawn_observed_ns,
         respawn_transition_ns=respawn_transition_ns,
         respawn_snapshot=respawn_observations[0]["snapshot"],
         post_absence_invocations=tuple(
@@ -136,7 +144,7 @@ def _true_idle_witnesses(
             and not isinstance(invocation.get("started_ns"), bool)
             and absent_transition_ns
             <= invocation["started_ns"]
-            <= respawn_transition_ns
+            <= respawn_observed_ns
         ),
     )
 

@@ -8,7 +8,13 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds the measurement-span contract: measurement workers stamp the
+/// measurement protocol's declared start/end instants themselves and return
+/// them as an exclusive `measurement` payload. Both the packaged worker and
+/// the external driver reject any other version, so a cross-version
+/// producer/consumer mix fails closed instead of silently recording the
+/// whole-worker window as a metric sample.
+pub const EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +29,19 @@ pub struct EmbeddingQualificationWorkerRequest {
     pub start_gate: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_gate_timeout_ms: Option<u64>,
+    /// Measurement workloads only: the protocol workload id that seeds the
+    /// deterministic `sha256_counter_utf8_v1` input generator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_id: Option<String>,
+    /// Measurement workloads only: the 1-based repeat ordinal that seeds the
+    /// deterministic input generator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<u32>,
+    /// `measure_busy_retry` only: the private-directory file the worker
+    /// creates once the typed capacity retry was validated, signalling the
+    /// driver to release the held classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_marker: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +70,53 @@ pub struct EmbeddingQualificationWorkerOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_identity: Option<EmbeddingEngineIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<EmbeddingQualificationWorkerMeasurement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<EmbeddingQualificationWorkerError>,
+}
+
+/// One measurement span stamped at the measurement protocol's declared start
+/// and end instants, on the worker's own awake-monotonic clock (the same
+/// clock as `EmbeddingQualificationWorkerOutput::clock`). The
+/// suspend-inclusive readings and boot ids are sampled at the same instants
+/// as the awake readings because the checker requires the suspend witness to
+/// cover exactly the recorded phase timestamps; the whole-worker readings in
+/// the output cannot serve a sub-window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingQualificationWorkerMeasurementSpan {
+    pub awake_started_ns: u64,
+    pub awake_finished_ns: u64,
+    pub inclusive_started_ns: u64,
+    pub inclusive_finished_ns: u64,
+    pub boot_id_started: String,
+    pub boot_id_finished: String,
+}
+
+/// Result of one measurement operation: the declared-instant span plus the
+/// evidence the driver needs to record the sample (server identity witness,
+/// per-metric operands, and busy-retry pressure evidence).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingQualificationWorkerMeasurement {
+    pub span: EmbeddingQualificationWorkerMeasurementSpan,
+    /// Server identity witness observed by the worker for this sample.
+    pub snapshot: EmbeddingServerSnapshot,
+    /// Engine identity validated inside the measured exchange (frame and
+    /// residency measurements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_identity: Option<EmbeddingEngineIdentity>,
+    /// Request id of the measured protocol exchange (frame measurements), for
+    /// driver-side token accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Documents validated inside the measured window (bulk frame
+    /// measurements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_documents: Option<u64>,
+    /// The typed capacity pressure that opened the busy-retry window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<EmbeddingCapacityPressureWire>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,8 +173,9 @@ pub struct EmbeddingQualificationWorkerQueueOperation {
 mod tests {
     use super::{
         EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationParameters,
-        EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerOutput,
-        EmbeddingQualificationWorkerRequest, EmbeddingServerClockSnapshot,
+        EmbeddingQualificationWorkerError, EmbeddingQualificationWorkerMeasurementSpan,
+        EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerRequest,
+        EmbeddingServerClockSnapshot,
     };
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -131,6 +197,9 @@ mod tests {
             },
             start_gate: None,
             start_gate_timeout_ms: None,
+            workload_id: None,
+            repeat: None,
+            retry_marker: None,
         };
 
         let encoded = serde_json::to_value(&request).expect("serialize worker request");
@@ -194,6 +263,7 @@ mod tests {
             protocol_exchange: None,
             queue_operations: None,
             engine_identity: None,
+            measurement: None,
             error: Some(EmbeddingQualificationWorkerError {
                 code: "capacity".into(),
                 message_head: "busy".into(),
@@ -211,6 +281,7 @@ mod tests {
             "protocol_exchange",
             "queue_operations",
             "engine_identity",
+            "measurement",
         ] {
             assert!(
                 encoded.get(omitted).is_none(),
@@ -222,6 +293,81 @@ mod tests {
         assert_eq!(
             decoded.error.expect("worker error").retry_after_ms,
             output.error.expect("source worker error").retry_after_ms
+        );
+    }
+
+    #[test]
+    fn measurement_request_fields_round_trip_and_stay_strict() {
+        let request = EmbeddingQualificationWorkerRequest {
+            schema_version: EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+            nonce_sha256: "a".repeat(64),
+            executable_sha256: "b".repeat(64),
+            project: PathBuf::from("/private/project"),
+            operation: "measure_busy_retry".into(),
+            parameters: EmbeddingQualificationParameters {
+                query_count: 65,
+                bulk_count: 0,
+                documents_per_bulk: 0,
+                input_bytes: 256,
+                hold_ms: 0,
+            },
+            start_gate: None,
+            start_gate_timeout_ms: None,
+            workload_id: Some("saturated_query_65th_retry_v1".into()),
+            repeat: Some(2),
+            retry_marker: Some(PathBuf::from("/private/dir/marker.json")),
+        };
+        let encoded = serde_json::to_value(&request).expect("serialize measure request");
+        assert_eq!(
+            encoded["workload_id"],
+            json!("saturated_query_65th_retry_v1")
+        );
+        assert_eq!(encoded["repeat"], json!(2));
+        let decoded: EmbeddingQualificationWorkerRequest =
+            serde_json::from_value(encoded).expect("deserialize measure request");
+        assert_eq!(decoded.workload_id, request.workload_id);
+        assert_eq!(decoded.repeat, request.repeat);
+        assert_eq!(decoded.retry_marker, request.retry_marker);
+    }
+
+    #[test]
+    fn measurement_span_round_trips_the_exact_witness_shape() {
+        let span = EmbeddingQualificationWorkerMeasurementSpan {
+            awake_started_ns: 10,
+            awake_finished_ns: 20,
+            inclusive_started_ns: 9,
+            inclusive_finished_ns: 21,
+            boot_id_started: "boot".into(),
+            boot_id_finished: "boot".into(),
+        };
+        let encoded = serde_json::to_value(&span).expect("serialize measurement span");
+        assert_eq!(
+            encoded
+                .as_object()
+                .expect("span object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "awake_started_ns",
+                "awake_finished_ns",
+                "inclusive_started_ns",
+                "inclusive_finished_ns",
+                "boot_id_started",
+                "boot_id_finished",
+            ]
+            .into_iter()
+            .collect()
+        );
+        let mut incompatible = encoded;
+        incompatible
+            .as_object_mut()
+            .expect("span object")
+            .insert("unexpected".into(), Value::Bool(true));
+        assert!(
+            serde_json::from_value::<EmbeddingQualificationWorkerMeasurementSpan>(incompatible)
+                .is_err(),
+            "the measurement span must reject fields unknown to either executable"
         );
     }
 }

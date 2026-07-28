@@ -29,6 +29,32 @@ pub(super) struct ActiveServerRequest {
     pub(super) started_ns: u64,
 }
 
+/// The longest the watchdog will sleep before rechecking whether the server has stopped.
+///
+/// The watchdog cadence is measured in seconds, and shutdown joins this thread. Sleeping the whole
+/// cadence in one call made every shutdown wait for it, which is why draining held the endpoint
+/// long after it stopped accepting.
+const WATCHDOG_STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sleep up to `total`, waking early once the server is stopped.
+///
+/// Returns false when the server stopped, meaning the caller should not run another cycle.
+pub(in crate::per_user_embedding) fn sleep_until_stopped(
+    state: &PerUserEmbeddingServerState,
+    total: Duration,
+) -> bool {
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if state.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let slice = remaining.min(WATCHDOG_STOP_CHECK_INTERVAL);
+        state.clock.sleep(slice);
+        remaining -= slice;
+    }
+    !state.stopped.load(Ordering::Acquire)
+}
+
 pub(super) fn spawn_server_watchdog(
     state: Arc<PerUserEmbeddingServerState>,
     transport: Arc<dyn EmbeddingServerTransport>,
@@ -42,8 +68,7 @@ pub(super) fn spawn_server_watchdog(
             let mut bulk_progress = WatchdogClassProgress::new(started_ns);
             let mut draining_progress = WatchdogClassProgress::new(started_ns);
             while !state.stopped.load(Ordering::Acquire) {
-                state.clock.sleep(budgets.watchdog_poll);
-                if state.stopped.load(Ordering::Acquire) {
+                if !sleep_until_stopped(&state, budgets.watchdog_poll) {
                     return;
                 }
                 let draining = state.draining.load(Ordering::Acquire);

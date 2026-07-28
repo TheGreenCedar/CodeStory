@@ -235,17 +235,26 @@ pub(in crate::app) fn semantic_contract_check(
     }
 
     if let Some(current) = retrieval.current_embedding.as_ref() {
-        compare_contract_field(
+        // The stored contract is projected from the publication pointer (the
+        // retrieval manifest), which records one opaque embedding runtime id
+        // — the same identity space as the current contract's cache key —
+        // plus a dimension. Per-doc profile/backend-label/doc-shape metadata
+        // is not carried by the publication pointer: it is validated when the
+        // generation is staged and folded into the sidecar input hash, so an
+        // absent optional field is not evidence of drift. The cache key and
+        // dimension are required publication evidence and keep failing closed
+        // when they are absent.
+        compare_carried_contract_field(
             &mut gaps,
             "embedding profile",
             stored.embedding_profile.as_deref(),
-            Some(current.profile.as_str()),
+            current.profile.as_str(),
         );
-        compare_contract_field(
+        compare_carried_contract_field(
             &mut gaps,
             "embedding backend",
             stored.embedding_backend.as_deref(),
-            Some(current.backend.as_str()),
+            current.backend.as_str(),
         );
         compare_contract_field(
             &mut gaps,
@@ -253,21 +262,38 @@ pub(in crate::app) fn semantic_contract_check(
             stored.cache_key.as_deref(),
             Some(current.cache_key.as_str()),
         );
-        compare_contract_field(
+        compare_carried_contract_field(
             &mut gaps,
             "semantic doc shape",
             stored.doc_shape.as_deref(),
-            Some(current.doc_shape.as_str()),
+            current.doc_shape.as_str(),
         );
-        if let (Some(stored_dim), Some(current_dim)) = (stored.dimension, current.dimension)
-            && stored_dim != current_dim
-        {
-            gaps.push(format!(
-                "embedding dimension mismatch: stored={stored_dim} current={current_dim}"
-            ));
+        match (stored.dimension, current.dimension) {
+            (Some(stored_dim), Some(current_dim)) if stored_dim != current_dim => {
+                gaps.push(format!(
+                    "embedding dimension mismatch: stored={stored_dim} current={current_dim}"
+                ));
+            }
+            (None, Some(current_dim)) => {
+                gaps.push(format!(
+                    "embedding dimension missing from stored docs; current={current_dim}"
+                ));
+            }
+            _ => {}
         }
     } else {
         gaps.push("current embedding config could not be resolved".to_string());
+    }
+    // The readiness projection already judged this publication against the
+    // full manifest contract (schema, generation, degraded modes, policy
+    // version). Honor its degraded verdict even when every field the
+    // publication carries matches, so doctor never calls a stale or degraded
+    // publication healthy.
+    if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::DegradedRuntime) {
+        gaps.push(
+            "the published retrieval index is stale or degraded for the current contract"
+                .to_string(),
+        );
     }
 
     if gaps.is_empty() {
@@ -299,6 +325,26 @@ pub(in crate::app) fn semantic_contract_check(
                 gaps.join("; ")
             ),
         )
+    }
+}
+
+/// Flag a mismatch only when the stored contract actually carries the field.
+///
+/// Publication-pointer contracts legitimately omit per-doc metadata (profile,
+/// backend label, doc shape); treating those omissions as gaps made doctor
+/// report `semantic stale` forever on healthy manifest-published stores.
+pub(in crate::app::diagnostics) fn compare_carried_contract_field(
+    gaps: &mut Vec<String>,
+    label: &str,
+    stored: Option<&str>,
+    current: &str,
+) {
+    if let Some(stored) = stored
+        && stored != current
+    {
+        gaps.push(format!(
+            "{label} mismatch: stored={stored} current={current}"
+        ));
     }
 }
 
@@ -394,7 +440,9 @@ pub(in crate::app) fn index_next_commands(
                 ));
                 return commands;
             }
-            IndexFreshnessStatusDto::NotChecked => {
+            IndexFreshnessStatusDto::NotChecked
+                if crate::readiness::freshness_requires_refresh(freshness) =>
+            {
                 commands.push(format!(
                     "codestory-cli index --project {project} --refresh full"
                 ));
@@ -403,7 +451,7 @@ pub(in crate::app) fn index_next_commands(
                 ));
                 return commands;
             }
-            IndexFreshnessStatusDto::Fresh => {}
+            IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::NotChecked => {}
         }
     }
     if !sidecar_is_full {

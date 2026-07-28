@@ -37,6 +37,7 @@ jobs:
     outputs:
       should_release: ${{ steps.version.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
+      release_lane: ${{ steps.version.outputs.release_lane }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -58,7 +59,7 @@ jobs:
   release:
     name: Release
     needs: detect-version
-    if: needs.detect-version.outputs.should_release == 'true'
+    if: needs.detect-version.outputs.should_release == 'true' && needs.detect-version.outputs.release_lane == 'native'
     permissions:
       actions: read
       contents: write
@@ -68,3 +69,17 @@ jobs:
       version: ${{ needs.detect-version.outputs.version }}
       publish_release: true
     secrets: inherit
+
+  # The plugin fast lane ships the plugin alone against its pinned, already-published CLI.
+  # No native secrets are forwarded: nothing is built or signed here.
+  plugin-release:
+    name: Plugin release
+    needs: detect-version
+    if: needs.detect-version.outputs.should_release == 'true' && needs.detect-version.outputs.release_lane == 'plugin'
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    uses: ./.github/workflows/plugin-release.yml
+    with:
+      version: ${{ needs.detect-version.outputs.version }}

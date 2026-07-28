@@ -1,22 +1,100 @@
 use super::super::{
-    IDLE_EXIT_GRACE, MeasurementArtifact, MeasurementInterval, RawMetric, RawMetricClock,
-    RawMetricProcess, RawMetricSampleInput, SNAPSHOT_TIMEOUT, successful_operation_operands,
+    MeasurementArtifact, MeasurementInterval, POLL, ProcessObservation,
+    QUALIFICATION_QUEUE_CAPACITY, RawMetric, RawMetricClock, RawMetricProcess,
+    RawMetricSampleInput, successful_operation_duration_ns, successful_operation_operands,
 };
 use super::analysis::{
-    accelerator_operands, completed_token_count, raw_server_identity,
+    accelerator_operands, completed_token_count, elapsed, raw_server_identity,
     snapshot_has_resident_generation,
 };
-use super::process::{query_parameters, require_worker_success};
-use super::{ScenarioRunner, WorkerOutput, push_metric};
+use super::process::{
+    busy_retry_marker_timeout, busy_retry_worker_timeout, measurement_worker_timeout,
+    query_parameters, require_worker_success,
+};
+use super::{RunningWorker, ScenarioRunner, WorkerOutput, push_metric};
 use crate::qualification::request::REQUIRED_METRICS;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    EmbeddingQualificationParameters, EmbeddingServerSnapshot,
-    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+    EmbeddingCapacityPressureWire, EmbeddingEngineIdentity, EmbeddingQualificationParameters,
+    EmbeddingQualificationWorkerMeasurementSpan as WorkerMeasurementSpan, EmbeddingServerSnapshot,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
+
+/// The measurement protocol's declared `phase_boundaries` for every metric the
+/// driver records. The WP5-floored frozen constants derive their meaning from
+/// these instants, so the driver stamps exactly these names onto each sample
+/// and the measurement workers observe exactly these windows; the checker
+/// rejects anything else.
+pub(super) fn declared_phase_boundaries(metric: &str) -> Result<[&'static str; 2]> {
+    Ok(match metric {
+        "existing_owner_connect" => ["client_connect_started", "compatible_hello_validated"],
+        "spawn_convergence" => ["owner_absence_proven", "compatible_hello_validated"],
+        "cold_first_vector" => [
+            "product_request_started_with_owner_absent",
+            "first_vector_and_engine_evidence_validated",
+        ],
+        "first_product_ready" => ["product_request_started", "product_result_validated"],
+        "warm_query_ipc" => [
+            "client_frame_started",
+            "query_response_identity_and_vector_validated",
+        ],
+        "warm_bulk_ipc" => [
+            "client_frame_started",
+            "bulk_response_identity_and_vectors_validated",
+        ],
+        "bulk_documents_per_second" => [
+            "bulk_measurement_window_started",
+            "bulk_document_results_validated",
+        ],
+        "bulk_tokens_per_second" => [
+            "bulk_measurement_window_started",
+            "bulk_token_results_validated",
+        ],
+        "busy_retry_usefulness" => ["typed_retry_emitted", "named_retry_condition_became_true"],
+        "true_idle_exit" => [
+            "last_queued_active_or_leased_work_ended",
+            "engine_and_server_absent",
+        ],
+        "backend_observed_accelerator_residency" => [
+            "accelerator_measurement_started",
+            "backend_residency_evidence_validated",
+        ],
+        _ => bail!("embedding_qualification_metric_phases_unknown:{metric}"),
+    })
+}
+
+/// The measurement protocol's declared workload id for every metric the
+/// driver records.
+pub(super) fn declared_workload_id(metric: &str) -> Result<&'static str> {
+    Ok(match metric {
+        "existing_owner_connect" => "compatible_hello_existing_owner_v1",
+        "spawn_convergence" => "compatible_hello_absent_owner_v1",
+        "cold_first_vector" => "cold_query_256b_v1",
+        "first_product_ready" => "product_query_256b_v1",
+        "warm_query_ipc" => "warm_query_256b_v1",
+        "warm_bulk_ipc" => "warm_bulk_64x256b_v1",
+        "bulk_documents_per_second" | "bulk_tokens_per_second" => "bulk_throughput_256x256b_v1",
+        "busy_retry_usefulness" => "saturated_query_65th_retry_v1",
+        "true_idle_exit" => "true_idle_60000_awake_ms_v1",
+        "backend_observed_accelerator_residency" => "resident_policy_identity_v1",
+        _ => bail!("embedding_qualification_metric_workload_unknown:{metric}"),
+    })
+}
+
+/// One finished measurement worker: the declared-instant interval plus the
+/// evidence the worker observed for the sample.
+pub(super) struct MeasuredWorker {
+    pub(super) interval: MeasurementInterval,
+    pub(super) snapshot: EmbeddingServerSnapshot,
+    pub(super) engine_identity: Option<EmbeddingEngineIdentity>,
+    pub(super) request_id: Option<String>,
+    pub(super) completed_documents: Option<u64>,
+    pub(super) pressure: Option<EmbeddingCapacityPressureWire>,
+}
 
 impl<'a> ScenarioRunner<'a> {
     pub(super) fn measurements(&mut self) -> Result<MeasurementArtifact> {
@@ -24,111 +102,141 @@ impl<'a> ScenarioRunner<'a> {
 
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_spawn_no_owner_{repeat}"))?;
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("query", query_parameters(1))?;
+            let measured = self.run_measure_worker(
+                "measure_spawn_hello",
+                "spawn_convergence",
+                repeat,
+                query_parameters(1),
+            )?;
+            let identity = raw_server_identity(&measured.snapshot)?;
             self.record_metric(
                 &mut metrics,
                 "spawn_convergence",
-                "compatible_query_absent_owner_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 BTreeMap::new(),
             )?;
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("observe", query_parameters(1))?;
+            let measured = self.run_measure_worker(
+                "measure_hello",
+                "existing_owner_connect",
+                repeat,
+                query_parameters(1),
+            )?;
+            let identity = raw_server_identity(&measured.snapshot)?;
             self.record_metric(
                 &mut metrics,
                 "existing_owner_connect",
-                "observe_existing_owner_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 BTreeMap::new(),
             )?;
         }
 
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_cold_no_owner_{repeat}"))?;
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
-            let operands = successful_operation_operands(&interval);
+            let measured = self.run_measure_worker(
+                "measure_product_query",
+                "cold_first_vector",
+                repeat,
+                measurement_parameters(1, 0, 0, 256),
+            )?;
+            let operands = successful_operation_operands(&measured.interval);
+            let identity = raw_server_identity(&measured.snapshot)?;
             self.record_metric(
                 &mut metrics,
                 "cold_first_vector",
-                "cold_query_256b_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 operands,
             )?;
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
-            let operands = successful_operation_operands(&interval);
+            let measured = self.run_measure_worker(
+                "measure_product_query",
+                "first_product_ready",
+                repeat,
+                measurement_parameters(1, 0, 0, 256),
+            )?;
+            let operands = successful_operation_operands(&measured.interval);
+            let identity = raw_server_identity(&measured.snapshot)?;
             self.record_metric(
                 &mut metrics,
                 "first_product_ready",
-                "product_query_256b_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 operands,
             )?;
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("query", measurement_parameters(1, 0, 0, 256))?;
-            let operands = successful_operation_operands(&interval);
+            let measured = self.run_measure_worker(
+                "measure_query_frame",
+                "warm_query_ipc",
+                repeat,
+                measurement_parameters(1, 0, 0, 256),
+            )?;
+            require_completed_documents(&measured, 1)?;
+            let operands = successful_operation_operands(&measured.interval);
+            let identity = frame_server_identity(&measured)?;
             self.record_metric(
                 &mut metrics,
                 "warm_query_ipc",
-                "warm_query_256b_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 operands,
             )?;
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot, _) =
-                self.run_measurement_worker("bulk", measurement_parameters(0, 1, 64, 256))?;
-            let operands = successful_operation_operands(&interval);
+            let measured = self.run_measure_worker(
+                "measure_bulk_frame",
+                "warm_bulk_ipc",
+                repeat,
+                measurement_parameters(0, 1, 64, 256),
+            )?;
+            require_completed_documents(&measured, 64)?;
+            let operands = successful_operation_operands(&measured.interval);
+            let identity = frame_server_identity(&measured)?;
             self.record_metric(
                 &mut metrics,
                 "warm_bulk_ipc",
-                "warm_bulk_64x256b_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 operands,
             )?;
         }
 
         for repeat in 1..=3 {
-            let (interval, snapshot, output) =
-                self.run_measurement_worker("bulk", measurement_parameters(0, 1, 256, 256))?;
-            let request_id = output
-                .result
-                .as_ref()
-                .and_then(|result| result.operations.as_slice().first())
-                .and_then(|operation| operation.attempts.last())
-                .map(|attempt| attempt.request_id.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("embedding_qualification_bulk_request_id_missing")
-                })?;
+            let measured = self.run_measure_worker(
+                "measure_bulk_frame",
+                "bulk_documents_per_second",
+                repeat,
+                measurement_parameters(0, 1, 256, 256),
+            )?;
+            require_completed_documents(&measured, 256)?;
+            let request_id = measured.request_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_bulk_request_id_missing")
+            })?;
             let completed_tokens =
                 completed_token_count(self.context.output_directory, request_id)?;
-            let duration_ns = interval
-                .awake_finished_ns
-                .saturating_sub(interval.awake_started_ns);
+            let duration_ns = successful_operation_duration_ns(&measured.interval);
+            let identity = frame_server_identity(&measured)?;
             self.record_metric(
                 &mut metrics,
                 "bulk_documents_per_second",
-                "bulk_throughput_256x256b_v1",
                 repeat,
-                (interval.clone(), snapshot.clone()),
+                &measured.interval,
+                identity.clone(),
                 BTreeMap::from([
                     ("completed_documents".into(), json!(256)),
                     (
@@ -140,9 +248,9 @@ impl<'a> ScenarioRunner<'a> {
             self.record_metric(
                 &mut metrics,
                 "bulk_tokens_per_second",
-                "bulk_throughput_256x256b_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 BTreeMap::from([
                     ("completed_tokens".into(), json!(completed_tokens)),
                     (
@@ -153,65 +261,68 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        let residency_worker = self.spawn_worker("resident_identity", query_parameters(1), None)?;
-        let residency_output = self.finish_worker(residency_worker, SNAPSHOT_TIMEOUT)?;
-        let residency_interval = measurement_interval(&residency_output)?;
-        let identity = residency_output
+        let measured = self.run_measure_worker(
+            "measure_resident_identity",
+            "backend_observed_accelerator_residency",
+            1,
+            query_parameters(1),
+        )?;
+        let engine = measured
             .engine_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_residency_identity_missing"))?;
-        let (_, residency_snapshot, _) =
-            self.run_measurement_worker("observe", query_parameters(1))?;
+        let identity = raw_server_identity(&measured.snapshot)?;
         self.record_metric(
             &mut metrics,
             "backend_observed_accelerator_residency",
-            "resident_policy_identity_v1",
             1,
-            (residency_interval, residency_snapshot.clone()),
-            accelerator_operands(identity),
+            &measured.interval,
+            identity,
+            accelerator_operands(engine),
         )?;
 
         for repeat in 1..=3 {
-            self.control("hold_class", Some("query"))?;
-            let worker = self.spawn_worker("query", query_parameters(1), None)?;
-            self.wait_for_snapshot("measurement_busy_queued", SNAPSHOT_TIMEOUT, |snapshot| {
-                snapshot.scheduler.active_request_count > 0 || snapshot.scheduler.query_depth > 0
-            })?;
-            self.control("release_class", Some("query"))?;
-            let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
-            require_worker_success(&output, "busy_retry_usefulness")?;
-            let interval = measurement_interval(&output)?;
-            let snapshot = self.record_worker_snapshot("measurement_busy_complete", &output)?;
+            let measured = self.measure_busy_retry(repeat)?;
+            let identity = raw_server_identity(&measured.snapshot)?;
             self.record_metric(
                 &mut metrics,
                 "busy_retry_usefulness",
-                "held_query_release_v1",
                 repeat,
-                (interval, snapshot),
+                &measured.interval,
+                identity,
                 BTreeMap::new(),
             )?;
         }
 
-        let (_, idle_owner, _) = self.run_measurement_worker("query", query_parameters(1))?;
+        let idle_worker = self.spawn_worker("query", query_parameters(1), None)?;
+        let idle_output = self.finish_worker(idle_worker, measurement_worker_timeout("query"))?;
+        require_worker_success(&idle_output, "true_idle_owner")?;
+        let idle_owner =
+            self.record_worker_snapshot("measurement_true_idle_owner", &idle_output)?;
         if !snapshot_has_resident_generation(&idle_owner) {
             bail!("embedding_qualification_true_idle_owner_not_resident");
         }
-        let idle_timeout = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
-            .saturating_add(IDLE_EXIT_GRACE)
-            .saturating_add(Duration::from_secs(30));
-        let idle_output = self.wait_for_absence_output(idle_timeout)?;
-        let idle_interval = measurement_interval(&idle_output)?;
-        if idle_output.result.as_ref().is_none_or(|result| {
-            result.initial_snapshot.is_none() || result.final_snapshot.is_some()
-        }) {
+        let measured = self.run_measure_worker(
+            "measure_true_idle",
+            "true_idle_exit",
+            1,
+            query_parameters(1),
+        )?;
+        if !snapshot_has_resident_generation(&measured.snapshot)
+            || measured.snapshot.scheduler.active_request_count != 0
+            || measured.snapshot.scheduler.query_depth != 0
+            || measured.snapshot.scheduler.bulk_depth != 0
+            || measured.snapshot.scheduler.lease_count != 0
+        {
             bail!("embedding_qualification_true_idle_worker_witness_invalid");
         }
+        let identity = raw_server_identity(&measured.snapshot)?;
         self.record_metric(
             &mut metrics,
             "true_idle_exit",
-            "true_idle_60000_awake_ms_v1",
             1,
-            (idle_interval, idle_owner),
+            &measured.interval,
+            identity,
             BTreeMap::new(),
         )?;
 
@@ -229,37 +340,153 @@ impl<'a> ScenarioRunner<'a> {
         })
     }
 
-    fn run_measurement_worker(
+    fn run_measure_worker(
         &mut self,
         operation: &str,
+        metric: &str,
+        repeat: u32,
         parameters: EmbeddingQualificationParameters,
-    ) -> Result<(MeasurementInterval, EmbeddingServerSnapshot, WorkerOutput)> {
-        let worker = self.spawn_worker(operation, parameters, None)?;
-        let output = self.finish_worker(worker, SNAPSHOT_TIMEOUT)?;
-        require_worker_success(&output, operation)?;
-        let interval = measurement_interval(&output)?;
-        let snapshot = self.record_worker_snapshot("measurement_worker", &output)?;
-        Ok((interval, snapshot, output))
+    ) -> Result<MeasuredWorker> {
+        let workload_id = declared_workload_id(metric)?;
+        let worker = self.spawn_measure_worker(operation, parameters, workload_id, repeat, None)?;
+        let output = self.finish_worker(worker, measurement_worker_timeout(operation))?;
+        self.measured_worker(operation, &output)
+    }
+
+    fn measured_worker(
+        &mut self,
+        operation: &str,
+        output: &WorkerOutput,
+    ) -> Result<MeasuredWorker> {
+        if let Some(error) = output.error.as_ref() {
+            bail!(
+                "embedding_qualification_measure_worker_failed:{operation}:{}",
+                error.code
+            );
+        }
+        let measurement = output.measurement.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_worker_measurement_missing:{operation}")
+        })?;
+        let interval = measurement_span_interval(output, &measurement.span)?;
+        self.artifact
+            .process_observations
+            .push(ProcessObservation::from_snapshot(
+                "measurement_worker",
+                self.clock.now_ns(),
+                Some(measurement.snapshot.clone()),
+            ));
+        Ok(MeasuredWorker {
+            interval,
+            snapshot: measurement.snapshot.clone(),
+            engine_identity: measurement.engine_identity.clone(),
+            request_id: measurement.request_id.clone(),
+            completed_documents: measurement.completed_documents,
+            pressure: measurement.pressure.clone(),
+        })
+    }
+
+    /// The single-process saturated-65th-retry experiment: the driver holds
+    /// the bulk and query classes, spawns the busy-retry worker, releases the
+    /// classes once the worker's typed-retry marker appears, and validates
+    /// the returned pressure evidence.
+    fn measure_busy_retry(&mut self, repeat: u32) -> Result<MeasuredWorker> {
+        self.ensure_owner("measurement_busy_owner")?;
+        self.control("hold_class", Some("bulk"))?;
+        self.control("hold_class", Some("query"))?;
+        let marker = self
+            .context
+            .output_directory
+            .join(format!(".measure-busy-retry-{repeat}.marker.json"));
+        let mut worker = self.spawn_measure_worker(
+            "measure_busy_retry",
+            measurement_parameters(QUALIFICATION_QUEUE_CAPACITY as u32 + 1, 0, 0, 256),
+            declared_workload_id("busy_retry_usefulness")?,
+            repeat,
+            Some(marker.clone()),
+        )?;
+        let marker_present =
+            self.wait_for_retry_marker(&mut worker, &marker, busy_retry_marker_timeout())?;
+        if marker_present {
+            self.control("release_class", Some("bulk"))?;
+            self.control("release_class", Some("query"))?;
+        }
+        let output = self.finish_worker(worker, busy_retry_worker_timeout())?;
+        self.cleanup_gate(&marker);
+        let measured = self.measured_worker("measure_busy_retry", &output)?;
+        if !marker_present {
+            // The worker exited before signalling the typed retry, so the
+            // measured window cannot exist; `measured_worker` above surfaces
+            // the worker's own error first.
+            bail!("embedding_qualification_busy_retry_marker_missing");
+        }
+        let pressure = measured.pressure.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_busy_retry_pressure_missing")
+        })?;
+        if pressure.reason != "queue_full"
+            || pressure.queue_class != "query"
+            || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
+            || pressure.depth != pressure.capacity
+            || pressure.retry_condition.trim().is_empty()
+        {
+            bail!("embedding_qualification_busy_retry_pressure_invalid");
+        }
+        Ok(measured)
+    }
+
+    /// Poll for the busy-retry worker's typed-retry marker with the standard
+    /// coordination cadence. Returns `false` when the worker exited before
+    /// signalling, so the caller can surface the worker's own error.
+    fn wait_for_retry_marker(
+        &mut self,
+        worker: &mut RunningWorker,
+        marker: &Path,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let started = self.clock.now_ns();
+        loop {
+            match fs::symlink_metadata(marker) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    return Ok(true);
+                }
+                Ok(_) => bail!("embedding_qualification_busy_retry_marker_untrusted"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("inspect embedding qualification retry marker");
+                }
+            }
+            if worker
+                .child
+                .try_wait()
+                .context("poll busy retry qualification worker")?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            if elapsed(&self.clock, started) >= timeout {
+                bail!("embedding_qualification_busy_retry_marker_timeout");
+            }
+            self.clock.sleep(POLL);
+        }
     }
 
     fn record_metric(
         &self,
         metrics: &mut BTreeMap<String, RawMetric>,
         metric: &str,
-        workload_id: &str,
         repeat: u32,
-        witness: (MeasurementInterval, EmbeddingServerSnapshot),
+        interval: &MeasurementInterval,
+        server_identity: super::super::RawServerIdentity,
         operands: BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
-        let (interval, snapshot) = witness;
+        let [start_phase, end_phase] = declared_phase_boundaries(metric)?;
         let sample = interval.sample(RawMetricSampleInput {
             sample_id: &self.measurement_sample_id(metric, repeat),
             repeat,
             runtime: self.context.qualification_runtime,
-            workload_id,
-            server_identity: raw_server_identity(&snapshot)?,
-            start_phase: "packaged_worker_operation_started",
-            end_phase: "packaged_worker_operation_validated",
+            workload_id: declared_workload_id(metric)?,
+            server_identity,
+            start_phase,
+            end_phase,
             operands,
         });
         push_metric(metrics, metric, metric_unit(metric), sample)
@@ -275,11 +502,21 @@ impl<'a> ScenarioRunner<'a> {
     }
 }
 
-fn measurement_interval(output: &WorkerOutput) -> Result<MeasurementInterval> {
-    if output.started_ns > output.finished_ns
-        || output.inclusive_started_ns > output.inclusive_finished_ns
-        || output.boot_id_started != output.clock.boot_id
-        || output.boot_id_finished != output.clock.boot_id
+/// Build the recorded interval from the worker's declared-instant span. The
+/// span must lie inside the worker's whole-process window and share its boot
+/// identity, so a span from another clock, boot, or process fails closed.
+pub(super) fn measurement_span_interval(
+    output: &WorkerOutput,
+    span: &WorkerMeasurementSpan,
+) -> Result<MeasurementInterval> {
+    if span.awake_started_ns > span.awake_finished_ns
+        || span.inclusive_started_ns > span.inclusive_finished_ns
+        || span.boot_id_started != output.clock.boot_id
+        || span.boot_id_finished != output.clock.boot_id
+        || span.awake_started_ns < output.started_ns
+        || span.awake_finished_ns > output.finished_ns
+        || span.inclusive_started_ns < output.inclusive_started_ns
+        || span.inclusive_finished_ns > output.inclusive_finished_ns
     {
         bail!("embedding_qualification_worker_measurement_clock_invalid");
     }
@@ -294,14 +531,40 @@ fn measurement_interval(output: &WorkerOutput) -> Result<MeasurementInterval> {
             boot_id: output.clock.boot_id.clone(),
             resolution_ns: output.clock.resolution_ns,
         },
-        awake_started_ns: output.started_ns,
-        awake_finished_ns: output.finished_ns,
+        awake_started_ns: span.awake_started_ns,
+        awake_finished_ns: span.awake_finished_ns,
         inclusive_clock_api: output.inclusive_clock_api.clone(),
-        inclusive_started_ns: output.inclusive_started_ns,
-        inclusive_finished_ns: output.inclusive_finished_ns,
-        boot_id_started: output.boot_id_started.clone(),
-        boot_id_finished: output.boot_id_finished.clone(),
+        inclusive_started_ns: span.inclusive_started_ns,
+        inclusive_finished_ns: span.inclusive_finished_ns,
+        boot_id_started: span.boot_id_started.clone(),
+        boot_id_finished: span.boot_id_finished.clone(),
     })
+}
+
+/// Frame measurements witness the server through the engine identity the
+/// validated response carried, paired with the process identity from the
+/// pre-window hello on the same connection.
+fn frame_server_identity(measured: &MeasuredWorker) -> Result<super::super::RawServerIdentity> {
+    let engine = measured
+        .engine_identity
+        .as_ref()
+        .filter(|identity| identity.load_generation > 0)
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_frame_identity_missing"))?;
+    if engine.server_instance_id != measured.snapshot.process.server_instance_id {
+        bail!("embedding_qualification_frame_identity_mismatch");
+    }
+    Ok(super::super::RawServerIdentity {
+        server_instance_id: engine.server_instance_id.clone(),
+        process_start_id: measured.snapshot.process.process_start_id.clone(),
+        load_generation: engine.load_generation,
+    })
+}
+
+fn require_completed_documents(measured: &MeasuredWorker, expected: u64) -> Result<()> {
+    if measured.completed_documents != Some(expected) {
+        bail!("embedding_qualification_measurement_document_count_invalid");
+    }
+    Ok(())
 }
 
 fn measurement_parameters(

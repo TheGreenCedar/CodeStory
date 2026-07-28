@@ -125,6 +125,7 @@ branch.
 | --- | --- | --- |
 | macOS Apple Silicon | Metal | v0.16 package; physical Apple adapter, full layer offload, timed live smoke |
 | Windows x64 | Vulkan | v0.16 package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
+| Linux x64 | Vulkan | v0.16 package; physical adapter, software-adapter rejection, full layer offload, timed live smoke |
 | Other targets | No release path | No v0.16 package or runtime claim |
 
 Windows source and package proof builds pin `CMAKE_GENERATOR=Ninja`; hosted

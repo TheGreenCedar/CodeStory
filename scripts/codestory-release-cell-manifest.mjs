@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -259,6 +260,93 @@ function flattenJobs(jobsByAttempt) {
   });
 }
 
+/// One cell's producer taken from a prior, binding-verified run.
+///
+/// The trust requirements are the same-run ones -- named job succeeded, one matching unexpired
+/// artifact, container digest present, artifact created inside the job window -- re-anchored to
+/// the reused run and its commit, with the reuse recorded rather than implied.
+function selectReusedProducer({ cell, reused, binding }) {
+  const reusedRunId = positiveInteger(reused.runId, "reused Actions run id");
+  const reusedHeadSha = text(reused.headSha, "reused Actions head commit");
+  const jobs = flattenJobs(reused.jobsByAttempt);
+  const jobName = text(cell.identity_constraints.producer_job_name, `${cell.id} producer job name`);
+  const occurrences = jobs.filter((job) => leafJobName(job.name) === jobName);
+  if (occurrences.length === 0) fail(`reused run ${reusedRunId} has no execution of ${jobName}`);
+  const latestAttempt = Math.max(...occurrences.map(({ run_attempt: attempt }) => Number(attempt)));
+  const latestJobs = occurrences.filter(({ run_attempt: attempt }) => Number(attempt) === latestAttempt);
+  if (latestJobs.length !== 1) {
+    fail(`reused run attempt ${latestAttempt} has multiple executions of ${jobName}`);
+  }
+  const job = latestJobs[0];
+  if (job.status !== "completed" || job.conclusion !== "success") {
+    fail(`reused execution of ${jobName} did not succeed`);
+  }
+  if (String(job.run_id) !== reusedRunId || job.head_sha !== reusedHeadSha) {
+    fail(`reused Actions job ${jobName} is not bound to the reused run and commit`);
+  }
+  const constraints = resolveReleaseCellConstraints(cell, String(latestAttempt));
+  const matching = (reused.artifacts ?? []).filter(({ name }) => name === constraints.producer_artifact);
+  if (matching.length !== 1) {
+    fail(`reused run must retain one ${constraints.producer_artifact} artifact`);
+  }
+  const artifact = matching[0];
+  if (artifact.expired !== false
+      || String(artifact.workflow_run?.id) !== reusedRunId
+      || artifact.workflow_run?.head_sha !== reusedHeadSha) {
+    fail(`reused artifact ${constraints.producer_artifact} has stale run provenance`);
+  }
+  if (!ACTIONS_DIGEST.test(String(artifact.digest ?? ""))) {
+    fail(`reused artifact ${constraints.producer_artifact} has no SHA-256 container digest`);
+  }
+  if (!Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes <= 0) {
+    fail(`reused artifact ${constraints.producer_artifact} has invalid size`);
+  }
+  const createdAt = actionsTimestamp(artifact.created_at, "reused artifact created_at");
+  const startedAt = actionsTimestamp(job.started_at, "reused job started_at");
+  const completedAt = actionsTimestamp(job.completed_at, "reused job completed_at");
+  if (Date.parse(createdAt) < Date.parse(startedAt)
+      || Date.parse(createdAt) > Date.parse(completedAt)) {
+    fail(`reused artifact ${constraints.producer_artifact} was not created by its job window`);
+  }
+  return {
+    cell_id: cell.id,
+    producer_workflow: constraints.producer_workflow,
+    producer_job: constraints.producer_job,
+    producer_job_name: constraints.producer_job_name,
+    producer_run_id: reusedRunId,
+    producer_run_attempt: String(latestAttempt),
+    producer_artifact: constraints.producer_artifact,
+    reused_from: {
+      run_id: reusedRunId,
+      head_sha: reusedHeadSha,
+      binding,
+      binding_value: text(reused.bindingValue, "reused binding value"),
+    },
+    artifact: {
+      id: positiveInteger(artifact.id, "reused artifact id"),
+      name: artifact.name,
+      digest: artifact.digest,
+      size_in_bytes: artifact.size_in_bytes,
+      expired: false,
+      created_at: createdAt,
+      expires_at: actionsTimestamp(artifact.expires_at, "reused artifact expires_at"),
+      workflow_run_id: reusedRunId,
+      head_sha: reusedHeadSha,
+    },
+    job: {
+      id: positiveInteger(job.id, "reused job id"),
+      run_id: reusedRunId,
+      head_sha: reusedHeadSha,
+      name: job.name,
+      status: job.status,
+      conclusion: job.conclusion,
+      run_attempt: String(latestAttempt),
+      started_at: startedAt,
+      completed_at: completedAt,
+    },
+  };
+}
+
 export function buildTrustedProducerMap({
   graph,
   gitIdentity,
@@ -267,13 +355,31 @@ export function buildTrustedProducerMap({
   currentRunAttempt,
   artifacts,
   jobsByAttempt,
+  // Cross-run evidence, keyed by cell-group id. Admissible only for groups that declare a
+  // reuse_binding in the claim graph; the caller is responsible for having verified the binding
+  // (tree equality and ancestry, or native-fingerprint equality) before supplying an entry.
+  reuse = {},
 }) {
   const selectedRunId = positiveInteger(runId, "Actions run id");
   const selectedCurrentAttempt = positiveInteger(currentRunAttempt, "Actions current run attempt");
   if (!Array.isArray(artifacts)) fail("Actions artifacts must be an array");
   const jobs = flattenJobs(jobsByAttempt);
+  const groupBindings = new Map(
+    (graph.closeout.cell_groups ?? [])
+      .filter((group) => typeof group.reuse_binding === "string")
+      .map((group) => [group.id, group.reuse_binding]),
+  );
+  for (const groupId of Object.keys(reuse)) {
+    if (!groupBindings.has(groupId)) {
+      fail(`cell group ${groupId} does not admit cross-run evidence`);
+    }
+  }
   const selectionCache = new Map();
   const producers = deriveReleaseCells(graph, phase).map((cell) => {
+    const reused = reuse[cell.group_id];
+    if (reused) {
+      return selectReusedProducer({ cell, reused, binding: groupBindings.get(cell.group_id) });
+    }
     const jobName = text(cell.identity_constraints.producer_job_name, `${cell.id} producer job name`);
     const cacheKey = `${jobName}\0${cell.identity_constraints.producer_artifact}`;
     let selected = selectionCache.get(cacheKey);
@@ -371,6 +477,45 @@ export function buildTrustedProducerMap({
   };
 }
 
+/// Verify a reuse binding against the local repository and return its recorded value.
+export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
+  const run = (args) =>
+    execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+  if (binding === "source_tree") {
+    const releaseTree = run(["rev-parse", `${releaseCommit}^{tree}`]);
+    const reusedTree = run(["rev-parse", `${reusedCommit}^{tree}`]);
+    if (releaseTree !== reusedTree) {
+      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
+    }
+    try {
+      execFileSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
+        cwd: repository,
+      });
+    } catch {
+      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
+    }
+    return releaseTree;
+  }
+  if (binding === "native_fingerprint") {
+    const script = new URL("./native-fingerprint.mjs", import.meta.url).pathname;
+    const fingerprint = (ref) =>
+      execFileSync(process.execPath, [script, "--ref", ref], {
+        cwd: repository,
+        encoding: "utf8",
+      }).trim();
+    const releasePrint = fingerprint(releaseCommit);
+    const reusedPrint = fingerprint(reusedCommit);
+    if (releasePrint !== reusedPrint) {
+      fail(
+        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
+          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
+      );
+    }
+    return releasePrint;
+  }
+  fail(`unknown reuse binding ${binding}`);
+}
+
 async function githubPages(url, token, field) {
   const values = [];
   for (let page = 1; ; page += 1) {
@@ -416,6 +561,33 @@ async function produceMap(values) {
       "jobs",
     )).map((job) => ({ ...job, run_attempt: String(attempt) }));
   }
+  // --reuse source_behavior=<runId>:<headSha>[,<group>=<runId>:<headSha>...]
+  // Each entry admits cross-run evidence for one reuse-bound cell group, after this process
+  // itself verifies the binding against the local repository.
+  const reuse = {};
+  for (const entry of text(values.reuse ?? "-", "--reuse").split(",")) {
+    if (entry === "-" || entry === "") continue;
+    const match = /^([a-z_]+)=(\d+):([0-9a-f]{40})$/u.exec(entry);
+    if (!match) fail(`--reuse entry ${entry} must be group=runId:headSha`);
+    const [, groupId, reusedRunId, reusedHeadSha] = match;
+    const binding = (graph.closeout.cell_groups ?? []).find((group) => group.id === groupId)
+      ?.reuse_binding;
+    if (!binding) fail(`cell group ${groupId} does not admit cross-run evidence`);
+    const bindingValue = verifyReuseBinding({
+      binding,
+      repository: text(values.repo, "--repo"),
+      releaseCommit: gitIdentity.commit,
+      reusedCommit: reusedHeadSha,
+    });
+    const reusedUrl = `${apiRoot}/repos/${repositoryPath}/actions/runs/${reusedRunId}`;
+    reuse[groupId] = {
+      runId: reusedRunId,
+      headSha: reusedHeadSha,
+      bindingValue,
+      artifacts: await githubPages(`${reusedUrl}/artifacts`, token, "artifacts"),
+      jobsByAttempt: await githubPages(`${reusedUrl}/jobs?filter=all`, token, "jobs"),
+    };
+  }
   const map = buildTrustedProducerMap({
     graph,
     gitIdentity,
@@ -424,6 +596,7 @@ async function produceMap(values) {
     currentRunAttempt: runAttempt,
     artifacts,
     jobsByAttempt,
+    reuse,
   });
   writeJson(text(values.out, "--out"), map);
 }

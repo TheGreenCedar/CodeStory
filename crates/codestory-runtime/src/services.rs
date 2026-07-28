@@ -3,11 +3,12 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
-    GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessStatusDto, IndexMode,
-    IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessDto,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest,
+    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
     TrailContextDto,
 };
@@ -674,10 +675,13 @@ impl ActivationService {
             || self
                 .controller
                 .complete_core_requires_publication_repair(&storage_path)?
+            // A bounded freshness check cannot prove drift either way, so treating it as stale
+            // would rebuild the whole index on every activation of a large repository and never
+            // reach a different answer.
             || summary
                 .freshness
                 .as_ref()
-                .is_none_or(|freshness| freshness.status != IndexFreshnessStatusDto::Fresh);
+                .is_none_or(|freshness| !index_freshness_admits_operation(freshness));
         if core_stale {
             let mode = if summary.publication.is_none() || summary.stats.node_count == 0 {
                 IndexMode::Full
@@ -702,7 +706,7 @@ impl ActivationService {
             && summary
                 .freshness
                 .as_ref()
-                .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Fresh);
+                .is_some_and(index_freshness_admits_operation);
         if !local_ready {
             if summary.stats.node_count > 0
                 && summary.stats.fatal_error_count == 0
@@ -770,6 +774,34 @@ fn operation_requires_retrieval(operation: &str) -> bool {
         operation,
         "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted"
     )
+}
+
+/// Whether a freshness observation permits serving an operation from the current publication.
+///
+/// `Fresh` obviously admits and `Stale` obviously blocks. `NotChecked` splits: a check that could
+/// not run establishes nothing and must fail closed, but one that stopped at a deliberate
+/// discovery bound says only that drift is unknown. The publication itself is still complete, so
+/// blocking there would permanently lock every repository past the bound out of packet and search
+/// with no way to re-open it.
+fn index_freshness_admits_operation(freshness: &IndexFreshnessDto) -> bool {
+    match freshness.status {
+        IndexFreshnessStatusDto::Fresh => true,
+        IndexFreshnessStatusDto::Stale => false,
+        IndexFreshnessStatusDto::NotChecked => matches!(
+            freshness.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+        ),
+    }
+}
+
+fn index_freshness_block_message(operation: &str, freshness: &IndexFreshnessDto) -> String {
+    // The reason is the only thing that tells an operator what to change, so it must survive.
+    match freshness.reason.as_deref() {
+        Some(reason) => {
+            format!("{operation} requires a fresh complete core publication: {reason}")
+        }
+        None => format!("{operation} requires a fresh complete core publication"),
+    }
 }
 
 fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
@@ -1079,12 +1111,12 @@ impl PublicOperationService {
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self.controller.index_freshness_uncached()?;
-                if freshness.status != IndexFreshnessStatusDto::Fresh
+                if !index_freshness_admits_operation(&freshness)
                     && !self.retained_core_allows(operation, publication)
                 {
                     return Err(ApiError::new(
                         "project_unavailable",
-                        format!("{operation} requires a fresh complete core publication"),
+                        index_freshness_block_message(operation, &freshness),
                     ));
                 }
                 let mut run = || {
@@ -1103,7 +1135,7 @@ impl PublicOperationService {
                         ));
                     }
                     let after = self.controller.index_freshness_uncached()?;
-                    if after.status != IndexFreshnessStatusDto::Fresh
+                    if !index_freshness_admits_operation(&after)
                         && !self.retained_core_allows(operation, publication)
                     {
                         return Err(ApiError::new(
@@ -1808,6 +1840,142 @@ impl BookmarkService {
 
     pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
         self.controller.delete_bookmark(id)
+    }
+}
+
+#[cfg(test)]
+mod embedding_start_classification_tests {
+    use super::*;
+
+    fn classify(code: &str, retry_class: &str) -> ApiError {
+        let error = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: code.into(),
+            message: format!("{code} occurred"),
+            retry_class: retry_class.into(),
+            retry_after_ms: 250,
+            retry_condition: "the server finishes starting".into(),
+            capacity: None,
+        });
+        map_activation_error(error)
+    }
+
+    #[test]
+    fn a_slow_cold_start_is_retryable_rather_than_terminal() {
+        // The spawned server keeps converging past the client's budget, so the next request
+        // usually connects. Reporting this as terminal turned an ordinary slow first use into a
+        // failed ground with nothing the caller could do.
+        for code in ["embedding_server_start_timeout", "embedding_server_absent"] {
+            let error = classify(code, "after_delay");
+            assert_eq!(
+                error.code, "activation_retryable",
+                "{code} must invite a retry"
+            );
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("embedding_retryable"),
+                "{code} must keep its cause visible"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unretryable_embedding_failure_still_fails_closed() {
+        assert_eq!(
+            classify("native_model_not_embedded", "none").code,
+            "project_unavailable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod freshness_gate_tests {
+    use super::*;
+
+    fn freshness(
+        status: IndexFreshnessStatusDto,
+        cause: Option<IndexFreshnessNotCheckedCauseDto>,
+        reason: Option<&str>,
+    ) -> IndexFreshnessDto {
+        IndexFreshnessDto {
+            status,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 30_000,
+            duration_ms: 0,
+            reason: reason.map(str::to_string),
+            not_checked_cause: cause,
+            samples: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_inventory_admits_broad_retrieval_while_stale_still_blocks() {
+        // A repository past the discovery bound has a complete publication; only drift is unknown.
+        // Blocking it would lock packet and search out permanently, with no command that reopens
+        // them, because the bound is a property of repository size rather than of index state.
+        assert!(index_freshness_admits_operation(&freshness(
+            IndexFreshnessStatusDto::NotChecked,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory),
+            Some("indexed file inventory exceeds bounded freshness cap (30000 > 25000)"),
+        )));
+
+        assert!(index_freshness_admits_operation(&freshness(
+            IndexFreshnessStatusDto::Fresh,
+            None,
+            None,
+        )));
+
+        assert!(!index_freshness_admits_operation(&freshness(
+            IndexFreshnessStatusDto::Stale,
+            None,
+            None,
+        )));
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_still_fails_closed() {
+        // Unlike a bound, this establishes nothing about the publication.
+        assert!(!index_freshness_admits_operation(&freshness(
+            IndexFreshnessStatusDto::NotChecked,
+            Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable),
+            Some("failed to read indexed file inventory: disk error"),
+        )));
+
+        // A NotChecked with no recorded cause predates the distinction; fail closed.
+        assert!(!index_freshness_admits_operation(&freshness(
+            IndexFreshnessStatusDto::NotChecked,
+            None,
+            None,
+        )));
+    }
+
+    #[test]
+    fn blocking_reports_the_reason_instead_of_discarding_it() {
+        let message = index_freshness_block_message(
+            "packet",
+            &freshness(
+                IndexFreshnessStatusDto::NotChecked,
+                Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable),
+                Some("failed to read indexed file inventory: disk error"),
+            ),
+        );
+        assert!(
+            message.contains("failed to read indexed file inventory"),
+            "operator needs the cause to act on it, got: {message}"
+        );
+
+        assert_eq!(
+            index_freshness_block_message(
+                "search",
+                &freshness(IndexFreshnessStatusDto::Stale, None, None)
+            ),
+            "search requires a fresh complete core publication"
+        );
     }
 }
 

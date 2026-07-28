@@ -7,20 +7,13 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Version of the repository identity hashing contract.
-pub const REPOSITORY_IDENTITY_SCHEMA_VERSION: u32 = 1;
 /// Lossless repository identity hashing contract available for migration.
 pub const REPOSITORY_IDENTITY_V2_SCHEMA_VERSION: u32 = 2;
 
-/// Shared project identity contract version.
-pub const PROJECT_IDENTITY_SCHEMA_VERSION: u32 = 2;
 /// Lossless shared project identity contract available for migration.
 pub const PROJECT_IDENTITY_V3_SCHEMA_VERSION: u32 = 3;
 const PROJECT_IDENTITY_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(1);
 
-static PROJECT_IDENTITY_OBSERVATION_CACHE: OnceLock<
-    Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV2)>>,
-> = OnceLock::new();
 static PROJECT_IDENTITY_V3_OBSERVATION_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV3)>>,
 > = OnceLock::new();
@@ -87,19 +80,6 @@ impl WorkspacePathLexicalIdentity {
     }
 }
 
-/// Git-derived identity used to decide whether portable sidecar cache reuse is
-/// safe for a project root.
-#[derive(Debug, Clone, Serialize)]
-pub struct RepositoryIdentity {
-    pub canonical_repository_id: Option<String>,
-    pub repository_identity_schema_version: u32,
-    pub normalized_repository_identity: Option<String>,
-    pub git_remote: Option<String>,
-    pub git_tree: Option<String>,
-    pub portable_reuse_eligible: bool,
-    pub portable_reuse_reason: String,
-}
-
 /// Lossless repository identity contract for staged schema-2 migrations.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryIdentityV2 {
@@ -113,26 +93,12 @@ pub struct RepositoryIdentityV2 {
     pub portable_reuse_reason: String,
 }
 
-/// Stable logical, workspace, and artifact identities for a project root.
+/// Lossless project identity contract for staged schema-3 migrations.
 ///
 /// `project_id` identifies the repository independently of checkout state when
 /// a canonical repository identity is available. `workspace_id` always scopes
 /// to one canonical root. `artifact_scope_id` fails closed to that workspace
 /// whenever portable reuse is not eligible.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectIdentityV2 {
-    pub project_identity_schema_version: u32,
-    pub project_id: String,
-    pub workspace_id: String,
-    pub artifact_scope_id: String,
-    pub canonical_repository_id: Option<String>,
-    pub legacy_raw_root_project_id: Option<String>,
-    pub normalized_root_project_id_alias: Option<String>,
-    pub portable_reuse_eligible: bool,
-    pub portable_reuse_reason: String,
-}
-
-/// Lossless project identity contract for staged schema-3 migrations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectIdentityV3 {
     pub project_identity_schema_version: u32,
@@ -146,43 +112,6 @@ pub struct ProjectIdentityV3 {
     pub normalized_root_project_id_alias: Option<String>,
     pub portable_reuse_eligible: bool,
     pub portable_reuse_reason: String,
-}
-
-/// Project id decision for sidecar artifacts.
-///
-/// Clean, identifiable Git repositories use a stable repository-derived id.
-/// Dirty, missing, or non-Git roots fall back to the root-derived id so cached
-/// sidecars do not cross an unsafe freshness boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidecarProjectIdentity {
-    pub project_id: String,
-    pub canonical_repository_id: Option<String>,
-    pub root_derived_project_id: String,
-    pub portable_reuse_eligible: bool,
-    pub portable_reuse_reason: String,
-}
-
-/// Inspect Git remote, tree, and dirtiness for portable cache reuse.
-pub fn inspect_repository_identity(project_root: &Path) -> RepositoryIdentity {
-    let remote = git_output(project_root, &["config", "--get", "remote.origin.url"]).ok();
-    let tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"]).ok();
-    let dirty = git_output(project_root, &["status", "--porcelain"])
-        .map(|status| !status.trim().is_empty())
-        .unwrap_or(true);
-    let normalized = remote.as_deref().and_then(normalize_repository_identity_v1);
-    let canonical_repository_id = normalized.as_deref().map(legacy_canonical_repository_id);
-    let (portable_reuse_eligible, portable_reuse_reason) =
-        portable_reuse_status(normalized.as_deref(), tree.as_deref(), dirty);
-
-    RepositoryIdentity {
-        canonical_repository_id,
-        repository_identity_schema_version: REPOSITORY_IDENTITY_SCHEMA_VERSION,
-        normalized_repository_identity: normalized,
-        git_remote: remote,
-        git_tree: tree,
-        portable_reuse_eligible,
-        portable_reuse_reason,
-    }
 }
 
 /// Inspect the lossless repository identity without migrating current consumers.
@@ -216,33 +145,6 @@ pub fn inspect_repository_identity_v2(project_root: &Path) -> RepositoryIdentity
         git_tree: tree,
         portable_reuse_eligible,
         portable_reuse_reason,
-    }
-}
-
-/// Resolve the shared V2 identity contract for a project root.
-pub fn project_identity_v2(project_root: &Path) -> ProjectIdentityV2 {
-    let repository_identity = inspect_repository_identity(project_root);
-    let root_identity = workspace_root_identity(project_root);
-    let project_id = repository_identity
-        .canonical_repository_id
-        .clone()
-        .unwrap_or_else(|| root_identity.workspace_id.clone());
-    let artifact_scope_id = if repository_identity.portable_reuse_eligible {
-        project_id.clone()
-    } else {
-        root_identity.workspace_id.clone()
-    };
-
-    ProjectIdentityV2 {
-        project_identity_schema_version: PROJECT_IDENTITY_SCHEMA_VERSION,
-        project_id,
-        workspace_id: root_identity.workspace_id,
-        artifact_scope_id,
-        canonical_repository_id: repository_identity.canonical_repository_id,
-        legacy_raw_root_project_id: root_identity.legacy_raw_root_project_id,
-        normalized_root_project_id_alias: root_identity.normalized_root_project_id_alias,
-        portable_reuse_eligible: repository_identity.portable_reuse_eligible,
-        portable_reuse_reason: repository_identity.portable_reuse_reason,
     }
 }
 
@@ -282,26 +184,6 @@ pub fn project_identity_v3_from_repository(
     }
 }
 
-/// Resolve identity for repeated observational status reads.
-///
-/// Mutating/indexing paths must use `project_identity_v2` so dirtiness changes
-/// are observed immediately.
-pub fn cached_project_identity_v2(project_root: &Path) -> ProjectIdentityV2 {
-    let key = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let cache = PROJECT_IDENTITY_OBSERVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_at, identity)) = cache.get(&key)
-        && cached_at.elapsed() < PROJECT_IDENTITY_OBSERVATION_CACHE_TTL
-    {
-        return identity.clone();
-    }
-    let identity = project_identity_v2(project_root);
-    cache.insert(key, (Instant::now(), identity.clone()));
-    identity
-}
-
 /// Resolve lossless identity for repeated observational status reads.
 ///
 /// Mutating paths must use `project_identity_v3` so dirtiness changes are
@@ -322,35 +204,9 @@ pub fn cached_project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
     identity
 }
 
-/// Return the canonical-root FNV identity used to scope one workspace.
-pub fn workspace_id_for_root(project_root: &Path) -> String {
-    workspace_root_identity(project_root).workspace_id
-}
-
 /// Return the schema-3 workspace id hashed from native path data.
 pub fn workspace_id_v3_for_root(project_root: &Path) -> String {
     workspace_root_identity_v3(project_root).workspace_id
-}
-
-/// Choose the sidecar project id while preserving the fallback reason.
-pub fn sidecar_project_identity(
-    project_root: &Path,
-    root_derived_project_id: String,
-) -> SidecarProjectIdentity {
-    let identity = project_identity_v2(project_root);
-    let project_id = if identity.portable_reuse_eligible {
-        identity.project_id
-    } else {
-        root_derived_project_id.clone()
-    };
-
-    SidecarProjectIdentity {
-        project_id,
-        canonical_repository_id: identity.canonical_repository_id,
-        root_derived_project_id,
-        portable_reuse_eligible: identity.portable_reuse_eligible,
-        portable_reuse_reason: identity.portable_reuse_reason,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,15 +214,6 @@ struct WorkspaceRootIdentity {
     workspace_id: String,
     legacy_raw_root_project_id: Option<String>,
     normalized_root_project_id_alias: Option<String>,
-}
-
-fn workspace_root_identity(project_root: &Path) -> WorkspaceRootIdentity {
-    let raw_root = project_root.to_string_lossy();
-    let canonical_root = fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    workspace_root_identity_from_text(&raw_root, &canonical_root)
 }
 
 fn workspace_root_identity_v3(project_root: &Path) -> WorkspaceRootIdentity {
@@ -379,22 +226,6 @@ fn workspace_root_identity_v3(project_root: &Path) -> WorkspaceRootIdentity {
     let normalized_root_project_id_alias = canonical_root
         .to_str()
         .and_then(|root| fnv_alias(&normalize_root_identity_text(root), &workspace_id));
-
-    WorkspaceRootIdentity {
-        workspace_id,
-        legacy_raw_root_project_id,
-        normalized_root_project_id_alias,
-    }
-}
-
-fn workspace_root_identity_from_text(
-    raw_root: &str,
-    canonical_root: &str,
-) -> WorkspaceRootIdentity {
-    let workspace_id = fnv1a_hex(canonical_root.as_bytes());
-    let legacy_raw_root_project_id = fnv_alias(raw_root, &workspace_id);
-    let normalized_root_project_id_alias =
-        fnv_alias(&normalize_root_identity_text(canonical_root), &workspace_id);
 
     WorkspaceRootIdentity {
         workspace_id,
@@ -481,58 +312,12 @@ fn canonical_repository_id_v2(normalized_repository_identity: &str) -> String {
     )
 }
 
-fn legacy_canonical_repository_id(normalized_repository_identity: &str) -> String {
-    versioned_repository_id(1, normalized_repository_identity)
-}
-
 fn versioned_repository_id(schema_version: u32, normalized_repository_identity: &str) -> String {
     let mut state = 0xcbf29ce484222325_u64;
     mix_str(&mut state, "codestory-repository-identity");
     mix_u32(&mut state, schema_version);
     mix_str(&mut state, normalized_repository_identity);
     format!("repo-v{schema_version}-{state:016x}")
-}
-
-fn normalize_repository_identity_v1(remote: &str) -> Option<String> {
-    let value = remote.trim().replace('\\', "/");
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Some((_, rest)) = value.split_once("://") {
-        return normalize_url_repository_identity_v1(rest);
-    }
-
-    let without_user = strip_userinfo(&value);
-    let scp_like = without_user.find(':').is_some_and(|colon| {
-        without_user[..colon].find('/').is_none() && without_user[colon + 1..].contains('/')
-    });
-    let normalized = if scp_like {
-        without_user.replacen(':', "/", 1)
-    } else {
-        without_user.to_string()
-    };
-    normalize_repository_path_v1(&normalized)
-}
-
-fn normalize_url_repository_identity_v1(rest: &str) -> Option<String> {
-    let rest = strip_userinfo(rest);
-    let (authority, path) = rest.split_once('/')?;
-    let host = authority
-        .split_once(':')
-        .map_or(authority, |(host, _)| host);
-    normalize_repository_path_v1(&format!("{host}/{path}"))
-}
-
-fn normalize_repository_path_v1(value: &str) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
-    let normalized = lower
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .trim_end_matches('/')
-        .to_string();
-    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -1286,64 +1071,17 @@ mod tests {
 
     #[test]
     fn identity_schema_migration_changes_repository_id_without_guessing_alias() {
-        assert_eq!(REPOSITORY_IDENTITY_SCHEMA_VERSION, 1);
-        assert_eq!(PROJECT_IDENTITY_SCHEMA_VERSION, 2);
         assert_eq!(REPOSITORY_IDENTITY_V2_SCHEMA_VERSION, 2);
         assert_eq!(PROJECT_IDENTITY_V3_SCHEMA_VERSION, 3);
         let normalized = "example.com/team/repo";
+        // Persisted artifacts remain keyed by schema-1 ids, so the current
+        // contract must never collide with that retired derivation.
         assert_ne!(
             canonical_repository_id_v2(normalized),
-            legacy_canonical_repository_id(normalized)
+            versioned_repository_id(1, normalized)
         );
         assert!(canonical_repository_id_v2(normalized).starts_with("repo-v2-"));
-        assert!(legacy_canonical_repository_id(normalized).starts_with("repo-v1-"));
-    }
-
-    #[test]
-    fn legacy_entrypoints_remain_on_the_existing_contract() {
-        assert_eq!(
-            normalize_repository_identity_v1("ssh://git@EXAMPLE.com:2222/Team/Repo.git").as_deref(),
-            Some("example.com/team/repo")
-        );
-        let Some(project) = git_project() else {
-            return;
-        };
-        let repository = inspect_repository_identity(project.path());
-        assert_eq!(repository.repository_identity_schema_version, 1);
-        assert_eq!(
-            repository.normalized_repository_identity.as_deref(),
-            Some("github.com/thegreencedar/codestory")
-        );
-        assert_eq!(
-            repository.canonical_repository_id.as_deref(),
-            Some("repo-v1-670ad7db4da1546b")
-        );
-        assert_eq!(repository.portable_reuse_reason, "eligible");
-
-        let project_identity = project_identity_v2(project.path());
-        assert_eq!(project_identity.project_identity_schema_version, 2);
-        assert_eq!(project_identity.project_id, "repo-v1-670ad7db4da1546b");
-        assert_eq!(
-            project_identity.canonical_repository_id.as_deref(),
-            Some("repo-v1-670ad7db4da1546b")
-        );
-        assert_eq!(
-            project_identity.artifact_scope_id,
-            project_identity.project_id
-        );
-        assert_eq!(project_identity.portable_reuse_reason, "eligible");
-
-        let root =
-            workspace_root_identity_from_text(r"C:\Source\CodeStory\", r"\\?\C:\Source\CodeStory\");
-        assert_eq!(root.workspace_id, "f6a770b628e5f7f2");
-        assert_eq!(
-            root.legacy_raw_root_project_id.as_deref(),
-            Some("914a8e53209dde45")
-        );
-        assert_eq!(
-            root.normalized_root_project_id_alias.as_deref(),
-            Some("e2562715b2c4b441")
-        );
+        assert!(versioned_repository_id(1, normalized).starts_with("repo-v1-"));
     }
 
     #[test]
@@ -1360,23 +1098,6 @@ mod tests {
             portable_reuse_status(Some("github.com/org/repo"), Some("tree"), true),
             (false, "git_worktree_dirty".into())
         );
-    }
-
-    #[test]
-    fn sidecar_project_identity_uses_canonical_id_only_when_clean_and_identifiable() {
-        let Some(project) = git_project() else {
-            return;
-        };
-
-        let clean = sidecar_project_identity(project.path(), "root-id".into());
-        assert!(clean.portable_reuse_eligible);
-        assert_eq!(clean.project_id, clean.canonical_repository_id.unwrap());
-
-        fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
-        let dirty = sidecar_project_identity(project.path(), "root-id".into());
-        assert!(!dirty.portable_reuse_eligible);
-        assert_eq!(dirty.portable_reuse_reason, "git_worktree_dirty");
-        assert_eq!(dirty.project_id, "root-id");
     }
 
     #[test]
@@ -1620,19 +1341,20 @@ mod tests {
 
     #[test]
     fn windows_normalization_is_an_alias_not_the_workspace_id() {
-        let identity =
-            workspace_root_identity_from_text(r"C:\Source\CodeStory\", r"\\?\C:\Source\CodeStory\");
-        let existing_canonical_id = fnv1a_hex(r"\\?\C:\Source\CodeStory\".as_bytes());
+        let canonical_id = fnv1a_hex(r"\\?\C:\Source\CodeStory\".as_bytes());
         let normalized_alias = fnv1a_hex("c:/source/codestory".as_bytes());
 
-        assert_eq!(identity.workspace_id, existing_canonical_id);
-        assert_eq!(
-            identity.normalized_root_project_id_alias.as_deref(),
-            Some(normalized_alias.as_str())
-        );
         assert_eq!(
             normalize_root_identity_text(r"\\?\C:\Source\CodeStory\"),
             "c:/source/codestory"
+        );
+        assert_eq!(
+            fnv_alias(
+                &normalize_root_identity_text(r"\\?\C:\Source\CodeStory\"),
+                &canonical_id
+            )
+            .as_deref(),
+            Some(normalized_alias.as_str())
         );
     }
 

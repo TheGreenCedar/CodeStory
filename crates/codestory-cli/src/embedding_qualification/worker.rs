@@ -5,8 +5,10 @@ use self::gate::{
     worker_error, write_atomic_json,
 };
 use self::operations::{
-    run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load, run_queue_load,
-    wait_for_owner_absence,
+    run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load,
+    run_measure_busy_retry, run_measure_hello, run_measure_product_query,
+    run_measure_resident_identity, run_measure_spawn_hello, run_measure_true_idle,
+    run_measure_vector_frame, run_queue_load, wait_for_owner_absence,
 };
 use self::protocol::run_raw_protocol_exchange;
 use crate::args::InternalEmbeddingQualificationCommand;
@@ -53,6 +55,20 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     if let Some(gate) = request.start_gate.as_deref() {
         validate_gate_path(gate, &directory)?;
     }
+    let is_measure_operation = request.operation.starts_with("measure_");
+    if !is_measure_operation
+        && (request.workload_id.is_some()
+            || request.repeat.is_some()
+            || request.retry_marker.is_some())
+    {
+        bail!("embedding_qualification_measurement_fields_unexpected");
+    }
+    if let Some(marker) = request.retry_marker.as_deref() {
+        validate_gate_path(marker, &directory)?;
+        if request.operation != "measure_busy_retry" {
+            bail!("embedding_qualification_retry_marker_unexpected");
+        }
+    }
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
     let clock = EmbeddingClientTransport::clock(&transport);
     if let Some(gate) = request.start_gate.as_deref() {
@@ -77,33 +93,38 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     if request.operation == "dead_client_load" {
         return run_dead_client_load(&runtime, request.parameters, clock.as_ref());
     }
-    let (result, protocol_exchange, queue_operations, engine_identity, error) =
-        if request.operation == "wait_for_absence" {
+    let (result, protocol_exchange, queue_operations, engine_identity, measurement, error) =
+        if is_measure_operation {
+            match run_measure_operation(&request, &runtime, &clock) {
+                Ok(measurement) => (None, None, None, None, Some(measurement), None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
+            }
+        } else if request.operation == "wait_for_absence" {
             match wait_for_owner_absence(&runtime, clock.as_ref()) {
-                Ok(result) => (Some(result), None, None, None, None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(result) => (Some(result), None, None, None, None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else if request.operation == "resident_identity" {
             match PerUserEmbeddingClient::for_runtime(&runtime)
                 .and_then(|client| client.ensure_resident())
             {
-                Ok(identity) => (None, None, None, Some(identity), None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(identity) => (None, None, None, Some(identity), None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else if request.operation == "activate_probe" {
             match run_activate_probe(&runtime, clock.as_ref()) {
-                Ok(error) => (None, None, None, None, Some(error)),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(error) => (None, None, None, None, None, Some(error)),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else if request.operation == "queue_load" {
             match run_queue_load(&runtime, request.parameters, Arc::clone(&clock)) {
-                Ok(operations) => (None, None, Some(operations), None, None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(operations) => (None, None, Some(operations), None, None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else if request.operation == "cold_race_query" {
             match run_cold_race_protocol_exchange(&runtime, clock.as_ref()) {
-                Ok(exchange) => (None, Some(exchange), None, None, None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(exchange) => (None, Some(exchange), None, None, None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else if matches!(
             request.operation.as_str(),
@@ -116,8 +137,8 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
                 _ => unreachable!("matched exact protocol operations"),
             };
             match run_raw_protocol_exchange(&runtime, clock.as_ref(), class, deadline_ms) {
-                Ok(exchange) => (None, Some(exchange), None, None, None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(exchange) => (None, Some(exchange), None, None, None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         } else {
             let qualification = codestory_retrieval::run_per_user_embedding_qualification(
@@ -130,8 +151,8 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
                 },
             );
             match qualification {
-                Ok(result) => (Some(result), None, None, None, None),
-                Err(error) => (None, None, None, None, Some(worker_error(&error))),
+                Ok(result) => (Some(result), None, None, None, None, None),
+                Err(error) => (None, None, None, None, None, Some(worker_error(&error))),
             }
         };
     let finished_ns = clock.now_ns();
@@ -156,7 +177,72 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
         protocol_exchange,
         queue_operations,
         engine_identity,
+        measurement,
         error,
     };
     write_atomic_json(&command.output, &output)
+}
+
+/// Dispatch one measurement operation. Measurement operations stamp the
+/// measurement protocol's declared start/end instants themselves and return
+/// the span with its suspend witness; the driver stamps the declared phase
+/// names onto the recorded sample.
+fn run_measure_operation(
+    request: &WorkerRequest,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    clock: &Arc<dyn codestory_retrieval::AwakeMonotonicClock>,
+) -> Result<codestory_retrieval::EmbeddingQualificationWorkerMeasurement> {
+    let workload_id = request
+        .workload_id
+        .as_deref()
+        .filter(|workload_id| !workload_id.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_measurement_workload_missing"))?;
+    let repeat = request
+        .repeat
+        .filter(|repeat| *repeat > 0)
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_measurement_repeat_missing"))?;
+    match request.operation.as_str() {
+        "measure_hello" => run_measure_hello(runtime, clock.as_ref()),
+        "measure_spawn_hello" => run_measure_spawn_hello(runtime, clock.as_ref()),
+        "measure_product_query" => run_measure_product_query(
+            runtime,
+            clock.as_ref(),
+            workload_id,
+            repeat,
+            request.parameters.input_bytes,
+        ),
+        "measure_query_frame" => run_measure_vector_frame(
+            runtime,
+            clock.as_ref(),
+            "query",
+            workload_id,
+            repeat,
+            &request.parameters,
+        ),
+        "measure_bulk_frame" => run_measure_vector_frame(
+            runtime,
+            clock.as_ref(),
+            "bulk",
+            workload_id,
+            repeat,
+            &request.parameters,
+        ),
+        "measure_resident_identity" => run_measure_resident_identity(runtime, clock.as_ref()),
+        "measure_true_idle" => run_measure_true_idle(runtime, clock.as_ref()),
+        "measure_busy_retry" => {
+            let marker = request
+                .retry_marker
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("embedding_qualification_retry_marker_missing"))?;
+            run_measure_busy_retry(
+                runtime,
+                Arc::clone(clock),
+                workload_id,
+                repeat,
+                request.parameters.input_bytes,
+                marker,
+            )
+        }
+        _ => bail!("embedding_qualification_measure_operation_unknown"),
+    }
 }

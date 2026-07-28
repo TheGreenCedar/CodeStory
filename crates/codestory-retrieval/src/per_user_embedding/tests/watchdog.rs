@@ -159,9 +159,25 @@ fn shutdown_with_stuck_initialization_keeps_watchdog_fail_stop_armed() {
 }
 
 #[test]
-fn background_engine_cleanup_marks_normal_shutdown_complete() {
+fn background_engine_cleanup_lets_the_watchdog_stand_down_without_a_fail_stop() {
     let state = test_server_state();
     state.draining.store(true, Ordering::Release);
+    let transport = Arc::new(WatchdogTransport {
+        clock: TestClock::new(),
+        fail_stops: AtomicUsize::new(0),
+    });
+    let watchdog = spawn_server_watchdog(
+        Arc::clone(&state),
+        transport.clone(),
+        EmbeddingServerBudgets {
+            idle_timeout: Duration::from_secs(60),
+            // Generous enough that only completed cleanup, never a virtual-clock
+            // timeout, can end the watchdog while the drain is in flight.
+            native_no_progress: Duration::from_secs(3600),
+            watchdog_poll: Duration::from_millis(1),
+        },
+    )
+    .expect("watchdog");
     let state_for_cleanup = Arc::clone(&state);
     let cleanup = thread::spawn(move || {
         state_for_cleanup.shutdown_engine();
@@ -169,6 +185,42 @@ fn background_engine_cleanup_marks_normal_shutdown_complete() {
     });
 
     cleanup.join().expect("cleanup completion");
+    watchdog.join().expect("watchdog completion");
 
+    assert_eq!(
+        transport.fail_stops.load(Ordering::Acquire),
+        0,
+        "a drain whose cleanup completes must not arm the fail-stop"
+    );
     assert!(state.stopped.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_stop_signal_ends_the_watchdog_sleep_without_waiting_out_the_cadence() {
+    use crate::per_user_embedding::scheduler::sleep_until_stopped;
+    use std::time::Instant;
+
+    let state = test_server_state();
+    // The shipped cadence is roughly 19 seconds. Shutdown joins this thread, so sleeping it in one
+    // call is what held the endpoint open long after the server stopped accepting.
+    let cadence = Duration::from_secs(19);
+
+    state.stopped.store(true, Ordering::Release);
+    let started = Instant::now();
+    assert!(
+        !sleep_until_stopped(&state, cadence),
+        "an already-stopped server must not begin another cycle"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stopping must not wait out the cadence, waited {:?}",
+        started.elapsed()
+    );
+
+    // A server that is still running consumes the whole cadence, so real polling is unchanged.
+    let running = test_server_state();
+    assert!(
+        sleep_until_stopped(&running, Duration::from_millis(250)),
+        "a running server keeps polling"
+    );
 }
