@@ -1,10 +1,5 @@
 {
   "schema_version": 1,
-  "cli_version": "0.16.1",
-  "release_tag": "v0.16.1",
-  "archives": {
-    "macos-arm64": "0074a2a7d2fe1047230414c7ea25f3b8d53a7cbbbfbee86329903ca11e5944b4",
-    "windows-x64": "f9885831a9e61c558c19987b9e65abf49a2dbc92cb6e775832d536bec0ca59d9",
-    "linux-x64": "1ad571e594ef0d00244e307e389d0d7a6a638bf168807e3d45d38cb875cd1480"
-  }
+  "cli_version": "0.16.2",
+  "release_tag": "v0.16.2"
 }
