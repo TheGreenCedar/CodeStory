@@ -675,26 +675,28 @@ pub(crate) fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> 
     ) && packet_terms_have_any(terms, &["use", "switch", "active", "current", "needed"])
 }
 
+/// A shell-install prompt needs an actual shell signal. "command"/"function" alone also describe a
+/// command server, and a shell requirement raised over a command-server prompt is unclosable: no
+/// citation in such a repository is a shell script, so the packet would report partial forever.
 pub(crate) fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["bash", "shell", "script", "function", "command", "commands"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "install",
-            "installer",
-            "bootstraps",
-            "bootstrap",
-            "download",
-            "downloads",
-            "completion",
-            "profile",
-            "source",
-            "sourced",
-            "use",
-        ],
-    ) && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
+    packet_terms_have_any(terms, &["bash", "shell", "sh", "zsh", "script", "scripts"])
+        && packet_terms_have_any(
+            terms,
+            &[
+                "install",
+                "installer",
+                "bootstraps",
+                "bootstrap",
+                "download",
+                "downloads",
+                "completion",
+                "profile",
+                "source",
+                "sourced",
+                "use",
+            ],
+        )
+        && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
 }
 
 pub(crate) fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {

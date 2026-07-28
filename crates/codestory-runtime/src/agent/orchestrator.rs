@@ -5813,7 +5813,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_uses_selected_plan_role_probes() {
+    fn planned_role_probes_stay_sufficiency_gaps_until_evidence_covers_their_requirement() {
         let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
         let plan = build_packet_plan_with_extra(
             question,
@@ -5876,15 +5876,36 @@ mod tests {
             PacketSufficiencyStatusDto::Partial,
             "{sufficiency:?}"
         );
+        // The same four HTML/JS anchors as before. They produce navigation prose over form files;
+        // none of them is evidence for a native constraint, a custom validator, or a submit guard,
+        // so all three requirements stay open and every planned probe for them stays a gap. Before
+        // this lane the wording of those navigation claims closed two of the three requirements and
+        // silently dropped their probes from the gap list.
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("submit prevent default")
-                    && !gap.contains("pattern")
-                    && !gap.contains("validity state")),
-            "only selected planned probes for still-missing roles should become sufficiency gaps: {sufficiency:?}"
+                .any(|gap| gap.contains("submit prevent default") && gap.contains("validity state")),
+            "planned probes for requirements no cited evidence reaches stay sufficiency gaps: {sufficiency:?}"
         );
+        let report = sufficiency
+            .coverage_report
+            .as_ref()
+            .expect("a partial packet carries a coverage report");
+        for requirement in [
+            "form_native_constraints",
+            "form_custom_validation",
+            "form_submit_guard",
+        ] {
+            assert!(
+                report.missing.iter().any(|entry| entry == requirement),
+                "an uncovered structural requirement stays missing: {report:?}"
+            );
+            assert!(
+                !report.covered.iter().any(|entry| entry == requirement),
+                "a requirement no cited evidence reaches must not be reported covered: {report:?}"
+            );
+        }
     }
 
     #[test]

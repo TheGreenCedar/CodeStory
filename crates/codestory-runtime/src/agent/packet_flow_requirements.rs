@@ -1,5 +1,23 @@
 //! Generic packet flow requirements shared by planning, probes, and sufficiency.
 
+use crate::agent::packet_evidence_carriers::{
+    citation_owns_buffer_read_write, citation_owns_buffer_storage,
+    citation_owns_client_request_finalization, citation_owns_client_request_method,
+    citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
+    citation_owns_css_animation_structure, citation_owns_css_structure,
+    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
+    citation_owns_form_submit_guard, citation_owns_format_arguments, citation_owns_format_errors,
+    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
+    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
+    citation_owns_html_app_shell, citation_owns_log_handler_processing,
+    citation_owns_log_record_creation, citation_owns_mapper_configuration,
+    citation_owns_mapper_execution, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_terminal,
+};
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
+};
 use crate::agent::packet_terms::{
     packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_command_dispatch_flow,
@@ -16,7 +34,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use codestory_contracts::api::PacketTaskClassDto;
+use codestory_contracts::api::{AgentCitationDto, PacketTaskClassDto};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlowRole {
@@ -31,6 +49,7 @@ pub(crate) enum FlowRole {
 }
 
 impl FlowRole {
+    #[cfg(test)]
     pub(crate) const fn role_id(self) -> &'static str {
         match self {
             Self::Entrypoint => "entrypoint",
@@ -66,15 +85,43 @@ pub(crate) enum CoverageMode {
     DiagnosticOnly,
 }
 
+/// What a packet must actually have *cited* for a requirement to count as covered.
+///
+/// A requirement's `FlowRole` describes where it sits in a flow; it is a label, not a test. Two
+/// requirements in one flow may share a role, so matching on the role alone let evidence for one
+/// close the other. An evidence predicate belongs to a single requirement and reads only the
+/// citation, never the claim's wording.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EvidencePredicate {
+    /// Covered by a citation the evidence-role classifier already places in this part of the flow.
+    CitedRoles(&'static [PacketEvidenceRole]),
+    /// Covered by a citation that passes a structural ownership check, used where the evidence
+    /// role is too coarse to separate a requirement from its siblings.
+    CitedCarrier(fn(&AgentCitationDto) -> bool),
+}
+
+impl EvidencePredicate {
+    pub(crate) fn citation_proves(self, citation: &AgentCitationDto) -> bool {
+        match self {
+            Self::CitedRoles(roles) => {
+                packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
+            }
+            Self::CitedCarrier(carrier) => carrier(citation),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FlowRequirement {
     pub id: &'static str,
     pub role: FlowRole,
     pub query_seeds: &'static [&'static str],
     pub coverage_mode: CoverageMode,
+    pub evidence: EvidencePredicate,
 }
 
 impl FlowRequirement {
+    #[cfg(test)]
     pub(crate) const fn role_id(&self) -> &'static str {
         self.role.role_id()
     }
@@ -293,12 +340,24 @@ const INDEXING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["indexing entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::IndexingWorkQueue,
+            PacketEvidenceRole::CommandEntrypoint,
+            PacketEvidenceRole::RuntimeOrchestration,
+        ]),
     },
     FlowRequirement {
         id: "indexing_storage",
         role: FlowRole::StateOrStorage,
         query_seeds: &["file discovery", "symbol extraction", "storage persistence"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::PersistenceAndSearchProjection,
+            PacketEvidenceRole::SymbolExtraction,
+            PacketEvidenceRole::SnapshotRefresh,
+            PacketEvidenceRole::WorkspaceDiscoveryAndPlanning,
+            PacketEvidenceRole::CandidateFileConstruction,
+        ]),
     },
 ];
 
@@ -308,18 +367,32 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Registration,
         query_seeds: &["request entrypoint", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::RouteHandling,
+            PacketEvidenceRole::AppServerRequestProtocol,
+        ]),
     },
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "handler dispatch", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::RequestDispatch,
+            PacketEvidenceRole::CommandDispatch,
+            PacketEvidenceRole::RuntimeOrchestration,
+        ]),
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response finalization", "transport send"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::TransportAdapter,
+            PacketEvidenceRole::EventOutputProcessing,
+            PacketEvidenceRole::BufferedIo,
+        ]),
     },
 ];
 
@@ -329,18 +402,24 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::ClientFactory,
+            PacketEvidenceRole::CommandEntrypoint,
+        ]),
     },
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::RequestDispatch]),
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response finalization", "transport send"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::TransportAdapter]),
     },
 ];
 
@@ -349,6 +428,7 @@ const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["interceptor handlers", "request interceptor"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedCarrier(packet_citation_owns_interceptor_management),
 };
 
 const URL_SESSION_FLOW: &[FlowRequirement] = &[
@@ -357,12 +437,23 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["session request creation", "request task resume"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::ClientFactory,
+            PacketEvidenceRole::AppServerRequestProtocol,
+            PacketEvidenceRole::CommandEntrypoint,
+        ]),
     },
     FlowRequirement {
         id: "session_callbacks",
         role: FlowRole::Dispatch,
         query_seeds: &["session delegate callbacks", "data request validation"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::RequestDispatch,
+            PacketEvidenceRole::EventLoop,
+            PacketEvidenceRole::RouteHandling,
+            PacketEvidenceRole::TransportAdapter,
+        ]),
     },
 ];
 
@@ -371,6 +462,7 @@ const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["http top level helper", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::ClientFactory]),
 };
 
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -378,6 +470,7 @@ const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["client convenience method", "client interface helper"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_method),
 };
 
 const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -385,6 +478,7 @@ const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement
     role: FlowRole::TransformOrValidate,
     query_seeds: &["request finalization", "transport-ready request object"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_finalization),
 };
 
 const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -392,6 +486,10 @@ const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["transport send", "client send implementation"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[
+        PacketEvidenceRole::TransportAdapter,
+        PacketEvidenceRole::RequestDispatch,
+    ]),
 };
 
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -399,6 +497,7 @@ const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequire
     role: FlowRole::TerminalBoundary,
     query_seeds: &["request response", "response stream boundary"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_response_materialization),
 };
 
 const HOOK_PUBLIC_EXPORT_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -406,6 +505,7 @@ const HOOK_PUBLIC_EXPORT_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["public hook export", "hook argument wrapper"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_public_export),
 };
 
 const HOOK_KEY_SERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -413,6 +513,7 @@ const HOOK_KEY_SERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::TransformOrValidate,
     query_seeds: &["key serialization", "serialize hook key"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_key_serialization),
 };
 
 const HOOK_CACHE_HELPER_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -420,6 +521,7 @@ const HOOK_CACHE_HELPER_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::StateOrStorage,
     query_seeds: &["cache helper", "cache state helper"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_cache_helper),
 };
 
 const HOOK_MUTATION_FLOW_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -427,6 +529,7 @@ const HOOK_MUTATION_FLOW_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["mutation helper", "mutate dispatch"],
     coverage_mode: CoverageMode::AllowsSourceRange,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_hook_mutation_flow),
 };
 
 const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -434,6 +537,10 @@ const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["server bootstrap", "command server entrypoint"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[
+        PacketEvidenceRole::CommandEntrypoint,
+        PacketEvidenceRole::RuntimeOrchestration,
+    ]),
 };
 
 const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -441,6 +548,7 @@ const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["event loop", "event loop source"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::EventLoop]),
 };
 
 const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -448,6 +556,7 @@ const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["network input", "network command input"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::NetworkCommandInput]),
 };
 
 const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -455,6 +564,10 @@ const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["command dispatch", "command table dispatch"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    evidence: EvidencePredicate::CitedRoles(&[
+        PacketEvidenceRole::CommandDispatch,
+        PacketEvidenceRole::RequestDispatch,
+    ]),
 };
 
 const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
@@ -463,12 +576,14 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["sql table definitions", "CREATE TABLE"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::SqlTableDefinition]),
     },
     FlowRequirement {
         id: "sql_relationships",
         role: FlowRole::Configuration,
         query_seeds: &["foreign key relationships", "schema constraints"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::SqlRelationshipConstraint]),
     },
 ];
 
@@ -478,6 +593,7 @@ const HTML_CSS_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["html app shell", "module script entry"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_html_app_shell),
     },
     FlowRequirement {
         id: "css_structure",
@@ -488,6 +604,7 @@ const HTML_CSS_FLOW: &[FlowRequirement] = &[
             "interactive element styles",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_css_structure),
     },
 ];
 
@@ -497,6 +614,7 @@ const CSS_ANIMATION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["animation stylesheet entrypoint", "css animation imports"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_css_animation_entrypoint),
     },
     FlowRequirement {
         id: "css_animation_structure",
@@ -507,6 +625,7 @@ const CSS_ANIMATION_FLOW: &[FlowRequirement] = &[
             "css animation keyframes",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_css_animation_structure),
     },
 ];
 
@@ -520,18 +639,21 @@ const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
             "validity state",
         ],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_form_native_constraint),
     },
     FlowRequirement {
         id: "form_custom_validation",
         role: FlowRole::TransformOrValidate,
         query_seeds: &["custom validation", "custom error rendering"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_form_custom_validation),
     },
     FlowRequirement {
         id: "form_submit_guard",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["submit prevent default", "submit invalid guard"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_form_submit_guard),
     },
 ];
 
@@ -541,18 +663,21 @@ const SHELL_INSTALL_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["shell installer bootstrap", "install download helpers"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_installer_bootstrap),
     },
     FlowRequirement {
         id: "shell_function_dispatch",
         role: FlowRole::Dispatch,
         query_seeds: &["shell function dispatch", "conditional version use"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_function_dispatch),
     },
     FlowRequirement {
         id: "shell_completion",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["shell completion"],
         coverage_mode: CoverageMode::DiagnosticOnly,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_shell_completion),
     },
 ];
 
@@ -562,12 +687,14 @@ const BUFFERED_IO_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["buffer storage", "source sink buffer"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_buffer_storage),
     },
     FlowRequirement {
         id: "buffered_read_write",
         role: FlowRole::Dispatch,
         query_seeds: &["source read buffer", "sink write buffer"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_buffer_read_write),
     },
 ];
 
@@ -577,6 +704,7 @@ const LOG_HANDLER_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["logger record", "record creation"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_log_record_creation),
     },
     FlowRequirement {
         id: "handler_processing",
@@ -587,6 +715,7 @@ const LOG_HANDLER_FLOW: &[FlowRequirement] = &[
             "handler interface",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_log_handler_processing),
     },
 ];
 
@@ -596,12 +725,14 @@ const SITE_BUILD_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["site build lifecycle", "site process phases"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_site_lifecycle),
     },
     FlowRequirement {
         id: "site_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["read generate render write", "renderer render"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_site_terminal),
     },
 ];
 
@@ -615,12 +746,14 @@ const MAPPER_PLAN_FLOW: &[FlowRequirement] = &[
             "type map plan",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_mapper_configuration),
     },
     FlowRequirement {
         id: "mapper_execution",
         role: FlowRole::Dispatch,
         query_seeds: &["mapping execution plan", "source destination mapping"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_mapper_execution),
     },
 ];
 
@@ -630,12 +763,14 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::TransformOrValidate,
         query_seeds: &["format arguments", "format output"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_format_arguments),
     },
     FlowRequirement {
         id: "format_errors",
         role: FlowRole::ErrorOrFallback,
         query_seeds: &["format error", "error formatting"],
         coverage_mode: CoverageMode::AllowsSourceRange,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_format_errors),
     },
 ];
 
@@ -645,6 +780,11 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["search entrypoint", "argument planning"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::SearchDriver,
+            PacketEvidenceRole::ArgumentPlanning,
+            PacketEvidenceRole::CommandEntrypoint,
+        ]),
     },
     FlowRequirement {
         id: "search_dispatch",
@@ -655,6 +795,10 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
             "search execution unit",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        evidence: EvidencePredicate::CitedRoles(&[
+            PacketEvidenceRole::SearchExecutionUnit,
+            PacketEvidenceRole::CandidateFileConstruction,
+        ]),
     },
 ];
 
