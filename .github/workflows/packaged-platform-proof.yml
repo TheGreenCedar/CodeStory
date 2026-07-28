@@ -127,9 +127,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install pinned Rust
+        # The toolchain is now read as a shell variable, which makes the script shell-dependent:
+        # this job's matrix includes windows-latest, where the runner default is pwsh.
+        shell: bash
         run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
           rustup target add "${{ matrix.rust_target }}"
 
       - name: Configure short Windows Cargo target
@@ -321,8 +324,8 @@ jobs:
         shell: bash
         run: |
           docker build --platform linux/amd64 \
-            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
-            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --build-arg "BUILD_IMAGE=$LINUX_GLIBC_BUILD_IMAGE" \
+            --build-arg "GLSLC_IMAGE=$LINUX_GLSLC_IMAGE" \
             --file .github/docker/linux-glibc-build.Dockerfile \
             --tag codestory-linux-glibc-build \
             .github/docker
@@ -354,6 +357,7 @@ jobs:
       - name: Build Linux x64 at the glibc 2.31 baseline
         id: linux-build
         if: matrix.asset_target == 'linux-x64'
+        shell: bash
         run: |
           test -x "$SCCACHE_PATH"
           mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"
@@ -739,6 +743,7 @@ jobs:
 
       - name: Package release asset
         if: runner.os != 'Windows'
+        shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
@@ -751,13 +756,14 @@ jobs:
 
       - name: Prove Linux x64 glibc 2.31 baseline
         if: matrix.asset_target == 'linux-x64'
+        shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "$PWD:/workspace" \
             --workdir /workspace \
-            "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
+            "$LINUX_GLIBC_BASELINE_IMAGE" \
             bash -lc '
               set -euo pipefail
               bash .github/scripts/check-linux-glibc-baseline.sh "$@"
@@ -778,15 +784,18 @@ jobs:
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'
+        shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz" \
             --checksum-file target/release-dist/SHA256SUMS.txt \
             --expected-version "$INPUT_VERSION" \
-            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" \
-            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-source-tree "$SOURCE_TREE" \
             --version-only \
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
@@ -840,6 +849,7 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           (inputs.calibration_mode ||
             inputs.quality_evidence_artifact != '')
+        shell: bash
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
           CALIBRATION_MODE: ${{ inputs.calibration_mode }}
@@ -948,13 +958,15 @@ jobs:
         shell: pwsh
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py `
             --archive "target/release-dist/codestory-cli-v$($env:INPUT_VERSION)-${{ matrix.asset_target }}.zip" `
             --checksum-file target/release-dist/SHA256SUMS.txt `
             --expected-version "$env:INPUT_VERSION" `
-            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" `
-            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" `
+            --expected-source-sha "$env:SOURCE_SHA" `
+            --expected-source-tree "$env:SOURCE_TREE" `
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
@@ -963,6 +975,8 @@ jobs:
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           set -euo pipefail
           archive="target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}"
@@ -973,8 +987,8 @@ jobs:
           {
             echo "### Fresh package identity"
             echo
-            echo "- Source SHA: \`${{ steps.source-identity.outputs.sha }}\`"
-            echo "- Source tree: \`${{ steps.source-identity.outputs.tree }}\`"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- Source tree: \`$SOURCE_TREE\`"
             echo "- Archive: \`$(basename "$archive")\`"
             echo "- Archive SHA-256: \`$archive_sha256\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -1075,9 +1089,10 @@ jobs:
           test -n "$INPUT_VERSION"
 
       - name: Install pinned Rust
+        shell: bash
         run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
           rustup target add x86_64-unknown-linux-gnu
 
       - name: Prepare checksum-pinned embedded model
@@ -1087,8 +1102,8 @@ jobs:
         shell: bash
         run: |
           docker build --platform linux/amd64 \
-            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
-            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --build-arg "BUILD_IMAGE=$LINUX_GLIBC_BUILD_IMAGE" \
+            --build-arg "GLSLC_IMAGE=$LINUX_GLSLC_IMAGE" \
             --file .github/docker/linux-glibc-build.Dockerfile \
             --tag codestory-linux-glibc-build \
             .github/docker

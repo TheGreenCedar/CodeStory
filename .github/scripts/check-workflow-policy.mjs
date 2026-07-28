@@ -1998,7 +1998,13 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
     "--trusted-producers",
     "codestory-release-closeout.mjs evaluate",
+    '--version "$RELEASE_VERSION"',
   ]);
+  // The version the ledger is filed under reaches the evaluator as a variable, so the command text
+  // alone no longer says which release it closed out.
+  requireStepEnv(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   const devRevalidation = namedStep(preCloseout, "Revalidate proof-only dev head");
   add(
     violations,
@@ -2087,6 +2093,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
   );
   violations.push(...catalogDeliveryOutcomeViolations(releaseFile, marketplacePublish, catalogDelivery));
+  // The version the catalog is pointed at reaches the push as a variable, so the command text no
+  // longer says which release it published. Both halves are pinned, as in the plugin lane.
+  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
+    '--version "$RELEASE_VERSION"',
+  ]);
+  requireStepEnv(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
     "build-marketplace-fixture.mjs",
     "--local-fixture true",
@@ -2167,7 +2181,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--trusted-producers",
     "--pre-publish-ledger",
     "codestory-release-closeout.mjs evaluate",
+    '--version "$RELEASE_VERSION"',
   ]);
+  requireStepEnv(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", {
+    RELEASE_VERSION: "${{ needs.preflight.outputs.version }}",
+  });
   requireStepUses(violations, releaseFile, postCloseout, "Upload accepted post-publish closeout", "actions/upload-artifact@v7.0.1");
   for (const [jobName, job] of [
     ["Metal proof", metal],
@@ -2608,21 +2626,30 @@ function validatePackagedProof(workflows, violations, graph) {
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     "CXXFLAGS=-std=c++17",
   ]);
-  for (const smokeStep of [
-    "Smoke packaged release asset",
-    "Smoke packaged release asset on Windows",
+  // The identity the smoke reads is the one `source-identity` proved against the dispatched ref,
+  // and it now arrives through `env:` rather than spliced into the command. Both halves are pinned:
+  // the script names the variable, and the variable names that step's output.
+  const sourceIdentityBindings = {
+    SOURCE_SHA: "${{ steps.source-identity.outputs.sha }}",
+    SOURCE_TREE: "${{ steps.source-identity.outputs.tree }}",
+  };
+  for (const [smokeStep, sha, tree] of [
+    ["Smoke packaged release asset", '"$SOURCE_SHA"', '"$SOURCE_TREE"'],
+    ["Smoke packaged release asset on Windows", '"$env:SOURCE_SHA"', '"$env:SOURCE_TREE"'],
   ]) {
     requireStepRun(violations, file, job, smokeStep, [
-      '--expected-source-sha "${{ steps.source-identity.outputs.sha }}"',
-      '--expected-source-tree "${{ steps.source-identity.outputs.tree }}"',
+      `--expected-source-sha ${sha}`,
+      `--expected-source-tree ${tree}`,
     ]);
+    requireStepEnv(violations, file, job, smokeStep, sourceIdentityBindings);
   }
   requireStepRun(violations, file, job, "Report fresh package identity", [
     "archive_sha256=",
-    "Source SHA:",
-    "Source tree:",
+    "Source SHA: \\`$SOURCE_SHA\\`",
+    "Source tree: \\`$SOURCE_TREE\\`",
     "Archive SHA-256:",
   ]);
+  requireStepEnv(violations, file, job, "Report fresh package identity", sourceIdentityBindings);
   add(
     violations,
     stepIndex(job, "Report fresh package identity")
@@ -2929,9 +2956,15 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
     );
   }
   requireStepRun(violations, file, job, installStepName, [
-    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
-    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
+    '--marketplace-source "$MARKETPLACE_SOURCE"',
+    '--local-fixture "$LOCAL_FIXTURE"',
   ]);
+  // The install arguments arrive as variables now, so the command text no longer says which
+  // delivery state they came from. This binds each variable back to that step's own output.
+  requireStepEnv(violations, file, job, installStepName, {
+    MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
+    LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
+  });
   return violations;
 }
 
@@ -3030,7 +3063,9 @@ function validatePostPublish(workflows, violations, graph) {
   );
   add(
     violations,
-    identityRun.includes('--arg installer "${{ steps.delivery.outputs.installer }}"'),
+    identityRun.includes('--arg installer "$DELIVERED_INSTALLER"')
+      && object(namedStep(job, "Emit authenticated post-publish release cells")?.env)
+        .DELIVERED_INSTALLER === "${{ steps.delivery.outputs.installer }}",
     `${file} post-publish cells must record the resolved delivery installer identity`,
   );
   for (const state of catalogDelivery.states) {
@@ -3042,25 +3077,48 @@ function validatePostPublish(workflows, violations, graph) {
   }
   const resolveInstalled = namedStep(job, resolveStepName);
   requireStepRun(violations, file, job, resolveStepName, [
-    'marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"',
+    'marketplace_revision="$MARKETPLACE_REVISION"',
     // Re-checked here as an immutable identity, not merely as 40 characters: this job is
     // dispatchable, so the published branch's revision can arrive from a human.
     `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
     '"@openai/codex@$CODEX_CLI_VERSION"',
     "install-codestory-marketplace-proof.mjs",
-    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+    '--marketplace-source "$MARKETPLACE_SOURCE"',
     '--marketplace-revision "$marketplace_revision"',
-    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
+    '--local-fixture "$LOCAL_FIXTURE"',
     '--source-repository "$GITHUB_WORKSPACE"',
     "install-attestation-v2.json",
     'isolated_home="$install_root/isolated-home"',
     'HOME="$isolated_home" node',
   ]);
+  // The install arguments arrive as variables, so the command text no longer says which delivery
+  // state produced them. Each variable is bound back to the step that resolved it.
+  requireStepEnv(violations, file, job, resolveStepName, {
+    MARKETPLACE_REVISION: "${{ steps.delivery.outputs.marketplace_revision }}",
+    MARKETPLACE_SOURCE: "${{ steps.delivery.outputs.marketplace_source }}",
+    LOCAL_FIXTURE: "${{ steps.delivery.outputs.local_fixture }}",
+  });
   add(
     violations,
     namedStep(job, "Prove packaged version, help, and stdio shape")?.shell === "bash",
     `${file} packaged Python proof must use Bash on every protected platform`,
   );
+  // The published asset this proof reads now arrives through `env:`, so the command text alone no
+  // longer says which archive or version it proved.
+  requireStepRun(violations, file, job, "Prove packaged version, help, and stdio shape", [
+    '--archive "$ASSET_ARCHIVE"',
+    '--checksum-file "$ASSET_CHECKSUM"',
+    '--expected-version "$RELEASE_VERSION"',
+  ]);
+  requireStepEnv(violations, file, job, "Prove packaged version, help, and stdio shape", {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+    ASSET_CHECKSUM: "${{ steps.asset.outputs.checksum }}",
+    RELEASE_VERSION: "${{ steps.release.outputs.version }}",
+  });
+  // The macOS signing proof quarantines and unpacks the same published archive.
+  requireStepEnv(violations, file, job, "Prove published macOS signature, notarization, and quarantined execution", {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+  });
   const resolveRun = executableRunText(String(resolveInstalled?.run ?? ""));
   for (const forbidden of [
     "git archive",
@@ -3082,7 +3140,8 @@ function validatePostPublish(workflows, violations, graph) {
       && resolveInstalled?.["continue-on-error"] === undefined,
     `${file} installed plugin resolution must be unconditional and fail closed`,
   );
-  const installed = namedStep(job, "Prove the catalog-resolved published runtime");
+  const installedProofName = "Prove the catalog-resolved published runtime";
+  const installed = namedStep(job, installedProofName);
   add(violations, installed !== undefined, `${file} installed runtime proof step is missing`);
   add(
     violations,
@@ -3098,7 +3157,7 @@ function validatePostPublish(workflows, violations, graph) {
   const installedRun = executableRunText(String(installed?.run ?? ""));
   for (const fragment of [
     "python .github/scripts/check-packaged-agent-proof.py",
-    '--archive "${{ steps.asset.outputs.archive }}"',
+    '--archive "$ASSET_ARCHIVE"',
     "--plugin-handoff",
     "--engine-policy accelerated",
     '--expected-backend "${{ matrix.backend }}"',
@@ -3115,6 +3174,16 @@ function validatePostPublish(workflows, violations, graph) {
       `${file} installed runtime proof must run ${fragment}`,
     );
   }
+  // The archive and the resolved installation now reach the proof as variables. Without these the
+  // command text would read the same whether it proved the published asset or something else.
+  requireStepEnv(violations, file, job, installedProofName, {
+    ASSET_ARCHIVE: "${{ steps.asset.outputs.archive }}",
+    ASSET_CHECKSUM: "${{ steps.asset.outputs.checksum }}",
+    RELEASE_VERSION: "${{ steps.release.outputs.version }}",
+    INSTALLED_PLUGIN_ROOT: "${{ steps.installed.outputs.plugin_root }}",
+    INSTALLED_ATTESTATION: "${{ steps.installed.outputs.attestation }}",
+    INSTALLED_PLUGIN_DATA: "${{ steps.installed.outputs.plugin_data }}",
+  });
   for (const fragment of ["--engine-policy cpu_explicit", "--expected-backend CPU", "--ground-only"]) {
     add(
       violations,
@@ -3256,15 +3325,20 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
     'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
-    'elif [ "${{ steps.resolve.outputs.mode }}" = "package" ]; then',
+    'elif [ "$RESOLVED_MODE" = "package" ]; then',
     'test "$REQUESTED_SCOPE" != none',
     'if [ "$REQUESTED_SCOPE" = auto ]; then',
-    'elif [ "${{ steps.resolve.outputs.mode }}" = "qualification" ]; then',
+    'elif [ "$RESOLVED_MODE" = "qualification" ]; then',
     'test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full',
     'scope="$REQUESTED_SCOPE"',
     "scope=full",
     "node .github/scripts/route-ci-proof.mjs --stdin",
   ]);
+  // The mode the scope selector branches on now arrives as a variable, so the branch text alone no
+  // longer says which mode it read. This binds the variable back to the resolver's own output.
+  requireStepEnv(violations, file, route, "Select change-aware proof scope", {
+    RESOLVED_MODE: "${{ steps.resolve.outputs.mode }}",
+  });
   add(
     violations,
     String(namedStep(route, "Select change-aware proof scope")?.run ?? "")
@@ -4582,9 +4656,56 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
   );
 }
 
-/// Every `${{ ... }}` in a piece of text, matched up to its own first `}}` so an expression that
-/// contains a single brace (`fromJSON('{"a":1}')`) is still bounded by its real terminator.
-const interpolations = /\$\{\{[\s\S]*?\}\}/gu;
+/// Every `${{ ... }}` in a piece of text, bounded by the `}}` that actually closes it.
+///
+/// A non-greedy `/\$\{\{[\s\S]*?\}\}/` stops at the first `}}` it sees, which is not always the
+/// terminator. GitHub's expression grammar puts braces inside expressions -- `fromJSON('{"a":1}')`
+/// carries one, and `format('{{Hello {0}}}', ...)`, the brace escape from GitHub's own expression
+/// documentation, carries a run of them. Against `${{ format('{{Hello {0}}}', inputs.ref) }}` the
+/// non-greedy form returned `${{ format('{{Hello {0}}`, which names no context at all, so a rule
+/// reading these spans saw a clean file and GitHub still spliced the input. Braces are counted
+/// here and the span ends at the `}}` that closes the expression itself.
+///
+/// Single-quoted literals are skipped whole, with `''` read as GitHub's escape for one quote, so a
+/// brace inside a string cannot move the count in either direction. Text that opens an expression
+/// and never closes it yields the rest of the text rather than nothing: an unreadable expression is
+/// not evidence that it is harmless.
+export function interpolationSpans(text) {
+  const source = String(text);
+  const spans = [];
+  let cursor = 0;
+  for (;;) {
+    const start = source.indexOf("${{", cursor);
+    if (start === -1) return spans;
+    let depth = 0;
+    let quoted = false;
+    let end = -1;
+    for (let index = start + 3; index < source.length; index += 1) {
+      const character = source[index];
+      if (quoted) {
+        if (character !== "'") continue;
+        if (source[index + 1] === "'") index += 1;
+        else quoted = false;
+        continue;
+      }
+      if (character === "'") quoted = true;
+      else if (character === "{") depth += 1;
+      else if (character === "}") {
+        if (depth > 0) depth -= 1;
+        else if (source[index + 1] === "}") {
+          end = index + 2;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      spans.push(source.slice(start));
+      return spans;
+    }
+    spans.push(source.slice(start, end));
+    cursor = end;
+  }
+}
 
 /// Any mention of the `inputs` context, however it is spelled. GitHub serves the same dispatched
 /// value under `inputs.version`, `github.event.inputs.version`, and `inputs['version']`, and an
@@ -4593,10 +4714,45 @@ const interpolations = /\$\{\{[\s\S]*?\}\}/gu;
 /// (`my_inputs`) is not the context.
 const namesADispatchInput = /\binputs\b/u;
 
+/// The contexts a dispatched value can be standing in when a script reads it one hop later. Each
+/// one is a channel, not a value: nothing at the reading site says what was put into it.
+///
+/// `env` -- a workflow-, job-, or step-level `env:` entry may be bound to `${{ inputs.x }}`, and
+///   `${{ env.NAME }}` in a script is then the input, spliced as text. This PR alone created 117
+///   step-level `env:` bindings carrying inputs, so this is the shape the next author reaches for.
+/// `steps.*.outputs.*` -- a step that receives an input can write it to `$GITHUB_OUTPUT`, and the
+///   consuming `${{ steps.x.outputs.y }}` is again text.
+/// `needs.*.outputs.*` -- a job output is a step output that crossed a job boundary.
+///
+/// The remedy is the same one #1566 applied 117 times: bind the value in `env:` and read `$NAME`.
+/// For `env` specifically it costs nothing at all -- a workflow- or job-level `env:` entry is
+/// already exported into the shell, so `$NAME` is available with no new binding.
+///
+/// Not claimed here: `github.*` can carry attacker-authored text (a pull request title), which is a
+/// different surface with a different argument. `matrix.*` can be built from an input, which is
+/// pinned where the matrix is built (`fromJSON` over a fixed set of literals) rather than here.
+const launderingContexts = [
+  [/\benv\b/u, "env"],
+  [/\bsteps\b[\s\S]*\boutputs\b/u, "a step output"],
+  [/\bneeds\b[\s\S]*\boutputs\b/u, "a job output"],
+];
+
 export function interpolatedDispatchInputs(run) {
-  return [...String(run).matchAll(interpolations)]
-    .map(match => match[0])
-    .filter(expression => namesADispatchInput.test(expression));
+  return interpolationSpans(run).filter(expression => namesADispatchInput.test(expression));
+}
+
+/// Every interpolation in `run` that reaches a dispatched value, paired with why it can.
+export function interpolatedInputChannels(run) {
+  const found = [];
+  for (const expression of interpolationSpans(run)) {
+    if (namesADispatchInput.test(expression)) {
+      found.push([expression, "a dispatch input"]);
+      continue;
+    }
+    const laundering = launderingContexts.find(([pattern]) => pattern.test(expression));
+    if (laundering !== undefined) found.push([expression, laundering[1]]);
+  }
+  return found;
 }
 
 /// Dispatched values must reach a script through `env:`, never through the script's own text.
@@ -4615,6 +4771,12 @@ export function interpolatedDispatchInputs(run) {
 ///
 /// The rule reads `run:` only. A dispatched value in an action input (`with.ref`) or an `if:` is a
 /// different surface with a different argument, pinned separately where it belongs.
+///
+/// Naming the `inputs` context alone was not enough. The context is only where the value is at the
+/// moment the rule looks: an author who binds it into `env:` and reads `${{ env.NAME }}` one line
+/// later, or writes it to `$GITHUB_OUTPUT` and reads `${{ steps.x.outputs.y }}` one step later, has
+/// rebuilt #1566 with the gate green. The channels a dispatched value can be sitting in are refused
+/// with it, so closing the surface does not depend on spotting where the value came from.
 export function dispatchInputInterpolationViolations(workflows) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -4623,12 +4785,118 @@ export function dispatchInputInterpolationViolations(workflows) {
         const step = object(rawStep);
         if (typeof step.run !== "string") continue;
         const named = step.name ? ` (${step.name})` : "";
-        for (const expression of new Set(interpolatedDispatchInputs(step.run))) {
+        const seen = new Set();
+        for (const [expression, channel] of interpolatedInputChannels(step.run)) {
+          if (seen.has(expression)) continue;
+          seen.add(expression);
           violations.push(
             `${file} jobs.${jobId}.steps.${index}${named} must read ${expression}`
-              + " from step env, not interpolated script text",
+              + ` from step env, not interpolated script text: it carries ${channel}`,
           );
         }
+      }
+    }
+  }
+  return violations;
+}
+
+/// Routing a value through `env:` moves the read from GitHub's interpolator into the shell, so the
+/// script stops being shell-independent the moment it does.
+///
+/// `${{ env.NAME }}` is spliced before any shell exists and reads the same everywhere. `"$NAME"` is
+/// a bash read; under pwsh -- the runner default on Windows -- it is the literal `$NAME` if it
+/// resolves to anything at all, and the correct read is `$env:NAME`. So a step that consumes a
+/// binding on a job that can land on a Windows runner has to say which shell it was written for.
+/// Every affected step in this repository declares one; this keeps that true, because the failure
+/// mode is a proof that silently compares against an empty string rather than an error.
+export function shellDependentBindingViolations(workflows) {
+  const violations = [];
+  const bashRead = name => new RegExp(`\\$\\{?${name}\\b`, "u");
+  for (const [file, workflow] of workflows) {
+    const workflowShell = at(workflow, "defaults", "run", "shell");
+    for (const [jobId, rawJob] of Object.entries(object(workflow.jobs))) {
+      const job = object(rawJob);
+      // `runs-on` is often an expression, so the platform is not always readable here. Anything
+      // that is not a literal non-Windows label is treated as reaching Windows.
+      const label = JSON.stringify(job["runs-on"] ?? "");
+      const known = /^"(ubuntu|macos)[\w.-]*"$/u.test(label);
+      if (known) continue;
+      const jobShell = at(job, "defaults", "run", "shell") ?? workflowShell;
+      for (const [index, rawStep] of list(job.steps).entries()) {
+        const step = object(rawStep);
+        if (typeof step.run !== "string") continue;
+        if ((step.shell ?? jobShell) !== undefined) continue;
+        const bound = Object.keys(object(step.env))
+          .concat(Object.keys(object(job.env)), Object.keys(object(workflow.env)))
+          .filter(name => bashRead(name).test(step.run)
+            && !new RegExp(`\\$env:${name}\\b`, "u").test(step.run));
+        if (bound.length === 0) continue;
+        const named = step.name ? ` (${step.name})` : "";
+        violations.push(
+          `${file} jobs.${jobId}.steps.${index}${named} reads ${bound.sort().join(", ")}`
+            + " as a shell variable on a job that can run on Windows and must declare its shell",
+        );
+      }
+    }
+  }
+  return violations;
+}
+
+/// A script that absorbs its own failure has to hand that failure to something that does not.
+///
+/// `continue-on-error` lives outside the script, so nothing the script's own text asserts can see
+/// it, and it turns a gate's `exit 1` into advice. Putting it on plugin-static.yml's
+/// `Check workflow policy` step would silence this file and its whole test suite while the run
+/// still reported green -- the commands that step runs are pinned, its blocking-ness was not.
+///
+/// The rule is not "gates must be blocking", because the repository has scripts that deliberately
+/// are not: source-proof compiles and lints under `continue-on-error` so a later step can save the
+/// cache before failing the job, and both release lanes push the marketplace catalog that way so a
+/// credential problem cannot strand an already-published release. What those have and a silenced
+/// gate does not is a *successor*: an `id:`, and another step that reads `steps.<id>.outcome` and
+/// fails on it. So absorbing a failure is allowed exactly when the failure is still required
+/// somewhere, and a step that absorbs its failure into nothing is refused.
+///
+/// Scoped to `run:` steps. The optional cache restores are `uses:` steps whose miss is the normal
+/// path and carries no outcome to require -- their non-blocking-ness is separately required, and
+/// this rule must not contradict that.
+export function absorbedFailureViolations(workflows) {
+  const violations = [];
+  const absorbs = value => value !== undefined && value !== false;
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, rawJob] of Object.entries(object(workflow.jobs))) {
+      const job = object(rawJob);
+      // A job-level `continue-on-error` downgrades every step it contains at once, and the only
+      // thing that can still require the failure is a downstream job reading `needs.<id>.result`.
+      if (absorbs(job["continue-on-error"])) {
+        add(
+          violations,
+          scalarStrings(workflow.jobs).some(text => text.includes(`needs.${jobId}.result`)),
+          `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
+        );
+      }
+      const steps = list(job.steps).map(step => object(step));
+      // Reading the outcome is not requiring it. `if: steps.x.outcome == 'success'` only decides
+      // whether the reader runs, and a skipped step is not a failed job; a reader that absorbs its
+      // own failure cannot fail the job on what it read either, so it just moves the same question
+      // one step along. A successor is therefore a blocking step that receives the outcome
+      // somewhere other than its own `if:` -- where a script can still `test` it and exit non-zero.
+      const requires = outcome => steps.some(other => {
+        if (absorbs(other["continue-on-error"])) return false;
+        const consumed = { ...other };
+        delete consumed.if;
+        return scalarStrings(consumed).some(text => text.includes(outcome));
+      });
+      for (const [index, step] of steps.entries()) {
+        if (typeof step.run !== "string") continue;
+        if (!absorbs(step["continue-on-error"])) continue;
+        const named = step.name ? ` (${step.name})` : "";
+        add(
+          violations,
+          typeof step.id === "string" && requires(`steps.${step.id}.outcome`),
+          `${file} jobs.${jobId}.steps.${index}${named} absorbs its own failure and must have`
+            + " an id whose outcome a later blocking step requires",
+        );
       }
     }
   }
@@ -5285,7 +5553,7 @@ export function validateMarketplaceSync(workflows, violations) {
   add(
     violations,
     scalarStrings(workflow)
-      .flatMap(text => [...text.matchAll(/\$\{\{[^}]*\binputs\b[^}]*\}\}/gu)].map(match => match[0]))
+      .flatMap(text => interpolatedDispatchInputs(text))
       .every(expression => Object.values(bindings).includes(expression)),
     `${file} must name a dispatch input only as ${bindings.INPUT_COMMIT} or ${bindings.INPUT_VERSION}`,
   );
@@ -5343,7 +5611,7 @@ export function validateMarketplaceSync(workflows, violations) {
       }
       add(
         violations,
-        !scalarStrings(surfaces).some(text => /\$\{\{[^}]*\binputs\b/u.test(text)),
+        !scalarStrings(surfaces).some(text => interpolatedDispatchInputs(text).length > 0),
         `${where} must not splice a dispatch input into an action input`,
       );
       for (const [name, expected] of Object.entries(bindings)) {
@@ -5417,6 +5685,8 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validateReleaseCellUploadOwnership(workflows, violations);
   validateReleaseArtifactRerunSafety(workflows, violations);
   violations.push(...dispatchInputInterpolationViolations(workflows));
+  violations.push(...shellDependentBindingViolations(workflows));
+  violations.push(...absorbedFailureViolations(workflows));
   violations.push(...annotationScopeViolations(workflows));
   violations.push(...lostRunnerRecoveryViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));

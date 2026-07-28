@@ -380,6 +380,8 @@ jobs:
         env:
           CODEX_CLI_VERSION: "0.144.5"
           MARKETPLACE_REVISION: ${{ steps.delivery.outputs.marketplace_revision }}
+          MARKETPLACE_SOURCE: ${{ steps.delivery.outputs.marketplace_source }}
+          LOCAL_FIXTURE: ${{ steps.delivery.outputs.local_fixture }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -395,10 +397,10 @@ jobs:
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source "${{ steps.delivery.outputs.marketplace_source }}" \
+            --marketplace-source "$MARKETPLACE_SOURCE" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$MARKETPLACE_REVISION" \
-            --local-fixture "${{ steps.delivery.outputs.local_fixture }}" \
+            --local-fixture "$LOCAL_FIXTURE" \
             --expected-version "$INPUT_VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json"

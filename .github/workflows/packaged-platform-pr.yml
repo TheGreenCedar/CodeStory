@@ -225,28 +225,29 @@ jobs:
         env:
           BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          RESOLVED_MODE: ${{ steps.resolve.outputs.mode }}
           REQUESTED_SCOPE: ${{ inputs.scope || 'auto' }}
         run: |
           set -euo pipefail
-          if [ "${{ steps.resolve.outputs.mode }}" = "integration" ]; then
+          if [ "$RESOLVED_MODE" = "integration" ]; then
             if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then
               scope="$REQUESTED_SCOPE"
             else
               scope=full
             fi
-          elif [ "${{ steps.resolve.outputs.mode }}" = "package" ]; then
+          elif [ "$RESOLVED_MODE" = "package" ]; then
             test "$REQUESTED_SCOPE" != none
             if [ "$REQUESTED_SCOPE" = auto ]; then
               scope=full
             else
               scope="$REQUESTED_SCOPE"
             fi
-          elif [ "${{ steps.resolve.outputs.mode }}" = "qualification" ]; then
+          elif [ "$RESOLVED_MODE" = "qualification" ]; then
             test "$REQUESTED_SCOPE" = auto || test "$REQUESTED_SCOPE" = full
             scope=full
-          elif [ "${{ steps.resolve.outputs.mode }}" = "calibration" ]; then
+          elif [ "$RESOLVED_MODE" = "calibration" ]; then
             scope=none
-          elif [ "${{ steps.resolve.outputs.mode }}" = "release-evidence" ]; then
+          elif [ "$RESOLVED_MODE" = "release-evidence" ]; then
             scope=none
           else
             scope="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" | node .github/scripts/route-ci-proof.mjs --stdin --requested "$REQUESTED_SCOPE")"
