@@ -756,6 +756,9 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     draftStep(packagedJob(workflow), "Capture reusable build cache contract");
 
   const mutations = [
+    ["release workflow policy loses its full history", releaseFile, workflow => {
+      delete workflow.jobs["workflow-policy"].steps[0].with;
+    }, /workflow-policy must check out full history for the reuse-binding contracts/u],
     ["source compiler restore becomes exact-SHA-only", sourceFile, workflow => {
       draftStep(sourceJob(workflow), "Restore compatible compiler objects")
         .with["restore-keys"] = "${{ steps.build-cache.outputs.compiler-key }}";

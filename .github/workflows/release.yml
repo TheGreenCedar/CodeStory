@@ -45,6 +45,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # The reuse-binding contracts verify tree identity and native
+          # fingerprints against this repository's real release history, so the
+          # default depth-1 clone cannot answer them.
+          fetch-depth: 0
 
       - name: Install workflow policy dependencies
         run: npm ci --ignore-scripts
