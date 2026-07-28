@@ -2,12 +2,14 @@ use super::request::{
     QualificationContracts, QualificationPackage, QualificationRuntime, QualificationSource,
 };
 use anyhow::{Context, Result, bail};
+use codestory_workspace::atomic_file::{PublishNewFileError, publish_new_private_file_atomic};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Names the temporaries this protocol leaves beside a publication, so a
+/// half-written qualification document is recognisable as one.
+const QUALIFICATION_TEMP_PREFIX: &str = "codestory-qualification";
 
 #[derive(Debug, Serialize)]
 pub(super) struct QualificationRawOutput {
@@ -39,6 +41,15 @@ pub(super) struct QualificationScenarioSummary {
     pub(super) event_count: u64,
 }
 
+/// Publish a qualification document at `path`, which must not already exist.
+///
+/// The driver writes the same protocol the worker reads, so this states the
+/// same contract as `codestory_cli`'s `write_atomic_json` - private-directory
+/// proof, refusal to republish, pretty body with a trailing newline - and
+/// reaches the publication mechanism at the same owner,
+/// [`codestory_workspace::atomic_file`]. The two used to carry byte-identical
+/// copies of that mechanism, which is why one Windows defect had to be fixed
+/// twice.
 pub(super) fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path
         .parent()
@@ -47,75 +58,26 @@ pub(super) fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<(
     if path.exists() {
         bail!("embedding_qualification_output_exists");
     }
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let bytes = serde_json::to_vec_pretty(value).context("serialize qualification output")?;
-    for _ in 0..32 {
-        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let temp = parent.join(format!(
-            ".codestory-qualification-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+    let mut bytes = serde_json::to_vec_pretty(value).context("serialize qualification output")?;
+    bytes.push(b'\n');
+    match publish_new_private_file_atomic(path, QUALIFICATION_TEMP_PREFIX, &bytes) {
+        Ok(()) => Ok(()),
+        Err(PublishNewFileError::NoParent) => {
+            bail!("atomic qualification output has no parent")
         }
-        let mut file = match options.open(&temp) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error).context("create atomic qualification temp file"),
-        };
-        let result = (|| {
-            file.write_all(&bytes)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, path)?;
-            sync_published_directory(parent)?;
-            Ok::<_, std::io::Error>(())
-        })();
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temp);
-            return Err(error).context("publish atomic qualification output");
+        Err(PublishNewFileError::UnsafeTempPrefix) => {
+            bail!("embedding_qualification_temp_prefix_unsafe")
         }
-        return Ok(());
+        Err(PublishNewFileError::TempNamesExhausted) => {
+            bail!("embedding_qualification_temp_name_exhausted")
+        }
+        Err(PublishNewFileError::CreateTemp(error)) => {
+            Err(error).context("create atomic qualification temp file")
+        }
+        Err(PublishNewFileError::Publish(error)) => {
+            Err(error).context("publish atomic qualification output")
+        }
     }
-    bail!("embedding_qualification_temp_name_exhausted")
-}
-
-/// Make an already-published name durable.
-///
-/// The rename is what makes the publication atomic; this step only decides
-/// whether the new directory entry survives a crash, so it must never be able
-/// to fail a publication that already happened. Unix fsyncs the parent
-/// directory. Windows skips it, because `File::open` does not pass
-/// `FILE_FLAG_BACKUP_SEMANTICS` and `CreateFileW` therefore refuses a directory
-/// with `ERROR_ACCESS_DENIED` - that denial, not the rename, is what failed the
-/// publish.
-///
-/// Opening the directory properly is not the fix. Windows documents no
-/// directory-fsync contract, and the behaviour bears that out: measured on
-/// windows 11 26200 / NTFS, with and without backup-class privileges,
-/// `FlushFileBuffers` on a backup-semantics handle is denied when the handle is
-/// `GENERIC_READ` and accepted when it is `GENERIC_WRITE`, so what it would
-/// commit is an accident of access mode rather than a guarantee. Skipping the
-/// step is what every other atomic publisher here already does
-/// (`codestory_workspace::atomic_file`, `codestory_cli::native_launcher`,
-/// `native_staging`, `codestory_store::sync_promotion_parent`,
-/// `sync_qualification_directory`); these two copies did not. Windows rename
-/// durability, if it is ever wanted, comes from
-/// `MoveFileExW(.., MOVEFILE_WRITE_THROUGH)` - which `native_launcher` already
-/// uses - not from a directory fsync.
-#[cfg(not(windows))]
-fn sync_published_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_published_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -126,21 +88,22 @@ mod tests {
     #[test]
     fn publishing_an_artifact_succeeds_and_leaves_only_the_complete_file() {
         // Regression: calibration run 30304210146, windows-x64 vulkan cell.
-        // The driver shares this publish shape with the worker
+        // The driver shared this publish shape with the worker
         // (`codestory-cli/src/embedding_qualification/worker/gate.rs`), whose
         // copy exited 1 with `publish atomic qualification output: Access is
         // denied. (os error 5)` after its rename had already succeeded: the
         // post-rename durability step opened the parent directory with
         // `File::open`, which Windows refuses without
-        // FILE_FLAG_BACKUP_SEMANTICS. This asserts the publication reports its
-        // own success, that the destination holds the whole document, and that
-        // the temporary is consumed by the rename rather than left beside it.
+        // FILE_FLAG_BACKUP_SEMANTICS.
         //
-        // Its revert value is windows-only. On unix the reverted body is
-        // exactly the `#[cfg(not(windows))]` arm this still exercises, so a
-        // unix-only lane passes with or without the fix and gives this change
-        // no regression protection; the revert-proof was run on windows 11
-        // 26200, where it fails with the calibration error.
+        // The step now lives once, in
+        // `codestory_workspace::atomic_file::sync_parent_directory`, and
+        // reverting it is proven there. What this covers is the wrapper: that
+        // the driver still reaches that mechanism, that the published document
+        // is whole and pretty-printed with a trailing newline, that the
+        // temporary is consumed by the rename, and that a second publication
+        // is refused with the `embedding_qualification_output_exists` code the
+        // packaged-proof scripts read.
         let directory = tempfile::tempdir().expect("qualification output directory");
         // The producer publishes into a private directory; reproduce that here
         // so the publish is exercised, not the private-directory guard.
@@ -172,6 +135,15 @@ mod tests {
         assert!(
             residue.is_empty(),
             "publish left temporaries beside the artifact: {residue:?}"
+        );
+
+        let republished = write_atomic_json(&path, &value)
+            .expect_err("a published artifact must not be republished");
+        assert!(
+            republished
+                .to_string()
+                .contains("embedding_qualification_output_exists"),
+            "unexpected refusal: {republished:?}"
         );
     }
 }

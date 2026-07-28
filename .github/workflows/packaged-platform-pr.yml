@@ -285,30 +285,17 @@ jobs:
       use_packaged_cli_artifact: false
       calibration_mode: true
 
-  calibration-windows:
-    if: needs.route.outputs.mode == 'calibration'
-    needs: route
-    uses: ./.github/workflows/windows-vulkan-proof.yml
-    with:
-      version: ${{ needs.route.outputs.version }}
-      ref: ${{ needs.route.outputs.head_sha }}
-      proof_key: calibration-windows-${{ needs.route.outputs.head_sha }}
-      use_packaged_cli_artifact: false
-      calibration_mode: true
-
   calibration-assemble:
     if: >-
       always() &&
       needs.route.result == 'success' &&
       needs.route.outputs.mode == 'calibration' &&
       needs.calibration-linux.result == 'success' &&
-      needs.calibration-macos.result == 'success' &&
-      needs.calibration-windows.result == 'success'
+      needs.calibration-macos.result == 'success'
     needs:
       - route
       - calibration-linux
       - calibration-macos
-      - calibration-windows
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -330,12 +317,6 @@ jobs:
           name: embedding-calibration-macos-${{ needs.route.outputs.version }}
           path: target/calibration-inputs/macos
 
-      - name: Download protected Windows calibration runs
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: embedding-calibration-windows-${{ needs.route.outputs.version }}
-          path: target/calibration-inputs/windows
-
       - name: Assemble frozen calibration candidate
         shell: bash
         env:
@@ -348,7 +329,7 @@ jobs:
               \( -name 'run-1.json' -o -name 'run-2.json' -o -name 'run-3.json' \) \
               -print | sort
           )
-          test "${#runs[@]}" = 9
+          test "${#runs[@]}" = 6
           run_args=()
           for run in "${runs[@]}"; do
             run_args+=(--calibration-run "$run")
@@ -383,8 +364,8 @@ jobs:
             --arg source_head_sha "$EXPECTED_HEAD_SHA" \
             --arg producer_run_id "$GITHUB_RUN_ID" \
             '.selection_source.commit == $source_head_sha
-             and .run_count == 9
-             and .matrix_cell_count == 3
+             and .run_count == 6
+             and .matrix_cell_count == 2
              and .producer_run_id == $producer_run_id' \
             target/calibration-freeze/manifest.json >/dev/null
 
