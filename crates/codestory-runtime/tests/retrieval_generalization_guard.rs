@@ -1478,6 +1478,11 @@ fn identifier_word_shapes(token: &str) -> Vec<(&'static str, String)> {
         // Digit glue: the other invisible break.
         ("digit_suffix", format!("{lower}2")),
         ("digit_prefix", format!("rank2{capital}")),
+        // A digit followed by a *lowercase* token is the same break as
+        // `rank2Swr`, and the lint already reads it -- but until it is
+        // enumerated here nothing fails if that stops being true, so the
+        // shape could be lost in silence the way the earlier ones were.
+        ("digit_then_lower", format!("rank2{lower}")),
     ]
 }
 
