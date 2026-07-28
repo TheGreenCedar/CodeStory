@@ -164,9 +164,9 @@ pub(super) fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<(
 /// `FlushFileBuffers` on a backup-semantics handle is denied when the handle is
 /// `GENERIC_READ` and accepted when it is `GENERIC_WRITE`, so what it would
 /// commit is an accident of access mode rather than a guarantee. Skipping the
-/// step is what every other atomic publisher here already does
-/// (`codestory_workspace::atomic_file`, `codestory_cli::native_launcher`,
-/// `native_staging`, `codestory_store::sync_promotion_parent`,
+/// step is what every other atomic publisher here already does (the workspace
+/// crate's `atomic_file`, this crate's `native_launcher` and `native_staging`,
+/// the store crate's promotion-parent sync, and
 /// `sync_qualification_directory`); these two copies did not. Windows rename
 /// durability, if it is ever wanted, comes from
 /// `MoveFileExW(.., MOVEFILE_WRITE_THROUGH)` - which `native_launcher` already
