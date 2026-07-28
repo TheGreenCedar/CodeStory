@@ -739,16 +739,20 @@ jobs:
 
       - name: Package release asset
         if: runner.os != 'Windows'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           bin="target/${{ matrix.rust_target }}/release/codestory-cli"
           python .github/scripts/package-codestory-release.py \
-            --version "${{ inputs.version }}" \
+            --version "$INPUT_VERSION" \
             --target "${{ matrix.asset_target }}" \
             --binary "$bin" \
             --out-dir target/release-dist
 
       - name: Prove Linux x64 glibc 2.31 baseline
         if: matrix.asset_target == 'linux-x64'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "$PWD:/workspace" \
@@ -758,8 +762,8 @@ jobs:
               set -euo pipefail
               bash .github/scripts/check-linux-glibc-baseline.sh "$@"
             ' bash \
-              "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \
-              "${{ inputs.version }}" \
+              "target/release-dist/codestory-cli-v${INPUT_VERSION}-linux-x64.tar.gz" \
+              "$INPUT_VERSION" \
               target/linux-glibc-baseline \
               "glibc 2.31"
 
@@ -774,11 +778,13 @@ jobs:
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz" \
             --checksum-file target/release-dist/SHA256SUMS.txt \
-            --expected-version "${{ inputs.version }}" \
+            --expected-version "$INPUT_VERSION" \
             --expected-source-sha "${{ steps.source-identity.outputs.sha }}" \
             --expected-source-tree "${{ steps.source-identity.outputs.tree }}" \
             --version-only \
@@ -837,14 +843,17 @@ jobs:
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
           CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          INPUT_VERSION: ${{ inputs.version }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           common_args=(
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz"
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz"
             --checksum-file target/release-dist/SHA256SUMS.txt
-            --expected-version "${{ inputs.version }}"
+            --expected-version "$INPUT_VERSION"
             --project "${{ github.workspace }}"
             --plugin-root plugins/codestory
             --plugin-handoff
@@ -884,8 +893,8 @@ jobs:
             --qualification-driver target/release/codestory_embedding_qualification \
             --qualification-evidence target/packaged-agent-proof/qualification.json \
             --calibration-bundle "$calibration_bundle" \
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
+            --calibration-producer-run-id "$CALIBRATION_RUN_ID" \
+            --calibration-producer-artifact "$CALIBRATION_ARTIFACT" \
             --retrieval-quality-evidence "$quality_path" \
             --out-dir target/packaged-agent-proof
 
@@ -924,10 +933,12 @@ jobs:
       - name: Package release asset on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           $bin = Join-Path $env:CARGO_TARGET_DIR "${{ matrix.rust_target }}/release/codestory-cli${{ matrix.exe_suffix }}"
           python .github/scripts/package-codestory-release.py `
-            --version "${{ inputs.version }}" `
+            --version "$env:INPUT_VERSION" `
             --target "${{ matrix.asset_target }}" `
             --binary $bin `
             --out-dir target/release-dist
@@ -935,11 +946,13 @@ jobs:
       - name: Smoke packaged release asset on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py `
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.zip" `
+            --archive "target/release-dist/codestory-cli-v$($env:INPUT_VERSION)-${{ matrix.asset_target }}.zip" `
             --checksum-file target/release-dist/SHA256SUMS.txt `
-            --expected-version "${{ inputs.version }}" `
+            --expected-version "$env:INPUT_VERSION" `
             --expected-source-sha "${{ steps.source-identity.outputs.sha }}" `
             --expected-source-tree "${{ steps.source-identity.outputs.tree }}" `
             --version-only `
@@ -948,9 +961,11 @@ jobs:
       - name: Report fresh package identity
         id: fresh-package
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          archive="target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
+          archive="target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}"
           archive_sha256="$(
             python -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' \
               "$archive"
@@ -982,19 +997,22 @@ jobs:
       - name: Emit authenticated package release cell
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
-            --version "${{ inputs.version }}" \
+            --expected-sha "$INPUT_REF" \
+            --version "$INPUT_VERSION" \
             --cell-id "package_identity:${{ matrix.asset_target }}" \
             --producer-workflow .github/workflows/packaged-platform-proof.yml \
             --producer-job build \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --producer-artifact "release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT" \
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
             --out "target/release-cells/package_identity-${{ matrix.asset_target }}.json"
 
       - name: Upload authenticated package release cell
@@ -1049,9 +1067,12 @@ jobs:
 
       - name: Require exact frozen source
         shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          test "$(git rev-parse HEAD)" = "${{ inputs.ref }}"
-          test -n "${{ inputs.version }}"
+          test "$(git rev-parse HEAD)" = "$INPUT_REF"
+          test -n "$INPUT_VERSION"
 
       - name: Install pinned Rust
         run: |

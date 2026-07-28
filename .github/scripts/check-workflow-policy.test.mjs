@@ -13,6 +13,7 @@ import {
 import {
   annotationScopeViolations,
   basicWorkflowViolations,
+  dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
   loadWorkflows,
@@ -2601,6 +2602,251 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
   }
 });
 
+function firstRunStep(workflow) {
+  for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+    const steps = Array.isArray(job?.steps) ? job.steps : [];
+    for (const [index, step] of steps.entries()) {
+      if (typeof step?.run === "string") return { jobId, index, step };
+    }
+  }
+  return undefined;
+}
+
+const unwrittenWorkflow = "future-dispatch-proof.yml";
+
+function unwrittenDispatchWorkflow(run) {
+  return {
+    name: "Future dispatch proof",
+    on: { workflow_dispatch: { inputs: { ref: { required: true, type: "string" } } } },
+    permissions: { contents: "read" },
+    jobs: {
+      leak: {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        steps: [{ name: "Echo the dispatched ref", shell: "bash", ...run }],
+      },
+    },
+  };
+}
+
+// #1554 fixed marketplace-sync.yml and pinned the fix with `validateMarketplaceSync`, a validator
+// that names one file. That shape cannot fail on a second file however many times the same splice
+// is written, and eight more workflows carried it (#1566). The replacement has to hold a property
+// the per-file validator could not: it reads whatever workflows exist, so it covers files nobody
+// listed -- including files that do not exist yet. Every test below is a claim about the rule's
+// reach, not about any one workflow.
+test("no workflow interpolates a dispatch input into a run: body", async (t) => {
+  await t.test("the repository as it stands has no such splice anywhere", () => {
+    assert.deepEqual(dispatchInputInterpolationViolations(loadWorkflows()), []);
+    assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  });
+
+  // The other direction, on every workflow at once. The loop names no file: it grows with the
+  // directory, so a workflow added tomorrow is mutated by this suite the day it lands.
+  for (const [file, workflow] of loadWorkflows()) {
+    const located = firstRunStep(workflow);
+    if (located === undefined) continue;
+    await t.test(`${file} cannot splice a dispatch input into ${located.step.name ?? "its first script"}`, () => {
+      const workflows = loadWorkflows();
+      const target = firstRunStep(workflows.get(file));
+      target.step.run = `${target.step.run}\necho "\${{ inputs.version }}"\n`;
+      const reported = dispatchInputInterpolationViolations(workflows);
+      assert.equal(reported.length, 1);
+      assert.equal(
+        reported[0].startsWith(`${file} jobs.${target.jobId}.steps.${target.index}`),
+        true,
+        reported[0],
+      );
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /must read \$\{\{ inputs\.version \}\} from step env, not interpolated script text/u,
+      );
+    });
+  }
+
+  // The claim the per-file validator could not make. Nothing here edits the rule, and the file is
+  // not on disk: the rule sees it because it iterates the set it is handed.
+  await t.test("a workflow that does not exist yet is covered without editing the rule", () => {
+    const workflows = loadWorkflows();
+    assert.equal(workflows.has(unwrittenWorkflow), false);
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({
+      run: 'echo "${{ inputs.ref }}"\n',
+    }));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ inputs.ref }} from step env, not interpolated script text",
+    ]);
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /future-dispatch-proof\.yml jobs\.leak\.steps\.0 \(Echo the dispatched ref\) must read/u,
+    );
+  });
+
+  await t.test("the same unwritten workflow reading that value from env is not a violation", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({
+      env: { INPUT_REF: "${{ inputs.ref }}" },
+      run: 'echo "$INPUT_REF"\n',
+    }));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+  });
+
+  // GitHub serves one dispatched value under several spellings and an expression can bury the
+  // context inside a function call. A rule that only knows `inputs.name` exempts the rest.
+  for (const [name, expression] of [
+    ["the short spelling", "${{ inputs.version }}"],
+    ["the spelling GitHub serves the same value under", "${{ github.event.inputs.version }}"],
+    ["the index spelling", "${{ inputs['version'] }}"],
+    ["a fallback that reaches an input second", "${{ github.ref_name || inputs.version }}"],
+    // A single `}` inside the expression must not end the match early and hide the rest of it.
+    ["a spelling wrapped in a format call carrying a brace", "${{ format('{0}', inputs.version) }}"],
+  ]) {
+    await t.test(`${name} is refused`, () => {
+      const workflows = loadWorkflows();
+      workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({ run: `echo "${expression}"\n` }));
+      assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+        `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+          + ` must read ${expression} from step env, not interpolated script text`,
+      ]);
+    });
+  }
+
+  // Over-firing would make the rule unusable and force exemptions, which is how the per-file shape
+  // started. These are the expressions a run: body is allowed to carry.
+  for (const [name, run] of [
+    ["a workflow context", 'echo "${{ github.run_attempt }}"\n'],
+    ["a matrix value", 'echo "${{ matrix.asset_target }}"\n'],
+    ["a step output", 'echo "${{ steps.source-identity.outputs.sha }}"\n'],
+    ["another job's output", 'echo "${{ needs.resolve.outputs.ref }}"\n'],
+    ["a shell variable whose name merely contains the word", 'echo "$RELEASE_INPUTS_PATH"\n'],
+  ]) {
+    await t.test(`${name} is not a violation`, () => {
+      const workflows = loadWorkflows();
+      workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({ run }));
+      assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+    });
+  }
+
+  // #1554 established that a checkout `ref:` is not an executable surface: it is resolved by the
+  // action, not parsed by a shell, and it is pinned separately where it belongs. This rule reads
+  // `run:` only, and that boundary is asserted rather than assumed.
+  await t.test("a dispatch input in an action input is outside this rule's surface", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, {
+      name: "Future dispatch proof",
+      on: { workflow_dispatch: { inputs: { ref: { required: true, type: "string" } } } },
+      permissions: { contents: "read" },
+      jobs: {
+        leak: {
+          "runs-on": "ubuntu-latest",
+          "timeout-minutes": 10,
+          steps: [{
+            name: "Checkout the dispatched ref",
+            uses: "actions/checkout@v5",
+            with: { ref: "${{ inputs.ref }}" },
+          }],
+        },
+      },
+    });
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+  });
+});
+
+// Routing a dispatched value through `env:` removes it from the script's text -- and from the
+// reach of the fragment pin that used to name it there. `--expected-sha "$INPUT_REF"` reads the
+// same whether `INPUT_REF` carries `inputs.ref` or a commit nobody reviewed, so the pin now has
+// two halves: the script names the variable, and the variable names the value. Both halves are
+// proven here for the trust-anchoring steps -- the release-cell producers, whose `--expected-sha`
+// is the commit every downstream claim is filed against -- and for the mode guards that decide
+// which claims a protected run is allowed to make at all.
+test("env-routed dispatch inputs stay pinned to the value they were reviewed with", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const reviewedRef = "${{ inputs.ref }}";
+  const behaviorOnly = "${{ inputs.server_behavior_only }}";
+  const sites = [
+    ["linux-vulkan-proof.yml", "packaged-vulkan", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly },
+      'test "$SERVER_BEHAVIOR_ONLY" = true', `test "${behaviorOnly}" = true`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly },
+      'if ($env:SERVER_BEHAVIOR_ONLY -ne "true")', `if ("${behaviorOnly}" -ne "true")`],
+    ["macos-metal-proof.yml", "packaged-metal", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly, CALIBRATION_MODE: "${{ inputs.calibration_mode }}" },
+      'test "$SERVER_BEHAVIOR_ONLY" = true', `test "${behaviorOnly}" = true`],
+    ["linux-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Linux Vulkan release cells",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Vulkan release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Windows retrieval-readiness release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated candidate-installed Windows release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated Metal release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated macOS retrieval-readiness release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated candidate-installed macOS release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["packaged-platform-proof.yml", "build", "Emit authenticated package release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    // source-proof resolves its own trusted head in an earlier job rather than taking a dispatched
+    // ref, so its anchor is that job's output. Same two halves, different source of truth.
+    ["source-proof.yml", "full-source-gate", "Emit authenticated source release cell",
+      { RESOLVED_REF: "${{ needs.resolve.outputs.ref }}" },
+      '--expected-sha "$RESOLVED_REF"', '--expected-sha "${{ needs.resolve.outputs.ref }}"'],
+  ];
+  for (const [file, jobId, stepName, bindings, needle, splice] of sites) {
+    for (const [key, expected] of Object.entries(bindings)) {
+      await t.test(`${file} ${stepName} refuses a rewired ${key}`, () => {
+        const workflows = loadWorkflows();
+        draftStep(workflows.get(file).jobs[jobId], stepName).env[key] = "${{ github.event.pull_request.head.sha }}";
+        const violations = validateWorkflows(workflows);
+        assert.ok(
+          violations.includes(`${file} step ${stepName} must bind ${key} to ${expected}`),
+          violations.join("\n"),
+        );
+      });
+      await t.test(`${file} ${stepName} refuses a dropped ${key}`, () => {
+        const workflows = loadWorkflows();
+        delete draftStep(workflows.get(file).jobs[jobId], stepName).env[key];
+        assert.ok(
+          validateWorkflows(workflows)
+            .includes(`${file} step ${stepName} must bind ${key} to ${expected}`),
+        );
+      });
+    }
+    await t.test(`${file} ${stepName} refuses the splice it was rewritten away from`, () => {
+      const workflows = loadWorkflows();
+      const step = draftStep(workflows.get(file).jobs[jobId], stepName);
+      assert.equal(step.run.includes(needle), true, `missing pinned fragment ${needle}`);
+      step.run = step.run.replace(needle, splice);
+      const violations = validateWorkflows(workflows);
+      // Both layers must see it: the fragment pin, which knows what this step should read, and
+      // the generic rule, which knows nothing about this step and refuses the shape anyway.
+      assert.ok(
+        violations.includes(`${file} step ${stepName} must run ${needle}`),
+        violations.join("\n"),
+      );
+      if (splice.includes("inputs")) {
+        assert.ok(
+          violations.some(violation =>
+            violation.startsWith(`${file} jobs.${jobId}.steps.`)
+            && violation.includes("from step env, not interpolated script text")),
+          violations.join("\n"),
+        );
+      }
+    });
+  }
+});
+
 // The guard is the layer the workflow relies on before a ref is resolved or a token is minted, so
 // it is proven by running it rather than by reading it. Every refusal below reaches the guard's own
 // `::error::` and exit 1: a bash syntax error would also be non-zero and would prove nothing.
@@ -2761,8 +3007,14 @@ test("the plugin lane publishes the catalog it then smoke-installs", async (t) =
     }, /marketplace token must be a SHA-pinned app token scoped to the marketplace repository/u],
     ["the catalog is pointed at an unbound version", workflow => {
       const step = catalogStep(workflow);
-      step.run = step.run.replace('--version "${{ inputs.version }}"', '--version "$LATEST"');
+      step.run = step.run.replace('--version "$INPUT_VERSION"', '--version "$LATEST"');
     }, /Point the catalog at the published release must run --version/u],
+    // Routing the version through `env:` moves it out of the script's text, so the script's own
+    // fragment can no longer see which value it carries. Rebinding the variable is the same
+    // substitution the mutation above makes, one layer down.
+    ["the catalog's version variable is rebound to another value", workflow => {
+      catalogStep(workflow).env.INPUT_VERSION = "${{ github.ref_name }}";
+    }, /Point the catalog at the published release must bind INPUT_VERSION/u],
     ["catalog publication hides the delivery state it recorded", workflow => {
       delete workflow.jobs["marketplace-publish"].outputs;
     }, /marketplace publication must publish the recorded delivery state/u],
