@@ -49,7 +49,6 @@
 - Windows and Linux start faster, and commands run at the same time no longer
   queue behind one another.
 
-||||||| parent of e925d6da (note the windows deep-cache-root publication fix in the changelog)
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.

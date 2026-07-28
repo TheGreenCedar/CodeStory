@@ -747,7 +747,7 @@ pub(super) fn retrieval_state_from_storage(
 /// forever on stores whose sidecar vectors were fully published — including
 /// every fresh auto-bootstrap.
 ///
-/// Cost and parity: resolving the manifest key goes through
+/// Manifest identity: resolving the manifest key goes through
 /// `sidecar_project_id_for_root`, which re-observes project identity with
 /// three git subprocesses per call (`config --get remote.origin.url`,
 /// `rev-parse HEAD^{tree}`, and a workload-dependent `status --porcelain`)
@@ -755,13 +755,36 @@ pub(super) fn retrieval_state_from_storage(
 /// storage-derived staleness scan. That is deliberately the same uncached
 /// helper per-search sidecar admission uses
 /// (`retrieval_primary::retrieval_manifest_exists`), so this projection and
-/// admission can never disagree about which manifest row is current. Do not
+/// admission can never disagree about *which manifest row is current*. Do not
 /// substitute a cached identity here without proving admission reads the same
-/// cache. The staleness scan is likewise the same helper admission gates on
-/// (`manifest_unavailable_reason_for_runtime`) and costs the same per-call
-/// symbol-doc count and dense-anchor sweep admission already pays: freshness
-/// derived from manifest shape alone would let readiness promise semantic
-/// retrieval that admission then refuses. The read stays observational: no
+/// cache.
+///
+/// Agreement with admission is one-directional, not equality. Freshness comes
+/// from `storage_admission_refusal_reason_for_runtime`, the subset of sidecar
+/// admission derivable from `&Storage` alone: the incomplete-incremental-run
+/// marker plus the manifest staleness scan. `SidecarQuery::begin` runs a
+/// second gate, `validate_strict_sidecar_readiness_for_runtime`, which is
+/// `pub(crate)` in `codestory-retrieval` and structurally unreachable from
+/// here because it also needs the storage path, the project root's workspace
+/// manifest, and a producer compatibility identity. So this projection can
+/// still report hybrid for a publication that gate refuses — on
+/// `indexable_file_added_or_changed_after_retrieval_manifest`,
+/// `indexed_file_removed_after_retrieval_manifest`,
+/// `indexed_file_error_retry_required`, `sidecar_input_hash_changed`, or the
+/// two symbol-doc backend reasons. What is guaranteed is the direction that
+/// matters for not over-claiming: everything consulted here also makes
+/// admission refuse, so readiness never promises hybrid over a refusal this
+/// projection can see. `retrieval status` runs both gates and is the surface
+/// to trust for exact parity. Closing the remaining gap means making the
+/// strict gate reachable with a `&Storage`-only signature, not adding another
+/// private re-derivation here.
+///
+/// Cost: the staleness scan is two aggregate counts (symbol docs and the
+/// grouped `dense_anchor_input` projection), not a row sweep — see
+/// `Storage::dense_anchor_input_stats`. This runs on observational callers
+/// (project open, `retrieval_state`, grounding snapshots), so it must stay
+/// aggregate-only; paging `DenseAnchorInput`s here would put every anchor's
+/// `document_text` on a status call. The read stays observational: no
 /// probing, repair, or refresh.
 pub(super) fn retrieval_state_from_storage_for_runtime(
     storage: &Storage,
@@ -788,14 +811,14 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
     // *and* the store the sidecar would be served from still agrees with it.
     // Manifest shape alone is not enough: a core-only refresh leaves the
     // manifest untouched while moving the symbol docs, dense anchors, and
-    // indexed-file mtimes underneath it, so admission
-    // (`manifest_unavailable_reason_for_runtime`) refuses to serve a
-    // publication that a shape-only projection still advertises as hybrid.
-    // Consulting the same storage-derived staleness admission uses is what
-    // keeps the two surfaces from contradicting each other.
+    // indexed-file mtimes underneath it, and an interrupted incremental run
+    // leaves all three untouched while still making admission refuse. Both are
+    // storage-derived, so both are read here through the one helper admission
+    // shares (`storage_admission_refusal_reason_for_runtime`) — see this
+    // function's doc comment for the strict gate this still cannot see.
     let stale_publication = manifest.as_ref().is_some_and(|manifest| {
         !codestory_retrieval::manifest_classifies_full(manifest)
-            || codestory_retrieval::manifest_unavailable_reason_for_runtime(
+            || codestory_retrieval::storage_admission_refusal_reason_for_runtime(
                 &project_id,
                 storage,
                 manifest,
@@ -806,17 +829,26 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
     let contract_mismatch = manifest
         .as_ref()
         .is_some_and(|manifest| !manifest_matches_current_embedding_contract(manifest, runtime));
-    let runtime_degraded =
-        semantic_doc_count > 0 && probe.available && (stale_publication || contract_mismatch);
-    // A current, contract-matched full publication may legitimately select
-    // zero dense anchors (generation only requires the dense count to equal
-    // the projection count). Admission serves that sidecar as full, so the
-    // semantic lane is published-and-empty, not unbuilt: reporting
-    // `missing_semantic_docs` here would prescribe a refresh that republishes
-    // the identical zero-anchor manifest and can never clear the message.
-    let zero_dense_published = manifest.as_ref().is_some_and(|manifest| {
-        manifest.dense_projection_count == Some(0) && !stale_publication && !contract_mismatch
-    });
+    // A full publication may legitimately select zero dense anchors (generation
+    // only requires the dense count to equal the projection count), so a
+    // zero-anchor manifest still describes a *built* semantic lane. It must
+    // therefore be able to degrade like any other publication: gating
+    // `runtime_degraded` on `semantic_doc_count > 0` alone made a stale
+    // zero-anchor sidecar fall through to `missing_semantic_docs` — "semantic
+    // symbol docs have not been built yet" for a lane that was built and is
+    // merely stale, and doctor's "stale or degraded" gap never fired for it.
+    let zero_dense_manifest = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.dense_projection_count == Some(0));
+    let runtime_degraded = (semantic_doc_count > 0 || zero_dense_manifest)
+        && probe.available
+        && (stale_publication || contract_mismatch);
+    // A *current, contract-matched* zero-anchor publication is the other half:
+    // admission serves it as full, so the lane is published-and-empty rather
+    // than unbuilt. Reporting `missing_semantic_docs` there would prescribe a
+    // refresh that republishes the identical zero-anchor manifest and can
+    // never clear the message.
+    let zero_dense_published = zero_dense_manifest && !stale_publication && !contract_mismatch;
     let fallback_message = probe.fallback_message.or_else(|| {
         if !runtime_degraded {
             None
