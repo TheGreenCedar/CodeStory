@@ -2007,19 +2007,6 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
         || normalized.contains("/controllers/")
         || normalized.contains("/middleware/")
         || normalized.contains("/sources/")
-        || matches!(
-            file_name,
-            "application.js"
-                | "context.go"
-                | "gin.go"
-                | "http.dart"
-                | "nvm.sh"
-                | "request.js"
-                | "response.js"
-                | "routergroup.go"
-                | "sessions.py"
-                | "tree.go"
-        )
 }
 
 pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
