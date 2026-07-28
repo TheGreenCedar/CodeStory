@@ -18,12 +18,14 @@ import {
   loadReleaseClaimGraph,
   releaseClaimGraphDigest,
   releaseClaimIdentityMatchesFormat,
+  verifyReuseBinding,
 } from "./codestory-release-claims.mjs";
 
 const MANIFEST_EVALUATION_SCHEMA = "codestory.release-cell-evaluation/v1";
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
 const TRUSTED_EXCEPTIONS_SCHEMA = "codestory.release-closeout-exceptions/v1";
 const SHA256 = /^[0-9a-f]{64}$/u;
+const FULL_SHA = /^[0-9a-f]{40}$/u;
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
 const AGGREGATE_IDENTITY = /^(?:aggregate|all|matrix|mixed|multiple|various)$/iu;
@@ -266,10 +268,67 @@ export function validateReleaseCellManifest({ manifest, cell, graph, version }) 
   });
 }
 
-function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, phase }) {
+/// The run and commit one producer row has to be bound to.
+///
+/// Same-run rows anchor to the Actions run that is publishing. A row carrying a reuse block
+/// anchors to the reused run instead, but only once the closeout has re-proved, against its own
+/// checkout, the binding the claim graph declares for that cell's group. Every rejecting path
+/// records its reason and falls back to the same-run anchor, so unverifiable reuse also fails the
+/// run identity checks that follow.
+function producerAnchor({ cell, row, trustedProducers, gitIdentity, bindings, verify, errors }) {
+  const sameRun = { runId: trustedProducers.run_id, headSha: gitIdentity.commit, reused: false };
+  const reused = row.reused_from;
+  if (reused === undefined) return sameRun;
+  if (reused === null || typeof reused !== "object" || Array.isArray(reused)) {
+    errors.push(`trusted producer map ${cell.id} reuse record must be an object`);
+    return sameRun;
+  }
+  const binding = bindings.get(cell.group_id);
+  if (binding === undefined || reused.binding !== binding) {
+    errors.push(`trusted producer map ${cell.id} reuses evidence under an undeclared binding`);
+    return sameRun;
+  }
+  if (!/^[1-9]\d*$/u.test(String(reused.run_id ?? "")) || !FULL_SHA.test(String(reused.head_sha ?? ""))) {
+    errors.push(`trusted producer map ${cell.id} reused run identity is invalid`);
+    return sameRun;
+  }
+  if (typeof verify !== "function") {
+    errors.push(`trusted producer map ${cell.id} reuses evidence this closeout cannot verify`);
+    return sameRun;
+  }
+  let bindingValue;
+  try {
+    bindingValue = verify({
+      binding,
+      releaseCommit: gitIdentity.commit,
+      reusedCommit: reused.head_sha,
+    });
+  } catch (error) {
+    errors.push(`trusted producer map ${cell.id} ${binding} reuse is unverified: ${error.message}`);
+    return sameRun;
+  }
+  if (reused.binding_value !== bindingValue) {
+    errors.push(`trusted producer map ${cell.id} recorded ${binding} value does not bind this release`);
+    return sameRun;
+  }
+  return { runId: reused.run_id, headSha: reused.head_sha, reused: true };
+}
+
+function trustedProducerIndex({
+  trustedProducers,
+  cells,
+  gitIdentity,
+  graph,
+  phase,
+  verifyReuseBinding: verify,
+}) {
   const errors = [];
   if (trustedProducers === null || typeof trustedProducers !== "object" || Array.isArray(trustedProducers)) {
-    return { byCell: new Map(), errors: ["closeout requires a separately trusted producer map"] };
+    return {
+      byCell: new Map(),
+      reusedByCell: new Map(),
+      errors: ["closeout requires a separately trusted producer map"],
+    };
   }
   if (trustedProducers.schema !== PRODUCER_MAP_SCHEMA) {
     errors.push(`trusted producer map schema must be ${PRODUCER_MAP_SCHEMA}`);
@@ -342,6 +401,10 @@ function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, pha
   for (const cellId of byCell.keys()) {
     if (!required.has(cellId)) errors.push(`trusted producer map contains undeclared cell ${cellId}`);
   }
+  const bindings = new Map((graph.closeout.cell_groups ?? [])
+    .filter((group) => typeof group.reuse_binding === "string")
+    .map((group) => [group.id, group.reuse_binding]));
+  const reusedByCell = new Map();
   for (const cell of cells) {
     const row = byCell.get(cell.id);
     if (!row) {
@@ -369,10 +432,23 @@ function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, pha
         errors.push(`trusted producer map ${cell.id} ${key} must equal ${constrained}`);
       }
     }
-    if (row.producer_run_id !== trustedProducers.run_id) {
+    const anchor = producerAnchor({
+      cell,
+      row,
+      trustedProducers,
+      gitIdentity,
+      bindings,
+      verify,
+      errors,
+    });
+    if (anchor.reused) reusedByCell.set(cell.id, anchor.headSha);
+    if (row.producer_run_id !== anchor.runId) {
       errors.push(`trusted producer map ${cell.id} run identity differs from the Actions run`);
     }
-    if (/^[1-9]\d*$/u.test(String(row.producer_run_attempt ?? ""))
+    // An attempt is bounded by its own run's attempt counter, and the closeout knows that counter
+    // for the publishing run alone. A reuse block naming that run stays capped all the same.
+    if (row.producer_run_id === trustedProducers.run_id
+        && /^[1-9]\d*$/u.test(String(row.producer_run_attempt ?? ""))
         && /^[1-9]\d*$/u.test(String(trustedProducers.current_run_attempt ?? ""))
         && Number(row.producer_run_attempt) > Number(trustedProducers.current_run_attempt)) {
       errors.push(`trusted producer map ${cell.id} uses a future run attempt`);
@@ -405,7 +481,7 @@ function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, pha
         errors.push(`trusted producer map ${cell.id} artifact is expired`);
       }
       if (artifact.workflow_run_id !== row.producer_run_id
-          || artifact.head_sha !== gitIdentity.commit) {
+          || artifact.head_sha !== anchor.headSha) {
         errors.push(`trusted producer map ${cell.id} artifact run identity changed`);
       }
     }
@@ -416,7 +492,7 @@ function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, pha
       if (!/^[1-9]\d*$/u.test(String(job.id ?? ""))) {
         errors.push(`trusted producer map ${cell.id} job id is invalid`);
       }
-      if (job.run_id !== row.producer_run_id || job.head_sha !== gitIdentity.commit) {
+      if (job.run_id !== row.producer_run_id || job.head_sha !== anchor.headSha) {
         errors.push(`trusted producer map ${cell.id} job run identity changed`);
       }
       if (job.run_attempt !== row.producer_run_attempt
@@ -443,7 +519,7 @@ function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, pha
       errors.push(`trusted producer map download inventory contains unused artifact ${artifactId}`);
     }
   }
-  return { byCell, errors };
+  return { byCell, reusedByCell, errors };
 }
 
 function producerAuthenticationProblems(manifest, trustedProducer) {
@@ -573,6 +649,7 @@ function evaluateCell({
   evaluatedAt,
   trustedExceptions,
   trustedExceptionIdentity,
+  reusedByCell,
 }) {
   const focal = manifests.get(cell.id);
   const claims = evaluationClaims(graph, cell, focal);
@@ -584,7 +661,15 @@ function evaluateCell({
         : dependencyCell(cells, claim.id, focal.evidence.identity.target),
     );
   }
-  const evidence = evidenceCells.map((dependency) => manifests.get(dependency.id).evidence);
+  // A reused row was produced at an earlier commit, which is the whole point of the binding the
+  // closeout just re-proved against its own checkout. Reading it at the release commit applies
+  // that binding; the row's own source tree is still compared against this release, so a binding
+  // that does not equate the trees still fails. The ledger keeps the manifest identity untouched.
+  const evidence = evidenceCells.map((dependency) => {
+    const row = manifests.get(dependency.id).evidence;
+    if (!reusedByCell.has(dependency.id)) return row;
+    return { ...row, identity: { ...row.identity, commit: gitIdentity.commit } };
+  });
   const requestedClaims = claims.map((claim) => ({
     id: claim.id,
     accepted_risks: [...claim.accepted_risks],
@@ -802,6 +887,9 @@ export function evaluateReleaseCloseout({
   trustedProducers = null,
   trustedExceptionDocument = null,
   artifactBindings = null,
+  // Re-proves a reuse binding against this closeout's own checkout. Absent, every reuse block is
+  // refused rather than trusted on the producer map's say-so.
+  verifyReuseBinding: verify = null,
 }) {
   if (!SEMVER.test(version)) fail("version must be semantic version text without a leading v");
   const evaluatedEpoch = Date.parse(evaluatedAt);
@@ -810,7 +898,14 @@ export function evaluateReleaseCloseout({
   }
   const graphSha256 = releaseClaimGraphDigest(graph);
   const cells = deriveReleaseCells(graph, phase);
-  const trusted = trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, phase });
+  const trusted = trustedProducerIndex({
+    trustedProducers,
+    cells,
+    gitIdentity,
+    graph,
+    phase,
+    verifyReuseBinding: verify,
+  });
   const performanceCell = cells.find(({ id }) => id === graph.exception_policy.eligible_evidence_type);
   const trustedException = trustedExceptionInput({
     document: trustedExceptionDocument,
@@ -945,6 +1040,7 @@ export function evaluateReleaseCloseout({
           evaluatedAt,
           trustedExceptions: trustedException.exceptions,
           trustedExceptionIdentity: trustedException.identity,
+          reusedByCell: trusted.reusedByCell,
         });
       } catch (error) {
         evaluation = {
@@ -1189,6 +1285,8 @@ function main() {
     trustedProducers,
     trustedExceptionDocument,
     artifactBindings: downloaded.artifactBindings,
+    verifyReuseBinding: ({ binding, releaseCommit, reusedCommit }) =>
+      verifyReuseBinding({ binding, repository: repoRoot, releaseCommit, reusedCommit }),
   });
   writeReleaseCloseout(text(values["out-dir"], "--out-dir"), result);
   console.log(JSON.stringify(result.summary, null, 2));

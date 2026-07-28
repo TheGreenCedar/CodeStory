@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -10,12 +9,15 @@ import {
   deriveTrustedGitIdentity,
   loadReleaseClaimGraph,
   releaseClaimGraphDigest,
+  verifyReuseBinding,
 } from "./codestory-release-claims.mjs";
 import {
   deriveReleaseCells,
   resolveReleaseCellConstraints,
   validateReleaseCellManifest,
 } from "./codestory-release-closeout.mjs";
+
+export { verifyReuseBinding };
 
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
@@ -475,45 +477,6 @@ export function buildTrustedProducerMap({
     producers,
     artifacts: [...new Map(producers.map((row) => [row.artifact.id, row.artifact])).values()],
   };
-}
-
-/// Verify a reuse binding against the local repository and return its recorded value.
-export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
-  const run = (args) =>
-    execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
-  if (binding === "source_tree") {
-    const releaseTree = run(["rev-parse", `${releaseCommit}^{tree}`]);
-    const reusedTree = run(["rev-parse", `${reusedCommit}^{tree}`]);
-    if (releaseTree !== reusedTree) {
-      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
-    }
-    try {
-      execFileSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
-        cwd: repository,
-      });
-    } catch {
-      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
-    }
-    return releaseTree;
-  }
-  if (binding === "native_fingerprint") {
-    const script = new URL("./native-fingerprint.mjs", import.meta.url).pathname;
-    const fingerprint = (ref) =>
-      execFileSync(process.execPath, [script, "--ref", ref], {
-        cwd: repository,
-        encoding: "utf8",
-      }).trim();
-    const releasePrint = fingerprint(releaseCommit);
-    const reusedPrint = fingerprint(reusedCommit);
-    if (releasePrint !== reusedPrint) {
-      fail(
-        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
-          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
-      );
-    }
-    return releasePrint;
-  }
-  fail(`unknown reuse binding ${binding}`);
 }
 
 async function githubPages(url, token, field) {

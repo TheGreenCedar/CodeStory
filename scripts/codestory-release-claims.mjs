@@ -172,6 +172,49 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
   };
 }
 
+/// Verify a reuse binding against the local repository and return its recorded value.
+///
+/// Both sides of the release ledger need this: the producer proves the binding before it admits
+/// cross-run evidence, and the closeout re-proves it against its own checkout before it anchors a
+/// reused row to the earlier run.
+export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
+  if (binding === "source_tree") {
+    const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
+    const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
+    if (releaseTree !== reusedTree) {
+      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
+    }
+    if (spawnSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
+      cwd: repository,
+      encoding: "utf8",
+    }).status !== 0) {
+      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
+    }
+    return releaseTree;
+  }
+  if (binding === "native_fingerprint") {
+    const script = fileURLToPath(new URL("./native-fingerprint.mjs", import.meta.url));
+    const fingerprint = (ref) => {
+      const result = spawnSync(process.execPath, [script, "--ref", ref], {
+        cwd: repository,
+        encoding: "utf8",
+      });
+      if (result.status !== 0) fail(`native fingerprint of ${ref} failed: ${result.stderr.trim()}`);
+      return result.stdout.trim();
+    };
+    const releasePrint = fingerprint(releaseCommit);
+    const reusedPrint = fingerprint(reusedCommit);
+    if (releasePrint !== reusedPrint) {
+      fail(
+        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
+          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
+      );
+    }
+    return releasePrint;
+  }
+  fail(`unknown reuse binding ${binding}`);
+}
+
 function uniqueById(values, label) {
   if (!Array.isArray(values) || values.length === 0) fail(`${label} must be a non-empty array`);
   const found = new Map();

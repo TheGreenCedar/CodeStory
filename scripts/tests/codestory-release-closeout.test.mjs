@@ -217,6 +217,7 @@ function evaluate(
   trustedProducers = trustedProducersFor(phase),
   trustedExceptionDocument = null,
   artifactBindings = null,
+  verifyReuseBinding = null,
 ) {
   const bindings = artifactBindings ?? manifests.map((manifest) => {
     const producer = trustedProducers?.producers?.find(({ cell_id: cellId }) =>
@@ -240,7 +241,52 @@ function evaluate(
     trustedProducers,
     trustedExceptionDocument,
     artifactBindings: bindings,
+    verifyReuseBinding,
   });
+}
+
+// ── Cross-run evidence reuse ────────────────────────────────────────────────────────────────
+
+const reusedRunId = "777";
+const reusedCommit = "3".repeat(40);
+
+/// Stands in for the git binding proof `main()` runs against the closeout's own checkout.
+function reuseVerifier({
+  // A commit is its own ancestor, so the release commit always satisfies the tree binding.
+  ancestors = [reusedCommit, gitIdentity.commit],
+  value = gitIdentity.source_tree,
+} = {}) {
+  return ({ binding, releaseCommit, reusedCommit: reused }) => {
+    assert.equal(releaseCommit, gitIdentity.commit);
+    if (binding !== "source_tree") throw new Error(`unknown reuse binding ${binding}`);
+    if (!ancestors.includes(reused)) {
+      throw new Error(`reused commit ${reused} is not an ancestor of the release commit`);
+    }
+    return value;
+  };
+}
+
+/// Re-anchor the source cell's producer row onto a prior run, exactly as the producer map does
+/// once release preflight selects source-proof reuse.
+function reuseSourceBehavior(trustedProducers, manifests, reusedFrom = {}) {
+  const row = trustedProducers.producers.find(({ cell_id: cellId }) => cellId === "source_behavior");
+  row.producer_run_id = reusedRunId;
+  row.reused_from = {
+    run_id: reusedRunId,
+    head_sha: reusedCommit,
+    binding: "source_tree",
+    binding_value: gitIdentity.source_tree,
+    ...reusedFrom,
+  };
+  row.artifact.workflow_run_id = reusedRunId;
+  row.artifact.head_sha = reusedCommit;
+  row.job.run_id = reusedRunId;
+  row.job.head_sha = reusedCommit;
+  // The reused manifest was produced by that earlier run, at the binding-equal commit.
+  const manifest = manifests.find(({ cell_id: cellId }) => cellId === "source_behavior");
+  manifest.evidence.identity.producer_run_id = reusedRunId;
+  manifest.evidence.identity.commit = reusedCommit;
+  return row;
 }
 
 test("cell inventory is derived only from the release claim graph", () => {
@@ -591,4 +637,165 @@ test("producer identity is accepted only from the separately trusted map", () =>
   assert.equal(rejectedWindow.decision, "reject");
   assert.ok(rejectedWindow.summary.input_errors.some((message) =>
     message.includes("outside its job window")));
+});
+
+test("a binding-verified reuse row is anchored to the run and commit it was produced by", () => {
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseSourceBehavior(trusted, manifests);
+  const calls = [];
+  const verify = reuseVerifier();
+  const accepted = evaluate("pre_publish", manifests, null, trusted, null, null, (request) => {
+    calls.push(request);
+    return verify(request);
+  });
+  assert.equal(accepted.decision, "accept");
+  assert.deepEqual(accepted.summary.input_errors, []);
+  assert.deepEqual(accepted.summary.failed_cells, []);
+  // The closeout re-proves the binding itself rather than trusting the producer map's word.
+  assert.deepEqual(calls, [{
+    binding: "source_tree",
+    releaseCommit: gitIdentity.commit,
+    reusedCommit,
+  }]);
+  // The ledger keeps the reused run and commit rather than restating the publishing run.
+  const row = accepted.ledger.cells.find(({ id }) => id === "source_behavior");
+  assert.equal(row.identity.producer_run_id, reusedRunId);
+  assert.equal(row.identity.commit, reusedCommit);
+  // Cells that were not reused stay bound to the publishing run.
+  const packaged = accepted.ledger.cells.find(({ id }) => id === "package_identity:windows-x64");
+  assert.equal(packaged.identity.producer_run_id, "12345");
+  assert.equal(packaged.identity.commit, gitIdentity.commit);
+});
+
+test("a reuse row whose binding the closeout cannot reprove fails closed", () => {
+  const rejections = [
+    ["no binding is declared for the cell group", (trusted, manifests) => {
+      const row = trusted.producers.find(({ cell_id: cellId }) =>
+        cellId === "package_identity:windows-x64");
+      row.producer_run_id = reusedRunId;
+      row.reused_from = {
+        run_id: reusedRunId,
+        head_sha: reusedCommit,
+        binding: "source_tree",
+        binding_value: gitIdentity.source_tree,
+      };
+      row.artifact.workflow_run_id = reusedRunId;
+      row.artifact.head_sha = reusedCommit;
+      row.job.run_id = reusedRunId;
+      row.job.head_sha = reusedCommit;
+      manifests.find(({ cell_id: cellId }) => cellId === "package_identity:windows-x64")
+        .evidence.identity.producer_run_id = reusedRunId;
+    }, "package_identity:windows-x64 reuses evidence under an undeclared binding"],
+    ["the row names a binding the group did not declare", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests, { binding: "native_fingerprint" });
+    }, "source_behavior reuses evidence under an undeclared binding"],
+    ["the reused commit is not an ancestor of the release commit", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests, { head_sha: "9".repeat(40) });
+    }, "is not an ancestor of the release commit"],
+    ["the reused commit does not resolve to the release tree", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests);
+      // A verifier that proves the tree binding cannot prove it here.
+      trusted.producers.find(({ cell_id: cellId }) => cellId === "source_behavior")
+        .reused_from.binding_value = "e".repeat(40);
+    }, "source_behavior recorded source_tree value does not bind this release"],
+    ["the reused run identity is malformed", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests, { run_id: "0" });
+    }, "source_behavior reused run identity is invalid"],
+    ["the reuse record is not an object", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests);
+      trusted.producers.find(({ cell_id: cellId }) => cellId === "source_behavior")
+        .reused_from = reusedCommit;
+    }, "source_behavior reuse record must be an object"],
+    ["the reused artifact expired", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests).artifact.expired = true;
+    }, "source_behavior artifact is expired"],
+    ["the reused artifact still claims the publishing run's commit", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests).artifact.head_sha = gitIdentity.commit;
+    }, "source_behavior artifact run identity changed"],
+    ["the reused job still claims the publishing run's commit", (trusted, manifests) => {
+      reuseSourceBehavior(trusted, manifests).job.head_sha = gitIdentity.commit;
+    }, "source_behavior job run identity changed"],
+    ["a reuse block naming the publishing run escapes its attempt cap", (trusted, manifests) => {
+      const row = reuseSourceBehavior(trusted, manifests, {
+        run_id: trusted.run_id,
+        head_sha: gitIdentity.commit,
+      });
+      row.producer_run_id = trusted.run_id;
+      row.producer_run_attempt = "2";
+      row.artifact.workflow_run_id = trusted.run_id;
+      row.artifact.head_sha = gitIdentity.commit;
+      row.job.run_id = trusted.run_id;
+      row.job.head_sha = gitIdentity.commit;
+      row.job.run_attempt = "2";
+      const manifest = manifests.find(({ cell_id: cellId }) => cellId === "source_behavior");
+      manifest.evidence.identity.producer_run_id = trusted.run_id;
+      manifest.evidence.identity.commit = gitIdentity.commit;
+    }, "source_behavior uses a future run attempt"],
+  ];
+  for (const [label, mutate, expected] of rejections) {
+    const manifests = manifestsFor("pre_publish");
+    const trusted = trustedProducersFor("pre_publish");
+    mutate(trusted, manifests);
+    const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, reuseVerifier());
+    assert.equal(rejected.decision, "reject", label);
+    assert.ok(
+      rejected.summary.input_errors.some((message) => message.includes(expected)),
+      `${label}: ${JSON.stringify(rejected.summary.input_errors)}`,
+    );
+  }
+});
+
+test("a closeout with no way to reprove a binding refuses the reuse row outright", () => {
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseSourceBehavior(trusted, manifests);
+  const rejected = evaluate("pre_publish", manifests, null, trusted);
+  assert.equal(rejected.decision, "reject");
+  assert.ok(rejected.summary.input_errors.some((message) =>
+    message.includes("source_behavior reuses evidence this closeout cannot verify")));
+});
+
+test("a reused artifact container is still bound by its digest", () => {
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseSourceBehavior(trusted, manifests);
+  const bindings = manifests.map((manifest) => {
+    const producer = trusted.producers.find(({ cell_id: cellId }) => cellId === manifest.cell_id);
+    return {
+      cell_id: manifest.cell_id,
+      producer_artifact: producer.producer_artifact,
+      artifact_id: producer.artifact.id,
+      artifact_digest: producer.artifact.digest,
+      manifest_sha256: canonicalManifestSha(manifest),
+    };
+  });
+  bindings.find(({ cell_id: cellId }) => cellId === "source_behavior")
+    .artifact_digest = `sha256:${"f".repeat(64)}`;
+  const rejected = evaluate(
+    "pre_publish",
+    manifests,
+    null,
+    trusted,
+    null,
+    bindings,
+    reuseVerifier(),
+  );
+  assert.equal(rejected.decision, "reject");
+  assert.ok(rejected.summary.failed_cells.includes("source_behavior"));
+  assert.ok(rejected.evaluations.get("source_behavior").value.failures.some((message) =>
+    message.includes("artifact_digest does not match Actions provenance")));
+});
+
+test("reuse never lets stale evidence through the checks that do not depend on the commit", () => {
+  // The reused commit is admissible for the commit identity the binding equates, and for nothing
+  // else: a reused manifest whose own tree is not this release's tree still fails.
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseSourceBehavior(trusted, manifests);
+  manifests.find(({ cell_id: cellId }) => cellId === "source_behavior")
+    .evidence.identity.source_tree = "e".repeat(40);
+  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, reuseVerifier());
+  assert.equal(rejected.decision, "reject");
+  assert.ok(rejected.summary.failed_cells.includes("source_behavior"));
 });
