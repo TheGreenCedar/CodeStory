@@ -91,6 +91,8 @@ fn grounding_orientation_uncertainty_label(
         }
         GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth => "limited_subsystem_breadth",
         GroundingOrientationUncertaintyDto::CompressedPresentation => "compressed_presentation",
+        GroundingOrientationUncertaintyDto::GraphSignalThin => "graph_signal_thin",
+        GroundingOrientationUncertaintyDto::LexicalFallback => "lexical_fallback",
     }
 }
 
@@ -112,6 +114,12 @@ fn grounding_orientation_uncertainty_note(
         }
         GroundingOrientationUncertaintyDto::CompressedPresentation => {
             "orientation evidence was compressed for the selected budget"
+        }
+        GroundingOrientationUncertaintyDto::GraphSignalThin => {
+            "no evaluated candidate carried call-graph evidence; ordering is structural"
+        }
+        GroundingOrientationUncertaintyDto::LexicalFallback => {
+            "no entrypoint or graph evidence; ordering is lexical and structural only"
         }
     }
 }

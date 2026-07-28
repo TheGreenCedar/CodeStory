@@ -789,7 +789,7 @@ fn search_match_rank(
     let orientation = evidence.and_then(|evidence| evidence.get(&hit.node_id));
     // Graph evidence must never rescue a demoted test, vendor, or generated
     // hit, so reference weight is forced off for non-primary sources.
-    let primary_source = source_bucket == 1 && !is_non_primary_source_hit(hit);
+    let primary_source = !is_non_primary_source_hit(hit);
 
     SearchMatchRank {
         full_definition,
