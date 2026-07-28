@@ -430,7 +430,11 @@ def _verify_model(
     producer = parts.model.get("producer")
     require(isinstance(producer, dict), "native manifest lacks model producer identity")
     require(
-        build_fields["producer"] == f"{producer.get('name')}@{producer.get('version')}",
+        # The binary embeds the embedding revision: persisted vectors are keyed
+        # by it, so it moves only when the embeddings do. Comparing the crate
+        # version held only while the two were equal.
+        build_fields["producer"]
+        == f"{producer.get('name')}@{producer.get('embedding_revision')}",
         "native build producer contradicts manifest",
     )
     require(
