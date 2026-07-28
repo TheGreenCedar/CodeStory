@@ -172,6 +172,49 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
   };
 }
 
+/// Verify a reuse binding against the local repository and return its recorded value.
+///
+/// Both sides of the release ledger need this: the producer proves the binding before it admits
+/// cross-run evidence, and the closeout re-proves it against its own checkout before it anchors a
+/// reused row to the earlier run.
+export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
+  if (binding === "source_tree") {
+    const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
+    const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
+    if (releaseTree !== reusedTree) {
+      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
+    }
+    if (spawnSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
+      cwd: repository,
+      encoding: "utf8",
+    }).status !== 0) {
+      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
+    }
+    return releaseTree;
+  }
+  if (binding === "native_fingerprint") {
+    const script = fileURLToPath(new URL("./native-fingerprint.mjs", import.meta.url));
+    const fingerprint = (ref) => {
+      const result = spawnSync(process.execPath, [script, "--ref", ref], {
+        cwd: repository,
+        encoding: "utf8",
+      });
+      if (result.status !== 0) fail(`native fingerprint of ${ref} failed: ${result.stderr.trim()}`);
+      return result.stdout.trim();
+    };
+    const releasePrint = fingerprint(releaseCommit);
+    const reusedPrint = fingerprint(reusedCommit);
+    if (releasePrint !== reusedPrint) {
+      fail(
+        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
+          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
+      );
+    }
+    return releasePrint;
+  }
+  fail(`unknown reuse binding ${binding}`);
+}
+
 function uniqueById(values, label) {
   if (!Array.isArray(values) || values.length === 0) fail(`${label} must be a non-empty array`);
   const found = new Map();
@@ -305,6 +348,77 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
     !== JSON.stringify(["answer_quality", "performance"])
   ) {
     fail("public_support.unclaimed_capabilities must name the release non-claims");
+  }
+}
+
+// The plugin lane's job DAG lives in the claim graph rather than in check-workflow-policy.mjs, and
+// the checker only asserts that the workflow's `needs:` match whatever this data says. That makes
+// this the only place left that can tell a real ordering contract from an empty one: with the
+// dependency lists blanked out, both gates would pass while `gh release create` ran with the
+// release-authority checks and the whole plugin-proof matrix detached from it.
+const PLUGIN_CHAIN_ROOT = "workflow-policy";
+const PLUGIN_CHAIN_ORDER = [
+  // Tagging is irreversible, so everything that can still refuse the release runs before it.
+  ["publish", "preflight"],
+  ["publish", "plugin-proof"],
+  // The catalog and the install proof that reads it only mean anything once the release exists.
+  ["marketplace-publish", "publish"],
+  ["post-publish-smoke", "publish"],
+  ["post-publish-smoke", "marketplace-publish"],
+];
+
+function pluginChainAncestors(dependencies, job, seen = new Set()) {
+  for (const dependency of dependencies[job] ?? []) {
+    if (seen.has(dependency)) continue;
+    seen.add(dependency);
+    pluginChainAncestors(dependencies, dependency, seen);
+  }
+  return seen;
+}
+
+function validatePluginChain(value) {
+  const chain = object(value, "workflow_policy.plugin_chain");
+  const dependencies = object(chain.dependencies, "workflow_policy.plugin_chain.dependencies");
+  const jobs = Object.keys(dependencies);
+  if (jobs.length === 0) {
+    fail("workflow_policy.plugin_chain.dependencies must declare at least one job");
+  }
+  const declared = new Set([PLUGIN_CHAIN_ROOT, ...jobs]);
+  // Null-prototype so a job named after an Object member cannot smuggle a dependency list past the
+  // reachability walk below.
+  const resolved = Object.create(null);
+  for (const job of jobs) {
+    nonEmptyText(job, "workflow_policy.plugin_chain.dependencies job");
+    if (job === PLUGIN_CHAIN_ROOT) {
+      fail(`workflow_policy.plugin_chain.dependencies must not redeclare ${PLUGIN_CHAIN_ROOT}`);
+    }
+    resolved[job] = stringArray(
+      dependencies[job],
+      `workflow_policy.plugin_chain.dependencies.${job}`,
+      { nonEmpty: true },
+    );
+    for (const dependency of resolved[job]) {
+      if (!declared.has(dependency)) {
+        fail(`workflow_policy.plugin_chain.dependencies.${job} names undeclared job ${dependency}`);
+      }
+    }
+  }
+  for (const job of jobs) {
+    const ancestors = pluginChainAncestors(resolved, job);
+    if (ancestors.has(job)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} cannot depend on itself`);
+    }
+    if (!ancestors.has(PLUGIN_CHAIN_ROOT)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${PLUGIN_CHAIN_ROOT}`);
+    }
+  }
+  for (const [job, required] of PLUGIN_CHAIN_ORDER) {
+    if (!declared.has(job) || !declared.has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies must declare ${job} and ${required}`);
+    }
+    if (!pluginChainAncestors(resolved, job).has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${required}`);
+    }
   }
 }
 
@@ -649,6 +763,7 @@ export function validateReleaseClaimGraph(graph) {
       fail("optional release evidence must not block a standard release job");
     }
   }
+  validatePluginChain(policy.plugin_chain);
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");

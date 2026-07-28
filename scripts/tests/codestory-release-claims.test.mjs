@@ -16,6 +16,7 @@ import {
   renderReleasePlatformNotes,
   validatePublicSupportDocuments,
   validateReleaseClaimGraph,
+  verifyReuseBinding,
 } from "../codestory-release-claims.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -290,6 +291,57 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   }
 });
 
+// check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
+// chain that parses but orders nothing would let both gates pass while `gh release create` ran
+// detached from the release-authority checks and the plugin-proof matrix. Every mutation below
+// leaves the workflow and the graph agreeing with each other; only the schema can refuse them.
+test("the plugin chain must order the lane, not merely name it", async (t) => {
+  const chain = (graphValue) => graphValue.workflow_policy.plugin_chain.dependencies;
+  const mutations = [
+    ["the ordering contract is dropped wholesale", (mutated) => {
+      delete mutated.workflow_policy.plugin_chain;
+    }, /workflow_policy\.plugin_chain must be an object/u],
+    ["the dependencies key is not a mapping", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = [];
+    }, /workflow_policy\.plugin_chain\.dependencies must be an object/u],
+    ["the lane declares no jobs at all", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = {};
+    }, /plugin_chain\.dependencies must declare at least one job/u],
+    ["tagging is cut loose from every gate", (mutated) => {
+      chain(mutated).publish = [];
+    }, /plugin_chain\.dependencies\.publish must be a non-empty array/u],
+    ["the install proof is cut loose from every gate", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = [];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must be a non-empty array/u],
+    ["tagging stops waiting on the plugin proof", (mutated) => {
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies\.publish must run behind plugin-proof/u],
+    ["the plugin proof is deleted from the lane", (mutated) => {
+      delete chain(mutated)["plugin-proof"];
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies must declare publish and plugin-proof/u],
+    ["catalog publication races the release it advertises", (mutated) => {
+      chain(mutated)["marketplace-publish"] = ["preflight"];
+    }, /plugin_chain\.dependencies\.marketplace-publish must run behind publish/u],
+    ["the install proof stops waiting on catalog publication", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = ["preflight", "publish"];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must run behind marketplace-publish/u],
+    ["a dependency names a job the lane never declares", (mutated) => {
+      chain(mutated).publish = ["preflight", "plugin-proof", "imaginary-gate"];
+    }, /plugin_chain\.dependencies\.publish names undeclared job imaginary-gate/u],
+    ["the lane closes into a cycle no job can enter", (mutated) => {
+      chain(mutated).preflight = ["plugin-proof"];
+    }, /plugin_chain\.dependencies\.(?:preflight|plugin-proof) cannot depend on itself/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const mutated = structuredClone(graph);
+      mutate(mutated);
+      assert.throws(() => validateReleaseClaimGraph(mutated), expected);
+    });
+  }
+});
+
 test("evaluation requires exact repository and source-tree identity", () => {
   const fixture = positiveFixture();
   delete fixture.expected_identity.source_tree;
@@ -496,4 +548,50 @@ test("CLI derives repository and tree identity from repo and rejects nonexistent
   ], { encoding: "utf8" });
   assert.notEqual(nonexistent.status, 0);
   assert.match(nonexistent.stderr, /git cat-file -e/u);
+});
+
+test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
+  // Both sides of the ledger prove reuse with this one function -- the producer before it admits
+  // cross-run evidence, the closeout before it anchors a row onto the earlier run -- so it is
+  // proved here, against real history, in the suite pull requests actually run.
+  //
+  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
+  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
+  // accelerator inheritance is exactly what version_only_delta authorizes).
+  const releaseTag = "00121349"; // v0.16.1 release commit
+  const priorTag = "29bd4795"; // v0.16.0 release commit
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_tree",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /does not match release tree/u,
+  );
+  const fingerprint = verifyReuseBinding({
+    binding: "native_fingerprint",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: priorTag,
+  });
+  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
+  // Identical commits always satisfy the tree binding.
+  const tree = verifyReuseBinding({
+    binding: "source_tree",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: releaseTag,
+  });
+  assert.match(tree, /^[0-9a-f]{40}$/u);
+  // A binding name the claim graph never declared proves nothing.
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_history",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /unknown reuse binding source_history/u,
+  );
 });

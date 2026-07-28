@@ -6,7 +6,6 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   buildTrustedProducerMap,
-  verifyReuseBinding,
   produceReleaseCellManifest,
 } from "../codestory-release-cell-manifest.mjs";
 import {
@@ -394,36 +393,4 @@ test("reused evidence keeps every same-run trust requirement", () => {
   const missing = reusedRunMetadata("source_behavior");
   missing.artifacts = [];
   assert.throws(withReuse(missing), /must retain one/u);
-});
-
-test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
-  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
-  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
-  // accelerator inheritance is exactly what version_only_delta authorizes).
-  const releaseTag = "00121349"; // v0.16.1 release commit
-  const priorTag = "29bd4795"; // v0.16.0 release commit
-  assert.throws(
-    () => verifyReuseBinding({
-      binding: "source_tree",
-      repository: root,
-      releaseCommit: releaseTag,
-      reusedCommit: priorTag,
-    }),
-    /does not match release tree/u,
-  );
-  const fingerprint = verifyReuseBinding({
-    binding: "native_fingerprint",
-    repository: root,
-    releaseCommit: releaseTag,
-    reusedCommit: priorTag,
-  });
-  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
-  // Identical commits always satisfy the tree binding.
-  const tree = verifyReuseBinding({
-    binding: "source_tree",
-    repository: root,
-    releaseCommit: releaseTag,
-    reusedCommit: releaseTag,
-  });
-  assert.match(tree, /^[0-9a-f]{40}$/u);
 });

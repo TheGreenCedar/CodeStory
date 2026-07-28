@@ -3286,6 +3286,21 @@ pub struct DenseAnchorInputReuseMetadata {
     pub source_identity: String,
 }
 
+/// Row-count shape of the published dense-anchor table.
+///
+/// Freshness checks only need the counts and the policy-version agreement, so
+/// this is deliberately the aggregate projection rather than the rows: it is
+/// what staleness callers must use so an observational readiness or status
+/// call never materializes `document_text` for the whole table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DenseAnchorInputStats {
+    pub doc_count: u32,
+    /// Policy version of the lowest `node_id`, matching a row-order scan.
+    pub policy_version: Option<String>,
+    pub mixed_policy_versions: bool,
+    pub selection_reason_counts: BTreeMap<String, u32>,
+}
+
 pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 1;
 pub const DENSE_ANCHOR_MIGRATION_STATE_NATIVE: &str = "native_v1";
 const DENSE_ANCHOR_DIGEST_DOMAIN: &[u8] = b"codestory-dense-anchor-publication-v1\0";
@@ -7490,6 +7505,55 @@ impl Storage {
             });
         }
         Ok(inputs)
+    }
+
+    /// Aggregate the published dense-anchor table without reading any row.
+    ///
+    /// Staleness comparison needs four numbers: how many anchors exist, how
+    /// they break down by selection reason, whether they agree on a policy
+    /// version, and which version that is. Paging
+    /// `get_dense_anchor_inputs_batch_after` to derive them `SELECT`s
+    /// `document_text` for every anchor and materializes a full
+    /// `DenseAnchorInput` per row — tens of megabytes of string allocation on
+    /// a large repository, paid on every observational readiness or status
+    /// call that re-derives freshness. SQLite answers all four from one
+    /// grouped scan that never touches the document column, so the group
+    /// cardinality is `distinct(selection_reason) x distinct(policy_version)`
+    /// rather than the anchor count. `MIN(node_id)` per group reproduces the
+    /// row-order "first policy version wins" rule exactly.
+    pub fn dense_anchor_input_stats(&self) -> Result<DenseAnchorInputStats, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT selection_reason, policy_version, COUNT(*), MIN(node_id)
+             FROM dense_anchor_input
+             GROUP BY selection_reason, policy_version",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut stats = DenseAnchorInputStats::default();
+        let mut policy_versions: BTreeSet<String> = BTreeSet::new();
+        let mut first_policy: Option<(i64, String)> = None;
+        while let Some(row) = rows.next()? {
+            let selection_reason: String = row.get(0)?;
+            let policy_version: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            let min_node_id: i64 = row.get(3)?;
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            stats.doc_count = stats.doc_count.saturating_add(count);
+            let reason_count = stats
+                .selection_reason_counts
+                .entry(selection_reason)
+                .or_insert(0);
+            *reason_count = reason_count.saturating_add(count);
+            if first_policy
+                .as_ref()
+                .is_none_or(|(lowest, _)| min_node_id < *lowest)
+            {
+                first_policy = Some((min_node_id, policy_version.clone()));
+            }
+            policy_versions.insert(policy_version);
+        }
+        stats.mixed_policy_versions = policy_versions.len() > 1;
+        stats.policy_version = first_policy.map(|(_, version)| version);
+        Ok(stats)
     }
 
     pub fn get_dense_anchor_input_reuse_metadata(
