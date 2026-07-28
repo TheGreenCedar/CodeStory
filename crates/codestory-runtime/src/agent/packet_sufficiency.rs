@@ -4111,9 +4111,19 @@ mod tests {
         let question = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
         let answer = answer_fixture(question);
         let budget = budget_fixture();
+        // Both claims are proof-bearing and cite resolved anchors, so nothing but the shape of that
+        // evidence can decide the schema requirements. The anchors are ordinary application
+        // symbols in a `.rb` file: `packet_evidence_role` classifies them as source evidence, which
+        // is neither a table definition nor a relationship constraint.
         let claims = vec![
-            claim("SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine."),
-            claim("Track rows reference Album, Genre, and MediaType rows."),
+            evidence_claim(
+                "SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine.",
+                anchor_at("Catalog.load", "app/models/catalog.rb"),
+            ),
+            evidence_claim(
+                "Track rows reference Album, Genre, and MediaType rows.",
+                anchor_at("Catalog.render", "app/views/catalog.rb"),
+            ),
         ];
 
         let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
@@ -4137,6 +4147,31 @@ mod tests {
             report.missing.contains(&"sql_relationships".to_string()),
             "SQL relationship wording without an FK citation must stay missing: {report:?}"
         );
+        // Pin the reason rather than relying on how the fixture happens to classify: the two SQL
+        // requirements are refused because their evidence predicates reject these anchors, not
+        // because the anchors landed on some other role or were ruled ineligible.
+        let context = PacketFlowContext::new(question, PacketTaskClassDto::DataFlow);
+        for requirement_id in ["sql_tables", "sql_relationships"] {
+            let requirement = context
+                .requirements
+                .iter()
+                .find(|requirement| requirement.id == requirement_id)
+                .unwrap_or_else(|| panic!("the prompt should raise {requirement_id}"));
+            for anchor in [
+                anchor_at("Catalog.load", "app/models/catalog.rb"),
+                anchor_at("Catalog.render", "app/views/catalog.rb"),
+            ] {
+                assert!(
+                    citation_sufficiency_eligible(&anchor),
+                    "the fixture anchors must be proof-bearing for this to test the predicate"
+                );
+                assert!(
+                    !requirement.evidence.citation_proves(&anchor),
+                    "{requirement_id} must reject `{}` by its own evidence predicate",
+                    anchor.display_name
+                );
+            }
+        }
     }
 
     #[test]
@@ -4437,12 +4472,22 @@ mod tests {
         let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
         let answer = answer_fixture(question);
         let budget = budget_fixture();
+        // Three proof-bearing claims over real formatting anchors. `format_arguments` and
+        // `format_errors` are separate requirements, so argument, output, and buffer evidence must
+        // leave the error/fallback requirement open — the case wording used to close.
         let claims = vec![
-            claim(
+            evidence_claim(
                 "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+                anchor_at("basic_format_args", "include/fmt/base.h"),
             ),
-            claim("Runtime formatting writes formatted output through output iterator helpers."),
-            claim("Runtime formatting appends formatted output to a buffer."),
+            evidence_claim(
+                "Runtime formatting writes formatted output through output iterator helpers.",
+                anchor_at("vformat_to", "include/fmt/format.h"),
+            ),
+            evidence_claim(
+                "Runtime formatting appends formatted output to a buffer.",
+                anchor_at("basic_memory_buffer.append", "include/fmt/format.h"),
+            ),
         ];
 
         let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
@@ -4997,11 +5042,18 @@ mod tests {
         mark_full_retrieval_available(&mut answer);
         let budget = compact_truncated_budget(question, vec!["citations", "markdown_blocks"]);
         let claims = vec![
-            claim(
+            evidence_claim(
                 "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+                anchor_at("basic_format_args", "include/fmt/base.h"),
             ),
-            claim("Runtime formatting writes formatted output through output iterator helpers."),
-            claim("Runtime formatting appends formatted output to a buffer."),
+            evidence_claim(
+                "Runtime formatting writes formatted output through output iterator helpers.",
+                anchor_at("vformat_to", "include/fmt/format.h"),
+            ),
+            evidence_claim(
+                "Runtime formatting appends formatted output to a buffer.",
+                anchor_at("basic_memory_buffer.append", "include/fmt/format.h"),
+            ),
         ];
 
         let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
@@ -6124,6 +6176,532 @@ mod tests {
             packet_supported_claim_family_count(&claims) >= 3,
             "string predicate claims should cover distinct sufficiency families"
         );
+    }
+
+    #[test]
+    fn a_claim_without_cited_evidence_cannot_satisfy_sufficiency() {
+        let question = "Explain what owns this behavior.";
+        let answer = answer_fixture(question);
+        let unsupported = claim("The runtime validates every request before it is dispatched.");
+
+        assert!(!packet_claim_can_satisfy_sufficiency(&unsupported));
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::SymbolOwnership,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: vec![unsupported],
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency.covered_claims.is_empty(),
+            "an unsupported sentence must not be published as a covered claim: {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report
+                .ineligible
+                .iter()
+                .any(|entry| entry.contains("reason=\"claim carries no cited evidence\"")),
+            "an unsupported sentence must be reported as unproven, not counted: {report:?}"
+        );
+        assert!(report.covered.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_claim_the_packet_reports_as_unproven_is_never_published_as_covered() {
+        // Callers read covered_claims as verified and safe to repeat. Publishing a claim that the
+        // same packet lists as ineligible would restate #1200's false-safe answer one claim down.
+        let question = "Explain what owns this behavior.";
+        let mut answer = answer_fixture(question);
+        let anchor = anchor_at(
+            "publish_generation",
+            "crates/codestory-store/src/publication.rs",
+        );
+        answer.citations = vec![anchor.clone()];
+        let navigation = cited_claim(
+            "`publish_generation` ties publication in this flow to cited definitions and adjacent ownership.",
+            Some("source evidence"),
+            anchor,
+            Some(true),
+        );
+
+        assert!(!packet_claim_can_satisfy_sufficiency(&navigation));
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::SymbolOwnership,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: vec![navigation],
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency.covered_claims.is_empty(),
+            "a cited claim that only points at evidence must not be published: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.avoid_opening_paths.is_empty(),
+            "a file only named by an unproven claim stays worth opening: {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.ineligible.iter().any(|entry| entry.contains(
+                "reason=\"generic navigation/source-evidence claim does not explain the flow\""
+            )),
+            "the dropped claim must still be explained in the coverage report: {report:?}"
+        );
+    }
+
+    #[test]
+    fn every_task_class_needs_a_proof_bearing_claim_for_each_resolved_exact_path() {
+        let covered_path = "crates/codestory-cli/src/stdio_transport.rs";
+        let uncovered_path = "crates/codestory-runtime/src/agent/orchestrator.rs";
+        let covered = anchor_at("dispatch_stdio_request", covered_path);
+        let exact_paths = [covered_path.to_string(), uncovered_path.to_string()];
+
+        for task_class in [
+            PacketTaskClassDto::ArchitectureExplanation,
+            PacketTaskClassDto::RouteTracing,
+            PacketTaskClassDto::DataFlow,
+            PacketTaskClassDto::ChangeImpact,
+            PacketTaskClassDto::EditPlanning,
+            PacketTaskClassDto::BugLocalization,
+            PacketTaskClassDto::SymbolOwnership,
+        ] {
+            let question = "Explain what these exact paths do.";
+            let mut answer = answer_fixture(question);
+            answer.citations = vec![covered.clone()];
+
+            let sufficiency = assemble_packet_sufficiency_with_probe_context(
+                PacketSufficiencyInput {
+                    project_root: Path::new("C:/workspace/project"),
+                    question,
+                    task_class,
+                    answer: &answer,
+                    budget: &budget_fixture(),
+                    supported_claims: vec![evidence_claim(
+                        "The stdio adapter dispatches the host request.",
+                        covered.clone(),
+                    )],
+                    missing_required_probe_queries: Vec::new(),
+                    targeted_follow_up_queries: Vec::new(),
+                },
+                &[],
+                &exact_paths,
+            );
+
+            assert_ne!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Sufficient,
+                "{task_class:?} packet must not report sufficient while an exact path is unproven: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.contains(uncovered_path)),
+                "{task_class:?} packet needs a path-specific gap: {sufficiency:?}"
+            );
+            assert!(
+                !sufficiency
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.contains(covered_path)),
+                "{task_class:?} packet must not report a proven path as missing: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .follow_up_commands
+                    .iter()
+                    .any(|command| command.contains(uncovered_path)),
+                "{task_class:?} packet needs a targeted follow-up for the unproven path: {sufficiency:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_uncovered_exact_paths_than_the_gap_budget_are_summarized_not_dropped() {
+        let question = "Explain what these exact paths do.";
+        let answer = answer_fixture(question);
+        let exact_paths = (0..MAX_EXACT_PATH_CLAIM_GAPS + 2)
+            .map(|index| format!("crates/example/src/module_{index}.rs"))
+            .collect::<Vec<_>>();
+
+        let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                answer: &answer,
+                budget: &budget_fixture(),
+                supported_claims: Vec::new(),
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            },
+            &[],
+            &exact_paths,
+        );
+
+        let path_gaps = sufficiency
+            .gaps
+            .iter()
+            .filter(|gap| gap.contains("explicit exact path"))
+            .count();
+        assert_eq!(
+            path_gaps, MAX_EXACT_PATH_CLAIM_GAPS,
+            "path-specific gaps stay bounded: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("2 further requested exact path(s)")),
+            "the paths beyond the gap budget are still reported: {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        for path in &exact_paths {
+            assert!(
+                report.missing.contains(&format!("exact path: {path}")),
+                "the coverage report names every unproven path: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requirement_coverage_comes_from_cited_evidence_not_claim_wording() {
+        let context =
+            PacketFlowContext::new("Explain request dispatch.", PacketTaskClassDto::DataFlow);
+        let requirement = *context
+            .requirements
+            .iter()
+            .find(|requirement| requirement.id == "request_dispatch")
+            .expect("a request-dispatch prompt raises the dispatch requirement");
+        let wording_only = evidence_claim(
+            "The runtime dispatches every request through a central handler.",
+            anchor_at("ProjectSettings", "src/settings.rs"),
+        );
+        let evidence_backed = evidence_claim(
+            "The runtime dispatches every request through a central handler.",
+            anchor_at("dispatchRequest", "src/dispatch.rs"),
+        );
+
+        assert!(
+            !context.claim_satisfies_requirement(&wording_only, &requirement),
+            "dispatch wording over unrelated evidence must not cover a dispatch requirement"
+        );
+        assert!(
+            context.claim_satisfies_requirement(&evidence_backed, &requirement),
+            "a cited dispatch symbol covers the dispatch requirement"
+        );
+    }
+
+    #[test]
+    fn evidence_at_one_flow_role_does_not_close_the_next_role_in_the_same_flow() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let claims = vec![evidence_claim(
+            "The log entrypoint builds a record before handlers see it.",
+            anchor_at("Logger.addRecord", "src/logging/Logger.php"),
+        )];
+
+        let missing =
+            packet_missing_required_flow_roles(question, PacketTaskClassDto::DataFlow, &claims);
+        assert!(
+            !missing.contains(&FlowRole::Entrypoint),
+            "cited record-creation evidence should close the entrypoint requirement: {missing:?}"
+        );
+        assert!(
+            missing.contains(&FlowRole::Dispatch),
+            "record-creation evidence must not also close the handler requirement beside it: {missing:?}"
+        );
+    }
+
+    /// The three holdout prompts in `benchmarks/tasks/holdout-retrieval/`, each with every
+    /// component cited except the one the manifest names. This lane's acceptance criterion is that
+    /// the packet refuses in exactly that case, so it belongs in the unit suite rather than only in
+    /// a corpus run.
+    #[test]
+    fn holdout_prompts_stay_partial_when_the_named_component_is_uncited() {
+        struct HoldoutCase {
+            id: &'static str,
+            question: &'static str,
+            cited: &'static [(&'static str, &'static str)],
+            uncited_requirement: &'static str,
+        }
+
+        let cases = [
+            HoldoutCase {
+                id: "axios-request-dispatch",
+                question: "Explain how the default axios instance is created and how an HTTP request flows through interceptors, dispatchRequest, and the transport adapter. Cite the source files that support the path.",
+                cited: &[
+                    ("createInstance", "lib/axios.js"),
+                    ("dispatchRequest", "lib/core/dispatchRequest.js"),
+                    ("getAdapter", "lib/adapters/adapters.js"),
+                ],
+                uncited_requirement: "request_interceptor_management",
+            },
+            HoldoutCase {
+                id: "redis-server-event-loop",
+                question: "Explain how the Redis server starts its event loop, reads client commands from the network, and dispatches them through processCommand and call. Cite the source files that support the path.",
+                cited: &[
+                    ("main", "src/server.c"),
+                    ("aeProcessEvents", "src/event/ae.c"),
+                    ("processCommand", "src/server.c"),
+                ],
+                uncited_requirement: "command_network_input",
+            },
+            HoldoutCase {
+                id: "ripgrep-search-pipeline",
+                question: "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files that support the path.",
+                cited: &[("main", "crates/core/main.rs")],
+                uncited_requirement: "search_dispatch",
+            },
+        ];
+
+        for case in cases {
+            let mut answer = answer_fixture(case.question);
+            answer.citations = case
+                .cited
+                .iter()
+                .map(|(name, path)| anchor_at(name, path))
+                .collect();
+            let claims = case
+                .cited
+                .iter()
+                .map(|(name, path)| {
+                    evidence_claim(
+                        &format!("`{name}` participates in the traced path."),
+                        anchor_at(name, path),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question: case.question,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                answer: &answer,
+                budget: &budget_fixture(),
+                supported_claims: claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            });
+
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Partial,
+                "holdout {} must refuse while {} is uncited: {sufficiency:?}",
+                case.id,
+                case.uncited_requirement
+            );
+            let report = sufficiency.coverage_report.as_ref().unwrap();
+            assert!(
+                report
+                    .missing
+                    .contains(&case.uncited_requirement.to_string()),
+                "holdout {} should name {} as missing: {report:?}",
+                case.id,
+                case.uncited_requirement
+            );
+        }
+    }
+
+    #[test]
+    fn holdout_axios_interceptor_evidence_closes_the_interceptor_requirement() {
+        // The opposite direction of the axios holdout gate: the same packet with an interceptor
+        // owner cited stops reporting that requirement missing, so the refusal above is caused by
+        // the uncited component and not by an unclosable requirement.
+        let question = "Explain how the default axios instance is created and how an HTTP request flows through interceptors, dispatchRequest, and the transport adapter. Cite the source files that support the path.";
+        let mut interceptor = anchor_at("InterceptorManager", "lib/core/InterceptorManager.js");
+        interceptor.kind = NodeKind::CLASS;
+        let cited = [
+            anchor_at("createInstance", "lib/axios.js"),
+            anchor_at("dispatchRequest", "lib/core/dispatchRequest.js"),
+            anchor_at("getAdapter", "lib/adapters/adapters.js"),
+            interceptor,
+        ];
+        let mut answer = answer_fixture(question);
+        answer.citations = cited.to_vec();
+        let claims = cited
+            .iter()
+            .map(|citation| {
+                evidence_claim(
+                    &format!(
+                        "`{}` participates in the traced path.",
+                        citation.display_name
+                    ),
+                    citation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            !report
+                .missing
+                .contains(&"request_interceptor_management".to_string()),
+            "a cited interceptor owner closes the interceptor requirement: {report:?}"
+        );
+    }
+
+    #[test]
+    fn retained_route_tracing_packet_reports_the_unproven_route_instead_of_sufficient() {
+        // Retained shape of ask-1784386505488682000 (#1200): a route_tracing request whose packet
+        // answered with generic router/application-factory prose, an unrelated task-class enum, and
+        // an import-only `Context -> Context` graph, yet reported sufficient with no gaps and told
+        // the caller not to open the very files the route runs through.
+        //
+        // Route order and avoid-opening already failed closed before this lane; what this pins in
+        // addition is that each requested path is held to its own proof in a route_tracing packet,
+        // and that the navigation claim over one of those paths is neither counted nor published.
+        let question = "plugins/codestory/scripts/codestory-mcp.cjs -> crates/codestory-cli/src/stdio_transport.rs -> crates/codestory-runtime/src/agent/orchestrator.rs -> crates/codestory-retrieval/src/lib.rs";
+        let route_paths = [
+            "plugins/codestory/scripts/codestory-mcp.cjs",
+            "crates/codestory-cli/src/stdio_transport.rs",
+            "crates/codestory-runtime/src/agent/orchestrator.rs",
+            "crates/codestory-retrieval/src/lib.rs",
+        ];
+
+        let router = anchor_at("create_router", "src/application/router.rs");
+        let factory = anchor_at("create_app", "src/application/factory.rs");
+        let mut task_enum = anchor_at("EditPlanning", "crates/codestory-contracts/src/api.rs");
+        task_enum.kind = NodeKind::ENUM_CONSTANT;
+        let mut import_node = anchor_at("Context", route_paths[2]);
+        import_node.kind = NodeKind::STRUCT;
+
+        let mut answer = answer_fixture(question);
+        answer.answer_id = "ask-1784386505488682000".to_string();
+        mark_full_retrieval_available(&mut answer);
+        answer.citations = vec![
+            router.clone(),
+            factory.clone(),
+            task_enum.clone(),
+            import_node.clone(),
+        ];
+        answer.graphs = vec![route_graph(
+            "import-neighborhood",
+            &["Context"],
+            &[("Context", "Context")],
+        )];
+        let claims = vec![
+            evidence_claim(
+                "`create_router` builds the application router for incoming requests.",
+                router,
+            ),
+            evidence_claim(
+                "`create_app` wires the application factory before requests are served.",
+                factory,
+            ),
+            evidence_claim(
+                "`EditPlanning` names the requested packet task class.",
+                task_enum,
+            ),
+            cited_claim(
+                "`Context` in `crates/codestory-runtime/src/agent/orchestrator.rs` ties context in this flow to cited definitions and adjacent ownership.",
+                Some("source evidence"),
+                import_node,
+                Some(true),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question,
+                task_class: PacketTaskClassDto::RouteTracing,
+                answer: &answer,
+                budget: &budget_fixture(),
+                supported_claims: claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            },
+            &[],
+            &route_paths.map(str::to_string),
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "generic router prose over an import-only graph cannot report a proven route: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.gaps.iter().any(|gap| gap
+                .contains("did not establish a proof-bearing claim from explicit exact path")),
+            "route tracing must hold every requested path to its own proof, not only architecture: {sufficiency:?}"
+        );
+        let report = sufficiency
+            .coverage_report
+            .as_ref()
+            .expect("retained route packet should carry a coverage report");
+        assert!(
+            report.ineligible.iter().any(|entry| entry
+                .contains("generic navigation/source-evidence claim does not explain the flow")),
+            "navigation prose over a requested file stays unproven: {report:?}"
+        );
+        assert!(
+            sufficiency
+                .covered_claims
+                .iter()
+                .all(|claim| !claim.claim.contains("adjacent ownership")),
+            "a claim the same packet reports as unproven must not be published as covered: {sufficiency:?}"
+        );
+        for path in route_paths {
+            assert!(
+                report.missing.contains(&format!("exact path: {path}")),
+                "coverage report should retain each unproven requested path: {report:?}"
+            );
+        }
+        let exact_path_gaps = sufficiency
+            .gaps
+            .iter()
+            .filter(|gap| gap.contains("explicit exact path"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact_path_gaps.len(),
+            route_paths.len(),
+            "every unproven requested path needs a gap of its own: {sufficiency:?}"
+        );
+        for path in route_paths {
+            assert_eq!(
+                exact_path_gaps
+                    .iter()
+                    .filter(|gap| gap.contains(path))
+                    .count(),
+                1,
+                "{path} needs exactly one path-specific gap: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .follow_up_commands
+                    .iter()
+                    .any(|command| command.contains(path)),
+                "each unproven route path needs a targeted follow-up: {path} missing from {sufficiency:?}"
+            );
+            assert!(
+                !sufficiency.avoid_opening_paths.contains(&path.to_string()),
+                "an unproven route path must never be advertised as already covered: {sufficiency:?}"
+            );
+        }
     }
 }
 

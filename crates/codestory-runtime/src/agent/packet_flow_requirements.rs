@@ -802,10 +802,76 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+/// Every requirement table, grouped the way a single question raises them. Requirements that share
+/// a group and a `FlowRole` are the ones that must stay separable by evidence, so tests need the
+/// grouping and not just a flat list.
+#[cfg(test)]
+pub(crate) fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)> {
+    let mut client_dispatch = CLIENT_REQUEST_DISPATCH_FLOW.to_vec();
+    client_dispatch.push(REQUEST_INTERCEPTOR_REQUIREMENT);
+    vec![
+        ("indexing", INDEXING_FLOW.to_vec()),
+        (
+            "server_request_dispatch",
+            SERVER_REQUEST_DISPATCH_FLOW.to_vec(),
+        ),
+        ("client_request_dispatch", client_dispatch),
+        ("url_session", URL_SESSION_FLOW.to_vec()),
+        (
+            "client_send",
+            vec![
+                CLIENT_PUBLIC_FACADE_REQUIREMENT,
+                CLIENT_INTERFACE_HELPERS_REQUIREMENT,
+                CLIENT_REQUEST_FINALIZATION_REQUIREMENT,
+                CLIENT_TRANSPORT_SEND_REQUIREMENT,
+                CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT,
+            ],
+        ),
+        (
+            "hook_cache",
+            vec![
+                HOOK_PUBLIC_EXPORT_REQUIREMENT,
+                HOOK_KEY_SERIALIZATION_REQUIREMENT,
+                HOOK_CACHE_HELPER_REQUIREMENT,
+                HOOK_MUTATION_FLOW_REQUIREMENT,
+            ],
+        ),
+        (
+            "command_loop",
+            vec![
+                COMMAND_SERVER_BOOTSTRAP_REQUIREMENT,
+                COMMAND_EVENT_LOOP_REQUIREMENT,
+                COMMAND_NETWORK_INPUT_REQUIREMENT,
+                COMMAND_DISPATCH_REQUIREMENT,
+            ],
+        ),
+        ("sql_schema", SQL_SCHEMA_FLOW.to_vec()),
+        ("html_css", HTML_CSS_FLOW.to_vec()),
+        ("css_animation", CSS_ANIMATION_FLOW.to_vec()),
+        ("form_validation", FORM_VALIDATION_FLOW.to_vec()),
+        ("shell_install", SHELL_INSTALL_FLOW.to_vec()),
+        ("buffered_io", BUFFERED_IO_FLOW.to_vec()),
+        ("log_handler", LOG_HANDLER_FLOW.to_vec()),
+        ("site_build", SITE_BUILD_FLOW.to_vec()),
+        ("mapper_plan", MAPPER_PLAN_FLOW.to_vec()),
+        ("runtime_formatting", RUNTIME_FORMATTING_FLOW.to_vec()),
+        ("search_execution", SEARCH_EXECUTION_FLOW.to_vec()),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn all_flow_requirements() -> Vec<FlowRequirement> {
+    all_flow_requirement_groups()
+        .into_iter()
+        .flat_map(|(_, requirements)| requirements)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::packet_terms::packet_probe_terms;
+    use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
 
     fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
         packet_flow_requirements_for_terms(
@@ -928,5 +994,473 @@ mod tests {
                 "server request flow should not probe {client_only}"
             );
         }
+    }
+
+    /// The checked-in inventory of every requirement a question can raise, as
+    /// `id | role | coverage mode`.
+    ///
+    /// This exists so that a requirement can never be quietly removed to make a gate pass. The
+    /// previous invariant asked "can any evidence role carry this requirement's `FlowRole`?", which
+    /// a failing lane could satisfy by deleting the requirement; this one fails on removal too, and
+    /// the only way past it is to edit the list in the diff a reviewer reads.
+    const FLOW_REQUIREMENT_INVENTORY: &[&str] = &[
+        "buffered_read_write | dispatch | RequiresResolvedSourceOrGraph",
+        "buffered_storage | state_or_storage | AllowsSourceRange",
+        "client_interface_helpers | entrypoint | RequiresResolvedSourceOrGraph",
+        "client_public_facade | entrypoint | RequiresResolvedSourceOrGraph",
+        "client_request_finalization | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "client_response_materialization | terminal_boundary | RequiresResolvedSourceOrGraph",
+        "client_transport_send | dispatch | RequiresResolvedSourceOrGraph",
+        "command_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "command_event_loop | dispatch | RequiresResolvedSourceOrGraph",
+        "command_network_input | dispatch | RequiresResolvedSourceOrGraph",
+        "command_server_bootstrap | entrypoint | RequiresResolvedSourceOrGraph",
+        "css_animation_entrypoint | entrypoint | AllowsLexicalSource",
+        "css_animation_structure | configuration | AllowsLexicalSource",
+        "css_structure | configuration | AllowsLexicalSource",
+        "form_custom_validation | transform_or_validate | AllowsLexicalSource",
+        "form_native_constraints | transform_or_validate | AllowsLexicalSource",
+        "form_submit_guard | terminal_boundary | AllowsLexicalSource",
+        "format_arguments | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "format_errors | error_or_fallback | AllowsSourceRange",
+        "handler_processing | dispatch | RequiresResolvedSourceOrGraph",
+        "hook_cache_helper | state_or_storage | AllowsSourceRange",
+        "hook_key_serialization | transform_or_validate | AllowsSourceRange",
+        "hook_mutation_flow | dispatch | AllowsSourceRange",
+        "hook_public_export | entrypoint | AllowsSourceRange",
+        "html_app_shell | entrypoint | AllowsLexicalSource",
+        "indexing_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
+        "indexing_storage | state_or_storage | AllowsSourceRange",
+        "logger_event | entrypoint | RequiresResolvedSourceOrGraph",
+        "mapper_config | configuration | RequiresResolvedSourceOrGraph",
+        "mapper_execution | dispatch | RequiresResolvedSourceOrGraph",
+        "request_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "request_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
+        "request_entrypoint | registration | RequiresResolvedSourceOrGraph",
+        "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
+        "request_terminal | terminal_boundary | AllowsSourceRange",
+        "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
+        "session_callbacks | dispatch | AllowsSourceRange",
+        "session_request | entrypoint | RequiresResolvedSourceOrGraph",
+        "shell_completion | terminal_boundary | DiagnosticOnly",
+        "shell_function_dispatch | dispatch | AllowsLexicalSource",
+        "shell_installer_bootstrap | entrypoint | AllowsLexicalSource",
+        "site_lifecycle | entrypoint | RequiresResolvedSourceOrGraph",
+        "site_terminal | terminal_boundary | AllowsSourceRange",
+        "sql_relationships | configuration | AllowsLexicalSource",
+        "sql_tables | state_or_storage | AllowsLexicalSource",
+    ];
+
+    fn requirement_inventory_entry(requirement: &FlowRequirement) -> String {
+        format!(
+            "{} | {} | {:?}",
+            requirement.id,
+            requirement.role_id(),
+            requirement.coverage_mode
+        )
+    }
+
+    #[test]
+    fn the_requirement_inventory_matches_the_requirement_tables() {
+        let mut live = all_flow_requirements()
+            .iter()
+            .map(requirement_inventory_entry)
+            .collect::<Vec<_>>();
+        live.sort();
+        live.dedup();
+
+        let mut recorded = FLOW_REQUIREMENT_INVENTORY
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect::<Vec<_>>();
+        recorded.sort();
+
+        let removed = recorded
+            .iter()
+            .filter(|entry| !live.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            removed.is_empty(),
+            "a requirement disappeared from the tables; a requirement no evidence can reach is a \
+             retrieval gap to close, not a requirement to drop: {removed:?}"
+        );
+        let added = live
+            .iter()
+            .filter(|entry| !recorded.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            added.is_empty(),
+            "a new requirement is not in the checked-in inventory; add it there so removals stay \
+             visible in review: {added:?}"
+        );
+    }
+
+    /// One cited anchor that proves each requirement. Two jobs: it shows every requirement is
+    /// reachable at all (a requirement no evidence can close would report partial forever), and it
+    /// gives the same-role distinctness test the witnesses it needs.
+    fn requirement_witnesses() -> Vec<((&'static str, &'static str), AgentCitationDto)> {
+        vec![
+            (
+                ("indexing_entrypoint", "entrypoint"),
+                witness("buildIndex", "src/indexer/build.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("indexing_storage", "state_or_storage"),
+                witness(
+                    "SymbolStore.persist",
+                    "src/store/symbols.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("request_entrypoint", "registration"),
+                witness("Router.add_route", "src/routing.py", NodeKind::FUNCTION),
+            ),
+            (
+                ("request_entrypoint", "entrypoint"),
+                witness("createInstance", "lib/axios.js", NodeKind::FUNCTION),
+            ),
+            (
+                ("request_dispatch", "dispatch"),
+                witness(
+                    "dispatchRequest",
+                    "lib/core/dispatchRequest.js",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("request_terminal", "terminal_boundary"),
+                witness(
+                    "selectAdapter",
+                    "lib/adapters/adapters.js",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("request_interceptor_management", "dispatch"),
+                witness(
+                    "InterceptorManager",
+                    "lib/core/InterceptorManager.js",
+                    NodeKind::CLASS,
+                ),
+            ),
+            (
+                ("session_request", "entrypoint"),
+                witness(
+                    "createClientInstance",
+                    "Source/Session.swift",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("session_callbacks", "dispatch"),
+                witness(
+                    "SessionDelegate.dispatchEvent",
+                    "Source/SessionDelegate.swift",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("client_public_facade", "entrypoint"),
+                witness("createClient", "lib/client.dart", NodeKind::FUNCTION),
+            ),
+            (
+                ("client_interface_helpers", "entrypoint"),
+                witness("Client.get", "lib/client.dart", NodeKind::METHOD),
+            ),
+            (
+                ("client_request_finalization", "transform_or_validate"),
+                witness(
+                    "BaseRequest.finalize",
+                    "lib/base_request.dart",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("client_transport_send", "dispatch"),
+                witness(
+                    "IOClient.sendAdapter",
+                    "lib/io_client.dart",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("client_response_materialization", "terminal_boundary"),
+                witness("Response.fromStream", "lib/response.dart", NodeKind::METHOD),
+            ),
+            (
+                ("hook_public_export", "entrypoint"),
+                witness("useData", "src/index/use-data.ts", NodeKind::FUNCTION),
+            ),
+            (
+                ("hook_key_serialization", "transform_or_validate"),
+                witness(
+                    "serializeKey",
+                    "src/_internal/utils/serialize.ts",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("hook_cache_helper", "state_or_storage"),
+                witness(
+                    "makeCacheHelper",
+                    "src/_internal/utils/helper.ts",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("hook_mutation_flow", "dispatch"),
+                witness(
+                    "applyMutation",
+                    "src/_internal/utils/mutate.ts",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("command_server_bootstrap", "entrypoint"),
+                witness("main", "src/server.c", NodeKind::FUNCTION),
+            ),
+            (
+                ("command_event_loop", "dispatch"),
+                witness("aeProcessEvents", "src/event/ae.c", NodeKind::FUNCTION),
+            ),
+            (
+                ("command_network_input", "dispatch"),
+                witness(
+                    "readQueryFromClient",
+                    "src/networking.c",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("command_dispatch", "dispatch"),
+                witness("processCommand", "src/server.c", NodeKind::FUNCTION),
+            ),
+            (
+                ("sql_tables", "state_or_storage"),
+                witness("CREATE TABLE Artist", "db/schema.sql", NodeKind::FUNCTION),
+            ),
+            (
+                ("sql_relationships", "configuration"),
+                witness("FOREIGN KEY", "db/schema.sql", NodeKind::FUNCTION),
+            ),
+            (
+                ("html_app_shell", "entrypoint"),
+                witness("div#app", "src/index.html", NodeKind::FUNCTION),
+            ),
+            (
+                ("css_structure", "configuration"),
+                witness(":root", "src/main.css", NodeKind::FUNCTION),
+            ),
+            (
+                ("css_animation_entrypoint", "entrypoint"),
+                witness(
+                    "@import \"animations/base\"",
+                    "src/animations/index.css",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("css_animation_structure", "configuration"),
+                witness(
+                    "@keyframes fade-in",
+                    "src/animations/fade.css",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("form_native_constraints", "transform_or_validate"),
+                witness("required", "examples/form.html", NodeKind::FUNCTION),
+            ),
+            (
+                ("form_custom_validation", "transform_or_validate"),
+                witness(
+                    "setCustomValidity",
+                    "examples/validate.js",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("form_submit_guard", "terminal_boundary"),
+                witness("onSubmitGuard", "examples/submit.js", NodeKind::FUNCTION),
+            ),
+            (
+                ("shell_installer_bootstrap", "entrypoint"),
+                witness("nvm_download", "install.sh", NodeKind::FUNCTION),
+            ),
+            (
+                ("shell_function_dispatch", "dispatch"),
+                witness("nvm_command", "nvm.sh", NodeKind::FUNCTION),
+            ),
+            (
+                ("shell_completion", "terminal_boundary"),
+                witness("nvm_completion", "bash_completion.sh", NodeKind::FUNCTION),
+            ),
+            (
+                ("buffered_storage", "state_or_storage"),
+                witness("Buffer", "okio/src/buffer.kt", NodeKind::CLASS),
+            ),
+            (
+                ("buffered_read_write", "dispatch"),
+                witness("Buffer.writeUtf8", "okio/src/buffer.kt", NodeKind::METHOD),
+            ),
+            (
+                ("logger_event", "entrypoint"),
+                witness(
+                    "Logger.addRecord",
+                    "src/logging/Logger.php",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("handler_processing", "dispatch"),
+                witness(
+                    "AbstractProcessingHandler.write",
+                    "src/logging/Handler.php",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("site_lifecycle", "entrypoint"),
+                witness("Build.process", "lib/site/build.rb", NodeKind::METHOD),
+            ),
+            (
+                ("site_terminal", "terminal_boundary"),
+                witness("Renderer.render", "lib/site/renderer.rb", NodeKind::METHOD),
+            ),
+            (
+                ("mapper_config", "configuration"),
+                witness(
+                    "MapperConfiguration",
+                    "src/AutoMapper/MapperConfiguration.cs",
+                    NodeKind::CLASS,
+                ),
+            ),
+            (
+                ("mapper_execution", "dispatch"),
+                witness(
+                    "TypeMapPlanBuilder",
+                    "src/AutoMapper/Execution/Plan.cs",
+                    NodeKind::CLASS,
+                ),
+            ),
+            (
+                ("format_arguments", "transform_or_validate"),
+                witness("basic_format_args", "include/fmt/base.h", NodeKind::CLASS),
+            ),
+            (
+                ("format_errors", "error_or_fallback"),
+                witness(
+                    "throw_format_error",
+                    "include/fmt/format.h",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("search_entrypoint", "entrypoint"),
+                witness("main", "crates/core/main.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("search_dispatch", "dispatch"),
+                witness("SearchWorker", "crates/core/search.rs", NodeKind::STRUCT),
+            ),
+        ]
+    }
+
+    fn witness(display_name: &str, file_path: &str, kind: NodeKind) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    #[test]
+    fn every_requirement_has_evidence_that_can_close_it() {
+        let witnesses = requirement_witnesses();
+        for requirement in all_flow_requirements() {
+            let key = (requirement.id, requirement.role_id());
+            let witness = witnesses
+                .iter()
+                .find(|(witness_key, _)| *witness_key == key)
+                .map(|(_, citation)| citation)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "requirement {} has no witness; every requirement needs evidence that can \
+                         close it, or it reports partial forever",
+                        requirement.id
+                    )
+                });
+            assert!(
+                requirement.evidence.citation_proves(witness),
+                "requirement {} is unclosable: its witness `{}` does not satisfy its evidence \
+                 predicate",
+                requirement.id,
+                witness.display_name
+            );
+        }
+    }
+
+    #[test]
+    fn requirements_sharing_a_flow_role_stay_separable_by_evidence() {
+        let witnesses = requirement_witnesses();
+        let witness_for = |requirement: &FlowRequirement| {
+            let key = (requirement.id, requirement.role_id());
+            witnesses
+                .iter()
+                .find(|(witness_key, _)| *witness_key == key)
+                .map(|(_, citation)| citation.clone())
+                .unwrap_or_else(|| panic!("missing witness for {key:?}"))
+        };
+
+        let mut checked_pairs = 0;
+        for (group, requirements) in all_flow_requirement_groups() {
+            for (index, left) in requirements.iter().enumerate() {
+                for right in requirements.iter().skip(index + 1) {
+                    if left.role != right.role || left.id == right.id {
+                        continue;
+                    }
+                    checked_pairs += 1;
+                    let left_witness = witness_for(left);
+                    let right_witness = witness_for(right);
+                    assert!(
+                        !right.evidence.citation_proves(&left_witness),
+                        "in flow {group}, evidence for {} also closes its {} sibling {}: two \
+                         requirements sharing a role must not be closed by one anchor",
+                        left.id,
+                        left.role.label(),
+                        right.id
+                    );
+                    assert!(
+                        !left.evidence.citation_proves(&right_witness),
+                        "in flow {group}, evidence for {} also closes its {} sibling {}: two \
+                         requirements sharing a role must not be closed by one anchor",
+                        right.id,
+                        right.role.label(),
+                        left.id
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_pairs >= 5,
+            "the tables still contain same-role sibling requirements; this invariant must actually \
+             be exercising them (checked {checked_pairs})"
+        );
     }
 }
