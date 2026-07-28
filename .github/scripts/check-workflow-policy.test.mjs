@@ -2753,6 +2753,22 @@ test("no workflow interpolates a dispatch input into a run: body", async (t) => 
     assert.match(validateWorkflows(workflows).join("\n"), /must read \$\{\{ env\.LAUNDERED \}\}/u);
   });
 
+  // For `workflow_dispatch`, `github.event` is the container the inputs arrive in, so serialising
+  // it carries every dispatched value into script text without the word `inputs` appearing at all.
+  // `toJSON` is not an escape: it preserves `$(` and backticks verbatim.
+  await t.test("serialising the event payload does not launder an input into script text", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+      { run: 'echo "${{ toJSON(github.event) }}"\n' },
+    ));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ toJSON(github.event) }} from step env, not interpolated script text:"
+        + " it carries the event payload",
+    ]);
+    assert.match(validateWorkflows(workflows).join("\n"), /it carries the event payload/u);
+  });
+
   await t.test("a step output does not launder an input into a later script", () => {
     const workflows = loadWorkflows();
     workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
@@ -2797,6 +2813,9 @@ test("no workflow interpolates a dispatch input into a run: body", async (t) => 
     ["a shell variable whose name merely contains the word", 'echo "$RELEASE_INPUTS_PATH"\n'],
     ["the shell read of a job-level env entry", 'echo "$LAUNDERED"\n'],
     ["a shell variable that merely spells the env context", 'echo "$env_path/bin"\n'],
+    // `_` is a word character, so `\bevent\b` does not reach inside `github.event_name`. Reading
+    // which trigger fired says nothing about what was dispatched.
+    ["the trigger name, which is not the event payload", 'echo "${{ github.event_name }}"\n'],
   ]) {
     await t.test(`${name} is not a violation`, () => {
       const workflows = loadWorkflows();

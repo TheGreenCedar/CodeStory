@@ -4735,6 +4735,11 @@ const launderingContexts = [
   [/\benv\b/u, "env"],
   [/\bsteps\b[\s\S]*\boutputs\b/u, "a step output"],
   [/\bneeds\b[\s\S]*\boutputs\b/u, "a job output"],
+  // For `workflow_dispatch`, `github.event` *is* the inputs container, so serialising the event
+  // carries every dispatched value into script text without the word `inputs` ever appearing --
+  // `toJSON` preserves `$(` and backticks intact. `\bevent\b` does not match inside
+  // `github.event_name`, because `_` is a word character, so the ordinary trigger read is untouched.
+  [/\bgithub\b[\s\S]*\bevent\b/u, "the event payload"],
 ];
 
 export function interpolatedDispatchInputs(run) {
