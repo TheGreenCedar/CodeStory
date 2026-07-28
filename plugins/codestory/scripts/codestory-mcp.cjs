@@ -523,6 +523,10 @@ function downloadFileOnce(url, destination, options = {}) {
     let stallTimer = null;
     // Bytes already on disk from earlier attempts, plus whatever this attempt appends.
     let downloadedBytes = resumeFrom;
+    // Device and inode of the descriptor the bytes actually went into. Publication compares the
+    // file standing at the partial path against this, so the name being swapped after the last
+    // byte cannot substitute a different file for the one this transfer wrote.
+    let partialIdentity = null;
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -536,7 +540,7 @@ function downloadFileOnce(url, destination, options = {}) {
         error.downloadedBytes = downloadedBytes;
         reject(error);
       } else {
-        resolve({ downloadedBytes });
+        resolve({ downloadedBytes, partial: partialIdentity });
       }
     };
     const armStall = () => {
@@ -570,6 +574,7 @@ function downloadFileOnce(url, destination, options = {}) {
           redirectsRemaining: redirectsRemaining - 1,
         }).then((result) => {
           downloadedBytes = result?.downloadedBytes ?? downloadedBytes;
+          partialIdentity = result?.partial ?? partialIdentity;
           finish(null);
         }, finish);
         return;
@@ -633,14 +638,21 @@ function downloadFileOnce(url, destination, options = {}) {
       });
       // Open the partial through an explicit no-follow descriptor rather than by path. The stat that
       // chose `appendFrom` happened earlier, so a symlink planted in between would otherwise still be
-      // followed here; refusing the open keeps every provisioning byte inside the managed cache.
+      // followed here. `O_NOFOLLOW` refuses a symlink and `O_NONBLOCK` refuses to block on a fifo,
+      // but neither says anything about a *hard link*: an extra name for a file outside the cache is
+      // indistinguishable from our own partial by path. So the descriptor itself is re-checked
+      // before a byte is written, and only a lone regular file is accepted.
+      // Both flags are `0` on Windows, where the fstat below is the whole guard: it still refuses a
+      // hard link (which Windows creates without privilege) but it cannot refuse a symlink planted
+      // inside this window, so that one case stays open there.
       let partialFd;
       try {
         partialFd = fs.openSync(
           destination,
           fs.constants.O_WRONLY | fs.constants.O_CREAT |
-            (appendFrom > 0 ? fs.constants.O_APPEND : fs.constants.O_TRUNC) |
-            (fs.constants.O_NOFOLLOW || 0),
+            (appendFrom > 0 ? fs.constants.O_APPEND : 0) |
+            (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+          0o600,
         );
       } catch (error) {
         response.resume();
@@ -648,6 +660,30 @@ function downloadFileOnce(url, destination, options = {}) {
           'partial_open',
           `download_partial_open_failed:${error?.code || 'unknown'}`,
         ));
+        return;
+      }
+      try {
+        const opened = fs.fstatSync(partialFd);
+        if (!opened.isFile() || opened.nlink !== 1) {
+          throw downloadError(
+            'partial_open',
+            `download_partial_open_failed:${opened.isFile() ? 'linked' : 'not_regular'}`,
+          );
+        }
+        // Truncation happens on the already-verified descriptor instead of through `O_TRUNC`, so a
+        // hard link planted at the partial path is refused above rather than emptied on the way in.
+        if (appendFrom === 0) fs.ftruncateSync(partialFd, 0);
+        partialIdentity = { dev: opened.dev, ino: opened.ino };
+      } catch (error) {
+        try {
+          fs.closeSync(partialFd);
+        } catch {
+          // The descriptor is being abandoned either way.
+        }
+        response.resume();
+        finish(downloadFailureKind(error) === 'partial_open'
+          ? error
+          : downloadError('partial_open', `download_partial_open_failed:${error?.code || 'unknown'}`));
         return;
       }
       output = fs.createWriteStream(destination, { fd: partialFd });
@@ -664,31 +700,105 @@ function downloadFileOnce(url, destination, options = {}) {
   });
 }
 
+// Publication reads the partial through a descriptor, not a path, because the last window in the
+// transfer is between the final byte and the rename: swap the partial for a link there and a plain
+// `rename` moves the link into place as the "archive". `identity` is the device/inode the transfer
+// actually wrote, so anything else standing at that name is refused before it can be published.
+function openVerifiedPartial(partialPath, identity) {
+  let fd;
+  try {
+    fd = fs.openSync(
+      partialPath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+    );
+  } catch (error) {
+    throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+  }
+  try {
+    const opened = fs.fstatSync(fd);
+    const ours = opened.isFile() && opened.nlink === 1 &&
+      (!identity || (opened.dev === identity.dev && opened.ino === identity.ino));
+    if (!ours) throw downloadError('publish', 'download_publish_failed:partial_identity');
+    return { fd, metadata: opened };
+  } catch (error) {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // The descriptor is being abandoned either way.
+    }
+    throw downloadFailureKind(error) === 'publish'
+      ? error
+      : downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+  }
+}
+
+// Copies from the verified descriptor rather than re-opening the partial by name, so the
+// cross-device path publishes the same bytes the same-device path would. `O_EXCL` means the
+// destination is one this call created: a file raced into that name is a failure, not a target.
+function copyVerifiedPartial(fd, destination) {
+  const out = fs.openSync(
+    destination,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
+    0o600,
+  );
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, position);
+      if (read <= 0) break;
+      fs.writeSync(out, buffer, 0, read);
+      position += read;
+    }
+  } finally {
+    fs.closeSync(out);
+  }
+}
+
 // `rename` cannot cross filesystems, and the partial deliberately lives under the managed CLI root
 // so it survives a restart while the caller's destination may sit in a temp directory on another
 // mount. Falling back to copy-then-unlink keeps publication correct wherever the two land.
-function publishDownloadedFile(partialPath, destination) {
+function publishDownloadedFile(partialPath, destination, identity = null) {
+  const { fd, metadata } = openVerifiedPartial(partialPath, identity);
   try {
-    fs.rmSync(destination, { force: true });
-    fs.renameSync(partialPath, destination);
-    return;
-  } catch (error) {
-    if (error?.code !== 'EXDEV') {
-      throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+    try {
+      fs.rmSync(destination, { force: true });
+      fs.renameSync(partialPath, destination);
+    } catch (error) {
+      if (error?.code !== 'EXDEV') {
+        throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+      }
+      try {
+        copyVerifiedPartial(fd, destination);
+        fs.rmSync(partialPath, { force: true });
+      } catch (copyError) {
+        throw downloadError('publish', `download_publish_failed:${copyError?.code || 'unknown'}`);
+      }
+      return;
     }
-  }
-  try {
-    fs.copyFileSync(partialPath, destination);
-    fs.rmSync(partialPath, { force: true });
-  } catch (error) {
-    throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+    // A rename keeps the inode, so the published name must still be the verified file. If it is
+    // not, something replaced the partial between the check and the rename: drop what landed
+    // instead of handing a foreign file to the checksum step as this release's archive.
+    const published = fs.lstatSync(destination);
+    if (!published.isFile() || published.dev !== metadata.dev || published.ino !== metadata.ino) {
+      fs.rmSync(destination, { force: true });
+      throw downloadError('publish', 'download_publish_failed:published_identity');
+    }
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Closing a descriptor whose file is already published or discarded changes nothing.
+    }
   }
 }
 
 // The partial is the one attacker-reachable name in the provisioning path, so it is measured with
 // `lstat`: a symlink planted there would otherwise report the target's size and make the transfer
-// resume *through* the link into a file outside the managed cache. Anything that is not a regular
-// file can never be resumed, so it is dropped and the transfer restarts from zero.
+// resume *through* the link into a file outside the managed cache. A hard link passes `isFile()`
+// and is just as available to a same-user attacker, so a partial with more than one name is
+// refused too. Anything but a lone regular file is unlinked here and the transfer restarts from
+// zero; a directory cannot be unlinked this way and instead fails the no-follow open below.
 function partialDownloadBytes(partialPath) {
   let metadata = null;
   try {
@@ -696,11 +806,12 @@ function partialDownloadBytes(partialPath) {
   } catch {
     return 0;
   }
-  if (metadata.isFile()) return metadata.size;
+  if (metadata.isFile() && metadata.nlink === 1) return metadata.size;
   try {
     fs.rmSync(partialPath, { force: true });
   } catch {
-    // Best effort. The no-follow open below is what actually refuses to write through the link.
+    // Best effort. The no-follow open and its fstat are what actually refuse to write through a
+    // link that survives here.
   }
   return 0;
 }
@@ -729,7 +840,7 @@ async function downloadFile(url, destination, options = {}) {
     const resumeFrom = partialDownloadBytes(partialPath);
     if (onProgress) onProgress({ receivedBytes: resumeFrom, attempt });
     try {
-      await downloadFileOnce(url, partialPath, {
+      const transferred = await downloadFileOnce(url, partialPath, {
         ...options,
         resumeFrom,
         deadlineMs,
@@ -737,7 +848,7 @@ async function downloadFile(url, destination, options = {}) {
           ? (progress) => onProgress({ ...progress, attempt })
           : undefined,
       });
-      publishDownloadedFile(partialPath, destination);
+      publishDownloadedFile(partialPath, destination, transferred?.partial || null);
       return;
     } catch (error) {
       lastError = error;
@@ -1837,10 +1948,28 @@ function managedCliDownloadCacheRoot(root) {
   return cacheRoot;
 }
 
+// The per-version directory needs the same guard as the cache root, and needs it after the mkdir:
+// `mkdirSync({ recursive: true })` on an existing symlink-to-directory succeeds silently, and the
+// no-follow open that protects the partial only constrains the final path component. A symlinked
+// version entry would therefore route every provisioning byte outside the cache with no race at
+// all. Provisioning treats a throw here as "no cache" and falls back to its temp directory, so
+// refusing costs resume rather than correctness.
 function managedCliDownloadCacheDir(root, version) {
-  const dir = path.join(managedCliDownloadCacheRoot(root), version);
+  const cacheRoot = managedCliDownloadCacheRoot(root);
+  const dir = path.join(cacheRoot, version);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return dir;
+  const metadata = fs.lstatSync(dir);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error('managed_cli_download_cache_not_direct');
+  }
+  // The lstat above covers the entry itself; resolving both ends also catches a link deeper in the
+  // version name and pins the answer to a path that really sits inside the cache.
+  const resolved = fs.realpathSync(dir);
+  const resolvedRoot = fs.realpathSync(cacheRoot);
+  if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) {
+    throw new Error('managed_cli_download_cache_not_direct');
+  }
+  return resolved;
 }
 
 function trimManagedCliDownloadCache(root, version) {
@@ -3597,6 +3726,7 @@ if (require.main === module) {
       pinnedCliVersion,
       pinnedArchiveSha256,
       publishDownloadedFile,
+      managedCliDownloadCacheDir,
       removeManagedCliDownloadCache,
       managedCliDownloadHint,
       managedCliDownloadProgress,

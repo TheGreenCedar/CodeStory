@@ -4873,6 +4873,219 @@ test("release asset downloader refuses a partial swapped for a symlink after it 
   }
 });
 
+// `O_NOFOLLOW` constrains the last path component only, and a hard link is not a symlink at all:
+// `lstat().isFile()` is true for one, so a hard link planted at the partial path was sized, resumed
+// and appended through into the file it shares an inode with. A partial with a second name is
+// never one this process created.
+test("release asset downloader refuses to resume through a hard-linked partial", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-partial-hardlink-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  const outside = join(dataDir, "outside.txt");
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  await writeFile(outside, "precious", "utf8");
+  await link(outside, partialPath);
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  const server = createServer((request, response) => {
+    const start = Number(/^bytes=(\d+)-$/u.exec(request.headers.range || "")?.[1] ?? 0);
+    response.writeHead(start > 0 ? 206 : 200, {
+      "content-length": String(body.length - start),
+      ...(start > 0
+        ? { "content-range": `bytes ${start}-${body.length - 1}/${body.length}` }
+        : {}),
+    });
+    response.end(body.subarray(start));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await launcherTest.downloadFile(
+      `http://127.0.0.1:${server.address().port}/runtime`,
+      destination,
+      { attempts: 3, retryDelayMs: () => 1, timeoutMs: 5000, partialPath },
+    );
+    // The extra name is dropped rather than resumed, so the linked file keeps its own bytes and the
+    // published archive is a different inode entirely — not a second name for the attacker's file.
+    assert.equal(await readFile(outside, "utf8"), "precious");
+    assert.deepEqual(await readFile(destination), body);
+    assert.notEqual(fs.statSync(destination).ino, fs.statSync(outside).ino);
+    assert.equal(fs.statSync(destination).nlink, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// The same window the symlink swap uses is open to a hard link, and there `O_NOFOLLOW` does
+// nothing. The descriptor itself has to be refused: the transfer fstats what it opened and writes
+// only into a lone regular file.
+test("release asset downloader refuses a partial hard-linked after it is sized", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-partial-linkswap-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  const outside = join(dataDir, "outside.txt");
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  await writeFile(outside, "precious", "utf8");
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  const server = createServer((request, response) => {
+    const start = Number(/^bytes=(\d+)-$/u.exec(request.headers.range || "")?.[1] ?? 0);
+    response.writeHead(start > 0 ? 206 : 200, {
+      "content-length": String(body.length - start),
+      ...(start > 0
+        ? { "content-range": `bytes ${start}-${body.length - 1}/${body.length}` }
+        : {}),
+    });
+    response.end(body.subarray(start));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let planted = false;
+  try {
+    await launcherTest.downloadFile(
+      `http://127.0.0.1:${server.address().port}/runtime`,
+      destination,
+      {
+        attempts: 3,
+        retryDelayMs: () => 1,
+        timeoutMs: 5000,
+        partialPath,
+        // The first callback of the first attempt sits between the sizing lstat and the open.
+        onProgress() {
+          if (planted) return;
+          planted = true;
+          fs.linkSync(outside, partialPath);
+        },
+      },
+    );
+    assert.equal(planted, true);
+    // The attempt that opened the planted link wrote nothing: neither the release bytes nor a
+    // truncation reached it, and the next attempt started from a partial of its own.
+    assert.equal(await readFile(outside, "utf8"), "precious");
+    assert.deepEqual(await readFile(destination), body);
+    assert.notEqual(fs.statSync(destination).ino, fs.statSync(outside).ino);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Between the last byte and the rename the partial is still just a name. Publication therefore
+// works from a no-follow descriptor and compares it against the device/inode the transfer wrote,
+// so a link swapped in at that point is refused instead of renamed into place as the "archive".
+test("release asset publication refuses a partial swapped for a symlink before the rename", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-symlink-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  const outside = join(dataDir, "outside.txt");
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  await writeFile(outside, "precious", "utf8");
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-length": String(body.length) });
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let planted = false;
+  try {
+    await assert.rejects(
+      launcherTest.downloadFile(
+        `http://127.0.0.1:${server.address().port}/runtime`,
+        destination,
+        {
+          attempts: 1,
+          retryDelayMs: () => 1,
+          timeoutMs: 5000,
+          partialPath,
+          onProgress(progress) {
+            if (planted || progress.receivedBytes !== body.length) return;
+            planted = true;
+            fs.rmSync(partialPath, { force: true });
+            fs.symlinkSync(outside, partialPath, "file");
+          },
+        },
+      ),
+      /download_publish_failed/u,
+    );
+    assert.equal(planted, true);
+    assert.equal(fs.existsSync(destination), false);
+    assert.equal(await readFile(outside, "utf8"), "precious");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// A plain regular file swapped in at the partial path passes every type check there is, so type is
+// not the question publication asks: it asks whether this is the file the transfer wrote. Without
+// the identity comparison the foreign bytes are published as this release's archive.
+test("release asset publication refuses a partial replaced by another regular file", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-swap-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = join(dataDir, "cache", "runtime.bin.part");
+  await mkdir(join(dataDir, "cache"), { recursive: true });
+  const body = Buffer.from("the-managed-runtime-archive-payload");
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-length": String(body.length) });
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let planted = false;
+  try {
+    await assert.rejects(
+      launcherTest.downloadFile(
+        `http://127.0.0.1:${server.address().port}/runtime`,
+        destination,
+        {
+          attempts: 1,
+          retryDelayMs: () => 1,
+          timeoutMs: 5000,
+          partialPath,
+          onProgress(progress) {
+            if (planted || progress.receivedBytes !== body.length) return;
+            planted = true;
+            fs.rmSync(partialPath, { force: true });
+            fs.writeFileSync(partialPath, "substituted-archive-payload");
+          },
+        },
+      ),
+      /download_publish_failed:partial_identity/u,
+    );
+    assert.equal(planted, true);
+    assert.equal(fs.existsSync(destination), false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// `mkdirSync({ recursive: true })` succeeds silently on an existing symlink-to-directory, and the
+// no-follow open protecting the partial only constrains the final component. A symlinked version
+// entry therefore needed no race at all to put every provisioning byte outside the cache.
+test("download cache refuses a symlinked per-version directory", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-cache-version-symlink-"));
+  const root = join(dataDir, "codestory-cli");
+  const outside = join(dataDir, "outside");
+  await mkdir(join(root, ".download"), { recursive: true });
+  await mkdir(outside, { recursive: true });
+  await symlink(outside, join(root, ".download", "0.16.1"), "dir");
+  try {
+    assert.throws(
+      () => launcherTest.managedCliDownloadCacheDir(root, "0.16.1"),
+      /managed_cli_download_cache_not_direct/u,
+    );
+    // Nothing was handed back, so no partial path can be built through the link.
+    assert.deepEqual(await readdir(outside), []);
+    // A real directory is still accepted, and lands inside the cache root.
+    const usable = launcherTest.managedCliDownloadCacheDir(root, "0.16.2");
+    assert.equal(usable, join(await realpath(join(root, ".download")), "0.16.2"));
+    assert.equal(fs.lstatSync(usable).isDirectory(), true);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("download cache trimming refuses to delete through a symlinked cache root", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-symlink-"));
   const root = join(dataDir, "codestory-cli");
