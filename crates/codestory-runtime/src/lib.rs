@@ -74,6 +74,7 @@ mod index_incremental;
 mod index_timings;
 mod publication;
 mod repo_text;
+mod root_rank;
 mod route_coverage;
 mod search_evidence;
 mod search_intent;

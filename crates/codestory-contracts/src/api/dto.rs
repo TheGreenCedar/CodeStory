@@ -1412,6 +1412,26 @@ pub enum GroundingOrientationUncertaintyDto {
     EntrypointEvidenceOmitted,
     LimitedSubsystemBreadth,
     CompressedPresentation,
+    /// No candidate in the evaluated window carries any non-speculative CALL
+    /// degree. Ranking could not use graph evidence; do not read the resulting
+    /// order as a claim about parser or graph coverage.
+    GraphSignalThin,
+    /// Orientation ranking ran but produced no reordering: no entry-point
+    /// evidence and no graph signal, so the order is lexical and structural
+    /// only.
+    LexicalFallback,
+}
+
+impl GroundingOrientationUncertaintyDto {
+    /// True when the variant reports missing or bounded *evidence* rather than
+    /// a presentation choice.
+    ///
+    /// `CompressedPresentation` fires on every strict-budget map by
+    /// construction, so folding it in here would pin every strict read to
+    /// `Partial` and destroy the signal.
+    pub fn is_evidence_class(self) -> bool {
+        !matches!(self, Self::CompressedPresentation)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
