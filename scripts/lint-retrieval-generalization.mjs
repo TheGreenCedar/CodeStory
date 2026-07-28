@@ -13,6 +13,13 @@ import { fileURLToPath } from "node:url";
 import { sourcetrailQueries } from "./cross-repo-sourcetrail-queries.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/// Slugs that identify this repository as a benchmark subject. Kept explicit rather
+/// than read from a git remote so the lint is deterministic in a detached CI checkout.
+const SELF_REPOSITORY_SLUGS = new Set([
+  "thegreencedar/codestory",
+  "codestory",
+]);
 const extraScanRoots = (
   process.env.CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS ?? ""
 )
@@ -476,21 +483,27 @@ function benchmarkManifestDerivedPatterns() {
     for (const task of benchmarkManifestTasks(manifest)) {
       parsedTaskCount += 1;
       addSpecificMarker(markers, task.id);
-      addRepoMarkers(markers, task.repo);
       addSpecificMarker(markers, task.prompt, { allowExactPhrase: true });
-      for (const expectedFile of task.expected_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
-      }
-      for (const expectedFile of task.expected_verification_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
-      }
-      for (const symbol of task.expected_symbols ?? []) {
-        if (typeof symbol === "string") {
-          addSpecificMarker(markers, symbol);
-        } else {
-          addSpecificMarker(markers, symbol?.name);
-          addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
-          addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+      // A task whose subject is this repository names our own symbols and paths.
+      // Banning those would forbid the product from containing itself, so only its
+      // benchmark-specific parts (id, prompt, claims) contribute markers.
+      const subjectIsSelf = taskSubjectIsThisRepository(task.repo);
+      if (!subjectIsSelf) {
+        addRepoMarkers(markers, task.repo);
+        for (const expectedFile of task.expected_files ?? []) {
+          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+        }
+        for (const expectedFile of task.expected_verification_files ?? []) {
+          addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+        }
+        for (const symbol of task.expected_symbols ?? []) {
+          if (typeof symbol === "string") {
+            addSpecificMarker(markers, symbol);
+          } else {
+            addSpecificMarker(markers, symbol?.name);
+            addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
+            addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+          }
         }
       }
       for (const claim of task.expected_claims ?? []) {
@@ -687,6 +700,18 @@ function benchmarkManifestTasks(manifest) {
     return [manifest];
   }
   return [];
+}
+
+/// A task manifest may name this repository as its subject: the readme-with-without
+/// suite asks CodeStory questions about CodeStory. Its expected symbols and paths are
+/// then our own product identifiers by construction, so deriving bans from them makes
+/// the product illegal to itself - `RefreshMode` is a codestory-workspace type, and
+/// `crates/.../lib.rs` is where our code lives. Only the benchmark-specific parts of
+/// such a task (its id, prompt, and claim texts) remain bannable.
+function taskSubjectIsThisRepository(repo) {
+  return repoUrlSlugs(repo?.url)
+    .concat(typeof repo?.name === "string" ? [repo.name] : [])
+    .some((slug) => SELF_REPOSITORY_SLUGS.has(slug.trim().toLowerCase()));
 }
 
 function addRepoMarkers(markers, repo) {
