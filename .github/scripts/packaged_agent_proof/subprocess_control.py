@@ -255,8 +255,11 @@ class McpProcess:
         name: str,
         arguments: dict,
         request_id: str,
+        deadline: float | None = None,
     ) -> tuple[dict, int]:
-        deadline = time.monotonic() + self.timeout
+        # A caller that already owns a bound threads it in; otherwise this call owns its own.
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
         attempt = 0
         while True:
             attempt += 1
@@ -331,7 +334,7 @@ class McpProcess:
                 request_id if poll == 1 else f"{request_id}-degraded-{poll}"
             )
             response, attempts = self.tool_until_ready(
-                "search", arguments, poll_request_id
+                "search", arguments, poll_request_id, deadline=deadline
             )
             total_attempts += attempts
             self.tool_attempt_counts[request_id] = total_attempts
