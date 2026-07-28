@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -9,7 +10,9 @@ import {
   deriveReleaseCells,
   evaluateReleaseCloseout,
   readReleaseCellArtifacts,
+  releaseCellWithheldClaims,
   resolveReleaseCellConstraints,
+  resolveReleaseCellNonClaimConstraints,
   writeReleaseCloseout,
 } from "../codestory-release-closeout.mjs";
 import {
@@ -76,7 +79,13 @@ function identityFor(cell, producerRunAttempt = "1") {
       case "host_arch": identity[key] = hostIdentity(target)[key]; break;
       case "runner": identity[key] = "hosted-runner"; break;
       case "backend": identity[key] = "CPU"; break;
-      case "installer": identity[key] = "managed_plugin"; break;
+      // The post-publish installed cells are where the closeout reads which catalog served the
+      // release, so their installer must be one of the two declared delivery identities.
+      case "installer":
+        identity[key] = cell.group_id === "installed_runtime_behavior"
+          ? "codex_marketplace_install"
+          : "managed_plugin";
+        break;
       case "profile": identity[key] = "codestory-release-evidence-linux-arm64-v2"; break;
       case "corpus_id": identity[key] = "v0.16-axios-js-ts-v1"; break;
       case "cache_id": identity[key] = "cold-full-retrieval-v1"; break;
@@ -94,10 +103,42 @@ function identityFor(cell, producerRunAttempt = "1") {
   return identity;
 }
 
-function manifestsFor(phase, prePublishLedger = null) {
+const nonClaimPolicy = graph.non_claim_policy;
+const linuxHost = nonClaimPolicy.hosts.find(({ id }) => id === "linux-x64-vulkan");
+
+function nonClaimFor(cell, host, attempt) {
+  return {
+    host: host.id,
+    runtime_execution: nonClaimPolicy.runtime_execution,
+    non_claim_reason: nonClaimPolicy.reason,
+    annotation: nonClaimPolicy.annotation,
+    unavailable_producer_workflow: host.unavailable_producer_workflow,
+    unavailable_producer_job_name: host.unavailable_producer_job_name,
+    withheld_claims: releaseCellWithheldClaims(graph, cell),
+    run_attempt: attempt,
+  };
+}
+
+/// Withholding is declared per host, so every helper takes the set of hosts a scenario lost. One
+/// host is the ordinary outage; the multi-host forms exist because the withhold cap is only
+/// observable when more than one host is gone at once.
+function withheldHostList(withheldHost) {
+  if (withheldHost === null || withheldHost === undefined) return [];
+  return Array.isArray(withheldHost) ? withheldHost : [withheldHost];
+}
+
+function withheldHostOf(withheldHost, cellId) {
+  return withheldHostList(withheldHost).find((host) => host.withheld_cells.includes(cellId)) ?? null;
+}
+
+function manifestsFor(phase, prePublishLedger = null, { attempt = "1", withheldHost = null } = {}) {
   const graphSha256 = releaseClaimGraphDigest(graph);
   return deriveReleaseCells(graph, phase).map((cell) => {
-    const identity = identityFor(cell);
+    const host = withheldHostOf(withheldHost, cell.id);
+    const withheld = host !== null;
+    const identity = withheld
+      ? { ...identityFor(cell, attempt), ...resolveReleaseCellNonClaimConstraints(cell, attempt) }
+      : identityFor(cell, attempt);
     const evidenceType = graph.evidence_types.find(({ id }) => id === cell.evidence_type);
     const manifest = {
       schema: graph.closeout.manifest_schema,
@@ -109,13 +150,14 @@ function manifestsFor(phase, prePublishLedger = null) {
         id: `${cell.id}-evidence`,
         type: cell.evidence_type,
         tier: evidenceType.tier,
-        status: "pass",
+        status: withheld ? "withheld" : "pass",
         graph_sha256: graphSha256,
         observed_at: observedAt,
         expires_at: expiresAt,
         identity,
       },
     };
+    if (withheld) manifest.non_claim = nonClaimFor(cell, host, attempt);
     if (cell.archive_role === "pre_publish") {
       manifest.archive = {
         name: archiveName(identity.target),
@@ -139,11 +181,20 @@ function manifestsFor(phase, prePublishLedger = null) {
   });
 }
 
-function trustedProducersFor(phase) {
+function trustedProducersFor(phase, withheldHost = null) {
   const artifactByName = new Map();
+  const attempt = withheldHostList(withheldHost).length > 0
+    ? String(nonClaimPolicy.maximum_run_attempts)
+    : "1";
   let nextId = 1000;
   const producers = deriveReleaseCells(graph, phase).map((cell) => {
-    const constraints = resolveReleaseCellConstraints(cell, "1");
+    const withheld = withheldHostOf(withheldHost, cell.id) !== null;
+    const constraints = withheld
+      ? {
+        ...resolveReleaseCellConstraints(cell, attempt),
+        ...resolveReleaseCellNonClaimConstraints(cell, attempt),
+      }
+      : resolveReleaseCellConstraints(cell, attempt);
     let artifact = artifactByName.get(constraints.producer_artifact);
     if (!artifact) {
       artifact = {
@@ -161,11 +212,12 @@ function trustedProducersFor(phase) {
     }
     return {
       cell_id: cell.id,
+      ...(withheld ? { non_claim: true } : {}),
       producer_workflow: constraints.producer_workflow,
       producer_job: constraints.producer_job,
       producer_job_name: constraints.producer_job_name,
       producer_run_id: "12345",
-      producer_run_attempt: "1",
+      producer_run_attempt: attempt,
       producer_artifact: constraints.producer_artifact,
       artifact,
       job: {
@@ -175,7 +227,7 @@ function trustedProducersFor(phase) {
         name: `Release / ${constraints.producer_job_name}`,
         status: "completed",
         conclusion: "success",
-        run_attempt: "1",
+        run_attempt: attempt,
         started_at: "2026-07-18T11:00:00.000Z",
         completed_at: "2026-07-18T11:10:00.000Z",
       },
@@ -188,7 +240,7 @@ function trustedProducersFor(phase) {
     graph_sha256: releaseClaimGraphDigest(graph),
     identity: gitIdentity,
     run_id: "12345",
-    current_run_attempt: "1",
+    current_run_attempt: attempt,
     producers,
     artifacts: [...artifactByName.values()],
   };
@@ -919,4 +971,410 @@ test("native-fingerprint reuse is still refused, and refused for the tree it can
       `${cellId}: ${JSON.stringify(failures)}`,
     );
   }
+});
+
+// ── Withheld accelerator claims ─────────────────────────────────────────────────────────────
+
+const withheldAttempt = String(nonClaimPolicy.maximum_run_attempts);
+
+function withheldPrePublish() {
+  return {
+    manifests: manifestsFor("pre_publish", null, { attempt: withheldAttempt, withheldHost: linuxHost }),
+    trustedProducers: trustedProducersFor("pre_publish", linuxHost),
+  };
+}
+
+function cellOf(id) {
+  return deriveReleaseCells(graph, "post_publish").find(({ id: candidate }) => candidate === id);
+}
+
+test("a lost host is recorded as an explicit withheld claim, never as a pass and never as a gap", () => {
+  const { manifests, trustedProducers } = withheldPrePublish();
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+
+  // The release is not lost, but the accepted ledger says out loud what it did not prove.
+  assert.equal(result.decision, "accept");
+  assert.deepEqual(result.summary.missing_cells, []);
+  assert.deepEqual(result.summary.failed_cells, []);
+  assert.deepEqual(
+    result.summary.withheld_cells,
+    ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
+  );
+  assert.equal(result.summary.counts.withheld, 2);
+  // A withheld cell is never counted as proven.
+  assert.equal(
+    result.summary.counts.passed,
+    result.summary.counts.required - result.summary.counts.withheld,
+  );
+  // Linux stopped proving the accelerator, but macOS and Windows did not, so the claim is named as
+  // partially withheld. `withheld_claims` stays literal: it is what nothing in the phase proved.
+  assert.ok(result.summary.partially_withheld_claims.includes("accelerator_execution"));
+  assert.deepEqual(result.summary.withheld_hosts, ["linux-x64-vulkan"]);
+  assert.equal(result.summary.withheld_claims.includes("accelerator_execution"), false);
+
+  const row = result.ledger.cells.find(({ id }) => id === "accelerator_execution:linux-x64-vulkan");
+  assert.equal(row.status, "withheld");
+  assert.equal(row.non_claim.runtime_execution, "not_proven_by_package");
+  assert.equal(row.non_claim.non_claim_reason, "accelerator_host_unavailable");
+  assert.equal(row.non_claim.unavailable_producer_job_name, "Packaged Linux Vulkan engine");
+  assert.deepEqual(row.withheld_claims, ["accelerator_execution", "package_identity", "source_behavior"]);
+  // The withheld row still names the host, backend, and target the missing proof would have used.
+  assert.equal(row.identity.backend, "Vulkan");
+  assert.equal(row.identity.target, "linux-x64");
+  assert.equal(row.identity.producer_job, nonClaimPolicy.producer_job);
+
+  const evaluation = result.evaluations.get("accelerator_execution:linux-x64-vulkan").value;
+  assert.equal(evaluation.status, "withheld");
+  assert.equal(evaluation.release_claim_evaluation, undefined);
+
+  // Every host that did report is untouched and still passes on its own proof.
+  const windows = result.ledger.cells.find(({ id }) => id === "accelerator_execution:windows-x64-vulkan");
+  assert.equal(windows.status, "pass");
+  assert.equal(windows.non_claim, undefined);
+});
+
+test("nothing may pass on top of a withheld claim, and nothing else may be withheld", () => {
+  // Withhold only the accelerator cell and let everything the Linux host produces keep claiming a
+  // pass. Retrieval readiness rests on proven accelerator execution, so it must fail rather than
+  // inherit an unexamined pass.
+  const acceleratorOnly = {
+    ...linuxHost,
+    withheld_cells: ["accelerator_execution:linux-x64-vulkan"],
+  };
+  const prePublish = evaluate(
+    "pre_publish",
+    manifestsFor("pre_publish", null, { attempt: withheldAttempt, withheldHost: acceleratorOnly }),
+    null,
+    trustedProducersFor("pre_publish", acceleratorOnly),
+  );
+  const postManifests = manifestsFor("post_publish", prePublish.ledger, {
+    attempt: withheldAttempt,
+    withheldHost: acceleratorOnly,
+  });
+  const cascaded = evaluate(
+    "post_publish",
+    postManifests,
+    prePublish.ledger,
+    trustedProducersFor("post_publish", acceleratorOnly),
+  );
+  assert.equal(
+    cascaded.ledger.cells.find(({ id }) => id === "retrieval_readiness:linux-x64").status,
+    "fail",
+  );
+  assert.ok(cascaded.evaluations.get("retrieval_readiness:linux-x64").value.failures.some((message) =>
+    message.includes("is withheld")));
+  assert.equal(cascaded.decision, "reject");
+
+  // A cell the graph never declared withholdable cannot be withheld into an accepted ledger.
+  const ineligible = withheldPrePublish();
+  const source = ineligible.manifests.find(({ cell_id: id }) => id === "source_behavior");
+  source.evidence.status = "withheld";
+  source.non_claim = nonClaimFor(cellOf("source_behavior"), linuxHost, withheldAttempt);
+  const rejectedSource = evaluate("pre_publish", ineligible.manifests, null, ineligible.trustedProducers);
+  assert.equal(rejectedSource.decision, "reject");
+  assert.ok(rejectedSource.evaluations.get("source_behavior").value.failures.some((message) =>
+    message.includes("does not admit a withheld non-claim")));
+
+  // A withheld manifest paired with a real proof producer, or the reverse, is a mismatch.
+  const mismatch = withheldPrePublish();
+  delete mismatch.trustedProducers.producers
+    .find(({ cell_id: id }) => id === "accelerator_execution:linux-x64-vulkan").non_claim;
+  const rejectedMismatch = evaluate("pre_publish", mismatch.manifests, null, mismatch.trustedProducers);
+  assert.equal(rejectedMismatch.decision, "reject");
+
+  const forged = withheldPrePublish();
+  const proven = forged.manifests
+    .find(({ cell_id: id }) => id === "accelerator_execution:windows-x64-vulkan");
+  proven.non_claim = nonClaimFor(
+    cellOf("accelerator_execution:windows-x64-vulkan"),
+    linuxHost,
+    withheldAttempt,
+  );
+  const rejectedForged = evaluate("pre_publish", forged.manifests, null, forged.trustedProducers);
+  assert.equal(rejectedForged.decision, "reject");
+  assert.ok(rejectedForged.evaluations.get("accelerator_execution:windows-x64-vulkan").value.failures
+    .some((message) => message.includes("only a withheld cell may carry a non-claim")));
+});
+
+test("a withheld cell must carry a complete, unspent-bound, honest non-claim", () => {
+  const cellId = "accelerator_execution:linux-x64-vulkan";
+  const cases = [
+    ["absent non-claim", (manifest) => {
+      delete manifest.non_claim;
+    }, /non_claim must be an object/u],
+    ["downgraded runtime execution", (manifest) => {
+      manifest.non_claim.runtime_execution = "proven_by_package";
+    }, /runtime_execution must equal not_proven_by_package/u],
+    ["invented reason", (manifest) => {
+      manifest.non_claim.non_claim_reason = "we_were_in_a_hurry";
+    }, /non_claim_reason must equal accelerator_host_unavailable/u],
+    ["mis-quoted annotation", (manifest) => {
+      manifest.non_claim.annotation = "Process completed with exit code 1.";
+    }, /annotation must equal/u],
+    ["shrunken withheld claim list", (manifest) => {
+      manifest.non_claim.withheld_claims = ["accelerator_execution"];
+    }, /withheld_claims must name/u],
+    ["unspent retry bound", (manifest) => {
+      manifest.non_claim.run_attempt = "1";
+    }, /recovery bound/u],
+    ["wrong unavailable host", (manifest) => {
+      manifest.non_claim.unavailable_producer_job_name = "Packaged Windows Vulkan engine";
+    }, /unavailable_producer_job_name must equal/u],
+  ];
+  for (const [label, mutate, pattern] of cases) {
+    const { manifests, trustedProducers } = withheldPrePublish();
+    mutate(manifests.find(({ cell_id: id }) => id === cellId));
+    const result = evaluate("pre_publish", manifests, null, trustedProducers);
+    assert.equal(result.decision, "reject", label);
+    assert.equal(result.ledger.cells.find(({ id }) => id === cellId).status, "fail", label);
+    assert.ok(
+      result.evaluations.get(cellId).value.failures.some((message) => pattern.test(message)),
+      `${label}: ${JSON.stringify(result.evaluations.get(cellId).value.failures)}`,
+    );
+  }
+});
+
+// ── The withhold cap ────────────────────────────────────────────────────────────────────────
+
+const withholdPolicy = nonClaimPolicy.withhold_policy;
+
+function withheldPrePublishHosts(hosts) {
+  return {
+    manifests: manifestsFor("pre_publish", null, { attempt: withheldAttempt, withheldHost: hosts }),
+    trustedProducers: trustedProducersFor("pre_publish", hosts),
+  };
+}
+
+test("the withhold cap is graph data and leaves at least one protected host proven", () => {
+  assert.equal(withholdPolicy.maximum_withheld_hosts, 1);
+  assert.ok(withholdPolicy.maximum_withheld_hosts < nonClaimPolicy.hosts.length);
+  assert.ok(withholdPolicy.claims_requiring_proof.includes("accelerator_execution"));
+});
+
+test("a release that withholds every accelerator host is refused, not published", () => {
+  const { manifests, trustedProducers } = withheldPrePublishHosts(nonClaimPolicy.hosts);
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+
+  // The exact shape the reviewer published: six of ten required cells withheld and accepted.
+  assert.equal(result.summary.counts.withheld, 6);
+  assert.equal(result.summary.counts.failed, 0);
+  assert.equal(result.summary.counts.missing, 0);
+  assert.equal(result.decision, "reject");
+  assert.deepEqual(
+    result.summary.withheld_hosts,
+    ["linux-x64-vulkan", "macos-arm64-metal", "windows-x64-vulkan"],
+  );
+  // Refusal is a recorded state naming the cap it broke, never a silent absence.
+  assert.ok(
+    result.summary.input_errors.some((message) => /exceed the 1-host withhold cap/u.test(message)),
+    JSON.stringify(result.summary.input_errors),
+  );
+  assert.ok(
+    result.summary.input_errors.some((message) =>
+      message === "claim accelerator_execution requires proof but no cell proved it"),
+    JSON.stringify(result.summary.input_errors),
+  );
+  assert.ok(
+    result.summary.input_errors.some((message) =>
+      message === "claim installed_runtime_behavior requires proof but no cell proved it"),
+    JSON.stringify(result.summary.input_errors),
+  );
+  assert.deepEqual(result.ledger.withhold_policy, {
+    claims_requiring_proof: [...withholdPolicy.claims_requiring_proof],
+    maximum_withheld_hosts: withholdPolicy.maximum_withheld_hosts,
+  });
+});
+
+test("two withheld hosts already break the cap even though a third still proves the claim", () => {
+  const two = nonClaimPolicy.hosts.filter(({ id }) => id !== "windows-x64-vulkan");
+  const { manifests, trustedProducers } = withheldPrePublishHosts(two);
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+  assert.equal(result.summary.counts.withheld, 4);
+  assert.equal(result.decision, "reject");
+  assert.deepEqual(result.summary.withheld_hosts, ["linux-x64-vulkan", "macos-arm64-metal"]);
+  assert.ok(
+    result.summary.input_errors.some((message) =>
+      message === "withheld hosts linux-x64-vulkan, macos-arm64-metal exceed the 1-host withhold cap"),
+    JSON.stringify(result.summary.input_errors),
+  );
+  // Windows still proved the accelerator, so the per-claim rule alone would not have caught this.
+  assert.ok(
+    !result.summary.input_errors.some((message) => /requires proof/u.test(message)),
+    JSON.stringify(result.summary.input_errors),
+  );
+});
+
+test("a withheld cell never satisfies a claim the policy requires proof for", () => {
+  // One host is inside the cap, so only the per-claim rule can speak here: strip the two proving
+  // accelerator cells to missing and the withheld third must not stand in for them.
+  const { manifests, trustedProducers } = withheldPrePublish();
+  const surviving = new Set([
+    "accelerator_execution:macos-arm64-metal",
+    "accelerator_execution:windows-x64-vulkan",
+  ]);
+  const thinned = manifests.filter(({ cell_id: id }) => !surviving.has(id));
+  const result = evaluate("pre_publish", thinned, null, trustedProducers);
+  assert.equal(result.decision, "reject");
+  assert.deepEqual(result.summary.withheld_hosts, ["linux-x64-vulkan"]);
+  assert.ok(
+    result.summary.input_errors.some((message) =>
+      message === "claim accelerator_execution requires proof but no cell proved it"),
+    JSON.stringify(result.summary.input_errors),
+  );
+});
+
+test("the published platform notes state a withheld accelerator instead of asserting it", () => {
+  // End to end through the real programs: the real closeout writes a real ledger, and the real
+  // release-notes command reads it. The graph still says Linux is a Vulkan platform; only the
+  // ledger knows this release did not prove it, which is why the notes may not be rendered from
+  // the graph alone.
+  const { manifests, trustedProducers } = withheldPrePublish();
+  const accepted = evaluate("pre_publish", manifests, null, trustedProducers);
+  assert.equal(accepted.decision, "accept");
+  const out = mkdtempSync(path.join(os.tmpdir(), "codestory-withheld-notes-"));
+  writeReleaseCloseout(out, accepted);
+
+  const render = (ledgerPath) => spawnSync(
+    process.execPath,
+    [
+      path.join(root, "scripts/codestory-release-claims.mjs"),
+      "release-platform-notes",
+      "--ledger",
+      ledgerPath,
+    ],
+    { encoding: "utf8" },
+  );
+  const withheldNotes = render(path.join(out, "ledger.json"));
+  assert.equal(withheldNotes.status, 0, withheldNotes.stderr);
+  assert.match(
+    withheldNotes.stdout,
+    /^- Linux x64: Vulkan not proven for this release \(accelerator_host_unavailable\)$/mu,
+  );
+  assert.equal(/^- Linux x64: supported with Vulkan$/mu.test(withheldNotes.stdout), false);
+  // The hosts that did prove their accelerator still say so.
+  assert.match(withheldNotes.stdout, /^- Windows x64: supported with Vulkan$/mu);
+  assert.match(withheldNotes.stdout, /^- macOS 15\+ on Apple Silicon: supported with Metal$/mu);
+  assert.match(withheldNotes.stdout, /release-closeout-summary\.json/u);
+
+  // A fully proven release is unchanged, so the honest wording costs nothing when nothing was lost.
+  const provenOut = mkdtempSync(path.join(os.tmpdir(), "codestory-proven-notes-"));
+  writeReleaseCloseout(provenOut, evaluate("pre_publish", manifestsFor("pre_publish")));
+  const provenNotes = render(path.join(provenOut, "ledger.json"));
+  assert.equal(provenNotes.status, 0, provenNotes.stderr);
+  assert.match(provenNotes.stdout, /^- Linux x64: supported with Vulkan$/mu);
+  assert.equal(/not proven for this release/u.test(provenNotes.stdout), false);
+
+  // Without a ledger the command refuses outright: the graph alone can never publish a claim.
+  const ungrounded = spawnSync(
+    process.execPath,
+    [path.join(root, "scripts/codestory-release-claims.mjs"), "release-platform-notes"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(ungrounded.status, 0);
+  assert.match(ungrounded.stderr, /--ledger/u);
+});
+
+test("withheld_claims names only what nothing proved, and says so separately for the rest", () => {
+  const { manifests, trustedProducers } = withheldPrePublish();
+  const result = evaluate("pre_publish", manifests, null, trustedProducers);
+  assert.equal(result.decision, "accept");
+
+  // package_identity:linux-x64 and source_behavior passed in this very ledger, so reporting their
+  // claims as withheld was the thing a reader could not take literally.
+  assert.deepEqual(result.summary.withheld_claims, []);
+  assert.deepEqual(
+    result.summary.partially_withheld_claims,
+    ["accelerator_execution", "installed_runtime_behavior", "package_identity", "source_behavior"],
+  );
+  for (const claimId of result.summary.partially_withheld_claims) {
+    const proven = result.ledger.cells.filter(({ claim, status }) =>
+      claim === claimId && new Set(["pass", "pass_with_exception"]).has(status));
+    assert.ok(proven.length > 0, `${claimId} is reported partial but nothing proved it`);
+  }
+  // Together the two lists still name every claim a withheld cell rested on: nothing is dropped.
+  assert.deepEqual(
+    [...result.summary.withheld_claims, ...result.summary.partially_withheld_claims].sort(),
+    [...new Set(result.ledger.cells
+      .filter(({ status }) => status === "withheld")
+      .flatMap(({ withheld_claims: rows }) => rows))].sort(),
+  );
+});
+
+// Catalog publication is delivery, not a release gate, so a release may legitimately end with the
+// public catalog untouched. The whole risk in allowing that is the deferred run reading as the
+// published one, and the installer identity in the post-publish cells is the only thing that
+// distinguishes them. Before these checks it was inert: a free-form string nothing read, so a
+// deferred release's verdict was identical in shape to a published one.
+test("the post-publish closeout resolves and records which catalog served the release", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+  const published = evaluate(
+    "post_publish",
+    manifestsFor("post_publish", prePublish.ledger),
+    prePublish.ledger,
+  );
+  assert.equal(published.decision, "accept");
+  assert.deepEqual(published.ledger.catalog_delivery, {
+    state: "published",
+    installer: "codex_marketplace_install",
+    live_catalog_revision: true,
+  });
+  assert.deepEqual(published.summary.catalog_delivery, published.ledger.catalog_delivery);
+
+  // A deferred release is accepted -- it published real artifacts -- but its verdict says so.
+  const deferredManifests = manifestsFor("post_publish", prePublish.ledger);
+  for (const manifest of deferredManifests) {
+    if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+      manifest.evidence.identity.installer = "codex_marketplace_deferred_fixture";
+    }
+  }
+  const deferred = evaluate("post_publish", deferredManifests, prePublish.ledger);
+  assert.equal(deferred.decision, "accept");
+  assert.deepEqual(deferred.ledger.catalog_delivery, {
+    state: "deferred",
+    installer: "codex_marketplace_deferred_fixture",
+    live_catalog_revision: false,
+  });
+  // The two states must be distinguishable in the signed verdict, not only to a human reading a
+  // warning in a log that expires.
+  assert.notDeepEqual(deferred.ledger.catalog_delivery, published.ledger.catalog_delivery);
+
+  // The pre-publish closeout has no post-publish installed cells, so it states nothing here
+  // rather than inventing a delivery state.
+  assert.equal(prePublish.ledger.catalog_delivery, undefined);
+});
+
+test("a post-publish closeout that cannot resolve one catalog delivery state is rejected", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+
+  // An installer identity no delivery state declares -- including the pre-publish lane's own
+  // candidate installer, which would otherwise sail through as a plausible-looking string.
+  for (const installer of ["candidate_managed_plugin", "managed_plugin", ""]) {
+    const manifests = manifestsFor("post_publish", prePublish.ledger);
+    for (const manifest of manifests) {
+      if (manifest.cell_id.startsWith("installed_runtime_behavior:")) {
+        manifest.evidence.identity.installer = installer;
+      }
+    }
+    const rejected = evaluate("post_publish", manifests, prePublish.ledger);
+    assert.equal(rejected.decision, "reject", installer);
+    assert.equal(rejected.ledger.catalog_delivery.state, "unresolved", installer);
+    assert.ok(
+      rejected.ledger.input_errors.some((message) =>
+        message.includes("does not record a declared catalog delivery installer identity")),
+      `${installer}: ${JSON.stringify(rejected.ledger.input_errors)}`,
+    );
+  }
+
+  // Targets disagreeing about the delivery state is not a state; it is a broken release.
+  const split = manifestsFor("post_publish", prePublish.ledger);
+  split.find(({ cell_id: id }) => id === "installed_runtime_behavior:macos-arm64")
+    .evidence.identity.installer = "codex_marketplace_deferred_fixture";
+  const rejected = evaluate("post_publish", split, prePublish.ledger);
+  assert.equal(rejected.decision, "reject");
+  assert.equal(rejected.ledger.catalog_delivery.state, "unresolved");
+  assert.ok(
+    rejected.ledger.input_errors.some((message) =>
+      message.includes("disagree on the catalog delivery state")),
+    JSON.stringify(rejected.ledger.input_errors),
+  );
 });

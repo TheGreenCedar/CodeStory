@@ -193,6 +193,16 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
       pluginManifest.version,
     );
     assert.equal(attestation.schema_version, 2);
+    // A fixture resolve is a distinct delivery state end to end: it gets its own installer
+    // identity and its own attestation repository, and the Python predicate routes on exactly
+    // this value. Writing `codex_marketplace_install` here -- as the first version did -- made
+    // the live predicate refuse the release three steps after the tag was already pushed.
+    assert.equal(attestation.installation_source, "codex_marketplace_deferred_fixture");
+    assert.equal(
+      attestation.marketplace.repository,
+      "local:candidate-pinned-marketplace-fixture",
+    );
+    assert.notEqual(attestation.marketplace.repository, marketplaceRoot);
     assert.equal(attestation.marketplace.codex_cli_version, `codex-cli ${codexVersion}`);
     assert.equal(attestation.marketplace.revision, marketplaceRevision);
     assert.equal(
@@ -279,6 +289,45 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         sourceRepository: pluginSourceRoot,
       }),
       /marketplace plugin source is not pinned to one immutable commit/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// `--local-fixture` decides which of two delivery states the attestation claims, so it may not be
+// decided by falling through a comparison. It used to be read as `!== "true"`, which made an unset
+// or misspelled value silently mean "the live public catalog served this release".
+test("the delivery state must be stated explicitly, never defaulted", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-marketplace-flag-"));
+  try {
+    const base = proofArgs({
+      packageRoot: path.join(root, "codex-package"),
+      proofRoot: root,
+      marketplaceRoot: path.join(root, "marketplace"),
+      marketplaceRevision: "a".repeat(40),
+      expectedVersion: "0.0.0",
+      sourceRepository: repositoryRoot,
+    });
+    const withFlag = (value) => {
+      const args = [...base];
+      const index = args.indexOf("--local-fixture");
+      if (value === null) args.splice(index, 2);
+      else args[index + 1] = value;
+      return args;
+    };
+    for (const value of [null, "", "TRUE", "1", "yes", "tru"]) {
+      assertFailedProof(withFlag(value), /--local-fixture must be true or false/u);
+    }
+
+    // The live state may only ever name the real catalog repository. A fixture path arriving
+    // here with `--local-fixture false` would attest a public-catalog install of a local
+    // directory.
+    const live = withFlag("false");
+    live[live.indexOf("--marketplace-source") + 1] = path.join(root, "marketplace");
+    assertFailedProof(
+      live,
+      /a live marketplace install must resolve TheGreenCedar\/AgentPluginMarketplace/u,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -494,6 +494,88 @@ The v0.16 closeout consumes physical Metal and Vulkan execution evidence and
 makes those accelerator claims for the released targets. Accuracy, latency,
 and throughput remain independent evaluator lanes and release non-claims.
 
+### Withheld accelerator claims
+
+The repository owns one host per accelerator, so a host that loses its
+connection mid-proof used to cost the whole release. Recovery is automatic and
+bounded, and it never waits on a human click.
+
+`.github/scripts/lost-runner-recovery.mjs` classifies a failed job as a runner
+communication loss only when all three parts of the Actions signature are
+present at once: the exact `The self-hosted runner lost communication with the
+server.` annotation, at least one step that completed with an empty conclusion,
+and no uploaded log blob. A proof that ran and failed its own assertions has a
+real conclusion on every step and a log, so it is classified as an assertion
+failure and is never re-dispatched and never withheld. The classifier never
+reads job names.
+
+All three parts are read by `.github/scripts/collect-actions-job-evidence.sh`,
+which fails closed on every one of them. The annotation endpoint needs the
+`checks: read` token scope; without it the call 403s, and a 403 reported as "no
+annotations" would make the signature unmatchable and the whole recovery path
+inert. The collector treats any answer other than a successful read as an
+error, and only a `404` from the log-blob endpoint counts as "the runner
+uploaded no log". `.github/scripts/check-workflow-policy.mjs` refuses any
+workflow that runs the collector without `checks: read`, including the
+reusable-workflow callers whose grant is the ceiling for what they call.
+
+`.github/workflows/lost-runner-rerun.yml` watches completed release runs and
+re-dispatches the individual lost jobs by id. The bound is
+`non_claim_policy.maximum_run_attempts` (2, meaning one automatic recovery
+attempt) and it counts **lost executions of that job**, not run attempts: a
+release re-run for an unrelated reason has spent no recovery on any host, so
+the first loss of a runner is still owed its one retry. The collector reads
+every attempt of the run to make that count possible, and counts a job Actions
+carried forward unchanged once. Jobs that failed on their own assertions are
+not named in the rerun request and stay red.
+
+If a host is lost twice, `release.yml`'s `accelerator-non-claim` job records a
+**populated non-claim** for that host in place of the cells that host would
+have produced. It mirrors the package manifest's own shape:
+`runtime_execution: not_proven_by_package` with a `non_claim_reason`. Every
+cell that host owns -- accelerator execution, candidate-installed behavior, and
+retrieval readiness -- is written with evidence status `withheld`, naming the
+target, backend, runner, the unavailable producer job, the exact annotation,
+and every claim the missing proof would have carried.
+
+The closeout does not take the producer's word for any of that. Its own job
+runs the same collector and `buildTrustedProducerMap` re-derives the signature
+before it will authenticate a cell against the non-claim producer, so a red
+accelerator job cannot become an accepted withheld claim through a bug or a
+future edit in the producer alone.
+
+A withheld cell is recorded as `withheld` in `ledger.json` and in
+`summary.json`'s `withheld_cells`, `withheld_hosts`, and `counts.withheld`, and
+is never counted as passed. Any cell that still claims a pass while something
+it rests on was withheld fails closeout validation, so a withheld accelerator
+claim cannot be inherited as a silent pass by retrieval readiness.
+
+**How much may be withheld** is `non_claim_policy.withhold_policy` in
+`release-claims.json`, and the closeout enforces it:
+
+- `maximum_withheld_hosts` (1) bounds how many protected hosts may be silent at
+  once. The graph refuses a cap that does not leave at least one host proven, so
+  "no accelerator was proven anywhere" is unrepresentable rather than merely
+  discouraged.
+- `claims_requiring_proof` names the claims that must keep at least one
+  *passing* cell in any phase that closes them. A withheld cell records a
+  non-claim and can never satisfy one.
+
+Breaking either records a named `input_errors` entry and the closeout decision
+becomes `reject`, so `pre-publish-closeout` fails and `publish` is skipped.
+
+The two claim lists in the ledger are literal in both directions:
+`withheld_claims` is what nothing in that phase proved, and
+`partially_withheld_claims` is what a withheld cell rested on but another host
+still proved. Their union is every claim a withheld cell touched.
+
+The published surfaces say the same thing. The GitHub release notes' platform
+section is rendered from the accepted ledger --
+`codestory-release-claims.mjs release-platform-notes` requires `--ledger` and
+has no graph-only mode -- and `release-closeout-summary.json` ships as a
+release asset, so a consumer can read what a specific release proved without
+reaching into a 30-day Actions artifact.
+
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
 

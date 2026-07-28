@@ -1,0 +1,86 @@
+name: Lost runner rerun
+
+# The repository owns exactly one GPU Linux host, so a single dropped connection used to cost a
+# whole release. This companion re-dispatches the individual jobs that carry the lost-runner
+# signature -- and only those -- with no approval step anywhere: recovery is a machine decision or
+# it does not happen. A job that ran and failed its own assertions is never named in the rerun
+# request, so it stays red and keeps the run red.
+
+on:
+  workflow_run:
+    workflows:
+      - Auto Release
+      - Release
+    types:
+      - completed
+
+permissions:
+  actions: write
+  # The lost-runner signature includes the job annotation Actions leaves behind, and
+  # GET /repos/{owner}/{repo}/check-runs/{id}/annotations is gated on `checks: read`. Without it
+  # the collector cannot read the signature at all, so the recovery path is dead.
+  checks: read
+  contents: read
+
+concurrency:
+  group: lost-runner-rerun-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  rerun-lost-jobs:
+    name: Re-dispatch jobs lost by their runner
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout recovery policy
+        uses: actions/checkout@v5
+
+      - name: Collect Actions failure evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          FAILED_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          FAILED_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$FAILED_RUN_ID" "$FAILED_RUN_ATTEMPT" target/lost-runner/jobs.json
+          jq -n \
+            --arg run_attempt "$FAILED_RUN_ATTEMPT" \
+            --arg conclusion "$FAILED_RUN_CONCLUSION" \
+            --slurpfile jobs target/lost-runner/jobs.json \
+            '{run_attempt: $run_attempt, conclusion: $conclusion, jobs: $jobs[0]}' \
+            > target/lost-runner/rerun-input.json
+
+      - name: Plan the bounded rerun
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/lost-runner-recovery.mjs plan-rerun \
+            --input target/lost-runner/rerun-input.json \
+            --out target/lost-runner/rerun-plan.json
+
+      - name: Re-dispatch only the lost jobs
+        if: steps.plan.outputs.rerun == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_IDS: ${{ steps.plan.outputs.job_ids }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$JOB_IDS"
+          for job_id in $JOB_IDS; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/rerun"
+          done
+
+      - name: Upload the recovery decision
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: lost-runner-rerun-${{ github.event.workflow_run.id }}-attempt-${{ github.event.workflow_run.run_attempt }}
+          path: target/lost-runner
+          if-no-files-found: error
+          retention-days: 30

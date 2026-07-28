@@ -62,6 +62,9 @@ jobs:
     if: needs.detect-version.outputs.should_release == 'true' && needs.detect-version.outputs.release_lane == 'native'
     permissions:
       actions: read
+      # This is the lane that actually publishes releases, so it is the lane whose token has to be
+      # able to read the lost-runner annotation. A called workflow cannot widen the caller's grant.
+      checks: read
       contents: write
       pull-requests: read
     uses: ./.github/workflows/release.yml

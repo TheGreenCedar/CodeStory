@@ -86,6 +86,26 @@ flowchart LR
 | Windows ARM | Unsupported |
 <!-- codestory-public-support:end -->
 
+"Supported with Metal" and "Supported with Vulkan" describe what the release
+line ships and intends to prove. Each individual release proves it on the
+protected hardware for that platform, and a release whose accelerator host was
+unreachable ships with that platform's accelerator claim **withheld** rather
+than assumed: the accelerator ran on that host in earlier releases, but this
+release did not observe it.
+
+You do not have to take the table's word for any single release. Every release
+ships `release-closeout-summary.json` as a release asset, and its platform
+section in the GitHub release notes is rendered from that release's ledger, so
+a platform whose accelerator was withheld says so in the notes instead of being
+listed as supported. In the summary, `withheld_cells` names every cell that did
+not run, `withheld_claims` names the claims nothing in that release proved, and
+`partially_withheld_claims` names the ones another host still proved. At most
+one platform's accelerator may be withheld
+(`non_claim_policy.withhold_policy.maximum_withheld_hosts`); a release that
+proved no accelerator anywhere is refused rather than published. See
+[the testing matrix](docs/contributors/testing-matrix.md) for how a claim
+becomes withheld.
+
 ## Example prompts
 
 Use your project's symbols and paths:

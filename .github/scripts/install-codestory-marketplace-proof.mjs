@@ -15,6 +15,13 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
+import {
+  DEFERRED_INSTALLATION_SOURCE,
+  DEFERRED_MARKETPLACE_REPOSITORY,
+  LIVE_INSTALLATION_SOURCE,
+  LIVE_MARKETPLACE_REPOSITORY,
+} from "./marketplace-delivery-identity.mjs";
+
 function fail(message) {
   throw new Error(message);
 }
@@ -131,6 +138,29 @@ function marketplaceRevisionAt(root) {
 
 function prepareInstallation(rawArgs) {
   const args = parseArgs(rawArgs);
+
+  // Which delivery state this install attests is decided first, before anything is touched. An
+  // unset or misspelled `--local-fixture` used to mean "live" by falling through a `!== "true"`
+  // comparison -- exactly the shape that lets a fixture resolve be attested as a public-catalog
+  // install.
+  const localFixtureRaw = args.local_fixture;
+  if (localFixtureRaw !== "true" && localFixtureRaw !== "false") {
+    fail(`--local-fixture must be true or false, not ${JSON.stringify(localFixtureRaw ?? null)}`);
+  }
+  const localFixture = localFixtureRaw === "true";
+  const installationSource = localFixture
+    ? DEFERRED_INSTALLATION_SOURCE
+    : LIVE_INSTALLATION_SOURCE;
+  const marketplaceSource = required(args, "marketplace_source");
+  if (!localFixture && marketplaceSource !== LIVE_MARKETPLACE_REPOSITORY) {
+    fail(
+      `a live marketplace install must resolve ${LIVE_MARKETPLACE_REPOSITORY}, not ${marketplaceSource}`,
+    );
+  }
+  const marketplaceRepository = localFixture
+    ? DEFERRED_MARKETPLACE_REPOSITORY
+    : marketplaceSource;
+
   const codexPackageRoot = path.resolve(required(args, "codex_package_root"));
   const codexExecutable = path.join(
     codexPackageRoot,
@@ -148,7 +178,6 @@ function prepareInstallation(rawArgs) {
   const pluginData = realpathSync(pluginDataInput);
   containedPath(codexHome, pluginData, "plugin data");
 
-  const marketplaceSource = required(args, "marketplace_source");
   const marketplaceName = required(args, "marketplace_name");
   const marketplaceRevision = required(args, "marketplace_revision");
   if (!/^[0-9a-f]{40}$/u.test(marketplaceRevision)) {
@@ -168,7 +197,10 @@ function prepareInstallation(rawArgs) {
     codexExecutable,
     codexHome,
     pluginData,
+    localFixture,
+    installationSource,
     marketplaceSource,
+    marketplaceRepository,
     marketplaceName,
     marketplaceRevision,
     expectedVersion,
@@ -183,7 +215,7 @@ function installMarketplace(setup) {
   const codex = (...command) => run(setup.codexExecutable, command, { env });
   const codexVersion = codex("--version");
   const addArguments = ["plugin", "marketplace", "add", setup.marketplaceSource];
-  if (setup.args.local_fixture !== "true") {
+  if (!setup.localFixture) {
     addArguments.push("--ref", setup.marketplaceRevision);
   }
   addArguments.push("--json");
@@ -227,7 +259,7 @@ function verifyInstallation(setup, installed) {
   const installedPlugins = installed.pluginList.installed;
   const availablePlugins = installed.pluginList.available;
   const pluginListEntry = installedPlugins?.[0];
-  const expectedSourceUrl = setup.args.local_fixture === "true"
+  const expectedSourceUrl = setup.localFixture
     ? undefined
     : "https://github.com/TheGreenCedar/CodeStory.git";
   if (
@@ -316,7 +348,7 @@ function verifyInstallation(setup, installed) {
 function attestInstallation(setup, installed, verified) {
   const attestation = {
     schema_version: 2,
-    installation_source: "codex_marketplace_install",
+    installation_source: setup.installationSource,
     installation: {
       codex_home: setup.codexHome,
       plugin_root: verified.pluginRoot,
@@ -330,7 +362,7 @@ function attestInstallation(setup, installed, verified) {
       package_sha256: verified.packageSha256,
     },
     marketplace: {
-      repository: setup.marketplaceSource,
+      repository: setup.marketplaceRepository,
       revision: setup.marketplaceRevision,
       provenance: {
         add: {

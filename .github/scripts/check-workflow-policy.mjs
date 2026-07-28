@@ -5,6 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LineCounter, parseDocument } from "yaml";
 import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
+import {
+  LOST_RUNNER_ANNOTATION,
+  MAXIMUM_RUN_ATTEMPTS,
+} from "./lost-runner-recovery.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
@@ -1588,8 +1592,92 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
   }
 }
 
+// Both release lanes point the catalog at what they just published, and both do it after the tag
+// and the GitHub release already exist. Failing either lane on a credential or a rejected push
+// would turn a recoverable delivery gap into an unrecoverable one, so publication is delivery: the
+// job absorbs its own failure. That is only honest if the run then SAYS which state it ended in,
+// which is what these rules force. Every conjunct below is load-bearing; dropping any one of them
+// lets a run that never touched the catalog report that it did.
+function catalogDeliveryOutcomeViolations(file, job, delivery) {
+  const violations = [];
+  const tokenStep = namedStep(job, "Mint a scoped marketplace token");
+  add(
+    violations,
+    tokenStep?.["continue-on-error"] === true,
+    `${file} marketplace token failure must not fail an already-published release`,
+  );
+  const catalogPush = namedStep(job, "Point the catalog at the published release");
+  add(
+    violations,
+    catalogPush?.["continue-on-error"] === true
+      && catalogPush?.if === "steps.token.outcome == 'success'",
+    `${file} catalog push must run only with a minted token and must not fail the release`,
+  );
+  // The step that mints `catalog_published` reads THIS step's outcome, so a push step that does
+  // not push would let a run claim a catalog update it never attempted. Turning the gate into
+  // delivery replaced the rule that checked this body; it belongs to both lanes, so it lives
+  // here rather than in either lane's own rules.
+  requireStepRun(violations, file, job, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+    '--commit "$GITHUB_SHA"',
+    '--github-output "$GITHUB_OUTPUT"',
+  ]);
+  const deliveryOutcome = namedStep(job, "Record catalog delivery outcome");
+  add(
+    violations,
+    deliveryOutcome?.if === "always()",
+    `${file} catalog delivery outcome must be recorded whatever the catalog push did`,
+  );
+  add(
+    violations,
+    object(deliveryOutcome?.env).TOKEN_OUTCOME === "${{ steps.token.outcome }}"
+      && object(deliveryOutcome?.env).PUBLISH_OUTCOME === "${{ steps.publish.outcome }}"
+      && object(deliveryOutcome?.env).PUBLISHED_REVISION
+        === "${{ steps.publish.outputs.marketplace_revision }}",
+    `${file} catalog delivery outcome must read the real token, push, and revision results`,
+  );
+  add(
+    violations,
+    object(deliveryOutcome?.env).RECOVERY_WORKFLOW === delivery.recovery_workflow,
+    `${file} deferred catalog delivery must name ${delivery.recovery_workflow} as the recovery path`,
+  );
+  requireStepRun(violations, file, job, "Record catalog delivery outcome", [
+    "catalog_published=false",
+    '[ "$TOKEN_OUTCOME" = "success" ]',
+    '[ "$PUBLISH_OUTCOME" = "success" ]',
+    `printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
+    'echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"',
+    'echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"',
+    "::warning::Catalog publication deferred",
+    "recover with $RECOVERY_WORKFLOW",
+    // The recovery workflow mints the SAME credential from the SAME environment, so it recovers
+    // a rejected push and not a missing credential. A run that defers because the credential is
+    // absent must say that, or the ledger records an instruction nobody can follow.
+    'if [ "$TOKEN_OUTCOME" != "success" ]; then',
+    "provision the marketplace-publish credential",
+  ]);
+  add(
+    violations,
+    object(job.outputs).catalog_published === "${{ steps.delivery.outputs.catalog_published }}"
+      && object(job.outputs).marketplace_revision === "${{ steps.delivery.outputs.marketplace_revision }}",
+    `${file} marketplace publication must publish the recorded delivery state, not the raw push result`,
+  );
+  // A retry would collapse distinguishable failures into one opaque one and could publish on a
+  // second attempt after the first was already recorded, so this job gets exactly one attempt.
+  for (const step of list(job.steps)) {
+    const run = executableRunText(String(object(step).run ?? ""));
+    add(
+      violations,
+      !/\b(?:until|while)\b|for\s+attempt|--retry\b/u.test(run),
+      `${file} marketplace publication step ${object(step).name ?? "<unnamed>"} must not retry a recorded delivery outcome`,
+    );
+  }
+  return violations;
+}
+
 function validateReleaseCoordinator(workflows, violations, graph) {
   const releaseChain = graph.workflow_policy.release_chain;
+  const catalogDelivery = graph.workflow_policy.catalog_delivery;
   const releaseFile = "release.yml";
   const release = workflows.get(releaseFile);
   if (!release) {
@@ -1661,7 +1749,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
   ]);
-  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
+  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
+    "node .github/scripts/check-workflow-policy.mjs",
+    // The recovery contract decides whether a lost host may withhold a claim, so the release's own
+    // policy gate must execute its tests before any proof runs.
+    "node --test .github/scripts/lost-runner-recovery.test.mjs",
+  ]);
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
@@ -1709,6 +1802,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       "install-codestory-marketplace-proof.mjs",
       '--source-repository "$GITHUB_WORKSPACE"',
       "marketplace_revision=$marketplace_revision",
+      `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+      `printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'`,
       // Fixture mode resolves from the locally built catalog, so provenance is
       // checked against that repository's own revision. Checking it against the
       // live revision can never match, which is how the fixture path shipped
@@ -1858,10 +1953,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
+  // The producer map is the trust boundary between a real proof and a non-claim, so the closeout
+  // collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict.
   requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
     "producer-map",
     "--phase pre_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const preDownload = namedStep(preCloseout, "Download selected pre-publish release cells");
   add(
@@ -1896,10 +1995,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const publish = requireJob(violations, releaseFile, release, "publish");
   add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
+  // The published platform table is a claim about this release, so it is rendered from the accepted
+  // ledger. Rendering it from the static graph is how a release whose accelerator proof was
+  // withheld still announced that accelerator as supported.
+  requireStepUses(
+    violations,
+    releaseFile,
+    publish,
+    "Download the accepted pre-publish closeout",
+    "actions/download-artifact@v8.0.1",
+  );
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
     "node scripts/codestory-release-claims.mjs release-platform-notes",
+    "--ledger target/release-closeout/pre_publish/ledger.json",
+  ]);
+  // The ledger the README tells readers to consult has to be reachable from the release itself.
+  requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
+    "target/release-closeout/pre_publish/summary.json",
+    '"$(jq -r .decision "$summary")" = accept',
+    "target/release-assets/release-closeout-summary.json",
   ]);
   requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
     'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
@@ -1950,33 +2066,69 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && object(tokenStep?.with).repositories === "AgentPluginMarketplace",
     `${releaseFile} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
   );
-  requireStepRun(violations, releaseFile, marketplacePublish, "Point the catalog at the published release", [
-    "publish-marketplace-catalog.mjs",
-  ]);
+  violations.push(...catalogDeliveryOutcomeViolations(releaseFile, marketplacePublish, catalogDelivery));
   requireStepRun(violations, releaseFile, preflight, "Prove the public marketplace install path", [
     "build-marketplace-fixture.mjs",
     "--local-fixture true",
   ]);
 
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
-  add(violations, post.if === "inputs.publish_release", `${releaseFile} post-publish smoke must require trusted publication authority`);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
+  // The smoke still needs publication authority and a real published release, but a deferred
+  // catalog must not suppress proof of the assets that were actually published.
+  const postIf = String(post.if ?? "");
+  add(
+    violations,
+    postIf.includes("always()")
+      && postIf.includes("inputs.publish_release")
+      && postIf.includes("needs.preflight.result == 'success'")
+      && postIf.includes("needs.publish.result == 'success'"),
+    `${releaseFile} post-publish smoke must require trusted publication authority and a successful publish`,
+  );
+  // Not `.result` alone: `needs.marketplace-publish.outputs.catalog_published == 'true'` in the
+  // condition would reinstate exactly the hard catalog gate this change removed, under a
+  // different spelling. Nothing about the catalog job may appear in the condition at all; the
+  // delivery state reaches the smoke through `with:`, where it is data rather than a gate.
+  add(
+    violations,
+    !postIf.includes(`needs.${catalogDelivery.publish_job}`),
+    `${releaseFile} post-publish smoke must not gate on ${catalogDelivery.publish_job} in any form`,
+  );
+  // THE anti-vacuity rule: the catalog claim may only ever be the recorded delivery state. A
+  // literal, an unrelated input, or any other expression would let a release assert a catalog
+  // update that never happened.
+  add(
+    violations,
+    object(post.with).catalog_published
+      === `\${{ needs.${catalogDelivery.publish_job}.outputs.catalog_published == 'true' }}`,
+    `${releaseFile} post-publish smoke must derive catalog_published from the recorded ${catalogDelivery.publish_job} outcome`,
+  );
   add(
     violations,
     object(post.with).emit_release_cells === true
       && object(post.with).marketplace_revision
-        === "${{ needs.marketplace-publish.outputs.marketplace_revision }}"
+        === `\${{ needs.${catalogDelivery.publish_job}.outputs.marketplace_revision }}`
       && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
     `${releaseFile} post-publish smoke must consume the proved marketplace revision and accepted pre-publish ledger`,
   );
   const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
   add(violations, postCloseout.if === "inputs.publish_release", `${releaseFile} post-publish closeout must require trusted publication authority`);
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
+  // The closeout reached marketplace-publish only through the smoke, so removing the smoke's gate
+  // removed the closeout's too. Keep it that way rather than leaving it to be reintroduced here.
+  add(
+    violations,
+    !needs(postCloseout).includes(catalogDelivery.publish_job)
+      && !String(postCloseout.if ?? "").includes(`needs.${catalogDelivery.publish_job}`),
+    `${releaseFile} post-publish closeout must not gate on ${catalogDelivery.publish_job} succeeding`,
+  );
   requireStepRun(violations, releaseFile, postCloseout, "Authenticate post-publish Actions provenance", [
     "producer-map",
     "--phase post_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
   add(
@@ -2652,7 +2804,114 @@ function validatePackagedProof(workflows, violations, graph) {
   );
 }
 
-function validatePostPublish(workflows, violations) {
+// The post-publish smoke runs whether or not the catalog was updated, so the one thing it must
+// never do is let the deferred run look like the published one. Both states resolve a real Codex
+// install of the real published assets; they differ in WHICH catalog served it, and that
+// difference is carried into the release ledger as a distinct installer identity. These rules
+// prove the two states stay distinguishable and that neither can be selected by accident.
+function catalogDeliveryStateViolations(file, job, delivery, handoff, installStepName, checkoutRef) {
+  const violations = [];
+  const published = delivery.states.find(({ id }) => id === "published");
+  const deferred = delivery.states.find(({ id }) => id === "deferred");
+  // Whatever else the deferred branch does, it builds a catalog out of a tree and then verifies
+  // the install back against a tree. If those may be the same tree by default, the comparison is
+  // a tautology and the smoke cannot fail for any release-related reason. Both lanes therefore
+  // check out the PUBLISHED tag and make GitHub confirm it before anything is pinned.
+  const checkout = list(job.steps).find(
+    (candidate) => String(object(candidate).uses ?? "").startsWith("actions/checkout@"),
+  );
+  add(
+    violations,
+    object(object(checkout).with).ref === checkoutRef
+      && object(object(checkout).with)["fetch-depth"] === 0,
+    `${file} post-publish smoke must check out the published release tag, not the run's own head`,
+  );
+  requireStepRun(violations, file, job, "Bind this smoke to the published release", [
+    'gh release view "$TAG"',
+    "--json isDraft",
+    'published_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"',
+    `printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'`,
+    'if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then',
+    'echo "commit=$published_commit" >> "$GITHUB_OUTPUT"',
+  ]);
+  const step = namedStep(job, "Record catalog delivery state");
+  add(
+    violations,
+    object(step?.env).PUBLISHED_COMMIT === "${{ steps.published.outputs.commit }}",
+    `${file} catalog delivery state must pin the commit resolved from the published release`,
+  );
+  add(
+    violations,
+    step?.if === undefined && step?.["continue-on-error"] === undefined,
+    `${file} catalog delivery state must be unconditional and fail closed`,
+  );
+  add(
+    violations,
+    object(step?.env).CATALOG_PUBLISHED === handoff.published
+      && object(step?.env).INPUT_MARKETPLACE_REVISION === handoff.revision,
+    `${file} catalog delivery state must read the recorded publication handoff`,
+  );
+  requireStepRun(violations, file, job, "Record catalog delivery state", [
+    // The published branch: the live catalog, its live revision, no fixture.
+    'if [ "$CATALOG_PUBLISHED" = "true" ]; then',
+    "marketplace_source=TheGreenCedar/AgentPluginMarketplace",
+    'marketplace_revision="$INPUT_MARKETPLACE_REVISION"',
+    "local_fixture=false",
+    `installer=${published.installer}`,
+    // The deferred branch: a catalog pinned to this published commit, and a revision that cannot
+    // be a live one because the caller is required to have supplied none.
+    'elif [ "$CATALOG_PUBLISHED" = "false" ]; then',
+    'if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then',
+    "Deferred catalog publication must not carry a live catalog revision",
+    "build-marketplace-fixture.mjs",
+    // The fixture pins the PUBLISHED commit, never the workspace's own head. Building a catalog
+    // out of the tree that then verifies the install makes the source-tree comparison a
+    // tautology, which is how the plugin lane's deferred smoke became unable to fail.
+    '--commit "$published_commit"',
+    'marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
+    "local_fixture=true",
+    `installer=${deferred.installer}`,
+    // Neither branch may fall through: an unset or unexpected handoff is a hard failure, never a
+    // silent default into the published identity.
+    "catalog_published must be true or false",
+    // Immutability, not length. A 40-character string is not a commit: the published branch
+    // takes its revision from a `workflow_dispatch`-able input, and a length-only test admits
+    // any 40 characters of anything.
+    `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+    'echo "installer=$installer"',
+  ]);
+  const deliveryRun = executableRunText(String(step?.run ?? ""));
+  const publishedIndex = deliveryRun.indexOf(`installer=${published.installer}`);
+  const deferredIndex = deliveryRun.indexOf(`installer=${deferred.installer}`);
+  const publishedBranch = deliveryRun.indexOf('if [ "$CATALOG_PUBLISHED" = "true" ]; then');
+  const deferredBranch = deliveryRun.indexOf('elif [ "$CATALOG_PUBLISHED" = "false" ]; then');
+  add(
+    violations,
+    published.installer !== deferred.installer
+      && publishedBranch >= 0
+      && deferredBranch > publishedBranch
+      && publishedIndex > publishedBranch
+      && publishedIndex < deferredBranch
+      && deferredIndex > deferredBranch,
+    `${file} the published installer identity must be reachable only from the published branch`,
+  );
+  // Neither state may be fabricated in a later step: the install must come from what this step
+  // resolved, and the forbidden fragments that stop a faked install apply here too.
+  for (const forbidden of ["git archive", "git clone", "git ls-remote", "--source-commit", "--source-tree"]) {
+    add(
+      violations,
+      !deliveryRun.includes(forbidden),
+      `${file} marketplace install must not fabricate installation with ${forbidden}`,
+    );
+  }
+  requireStepRun(violations, file, job, installStepName, [
+    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
+  ]);
+  return violations;
+}
+
+function validatePostPublish(workflows, violations, graph) {
   const file = "post-publish-release-smoke.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
@@ -2663,13 +2922,21 @@ function validatePostPublish(workflows, violations) {
   add(violations, object(workflow.permissions).actions === "read", `${file} must read the accepted pre-publish closeout`);
   requireNoCalibrationReferences(violations, file, workflow);
   for (const event of ["workflow_call", "workflow_dispatch"]) {
+    // The catalog revision is now empty exactly when publication was deferred, so the required
+    // input is the delivery state itself: the caller must state which one it is, never omit it.
+    const publishedInput = object(at(workflow, "on", event, "inputs", "catalog_published"));
+    add(
+      violations,
+      publishedInput.required === true && publishedInput.type === "boolean",
+      `${file} ${event} catalog_published must be a required boolean`,
+    );
     const marketplaceInput = object(
       at(workflow, "on", event, "inputs", "marketplace_revision"),
     );
     add(
       violations,
-      marketplaceInput.required === true && marketplaceInput.type === "string",
-      `${file} ${event} marketplace_revision must be a required string`,
+      marketplaceInput.type === "string" && marketplaceInput.default === "",
+      `${file} ${event} marketplace_revision must be a string defaulting to the deferred empty revision`,
     );
     const closeoutInput = object(at(workflow, "on", event, "inputs", "pre_publish_closeout_artifact"));
     add(violations, closeoutInput.type === "string", `${file} ${event} pre_publish_closeout_artifact must be a string`);
@@ -2719,13 +2986,47 @@ function validatePostPublish(workflows, violations) {
     object(workflow.env).CODEX_CLI_VERSION === "0.144.5",
     `${file} must pin the Codex CLI used for marketplace installation`,
   );
-  const resolveInstalled = namedStep(job, "Resolve the published plugin through the marketplace catalog");
-  requireStepRun(violations, file, job, "Resolve the published plugin through the marketplace catalog", [
-    'marketplace_revision="${{ inputs.marketplace_revision }}"',
+  const catalogDelivery = graph.workflow_policy.catalog_delivery;
+  const resolveStepName = "Resolve the published plugin through the marketplace catalog";
+  violations.push(...catalogDeliveryStateViolations(
+    file,
+    job,
+    catalogDelivery,
+    {
+      published: "${{ inputs.catalog_published }}",
+      revision: "${{ inputs.marketplace_revision }}",
+    },
+    resolveStepName,
+    "${{ steps.release.outputs.tag }}",
+  ));
+  // The one place the delivery state reaches the release ledger. It must be the resolved value and
+  // never a literal, or a deferred run could sign a cell saying the public catalog served it.
+  const identityRun = executableRunText(
+    String(namedStep(job, "Emit authenticated post-publish release cells")?.run ?? ""),
+  );
+  add(
+    violations,
+    identityRun.includes('--arg installer "${{ steps.delivery.outputs.installer }}"'),
+    `${file} post-publish cells must record the resolved delivery installer identity`,
+  );
+  for (const state of catalogDelivery.states) {
+    add(
+      violations,
+      !identityRun.includes(state.installer),
+      `${file} post-publish cells must not hard-code the ${state.id} installer identity`,
+    );
+  }
+  const resolveInstalled = namedStep(job, resolveStepName);
+  requireStepRun(violations, file, job, resolveStepName, [
+    'marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"',
+    // Re-checked here as an immutable identity, not merely as 40 characters: this job is
+    // dispatchable, so the published branch's revision can arrive from a human.
+    `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
     '"@openai/codex@$CODEX_CLI_VERSION"',
     "install-codestory-marketplace-proof.mjs",
-    "TheGreenCedar/AgentPluginMarketplace",
+    '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
     '--marketplace-revision "$marketplace_revision"',
+    '--local-fixture "${{ steps.delivery.outputs.local_fixture }}"',
     '--source-repository "$GITHUB_WORKSPACE"',
     "install-attestation-v2.json",
     'isolated_home="$install_root/isolated-home"',
@@ -4199,12 +4500,214 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-linux-x64-attempt-${{ github.run_attempt }}",
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-linux-x64-attempt-${{ github.run_attempt }}",
     "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
+    // The withheld-claim producer is the one job allowed to write a cell it did not prove, and it
+    // owns exactly one attempt-qualified artifact per protected host and closeout phase.
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
   ];
   add(
     violations,
     JSON.stringify(actual.sort()) === JSON.stringify(expected.sort()),
     "release-cell Actions artifact names must have one graph-owned producer job and attempt suffix",
   );
+}
+
+const JOB_EVIDENCE_COLLECTOR = ".github/scripts/collect-actions-job-evidence.sh";
+
+/// `checks: read` is the token scope that makes the lost-runner signature readable at all.
+///
+/// The signature's first part is a job annotation, and GET /repos/{o}/{r}/check-runs/{id}/annotations
+/// is gated on that scope. A workflow that runs the collector without it gets a 403, which the
+/// collector now refuses rather than reporting as "no annotations" -- so the missing scope stops a
+/// release instead of quietly making recovery impossible. This rule catches it before the release,
+/// in every workflow that reaches the collector, including the reusable-workflow callers whose own
+/// grant is the ceiling for everything they call.
+export function annotationScopeViolations(workflows) {
+  const violations = [];
+  const grantsChecksRead = permissions => object(permissions).checks === "read";
+  const collectorWorkflows = new Set();
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const runsCollector = list(object(job).steps)
+        .some(step => String(object(step).run ?? "").includes(JOB_EVIDENCE_COLLECTOR));
+      if (!runsCollector) continue;
+      collectorWorkflows.add(file);
+      // A job-level `permissions:` block replaces the workflow-level one outright, so the effective
+      // grant is whichever of the two the job actually has.
+      const effective = object(job).permissions !== undefined
+        ? object(job).permissions
+        : object(workflow).permissions;
+      add(
+        violations,
+        grantsChecksRead(effective),
+        `${file} job ${jobId} reads Actions job annotations and must grant checks: read`,
+      );
+    }
+  }
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const uses = String(object(job).uses ?? "");
+      if (!uses.startsWith("./.github/workflows/")) continue;
+      if (!collectorWorkflows.has(uses.slice(uses.lastIndexOf("/") + 1))) continue;
+      add(
+        violations,
+        grantsChecksRead(object(job).permissions),
+        `${file} job ${jobId} calls a workflow that reads job annotations and must pass checks: read`,
+      );
+    }
+  }
+  add(
+    violations,
+    collectorWorkflows.size > 0,
+    `no workflow runs ${JOB_EVIDENCE_COLLECTOR}, so the lost-runner signature is never collected`,
+  );
+  return violations;
+}
+
+/// The two halves of the lost-runner contract: a bounded automatic re-dispatch, and a withheld
+/// claim once that bound is spent.
+///
+/// Both are places where a gate is being relaxed, so the policy pins the shapes that keep the
+/// relaxation honest: the rerun names individual lost jobs instead of asking Actions to rerun every
+/// failure, the recovery never waits on a human, and the withheld-claim producer decides from the
+/// shared classifier rather than from "the proof job went red".
+export function lostRunnerRecoveryViolations(workflows, graph) {
+  const violations = [];
+  const policy = graph.non_claim_policy;
+  const rerunFile = "lost-runner-rerun.yml";
+  const rerun = workflows.get(rerunFile);
+  add(
+    violations,
+    MAXIMUM_RUN_ATTEMPTS === policy.maximum_run_attempts,
+    `${rerunFile} recovery bound must equal the release claim graph maximum_run_attempts`,
+  );
+  add(
+    violations,
+    LOST_RUNNER_ANNOTATION === policy.annotation,
+    `${rerunFile} recovery contract must key on the annotation the release claim graph records`,
+  );
+  if (!rerun) {
+    violations.push(`${rerunFile} must exist`);
+  } else {
+    const trigger = object(at(rerun, "on", "workflow_run"));
+    add(
+      violations,
+      includesAll(trigger.workflows, ["Auto Release", "Release"])
+        && includesAll(trigger.types, ["completed"]),
+      `${rerunFile} must observe completed release runs`,
+    );
+    add(
+      violations,
+      JSON.stringify(Object.entries(object(rerun.permissions)).sort())
+        === JSON.stringify([["actions", "write"], ["checks", "read"], ["contents", "read"]]),
+      `${rerunFile} must hold only the Actions write and annotation read scopes its recovery needs`,
+    );
+    const job = requireJob(violations, rerunFile, rerun, "rerun-lost-jobs");
+    // The repository requires machine recovery: an environment on this job would put a human click
+    // between a dropped connection and the retry, which is the failure this workflow exists to fix.
+    add(
+      violations,
+      object(job).environment === undefined,
+      `${rerunFile} recovery must not wait on an approval environment`,
+    );
+    add(
+      violations,
+      String(object(job).if ?? "").includes("github.event.workflow_run.conclusion == 'failure'"),
+      `${rerunFile} must act only on a failed release run`,
+    );
+    requireStepRun(violations, rerunFile, job, "Collect Actions failure evidence", [
+      "bash .github/scripts/collect-actions-job-evidence.sh",
+    ]);
+    requireStepRun(violations, rerunFile, job, "Plan the bounded rerun", [
+      "node .github/scripts/lost-runner-recovery.mjs plan-rerun",
+    ]);
+    const dispatch = namedStep(job, "Re-dispatch only the lost jobs");
+    add(
+      violations,
+      dispatch?.if === "steps.plan.outputs.rerun == 'true'",
+      `${rerunFile} re-dispatch must be gated on the classified recovery plan`,
+    );
+    requireStepRun(violations, rerunFile, job, "Re-dispatch only the lost jobs", [
+      "actions/jobs/$job_id/rerun",
+    ]);
+    // Re-running every failed job would sweep an assertion failure back into the queue alongside
+    // the lost one; the plan names ids, so the API call must be the per-job endpoint.
+    add(
+      violations,
+      !scalarStrings(rerun).some(value => value.includes("rerun-failed-jobs")),
+      `${rerunFile} must re-dispatch named lost jobs, never every failed job`,
+    );
+  }
+
+  const releaseFile = "release.yml";
+  const release = workflows.get(releaseFile);
+  if (!release) return violations;
+  const job = requireJob(violations, releaseFile, release, "accelerator-non-claim");
+  add(
+    violations,
+    sameMembers(needs(job), graph.workflow_policy.release_chain.dependencies["accelerator-non-claim"]),
+    `${releaseFile} non-claim dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    job.name === policy.producer_job_name,
+    `${releaseFile} non-claim job name must equal the release claim graph producer_job_name`,
+  );
+  add(
+    violations,
+    object(job).environment === undefined,
+    `${releaseFile} non-claim producer must not wait on an approval environment`,
+  );
+  add(
+    violations,
+    String(object(job).if ?? "").startsWith("always()"),
+    `${releaseFile} non-claim producer must observe every accelerator outcome`,
+  );
+  requireStepRun(violations, releaseFile, job, "Collect protected accelerator job evidence", [
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "non_claim_policy.hosts",
+  ]);
+  requireStepRun(violations, releaseFile, job, "Decide withheld accelerator hosts", [
+    "node .github/scripts/lost-runner-recovery.mjs plan-non-claim",
+  ]);
+  const record = namedStep(job, "Record populated accelerator non-claims");
+  add(
+    violations,
+    record?.if === "steps.non-claim.outputs.withheld_hosts != ''",
+    `${releaseFile} non-claim cells must be written only for hosts the classifier withheld`,
+  );
+  requireStepRun(violations, releaseFile, job, "Record populated accelerator non-claims", [
+    "scripts/codestory-release-cell-manifest.mjs withhold",
+    '--producer-run-attempt "$GITHUB_RUN_ATTEMPT"',
+  ]);
+  // A non-claim producer that emitted evidence for a host that reported would overwrite a real
+  // proof, so every upload is bound to the classifier's own withheld list. Each closeout phase gets
+  // its own container: a phase authorizes every manifest inside the container it downloads, so a
+  // container mixing phases would carry a manifest that phase's producer map never selected.
+  for (const host of policy.hosts) {
+    for (const [phase, artifact] of Object.entries(host.producer_artifacts)) {
+      const prefix = artifact.replace("-attempt-{attempt}", "");
+      const upload = [...list(job.steps)].find(step =>
+        String(object(object(step).with).name ?? "").startsWith(prefix));
+      add(
+        violations,
+        upload?.if === `contains(steps.non-claim.outputs.withheld_hosts, '${host.id}')`
+          && String(object(object(upload).with).path ?? "").endsWith(`/${host.id}/${phase}`),
+        `${releaseFile} withheld ${host.id} ${phase} cells must upload only that phase for a withheld host`,
+      );
+    }
+  }
+  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  add(
+    violations,
+    String(object(closeout).if ?? "").includes("needs.accelerator-non-claim.result == 'success'"),
+    `${releaseFile} pre-publish closeout must require a decided non-claim outcome`,
+  );
+  return violations;
 }
 
 function validateReleaseArtifactRerunSafety(workflows, violations) {
@@ -4568,12 +5071,10 @@ export function validatePluginRelease(workflows, violations, graph) {
     "publish-marketplace-catalog.mjs",
     '--version "${{ inputs.version }}"',
   ]);
-  add(
-    violations,
-    object(marketplacePublish.outputs).marketplace_revision
-      === "${{ steps.publish.outputs.marketplace_revision }}",
-    `${file} marketplace publication must publish the revision it pushed`,
-  );
+  // Same contract as the native lane: the catalog push is delivery after an irreversible tag, so
+  // it may not fail the release, and the run must record which state it ended in.
+  const catalogDelivery = object(at(graph, "workflow_policy", "catalog_delivery"));
+  violations.push(...catalogDeliveryOutcomeViolations(file, marketplacePublish, catalogDelivery));
 
   // Preflight runs before the release exists, so a revision captured there names the *previous*
   // release. Smoke must install from the revision this run published or it proves nothing.
@@ -4583,11 +5084,34 @@ export function validatePluginRelease(workflows, violations, graph) {
     object(preflight.outputs).marketplace_revision === undefined,
     `${file} preflight must not capture a marketplace revision that predates publication`,
   );
+  const installStepName = "Prove the public marketplace install path";
   add(
     violations,
-    object(namedStep(smoke, "Prove the public marketplace install path")?.env).MARKETPLACE_REVISION
-      === "${{ needs.marketplace-publish.outputs.marketplace_revision }}",
+    object(namedStep(smoke, installStepName)?.env).MARKETPLACE_REVISION
+      === "${{ steps.delivery.outputs.marketplace_revision }}",
     `${file} post-publish smoke must install from the marketplace revision this release published`,
+  );
+  violations.push(...catalogDeliveryStateViolations(
+    file,
+    smoke,
+    catalogDelivery,
+    {
+      published: "${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}",
+      revision: "${{ needs.marketplace-publish.outputs.marketplace_revision }}",
+    },
+    installStepName,
+    "v${{ inputs.version }}",
+  ));
+  const smokeIf = String(smoke.if ?? "");
+  add(
+    violations,
+    smokeIf.includes("always()")
+      && smokeIf.includes("needs.preflight.result == 'success'")
+      && smokeIf.includes("needs.publish.result == 'success'")
+      // Any reference at all, not just `.result`: an `outputs.catalog_published == 'true'`
+      // conjunct here is the same hard gate wearing a different name.
+      && !smokeIf.includes("needs.marketplace-publish"),
+    `${file} post-publish smoke must require a successful publish without gating on marketplace-publish in any form`,
   );
 
   const auto = workflows.get("auto-release.yml");
@@ -4765,11 +5289,13 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validatePluginAndDraftWorkflows(workflows, violations, graph);
   validateReleaseCoordinator(workflows, violations, graph);
   validatePackagedProof(workflows, violations, graph);
-  validatePostPublish(workflows, violations);
+  validatePostPublish(workflows, violations, graph);
   validatePackagedCoordinator(workflows, violations, graph);
   validateRemainingWorkflows(workflows, violations);
   validateReleaseCellUploadOwnership(workflows, violations);
   validateReleaseArtifactRerunSafety(workflows, violations);
+  violations.push(...annotationScopeViolations(workflows));
+  violations.push(...lostRunnerRecoveryViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }

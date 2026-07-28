@@ -138,14 +138,35 @@ pub(super) fn run_raw_protocol_exchange_with_input(
     measured_input: Option<String>,
 ) -> Result<WorkerProtocolExchange> {
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
-    let stream = connect_required_owner(&transport)?;
+    run_raw_protocol_exchange_with_transport(
+        runtime,
+        &transport,
+        clock,
+        class,
+        deadline_ms,
+        measured_input,
+    )
+}
+
+/// Run one raw exchange against an executable identity the caller already
+/// captured. Callers that fan several exchanges out of one process share a
+/// single capture instead of re-hashing the executable per exchange.
+pub(super) fn run_raw_protocol_exchange_with_transport(
+    runtime: &SidecarRuntimeConfig,
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+    clock: &dyn AwakeMonotonicClock,
+    class: &str,
+    deadline_ms: u64,
+    measured_input: Option<String>,
+) -> Result<WorkerProtocolExchange> {
+    let stream = connect_required_owner(transport)?;
     run_protocol_exchange_on_stream(
         runtime,
         clock,
         class,
         deadline_ms,
         measured_input,
-        &transport,
+        transport,
         stream,
     )
 }

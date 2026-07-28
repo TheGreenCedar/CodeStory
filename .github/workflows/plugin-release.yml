@@ -188,20 +188,24 @@ jobs:
             --title "CodeStory plugin ${{ inputs.version }}" \
             --notes-file /tmp/plugin-release-notes.md
 
-  # The catalog is what a host installs from, so the plugin lane publishes it too. Without this the
-  # smoke below would resolve the previous release and fail after the tag is already irreversible.
+  # The catalog is what a host installs from, so the plugin lane publishes it too. It is DELIVERY,
+  # not a gate: the tag already exists when this job runs, so a failure here must leave the release
+  # standing with the catalog still serving the previous one -- never fail an irreversible release.
+  # The run says which of the two states it ended in, and the smoke below records that state.
   marketplace-publish:
     needs: [preflight, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: marketplace-publish
     outputs:
-      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+      catalog_published: ${{ steps.delivery.outputs.catalog_published }}
+      marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Mint a scoped marketplace token
         id: token
+        continue-on-error: true
         uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
         with:
           app-id: ${{ secrets.MARKETPLACE_APP_ID }}
@@ -211,8 +215,11 @@ jobs:
 
       # Publication already happened, so a failure here leaves the catalog serving the previous
       # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      # One attempt only: a retry loop here would hide which failure the run actually hit.
       - name: Point the catalog at the published release
         id: publish
+        if: steps.token.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
@@ -223,17 +230,149 @@ jobs:
             --version "${{ inputs.version }}" \
             --github-output "$GITHUB_OUTPUT"
 
+      # The only place this lane's "catalog was updated" claim is ever minted.
+      - name: Record catalog delivery outcome
+        id: delivery
+        if: always()
+        env:
+          TOKEN_OUTCOME: ${{ steps.token.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          RECOVERY_WORKFLOW: marketplace-sync.yml
+        run: |
+          set -euo pipefail
+          catalog_published=false
+          marketplace_revision=""
+          if [ "$TOKEN_OUTCOME" = "success" ] \
+            && [ "$PUBLISH_OUTCOME" = "success" ] \
+            && printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            catalog_published=true
+            marketplace_revision="$PUBLISHED_REVISION"
+          fi
+          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
+          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          if [ "$catalog_published" = "true" ]; then
+            echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
+          # rejected push, not a missing credential. Saying so here keeps the recorded recovery
+          # instruction one that can actually be followed.
+          if [ "$TOKEN_OUTCOME" != "success" ]; then
+            recovery="provision the marketplace-publish credential, then run $RECOVERY_WORKFLOW (it mints the same token, so it defers as well when that credential is absent)"
+          else
+            recovery="re-run $RECOVERY_WORKFLOW with this version and commit"
+          fi
+          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW: $recovery."
+          echo "Catalog delivery: DEFERRED. The release is published; the catalog still serves the previous release. Recover with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
+
   post-publish-smoke:
+    # Deliberately not gated on marketplace-publish: a deferred catalog must not suppress proof of
+    # the plugin that was actually published. The delivery state is carried in, not depended on.
+    if: always() && needs.preflight.result == 'success' && needs.publish.result == 'success'
     needs: [preflight, publish, marketplace-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The published release tag, not the run's own head. A bare checkout gave this job the
+      # workspace it was triggered from, and the deferred branch then built a catalog out of
+      # that workspace and verified the install back against the same tree -- a comparison that
+      # could not fail for any release-related reason. Resolving the tag makes the commit under
+      # proof the one the release actually published.
       - uses: actions/checkout@v5
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      # The tag alone is a local name; this is where it becomes the PUBLISHED identity. The
+      # published release must exist, must not be a draft, and must resolve to the commit this
+      # job checked out. Every later step pins that commit, so the fixture catalog, the Codex
+      # resolve, and the byte comparison all name a release GitHub is actually serving.
+      - name: Bind this smoke to the published release
+        id: published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" != "false" ]; then
+            echo "::error::Published plugin release $TAG is a draft."
+            exit 1
+          fi
+          published_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
+          if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then
+            echo "::error::Checked-out tree is not the commit published at $TAG."
+            exit 1
+          fi
+          echo "commit=$published_commit" >> "$GITHUB_OUTPUT"
+          echo "Smoking the plugin published at $TAG ($published_commit)." >> "$GITHUB_STEP_SUMMARY"
+
+      # Same two states as the native lane, decided once from the recorded publication outcome.
+      # Published resolves the live catalog; deferred resolves a catalog pinned to this exact
+      # published commit, because the live one still names the previous release. Neither may be
+      # reached by accident: an inconsistent or unrecognized handoff stops the job.
+      - name: Record catalog delivery state
+        id: delivery
+        shell: bash
+        env:
+          CATALOG_PUBLISHED: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
+          INPUT_MARKETPLACE_REVISION: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
+          PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # The commit GitHub reports for the published tag, bound in the previous step.
+          published_commit="$PUBLISHED_COMMIT"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
+          fixture_root="$RUNNER_TEMP/codestory-marketplace-delivery/fixture"
+          rm -rf "$fixture_root"
+          if [ "$CATALOG_PUBLISHED" = "true" ]; then
+            marketplace_source=TheGreenCedar/AgentPluginMarketplace
+            marketplace_revision="$INPUT_MARKETPLACE_REVISION"
+            local_fixture=false
+            installer=codex_marketplace_install
+            state=published
+          elif [ "$CATALOG_PUBLISHED" = "false" ]; then
+            if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then
+              echo "::error::Deferred catalog publication must not carry a live catalog revision."
+              exit 1
+            fi
+            # Pinned to the PUBLISHED commit resolved from GitHub, not to whatever this
+            # workspace happens to be. The Codex resolver then fetches that commit from
+            # github.com, so the installed bytes come from the published release rather than
+            # from the tree performing the check.
+            node .github/scripts/build-marketplace-fixture.mjs \
+              --out "$fixture_root" \
+              --source-repository "$GITHUB_WORKSPACE" \
+              --commit "$published_commit"
+            marketplace_source="$fixture_root"
+            marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"
+            local_fixture=true
+            installer=codex_marketplace_deferred_fixture
+            state=deferred
+          else
+            echo "::error::catalog_published must be true or false, not '$CATALOG_PUBLISHED'."
+            exit 1
+          fi
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
+          {
+            echo "marketplace_source=$marketplace_source"
+            echo "marketplace_revision=$marketplace_revision"
+            echo "local_fixture=$local_fixture"
+            echo "installer=$installer"
+            echo "state=$state"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$state" = "deferred" ]; then
+            echo "::warning::Catalog publication was deferred for this release. This smoke proves the published plugin against a candidate-pinned catalog fixture and records installer $installer; recover the public catalog with marketplace-sync.yml."
+          fi
+          echo "Catalog delivery state: $state (installer $installer, catalog revision $marketplace_revision)." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prove the public marketplace install path
         env:
           CODEX_CLI_VERSION: "0.144.5"
-          MARKETPLACE_REVISION: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
+          MARKETPLACE_REVISION: ${{ steps.delivery.outputs.marketplace_revision }}
         run: |
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-marketplace-postpublish"
@@ -248,9 +387,10 @@ jobs:
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
-            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-source "${{ steps.delivery.outputs.marketplace_source }}" \
             --marketplace-name TheGreenCedar \
             --marketplace-revision "$MARKETPLACE_REVISION" \
+            --local-fixture "${{ steps.delivery.outputs.local_fixture }}" \
             --expected-version "${{ inputs.version }}" \
             --source-repository "$GITHUB_WORKSPACE" \
             --attestation "$install_root/install-attestation-v2.json"
