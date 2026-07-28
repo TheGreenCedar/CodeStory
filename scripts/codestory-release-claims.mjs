@@ -227,6 +227,78 @@ function uniqueById(values, label) {
   return found;
 }
 
+// Marketplace catalog publication is delivery, not a release gate: it happens after the tag and
+// the GitHub release already exist, so failing the release on it would only convert a recoverable
+// delivery gap into an unrecoverable one. The price of that is that the release must say which of
+// the two states it is in, so the graph names both and pins a distinct installer identity to each.
+// A run that could not publish records the deferred identity in its post-publish cells; nothing in
+// the pipeline is allowed to record the published identity without the catalog push succeeding.
+function validateCatalogDelivery(policy, dependencies, cellGroups) {
+  const delivery = object(policy.catalog_delivery, "workflow_policy.catalog_delivery");
+  const publishJob = nonEmptyText(delivery.publish_job, "workflow_policy.catalog_delivery.publish_job");
+  if (dependencies[publishJob] === undefined) {
+    fail(`workflow_policy.catalog_delivery.publish_job ${publishJob} must be a release chain job`);
+  }
+  nonEmptyText(delivery.recovery_workflow, "workflow_policy.catalog_delivery.recovery_workflow");
+  if (delivery.release_gate !== false) {
+    fail("workflow_policy.catalog_delivery.release_gate must be false: catalog publication is delivery, not a release gate");
+  }
+  if (!Array.isArray(delivery.states) || delivery.states.length !== 2) {
+    fail("workflow_policy.catalog_delivery.states must name exactly the published and deferred states");
+  }
+  const installers = new Set();
+  const byId = new Map();
+  for (const [index, stateValue] of delivery.states.entries()) {
+    const state = object(stateValue, `workflow_policy.catalog_delivery.states[${index}]`);
+    const id = nonEmptyText(state.id, `workflow_policy.catalog_delivery.states[${index}].id`);
+    const installer = nonEmptyText(
+      state.installer,
+      `workflow_policy.catalog_delivery.states[${index}].installer`,
+    );
+    if (!identityMatchesFormat(installer, "identifier")) {
+      fail(`workflow_policy.catalog_delivery.states[${index}].installer does not match identifier`);
+    }
+    if (typeof state.live_catalog_revision !== "boolean") {
+      fail(`workflow_policy.catalog_delivery.states[${index}].live_catalog_revision must be a boolean`);
+    }
+    if (installers.has(installer)) {
+      fail("workflow_policy.catalog_delivery states must record distinct installer identities");
+    }
+    installers.add(installer);
+    byId.set(id, state);
+  }
+  for (const id of ["published", "deferred"]) {
+    if (!byId.has(id)) fail(`workflow_policy.catalog_delivery.states must declare the ${id} state`);
+  }
+  if (byId.get("published").live_catalog_revision !== true) {
+    fail("workflow_policy.catalog_delivery published state must consume the live catalog revision");
+  }
+  if (byId.get("deferred").live_catalog_revision !== false) {
+    fail("workflow_policy.catalog_delivery deferred state must not consume a live catalog revision");
+  }
+  // Naming the two states is not enough on its own: something has to read the mark, or a
+  // deferred release's closeout verdict stays indistinguishable from a published one. This
+  // names the post-publish cell family whose signed `installer` identity the closeout resolves
+  // the delivery state from, so the graph cannot declare the states without a reader.
+  const installedCellGroup = nonEmptyText(
+    delivery.installed_cell_group,
+    "workflow_policy.catalog_delivery.installed_cell_group",
+  );
+  const group = cellGroups.get(installedCellGroup);
+  if (group === undefined) {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a closeout cell group`);
+  }
+  if (group.phase !== "post_publish") {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a post-publish cell group`);
+  }
+  for (const key of ["required_identity", "singleton_identity"]) {
+    if (!(group[key] ?? []).includes("installer")) {
+      fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must carry installer in ${key}`);
+    }
+  }
+  return delivery;
+}
+
 function validatePublicSupport(graph, packageTargets, cellGroups) {
   const publicSupport = object(
     graph.public_support,
@@ -764,6 +836,7 @@ export function validateReleaseClaimGraph(graph) {
     }
   }
   validatePluginChain(policy.plugin_chain);
+  validateCatalogDelivery(policy, dependencies, cellGroups);
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");

@@ -1113,6 +1113,24 @@
         ]
       }
     },
+    "catalog_delivery": {
+      "publish_job": "marketplace-publish",
+      "recovery_workflow": "marketplace-sync.yml",
+      "release_gate": false,
+      "installed_cell_group": "installed_runtime_behavior",
+      "states": [
+        {
+          "id": "published",
+          "installer": "codex_marketplace_install",
+          "live_catalog_revision": true
+        },
+        {
+          "id": "deferred",
+          "installer": "codex_marketplace_deferred_fixture",
+          "live_catalog_revision": false
+        }
+      ]
+    },
     "artifact_workflows": [
       "source-proof.yml",
       "release-candidate-evidence.yml",

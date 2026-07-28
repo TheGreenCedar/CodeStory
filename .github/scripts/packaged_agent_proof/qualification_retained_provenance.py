@@ -16,6 +16,7 @@ from .foundation import (
     PINNED_CODEX_CLI_VERSION,
     require,
 )
+from .marketplace_installation import delivery_state
 from .native_manifest import runtime_executable_sha256
 from .qualification_retained_types import (
     RetainedPackageBinding,
@@ -29,8 +30,13 @@ def _verify_marketplace_provenance(
     plugin: dict,
     runtime: dict,
 ) -> None:
+    # The two catalog delivery states carry different repository identities, and the retained
+    # evidence must name the one that matches its own installer identity. Accepting either name
+    # for either identity would let a deferred release's retained evidence read as a live one.
+    state = delivery_state(plugin.get("installation_source"))
+    require(state is not None, "installed evidence names no marketplace delivery state")
     require(
-        plugin.get("marketplace_repository") == "TheGreenCedar/AgentPluginMarketplace"
+        plugin.get("marketplace_repository") == state.repository
         and plugin.get("codex_cli_version") == PINNED_CODEX_CLI_VERSION
         and runtime.get("build_source") == "github_release"
         and runtime.get("repo_ref") == f"v{contract.manifest['release_version']}",
@@ -87,15 +93,18 @@ def _verify_installed_provenance(contract: RetainedQualificationContract) -> Non
     installation_source = plugin.get("installation_source")
     require(
         plugin.get("schema_version") == 2
-        and installation_source in {"codex_marketplace_install", "candidate_archive"}
+        and (
+            installation_source == "candidate_archive"
+            or delivery_state(installation_source) is not None
+        )
         and plugin.get("plugin_id") == "codestory"
         and plugin.get("plugin_version") == manifest["release_version"],
         "installed evidence has invalid plugin provenance",
     )
-    if installation_source == "codex_marketplace_install":
-        _verify_marketplace_provenance(contract, plugin, runtime)
-    else:
+    if installation_source == "candidate_archive":
         _verify_candidate_provenance(contract, plugin, runtime)
+    else:
+        _verify_marketplace_provenance(contract, plugin, runtime)
     require_sha256(
         plugin.get("plugin_package_sha256"),
         "installed evidence plugin_package_sha256",

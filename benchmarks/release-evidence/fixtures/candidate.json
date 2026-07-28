@@ -62,7 +62,7 @@
   },
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "5e61e808ffb6edad30699c701b3f8c4182ddfeb3f7d83ba49bb41b1ce948aacb",
+    "graph_sha256": "dc16ae973ec63ecc72116f7861ff77eef8cf709ddf2002d7485665541f7fd2f6",
     "observed_at": "2026-07-21T02:13:20.738Z",
     "expires_at": "2026-07-22T02:13:20.738Z",
     "requested_claims": [
@@ -85,7 +85,7 @@
         "type": "performance",
         "tier": "live_behavior",
         "status": "measured",
-        "graph_sha256": "5e61e808ffb6edad30699c701b3f8c4182ddfeb3f7d83ba49bb41b1ce948aacb",
+        "graph_sha256": "dc16ae973ec63ecc72116f7861ff77eef8cf709ddf2002d7485665541f7fd2f6",
         "observed_at": "2026-07-21T02:13:20.738Z",
         "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
@@ -106,7 +106,7 @@
         "type": "answer_quality",
         "tier": "answer_quality",
         "status": "pass",
-        "graph_sha256": "5e61e808ffb6edad30699c701b3f8c4182ddfeb3f7d83ba49bb41b1ce948aacb",
+        "graph_sha256": "dc16ae973ec63ecc72116f7861ff77eef8cf709ddf2002d7485665541f7fd2f6",
         "observed_at": "2026-07-21T02:13:20.738Z",
         "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
