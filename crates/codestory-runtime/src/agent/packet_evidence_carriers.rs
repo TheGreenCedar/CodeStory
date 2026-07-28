@@ -49,7 +49,7 @@ fn path_has_any_extension(citation: &AgentCitationDto, extensions: &[&str]) -> b
 // HTTP client lifecycle
 // ---------------------------------------------------------------------------
 
-/// The convenience request method a caller reaches first (`Axios.prototype.request`, `client.get`).
+/// The convenience request method a caller reaches first: a verb-named method on a client type.
 /// Distinct from the factory that builds the client and from the adapter that finally sends.
 pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
@@ -74,7 +74,6 @@ pub(crate) fn citation_owns_client_request_finalization(citation: &AgentCitation
             "tohttprequest",
             "buildrequest",
             "requestbody",
-            "transformrequest",
         ],
     )
 }
@@ -196,7 +195,6 @@ pub(crate) fn citation_owns_form_native_constraint(citation: &AgentCitationDto) 
                 "min",
                 "max",
                 "inputtype",
-                "novalidate",
             ],
         )
 }
@@ -302,13 +300,12 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
         display.contains("record")
             && !display.contains("handler")
             && (has_any(&display, &["add", "create", "make", "build", "log"])
-                || display == "record"
-                || display.ends_with("logrecord"))
+                || display == "record")
     }
 }
 
-/// Processing a record, not registering something that might. `Logger::pushHandler` names a
-/// handler but does nothing with a record, so it must not close this requirement.
+/// Processing a record, not registering something that might: a symbol that pushes a handler onto
+/// a stack names a handler but does nothing with a record, so it must not close this requirement.
 pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && {
         let display = display(citation);
