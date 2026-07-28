@@ -2518,6 +2518,14 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
         steps: [{ name: "Do something", run: "echo hello\n" }],
       };
     }, /jobs\.leak\.steps\.0 must declare shell: bash/u],
+    // `continue-on-error` sits outside the script, exactly like `shell:`, so the guard's own text
+    // cannot assert against it. It leaves the refusal running and simply ignores its exit code.
+    ["the guard's refusal is downgraded to advice", workflow => {
+      workflow.jobs.sync.steps[0]["continue-on-error"] = true;
+    }, /jobs\.sync\.steps\.0 must not declare continue-on-error/u],
+    ["a whole job downgrades every guard it contains", workflow => {
+      workflow.jobs.sync["continue-on-error"] = true;
+    }, /jobs\.sync must not declare continue-on-error/u],
     // A `uses:` step is not exempt: an action can evaluate the input it is handed, and
     // `actions/github-script` runs its `script:` input as JavaScript.
     ["a pinned action evaluates the commit as script text", workflow => {

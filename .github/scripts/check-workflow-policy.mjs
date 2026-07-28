@@ -4647,9 +4647,22 @@ export function validateMarketplaceSync(workflows, violations) {
   // runner with the same repository token and the same marketplace environment, so a scan scoped
   // to `jobs.sync` would exempt exactly the code an attacker would add.
   for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+    // `continue-on-error` is the same class of blind spot as `shell:`: it lives outside the script,
+    // so nothing the guard's own text asserts can see it, and it converts the guard's `exit 1` into
+    // advice. A job carrying it downgrades every step it contains at once.
+    add(
+      violations,
+      object(rawJob)["continue-on-error"] === undefined,
+      `${file} jobs.${jobName} must not declare continue-on-error, which would make its guards advisory`,
+    );
     for (const [index, rawStep] of list(object(rawJob).steps).entries()) {
       const step = object(rawStep);
       const where = `${file} jobs.${jobName}.steps.${index}`;
+      add(
+        violations,
+        step["continue-on-error"] === undefined,
+        `${where} must not declare continue-on-error, which would make its refusal advisory`,
+      );
       if (typeof step.run === "string") {
         // Interpolation is textual and quoting does not stop command substitution, so a dispatched
         // value spliced into script text executes on the runner -- here beside repository tokens.
