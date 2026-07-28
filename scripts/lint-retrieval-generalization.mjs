@@ -369,19 +369,68 @@ const evalCorpusRoots = [
 // the gate on everything except the code it guards, so the guard suite reads
 // this list out of the lint rather than keeping a second copy that can drift.
 const dumpGuardedPathsPath = process.env.CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_GUARDED_PATHS;
-if (dumpGuardedPathsPath) {
+function writeGuardedPathDump(scannedFiles) {
   const asRepoPath = (absolute) =>
     path.relative(repoRoot, absolute).replaceAll(path.sep, "/");
-  writeFileSync(dumpGuardedPathsPath, JSON.stringify({
-    productionDirs: requiredScanDirs.map(asRepoPath),
-    productionFiles: requiredProductionOnlyFiles.map(asRepoPath),
-    corpusDirs: [asRepoPath(benchmarkTaskRoot)],
+  const asRepoPaths = (absolutes) =>
+    [...new Set(absolutes.map(asRepoPath))].sort();
+  const document = {
+    // Rust whose content the corpus bans are applied to. `requiredScanDirs` is
+    // the retrieval slice that gets the full ban set; `structuralScanDirs` is
+    // every other crate, which gets the corpus-path bans. Both decide the
+    // verdict, so both are guarded.
+    productionDirs: asRepoPaths([...requiredScanDirs, ...structuralScanDirs]),
+    productionFiles: asRepoPaths([
+      ...requiredProductionOnlyFiles,
+      benchmarkEvalProbeSourcePath,
+    ]),
+    // Corpus the bans are derived from. All three eval roots, not just the task
+    // manifests: a marker deleted from any of them lowers the ban set.
+    corpusDirs: asRepoPaths(evalCorpusRoots),
+    corpusFiles: asRepoPaths([
+      ...benchmarkIdentityScriptFiles,
+      ...benchmarkPromptScriptFiles.map(({ filePath }) => filePath),
+      benchmarkEvalProbeManifestPath,
+    ]),
+    // The non-Rust product/release surfaces this lint also scans. Omitting them
+    // is how a corpus dependency lands in a skill, a rule file or a workflow
+    // with the gate that rejects it never firing.
+    protectedNonRustDirs: asRepoPaths(protectedNonRustDirs),
+    protectedNonRustFiles: asRepoPaths([
+      ...requiredProtectedNonRustFiles,
+      ...corpusHarnessNonRustFiles,
+    ]),
     lintFiles: [
       "scripts/lint-retrieval-generalization.mjs",
       "scripts/cross-repo-sourcetrail-queries.mjs",
       asRepoPath(pendingSurfacePath),
     ],
-  }));
+  };
+
+  // The dump is only worth reading if it is complete, and "complete" cannot be
+  // a list someone remembered to extend. Every file this run actually opened is
+  // checked against the dump before it is written, so a scan root added to the
+  // lint without being declared here fails the dump instead of quietly shrinking
+  // what CI is told to watch. This is what makes the trigger contract in
+  // `retrieval_generalization_guard.rs` bind: the trigger covers the dump, and
+  // the dump provably covers the scan.
+  const guarded = Object.values(document).flat();
+  const covers = (candidate) =>
+    guarded.some((entry) => candidate === entry || candidate.startsWith(`${entry}/`));
+  const undeclared = [...new Set(scannedFiles.map(asRepoPath))]
+    .filter((candidate) => !covers(candidate))
+    .sort();
+  if (undeclared.length > 0) {
+    console.error(
+      "lint-retrieval-generalization: these scanned paths are not declared as guarded, so a CI trigger built from this dump would not fire on them:",
+    );
+    for (const candidate of undeclared) {
+      console.error(`  ${candidate}`);
+    }
+    process.exit(2);
+  }
+
+  writeFileSync(dumpGuardedPathsPath, JSON.stringify(document));
   process.exit(0);
 }
 
@@ -475,6 +524,12 @@ const residualBannedLiterals = [
   },
 ];
 
+// The only bans that carry their own boundaries, and therefore the only ones an
+// identifier can hide a corpus name inside. Named once here so the scan can give
+// them the segmented view of a line without guessing which patterns need it.
+const benchmarkIdentityPatternList = benchmarkIdentityDerivedPatterns();
+const identityBoundedPatterns = new Set(benchmarkIdentityPatternList);
+
 // Corpora overlap by design, so the same marker arrives from several of them;
 // one pattern per marker keeps the report readable.
 const bannedPatterns = [...new Set([
@@ -484,7 +539,7 @@ const bannedPatterns = [...new Set([
   ...benchmarkEvalProbeDerivedPatterns(),
   ...benchmarkScriptPromptDerivedPatterns(),
   ...benchmarkQueryCatalogDerivedPatterns(),
-  ...benchmarkIdentityDerivedPatterns(),
+  ...benchmarkIdentityPatternList,
 ])];
 
 const bannedLiteralPatterns = [
@@ -578,6 +633,54 @@ function benchmarkIdentityDerivedPatterns() {
   return [...benchmarkCorpusMarkerSet.identity]
     .sort()
     .map((token) => `(?:^|[^A-Za-z0-9])${escapeRegExp(token)}(?![A-Za-z0-9])`);
+}
+
+// `_` is not the only separator a programmer writes. An identifier is a run of
+// words whatever glues them together, and every language in this tree spells the
+// same steering site several ways: `sourcetrail_index`, `SourcetrailIndex`,
+// `useSourcetrail`, `SOURCETRAIL_BOOST`, `sourcetrail2`. The identity bans above
+// are anchored on alphanumeric boundaries, so only the spellings that happen to
+// use a punctuation separator trip them; the rest walk straight past a ban that
+// is nominally in force. Teaching each ban about letter case is not possible
+// while the scan compiles them case-insensitively, so instead the scan gets a
+// second view of every line with the invisible boundaries made visible, and the
+// unchanged bans then apply to `SwrIndexBoost` exactly as they apply to
+// `swr_index_boost`.
+//
+// Only boundaries a reader can actually see are inserted, which is the same
+// floor the bans already stand on: `tokio` is not `okio`, `answerswrongly` is
+// not `swr`, and `plugin` is not `gin`. An unbroken lowercase run carries no
+// boundary and neither does an unbroken uppercase one, so `sourcetrailindex` and
+// `SOURCETRAILINDEX` stay unsegmented and stay unbanned - deliberately, because
+// segmenting them means banning the substring, which is what the boundaries were
+// introduced to stop.
+function segmentIdentifierWords(text) {
+  return text
+    // `useSwr`, `rank2Swr` - a lowercase letter or digit followed by a capital
+    // is the camelCase/PascalCase word break.
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    // `SWRIndex` - an acronym run ends where the next capitalised word starts.
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    // `swr2` / `v2swr` - a letter/digit transition is a word break in every
+    // naming convention this repository uses.
+    .replace(/([A-Za-z])([0-9])/g, "$1 $2")
+    .replace(/([0-9])([A-Za-z])/g, "$1 $2");
+}
+
+// The hits two views of the same file found, keyed by pattern. Both views report
+// a hit as `path:line:sourceLine`, so a line that trips a ban in both views is
+// one hit and the pending inventory's exact counts stay exact.
+function mergeHitsByPattern(primary, secondary) {
+  if (secondary.size === 0) {
+    return primary;
+  }
+  const merged = new Map(primary);
+  for (const [pattern, hits] of secondary) {
+    const existing = merged.get(pattern) ?? [];
+    const seen = new Set(existing);
+    merged.set(pattern, [...existing, ...hits.filter((hit) => !seen.has(hit))]);
+  }
+  return merged;
 }
 
 // Split string literals rejoin into the same marker, so the compact scan needs
@@ -2130,7 +2233,7 @@ function allowedReferenceUseMatches(prepared, use, startLine, endLine) {
     && matches[0].endLine === endLine;
 }
 
-function scanProductionFile(prepared, patterns, combinedRe) {
+function scanProductionFile(prepared, patterns, combinedRe, segmentIdentifiers = false) {
   const lines = prepared.logicalLines ?? prepared.lines.map((text, index) => ({
     text,
     startLine: index + 1,
@@ -2139,7 +2242,12 @@ function scanProductionFile(prepared, patterns, combinedRe) {
   const sourceLines = prepared.sourceLines ?? prepared.lines;
   const hitsByPattern = new Map();
   for (const line of lines) {
-    const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike);
+    const separatorNormalized = normalizeNativeSeparators(line.text, line.shellLike);
+    // Segmenting after separator normalisation, not before, so a shell-quoted
+    // `"boost""Swr"` is one run by the time its word breaks are read.
+    const normalizedLine = segmentIdentifiers
+      ? segmentIdentifierWords(separatorNormalized)
+      : separatorNormalized;
     if (!combinedRe.test(normalizedLine)) {
       continue;
     }
@@ -2611,6 +2719,38 @@ if (scanFiles.size === 0) {
   process.exit(2);
 }
 
+const structuralFiles = new Set();
+for (const root of structuralScanDirs) {
+  for (const filePath of walkRustProductionFiles(root)) structuralFiles.add(filePath);
+}
+
+const protectedNonRustScanFiles = new Set();
+for (const root of nonRustScanRoots) {
+  for (const filePath of walkProtectedNonRustFiles(root)) {
+    protectedNonRustScanFiles.add(filePath);
+  }
+}
+if (usesDefaultNonRustScanRoots) {
+  for (const filePath of requiredProtectedNonRustFiles) {
+    protectedNonRustScanFiles.add(filePath);
+  }
+}
+if (protectedNonRustScanFiles.size === 0) {
+  console.error("lint-retrieval-generalization: no protected non-Rust files found");
+  process.exit(2);
+}
+
+// Every file this run will open is now known, so the guarded-path dump can be
+// checked against it rather than trusted. Emitted before any scanning so the
+// query stays a query.
+if (dumpGuardedPathsPath) {
+  writeGuardedPathDump(
+    usesDefaultScanRoots && usesDefaultNonRustScanRoots
+      ? [...scanFiles, ...structuralFiles, ...protectedNonRustScanFiles]
+      : [],
+  );
+}
+
 const bannedRegexPatterns = bannedPatterns.map((pattern) => ({
   pattern,
   re: new RegExp(pattern, "i"),
@@ -2623,14 +2763,29 @@ const bannedLiteralRegexPatterns = bannedLiteralPatterns.map((pattern) => ({
   pattern,
   re: new RegExp(pattern, "i"),
 }));
+// The boundary-carrying bans get a second pass over the same lines with
+// identifier word breaks made explicit. They keep their own combined prefilter:
+// the segmented view is a different string, so the unsegmented prefilter would
+// skip exactly the lines this pass exists to read.
+const identityRegexPatterns = bannedRegexPatterns.filter(({ pattern }) =>
+  identityBoundedPatterns.has(pattern)
+);
+const identityCombinedRegex = new RegExp(
+  identityRegexPatterns.map(({ pattern }) => `(?:${pattern})`).join("|"),
+  "i",
+);
 
 for (const filePath of [...scanFiles].sort()) {
   const prepared = prepareProductionFile(filePath);
   if (!isEvalOnlyProductionFile(filePath)) {
-    const productionHits = scanProductionFile(
-      prepared,
-      bannedRegexPatterns,
-      bannedCombinedRegex,
+    const productionHits = mergeHitsByPattern(
+      scanProductionFile(prepared, bannedRegexPatterns, bannedCombinedRegex),
+      scanProductionFile(
+        prepared,
+        identityRegexPatterns,
+        identityCombinedRegex,
+        true,
+      ),
     );
     for (const { pattern } of bannedRegexPatterns) {
       const hits = productionHits.get(pattern) ?? [];
@@ -2686,10 +2841,6 @@ const corpusCombinedRegex = new RegExp(
   corpusRegexPatterns.map(({ pattern }) => `(?:${pattern})`).join("|"),
   "i",
 );
-const structuralFiles = new Set();
-for (const root of structuralScanDirs) {
-  for (const filePath of walkRustProductionFiles(root)) structuralFiles.add(filePath);
-}
 for (const filePath of [...structuralFiles].sort()) {
   if (isEvalOnlyProductionFile(filePath)) continue;
   const prepared = prepareProductionFile(filePath);
@@ -2708,22 +2859,6 @@ for (const filePath of [...structuralFiles].sort()) {
       failed = true;
     }
   }
-}
-
-const protectedNonRustScanFiles = new Set();
-for (const root of nonRustScanRoots) {
-  for (const filePath of walkProtectedNonRustFiles(root)) {
-    protectedNonRustScanFiles.add(filePath);
-  }
-}
-if (usesDefaultNonRustScanRoots) {
-  for (const filePath of requiredProtectedNonRustFiles) {
-    protectedNonRustScanFiles.add(filePath);
-  }
-}
-if (protectedNonRustScanFiles.size === 0) {
-  console.error("lint-retrieval-generalization: no protected non-Rust files found");
-  process.exit(2);
 }
 
 for (const filePath of [...protectedNonRustScanFiles].sort()) {

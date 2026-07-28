@@ -2,10 +2,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 static LINT_SCRIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Serialises the lint subprocesses. The lock guards no shared state -- only the
+/// cost of running many `node` processes at once -- so a test that panics while
+/// holding it has corrupted nothing. Recovering from the poison rather than
+/// propagating it keeps one real failure reported as one failure: without this,
+/// the first genuine assertion turns every later test into a `PoisonError`
+/// panic, and the failure list says nothing about how much is actually broken.
+fn lint_script_lock() -> MutexGuard<'static, ()> {
+    LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn production_source(contents: &str) -> &str {
     match contents.find("#[cfg(test)]") {
@@ -70,10 +83,7 @@ fn lint_script(repo_root: &Path) -> PathBuf {
 }
 
 fn run_lint_with_scan_root(repo_root: &Path, script: &Path, scan_root: &Path) -> Output {
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     Command::new("node")
         .arg(script)
         .current_dir(repo_root)
@@ -112,10 +122,7 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
     .expect("write neutral Rust fixture");
     std::fs::write(&prompt_script, contents).expect("write prompt script fixture");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -147,10 +154,7 @@ fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
         std::fs::write(file_path, contents).expect("write non-Rust fixture");
     }
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -172,10 +176,7 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -870,10 +871,7 @@ fn run_lint_with_fixture_and_task_root(contents: &str, task_root: Option<&Path>)
     let fixture_root = TempDir::new().expect("create fixture root");
     std::fs::write(fixture_root.path().join("fixture.rs"), contents).expect("write fixture");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     let mut command = Command::new("node");
     command.arg(&script).current_dir(&repo_root).env(
         "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
@@ -961,10 +959,7 @@ fn derived_patterns_with_extra_task(manifest: &str) -> Vec<String> {
     std::fs::write(scan_root.join("probe.rs"), "pub fn probe() {}\n").expect("write probe fixture");
     let dump_path = probe_root.path().join("patterns.json");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -1047,10 +1042,7 @@ fn run_lint_with_extra_crate_names(extra_crate_names: &[&str]) -> Output {
     )
     .expect("write neutral fixture");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -1117,10 +1109,7 @@ fn lint_guarded_paths() -> Vec<String> {
     let dump_root = TempDir::new().expect("create guarded-path dump root");
     let dump_path = dump_root.path().join("guarded.json");
 
-    let _guard = LINT_SCRIPT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock lint script subprocess");
+    let _guard = lint_script_lock();
     let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -1138,23 +1127,42 @@ fn lint_guarded_paths() -> Vec<String> {
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&dump_path).expect("read guarded paths"))
             .expect("parse guarded paths");
-    let mut guarded = Vec::new();
-    for group in [
+    // Every group the dump carries, read from the document rather than from a
+    // list written down here. A hand-picked subset is how the last version of
+    // this test passed while the lint guarded 221 non-Rust files that no trigger
+    // covered: the test could not see the roots it was not told to look at.
+    let groups = doc
+        .as_object()
+        .expect("guarded-path dump is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for required in [
         "productionDirs",
         "productionFiles",
         "corpusDirs",
+        "corpusFiles",
+        "protectedNonRustDirs",
+        "protectedNonRustFiles",
         "lintFiles",
     ] {
+        assert!(
+            groups.iter().any(|group| group == required),
+            "guarded-path dump dropped the {required} surface, got {groups:?}"
+        );
+    }
+    let mut guarded = Vec::new();
+    for group in &groups {
         for entry in doc
             .get(group)
             .and_then(|value| value.as_array())
-            .unwrap_or_else(|| panic!("guarded-path dump carries {group}"))
+            .unwrap_or_else(|| panic!("guarded-path group {group} is not an array"))
         {
             guarded.push(entry.as_str().expect("guarded path is a string").to_owned());
         }
     }
     assert!(
-        guarded.len() >= 8,
+        guarded.len() >= 40,
         "the lint should report every surface it reads, got {guarded:?}"
     );
     guarded
@@ -1433,6 +1441,66 @@ const CORPUS_NAMES_RULED_OUT_OF_THE_BAN: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every shape an identifier gives a corpus name it carries as one of its
+/// words. `_` is only the most obvious glue. The same steering site is spelled
+/// `sourcetrail_index`, `SourcetrailIndex`, `useSourcetrail`,
+/// `SOURCETRAIL_BOOST` or `sourcetrail2` depending on the item kind, and a ban
+/// anchored on alphanumeric boundaries survives only the spellings whose glue
+/// happens to be punctuation -- every other spelling walks past a ban that is
+/// nominally in force.
+///
+/// Tests generate over this list instead of naming examples. Twice now a repair
+/// on this lint closed the inputs it was shown (`_` adjacency, then PascalCase
+/// concatenation) and left the rest of the same class open; a shape closed here
+/// is closed for every token, and a shape someone reopens is reported for every
+/// token at once.
+fn identifier_word_shapes(token: &str) -> Vec<(&'static str, String)> {
+    let lower = token.to_ascii_lowercase();
+    let upper = token.to_ascii_uppercase();
+    let mut characters = lower.chars();
+    let capital = match characters.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), characters.as_str()),
+        None => String::new(),
+    };
+    vec![
+        // Punctuation glue: what the boundary already understood.
+        ("separator_prefix", format!("boost_{lower}_paths")),
+        ("separator_suffix", format!("{lower}_command_boost")),
+        ("screaming_separator", format!("{upper}_PATH_BOOST")),
+        // Case glue: a word break every reader sees and no `[^A-Za-z0-9]`
+        // boundary can.
+        ("pascal_type", format!("{capital}Ranker")),
+        ("pascal_lead", format!("{capital}IndexBoost")),
+        ("pascal_middle", format!("BoostFor{capital}Index")),
+        ("camel_tail", format!("boostFor{capital}")),
+        ("camel_tail_acronym", format!("boostFor{upper}")),
+        ("acronym_then_word", format!("{upper}Index")),
+        // Digit glue: the other invisible break.
+        ("digit_suffix", format!("{lower}2")),
+        ("digit_prefix", format!("rank2{capital}")),
+    ]
+}
+
+/// True when `name` can be spelled as Rust identifier text at all. Hyphenated
+/// slugs (`chinook-database`) and dotted file names (`axios.js`) can only be
+/// planted as literals, so the identifier shapes do not apply to them.
+fn is_identifier_text(name: &str) -> bool {
+    name.chars().all(|c| c.is_ascii_alphanumeric())
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+}
+
+/// A shape planted the way a steering site would actually be written: as the
+/// declaration its casing implies, and as a table literal, because steering is
+/// as often a string in a scoring table as it is a symbol.
+fn shape_fixture_source(index: usize, text: &str) -> String {
+    let declaration = if text.starts_with(|c: char| c.is_ascii_uppercase()) {
+        format!("pub struct {text};\n")
+    } else {
+        format!("pub fn {text}() -> f32 {{ 1.0 }}\n")
+    };
+    format!("pub const PLANTED_{index}: &str = \"{text}\";\n{declaration}")
+}
+
 #[test]
 fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
     let ruled_out: std::collections::BTreeMap<&str, &str> =
@@ -1443,52 +1511,39 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
         "expected the corpus to name many repositories, found {names:?}"
     );
 
-    // Each name is planted four ways. The bare literal is the easy shape -- it
-    // is already delimited by its own quotes, so a boundary that treats `_` as
-    // part of the identifier still reports it. The other three are the shapes a
-    // re-introduced steering site actually takes in Rust, where `_` is the word
-    // separator: `sourcetrail_index`, `index_sourcetrail`,
-    // `redis_command_boost`, `AXIOS_PATH_BOOST`. A ban that only survives the
-    // first shape is lost in practice, and only planting the evading shapes can
-    // say so.
+    // The bare literal is the easy shape -- it is already delimited by its own
+    // quotes, so any boundary at all reports it. Every other shape comes from
+    // `identifier_word_shapes`, which enumerates the ways an identifier can
+    // carry the name as one of its words rather than listing the ones someone
+    // happened to think of. A ban that only survives the literal is lost in
+    // practice, and only planting the evading shapes can say so.
     let mut fixtures = Vec::new();
     let mut planted: Vec<(String, String)> = Vec::new();
+    let mut shapes_of_name: Vec<Vec<(String, &str)>> = Vec::new();
     for (index, name) in names.iter().enumerate() {
-        let mut shapes = vec![
-            (
-                format!("repo_name_{index}.rs"),
-                format!("pub const PLANTED: &str = \"{name} cache key\";\n"),
-                format!("{name} cache key"),
-            ),
-            (
-                format!("repo_glue_{index}.rs"),
-                format!("pub const PLANTED: &str = \"boost_{name}_paths\";\n"),
-                format!("boost_{name}_paths"),
-            ),
-        ];
-        // The identifier shapes need a name that is legal identifier text; the
-        // hyphenated slugs (`chinook-database`) can only be planted as literals.
-        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && name.starts_with(|c: char| c.is_ascii_alphabetic())
-        {
-            shapes.push((
-                format!("repo_fn_{index}.rs"),
-                format!(
-                    "pub fn {}_command_boost(path: &str) -> f32 {{ 1.0 }}\n",
-                    name.to_lowercase()
-                ),
-                format!("{}_command_boost", name.to_lowercase()),
-            ));
-            shapes.push((
-                format!("repo_const_{index}.rs"),
-                format!("pub const {}_PATH_BOOST: f32 = 1.5;\n", name.to_uppercase()),
-                format!("{}_PATH_BOOST", name.to_uppercase()),
-            ));
+        let mut shapes = vec![(
+            format!("repo_literal_{index}.rs"),
+            format!("pub const PLANTED: &str = \"{name} cache key\";\n"),
+            format!("{name} cache key"),
+            "bare_literal",
+        )];
+        if is_identifier_text(name) {
+            for (shape, text) in identifier_word_shapes(name) {
+                shapes.push((
+                    format!("repo_{shape}_{index}.rs"),
+                    shape_fixture_source(index, &text),
+                    text,
+                    shape,
+                ));
+            }
         }
-        for (file_name, contents, text) in shapes {
+        let mut per_name = Vec::new();
+        for (file_name, contents, text, shape) in shapes {
             fixtures.push((file_name.clone(), contents));
-            planted.push((file_name, text));
+            planted.push((file_name.clone(), text));
+            per_name.push((file_name, shape));
         }
+        shapes_of_name.push(per_name);
     }
     let borrowed: Vec<(&str, &str)> = fixtures
         .iter()
@@ -1506,17 +1561,16 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
     let mut stale_rulings = Vec::new();
     for (index, name) in names.iter().enumerate() {
         let is_ruled_out = ruled_out.contains_key(name.as_str());
-        for prefix in ["repo_name", "repo_glue", "repo_fn", "repo_const"] {
-            let fixture = format!("{prefix}_{index}.rs");
+        for (fixture, shape) in &shapes_of_name[index] {
             let Some(text) = planted_by_file.get(fixture.as_str()) else {
                 continue;
             };
             // The ban has to be about the name we planted, not about some other
             // corpus marker that happened to match the same fixture.
-            let reported = ban_fired_for(&reported_patterns, &fixture, text);
+            let reported = ban_fired_for(&reported_patterns, fixture, text);
             match (reported, is_ruled_out) {
-                (false, false) => unbanned.push(format!("{name} ({fixture})")),
-                (true, true) => stale_rulings.push(format!("{name} ({fixture})")),
+                (false, false) => unbanned.push(format!("{name} as {shape} ({text})")),
+                (true, true) => stale_rulings.push(format!("{name} as {shape} ({text})")),
                 _ => {}
             }
         }
@@ -1819,62 +1873,44 @@ fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
 }
 
 #[test]
-fn linter_still_reports_its_bans_when_a_separator_is_glued_to_them() {
+fn linter_still_reports_its_bans_in_every_identifier_word_shape() {
     // The floor above plants each ban alone inside `"..."`, so the quotes
-    // already delimit it and a boundary that counts `_` as identifier text
-    // still reports it. That is not the shape a re-introduced steering site
-    // takes: Rust spells its steering `sourcetrail_index`, `axios_adapter`,
-    // `redis_command_boost`, `AXIOS_PATH_BOOST`. Planting the same floor glued
-    // to `_` is the only way the floor can tell "still banned" from "banned
-    // only in the shape nobody writes".
-    let glued: Vec<&&str> = PRE_DERIVATION_BAN_FLOOR
+    // already delimit it and any boundary at all reports it. That is not the
+    // shape a re-introduced steering site takes. Rust spells the same site
+    // `sourcetrail_index`, `SourcetrailIndex`, `useSourcetrail`,
+    // `SOURCETRAIL_BOOST` and `sourcetrail2`, and a ban that survives only the
+    // punctuation-glued spellings is lost in practice. Planting the whole floor
+    // in every shape `identifier_word_shapes` enumerates is the only way the
+    // floor can tell "still banned" from "banned only in the shape nobody
+    // writes" -- and generating the shapes rather than listing them is what
+    // stops the next repair from closing one spelling and leaving its siblings.
+    let tokens: Vec<&&str> = PRE_DERIVATION_BAN_FLOOR
         .iter()
-        .filter(|planted| {
-            planted.chars().all(|c| c.is_ascii_alphanumeric())
-                && planted.starts_with(|c: char| c.is_ascii_alphabetic())
-        })
+        .filter(|planted| is_identifier_text(planted))
         .collect();
     assert!(
-        glued.len() > 30,
+        tokens.len() > 30,
         "the floor should have many single-token bans to glue, found {}",
-        glued.len()
+        tokens.len()
     );
 
     let mut fixtures = Vec::new();
-    let mut planted_by_file: std::collections::BTreeMap<String, String> =
+    let mut planted_by_file: std::collections::BTreeMap<String, (String, &str, &str)> =
         std::collections::BTreeMap::new();
-    for (index, planted) in glued.iter().enumerate() {
-        for (shape, file_name, contents, text) in [
-            (
-                "literal",
-                format!("glued-lit-{index}.rs"),
-                format!("pub const PLANTED: &str = \"boost_{planted}_paths\";\n"),
-                format!("boost_{planted}_paths"),
-            ),
-            (
-                "function",
-                format!("glued-fn-{index}.rs"),
-                format!(
-                    "pub fn {}_command_boost(path: &str) -> f32 {{ 1.0 }}\n",
-                    planted.to_lowercase()
-                ),
-                format!("{}_command_boost", planted.to_lowercase()),
-            ),
-            (
-                "constant",
-                format!("glued-const-{index}.rs"),
-                format!(
-                    "pub const {}_PATH_BOOST: f32 = 1.5;\n",
-                    planted.to_uppercase()
-                ),
-                format!("{}_PATH_BOOST", planted.to_uppercase()),
-            ),
-        ] {
-            let _ = shape;
-            fixtures.push((file_name.clone(), contents));
-            planted_by_file.insert(file_name, text);
+    let mut index = 0usize;
+    for token in &tokens {
+        for (shape, text) in identifier_word_shapes(token) {
+            let file_name = format!("shape-{index}.rs");
+            fixtures.push((file_name.clone(), shape_fixture_source(index, &text)));
+            planted_by_file.insert(file_name, (text, shape, token));
+            index += 1;
         }
     }
+    assert!(
+        fixtures.len() > 300,
+        "every floor token should be planted in every shape, got {} fixtures",
+        fixtures.len()
+    );
     let borrowed: Vec<(&str, &str)> = fixtures
         .iter()
         .map(|(name, contents)| (name.as_str(), contents.as_str()))
@@ -1883,19 +1919,102 @@ fn linter_still_reports_its_bans_when_a_separator_is_glued_to_them() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "the glued ban floor must fail lint, stderr={stderr}"
+        "the identifier-shape ban floor must fail lint, stderr={stderr}"
     );
 
     let reported = reported_patterns_by_fixture(&stderr);
     let mut lost = Vec::new();
-    for (file_name, text) in &planted_by_file {
+    for (file_name, (text, shape, token)) in &planted_by_file {
         if !ban_fired_for(&reported, file_name, text) {
-            lost.push(text.clone());
+            lost.push(format!("{token} as {shape} ({text})"));
         }
     }
     assert!(
         lost.is_empty(),
-        "these bans are lost the moment a separator touches them, which is how a \
+        "these bans are lost the moment an identifier glues a word to them, which is how a \
          steering site would actually spell them: {lost:?}"
+    );
+}
+
+#[test]
+fn linter_does_not_ban_a_corpus_name_that_is_only_a_substring_of_one_word() {
+    // The other half of the class, and the reason the boundaries exist at all.
+    // Making word breaks visible must not turn into substring matching: `tokio`
+    // is not `okio`, `answerswrongly` is not `swr`, `plugin` is not `gin`.
+    //
+    // An unbroken run of one case carries no boundary a reader can see, so it
+    // stays unsegmented and stays unbanned -- deliberately, and this test is
+    // where that floor is written down. It is generated over the same corpus
+    // names the ban test uses, so widening the ban to a new shape has to face
+    // both halves of the space at once.
+    let names = corpus_repository_names();
+    let identifier_names: Vec<&String> = names
+        .iter()
+        .filter(|name| is_identifier_text(name))
+        .collect();
+    assert!(
+        identifier_names.len() > 10,
+        "expected many identifier-shaped corpus names, found {identifier_names:?}"
+    );
+
+    let mut fixtures = Vec::new();
+    for (index, name) in identifier_names.iter().enumerate() {
+        let lower = name.to_ascii_lowercase();
+        let upper = name.to_ascii_uppercase();
+        // `zz` padding, not a real prefix: the point is an unbroken run, and a
+        // meaningful prefix would risk colliding with some other corpus marker
+        // and testing the wrong thing.
+        fixtures.push((
+            format!("substring-lower-{index}.rs"),
+            format!("pub const INSIDE_ONE_WORD: &str = \"zz{lower}zz\";\n"),
+        ));
+        fixtures.push((
+            format!("substring-upper-{index}.rs"),
+            format!("pub const INSIDE_ONE_WORD: &str = \"ZZ{upper}ZZ\";\n"),
+        ));
+    }
+    // The real-world cases the boundary was introduced for, kept alongside the
+    // generated ones because these are the words that actually appear in this
+    // tree and a regression here breaks the build rather than a fixture.
+    for (index, word) in [
+        "tokio",
+        "Tokio",
+        "TokioRuntime",
+        "useTokio",
+        "answerswrongly",
+        "AnswersWrongly",
+        "plugin",
+        "PluginHost",
+        "pluginHost",
+        "PLUGIN_HOST",
+        "login",
+        "LoginHandler",
+        "origin",
+        "OriginBoost",
+        "ORIGIN_BOOST",
+        "invite",
+        "InviteToken",
+        "demux",
+        "DemuxState",
+    ]
+    .iter()
+    .enumerate()
+    {
+        fixtures.push((
+            format!("vocabulary-{index}.rs"),
+            format!("pub const PRODUCT_WORD: &str = \"{word}\";\n"),
+        ));
+    }
+
+    let borrowed: Vec<(&str, &str)> = fixtures
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let output = run_lint_with_named_fixtures(&borrowed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a corpus name buried inside one unbroken word must not be banned; the boundaries exist \
+         so that ordinary product vocabulary keeps compiling, stderr={stderr}"
     );
 }
