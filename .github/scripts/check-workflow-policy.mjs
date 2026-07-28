@@ -5,6 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LineCounter, parseDocument } from "yaml";
 import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
+import {
+  LOST_RUNNER_ANNOTATION,
+  MAXIMUM_RUN_ATTEMPTS,
+} from "./lost-runner-recovery.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
@@ -1745,7 +1749,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
   ]);
-  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
+  requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
+    "node .github/scripts/check-workflow-policy.mjs",
+    // The recovery contract decides whether a lost host may withhold a claim, so the release's own
+    // policy gate must execute its tests before any proof runs.
+    "node --test .github/scripts/lost-runner-recovery.test.mjs",
+  ]);
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
@@ -1944,10 +1953,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
+  // The producer map is the trust boundary between a real proof and a non-claim, so the closeout
+  // collects the lost-runner evidence itself instead of inheriting the non-claim producer's verdict.
   requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
     "producer-map",
     "--phase pre_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const preDownload = namedStep(preCloseout, "Download selected pre-publish release cells");
   add(
@@ -1982,10 +1995,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const publish = requireJob(violations, releaseFile, release, "publish");
   add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
+  // The published platform table is a claim about this release, so it is rendered from the accepted
+  // ledger. Rendering it from the static graph is how a release whose accelerator proof was
+  // withheld still announced that accelerator as supported.
+  requireStepUses(
+    violations,
+    releaseFile,
+    publish,
+    "Download the accepted pre-publish closeout",
+    "actions/download-artifact@v8.0.1",
+  );
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
     "node scripts/codestory-release-claims.mjs release-platform-notes",
+    "--ledger target/release-closeout/pre_publish/ledger.json",
+  ]);
+  // The ledger the README tells readers to consult has to be reachable from the release itself.
+  requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
+    "target/release-closeout/pre_publish/summary.json",
+    '"$(jq -r .decision "$summary")" = accept',
+    "target/release-assets/release-closeout-summary.json",
   ]);
   requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
     'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
@@ -2097,6 +2127,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "producer-map",
     "--phase post_publish",
     "artifact_ids",
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "--job-evidence target/release-closeout/job-evidence.json",
   ]);
   const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
   add(
@@ -4468,12 +4500,214 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-linux-x64-attempt-${{ github.run_attempt }}",
     "linux-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-linux-x64-attempt-${{ github.run_attempt }}",
     "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
+    // The withheld-claim producer is the one job allowed to write a cell it did not prove, and it
+    // owns exactly one attempt-qualified artifact per protected host and closeout phase.
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "release.yml/accelerator-non-claim/release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
   ];
   add(
     violations,
     JSON.stringify(actual.sort()) === JSON.stringify(expected.sort()),
     "release-cell Actions artifact names must have one graph-owned producer job and attempt suffix",
   );
+}
+
+const JOB_EVIDENCE_COLLECTOR = ".github/scripts/collect-actions-job-evidence.sh";
+
+/// `checks: read` is the token scope that makes the lost-runner signature readable at all.
+///
+/// The signature's first part is a job annotation, and GET /repos/{o}/{r}/check-runs/{id}/annotations
+/// is gated on that scope. A workflow that runs the collector without it gets a 403, which the
+/// collector now refuses rather than reporting as "no annotations" -- so the missing scope stops a
+/// release instead of quietly making recovery impossible. This rule catches it before the release,
+/// in every workflow that reaches the collector, including the reusable-workflow callers whose own
+/// grant is the ceiling for everything they call.
+export function annotationScopeViolations(workflows) {
+  const violations = [];
+  const grantsChecksRead = permissions => object(permissions).checks === "read";
+  const collectorWorkflows = new Set();
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const runsCollector = list(object(job).steps)
+        .some(step => String(object(step).run ?? "").includes(JOB_EVIDENCE_COLLECTOR));
+      if (!runsCollector) continue;
+      collectorWorkflows.add(file);
+      // A job-level `permissions:` block replaces the workflow-level one outright, so the effective
+      // grant is whichever of the two the job actually has.
+      const effective = object(job).permissions !== undefined
+        ? object(job).permissions
+        : object(workflow).permissions;
+      add(
+        violations,
+        grantsChecksRead(effective),
+        `${file} job ${jobId} reads Actions job annotations and must grant checks: read`,
+      );
+    }
+  }
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, job] of Object.entries(object(workflow.jobs))) {
+      const uses = String(object(job).uses ?? "");
+      if (!uses.startsWith("./.github/workflows/")) continue;
+      if (!collectorWorkflows.has(uses.slice(uses.lastIndexOf("/") + 1))) continue;
+      add(
+        violations,
+        grantsChecksRead(object(job).permissions),
+        `${file} job ${jobId} calls a workflow that reads job annotations and must pass checks: read`,
+      );
+    }
+  }
+  add(
+    violations,
+    collectorWorkflows.size > 0,
+    `no workflow runs ${JOB_EVIDENCE_COLLECTOR}, so the lost-runner signature is never collected`,
+  );
+  return violations;
+}
+
+/// The two halves of the lost-runner contract: a bounded automatic re-dispatch, and a withheld
+/// claim once that bound is spent.
+///
+/// Both are places where a gate is being relaxed, so the policy pins the shapes that keep the
+/// relaxation honest: the rerun names individual lost jobs instead of asking Actions to rerun every
+/// failure, the recovery never waits on a human, and the withheld-claim producer decides from the
+/// shared classifier rather than from "the proof job went red".
+export function lostRunnerRecoveryViolations(workflows, graph) {
+  const violations = [];
+  const policy = graph.non_claim_policy;
+  const rerunFile = "lost-runner-rerun.yml";
+  const rerun = workflows.get(rerunFile);
+  add(
+    violations,
+    MAXIMUM_RUN_ATTEMPTS === policy.maximum_run_attempts,
+    `${rerunFile} recovery bound must equal the release claim graph maximum_run_attempts`,
+  );
+  add(
+    violations,
+    LOST_RUNNER_ANNOTATION === policy.annotation,
+    `${rerunFile} recovery contract must key on the annotation the release claim graph records`,
+  );
+  if (!rerun) {
+    violations.push(`${rerunFile} must exist`);
+  } else {
+    const trigger = object(at(rerun, "on", "workflow_run"));
+    add(
+      violations,
+      includesAll(trigger.workflows, ["Auto Release", "Release"])
+        && includesAll(trigger.types, ["completed"]),
+      `${rerunFile} must observe completed release runs`,
+    );
+    add(
+      violations,
+      JSON.stringify(Object.entries(object(rerun.permissions)).sort())
+        === JSON.stringify([["actions", "write"], ["checks", "read"], ["contents", "read"]]),
+      `${rerunFile} must hold only the Actions write and annotation read scopes its recovery needs`,
+    );
+    const job = requireJob(violations, rerunFile, rerun, "rerun-lost-jobs");
+    // The repository requires machine recovery: an environment on this job would put a human click
+    // between a dropped connection and the retry, which is the failure this workflow exists to fix.
+    add(
+      violations,
+      object(job).environment === undefined,
+      `${rerunFile} recovery must not wait on an approval environment`,
+    );
+    add(
+      violations,
+      String(object(job).if ?? "").includes("github.event.workflow_run.conclusion == 'failure'"),
+      `${rerunFile} must act only on a failed release run`,
+    );
+    requireStepRun(violations, rerunFile, job, "Collect Actions failure evidence", [
+      "bash .github/scripts/collect-actions-job-evidence.sh",
+    ]);
+    requireStepRun(violations, rerunFile, job, "Plan the bounded rerun", [
+      "node .github/scripts/lost-runner-recovery.mjs plan-rerun",
+    ]);
+    const dispatch = namedStep(job, "Re-dispatch only the lost jobs");
+    add(
+      violations,
+      dispatch?.if === "steps.plan.outputs.rerun == 'true'",
+      `${rerunFile} re-dispatch must be gated on the classified recovery plan`,
+    );
+    requireStepRun(violations, rerunFile, job, "Re-dispatch only the lost jobs", [
+      "actions/jobs/$job_id/rerun",
+    ]);
+    // Re-running every failed job would sweep an assertion failure back into the queue alongside
+    // the lost one; the plan names ids, so the API call must be the per-job endpoint.
+    add(
+      violations,
+      !scalarStrings(rerun).some(value => value.includes("rerun-failed-jobs")),
+      `${rerunFile} must re-dispatch named lost jobs, never every failed job`,
+    );
+  }
+
+  const releaseFile = "release.yml";
+  const release = workflows.get(releaseFile);
+  if (!release) return violations;
+  const job = requireJob(violations, releaseFile, release, "accelerator-non-claim");
+  add(
+    violations,
+    sameMembers(needs(job), graph.workflow_policy.release_chain.dependencies["accelerator-non-claim"]),
+    `${releaseFile} non-claim dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    job.name === policy.producer_job_name,
+    `${releaseFile} non-claim job name must equal the release claim graph producer_job_name`,
+  );
+  add(
+    violations,
+    object(job).environment === undefined,
+    `${releaseFile} non-claim producer must not wait on an approval environment`,
+  );
+  add(
+    violations,
+    String(object(job).if ?? "").startsWith("always()"),
+    `${releaseFile} non-claim producer must observe every accelerator outcome`,
+  );
+  requireStepRun(violations, releaseFile, job, "Collect protected accelerator job evidence", [
+    "bash .github/scripts/collect-actions-job-evidence.sh",
+    "non_claim_policy.hosts",
+  ]);
+  requireStepRun(violations, releaseFile, job, "Decide withheld accelerator hosts", [
+    "node .github/scripts/lost-runner-recovery.mjs plan-non-claim",
+  ]);
+  const record = namedStep(job, "Record populated accelerator non-claims");
+  add(
+    violations,
+    record?.if === "steps.non-claim.outputs.withheld_hosts != ''",
+    `${releaseFile} non-claim cells must be written only for hosts the classifier withheld`,
+  );
+  requireStepRun(violations, releaseFile, job, "Record populated accelerator non-claims", [
+    "scripts/codestory-release-cell-manifest.mjs withhold",
+    '--producer-run-attempt "$GITHUB_RUN_ATTEMPT"',
+  ]);
+  // A non-claim producer that emitted evidence for a host that reported would overwrite a real
+  // proof, so every upload is bound to the classifier's own withheld list. Each closeout phase gets
+  // its own container: a phase authorizes every manifest inside the container it downloads, so a
+  // container mixing phases would carry a manifest that phase's producer map never selected.
+  for (const host of policy.hosts) {
+    for (const [phase, artifact] of Object.entries(host.producer_artifacts)) {
+      const prefix = artifact.replace("-attempt-{attempt}", "");
+      const upload = [...list(job.steps)].find(step =>
+        String(object(object(step).with).name ?? "").startsWith(prefix));
+      add(
+        violations,
+        upload?.if === `contains(steps.non-claim.outputs.withheld_hosts, '${host.id}')`
+          && String(object(object(upload).with).path ?? "").endsWith(`/${host.id}/${phase}`),
+        `${releaseFile} withheld ${host.id} ${phase} cells must upload only that phase for a withheld host`,
+      );
+    }
+  }
+  const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  add(
+    violations,
+    String(object(closeout).if ?? "").includes("needs.accelerator-non-claim.result == 'success'"),
+    `${releaseFile} pre-publish closeout must require a decided non-claim outcome`,
+  );
+  return violations;
 }
 
 function validateReleaseArtifactRerunSafety(workflows, violations) {
@@ -5060,6 +5294,8 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validateRemainingWorkflows(workflows, violations);
   validateReleaseCellUploadOwnership(workflows, violations);
   validateReleaseArtifactRerunSafety(workflows, violations);
+  violations.push(...annotationScopeViolations(workflows));
+  violations.push(...lostRunnerRecoveryViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }
