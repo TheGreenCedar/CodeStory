@@ -19,6 +19,7 @@ use super::super::protocol::{
     run_raw_protocol_exchange_with_input, validated_hello, write_protocol_frame,
 };
 use super::ANTI_IDLE_PROTOCOL_DEADLINE_MS;
+use super::owner_exit::{observe_owner_exit, wait_for_owner_exit};
 use super::queue::{QueueOperation, run_queue_operation};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
@@ -376,21 +377,13 @@ pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
     let timeout = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
         .saturating_add(OWNER_ABSENCE_GRACE);
     let wait_started = clock.now_ns();
-    loop {
-        match client.observe()? {
-            None => break,
-            Some(snapshot)
-                if snapshot.process.server_instance_id != idle_owner.process.server_instance_id =>
-            {
-                bail!("embedding_qualification_owner_changed_before_absence")
-            }
-            Some(_) => {}
-        }
-        if elapsed(clock, wait_started) >= timeout {
-            bail!("embedding_qualification_owner_exit_timeout");
-        }
-        clock.sleep(POLL);
-    }
+    wait_for_owner_exit(
+        clock,
+        wait_started,
+        timeout,
+        &idle_owner.process.server_instance_id,
+        || observe_owner_exit(&client),
+    )?;
     let span = finish_span(clock, start)?;
     Ok(measurement(span, idle_owner))
 }

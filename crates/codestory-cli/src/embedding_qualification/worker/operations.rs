@@ -2,6 +2,7 @@ mod absence;
 mod activation;
 mod dead_client;
 mod measure;
+mod owner_exit;
 mod queue;
 
 pub(super) use absence::wait_for_owner_absence;
