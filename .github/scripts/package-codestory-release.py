@@ -755,7 +755,7 @@ def native_marker(
         f"backends={backends}|llama_cpp_crate=0.1.151|"
         "llama_cpp_commit=test-commit|"
         f"model_sha256={'a' * 64}|embedding_contract_sha256={embedding_contract_sha256}|"
-        f"model_embedded={model_embedded}|producer=codestory-llama-sys@0.0.0|end"
+        f"model_embedded={model_embedded}|producer=codestory-llama-sys@1.2.3|end"
     )
 
 
@@ -1035,7 +1035,19 @@ def run_self_test() -> None:
                 "tokenizer_sha256": "b" * 64,
                 "config_sha256": "c" * 64,
             },
-            "producer": {"name": "codestory-llama-sys", "version": "0.0.0"},
+            # The version and the embedding revision are deliberately different:
+            # the binary embeds the revision, so a packager that compared the
+            # version would fail here. They were equal in every real release
+            # until 0.16.2, which is why that comparison shipped unnoticed.
+            # The revision is deliberately not the version: the binary embeds
+            # the revision, so a packager comparing the version fails here. The
+            # two were equal in every release until 0.16.2, which is why that
+            # comparison shipped unnoticed.
+            "producer": {
+                "name": "codestory-llama-sys",
+                "version": "0.0.0",
+                "embedding_revision": "1.2.3",
+            },
         }
         model_contract_path = repo_root / "crates/codestory-llama-sys/model-contract.json"
         model_contract_path.parent.mkdir(parents=True, exist_ok=True)
