@@ -1,7 +1,8 @@
 use crate::config::{SidecarProfile, SidecarRuntimeConfig};
 use crate::generation::{
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
-    manifest_staleness_reason_for_runtime, manifest_unavailable_reason_for_runtime,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, incomplete_incremental_run_reason,
+    manifest_has_current_sidecar_contract, manifest_staleness_reason_for_runtime,
+    manifest_unavailable_reason_for_runtime,
 };
 use crate::health::{
     RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health_for_runtime,
@@ -269,11 +270,11 @@ fn strict_readiness_unavailable_reason_for_runtime(
     runtime: &SidecarRuntimeConfig,
     producer_compatibility_identity: &str,
 ) -> Result<Option<String>> {
-    if storage
-        .has_incomplete_incremental_run()
-        .context("inspect incomplete incremental index marker")?
-    {
-        return Ok(Some("incomplete_incremental_index_run".into()));
+    // Shared with the `&Store`-only projection in `codestory-runtime` through
+    // `storage_admission_refusal_reason_for_runtime`, so agent-facing readiness
+    // cannot promise hybrid retrieval this marker already refuses.
+    if let Some(reason) = incomplete_incremental_run_reason(storage) {
+        return Ok(Some(reason));
     }
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Ok(None);
