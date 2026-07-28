@@ -2022,74 +2022,26 @@ fn published_full_retrieval_manifest(project_root: &Path) -> RetrievalIndexManif
 /// manifest row is therefore a publication the sidecar would *not* serve, so
 /// it cannot stand in for a healthy project when asserting that readiness
 /// reports hybrid.
+///
+/// The seeding itself lives in `search_publication` so this fixture and the
+/// one consumer crates reach through
+/// `publish_admissible_retrieval_manifest_for_test` stage the same store; a
+/// second private copy here is how the CLI's doctor fixture silently fell
+/// behind this crate's in the first place.
 fn publish_admissible_full_retrieval_manifest(
     storage: &mut Storage,
     project_root: &Path,
 ) -> RetrievalIndexManifest {
-    let mut manifest = published_full_retrieval_manifest(project_root);
-    manifest.dense_reason_counts_json =
-        Some(serde_json::json!({ DenseAnchorReason::PublicApi.as_str(): 2 }).to_string());
-    let symbol_doc_count = manifest.symbol_doc_count.expect("fixture symbol doc count");
-    let dense_count = manifest
-        .dense_projection_count
-        .expect("fixture dense projection count");
-    let nodes = (1..=symbol_doc_count)
-        .map(|id| Node {
-            id: CoreNodeId(id),
-            kind: NodeKind::FUNCTION,
-            serialized_name: format!("admissible_{id:02}"),
-            ..Default::default()
-        })
-        .collect::<Vec<_>>();
-    let symbol_docs = (1..=symbol_doc_count)
-        .map(|id| SymbolSearchDoc {
-            node_id: CoreNodeId(id),
-            file_node_id: None,
-            kind: NodeKind::FUNCTION,
-            display_name: format!("admissible_{id:02}"),
-            qualified_name: None,
-            file_path: None,
-            start_line: None,
-            doc_text: format!("admissible_{id:02}"),
-            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-            doc_hash: format!("admissible-doc-{id:02}"),
-            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
-            updated_at_epoch_ms: 1,
-        })
-        .collect::<Vec<_>>();
-    let dense_inputs = (1..=dense_count)
-        .map(|id| DenseAnchorInput {
-            node_id: CoreNodeId(id),
-            file_node_id: None,
-            kind: NodeKind::FUNCTION,
-            display_name: format!("admissible_{id:02}"),
-            qualified_name: None,
-            file_path: None,
-            start_line: None,
-            end_line: None,
-            file_role: codestory_store::FileRole::Source,
-            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
-            text: format!("admissible_{id:02}"),
-            document_hash: format!("admissible-anchor-{id:02}"),
-            selection_reason: DenseAnchorReason::PublicApi.as_str().to_string(),
-            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-            source_identity: format!("core:admissible_{id:02}"),
-            updated_at_epoch_ms: 1,
-        })
-        .collect::<Vec<_>>();
-    storage
-        .insert_nodes_batch(&nodes)
-        .expect("seed admissible publication nodes");
-    storage
-        .upsert_symbol_search_docs_batch(&symbol_docs)
-        .expect("seed admissible publication symbol docs");
-    storage
-        .upsert_dense_anchor_inputs_batch(&dense_inputs)
-        .expect("seed admissible publication dense anchors");
-    storage
-        .upsert_retrieval_index_manifest(&manifest)
-        .expect("publish retrieval manifest");
+    let manifest = published_full_retrieval_manifest(project_root);
+    let manifest =
+        crate::search_publication::publish_admissible_retrieval_manifest(storage, &manifest)
+            .expect("publish admissible retrieval manifest");
+    assert_eq!(
+        manifest.dense_reason_counts_json.as_deref(),
+        Some(serde_json::json!({ DenseAnchorReason::PublicApi.as_str(): 2 }).to_string())
+            .as_deref(),
+        "the shared fixture must publish the histogram of the anchors it seeds"
+    );
     manifest
 }
 

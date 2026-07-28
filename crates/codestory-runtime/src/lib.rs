@@ -134,27 +134,77 @@ use semantic_projection::edge_digest_for_node;
 #[doc(hidden)]
 pub use semantic_projection::stored_semantic_embeddings_for_test;
 
-/// Test-support: publish a retrieval manifest fixture into the store at
-/// `storage_path`. Consumer crates (for example the CLI, whose architecture
-/// contract forbids direct `codestory_store` access) use this to stage
-/// manifest-published stores for readiness regression tests.
+/// Test-support: publish a *servable* retrieval manifest fixture into the
+/// store at `storage_path`. Consumer crates (for example the CLI, whose
+/// architecture contract forbids direct `codestory_store` access) use this to
+/// stage manifest-published stores for readiness regression tests.
+///
+/// This seeds the symbol docs and dense anchors the manifest's own counts
+/// describe, not just the manifest row, because readiness derives freshness
+/// from the same storage recount sidecar admission uses. A manifest-only
+/// fixture stages a publication admission refuses, so it cannot stand in for a
+/// healthy project — see [`search_publication::publish_admissible_retrieval_manifest`].
+/// The returned manifest is the one actually published; its
+/// `dense_reason_counts_json` matches the seeded anchors.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
-pub fn publish_retrieval_manifest_for_test(
+pub fn publish_admissible_retrieval_manifest_for_test(
     storage_path: &Path,
     manifest: &codestory_retrieval::RetrievalIndexManifest,
+) -> Result<codestory_retrieval::RetrievalIndexManifest, ApiError> {
+    let mut storage = open_storage_for_manifest_fixture(storage_path)?;
+    search_publication::publish_admissible_retrieval_manifest(&mut storage, manifest)
+}
+
+/// Test-support: leave behind the store shape a *core-only refresh* produces —
+/// an indexed file newer than the published sidecar, with the manifest and its
+/// aggregates untouched. Sidecar admission refuses that publication with
+/// `indexed_file_newer_than_retrieval_manifest`, so readiness must not promise
+/// hybrid retrieval over it.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn stage_core_only_refresh_for_test(
+    storage_path: &Path,
+    project_root: &Path,
+    file_modification_time_epoch_ms: i64,
 ) -> Result<(), ApiError> {
-    let mut storage = Storage::open(storage_path).map_err(|error| {
+    let mut storage = open_storage_for_manifest_fixture(storage_path)?;
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 900_001,
+            path: project_root.join("core_only_refresh.rs"),
+            language: "rust".to_string(),
+            modification_time: file_modification_time_epoch_ms,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: StoreFileRole::Source,
+        }])
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to seed core-only refresh file: {error}"))
+        })?;
+    Ok(())
+}
+
+/// Test-support: leave behind the marker an *interrupted incremental run*
+/// leaves. Manifest, aggregates, and mtimes all still agree; admission still
+/// refuses with `incomplete_incremental_index_run`, so readiness must too.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn stage_incomplete_incremental_run_for_test(storage_path: &Path) -> Result<(), ApiError> {
+    let storage = open_storage_for_manifest_fixture(storage_path)?;
+    storage.begin_incremental_run().map_err(|error| {
+        ApiError::internal(format!("Failed to mark incremental run in flight: {error}"))
+    })
+}
+
+#[cfg(feature = "test-support")]
+fn open_storage_for_manifest_fixture(storage_path: &Path) -> Result<Storage, ApiError> {
+    Storage::open(storage_path).map_err(|error| {
         ApiError::internal(format!(
             "Failed to open storage for manifest fixture: {error}"
         ))
-    })?;
-    storage
-        .upsert_retrieval_index_manifest(manifest)
-        .map_err(|error| {
-            ApiError::internal(format!("Failed to publish manifest fixture: {error}"))
-        })?;
-    Ok(())
+    })
 }
 
 /// Test-support: run the production manifest-derived retrieval readiness
