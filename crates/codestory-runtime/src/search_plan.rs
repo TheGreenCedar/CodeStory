@@ -25,7 +25,8 @@ use crate::search_scoring::{
 use crate::search_terms::{
     SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS, SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER,
     SEARCH_PLAN_MAX_SEED_ANCHORS, SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT,
-    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER, search_plan_terms,
+    SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER,
+    SEARCH_PLAN_STOPWORDS, search_plan_terms,
 };
 
 fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
@@ -58,14 +59,20 @@ pub(super) fn search_plan_eligible(
 ) -> bool {
     let broad_query = looks_like_repo_text_query(query) || query.split_whitespace().count() >= 4;
     let has_seed_anchors = query.contains(SEARCH_PLAN_SEED_ANCHOR_MARKER);
-    let broad_explanation_prompt =
-        search_plan_broad_explanation_prompt_with_architecture_terms(query);
     !intents.is_empty()
         && broad_query
-        && (exact_symbol_hit_count == 0 || has_seed_anchors || broad_explanation_prompt)
+        && (exact_symbol_hit_count == 0
+            || has_seed_anchors
+            || search_plan_prose_flow_prompt(query))
 }
 
-pub(super) fn search_plan_broad_explanation_prompt_with_architecture_terms(query: &str) -> bool {
+/// A flow question that names no identifier of its own: every exact symbol hit
+/// it produced came from a word the asker used as prose, so exact-first ranking
+/// answers a question nobody asked. Asking whether the question names an
+/// identifier is a property of the question; the alternative is a table of
+/// architecture nouns, and such a table can only recognise the repositories it
+/// was written against.
+pub(super) fn search_plan_prose_flow_prompt(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
     let asks_for_flow = lower.contains("explain how")
         || lower.contains("trace how")
@@ -74,34 +81,21 @@ pub(super) fn search_plan_broad_explanation_prompt_with_architecture_terms(query
     if !asks_for_flow {
         return false;
     }
-    let tokens = lower
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect::<HashSet<_>>();
-    [
-        "cli",
-        "command",
-        "runtime",
-        "workspace",
-        "indexer",
-        "indexing",
-        "store",
-        "storage",
-        "persistence",
-        "snapshot",
-        "search",
-        "trail",
-        "snippet",
-        "configuration",
-        "source",
-        "activation",
-        "host",
-        "execution",
-    ]
-    .iter()
-    .filter(|term| tokens.contains(**term))
-    .count()
-        >= 3
+    if query.split_whitespace().any(query_word_names_identifier) {
+        return false;
+    }
+    search_plan_terms(query).extracted.len() >= 3
+}
+
+fn query_word_names_identifier(word: &str) -> bool {
+    let trimmed =
+        word.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'));
+    trimmed.contains("::")
+        || trimmed.contains('_')
+        || trimmed
+            .chars()
+            .zip(trimmed.chars().skip(1))
+            .any(|(previous, next)| previous.is_ascii_lowercase() && next.is_ascii_uppercase())
 }
 
 pub(super) fn search_plan_subqueries(
@@ -507,17 +501,20 @@ pub(super) fn repo_text_line_identifiers(hit: &SearchHit) -> Vec<String> {
         .join("\n");
     let mut identifiers = Vec::new();
     let mut seen = HashSet::new();
+    // Every candidate is answered by the repository: callers keep only the ones
+    // that match a symbol indexed in this same file. Pre-filtering to
+    // camel/snake shapes would drop the lowercase single-word names that Go, C,
+    // and Python declare, and the noun list that used to rescue them named the
+    // domains of four repositories instead of any repository's own symbols.
     for token in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         if token.len() < 3 {
             continue;
         }
-        let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
-            || token.contains('_')
-            || matches!(
-                token,
-                "auth" | "feed" | "posts" | "storage" | "indexer" | "service" | "trail" | "snippet"
-            );
-        if looks_symbolic && seen.insert(token.to_ascii_lowercase()) {
+        let lower = token.to_ascii_lowercase();
+        if SEARCH_PLAN_STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower) {
             identifiers.push(token.to_string());
         }
     }

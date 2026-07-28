@@ -220,6 +220,99 @@ fn broad_explain_how_search_plan_survives_generic_exact_hits() {
 }
 
 #[test]
+fn prose_flow_questions_survive_exact_hits_whatever_domain_they_ask_about() {
+    for query in [
+        "Explain how a checkout moves from the storefront into payment capture, ledger posting, and receipt delivery.",
+        "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.",
+        "Explain how a lab sample moves from intake through the assay queue into reported results.",
+    ] {
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !intents.is_empty(),
+            "explain-how question should have architecture intent: `{query}`"
+        );
+        assert!(
+            search_plan_eligible(query, 7, &intents),
+            "a question that names no identifier should keep its plan whatever it asks about: `{query}`"
+        );
+    }
+}
+
+#[test]
+fn questions_that_name_an_identifier_stay_exact_first() {
+    for query in [
+        "Explain how run_index moves work through the runtime.",
+        "Explain how RuntimeContext::ensure_open_from_summary opens a stored snapshot.",
+        "Explain how WorkspaceIndexer moves files into the store.",
+    ] {
+        let intents = architecture_query_intents(query)
+            .into_iter()
+            .map(|intent| intent.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !intents.is_empty(),
+            "explain-how question should have architecture intent: `{query}`"
+        );
+        assert!(
+            !search_plan_eligible(query, 2, &intents),
+            "the asker named this symbol, so its exact hits answer the question: `{query}`"
+        );
+    }
+}
+
+#[test]
+fn repo_text_identifiers_come_from_the_file_rather_than_a_noun_list() {
+    let temp = tempdir().expect("create temp dir");
+    let source_path = temp.path().join("src").join("queue.go");
+    fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+    fs::write(
+        &source_path,
+        "package queue\n\nfunc dispatch() {}\n\n\n\n// dispatch hands the job to the next worker\n",
+    )
+    .expect("write source");
+    let symbol_hit = search_plan_test_hit(
+        "symbol",
+        "dispatch",
+        &source_path,
+        3,
+        SearchHitOrigin::IndexedSymbol,
+        false,
+    );
+    let repo_hit = search_plan_test_hit(
+        "repo",
+        "src/queue.go:7",
+        &source_path,
+        7,
+        SearchHitOrigin::TextMatch,
+        false,
+    );
+    let query = "how does a job reach the next worker";
+    let terms = search_plan_terms(query);
+
+    let groups = search_plan_anchor_groups(
+        query,
+        &terms,
+        &[],
+        &[repo_hit],
+        &[symbol_hit],
+        &HashMap::new(),
+    );
+
+    assert!(
+        groups.iter().any(|group| {
+            group
+                .chosen_symbol
+                .as_ref()
+                .is_some_and(|hit| hit.display_name == "dispatch")
+        }),
+        "a lowercase symbol named by the file's own text should still bind: {groups:#?}"
+    );
+}
+
+#[test]
 fn search_plan_preserves_seed_anchor_line_exactly() {
     let query = "Explain how a full indexing run moves through the runtime. Seed anchors: run_index, run_index_once, RuntimeContext::ensure_open_from_summary, IndexService::run_indexing_blocking, AppController::run_indexing_blocking_inner, index_incremental, WorkspaceManifest::build_execution_plan, WorkspaceIndexer::run, WorkspaceIndexer::flush_projection_batch";
     let intents = architecture_query_intents(query)
