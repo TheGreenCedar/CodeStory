@@ -799,3 +799,124 @@ test("reuse never lets stale evidence through the checks that do not depend on t
   assert.equal(rejected.decision, "reject");
   assert.ok(rejected.summary.failed_cells.includes("source_behavior"));
 });
+
+test("a reused manifest may declare only the commit the closeout proved bound to this release", () => {
+  // Reading a reused row at the release commit is what the binding buys, and it is the only thing
+  // that ever compared that row's declared commit to anything. So the declared commit has to be
+  // the one the binding proof covered: not an unrelated commit, and not this release's own, which
+  // the reused run could not have produced this artifact at.
+  const declarations = [
+    ["a commit the closeout never saw", "d".repeat(40)],
+    ["the publishing run's own commit", gitIdentity.commit],
+  ];
+  for (const [label, declared] of declarations) {
+    const manifests = manifestsFor("pre_publish");
+    const trusted = trustedProducersFor("pre_publish");
+    reuseSourceBehavior(trusted, manifests);
+    manifests.find(({ cell_id: cellId }) => cellId === "source_behavior")
+      .evidence.identity.commit = declared;
+    const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, reuseVerifier());
+    assert.equal(rejected.decision, "reject", label);
+    assert.ok(rejected.summary.failed_cells.includes("source_behavior"), label);
+    assert.ok(
+      rejected.evaluations.get("source_behavior").value.failures.some((message) =>
+        message.includes("manifest commit is not the reused commit the closeout proved")),
+      `${label}: ${JSON.stringify(rejected.evaluations.get("source_behavior").value.failures)}`,
+    );
+    // Nothing that reads the row as evidence inherits the unproven commit either.
+    assert.ok(
+      rejected.summary.failed_cells.includes("candidate_installed_behavior:linux-x64"),
+      label,
+    );
+    // And the rejected ledger never restates the unproven commit as accepted evidence.
+    assert.equal(
+      rejected.ledger.cells.find(({ id }) => id === "source_behavior").status,
+      "fail",
+      label,
+    );
+  }
+});
+
+test("a reuse block naming the publishing run is not reuse", () => {
+  // A commit is its own ancestor and its own tree, so a reuse block pointing at the run that is
+  // publishing verifies trivially while inheriting nothing. Admitting it as a reuse anchor would
+  // let an ordinary same-run row buy the reused row's standing with a proof about nothing.
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  trusted.producers.find(({ cell_id: cellId }) => cellId === "source_behavior").reused_from = {
+    run_id: trusted.run_id,
+    head_sha: gitIdentity.commit,
+    binding: "source_tree",
+    binding_value: gitIdentity.source_tree,
+  };
+  manifests.find(({ cell_id: cellId }) => cellId === "source_behavior")
+    .evidence.identity.commit = "d".repeat(40);
+  const calls = [];
+  const verify = reuseVerifier();
+  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, (request) => {
+    calls.push(request);
+    return verify(request);
+  });
+  assert.equal(rejected.decision, "reject");
+  assert.ok(rejected.summary.input_errors.some((message) =>
+    message.includes("source_behavior reuses evidence from the publishing run")));
+  // Refused as meaningless rather than proved: there is no earlier run here to inherit from, so
+  // the closeout never asks the binding verifier to bless one.
+  assert.deepEqual(calls, []);
+  // And the row keeps the commit binding it would have had with no reuse block at all.
+  assert.ok(rejected.summary.failed_cells.includes("source_behavior"));
+});
+
+test("native-fingerprint reuse is still refused, and refused for the tree it cannot equate", () => {
+  // release-claims.json declares a second reuse binding -- accelerator_execution under
+  // native_fingerprint -- and this closeout does not yet honour it. Fingerprint reuse exists
+  // precisely because the trees differ, and accelerator_execution requires source_tree, so the
+  // claim evaluator refuses the row after the closeout anchors it. #1552 is about source-proof
+  // reuse; widening the tree identity for accelerator evidence is a separate trust decision.
+  // Pinned here so that gap stays a documented refusal and can never widen unnoticed.
+  const reusedTree = "c".repeat(40);
+  const fingerprint = "f".repeat(64);
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  const acceleratorCells = deriveReleaseCells(graph, "pre_publish")
+    .filter(({ group_id: groupId }) => groupId === "accelerator_execution")
+    .map(({ id }) => id);
+  assert.equal(acceleratorCells.length, 3);
+  for (const cellId of acceleratorCells) {
+    const row = trusted.producers.find(({ cell_id: candidate }) => candidate === cellId);
+    row.producer_run_id = reusedRunId;
+    row.reused_from = {
+      run_id: reusedRunId,
+      head_sha: reusedCommit,
+      binding: "native_fingerprint",
+      binding_value: fingerprint,
+    };
+    row.artifact.workflow_run_id = reusedRunId;
+    row.artifact.head_sha = reusedCommit;
+    row.job.run_id = reusedRunId;
+    row.job.head_sha = reusedCommit;
+    const manifest = manifests.find(({ cell_id: candidate }) => candidate === cellId);
+    manifest.evidence.identity.producer_run_id = reusedRunId;
+    manifest.evidence.identity.commit = reusedCommit;
+    manifest.evidence.identity.source_tree = reusedTree;
+  }
+  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, ({ binding }) => {
+    if (binding !== "native_fingerprint") throw new Error(`unknown reuse binding ${binding}`);
+    return fingerprint;
+  });
+  assert.equal(rejected.decision, "reject");
+  for (const cellId of acceleratorCells) {
+    assert.ok(rejected.summary.failed_cells.includes(cellId), cellId);
+    const failures = rejected.evaluations.get(cellId).value.release_claim_evaluation.failures;
+    assert.ok(
+      failures.some(({ class: failureClass, message }) =>
+        failureClass === "stale_sha" && message.includes("source tree does not match")),
+      `${cellId}: ${JSON.stringify(failures)}`,
+    );
+    // The commit the binding proof covered is admitted; only the tree it cannot equate refuses.
+    assert.ok(
+      !failures.some(({ message }) => message.includes("commit does not match")),
+      `${cellId}: ${JSON.stringify(failures)}`,
+    );
+  }
+});

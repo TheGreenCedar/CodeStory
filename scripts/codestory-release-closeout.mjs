@@ -292,6 +292,14 @@ function producerAnchor({ cell, row, trustedProducers, gitIdentity, bindings, ve
     errors.push(`trusted producer map ${cell.id} reused run identity is invalid`);
     return sameRun;
   }
+  // Reuse inherits what an *earlier* run produced. A block naming the run that is publishing
+  // inherits nothing, and every binding it could name verifies vacuously -- a commit is its own
+  // ancestor and its own tree -- so treating it as reuse would hand an ordinary same-run row the
+  // reused row's freedom from the release commit. There is nothing here to reuse.
+  if (String(reused.run_id) === String(trustedProducers.run_id ?? "")) {
+    errors.push(`trusted producer map ${cell.id} reuses evidence from the publishing run`);
+    return sameRun;
+  }
   if (typeof verify !== "function") {
     errors.push(`trusted producer map ${cell.id} reuses evidence this closeout cannot verify`);
     return sameRun;
@@ -522,7 +530,7 @@ function trustedProducerIndex({
   return { byCell, reusedByCell, errors };
 }
 
-function producerAuthenticationProblems(manifest, trustedProducer) {
+function producerAuthenticationProblems(manifest, trustedProducer, reusedCommit) {
   if (!trustedProducer) return ["manifest producer is absent from the trusted producer map"];
   const identity = manifest.evidence?.identity ?? {};
   const problems = [];
@@ -537,6 +545,13 @@ function producerAuthenticationProblems(manifest, trustedProducer) {
     if (identity[key] !== trustedProducer[key]) {
       problems.push(`manifest ${key} does not match the trusted producer map`);
     }
+  }
+  // A same-run manifest is held to the release commit by the claim evaluator. A reused one is
+  // read at the release commit instead, so that comparison no longer binds it to anything --
+  // this does. The binding proof covers exactly one earlier commit, and it is the only commit
+  // this manifest may declare.
+  if (reusedCommit !== undefined && identity.commit !== reusedCommit) {
+    problems.push("manifest commit is not the reused commit the closeout proved bound to this release");
   }
   return problems;
 }
@@ -665,9 +680,14 @@ function evaluateCell({
   // closeout just re-proved against its own checkout. Reading it at the release commit applies
   // that binding; the row's own source tree is still compared against this release, so a binding
   // that does not equate the trees still fails. The ledger keeps the manifest identity untouched.
+  //
+  // The substitution is granted to exactly the commit the proof covered. A row declaring any
+  // other commit is not the evidence that was proved, so it is read as written and fails the
+  // claim evaluator's commit check -- the same check that binds every same-run row.
   const evidence = evidenceCells.map((dependency) => {
     const row = manifests.get(dependency.id).evidence;
-    if (!reusedByCell.has(dependency.id)) return row;
+    const provedCommit = reusedByCell.get(dependency.id);
+    if (provedCommit === undefined || row.identity?.commit !== provedCommit) return row;
     return { ...row, identity: { ...row.identity, commit: gitIdentity.commit } };
   });
   const requestedClaims = claims.map((claim) => ({
@@ -938,7 +958,11 @@ export function evaluateReleaseCloseout({
     if (rows.length !== 1) continue;
     const manifest = rows[0];
     const problems = manifestProblems({ manifest, cell, graph, graphSha256, version });
-    problems.push(...producerAuthenticationProblems(manifest, trusted.byCell.get(cell.id)));
+    problems.push(...producerAuthenticationProblems(
+      manifest,
+      trusted.byCell.get(cell.id),
+      trusted.reusedByCell.get(cell.id),
+    ));
     problems.push(...artifactBindingProblems(
       manifest,
       bindings.byCell.get(cell.id),

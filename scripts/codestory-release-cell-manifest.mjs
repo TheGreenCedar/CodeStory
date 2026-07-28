@@ -17,8 +17,6 @@ import {
   validateReleaseCellManifest,
 } from "./codestory-release-closeout.mjs";
 
-export { verifyReuseBinding };
-
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
