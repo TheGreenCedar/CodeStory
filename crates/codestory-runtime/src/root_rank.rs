@@ -412,16 +412,27 @@ mod tests {
             ("alpha", "four"),
             ("beta", "five"),
         ]);
-        let ordered = diversify_root_order(items, |_| false, Clone::clone);
-        for smaller in 0..=ordered.len() {
-            for larger in smaller..=ordered.len() {
-                assert_eq!(
-                    ordered[..smaller],
-                    ordered[..larger][..smaller],
-                    "prefix broke between {smaller} and {larger}"
-                );
-            }
+        // Re-diversify per limit and truncate the fresh result. Slicing one
+        // stored Vec would hold for any function, including one that consulted
+        // the limit -- the property under test is that none of them can.
+        let at_limit = |limit: usize| {
+            let mut ordered = diversify_root_order(items.clone(), |_| false, Clone::clone);
+            ordered.truncate(limit);
+            ordered
+        };
+        let full = at_limit(items.len());
+        for smaller in 0..=items.len() {
+            assert_eq!(
+                at_limit(smaller),
+                full[..smaller],
+                "the order changed with the limit at {smaller}"
+            );
         }
+        assert_ne!(
+            full,
+            items,
+            "the fixture must actually be reordered, or the prefix claim is empty"
+        );
     }
 
     #[test]

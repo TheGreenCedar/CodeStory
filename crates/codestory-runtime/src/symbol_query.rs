@@ -60,9 +60,15 @@ pub(crate) struct OrientationHitEvidence {
 /// every new rank field then takes a constant. A field constant across all
 /// candidates contributes `Ordering::Equal` to every comparison, so the induced
 /// order is exactly the order of the tuple without those fields.
+///
+/// Every candidate carries path-tier evidence -- role, subsystem, helper shape,
+/// structural rank -- because those are free from the path. Only the graph walk
+/// is windowed, so a candidate the window did not reach still ranks on its own
+/// structure instead of being pushed below the window by a missing entry.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OrientationEvidence {
     by_node: HashMap<NodeId, OrientationHitEvidence>,
+    graph_evaluated: usize,
 }
 
 impl OrientationEvidence {
@@ -74,8 +80,33 @@ impl OrientationEvidence {
         self.by_node.get(node_id)
     }
 
-    /// True when nothing in the evaluated window carries any call degree, so
-    /// the order below role and structure is not backed by graph evidence.
+    pub(crate) fn contains(&self, node_id: &NodeId) -> bool {
+        self.by_node.contains_key(node_id)
+    }
+
+    /// How many candidates the bounded graph walk actually reached.
+    ///
+    /// Reported as `evaluated_root_candidates`, so the number names measured
+    /// evidence rather than the size of the list the window was drawn from.
+    pub(crate) fn graph_evaluated(&self) -> usize {
+        self.graph_evaluated
+    }
+
+    /// Claim one slot of the bounded graph walk, or refuse when it is spent.
+    pub(crate) fn claim_graph_slot(&mut self, window: usize) -> bool {
+        if self.graph_evaluated >= window {
+            return false;
+        }
+        self.graph_evaluated += 1;
+        true
+    }
+
+    /// True when nothing the graph walk reached carries any call degree, so the
+    /// order below role and structure is not backed by graph evidence.
+    ///
+    /// Scanning the whole map rather than only the walked candidates is exact:
+    /// an unwalked candidate always carries zero degrees, so it can never turn a
+    /// walk that did find evidence into a thin one.
     pub(crate) fn graph_signal_thin(&self) -> bool {
         !self.by_node.is_empty()
             && self

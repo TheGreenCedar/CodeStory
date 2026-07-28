@@ -657,36 +657,149 @@ fn ordering_reduces_to_the_lexical_comparator_when_graph_evidence_is_absent() {
 
 #[test]
 fn smaller_limit_results_are_an_exact_prefix_of_larger_limit_results_for_one_candidate_set() {
-    let hits = vec![
+    let query = "explain how the subsystems connect end to end";
+    let candidates = vec![
         orientation_hit("a", "zqOne", "src/a.ts", SearchHitOrigin::IndexedSymbol),
         orientation_hit("b", "zqOne", "src/b.ts", SearchHitOrigin::IndexedSymbol),
         orientation_hit("c", "zqTwo", "src/b.ts", SearchHitOrigin::IndexedSymbol),
         orientation_hit("d", "zqThree", "src/c.ts", SearchHitOrigin::IndexedSymbol),
     ];
-    let ordered = diversify_root_order(
-        hits,
-        |_| false,
-        |hit| {
-            (
-                hit.file_path.clone().unwrap_or_default(),
-                hit.display_name.clone(),
-            )
-        },
-    );
-    for smaller in 0..=ordered.len() {
-        for larger in smaller..=ordered.len() {
-            let short = ordered[..smaller]
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>();
-            let long = ordered[..larger]
-                .iter()
-                .take(smaller)
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(short, long, "prefix broke between {smaller} and {larger}");
-        }
+    let mut evidence = OrientationEvidence::default();
+    for (index, hit) in candidates.iter().enumerate() {
+        evidence.insert(
+            hit.node_id.clone(),
+            hit_evidence(
+                EntryEvidence::None,
+                false,
+                CallDegrees {
+                    production_in_calls: index as u32,
+                    out_calls: 0,
+                },
+                1,
+                hit.file_path.as_deref().unwrap_or_default(),
+            ),
+        );
     }
+
+    // Re-run the whole ordering pipeline per limit rather than slicing one
+    // result, so a stage that consulted the limit would break the prefix.
+    let run = |limit: usize| {
+        let mut hits = candidates.clone();
+        hits.sort_by(|left, right| {
+            compare_search_hits_with_project_root(None, query, left, right, Some(&evidence))
+        });
+        let mut ordered = diversify_root_order(
+            hits,
+            |_| false,
+            |hit| {
+                (
+                    hit.file_path.clone().unwrap_or_default(),
+                    hit.display_name.clone(),
+                )
+            },
+        );
+        ordered.truncate(limit);
+        ordered
+            .into_iter()
+            .map(|hit| hit.node_id.0)
+            .collect::<Vec<_>>()
+    };
+
+    let full = run(candidates.len());
+    for smaller in 0..=candidates.len() {
+        assert_eq!(
+            run(smaller),
+            full[..smaller],
+            "the order changed with the limit at {smaller}"
+        );
+    }
+}
+
+#[test]
+fn a_candidate_the_graph_window_did_not_reach_still_ranks_on_its_own_structure() {
+    let query = "explain how the subsystems connect end to end";
+    let shallow = orientation_hit(
+        "shallow",
+        "zqAlpha",
+        "src/main.ts",
+        SearchHitOrigin::IndexedSymbol,
+    );
+    let deep = orientation_hit(
+        "deep",
+        "zqBeta",
+        "src/deep/nested/leaf.ts",
+        SearchHitOrigin::IndexedSymbol,
+    );
+    // Neither candidate carries call degrees: the window reached one and simply
+    // did not measure the other. Path-tier evidence is free, so both still carry
+    // a real structural rank, and structure decides.
+    let mut evidence = OrientationEvidence::default();
+    evidence.insert(
+        deep.node_id.clone(),
+        hit_evidence(
+            EntryEvidence::None,
+            false,
+            CallDegrees::default(),
+            2,
+            "ts:src/deep",
+        ),
+    );
+    evidence.insert(
+        shallow.node_id.clone(),
+        hit_evidence(
+            EntryEvidence::None,
+            false,
+            CallDegrees::default(),
+            1,
+            "ts:src",
+        ),
+    );
+
+    let mut hits = vec![deep, shallow];
+    let order = order_by_orientation(query, &mut hits, Some(&evidence));
+    assert_eq!(
+        order.first().map(String::as_str),
+        Some("zqAlpha"),
+        "a shallower source-root candidate should outrank a deep leaf: {order:?}"
+    );
+}
+
+#[test]
+fn orientation_reports_the_candidates_the_graph_walk_reached_not_the_list_it_scanned() {
+    let selected = vec![orientation_hit(
+        "reached",
+        "zqAlpha",
+        "src/main.ts",
+        SearchHitOrigin::IndexedSymbol,
+    )];
+    let mut evidence = OrientationEvidence::default();
+    assert!(evidence.claim_graph_slot(1), "first slot is available");
+    assert!(!evidence.claim_graph_slot(1), "the window is spent");
+    evidence.insert(
+        selected[0].node_id.clone(),
+        hit_evidence(
+            EntryEvidence::TopologicalRoot,
+            false,
+            CallDegrees {
+                production_in_calls: 0,
+                out_calls: 4,
+            },
+            1,
+            "ts:src",
+        ),
+    );
+
+    // Twelve candidates were ordered but only one carries measured graph
+    // evidence; reporting twelve would overstate parser/graph coverage.
+    let report = search_orientation_report(&evidence, 12, &selected);
+    assert_eq!(report.evaluated_root_candidates, 1);
+    assert_eq!(report.total_root_candidates, 12);
+    assert!(
+        report
+            .uncertainty
+            .contains(&GroundingOrientationUncertaintyDto::BoundedCandidateWindow),
+        "an unreached candidate must be reported: {report:#?}"
+    );
 }
 
 #[test]
@@ -844,8 +957,20 @@ fn duplicate_name_diversity_and_non_primary_deprioritization_are_preserved() {
         "vendor hits must stay demoted under orientation ranking: {order:?}"
     );
 
+    // Three candidates share one surface and two of them share a name, so a
+    // diversification that ignored names would leave the duplicate second.
+    let repeated = vec![
+        orientation_hit("dup-1", "zzShared", "src/one.ts", SearchHitOrigin::IndexedSymbol),
+        orientation_hit("dup-2", "zzShared", "src/two.ts", SearchHitOrigin::IndexedSymbol),
+        orientation_hit(
+            "distinct",
+            "zzDistinct",
+            "src/three.ts",
+            SearchHitOrigin::IndexedSymbol,
+        ),
+    ];
     let diversified = diversify_root_order(
-        hits.clone(),
+        repeated,
         |_| false,
         |hit| ("one-surface".to_string(), hit.display_name.clone()),
     );
@@ -854,8 +979,13 @@ fn duplicate_name_diversity_and_non_primary_deprioritization_are_preserved() {
         .map(|hit| hit.display_name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
-        names.iter().collect::<HashSet<_>>().len(),
-        names.len(),
-        "duplicate-name diversity should keep distinct names first: {names:?}"
+        names,
+        vec!["zzShared", "zzDistinct", "zzShared"],
+        "a novel name should precede a repeat of an already-emitted name"
+    );
+    assert_eq!(
+        names.iter().take(2).collect::<HashSet<_>>().len(),
+        2,
+        "the first two slots should carry distinct names: {names:?}"
     );
 }

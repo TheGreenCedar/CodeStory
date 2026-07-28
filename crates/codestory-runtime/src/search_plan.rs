@@ -53,7 +53,10 @@ pub(super) fn search_orientation_report(
     total_root_candidates: usize,
     selected: &[SearchHit],
 ) -> GroundingOrientationDto {
-    let evaluated = total_root_candidates.min(SEARCH_ORIENTATION_WINDOW);
+    // Report the candidates the graph walk actually reached, not the size of the
+    // list it was drawn from: #1338 requires typed orientation that does not
+    // overstate graph coverage.
+    let evaluated = evidence.graph_evaluated().min(total_root_candidates);
     let candidate_entrypoint_roots = evidence.entrypoint_roots_in_map();
     let selected_entrypoint_roots =
         evidence.entrypoint_roots(selected.iter().map(|hit| hit.node_id.clone()));
@@ -140,6 +143,9 @@ impl SearchPlanActivePathEvidence {
 #[derive(Debug, Clone)]
 pub(super) struct SearchPlanBuild {
     plan: SearchPlanDto,
+    /// The shared orientation evidence, built where the plan's own discoveries
+    /// are visible so the caller reuses it rather than paying for it twice.
+    orientation: Option<OrientationEvidence>,
     indexed_symbol_hits: Vec<SearchHit>,
 }
 
@@ -1279,21 +1285,29 @@ impl AppController {
         Ok(evidence)
     }
 
-    /// Build the orientation-regime evidence map once per request.
+    /// Extend the orientation-regime evidence map over further candidates.
     ///
-    /// Bounded to `SEARCH_ORIENTATION_WINDOW` deduped hits, and the resulting
-    /// map is shared by anchor grouping, the final root ordering, the rejected
-    /// hit reasons, and the reported orientation, so no stage repeats the edge
-    /// walk or the file lookup.
-    fn build_orientation_evidence(
+    /// The map is built once per request and shared by anchor grouping, the
+    /// final root ordering, the rejected hit reasons, and the reported
+    /// orientation, so no stage repeats the edge walk or the file lookup. It is
+    /// extended rather than rebuilt because the plan discovers candidates after
+    /// the first pass, and a candidate the map never reached would be ranked by
+    /// the absence of evidence rather than by evidence.
+    ///
+    /// Every candidate gets path-tier evidence; only the store-reading graph
+    /// walk is bounded, to `SEARCH_ORIENTATION_WINDOW` candidates per request.
+    fn extend_orientation_evidence<'a>(
         &self,
         storage: &Storage,
         project_root: Option<&Path>,
-        hits: &[SearchHit],
-    ) -> OrientationEvidence {
-        let mut evidence = OrientationEvidence::default();
+        hits: impl IntoIterator<Item = &'a SearchHit>,
+        evidence: &mut OrientationEvidence,
+    ) {
         let mut file_facts = HashMap::<String, (Option<FileRole>, String)>::new();
-        for hit in hits.iter().take(SEARCH_ORIENTATION_WINDOW) {
+        for hit in hits {
+            if evidence.contains(&hit.node_id) {
+                continue;
+            }
             let path = hit.file_path.as_deref();
             let (role, language) = match path {
                 Some(path) => file_facts
@@ -1321,10 +1335,16 @@ impl AppController {
                 (None, Some(path)) => Some(path.replace('\\', "/")),
                 _ => None,
             };
-            let degrees = self
-                .search_plan_active_path_evidence_for_hit(storage, hit)
-                .map(SearchPlanActivePathEvidence::degrees)
-                .unwrap_or_default();
+            // Beyond the window the degrees stay zero, which reads as unmeasured
+            // rather than as proven-unreferenced: `bounded_candidate_window`
+            // reports the gap and the structural tie-breakers still apply.
+            let degrees = if evidence.claim_graph_slot(SEARCH_ORIENTATION_WINDOW) {
+                self.search_plan_active_path_evidence_for_hit(storage, hit)
+                    .map(SearchPlanActivePathEvidence::degrees)
+                    .unwrap_or_default()
+            } else {
+                CallDegrees::default()
+            };
             let language = if language.trim().is_empty() {
                 "unknown".to_string()
             } else {
@@ -1347,7 +1367,6 @@ impl AppController {
                 },
             );
         }
-        evidence
     }
 
     fn search_plan_active_path_evidence<'a, I>(
@@ -1427,7 +1446,7 @@ impl AppController {
         allow_repo_text: bool,
         hybrid_weights: Option<AgentHybridWeightsDto>,
         hybrid_limits: Option<SearchHybridLimitsDto>,
-        orientation: Option<&OrientationEvidence>,
+        orientation_regime: bool,
     ) -> Result<Option<SearchPlanBuild>, ApiError> {
         let eligible =
             search_plan_eligible(effective_query, query_assessment.exact_symbol_hit_count);
@@ -1458,6 +1477,25 @@ impl AppController {
         merge_search_hits_by_node_id(&mut plan_repo_text_hits, executed.repo_text_hits.clone());
         let mut plan_suggestions = suggestions.to_vec();
         merge_search_hits_by_node_id(&mut plan_suggestions, executed.suggestions.clone());
+        // Build the shared evidence here, where the plan's own discoveries are
+        // already merged in. Building it from the pre-plan window instead would
+        // leave every plan-discovered candidate -- which is where breadth comes
+        // from -- ranked and reported with no evidence at all.
+        let mut orientation_evidence = orientation_regime.then(|| {
+            let project_root = self.require_project_root().ok();
+            let mut evidence = OrientationEvidence::default();
+            self.extend_orientation_evidence(
+                storage,
+                project_root.as_deref(),
+                plan_indexed_hits
+                    .iter()
+                    .chain(plan_suggestions.iter())
+                    .chain(plan_repo_text_hits.iter()),
+                &mut evidence,
+            );
+            evidence
+        });
+        let orientation = orientation_evidence.as_ref();
         let active_path_evidence = self.search_plan_active_path_evidence(
             storage,
             plan_indexed_hits.iter().chain(plan_suggestions.iter()),
@@ -1524,6 +1562,7 @@ impl AppController {
         };
         Ok(Some(SearchPlanBuild {
             plan,
+            orientation: orientation_evidence.take(),
             indexed_symbol_hits: executed.indexed_symbol_hits,
         }))
     }
@@ -1760,12 +1799,10 @@ impl AppController {
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<HashSet<_>>();
-        // Build the shared orientation evidence once, inside the pinned
-        // publication, and only for queries that actually ask about structure.
-        let orientation_evidence = orientation_query(&query).then(|| {
-            self.build_orientation_evidence(&storage, project_root.as_deref(), &indexed_symbol_hits)
-        });
-        let orientation = orientation_evidence.as_ref();
+        // The orientation regime is a property of the query, not of the plan, so
+        // it is decided before the plan and the evidence is built inside it.
+        let orientation_regime = orientation_query(&query);
+        let mut orientation_evidence: Option<OrientationEvidence> = None;
         let mut search_plan_anchor_rank = HashMap::<NodeId, usize>::new();
         let search_plan = if expand_search_plan {
             match self.build_search_plan(
@@ -1783,9 +1820,10 @@ impl AppController {
                 false,
                 hybrid_weights,
                 hybrid_limits,
-                orientation,
+                orientation_regime,
             )? {
                 Some(plan_build) => {
+                    orientation_evidence = plan_build.orientation;
                     for (rank, group) in plan_build.plan.anchor_groups.iter().enumerate() {
                         if let Some(symbol) = &group.chosen_symbol {
                             search_plan_anchor_rank
@@ -1808,6 +1846,20 @@ impl AppController {
         } else {
             None
         };
+        // Cover every candidate that will be ordered, including anchor symbols
+        // promoted out of the repo-text and suggestion channels and every hit
+        // reached when no plan ran. Ordering a candidate the map never saw would
+        // rank it by the absence of evidence rather than by its own structure.
+        if orientation_regime {
+            let evidence = orientation_evidence.get_or_insert_with(OrientationEvidence::default);
+            self.extend_orientation_evidence(
+                &storage,
+                project_root.as_deref(),
+                indexed_symbol_hits.iter(),
+                evidence,
+            );
+        }
+        let orientation = orientation_evidence.as_ref();
         indexed_symbol_hits.sort_by(|left, right| {
             let anchor_order = match (
                 search_plan_anchor_rank.get(&left.node_id),
