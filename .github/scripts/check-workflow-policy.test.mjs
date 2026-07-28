@@ -11,10 +11,13 @@ import {
   MAXIMUM_RUN_ATTEMPTS,
 } from "./lost-runner-recovery.mjs";
 import {
+  absorbedFailureViolations,
   annotationScopeViolations,
   basicWorkflowViolations,
+  dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
+  interpolationSpans,
   loadWorkflows,
   lostRunnerRecoveryViolations,
   macosCliDistributionViolations,
@@ -26,6 +29,7 @@ import {
   releaseWorkflowContractViolations,
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
+  shellDependentBindingViolations,
   validateCargoTestFilters,
   validateWorkflows,
   windowsManifestProofPolicyViolations,
@@ -1057,10 +1061,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     }, /package jobs must checkout only the requested exact SHA/u],
     ["package smoke loses source identity", packagedFile, workflow => {
       const smoke = draftStep(packagedJob(workflow), "Smoke packaged release asset");
-      smoke.run = smoke.run.replace(
-        '--expected-source-sha "${{ steps.source-identity.outputs.sha }}" \\\n',
-        "",
-      );
+      smoke.run = smoke.run.replace('--expected-source-sha "$SOURCE_SHA" \\\n', "");
     }, /step Smoke packaged release asset must run --expected-source-sha/u],
     ["fresh package identity is reported after upload", packagedFile, workflow => {
       moveNamedStepAfter(
@@ -2601,6 +2602,542 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
   }
 });
 
+function firstRunStep(workflow) {
+  for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+    const steps = Array.isArray(job?.steps) ? job.steps : [];
+    for (const [index, step] of steps.entries()) {
+      if (typeof step?.run === "string") return { jobId, index, step };
+    }
+  }
+  return undefined;
+}
+
+const unwrittenWorkflow = "future-dispatch-proof.yml";
+
+function unwrittenDispatchWorkflow(run, job = {}) {
+  return {
+    name: "Future dispatch proof",
+    on: { workflow_dispatch: { inputs: { ref: { required: true, type: "string" } } } },
+    permissions: { contents: "read" },
+    jobs: {
+      leak: {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        ...job,
+        steps: [
+          ...(job.steps ?? []),
+          { name: "Echo the dispatched ref", shell: "bash", ...run },
+        ],
+      },
+    },
+  };
+}
+
+// #1554 fixed marketplace-sync.yml and pinned the fix with `validateMarketplaceSync`, a validator
+// that names one file. That shape cannot fail on a second file however many times the same splice
+// is written, and eight more workflows carried it (#1566). The replacement has to hold a property
+// the per-file validator could not: it reads whatever workflows exist, so it covers files nobody
+// listed -- including files that do not exist yet. Every test below is a claim about the rule's
+// reach, not about any one workflow.
+test("no workflow interpolates a dispatch input into a run: body", async (t) => {
+  await t.test("the repository as it stands has no such splice anywhere", () => {
+    assert.deepEqual(dispatchInputInterpolationViolations(loadWorkflows()), []);
+    assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  });
+
+  // The other direction, on every workflow at once. The loop names no file: it grows with the
+  // directory, so a workflow added tomorrow is mutated by this suite the day it lands.
+  for (const [file, workflow] of loadWorkflows()) {
+    const located = firstRunStep(workflow);
+    if (located === undefined) continue;
+    await t.test(`${file} cannot splice a dispatch input into ${located.step.name ?? "its first script"}`, () => {
+      const workflows = loadWorkflows();
+      const target = firstRunStep(workflows.get(file));
+      target.step.run = `${target.step.run}\necho "\${{ inputs.version }}"\n`;
+      const reported = dispatchInputInterpolationViolations(workflows);
+      assert.equal(reported.length, 1);
+      assert.equal(
+        reported[0].startsWith(`${file} jobs.${target.jobId}.steps.${target.index}`),
+        true,
+        reported[0],
+      );
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /must read \$\{\{ inputs\.version \}\} from step env, not interpolated script text/u,
+      );
+      assert.match(reported[0], /it carries a dispatch input$/u);
+    });
+  }
+
+  // The claim the per-file validator could not make. Nothing here edits the rule, and the file is
+  // not on disk: the rule sees it because it iterates the set it is handed.
+  await t.test("a workflow that does not exist yet is covered without editing the rule", () => {
+    const workflows = loadWorkflows();
+    assert.equal(workflows.has(unwrittenWorkflow), false);
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({
+      run: 'echo "${{ inputs.ref }}"\n',
+    }));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ inputs.ref }} from step env, not interpolated script text:"
+        + " it carries a dispatch input",
+    ]);
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /future-dispatch-proof\.yml jobs\.leak\.steps\.0 \(Echo the dispatched ref\) must read/u,
+    );
+  });
+
+  await t.test("the same unwritten workflow reading that value from env is not a violation", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({
+      env: { INPUT_REF: "${{ inputs.ref }}" },
+      run: 'echo "$INPUT_REF"\n',
+    }));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+  });
+
+  // GitHub serves one dispatched value under several spellings and an expression can bury the
+  // context inside a function call. A rule that only knows `inputs.name` exempts the rest.
+  for (const [name, expression] of [
+    ["the short spelling", "${{ inputs.version }}"],
+    ["the spelling GitHub serves the same value under", "${{ github.event.inputs.version }}"],
+    ["the index spelling", "${{ inputs['version'] }}"],
+    ["a fallback that reaches an input second", "${{ github.ref_name || inputs.version }}"],
+    // Braces inside the expression must not end the match early and hide the rest of it. The first
+    // case carries a single `}`, which the old non-greedy match survived. The rest carry `}}`
+    // sequences -- `{{` and `}}` are GitHub's own documented escapes for a literal brace inside
+    // `format()` -- and those it did not: `${{ format('{{Hello {0}}}', inputs.ref) }}` was cut to
+    // `${{ format('{{Hello {0}}`, which names no context, so the rule reported the file clean while
+    // GitHub spliced the input. Every one of these passed policy and actionlint before the fix.
+    ["a spelling wrapped in a format call carrying a brace", "${{ format('{0}', inputs.version) }}"],
+    ["the documented format brace escape", "${{ format('{{Hello {0}}}', inputs.version) }}"],
+    ["the documented escape around two placeholders",
+      "${{ format('{{Hello {0} {1}}}', inputs.version, github.sha) }}"],
+    ["a brace escape whose literal looks like the terminator", "${{ format('}}{{', inputs.version) }}"],
+    ["JSON carrying a nested object", `\${{ fromJSON('{"a":{"b":1}}').a.b && inputs.version }}`],
+  ]) {
+    await t.test(`${name} is refused`, () => {
+      const workflows = loadWorkflows();
+      workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow({ run: `echo "${expression}"\n` }));
+      assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+        `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+          + ` must read ${expression} from step env, not interpolated script text:`
+          + " it carries a dispatch input",
+      ]);
+      // Reporting is not enough on its own: the span has to be the whole expression. A matcher that
+      // stops early still names `inputs` in some of these and would pass the check above on an
+      // accident rather than on the property being claimed.
+      assert.deepEqual(interpolationSpans(`echo "${expression}"`), [expression]);
+    });
+  }
+
+  // Naming the `inputs` context alone reads the value's *location*, not the value. One hop moves
+  // it somewhere the rule was not looking, and the launder is a legal, actionlint-clean workflow.
+  // Each of these passed both gates before the channels were refused with the context.
+  //
+  // These replace two cases that used to assert `${{ steps.*.outputs.* }}` and
+  // `${{ needs.*.outputs.* }}` are "not a violation". That claim was false, and asserting it meant
+  // a test was holding the hole open: it would have failed anyone who tried to close it.
+  await t.test("a job-level env binding does not launder an input into script text", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+      { run: 'echo "${{ env.LAUNDERED }}"\n' },
+      { env: { LAUNDERED: "${{ inputs.ref }}" } },
+    ));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ env.LAUNDERED }} from step env, not interpolated script text:"
+        + " it carries env",
+    ]);
+    assert.match(validateWorkflows(workflows).join("\n"), /must read \$\{\{ env\.LAUNDERED \}\}/u);
+  });
+
+  // For `workflow_dispatch`, `github.event` is the container the inputs arrive in, so serialising
+  // it carries every dispatched value into script text without the word `inputs` appearing at all.
+  // `toJSON` is not an escape: it preserves `$(` and backticks verbatim.
+  await t.test("serialising the event payload does not launder an input into script text", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+      { run: 'echo "${{ toJSON(github.event) }}"\n' },
+    ));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ toJSON(github.event) }} from step env, not interpolated script text:"
+        + " it carries the event payload",
+    ]);
+    assert.match(validateWorkflows(workflows).join("\n"), /it carries the event payload/u);
+  });
+
+  await t.test("a step output does not launder an input into a later script", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+      { run: 'echo "${{ steps.launder.outputs.ref }}"\n' },
+      {
+        steps: [{
+          name: "Write the dispatched ref to a step output",
+          id: "launder",
+          shell: "bash",
+          env: { INPUT_REF: "${{ inputs.ref }}" },
+          run: 'echo "ref=$INPUT_REF" >> "$GITHUB_OUTPUT"\n',
+        }],
+      },
+    ));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.1 (Echo the dispatched ref)`
+        + " must read ${{ steps.launder.outputs.ref }} from step env, not interpolated script text:"
+        + " it carries a step output",
+    ]);
+  });
+
+  await t.test("a job output does not launder an input into another job's script", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+      { run: 'echo "${{ needs.resolve.outputs.ref }}"\n' },
+    ));
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), [
+      `${unwrittenWorkflow} jobs.leak.steps.0 (Echo the dispatched ref)`
+        + " must read ${{ needs.resolve.outputs.ref }} from step env, not interpolated script text:"
+        + " it carries a job output",
+    ]);
+  });
+
+  // Over-firing would make the rule unusable and force exemptions, which is how the per-file shape
+  // started. These are the expressions a run: body is still allowed to carry, and each remedy above
+  // is one `env:` line -- for `env` itself it is zero, because a workflow- or job-level `env:` entry
+  // is already exported into the shell.
+  for (const [name, run] of [
+    ["a workflow context", 'echo "${{ github.run_attempt }}"\n'],
+    ["a matrix value", 'echo "${{ matrix.asset_target }}"\n'],
+    ["a runner context", 'echo "${{ runner.os }}"\n'],
+    ["a shell variable whose name merely contains the word", 'echo "$RELEASE_INPUTS_PATH"\n'],
+    ["the shell read of a job-level env entry", 'echo "$LAUNDERED"\n'],
+    ["a shell variable that merely spells the env context", 'echo "$env_path/bin"\n'],
+    // `_` is a word character, so `\bevent\b` does not reach inside `github.event_name`. Reading
+    // which trigger fired says nothing about what was dispatched.
+    ["the trigger name, which is not the event payload", 'echo "${{ github.event_name }}"\n'],
+  ]) {
+    await t.test(`${name} is not a violation`, () => {
+      const workflows = loadWorkflows();
+      workflows.set(unwrittenWorkflow, unwrittenDispatchWorkflow(
+        { run },
+        { env: { LAUNDERED: "${{ inputs.ref }}" } },
+      ));
+      assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+    });
+  }
+
+  // #1554 established that a checkout `ref:` is not an executable surface: it is resolved by the
+  // action, not parsed by a shell, and it is pinned separately where it belongs. This rule reads
+  // `run:` only, and that boundary is asserted rather than assumed.
+  await t.test("a dispatch input in an action input is outside this rule's surface", () => {
+    const workflows = loadWorkflows();
+    workflows.set(unwrittenWorkflow, {
+      name: "Future dispatch proof",
+      on: { workflow_dispatch: { inputs: { ref: { required: true, type: "string" } } } },
+      permissions: { contents: "read" },
+      jobs: {
+        leak: {
+          "runs-on": "ubuntu-latest",
+          "timeout-minutes": 10,
+          steps: [{
+            name: "Checkout the dispatched ref",
+            uses: "actions/checkout@v5",
+            with: { ref: "${{ inputs.ref }}" },
+          }],
+        },
+      },
+    });
+    assert.deepEqual(dispatchInputInterpolationViolations(workflows), []);
+  });
+});
+
+// Moving a value out of the script's text and into `env:` moves the read out of GitHub's
+// interpolator and into the shell -- and the shell is not the same everywhere. `${{ env.NAME }}`
+// read identically on every runner; `"$NAME"` is a bash read, and this repository's packaged build
+// matrix includes windows-latest, where the runner default is pwsh and the read is `$env:NAME`.
+// The failure mode is the dangerous one: not an error, but a proof comparing against an empty
+// string. Closing #1566's laundering channels forced these reads into scripts, so the property the
+// rewrite depends on is asserted rather than assumed.
+test("a binding consumed as a shell variable must say which shell it was written for", async (t) => {
+  await t.test("the repository as it stands declares a shell wherever it matters", () => {
+    assert.deepEqual(shellDependentBindingViolations(loadWorkflows()), []);
+  });
+
+  // Every step the #1566 rewrite pointed at a variable, on the one job whose matrix reaches
+  // Windows. Dropping the shell is the whole mutation; the script text is untouched.
+  for (const name of [
+    "Install pinned Rust",
+    "Smoke packaged release asset",
+    "Prove Linux x64 glibc 2.31 baseline",
+    "Report fresh package identity",
+  ]) {
+    await t.test(`${name} cannot leave its shell to the runner`, () => {
+      const workflows = loadWorkflows();
+      delete draftStep(workflows.get("packaged-platform-proof.yml").jobs.build, name).shell;
+      assert.match(
+        shellDependentBindingViolations(workflows).join("\n"),
+        new RegExp(`\\(${name}\\) reads [A-Z_, ]+ as a shell variable`, "u"),
+      );
+      assert.match(validateWorkflows(workflows).join("\n"), /must declare its shell/u);
+    });
+  }
+
+  // The Windows smoke is the counter-case: it consumes the same two bindings and is correct
+  // because it reads them the way its own shell spells them.
+  await t.test("the Windows smoke reads the same bindings the pwsh way", () => {
+    const step = draftStep(loadWorkflows().get("packaged-platform-proof.yml").jobs.build,
+      "Smoke packaged release asset on Windows");
+    assert.equal(step.shell, "pwsh");
+    assert.equal(step.env.SOURCE_SHA, "${{ steps.source-identity.outputs.sha }}");
+    assert.match(step.run, /--expected-source-sha "\$env:SOURCE_SHA"/u);
+    assert.equal(/--expected-source-sha "\$SOURCE_SHA"/u.test(step.run), false);
+  });
+
+  // A job pinned to a non-Windows label needs no declaration: bash is the runner default there,
+  // and requiring one would be noise rather than a property.
+  await t.test("a Linux-only job is not asked to declare a shell it already has", () => {
+    const workflows = loadWorkflows();
+    const job = workflows.get("release.yml").jobs["marketplace-publish"];
+    assert.equal(job["runs-on"], "ubuntu-latest");
+    assert.equal(draftStep(job, "Point the catalog at the published release").shell, undefined);
+    assert.deepEqual(shellDependentBindingViolations(workflows), []);
+  });
+});
+
+// A rule is only as blocking as the step that runs it. `continue-on-error` lives outside the
+// script, so nothing this file's own text asserts can see it, and it converts every `exit 1` the
+// step produces into advice. The commands the policy gate runs were pinned; that the gate FAILS was
+// not, so one key on plugin-static.yml would have silenced this file and its whole suite green.
+//
+// The repository has scripts that deliberately absorb their own failure, so "gates must be
+// blocking" would be false here. What those have and a silenced gate does not is a successor: an
+// `id:`, and a later step that reads `steps.<id>.outcome` and fails on it. That is the property.
+test("a script that absorbs its own failure must hand that failure to something that does not", async (t) => {
+  await t.test("the repository as it stands absorbs no failure into nothing", () => {
+    assert.deepEqual(absorbedFailureViolations(loadWorkflows()), []);
+    assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  });
+
+  // The exact key the reviewer reached for, on the exact step. It silences check-workflow-policy.mjs
+  // AND `node --test check-workflow-policy.test.mjs` at once while the job still reports success.
+  await t.test("the workflow policy gate cannot be made advisory", () => {
+    const workflows = loadWorkflows();
+    draftStep(workflows.get("plugin-static.yml").jobs["plugin-static"], "Check workflow policy")
+      ["continue-on-error"] = true;
+    assert.deepEqual(absorbedFailureViolations(workflows), [
+      "plugin-static.yml jobs.plugin-static.steps.7 (Check workflow policy) absorbs its own"
+        + " failure and must have an id whose outcome a later blocking step requires",
+    ]);
+    assert.match(validateWorkflows(workflows).join("\n"), /Check workflow policy\) absorbs its own failure/u);
+  });
+
+  // The rule names no step and no file: it reads whatever `run:` steps exist, so a gate added
+  // tomorrow is covered the day it lands. Every gate step in the repository is mutated here.
+  for (const [file, workflow] of loadWorkflows()) {
+    for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+      const steps = (Array.isArray(job?.steps) ? job.steps : [])
+        .map((step, index) => ({ step, index }))
+        .filter(({ step }) => typeof step?.run === "string"
+          && step["continue-on-error"] === undefined);
+      if (steps.length === 0) continue;
+      const { step, index } = steps[0];
+      await t.test(`${file} ${jobId} cannot silence ${step.name ?? `step ${index}`}`, () => {
+        const workflows = loadWorkflows();
+        workflows.get(file).jobs[jobId].steps[index]["continue-on-error"] = true;
+        const reported = absorbedFailureViolations(workflows);
+        // Silencing a step that was somebody else's successor reports both -- the step that stopped
+        // failing and the step whose failure it stopped requiring -- so this asserts the mutated
+        // step is named rather than that it is the only one named.
+        assert.equal(
+          reported.some(violation => violation.startsWith(`${file} jobs.${jobId}.steps.${index} `)
+            || violation.startsWith(`${file} jobs.${jobId}.steps.${index} (`)),
+          true,
+          reported.join("\n"),
+        );
+      });
+    }
+  }
+
+  // An `id:` on its own is not a successor. Naming the step is how you make its outcome readable,
+  // not how you make it required, and stopping at the id would let one line reopen the hole.
+  await t.test("naming the silenced step is not enough", () => {
+    const workflows = loadWorkflows();
+    const gate = draftStep(workflows.get("plugin-static.yml").jobs["plugin-static"], "Check workflow policy");
+    gate["continue-on-error"] = true;
+    gate.id = "workflow-policy";
+    assert.match(
+      absorbedFailureViolations(workflows).join("\n"),
+      /must have an id whose outcome a later blocking step requires/u,
+    );
+  });
+
+  // And the shape that is allowed: the failure is absorbed here and required there.
+  await t.test("a successor that requires the outcome makes absorbing it legal", () => {
+    const workflows = loadWorkflows();
+    const job = workflows.get("plugin-static.yml").jobs["plugin-static"];
+    const gate = draftStep(job, "Check workflow policy");
+    gate["continue-on-error"] = true;
+    gate.id = "workflow-policy";
+    job.steps.push({
+      name: "Require the workflow policy gate",
+      shell: "bash",
+      env: { POLICY_OUTCOME: "${{ steps.workflow-policy.outcome }}" },
+      run: 'test "$POLICY_OUTCOME" = success\n',
+    });
+    assert.deepEqual(absorbedFailureViolations(workflows), []);
+  });
+
+  // The precedent this generalises must survive it. The optional cache restores are `uses:` steps
+  // whose miss is the normal path: they carry no outcome for anything to require, and a separate
+  // rule requires them to stay non-blocking. Generalising must not put those two in conflict.
+  for (const [file, jobId, name] of [
+    ["rust-ci.yml", "linux-draft", "Restore Cargo inputs and output"],
+    ["rust-ci.yml", "linux-draft", "Restore compiler objects"],
+    ["source-proof.yml", "full-source-gate", "Restore Cargo dependency inputs"],
+    ["packaged-platform-proof.yml", "build", "Restore Cargo dependency inputs"],
+  ]) {
+    await t.test(`${file} ${name} stays deliberately optional`, () => {
+      const workflows = loadWorkflows();
+      const step = draftStep(workflows.get(file).jobs[jobId], name);
+      assert.equal(step["continue-on-error"], true);
+      assert.equal(step.run, undefined);
+      assert.deepEqual(absorbedFailureViolations(workflows), []);
+      assert.deepEqual(validateWorkflows(workflows), []);
+    });
+  }
+
+  // The two scripts that legitimately absorb their failure, and what happens when the successor
+  // that requires them is taken away. Without this the rule could be satisfied by deleting the
+  // requirement instead of the `continue-on-error`.
+  for (const [file, jobId, absorbing, successor] of [
+    ["source-proof.yml", "full-source-gate", "Compile the complete workspace test suite",
+      "Require successful source compilation"],
+    ["source-proof.yml", "full-source-gate", "Lint every workspace target and feature once",
+      "Require successful source compilation"],
+  ]) {
+    await t.test(`${file} ${absorbing} stops being required when ${successor} drops it`, () => {
+      const workflows = loadWorkflows();
+      const job = workflows.get(file).jobs[jobId];
+      const id = draftStep(job, absorbing).id;
+      const step = draftStep(job, successor);
+      step.env = Object.fromEntries(
+        Object.entries(step.env ?? {}).filter(([, value]) => !String(value).includes(`steps.${id}.outcome`)),
+      );
+      assert.match(
+        absorbedFailureViolations(workflows).join("\n"),
+        new RegExp(`\\(${absorbing}\\) absorbs its own failure`, "u"),
+      );
+    });
+  }
+
+  // A job-level key downgrades every step it contains at once, so no per-step id can answer for it.
+  // Only a downstream job reading `needs.<id>.result` can.
+  await t.test("a job cannot absorb its own failure into nothing either", () => {
+    const workflows = loadWorkflows();
+    workflows.get("plugin-static.yml").jobs["plugin-static"]["continue-on-error"] = true;
+    assert.deepEqual(absorbedFailureViolations(workflows), [
+      "plugin-static.yml jobs.plugin-static absorbs its own failure and must have"
+        + " needs.plugin-static.result required",
+    ]);
+  });
+});
+
+// Routing a dispatched value through `env:` removes it from the script's text -- and from the
+// reach of the fragment pin that used to name it there. `--expected-sha "$INPUT_REF"` reads the
+// same whether `INPUT_REF` carries `inputs.ref` or a commit nobody reviewed, so the pin now has
+// two halves: the script names the variable, and the variable names the value. Both halves are
+// proven here for the trust-anchoring steps -- the release-cell producers, whose `--expected-sha`
+// is the commit every downstream claim is filed against -- and for the mode guards that decide
+// which claims a protected run is allowed to make at all.
+test("env-routed dispatch inputs stay pinned to the value they were reviewed with", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const reviewedRef = "${{ inputs.ref }}";
+  const behaviorOnly = "${{ inputs.server_behavior_only }}";
+  const sites = [
+    ["linux-vulkan-proof.yml", "packaged-vulkan", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly },
+      'test "$SERVER_BEHAVIOR_ONLY" = true', `test "${behaviorOnly}" = true`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly },
+      'if ($env:SERVER_BEHAVIOR_ONLY -ne "true")', `if ("${behaviorOnly}" -ne "true")`],
+    ["macos-metal-proof.yml", "packaged-metal", "Validate candidate-installed mode",
+      { SERVER_BEHAVIOR_ONLY: behaviorOnly, CALIBRATION_MODE: "${{ inputs.calibration_mode }}" },
+      'test "$SERVER_BEHAVIOR_ONLY" = true', `test "${behaviorOnly}" = true`],
+    ["linux-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Linux Vulkan release cells",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Vulkan release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated Windows retrieval-readiness release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["windows-vulkan-proof.yml", "packaged-vulkan", "Emit authenticated candidate-installed Windows release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated Metal release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated macOS retrieval-readiness release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["macos-metal-proof.yml", "packaged-metal", "Emit authenticated candidate-installed macOS release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    ["packaged-platform-proof.yml", "build", "Emit authenticated package release cell",
+      { INPUT_REF: reviewedRef },
+      '--expected-sha "$INPUT_REF"', `--expected-sha "${reviewedRef}"`],
+    // source-proof resolves its own trusted head in an earlier job rather than taking a dispatched
+    // ref, so its anchor is that job's output. Same two halves, different source of truth.
+    ["source-proof.yml", "full-source-gate", "Emit authenticated source release cell",
+      { RESOLVED_REF: "${{ needs.resolve.outputs.ref }}" },
+      '--expected-sha "$RESOLVED_REF"', '--expected-sha "${{ needs.resolve.outputs.ref }}"'],
+  ];
+  for (const [file, jobId, stepName, bindings, needle, splice] of sites) {
+    for (const [key, expected] of Object.entries(bindings)) {
+      await t.test(`${file} ${stepName} refuses a rewired ${key}`, () => {
+        const workflows = loadWorkflows();
+        draftStep(workflows.get(file).jobs[jobId], stepName).env[key] = "${{ github.event.pull_request.head.sha }}";
+        const violations = validateWorkflows(workflows);
+        assert.ok(
+          violations.includes(`${file} step ${stepName} must bind ${key} to ${expected}`),
+          violations.join("\n"),
+        );
+      });
+      await t.test(`${file} ${stepName} refuses a dropped ${key}`, () => {
+        const workflows = loadWorkflows();
+        delete draftStep(workflows.get(file).jobs[jobId], stepName).env[key];
+        assert.ok(
+          validateWorkflows(workflows)
+            .includes(`${file} step ${stepName} must bind ${key} to ${expected}`),
+        );
+      });
+    }
+    await t.test(`${file} ${stepName} refuses the splice it was rewritten away from`, () => {
+      const workflows = loadWorkflows();
+      const step = draftStep(workflows.get(file).jobs[jobId], stepName);
+      assert.equal(step.run.includes(needle), true, `missing pinned fragment ${needle}`);
+      step.run = step.run.replace(needle, splice);
+      const violations = validateWorkflows(workflows);
+      // Both layers must see it: the fragment pin, which knows what this step should read, and
+      // the generic rule, which knows nothing about this step and refuses the shape anyway.
+      assert.ok(
+        violations.includes(`${file} step ${stepName} must run ${needle}`),
+        violations.join("\n"),
+      );
+      if (splice.includes("inputs")) {
+        assert.ok(
+          violations.some(violation =>
+            violation.startsWith(`${file} jobs.${jobId}.steps.`)
+            && violation.includes("from step env, not interpolated script text")),
+          violations.join("\n"),
+        );
+      }
+    });
+  }
+});
+
 // The guard is the layer the workflow relies on before a ref is resolved or a token is minted, so
 // it is proven by running it rather than by reading it. Every refusal below reaches the guard's own
 // `::error::` and exit 1: a bash syntax error would also be non-zero and would prove nothing.
@@ -2761,8 +3298,14 @@ test("the plugin lane publishes the catalog it then smoke-installs", async (t) =
     }, /marketplace token must be a SHA-pinned app token scoped to the marketplace repository/u],
     ["the catalog is pointed at an unbound version", workflow => {
       const step = catalogStep(workflow);
-      step.run = step.run.replace('--version "${{ inputs.version }}"', '--version "$LATEST"');
+      step.run = step.run.replace('--version "$INPUT_VERSION"', '--version "$LATEST"');
     }, /Point the catalog at the published release must run --version/u],
+    // Routing the version through `env:` moves it out of the script's text, so the script's own
+    // fragment can no longer see which value it carries. Rebinding the variable is the same
+    // substitution the mutation above makes, one layer down.
+    ["the catalog's version variable is rebound to another value", workflow => {
+      catalogStep(workflow).env.INPUT_VERSION = "${{ github.ref_name }}";
+    }, /Point the catalog at the published release must bind INPUT_VERSION/u],
     ["catalog publication hides the delivery state it recorded", workflow => {
       delete workflow.jobs["marketplace-publish"].outputs;
     }, /marketplace publication must publish the recorded delivery state/u],
@@ -3344,7 +3887,7 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["deferred smoke records the public catalog installer", workflows => {
       const step = draftStep(smokeJob(workflows), "Emit authenticated post-publish release cells");
       step.run = step.run.replace(
-        '--arg installer "${{ steps.delivery.outputs.installer }}"',
+        '--arg installer "$DELIVERED_INSTALLER"',
         "--arg installer codex_marketplace_install",
       );
     }, /must not hard-code the published installer identity/u],
@@ -3372,10 +3915,16 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["smoke resolves whatever catalog it likes", workflows => {
       const step = draftStep(smokeJob(workflows), "Resolve the published plugin through the marketplace catalog");
       step.run = step.run.replace(
-        '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+        '--marketplace-source "$MARKETPLACE_SOURCE"',
         "--marketplace-source TheGreenCedar/AgentPluginMarketplace",
       );
-    }, /must run --marketplace-source "\$\{\{ steps\.delivery\.outputs\.marketplace_source \}\}"/u],
+    }, /must run --marketplace-source "\$MARKETPLACE_SOURCE"/u],
+    // The other half of the same claim: the variable the command names has to be bound to the
+    // delivery state's own output, or routing it through `env:` would only move the hole.
+    ["smoke rebinds the catalog source away from the delivery state", workflows => {
+      draftStep(smokeJob(workflows), "Resolve the published plugin through the marketplace catalog")
+        .env.MARKETPLACE_SOURCE = "TheGreenCedar/AgentPluginMarketplace";
+    }, /must bind MARKETPLACE_SOURCE to \$\{\{ steps\.delivery\.outputs\.marketplace_source \}\}/u],
     ["smoke fakes the fixture catalog by cloning it", workflows => {
       draftStep(smokeJob(workflows), "Record catalog delivery state").run
         += "\ngit clone https://github.com/TheGreenCedar/AgentPluginMarketplace.git";
@@ -3451,10 +4000,14 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["plugin lane installs from a catalog the delivery state did not resolve", workflows => {
       const step = draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path");
       step.run = step.run.replace(
-        '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
+        '--marketplace-source "$MARKETPLACE_SOURCE"',
         "--marketplace-source TheGreenCedar/AgentPluginMarketplace",
       );
     }, /plugin-release\.yml step Prove the public marketplace install path must run --marketplace-source/u],
+    ["plugin lane rebinds the catalog source away from the delivery state", workflows => {
+      draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path")
+        .env.MARKETPLACE_SOURCE = "TheGreenCedar/AgentPluginMarketplace";
+    }, /plugin-release\.yml step Prove the public marketplace install path must bind MARKETPLACE_SOURCE/u],
     ["plugin lane smoke installs the revision the job failed to publish", workflows => {
       draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path")
         .env.MARKETPLACE_REVISION = "${{ needs.marketplace-publish.outputs.marketplace_revision }}";
