@@ -377,6 +377,126 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   }
 });
 
+// Catalog publication is delivery rather than a release gate, which is only honest if the run
+// records which of the two states it ended in. The graph is where that vocabulary lives, so
+// deleting it, reinstating the gate, or collapsing the two installer identities onto one -- which
+// is exactly how a deferred run would come to read as a published one -- must be refusals here,
+// not merely in the workflow policy that consumes them.
+test("catalog delivery declares two distinguishable states and no release gate", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  assert.equal(delivery.release_gate, false);
+  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published"]);
+  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 2);
+
+  const missing = structuredClone(graph);
+  delete missing.workflow_policy.catalog_delivery;
+  assert.throws(
+    () => validateReleaseClaimGraph(missing),
+    /workflow_policy\.catalog_delivery must be an object/u,
+  );
+
+  const gated = structuredClone(graph);
+  gated.workflow_policy.catalog_delivery.release_gate = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(gated),
+    /release_gate must be false: catalog publication is delivery, not a release gate/u,
+  );
+
+  const collapsed = structuredClone(graph);
+  const [first, second] = collapsed.workflow_policy.catalog_delivery.states;
+  second.installer = first.installer;
+  assert.throws(
+    () => validateReleaseClaimGraph(collapsed),
+    /must record distinct installer identities/u,
+  );
+
+  const renamed = structuredClone(graph);
+  renamed.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").id = "unknown";
+  assert.throws(
+    () => validateReleaseClaimGraph(renamed),
+    /must declare the deferred state/u,
+  );
+
+  const inverted = structuredClone(graph);
+  inverted.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").live_catalog_revision = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(inverted),
+    /deferred state must not consume a live catalog revision/u,
+  );
+
+  const unpublished = structuredClone(graph);
+  unpublished.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "published").live_catalog_revision = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(unpublished),
+    /published state must consume the live catalog revision/u,
+  );
+
+  const detached = structuredClone(graph);
+  detached.workflow_policy.catalog_delivery.publish_job = "no-such-job";
+  assert.throws(
+    () => validateReleaseClaimGraph(detached),
+    /publish_job no-such-job must be a release chain job/u,
+  );
+
+  const unrecoverable = structuredClone(graph);
+  delete unrecoverable.workflow_policy.catalog_delivery.recovery_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(unrecoverable),
+    /workflow_policy\.catalog_delivery\.recovery_workflow/u,
+  );
+});
+
+// Naming the two delivery states buys nothing on its own: the first version of this graph
+// declared both and nothing anywhere read the mark, so a deferred release's closeout verdict was
+// identical in shape to a published one. The graph must therefore also name the cell family whose
+// signed installer identity the closeout resolves the state from -- and that family has to be a
+// post-publish one that actually carries `installer`, or the reader would have nothing to read.
+test("catalog delivery names the cells whose installer identity resolves the state", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  const group = graph.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group);
+  assert.equal(group.phase, "post_publish");
+  assert.ok(group.required_identity.includes("installer"));
+  assert.ok(group.singleton_identity.includes("installer"));
+
+  const unread = structuredClone(graph);
+  delete unread.workflow_policy.catalog_delivery.installed_cell_group;
+  assert.throws(
+    () => validateReleaseClaimGraph(unread),
+    /workflow_policy\.catalog_delivery\.installed_cell_group/u,
+  );
+
+  const unknown = structuredClone(graph);
+  unknown.workflow_policy.catalog_delivery.installed_cell_group = "no-such-group";
+  assert.throws(
+    () => validateReleaseClaimGraph(unknown),
+    /must be a closeout cell group/u,
+  );
+
+  // A pre-publish family cannot carry the delivery state: it is produced before the catalog is
+  // ever touched, so reading it would report a state nothing had decided yet.
+  const early = structuredClone(graph);
+  early.workflow_policy.catalog_delivery.installed_cell_group = "candidate_installed_behavior";
+  assert.throws(
+    () => validateReleaseClaimGraph(early),
+    /must be a post-publish cell group/u,
+  );
+
+  // The installer must be a singleton identity, or the three targets could each report a
+  // different catalog and no single state would exist to record.
+  const nonSingleton = structuredClone(graph);
+  nonSingleton.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group)
+    .singleton_identity = ["host_os", "host_arch", "native_engine"];
+  assert.throws(
+    () => validateReleaseClaimGraph(nonSingleton),
+    /must carry installer in singleton_identity/u,
+  );
+});
+
 // check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
 // chain that parses but orders nothing would let both gates pass while `gh release create` ran
 // detached from the release-authority checks and the plugin-proof matrix. Every mutation below
