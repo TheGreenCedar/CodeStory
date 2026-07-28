@@ -513,7 +513,10 @@ def native_release_manifest(
     embedding_descriptor = dict(embedding)
     embedding_descriptor["family"] = runtime.get("embedding_family")
     contract_sha256 = embedding_contract_digest(model, embedding_descriptor, tokenizer)
-    producer_identity = f"{producer.get('name')}@{producer.get('version')}"
+    # The binary embeds the embedding revision, not the crate version: persisted
+    # vectors are keyed by this identity, so it moves only when the embeddings do.
+    # Comparing the crate version here held only while the two were equal.
+    producer_identity = f"{producer.get('name')}@{producer.get('embedding_revision')}"
     require(fields["producer"] == producer_identity, "native engine producer does not match model contract")
     require(fields["model_sha256"] == model.get("sha256"), "embedded model digest does not match model contract")
     require(
