@@ -143,6 +143,21 @@ function requireExactResolverContract(violations, file, job, expectedDigest) {
   );
 }
 
+// Fragment assertions are substring matches, so they prove a string is present and nothing about
+// what it does: a guard body can be replaced with `true '<the pinned regex>'` and still satisfy
+// them. Digesting the executable text pins the whole script, so any rewrite has to be reviewed
+// rather than merely keep the quoted evidence around. Comments are stripped so prose can be
+// improved without churning the constant.
+function requireExactStepScript(violations, file, job, name, expectedDigest, subject) {
+  const run = executableRunText(stepRun(job, name)).replace(/\r\n/gu, "\n");
+  const digest = createHash("sha256").update(run).digest("hex");
+  add(
+    violations,
+    run.length > 0 && digest === expectedDigest,
+    `${file} step ${name} must match the reviewed ${subject} script exactly`,
+  );
+}
+
 function stepIndex(job, name) {
   return list(job?.steps).map(object).findIndex(step => step.name === name);
 }
@@ -230,6 +245,9 @@ const draftCachePaths = [
 ];
 const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
 const platformResolverContractDigest = "12f5e887eb236625eec5e9718edd305ba625ab06f9a1467ed1146a8a80db0f74";
+// check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
+// it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
+const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -4536,14 +4554,37 @@ export function validateMarketplaceSync(workflows, violations) {
   }
   // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
   const guard = "Validate the dispatched release coordinates";
+  // Each fragment pins an anchored regex together with the test that consumes it, so neither the
+  // closing anchor nor the comparison can go missing on its own. A prefix here would be satisfied
+  // by an unanchored rewrite that accepts `0.16.3; id`.
   requireStepRun(violations, file, job, guard, [
-    "^[0-9a-fA-F]{7,40}$",
-    "^[0-9]+\\.[0-9]+\\.[0-9]+",
+    "commit_shape='^[0-9a-fA-F]{7,40}$'",
+    "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
+    'if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then',
+    'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
   ]);
+  // grep anchors per line, so `printf | grep -Eq '^...$'` passes any value whose *first* line is
+  // well formed. The guard must match whole values; the digest keeps that property from being
+  // quietly traded back for a line-oriented test.
+  forbidStepRun(violations, file, job, guard, ["grep"]);
+  requireExactStepScript(violations, file, job, guard, marketplaceGuardDigest, "dispatch coordinate guard");
   add(
     violations,
     stepIndex(job, guard) === 0,
     `${file} must validate the dispatched coordinates before any other step`,
+  );
+  // Ordering only buys something if the guard covers what the next step consumes. Without this the
+  // checkout could resolve `github.ref` and the validated commit would gate nothing.
+  const checkout = "Checkout the published commit";
+  add(
+    violations,
+    object(object(namedStep(job, checkout)).with).ref === bindings.INPUT_COMMIT,
+    `${file} ${checkout} must resolve the validated ${bindings.INPUT_COMMIT}`,
+  );
+  add(
+    violations,
+    stepIndex(job, checkout) > stepIndex(job, guard),
+    `${file} must validate the dispatched commit before checking it out`,
   );
 }
 

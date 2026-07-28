@@ -123,6 +123,23 @@ ${run}`;
   });
 }
 
+// Runs the marketplace guard exactly as Actions does: the dispatched values arrive through the
+// environment, so a value containing a newline stays one value instead of being re-split by the
+// harness. Text assertions cannot tell an enforcing guard from a decorative one, so the guard is
+// measured against the values it exists to refuse.
+function runMarketplaceGuard(environment) {
+  const workflow = loadWorkflows().get("marketplace-sync.yml");
+  const run = draftStep(workflow.jobs.sync, "Validate the dispatched release coordinates").run;
+  const executable = process.platform === "win32" ? "wsl.exe" : "bash";
+  const args = process.platform === "win32"
+    ? ["--exec", "/bin/bash", "-c", run]
+    : ["-c", run];
+  return spawnSync(executable, args, {
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+  });
+}
+
 function windowsManifestJob(workflow) {
   return workflow.jobs["windows-manifest-missing"];
 }
@@ -2379,14 +2396,47 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
     ["the commit shape check disappears", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
       step.run = step.run.replace("^[0-9a-fA-F]{7,40}$", "^.*$");
-    }, /step Validate the dispatched release coordinates must run \^\[0-9a-fA-F\]\{7,40\}\$/u],
+    }, /must run commit_shape='\^\[0-9a-fA-F\]\{7,40\}\$'/u],
     ["the version shape check disappears", workflow => {
       const step = draftStep(workflow.jobs.sync, guard);
       step.run = step.run.replace("^[0-9]+\\.[0-9]+\\.[0-9]+", "^.+");
-    }, /step Validate the dispatched release coordinates must run \^\[0-9\]\+/u],
+    }, /must run version_shape=/u],
+    // A prefix fragment cannot see a dropped closing anchor, and an unanchored version regex admits
+    // `0.16.3; id`. The pinned fragment carries the anchor, so the truncation is a violation.
+    ["the version regex loses its closing anchor", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("(-[0-9A-Za-z.]+)?$'", "'");
+    }, /must run version_shape='\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\(-\[0-9A-Za-z\.\]\+\)\?\$'/u],
+    // Substring assertions prove a string is present, not that it is consulted. Both of these keep
+    // every pinned regex verbatim while the guard stops rejecting anything.
+    ["the guard body becomes a no-op that still quotes its regexes", workflow => {
+      draftStep(workflow.jobs.sync, guard).run =
+        "set -euo pipefail\ntrue 'commit_shape=^[0-9a-fA-F]{7,40}$'"
+        + " 'version_shape=^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'\n";
+    }, /must match the reviewed dispatch coordinate guard script exactly/u],
+    ["the commit comparison is rewired away from its regex", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("=~ $commit_shape", "=~ .*");
+    }, /must run if \[\[ ! "\$INPUT_COMMIT" =~ \$commit_shape \]\]; then/u],
+    // grep tests a line, so the whole-value comparison must not be traded back for one.
+    ["the value comparison reverts to a line-oriented grep", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace(
+        'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
+        'if ! printf \'%s\' "$INPUT_VERSION" | grep -Eq "$version_shape"; then',
+      );
+    }, /must not run grep/u],
     ["validation moves behind the minted token", workflow => {
       moveNamedStepAfter(workflow.jobs.sync, guard, "Mint a scoped marketplace token");
     }, /must validate the dispatched coordinates before any other step/u],
+    // Validating first only matters if the validated value is what the checkout resolves.
+    ["the checkout resolves the workflow ref instead of the validated commit", workflow => {
+      draftStep(workflow.jobs.sync, "Checkout the published commit").with.ref = "${{ github.ref }}";
+    }, /Checkout the published commit must resolve the validated \$\{\{ inputs\.commit \}\}/u],
+    ["the checkout resolves an unvalidated spelling of the same input", workflow => {
+      draftStep(workflow.jobs.sync, "Checkout the published commit").with.ref =
+        "${{ github.event.inputs.commit }}";
+    }, /Checkout the published commit must resolve the validated \$\{\{ inputs\.commit \}\}/u],
     ["a third dispatch input appears", workflow => {
       workflow.on.workflow_dispatch.inputs.ref = { required: false, type: "string" };
     }, /must dispatch on exactly a version and a commit/u],
@@ -2396,6 +2446,51 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
       const workflows = loadWorkflows();
       mutate(workflows.get(file));
       assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+// The guard is the layer the workflow relies on before a ref is resolved or a token is minted, so
+// it is proven by running it rather than by reading it. Every refusal below reaches the guard's own
+// `::error::` and exit 1: a bash syntax error would also be non-zero and would prove nothing.
+test("the marketplace dispatch guard refuses whole values, not first lines", async (t) => {
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  const version = "0.16.3";
+  const refused = [
+    // grep anchors per line, so each of these presents one well-formed line and smuggles the rest.
+    ["a commit whose first line is a valid abbreviated sha", {
+      INPUT_COMMIT: "abc1234\n$(id); rm -rf /",
+      INPUT_VERSION: version,
+    }],
+    ["a commit whose payload precedes the sha", { INPUT_COMMIT: "; id\nabc1234", INPUT_VERSION: version }],
+    ["a version whose first line is a release", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3\n; id" }],
+    ["a version whose payload precedes the release", { INPUT_COMMIT: commit, INPUT_VERSION: "; id\n0.16.3" }],
+    ["a commit carrying a command substitution", { INPUT_COMMIT: "abc1234$(id)", INPUT_VERSION: version }],
+    ["a version carrying a trailing command", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3; id" }],
+    ["a commit shorter than an abbreviation", { INPUT_COMMIT: "abc123", INPUT_VERSION: version }],
+    ["a commit longer than a sha", { INPUT_COMMIT: `${commit}ab`, INPUT_VERSION: version }],
+    ["a non-hexadecimal commit", { INPUT_COMMIT: "zzzzzzz", INPUT_VERSION: version }],
+    ["an empty commit", { INPUT_COMMIT: "", INPUT_VERSION: version }],
+    ["an empty version", { INPUT_COMMIT: commit, INPUT_VERSION: "" }],
+    ["a v-prefixed version", { INPUT_COMMIT: commit, INPUT_VERSION: "v0.16.3" }],
+  ];
+  for (const [name, environment] of refused) {
+    await t.test(`refuses ${name}`, () => {
+      const result = runMarketplaceGuard(environment);
+      assert.equal(result.status, 1, `guard admitted ${JSON.stringify(environment)}`);
+      assert.match(result.stdout, /::error::/u);
+    });
+  }
+  const admitted = [
+    ["an abbreviated sha", { INPUT_COMMIT: "abc1234", INPUT_VERSION: version }],
+    ["a full sha", { INPUT_COMMIT: commit, INPUT_VERSION: "1.0.0" }],
+    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
+    ["an uppercase sha", { INPUT_COMMIT: "ABC1234DEF", INPUT_VERSION: version }],
+  ];
+  for (const [name, environment] of admitted) {
+    await t.test(`admits ${name}`, () => {
+      const result = runMarketplaceGuard(environment);
+      assert.equal(result.status, 0, result.stderr);
     });
   }
 });

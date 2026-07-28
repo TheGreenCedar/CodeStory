@@ -42,11 +42,17 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if ! printf '%s' "$INPUT_COMMIT" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+          # Match the whole value, not a line inside it. grep anchors per line, so a dispatched
+          # commit of a well-formed abbreviation followed by a newline and a payload passes a
+          # per-line test on its first line and carries the rest through untouched. Bash regex has
+          # no notion of a line: here ^ and $ are the ends of the value itself.
+          commit_shape='^[0-9a-fA-F]{7,40}$'
+          version_shape='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then
             echo "::error::commit must be a 7-40 character hexadecimal commit id."
             exit 1
           fi
-          if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+          if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then
             echo "::error::version must be a semantic version without a v prefix."
             exit 1
           fi
