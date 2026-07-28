@@ -32,6 +32,35 @@ jobs:
     timeout-minutes: 10
     environment: marketplace-publish
     steps:
+      # Dispatch inputs reach shells only through the environment. Actions interpolation is textual
+      # and double quotes do not stop command substitution, so a value spliced into script text runs
+      # as a command on the runner -- here with the default token and, later, the marketplace app
+      # token. Shape is checked before the ref is resolved or any token is minted.
+      # `[[ =~ ]]` is a bash construct. Under a POSIX shell it is a missing command inside an `if`,
+      # which `set -e` does not treat as an error, so the refusal below would be skipped and the
+      # guard would exit 0 on the value it exists to reject. The shell is declared, not inherited.
+      - name: Validate the dispatched release coordinates
+        shell: bash
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Match the whole value, not a line inside it. grep anchors per line, so a dispatched
+          # commit of a well-formed abbreviation followed by a newline and a payload passes a
+          # per-line test on its first line and carries the rest through untouched. Bash regex has
+          # no notion of a line: here ^ and $ are the ends of the value itself.
+          commit_shape='^[0-9a-fA-F]{7,40}$'
+          version_shape='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then
+            echo "::error::commit must be a 7-40 character hexadecimal commit id."
+            exit 1
+          fi
+          if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then
+            echo "::error::version must be a semantic version without a v prefix."
+            exit 1
+          fi
+
       - name: Checkout the published commit
         uses: actions/checkout@v5
         with:
@@ -39,13 +68,16 @@ jobs:
           fetch-depth: 0
 
       - name: Require a published release for this commit
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tag="v${{ inputs.version }}"
+          tag="v$INPUT_VERSION"
           target="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)"
-          resolved="$(git rev-parse "${{ inputs.commit }}^{commit}")"
+          resolved="$(git rev-parse "$INPUT_COMMIT^{commit}")"
           if [ "$target" != "$resolved" ]; then
             echo "::error::release $tag targets $target, not $resolved. The catalog may only point at a published release commit."
             exit 1
@@ -65,11 +97,14 @@ jobs:
           repositories: AgentPluginMarketplace
 
       - name: Point the catalog at the published release
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           node .github/scripts/publish-marketplace-catalog.mjs \
             --source-repository "$GITHUB_WORKSPACE" \
-            --commit "${{ inputs.commit }}" \
-            --version "${{ inputs.version }}"
+            --commit "$INPUT_COMMIT" \
+            --version "$INPUT_VERSION"

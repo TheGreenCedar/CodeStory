@@ -123,6 +123,62 @@ ${run}`;
   });
 }
 
+const marketplaceGuardName = "Validate the dispatched release coordinates";
+
+function marketplaceGuardStep() {
+  return draftStep(loadWorkflows().get("marketplace-sync.yml").jobs.sync, marketplaceGuardName);
+}
+
+// Actions executes a `run:` body with the shell the step declares, so a harness that hardcodes
+// bash measures a script the workflow may no longer run. Resolving the declared key here is what
+// makes the refusals below evidence about the step as written: flip the workflow to `shell: sh`
+// and this suite re-runs the guard under `sh`, where it stops refusing.
+function marketplaceGuardShell(step) {
+  const declared = step.shell;
+  assert.equal(
+    typeof declared,
+    "string",
+    `${marketplaceGuardName} must declare its shell; the harness will not guess one`,
+  );
+  const known = { bash: "bash", sh: "sh" };
+  assert.ok(
+    Object.hasOwn(known, declared),
+    `${marketplaceGuardName} declares shell ${JSON.stringify(declared)}, which this harness cannot run`,
+  );
+  return known[declared];
+}
+
+// The dispatched values arrive through the environment, so a value containing a newline stays one
+// value instead of being re-split by the harness. Text assertions cannot tell an enforcing guard
+// from a decorative one, so the guard is measured against the values it exists to refuse.
+function spawnMarketplaceGuard(shell, run, environment) {
+  const executable = process.platform === "win32" ? "wsl.exe" : shell;
+  const args = process.platform === "win32"
+    ? ["--exec", shell.startsWith("/") ? shell : `/bin/${shell}`, "-c", run]
+    : ["-c", run];
+  return { shell, ...spawnSync(executable, args, {
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+  }) };
+}
+
+function runMarketplaceGuard(environment) {
+  const step = marketplaceGuardStep();
+  return spawnMarketplaceGuard(marketplaceGuardShell(step), step.run, environment);
+}
+
+// A POSIX shell that genuinely lacks `[[`. macOS ships `/bin/sh` as bash in POSIX mode, which
+// still has it, so the candidate is probed rather than assumed.
+function posixShellWithoutDoubleBracket() {
+  for (const candidate of ["dash", "/bin/dash", "sh", "/bin/sh"]) {
+    const usable = spawnSync(candidate, ["-c", "exit 0"], { encoding: "utf8" });
+    if (usable.error !== undefined || usable.status !== 0) continue;
+    const probe = spawnSync(candidate, ["-c", "[[ 1 = 1 ]]"], { encoding: "utf8" });
+    if (probe.status !== 0) return candidate;
+  }
+  return undefined;
+}
+
 function windowsManifestJob(workflow) {
   return workflow.jobs["windows-manifest-missing"];
 }
@@ -2324,6 +2380,337 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
     mutate(workflows);
     assert.notDeepEqual(validateWorkflows(workflows), [], label);
   }
+});
+
+// The gate `publish` sits behind was asserted by a condition that could never fail. The claim
+// graph now owns the whole plugin chain, so this suite proves the graph-driven assertion actually
+// refuses each way the gate can be dropped -- and, because `needs:` is an unordered set in GitHub
+// Actions, that a reordered-but-equivalent gate is *not* reported.
+test("plugin publish must actually wait on preflight and plugin proof", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "plugin-release.yml";
+  const expected = /plugin-release\.yml publish dependencies must match the release claim graph/u;
+  const mutations = [
+    ["publish drops plugin proof", workflow => {
+      workflow.jobs.publish.needs = ["preflight"];
+    }],
+    ["publish waits on nothing", workflow => {
+      delete workflow.jobs.publish.needs;
+    }],
+    ["publish waits on a single scalar", workflow => {
+      workflow.jobs.publish.needs = "preflight";
+    }],
+    ["publish waits on an unrelated job", workflow => {
+      workflow.jobs.publish.needs = ["preflight", "post-publish-smoke"];
+    }],
+    ["a scalar needs spells the gate as one string", workflow => {
+      workflow.jobs.publish.needs = "preflight, plugin-proof";
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+  await t.test("a reordered gate names the same set and is not a violation", () => {
+    const workflows = loadWorkflows();
+    workflows.get(file).jobs.publish.needs = ["plugin-proof", "preflight"];
+    assert.deepEqual(validateWorkflows(workflows), []);
+  });
+});
+
+test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "marketplace-sync.yml";
+  const guard = "Validate the dispatched release coordinates";
+  const mutations = [
+    ["the untokened check interpolates the commit", workflow => {
+      const step = draftStep(workflow.jobs.sync, "Require a published release for this commit");
+      step.run = step.run.replace('"$INPUT_COMMIT^{commit}"', '"${{ inputs.commit }}^{commit}"');
+    }, /steps\.2 must read dispatch inputs from env/u],
+    ["the tokened publish interpolates the version", workflow => {
+      const step = draftStep(workflow.jobs.sync, "Point the catalog at the published release");
+      step.run = step.run.replace('"$INPUT_VERSION"', '"${{ inputs.version }}"');
+    }, /steps\.4 must read dispatch inputs from env/u],
+    ["a consumed input loses its env binding", workflow => {
+      delete draftStep(workflow.jobs.sync, "Point the catalog at the published release")
+        .env.INPUT_COMMIT;
+    }, /steps\.4 must bind INPUT_COMMIT/u],
+    ["an env binding is rewired to another value", workflow => {
+      draftStep(workflow.jobs.sync, guard).env.INPUT_VERSION = "${{ github.ref_name }}";
+    }, /steps\.0 must bind INPUT_VERSION/u],
+    ["the commit shape check disappears", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("^[0-9a-fA-F]{7,40}$", "^.*$");
+    }, /must run commit_shape='\^\[0-9a-fA-F\]\{7,40\}\$'/u],
+    ["the version shape check disappears", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("^[0-9]+\\.[0-9]+\\.[0-9]+", "^.+");
+    }, /must run version_shape=/u],
+    // A prefix fragment cannot see a dropped closing anchor, and an unanchored version regex admits
+    // `0.16.3; id`. The pinned fragment carries the anchor, so the truncation is a violation.
+    ["the version regex loses its closing anchor", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("(-[0-9A-Za-z.]+)?$'", "'");
+    }, /must run version_shape='\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\(-\[0-9A-Za-z\.\]\+\)\?\$'/u],
+    // Substring assertions prove a string is present, not that it is consulted. This body satisfies
+    // every fragment above -- both anchored regexes, both comparisons, no grep -- and refuses
+    // nothing, so only a pin over the whole script can see it.
+    ["the guard keeps every pinned fragment and stops refusing anything", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replaceAll("exit 1", ":");
+    }, /must match the reviewed dispatch coordinate guard script exactly/u],
+    ["the commit comparison is rewired away from its regex", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace("=~ $commit_shape", "=~ .*");
+    }, /must run if \[\[ ! "\$INPUT_COMMIT" =~ \$commit_shape \]\]; then/u],
+    // grep tests a line, so the whole-value comparison must not be traded back for one.
+    ["the value comparison reverts to a line-oriented grep", workflow => {
+      const step = draftStep(workflow.jobs.sync, guard);
+      step.run = step.run.replace(
+        'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
+        'if ! printf \'%s\' "$INPUT_VERSION" | grep -Eq "$version_shape"; then',
+      );
+    }, /must not run grep/u],
+    ["validation moves behind the minted token", workflow => {
+      moveNamedStepAfter(workflow.jobs.sync, guard, "Mint a scoped marketplace token");
+    }, /must validate the dispatched coordinates before any other step/u],
+    // Validating first only matters if the validated value is what the checkout resolves.
+    ["the checkout resolves the workflow ref instead of the validated commit", workflow => {
+      draftStep(workflow.jobs.sync, "Checkout the published commit").with.ref = "${{ github.ref }}";
+    }, /Checkout the published commit must resolve the validated \$\{\{ inputs\.commit \}\}/u],
+    ["the checkout resolves an unvalidated spelling of the same input", workflow => {
+      draftStep(workflow.jobs.sync, "Checkout the published commit").with.ref =
+        "${{ github.event.inputs.commit }}";
+    }, /Checkout the published commit must resolve the validated \$\{\{ inputs\.commit \}\}/u],
+    ["a third dispatch input appears", workflow => {
+      workflow.on.workflow_dispatch.inputs.ref = { required: false, type: "string" };
+    }, /must dispatch on exactly a version and a commit/u],
+    // Pinning `on.workflow_dispatch.inputs` says nothing about a second trigger, and a
+    // `workflow_call` input is neither validated by the guard nor named by that assertion.
+    ["a second trigger opens an unvalidated input surface", workflow => {
+      workflow.on.workflow_call = { inputs: { ref: { required: false, type: "string" } } };
+    }, /must be reachable only by manual dispatch/u],
+    ["the file becomes reachable on push", workflow => {
+      workflow.on.push = { branches: ["main"] };
+    }, /must be reachable only by manual dispatch/u],
+    // The ban advertises itself as a property of the file. A scan scoped to `jobs.sync` would
+    // exempt any job added beside it -- fully formed, so nothing else in policy objects either.
+    ["a second job interpolates the commit into its own script", workflow => {
+      workflow.jobs.leak = {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        permissions: { contents: "read" },
+        steps: [{
+          name: "Echo the dispatched commit",
+          shell: "bash",
+          run: 'echo "${{ inputs.commit }}"\n',
+        }],
+      };
+    }, /jobs\.leak\.steps\.0 must read dispatch inputs from env/u],
+    ["a second job's step runs under an unpinned shell", workflow => {
+      workflow.jobs.leak = {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        permissions: { contents: "read" },
+        steps: [{ name: "Do something", run: "echo hello\n" }],
+      };
+    }, /jobs\.leak\.steps\.0 must declare shell: bash/u],
+    // `continue-on-error` sits outside the script, exactly like `shell:`, so the guard's own text
+    // cannot assert against it. It leaves the refusal running and simply ignores its exit code.
+    ["the guard's refusal is downgraded to advice", workflow => {
+      workflow.jobs.sync.steps[0]["continue-on-error"] = true;
+    }, /jobs\.sync\.steps\.0 must not declare continue-on-error/u],
+    ["a whole job downgrades every guard it contains", workflow => {
+      workflow.jobs.sync["continue-on-error"] = true;
+    }, /jobs\.sync must not declare continue-on-error/u],
+    // A `uses:` step is not exempt: an action can evaluate the input it is handed, and
+    // `actions/github-script` runs its `script:` input as JavaScript.
+    ["a pinned action evaluates the commit as script text", workflow => {
+      workflow.jobs.sync.steps.push({
+        name: "Report the dispatched commit",
+        uses: `actions/github-script@${fullSha}`,
+        with: { script: 'console.log("${{ inputs.commit }}")' },
+      });
+    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    ["a pinned action takes the unvalidated spelling of the input", workflow => {
+      workflow.jobs.sync.steps.push({
+        name: "Report the dispatched commit",
+        uses: `actions/github-script@${fullSha}`,
+        with: { script: 'console.log("${{ github.event.inputs.commit }}")' },
+      });
+    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    // `$NAME` and `${NAME}` are the same read, so a binding assertion that only sees the bare form
+    // is evaded by writing the brace form and deleting the bindings.
+    ["a brace-form read loses both of its env bindings", workflow => {
+      const step = draftStep(workflow.jobs.sync, "Point the catalog at the published release");
+      step.run = step.run
+        .replaceAll('"$INPUT_COMMIT"', '"${INPUT_COMMIT}"')
+        .replaceAll('"$INPUT_VERSION"', '"${INPUT_VERSION}"');
+      delete step.env.INPUT_COMMIT;
+      delete step.env.INPUT_VERSION;
+    }, /jobs\.sync\.steps\.4 must bind INPUT_COMMIT/u],
+    // The other direction: a binding may not name the unvalidated spelling, whether or not the
+    // step that declares it is the step that reads it.
+    ["a binding is rewired to the unvalidated spelling but never read", workflow => {
+      workflow.jobs.sync.steps.push({
+        name: "Carry an unvalidated commit",
+        shell: "bash",
+        env: { INPUT_COMMIT: "${{ github.event.inputs.commit }}" },
+        run: "echo bound\n",
+      });
+    }, /jobs\.sync\.steps\.5 must bind INPUT_COMMIT/u],
+    // Job-level `env:` is below every step's own binding check, so the unvalidated spelling is
+    // refused by name wherever it appears rather than only where a step declares it.
+    ["the unvalidated spelling hides in job-level env", workflow => {
+      workflow.jobs.sync.env = { CARRIED: "${{ github.event.inputs.commit }}" };
+    }, /must name a dispatch input only as \$\{\{ inputs\.commit \}\}/u],
+    ["the unvalidated spelling hides in a job-level conditional", workflow => {
+      workflow.jobs.sync.if = "${{ github.event.inputs.version != '' }}";
+    }, /must name a dispatch input only as \$\{\{ inputs\.commit \}\}/u],
+    // The checkout `ref` exemption exists because that one step's ref is separately pinned to the
+    // value the guard validated. A like-named step in another job borrows the name, not the guard.
+    ["another job borrows the checkout step's name to inherit its exemption", workflow => {
+      workflow.jobs.leak = {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        permissions: { contents: "read" },
+        steps: [{
+          name: "Checkout the published commit",
+          uses: "actions/checkout@v5",
+          with: { ref: "${{ inputs.commit }}" },
+        }],
+      };
+    }, /jobs\.leak\.steps\.0 must not splice a dispatch input into an action input/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+// The guard is the layer the workflow relies on before a ref is resolved or a token is minted, so
+// it is proven by running it rather than by reading it. Every refusal below reaches the guard's own
+// `::error::` and exit 1: a bash syntax error would also be non-zero and would prove nothing.
+test("the marketplace dispatch guard refuses whole values, not first lines", async (t) => {
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  const version = "0.16.3";
+  const refused = [
+    // grep anchors per line, so each of these presents one well-formed line and smuggles the rest.
+    ["a commit whose first line is a valid abbreviated sha", {
+      INPUT_COMMIT: "abc1234\n$(id); rm -rf /",
+      INPUT_VERSION: version,
+    }],
+    ["a commit whose payload precedes the sha", { INPUT_COMMIT: "; id\nabc1234", INPUT_VERSION: version }],
+    ["a version whose first line is a release", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3\n; id" }],
+    ["a version whose payload precedes the release", { INPUT_COMMIT: commit, INPUT_VERSION: "; id\n0.16.3" }],
+    ["a commit carrying a command substitution", { INPUT_COMMIT: "abc1234$(id)", INPUT_VERSION: version }],
+    ["a version carrying a trailing command", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3; id" }],
+    ["a commit shorter than an abbreviation", { INPUT_COMMIT: "abc123", INPUT_VERSION: version }],
+    ["a commit longer than a sha", { INPUT_COMMIT: `${commit}ab`, INPUT_VERSION: version }],
+    ["a non-hexadecimal commit", { INPUT_COMMIT: "zzzzzzz", INPUT_VERSION: version }],
+    ["an empty commit", { INPUT_COMMIT: "", INPUT_VERSION: version }],
+    ["an empty version", { INPUT_COMMIT: commit, INPUT_VERSION: "" }],
+    ["a v-prefixed version", { INPUT_COMMIT: commit, INPUT_VERSION: "v0.16.3" }],
+  ];
+  for (const [name, environment] of refused) {
+    await t.test(`refuses ${name}`, () => {
+      const result = runMarketplaceGuard(environment);
+      assert.equal(result.status, 1, `guard admitted ${JSON.stringify(environment)}`);
+      assert.match(result.stdout, /::error::/u);
+    });
+  }
+  const admitted = [
+    ["an abbreviated sha", { INPUT_COMMIT: "abc1234", INPUT_VERSION: version }],
+    ["a full sha", { INPUT_COMMIT: commit, INPUT_VERSION: "1.0.0" }],
+    ["a prerelease version", { INPUT_COMMIT: commit, INPUT_VERSION: "0.16.3-rc.1" }],
+    ["an uppercase sha", { INPUT_COMMIT: "ABC1234DEF", INPUT_VERSION: version }],
+  ];
+  for (const [name, environment] of admitted) {
+    await t.test(`admits ${name}`, () => {
+      const result = runMarketplaceGuard(environment);
+      assert.equal(result.status, 0, result.stderr);
+    });
+  }
+  await t.test("every refusal above was measured under the shell the step declares", () => {
+    assert.equal(marketplaceGuardStep().shell, "bash");
+    assert.equal(runMarketplaceGuard({ INPUT_COMMIT: "abc1234", INPUT_VERSION: version }).shell, "bash");
+  });
+});
+
+// `shell:` is invisible to both the fragment assertions and the script digest -- neither reads a
+// key outside `run:` -- so the guard's dependence on bash was a blind spot on both sides. This
+// measures that dependence rather than arguing it: the identical script, under a shell that lacks
+// `[[`, never reaches its own refusal. That is why the shell is pinned in policy, and why the
+// harness above resolves the declared key instead of hardcoding bash.
+test("the dispatch guard's refusal is bash-dependent, so the declared shell is load-bearing", async (t) => {
+  const payload = { INPUT_COMMIT: "abc1234$(id); rm -rf /", INPUT_VERSION: "0.16.3" };
+  const step = marketplaceGuardStep();
+
+  await t.test("bash refuses the payload", () => {
+    const result = spawnMarketplaceGuard("bash", step.run, payload);
+    assert.equal(result.status, 1, `bash admitted ${JSON.stringify(payload)}`);
+    assert.match(result.stdout, /::error::commit must be/u);
+  });
+
+  // The harness reads the step's declared shell rather than assuming one, so a workflow that
+  // changed its shell would change what this suite executes instead of silently measuring bash.
+  await t.test("the harness follows the declared shell and refuses to guess", () => {
+    assert.equal(marketplaceGuardShell({ shell: "bash" }), "bash");
+    assert.equal(marketplaceGuardShell({ shell: "sh" }), "sh");
+    assert.throws(() => marketplaceGuardShell({}), /must declare its shell/u);
+    assert.throws(() => marketplaceGuardShell({ shell: "pwsh" }), /cannot run/u);
+  });
+
+  const posix = posixShellWithoutDoubleBracket();
+  await t.test("a POSIX shell never reaches the refusal", { skip: posix === undefined
+    ? "no POSIX shell without [[ is available on this host"
+    : false }, () => {
+    const result = spawnMarketplaceGuard(posix, step.run, payload);
+    // On dash `[[` is a missing command; inside an `if` condition `set -e` does not fire, so the
+    // reject branch is skipped and the script runs off its end with status 0. Older dash instead
+    // dies on `set -o pipefail`. Either way the refusal the guard exists to perform never happens.
+    assert.doesNotMatch(
+      result.stdout,
+      /::error::commit must be/u,
+      `${posix} unexpectedly performed the guard's refusal`,
+    );
+  });
+
+  await t.test("policy refuses to let the step run under that shell", () => {
+    const workflows = loadWorkflows();
+    draftStep(workflows.get("marketplace-sync.yml").jobs.sync, marketplaceGuardName).shell = "sh";
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /marketplace-sync\.yml jobs\.sync\.steps\.0 must declare shell: bash/u,
+    );
+  });
+
+  await t.test("policy refuses an inherited shell", () => {
+    const workflows = loadWorkflows();
+    delete draftStep(workflows.get("marketplace-sync.yml").jobs.sync, marketplaceGuardName).shell;
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /marketplace-sync\.yml jobs\.sync\.steps\.0 must declare shell: bash/u,
+    );
+  });
+
+  await t.test("the pin covers every run step in the file, not only the guard", () => {
+    const workflows = loadWorkflows();
+    draftStep(
+      workflows.get("marketplace-sync.yml").jobs.sync,
+      "Point the catalog at the published release",
+    ).shell = "sh";
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /marketplace-sync\.yml jobs\.sync\.steps\.4 must declare shell: bash/u,
+    );
+  });
 });
 
 test("the plugin lane publishes the catalog it then smoke-installs", async (t) => {

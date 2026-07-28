@@ -143,6 +143,21 @@ function requireExactResolverContract(violations, file, job, expectedDigest) {
   );
 }
 
+// Fragment assertions are substring matches, so they prove a string is present and nothing about
+// what it does: a guard body can be replaced with `true '<the pinned regex>'` and still satisfy
+// them. Digesting the executable text pins the whole script, so any rewrite has to be reviewed
+// rather than merely keep the quoted evidence around. Comments are stripped so prose can be
+// improved without churning the constant.
+function requireExactStepScript(violations, file, job, name, expectedDigest, subject) {
+  const run = executableRunText(stepRun(job, name)).replace(/\r\n/gu, "\n");
+  const digest = createHash("sha256").update(run).digest("hex");
+  add(
+    violations,
+    run.length > 0 && digest === expectedDigest,
+    `${file} step ${name} must match the reviewed ${subject} script exactly`,
+  );
+}
+
 function stepIndex(job, name) {
   return list(job?.steps).map(object).findIndex(step => step.name === name);
 }
@@ -230,6 +245,9 @@ const draftCachePaths = [
 ];
 const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
 const platformResolverContractDigest = "12f5e887eb236625eec5e9718edd305ba625ab06f9a1467ed1146a8a80db0f74";
+// check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
+// it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
+const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -4588,6 +4606,152 @@ export function validatePluginRelease(workflows, violations, graph) {
   );
 }
 
+export function validateMarketplaceSync(workflows, violations) {
+  const file = "marketplace-sync.yml";
+  const workflow = workflows.get(file);
+  if (!workflow) {
+    violations.push(`${file} must exist`);
+    return;
+  }
+  // Pinning the dispatch input names while leaving the trigger set open closes one door and
+  // leaves another: `workflow_call` carries its own inputs, which `on.workflow_dispatch.inputs`
+  // says nothing about, and a caller-supplied value would reach the same steps.
+  add(
+    violations,
+    hasExactKeys(object(workflow.on), ["workflow_dispatch"]),
+    `${file} must be reachable only by manual dispatch`,
+  );
+  add(
+    violations,
+    hasExactKeys(at(workflow, "on", "workflow_dispatch", "inputs"), ["version", "commit"]),
+    `${file} must dispatch on exactly a version and a commit`,
+  );
+  const job = requireJob(violations, file, workflow, "sync");
+  const bindings = {
+    INPUT_COMMIT: "${{ inputs.commit }}",
+    INPUT_VERSION: "${{ inputs.version }}",
+  };
+  const checkout = "Checkout the published commit";
+  // GitHub serves the same dispatched value under a second name, `github.event.inputs.commit`, and
+  // the guard validates only what arrives as `inputs.commit`. The checkout already refuses the
+  // other spelling for its own `ref`; this refuses it everywhere in the file, including the job
+  // level, where a step's own binding check cannot see it.
+  add(
+    violations,
+    scalarStrings(workflow)
+      .flatMap(text => [...text.matchAll(/\$\{\{[^}]*\binputs\b[^}]*\}\}/gu)].map(match => match[0]))
+      .every(expression => Object.values(bindings).includes(expression)),
+    `${file} must name a dispatch input only as ${bindings.INPUT_COMMIT} or ${bindings.INPUT_VERSION}`,
+  );
+  // The ban is a property of the file, not of one job. A second job added beside `sync` runs on a
+  // runner with the same repository token and the same marketplace environment, so a scan scoped
+  // to `jobs.sync` would exempt exactly the code an attacker would add.
+  for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+    // `continue-on-error` is the same class of blind spot as `shell:`: it lives outside the script,
+    // so nothing the guard's own text asserts can see it, and it converts the guard's `exit 1` into
+    // advice. A job carrying it downgrades every step it contains at once.
+    add(
+      violations,
+      object(rawJob)["continue-on-error"] === undefined,
+      `${file} jobs.${jobName} must not declare continue-on-error, which would make its guards advisory`,
+    );
+    for (const [index, rawStep] of list(object(rawJob).steps).entries()) {
+      const step = object(rawStep);
+      const where = `${file} jobs.${jobName}.steps.${index}`;
+      add(
+        violations,
+        step["continue-on-error"] === undefined,
+        `${where} must not declare continue-on-error, which would make its refusal advisory`,
+      );
+      if (typeof step.run === "string") {
+        // Interpolation is textual and quoting does not stop command substitution, so a dispatched
+        // value spliced into script text executes on the runner -- here beside repository tokens.
+        add(
+          violations,
+          !step.run.includes("${{"),
+          `${where} must read dispatch inputs from env, not interpolated script text`,
+        );
+        // A `run:` body is executed by the shell the step declares, so the script and its
+        // interpreter are one artifact. The guard's whole-value test is `[[ =~ ]]`, which POSIX
+        // shells do not have: under `shell: sh` the condition is a missing command, `set -e` does
+        // not fire inside an `if`, the refusal branch never runs, and the guard exits 0 on the very
+        // value it exists to reject. Nothing in the script's own text can see that, so the shell is
+        // pinned here.
+        add(
+          violations,
+          step.shell === "bash",
+          `${where} must declare shell: bash so its script runs under the shell it was reviewed under`,
+        );
+      }
+      // `env:` is the sanctioned channel into a step. Every other scalar is an action input or
+      // script text, and an action can evaluate what it is handed -- `actions/github-script` runs
+      // its `script:` input. The checkout `ref` is the single exception: it is not an executable
+      // surface and is separately pinned below to the value the guard validated. That exemption is
+      // scoped to `sync`, the only job the guard runs in; a like-named step elsewhere is not covered
+      // by it and so is not exempt either.
+      const surfaces = { ...step };
+      delete surfaces.env;
+      if (jobName === "sync" && step.name === checkout) {
+        surfaces.with = { ...object(step.with) };
+        delete surfaces.with.ref;
+      }
+      add(
+        violations,
+        !scalarStrings(surfaces).some(text => /\$\{\{[^}]*\binputs\b/u.test(text)),
+        `${where} must not splice a dispatch input into an action input`,
+      );
+      for (const [name, expected] of Object.entries(bindings)) {
+        // `$NAME` and `${NAME}` are the same read; gating on the bare form alone let a step consume
+        // `${INPUT_COMMIT}` with no binding at all. Checking the declaration too closes the other
+        // direction: a binding of the unvalidated `github.event.inputs` spelling is a violation
+        // whether or not this step is the one that reads it.
+        const consumed = typeof step.run === "string"
+          && new RegExp(`\\$\\{?${name}\\b`, "u").test(step.run);
+        const declared = Object.hasOwn(object(step.env), name);
+        if (!consumed && !declared) continue;
+        add(
+          violations,
+          object(step.env)[name] === expected,
+          `${where} must bind ${name} to ${expected}`,
+        );
+      }
+    }
+  }
+  // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
+  const guard = "Validate the dispatched release coordinates";
+  // Each fragment pins an anchored regex together with the test that consumes it, so neither the
+  // closing anchor nor the comparison can go missing on its own. A prefix here would be satisfied
+  // by an unanchored rewrite that accepts `0.16.3; id`.
+  requireStepRun(violations, file, job, guard, [
+    "commit_shape='^[0-9a-fA-F]{7,40}$'",
+    "version_shape='^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$'",
+    'if [[ ! "$INPUT_COMMIT" =~ $commit_shape ]]; then',
+    'if [[ ! "$INPUT_VERSION" =~ $version_shape ]]; then',
+  ]);
+  // grep anchors per line, so `printf | grep -Eq '^...$'` passes any value whose *first* line is
+  // well formed. The guard must match whole values; the digest keeps that property from being
+  // quietly traded back for a line-oriented test.
+  forbidStepRun(violations, file, job, guard, ["grep"]);
+  requireExactStepScript(violations, file, job, guard, marketplaceGuardDigest, "dispatch coordinate guard");
+  add(
+    violations,
+    stepIndex(job, guard) === 0,
+    `${file} must validate the dispatched coordinates before any other step`,
+  );
+  // Ordering only buys something if the guard covers what the next step consumes. Without this the
+  // checkout could resolve `github.ref` and the validated commit would gate nothing.
+  add(
+    violations,
+    object(object(namedStep(job, checkout)).with).ref === bindings.INPUT_COMMIT,
+    `${file} ${checkout} must resolve the validated ${bindings.INPUT_COMMIT}`,
+  );
+  add(
+    violations,
+    stepIndex(job, checkout) > stepIndex(job, guard),
+    `${file} must validate the dispatched commit before checking it out`,
+  );
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -4595,6 +4759,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   }
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations, graph);
+  validateMarketplaceSync(workflows, violations);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);
