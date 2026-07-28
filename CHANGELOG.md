@@ -55,7 +55,6 @@
   `CODESTORY_INDEX_FRESHNESS_CURRENT_FILE_CAP` raise the repository size at which
   CodeStory stops checking for changes.
 
-||||||| parent of e925d6da (note the windows deep-cache-root publication fix in the changelog)
 ## 0.16.1
 
 Fixes first use on a slow or unreliable connection.
