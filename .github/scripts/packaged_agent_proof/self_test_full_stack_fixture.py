@@ -99,7 +99,9 @@ def _build_native_contract(
         "size_bytes": 4,
         "sha256": "a" * 64,
         "embedded": True,
-        "producer": {"name": "test", "version": "0.0.0"},
+        # Revision deliberately differs from version: the binary embeds the
+        # revision, so a check comparing the version fails here.
+        "producer": {"name": "test", "version": "0.0.0", "embedding_revision": "1.2.3"},
     }
     embedding = {
         "family": "inprocess:test",
@@ -123,7 +125,7 @@ def _build_native_contract(
         "backends=cpu,metal|llama_cpp_crate=test|"
         f"llama_cpp_commit=test|model_sha256={'a' * 64}|"
         f"embedding_contract_sha256={contract_sha256}|model_embedded=true|"
-        "producer=test@0.0.0|end"
+        "producer=test@1.2.3|end"
     )
     protocol_sha256 = sha256(protocol)
     constant_set_sha256 = sha256(constant_set)
