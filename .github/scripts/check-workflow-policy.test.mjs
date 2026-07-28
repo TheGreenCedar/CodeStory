@@ -2528,7 +2528,19 @@ function runCatalogDeliveryOutcome(environment, [file, jobName] = catalogOutcome
 function runCatalogDeliveryState(environment, [file, jobName] = catalogStateLanes[0]) {
   const step = draftStep(loadWorkflows().get(file).jobs[jobName], "Record catalog delivery state");
   assert.ok(!step.run.includes("${{"), "delivery state body must not embed workflow expressions");
+  // PUBLISHED_COMMIT is what the preceding step resolved from the published release. It is the
+  // step's own input here, exactly as it is in the workflow.
   return runStepBash(step.run, environment);
+}
+
+// Both smokes bind themselves to the published release before deciding anything, so the executable
+// body below is run with that binding present -- and, separately, with it broken.
+function runCatalogDeliveryStateBound(environment, lane) {
+  return runCatalogDeliveryState({ PUBLISHED_COMMIT: repositoryHead(), ...environment }, lane);
+}
+
+function repositoryHead() {
+  return spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
 }
 
 test("a release records catalog publication only when the catalog push actually landed", () => {
@@ -2592,11 +2604,11 @@ test("the post-publish smoke cannot record a public catalog install it did not p
   const publishedInstaller = states.find(({ id }) => id === "published").installer;
   const deferredInstaller = states.find(({ id }) => id === "deferred").installer;
   const liveRevision = "b".repeat(40);
-  const head = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const head = repositoryHead();
 
   for (const lane of catalogStateLanes) {
     const where = lane.join("/");
-    const published = runCatalogDeliveryState({
+    const published = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "true",
       INPUT_MARKETPLACE_REVISION: liveRevision,
     }, lane);
@@ -2610,7 +2622,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     // Deferred still proves a real Codex install of the real published artifacts -- it changes only
     // WHICH catalog served it -- and it says so with an installer identity that cannot be confused
     // for the public one.
-    const deferred = runCatalogDeliveryState({
+    const deferred = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "false",
       INPUT_MARKETPLACE_REVISION: "",
     }, lane);
@@ -2635,17 +2647,47 @@ test("the post-publish smoke cannot record a public catalog install it did not p
       ["absent handoff", { CATALOG_PUBLISHED: "", INPUT_MARKETPLACE_REVISION: "" }],
       ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", INPUT_MARKETPLACE_REVISION: liveRevision }],
       ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", INPUT_MARKETPLACE_REVISION: liveRevision }],
-      // Published demands an immutable revision: an empty or mutable one is not a catalog install.
+      // Published demands an IMMUTABLE revision. "main" is refused by any length test at all, so
+      // it never exercised immutability; the 40-character non-hex cases below do, and they are
+      // reachable in practice because this workflow is dispatchable with an arbitrary string.
       ["published without a revision", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "" }],
       ["published with a mutable ref", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "main" }],
       ["published with a truncated revision", {
         CATALOG_PUBLISHED: "true",
         INPUT_MARKETPLACE_REVISION: "b".repeat(39),
       }],
+      ["published with forty non-hex characters", {
+        CATALOG_PUBLISHED: "true",
+        INPUT_MARKETPLACE_REVISION: "z".repeat(40),
+      }],
+      ["published with a forty-character branch name", {
+        CATALOG_PUBLISHED: "true",
+        INPUT_MARKETPLACE_REVISION: "refs/heads/some-quite-long-branch-name-xy",
+      }],
+      ["published with an uppercase revision", {
+        CATALOG_PUBLISHED: "true",
+        INPUT_MARKETPLACE_REVISION: "B".repeat(40),
+      }],
     ]) {
-      const refused = runCatalogDeliveryState(environment, lane);
+      const refused = runCatalogDeliveryStateBound(environment, lane);
       assert.notEqual(refused.status, 0, `${where}: ${label}`);
       assert.notEqual(refused.outputs.installer, publishedInstaller, `${where}: ${label}`);
+    }
+
+    // The deferred branch pins the commit the previous step resolved from the published release.
+    // A missing or non-immutable binding must stop the job rather than fall back to this tree.
+    for (const [label, publishedCommit] of [
+      ["absent published commit", ""],
+      ["mutable published ref", "main"],
+      ["forty non-hex characters", "z".repeat(40)],
+    ]) {
+      const refused = runCatalogDeliveryState({
+        CATALOG_PUBLISHED: "false",
+        INPUT_MARKETPLACE_REVISION: "",
+        PUBLISHED_COMMIT: publishedCommit,
+      }, lane);
+      assert.notEqual(refused.status, 0, `${where}: ${label}`);
+      assert.equal(refused.outputs.installer, undefined, `${where}: ${label}`);
     }
   }
 });
@@ -2762,7 +2804,7 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["smoke waits for the catalog job to succeed", workflows => {
       smokeCall(workflows).if
         = "inputs.publish_release && needs.marketplace-publish.result == 'success'";
-    }, /must not gate on marketplace-publish succeeding/u],
+    }, /must not gate on marketplace-publish in any form/u],
     ["smoke is skipped whenever the catalog job did not run cleanly", workflows => {
       smokeCall(workflows).if = "inputs.publish_release";
     }, /post-publish smoke must require trusted publication authority and a successful publish/u],
@@ -2824,6 +2866,152 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
       draftStep(pluginSmokeJob(workflows), "Prove the public marketplace install path")
         .env.MARKETPLACE_REVISION = "${{ needs.marketplace-publish.outputs.marketplace_revision }}";
     }, /plugin-release\.yml post-publish smoke must install from the marketplace revision this release published/u],
+    // --- A recovery instruction that cannot be followed ---
+    // marketplace-sync.yml mints the same credential from the same environment, so it recovers a
+    // rejected push and not a missing credential. Naming it unconditionally recorded a one-click
+    // fix that does not exist for the state every release currently reaches.
+    ["deferral stops distinguishing a missing credential from a rejected push", workflows => {
+      const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace('if [ "$TOKEN_OUTCOME" != "success" ]; then', "if false; then");
+    }, /release\.yml step Record catalog delivery outcome must run if \[ "\$TOKEN_OUTCOME" != "success" \]; then/u],
+    ["plugin lane deferral stops naming the credential the recovery needs", workflows => {
+      const step = draftStep(pluginPublishJob(workflows), "Record catalog delivery outcome");
+      step.run = step.run.replace("provision the marketplace-publish credential", "try again");
+    }, /plugin-release\.yml step Record catalog delivery outcome must run provision the marketplace-publish credential/u],
+
+    // --- The push step no longer having to push ---
+    // Turning the gate into delivery deleted the rule that read this step's body, leaving a job
+    // that could mint `catalog_published=true` with the catalog untouched. Both lanes.
+    ["catalog push stops pushing anything", workflows => {
+      draftStep(publishJob(workflows), "Point the catalog at the published release").run
+        = 'echo "catalog untouched"\necho "marketplace_revision=$(printf a%.0s $(seq 40))" >> "$GITHUB_OUTPUT"';
+    }, /release\.yml step Point the catalog at the published release must run publish-marketplace-catalog\.mjs/u],
+    ["catalog push stops naming the commit it publishes", workflows => {
+      const step = draftStep(publishJob(workflows), "Point the catalog at the published release");
+      step.run = step.run.replace('--commit "$GITHUB_SHA"', "--commit HEAD");
+    }, /release\.yml step Point the catalog at the published release must run --commit "\$GITHUB_SHA"/u],
+    ["catalog push stops reporting the revision it landed", workflows => {
+      const step = draftStep(publishJob(workflows), "Point the catalog at the published release");
+      step.run = step.run.replace('--github-output "$GITHUB_OUTPUT"', "--quiet");
+    }, /release\.yml step Point the catalog at the published release must run --github-output/u],
+    ["plugin lane catalog push stops pushing anything", workflows => {
+      draftStep(pluginPublishJob(workflows), "Point the catalog at the published release").run
+        = 'echo "catalog untouched"';
+    }, /plugin-release\.yml step Point the catalog at the published release must run publish-marketplace-catalog\.mjs/u],
+
+    // --- The gate coming back under a different spelling ---
+    // `.result` was the only spelling forbidden, so the identical hard gate written as an output
+    // comparison passed. Both lanes, and the closeout that reaches the catalog through the smoke.
+    ["smoke gates on the catalog output instead of the job result", workflows => {
+      smokeCall(workflows).if
+        = "always() && inputs.publish_release && needs.preflight.result == 'success'"
+        + " && needs.publish.result == 'success'"
+        + " && needs.marketplace-publish.outputs.catalog_published == 'true'";
+    }, /must not gate on marketplace-publish in any form/u],
+    ["smoke gates on the catalog revision being present", workflows => {
+      smokeCall(workflows).if
+        = "always() && inputs.publish_release && needs.preflight.result == 'success'"
+        + " && needs.publish.result == 'success'"
+        + " && needs.marketplace-publish.outputs.marketplace_revision != ''";
+    }, /must not gate on marketplace-publish in any form/u],
+    ["plugin lane smoke gates on the catalog output instead of the job result", workflows => {
+      pluginSmokeJob(workflows).if
+        = "always() && needs.preflight.result == 'success' && needs.publish.result == 'success'"
+        + " && needs.marketplace-publish.outputs.catalog_published == 'true'";
+    }, /plugin-release\.yml post-publish smoke must require a successful publish without gating on marketplace-publish in any form/u],
+    ["post-publish closeout gates on the catalog output instead of the job result", workflows => {
+      workflows.get(releaseFile).jobs["post-publish-closeout"].if
+        = "inputs.publish_release && needs.marketplace-publish.outputs.catalog_published == 'true'";
+    }, /post-publish closeout must not gate on marketplace-publish succeeding/u],
+
+    // --- A revision test that measures length instead of immutability ---
+    ["delivery state accepts any forty characters as a revision", workflows => {
+      const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+        `test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40`,
+      );
+    }, /must run printf '%s' "\$marketplace_revision" \| grep -Eq/u],
+    ["plugin lane delivery state accepts any forty characters as a revision", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+        `test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40`,
+      );
+    }, /must run printf '%s' "\$marketplace_revision" \| grep -Eq/u],
+    ["install step accepts any forty characters as a revision", workflows => {
+      const step = draftStep(smokeJob(workflows), "Resolve the published plugin through the marketplace catalog");
+      step.run = step.run.replace(
+        `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+        `test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40`,
+      );
+    }, /must run printf '%s' "\$marketplace_revision" \| grep -Eq/u],
+    ["release preflight accepts any forty characters as a live revision", workflows => {
+      const step = draftStep(
+        workflows.get(releaseFile).jobs.preflight,
+        "Prove the public marketplace install path",
+      );
+      step.run = step.run.replace(
+        `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+        `test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40`,
+      );
+    }, /must run printf '%s' "\$marketplace_revision" \| grep -Eq/u],
+
+    // --- The smoke verifying its own workspace against itself ---
+    ["smoke stops checking out the published tag", workflows => {
+      const checkout = smokeJob(workflows).steps
+        .find(step => String(step.uses ?? "").startsWith("actions/checkout@"));
+      delete checkout.with;
+    }, /post-publish-release-smoke\.yml post-publish smoke must check out the published release tag/u],
+    ["plugin lane smoke stops checking out the published tag", workflows => {
+      const checkout = pluginSmokeJob(workflows).steps
+        .find(step => String(step.uses ?? "").startsWith("actions/checkout@"));
+      delete checkout.with;
+    }, /plugin-release\.yml post-publish smoke must check out the published release tag/u],
+    ["plugin lane smoke checks out its own head instead of the tag", workflows => {
+      const checkout = pluginSmokeJob(workflows).steps
+        .find(step => String(step.uses ?? "").startsWith("actions/checkout@"));
+      checkout.with = { ref: "${{ github.sha }}", "fetch-depth": 0 };
+    }, /plugin-release\.yml post-publish smoke must check out the published release tag/u],
+    ["smoke stops making GitHub confirm the release is published", workflows => {
+      const job = smokeJob(workflows);
+      job.steps = job.steps.filter(({ name }) => name !== "Bind this smoke to the published release");
+    }, /post-publish-release-smoke\.yml must contain named step Bind this smoke to the published release/u],
+    ["plugin lane smoke stops making GitHub confirm the release is published", workflows => {
+      const job = pluginSmokeJob(workflows);
+      job.steps = job.steps.filter(({ name }) => name !== "Bind this smoke to the published release");
+    }, /plugin-release\.yml must contain named step Bind this smoke to the published release/u],
+    ["published binding stops comparing GitHub's commit with the checked-out tree", workflows => {
+      const step = draftStep(smokeJob(workflows), "Bind this smoke to the published release");
+      step.run = step.run.replace(
+        'if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then',
+        "if false; then",
+      );
+    }, /must run if \[ "\$published_commit" != "\$\(git -C "\$GITHUB_WORKSPACE" rev-parse HEAD\)" \]; then/u],
+    ["published binding accepts a draft release", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Bind this smoke to the published release");
+      step.run = step.run.replace('gh release view "$TAG"', 'gh release list "$TAG"');
+    }, /plugin-release\.yml step Bind this smoke to the published release must run gh release view/u],
+    ["deferred fixture is pinned to the run's own head again", workflows => {
+      const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        '--commit "$published_commit"',
+        '--commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"',
+      );
+    }, /must run --commit "\$published_commit"/u],
+    ["plugin lane deferred fixture is pinned to the run's own head again", workflows => {
+      const step = draftStep(pluginSmokeJob(workflows), "Record catalog delivery state");
+      step.run = step.run.replace(
+        '--commit "$published_commit"',
+        '--commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"',
+      );
+    }, /must run --commit "\$published_commit"/u],
+    ["delivery state stops reading the published commit binding", workflows => {
+      delete draftStep(smokeJob(workflows), "Record catalog delivery state").env.PUBLISHED_COMMIT;
+    }, /must pin the commit resolved from the published release/u],
+    ["plugin lane delivery state stops reading the published commit binding", workflows => {
+      delete draftStep(pluginSmokeJob(workflows), "Record catalog delivery state").env.PUBLISHED_COMMIT;
+    }, /plugin-release\.yml catalog delivery state must pin the commit resolved from the published release/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {

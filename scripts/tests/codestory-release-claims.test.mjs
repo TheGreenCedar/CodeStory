@@ -363,6 +363,54 @@ test("catalog delivery declares two distinguishable states and no release gate",
   );
 });
 
+// Naming the two delivery states buys nothing on its own: the first version of this graph
+// declared both and nothing anywhere read the mark, so a deferred release's closeout verdict was
+// identical in shape to a published one. The graph must therefore also name the cell family whose
+// signed installer identity the closeout resolves the state from -- and that family has to be a
+// post-publish one that actually carries `installer`, or the reader would have nothing to read.
+test("catalog delivery names the cells whose installer identity resolves the state", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  const group = graph.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group);
+  assert.equal(group.phase, "post_publish");
+  assert.ok(group.required_identity.includes("installer"));
+  assert.ok(group.singleton_identity.includes("installer"));
+
+  const unread = structuredClone(graph);
+  delete unread.workflow_policy.catalog_delivery.installed_cell_group;
+  assert.throws(
+    () => validateReleaseClaimGraph(unread),
+    /workflow_policy\.catalog_delivery\.installed_cell_group/u,
+  );
+
+  const unknown = structuredClone(graph);
+  unknown.workflow_policy.catalog_delivery.installed_cell_group = "no-such-group";
+  assert.throws(
+    () => validateReleaseClaimGraph(unknown),
+    /must be a closeout cell group/u,
+  );
+
+  // A pre-publish family cannot carry the delivery state: it is produced before the catalog is
+  // ever touched, so reading it would report a state nothing had decided yet.
+  const early = structuredClone(graph);
+  early.workflow_policy.catalog_delivery.installed_cell_group = "candidate_installed_behavior";
+  assert.throws(
+    () => validateReleaseClaimGraph(early),
+    /must be a post-publish cell group/u,
+  );
+
+  // The installer must be a singleton identity, or the three targets could each report a
+  // different catalog and no single state would exist to record.
+  const nonSingleton = structuredClone(graph);
+  nonSingleton.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group)
+    .singleton_identity = ["host_os", "host_arch", "native_engine"];
+  assert.throws(
+    () => validateReleaseClaimGraph(nonSingleton),
+    /must carry installer in singleton_identity/u,
+  );
+});
+
 // check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
 // chain that parses but orders nothing would let both gates pass while `gh release create` ran
 // detached from the release-authority checks and the plugin-proof matrix. Every mutation below

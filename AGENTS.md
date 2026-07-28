@@ -253,10 +253,34 @@ adapter to compensate for incorrect upstream state.
   `codex_marketplace_deferred_fixture` into the release ledger. A release may say
   the catalog was updated only when the push actually landed; the honest outcome
   otherwise is "released, catalog sync deferred".
+- The two states are distinct **end to end**, not just in a log line. Each has its
+  own installer identity, its own `marketplace.repository` in the install
+  attestation (`local:candidate-pinned-marketplace-fixture` for a fixture), and
+  its own accepted shape in `marketplace_installation.py` — the resolver reports a
+  local source, a marketplace root outside the Codex home, and no pinned `ref`,
+  which the live shape cannot describe and must never be relaxed to admit. A
+  deferred install must resolve a catalog carrying the
+  `.codestory-marketplace-fixture.json` marker naming the exact released commit,
+  so an arbitrary local git directory cannot pass for one. The three names live in
+  `.github/scripts/marketplace-delivery-identity.mjs`; add a state there, in the
+  Python predicate, and in `release-claims.json` together or not at all.
+- The closeout *reads* the mark. `workflow_policy.catalog_delivery.installed_cell_group`
+  names the post-publish cells whose signed `installer` identity resolves the
+  state, and `ledger.json`/`summary.json` carry `catalog_delivery`. Every one of
+  those cells must agree on one declared identity; an undeclared installer or a
+  disagreement between targets rejects the closeout rather than passing quietly.
 - `marketplace-sync.yml` is the recovery path for a deferred catalog. Re-run it
   with the published version and commit rather than editing the catalog by hand;
   it is idempotent, so re-running it against an already-synced catalog succeeds
-  without pushing.
+  without pushing. It mints its token from the same `MARKETPLACE_APP_ID` /
+  `MARKETPLACE_APP_PRIVATE_KEY` in the same `marketplace-publish` environment the
+  release lanes use, so it recovers a push that was **rejected**, not a
+  credential that does not exist. While those secrets are absent every release
+  defers and re-running the sync defers too: the exit is to provision the
+  credential first. That is deliberate — the alternative is a second, unscoped
+  way to write another repository — but it means "deferred" persists until
+  someone with repository-settings access acts, and the ledger says so rather
+  than implying a one-click fix.
 - For a local plugin-source change Codex must observe outside a release, refresh
   the installed package and verify the managed runtime path/version plus
   project-scoped status. CodeStory repository state alone does not update an

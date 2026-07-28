@@ -141,6 +141,59 @@ export function deriveReleaseCells(graph, phase) {
   return cells;
 }
 
+// Which catalog served the release is a fact about the release, so the closeout has to READ it
+// rather than let it ride along as an unexamined string. Before this, `installer` on the
+// post-publish installed cells was free-form: a deferred release's verdict was identical in
+// shape to a published one, and nothing would have noticed a cell carrying a pre-publish
+// installer identity either. The state is resolved from the signed cells, must be one of the
+// two declared identities, must be the SAME one across every target, and lands in the ledger
+// and summary. When it cannot be resolved the closeout records that explicitly and errors --
+// it never simply omits the field.
+export function resolveCatalogDelivery({ graph, cells, manifests }) {
+  const delivery = graph.workflow_policy?.catalog_delivery;
+  const groupId = delivery?.installed_cell_group;
+  if (!delivery || typeof groupId !== "string") return { record: undefined, errors: [] };
+  const relevant = cells.filter((cell) => cell.group_id === groupId);
+  if (relevant.length === 0) return { record: undefined, errors: [] };
+  const byInstaller = new Map(delivery.states.map((state) => [state.installer, state]));
+  const errors = [];
+  const observed = new Set();
+  for (const cell of relevant) {
+    const installer = manifests.get(cell.id)?.evidence?.identity?.installer;
+    if (typeof installer !== "string" || !byInstaller.has(installer)) {
+      errors.push(
+        `${cell.id} does not record a declared catalog delivery installer identity`,
+      );
+      continue;
+    }
+    observed.add(installer);
+  }
+  if (observed.size !== 1 || errors.length > 0) {
+    if (observed.size > 1) {
+      errors.push(
+        `post-publish cells disagree on the catalog delivery state: ${[...observed].sort().join(", ")}`,
+      );
+    }
+    if (observed.size === 0 && errors.length === 0) {
+      errors.push("post-publish cells record no catalog delivery state");
+    }
+    return {
+      record: { state: "unresolved", installer: null, live_catalog_revision: null },
+      errors,
+    };
+  }
+  const [installer] = [...observed];
+  const state = byInstaller.get(installer);
+  return {
+    record: {
+      state: state.id,
+      installer,
+      live_catalog_revision: state.live_catalog_revision,
+    },
+    errors,
+  };
+}
+
 export function resolveReleaseCellConstraints(cell, producerRunAttempt) {
   const attempt = text(producerRunAttempt, "producer run attempt");
   if (!/^[1-9]\d*$/u.test(attempt)) fail("producer run attempt must be a positive integer");
@@ -1099,6 +1152,8 @@ export function evaluateReleaseCloseout({
   }
   const missingCells = ledgerCells.filter(({ status }) => status === "missing").map(({ id }) => id);
   const failedCells = ledgerCells.filter(({ status }) => status === "fail").map(({ id }) => id);
+  const catalogDelivery = resolveCatalogDelivery({ graph, cells, manifests });
+  inputErrors.push(...catalogDelivery.errors);
   inputErrors.sort();
   const decision = inputErrors.length === 0 && missingCells.length === 0 && failedCells.length === 0
     ? "accept"
@@ -1114,6 +1169,7 @@ export function evaluateReleaseCloseout({
     identity: canonicalReleaseClaimValue(gitIdentity),
     producer_provenance_sha256: digest(canonicalJson(trustedProducers)),
     trusted_exceptions_sha256: digest(canonicalJson(trustedExceptionDocument)),
+    ...(catalogDelivery.record ? { catalog_delivery: catalogDelivery.record } : {}),
     cells: ledgerCells,
     input_errors: inputErrors,
   };
@@ -1126,6 +1182,7 @@ export function evaluateReleaseCloseout({
     identity: canonicalReleaseClaimValue(gitIdentity),
     producer_provenance_sha256: ledger.producer_provenance_sha256,
     trusted_exceptions_sha256: ledger.trusted_exceptions_sha256,
+    ...(catalogDelivery.record ? { catalog_delivery: catalogDelivery.record } : {}),
     counts: {
       required: ledgerCells.length,
       passed: ledgerCells.filter(({ status }) => new Set(["pass", "pass_with_exception"]).has(status)).length,

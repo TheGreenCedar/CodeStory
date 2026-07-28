@@ -1117,6 +1117,7 @@
       "publish_job": "marketplace-publish",
       "recovery_workflow": "marketplace-sync.yml",
       "release_gate": false,
+      "installed_cell_group": "installed_runtime_behavior",
       "states": [
         {
           "id": "published",

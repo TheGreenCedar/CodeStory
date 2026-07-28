@@ -255,7 +255,15 @@ jobs:
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW."
+          # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
+          # rejected push, not a missing credential. Saying so here keeps the recorded recovery
+          # instruction one that can actually be followed.
+          if [ "$TOKEN_OUTCOME" != "success" ]; then
+            recovery="provision the marketplace-publish credential, then run $RECOVERY_WORKFLOW (it mints the same token, so it defers as well when that credential is absent)"
+          else
+            recovery="re-run $RECOVERY_WORKFLOW with this version and commit"
+          fi
+          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW: $recovery."
           echo "Catalog delivery: DEFERRED. The release is published; the catalog still serves the previous release. Recover with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
 
   post-publish-smoke:
@@ -266,7 +274,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The published release tag, not the run's own head. A bare checkout gave this job the
+      # workspace it was triggered from, and the deferred branch then built a catalog out of
+      # that workspace and verified the install back against the same tree -- a comparison that
+      # could not fail for any release-related reason. Resolving the tag makes the commit under
+      # proof the one the release actually published.
       - uses: actions/checkout@v5
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      # The tag alone is a local name; this is where it becomes the PUBLISHED identity. The
+      # published release must exist, must not be a draft, and must resolve to the commit this
+      # job checked out. Every later step pins that commit, so the fixture catalog, the Codex
+      # resolve, and the byte comparison all name a release GitHub is actually serving.
+      - name: Bind this smoke to the published release
+        id: published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" != "false" ]; then
+            echo "::error::Published plugin release $TAG is a draft."
+            exit 1
+          fi
+          published_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
+          if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then
+            echo "::error::Checked-out tree is not the commit published at $TAG."
+            exit 1
+          fi
+          echo "commit=$published_commit" >> "$GITHUB_OUTPUT"
+          echo "Smoking the plugin published at $TAG ($published_commit)." >> "$GITHUB_STEP_SUMMARY"
 
       # Same two states as the native lane, decided once from the recorded publication outcome.
       # Published resolves the live catalog; deferred resolves a catalog pinned to this exact
@@ -278,8 +320,12 @@ jobs:
         env:
           CATALOG_PUBLISHED: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
           INPUT_MARKETPLACE_REVISION: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
+          PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
         run: |
           set -euo pipefail
+          # The commit GitHub reports for the published tag, bound in the previous step.
+          published_commit="$PUBLISHED_COMMIT"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
           fixture_root="$RUNNER_TEMP/codestory-marketplace-delivery/fixture"
           rm -rf "$fixture_root"
           if [ "$CATALOG_PUBLISHED" = "true" ]; then
@@ -293,10 +339,14 @@ jobs:
               echo "::error::Deferred catalog publication must not carry a live catalog revision."
               exit 1
             fi
+            # Pinned to the PUBLISHED commit resolved from GitHub, not to whatever this
+            # workspace happens to be. The Codex resolver then fetches that commit from
+            # github.com, so the installed bytes come from the published release rather than
+            # from the tree performing the check.
             node .github/scripts/build-marketplace-fixture.mjs \
               --out "$fixture_root" \
               --source-repository "$GITHUB_WORKSPACE" \
-              --commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+              --commit "$published_commit"
             marketplace_source="$fixture_root"
             marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"
             local_fixture=true
@@ -306,7 +356,7 @@ jobs:
             echo "::error::catalog_published must be true or false, not '$CATALOG_PUBLISHED'."
             exit 1
           fi
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           {
             echo "marketplace_source=$marketplace_source"
             echo "marketplace_revision=$marketplace_revision"

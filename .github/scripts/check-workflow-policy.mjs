@@ -1591,6 +1591,15 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
       && catalogPush?.if === "steps.token.outcome == 'success'",
     `${file} catalog push must run only with a minted token and must not fail the release`,
   );
+  // The step that mints `catalog_published` reads THIS step's outcome, so a push step that does
+  // not push would let a run claim a catalog update it never attempted. Turning the gate into
+  // delivery replaced the rule that checked this body; it belongs to both lanes, so it lives
+  // here rather than in either lane's own rules.
+  requireStepRun(violations, file, job, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+    '--commit "$GITHUB_SHA"',
+    '--github-output "$GITHUB_OUTPUT"',
+  ]);
   const deliveryOutcome = namedStep(job, "Record catalog delivery outcome");
   add(
     violations,
@@ -1619,6 +1628,11 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     'echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"',
     "::warning::Catalog publication deferred",
     "recover with $RECOVERY_WORKFLOW",
+    // The recovery workflow mints the SAME credential from the SAME environment, so it recovers
+    // a rejected push and not a missing credential. A run that defers because the credential is
+    // absent must say that, or the ledger records an instruction nobody can follow.
+    'if [ "$TOKEN_OUTCOME" != "success" ]; then',
+    "provision the marketplace-publish credential",
   ]);
   add(
     violations,
@@ -1761,6 +1775,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       "install-codestory-marketplace-proof.mjs",
       '--source-repository "$GITHUB_WORKSPACE"',
       "marketplace_revision=$marketplace_revision",
+      `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
+      `printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'`,
       // Fixture mode resolves from the locally built catalog, so provenance is
       // checked against that repository's own revision. Checking it against the
       // live revision can never match, which is how the fixture path shipped
@@ -2022,10 +2038,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       && postIf.includes("needs.publish.result == 'success'"),
     `${releaseFile} post-publish smoke must require trusted publication authority and a successful publish`,
   );
+  // Not `.result` alone: `needs.marketplace-publish.outputs.catalog_published == 'true'` in the
+  // condition would reinstate exactly the hard catalog gate this change removed, under a
+  // different spelling. Nothing about the catalog job may appear in the condition at all; the
+  // delivery state reaches the smoke through `with:`, where it is data rather than a gate.
   add(
     violations,
-    !postIf.includes(`needs.${catalogDelivery.publish_job}.result`),
-    `${releaseFile} post-publish smoke must not gate on ${catalogDelivery.publish_job} succeeding`,
+    !postIf.includes(`needs.${catalogDelivery.publish_job}`),
+    `${releaseFile} post-publish smoke must not gate on ${catalogDelivery.publish_job} in any form`,
   );
   // THE anti-vacuity rule: the catalog claim may only ever be the recorded delivery state. A
   // literal, an unrelated input, or any other expression would let a release assert a catalog
@@ -2739,11 +2759,37 @@ function validatePackagedProof(workflows, violations, graph) {
 // install of the real published assets; they differ in WHICH catalog served it, and that
 // difference is carried into the release ledger as a distinct installer identity. These rules
 // prove the two states stay distinguishable and that neither can be selected by accident.
-function catalogDeliveryStateViolations(file, job, delivery, handoff, installStepName) {
+function catalogDeliveryStateViolations(file, job, delivery, handoff, installStepName, checkoutRef) {
   const violations = [];
   const published = delivery.states.find(({ id }) => id === "published");
   const deferred = delivery.states.find(({ id }) => id === "deferred");
+  // Whatever else the deferred branch does, it builds a catalog out of a tree and then verifies
+  // the install back against a tree. If those may be the same tree by default, the comparison is
+  // a tautology and the smoke cannot fail for any release-related reason. Both lanes therefore
+  // check out the PUBLISHED tag and make GitHub confirm it before anything is pinned.
+  const checkout = list(job.steps).find(
+    (candidate) => String(object(candidate).uses ?? "").startsWith("actions/checkout@"),
+  );
+  add(
+    violations,
+    object(object(checkout).with).ref === checkoutRef
+      && object(object(checkout).with)["fetch-depth"] === 0,
+    `${file} post-publish smoke must check out the published release tag, not the run's own head`,
+  );
+  requireStepRun(violations, file, job, "Bind this smoke to the published release", [
+    'gh release view "$TAG"',
+    "--json isDraft",
+    'published_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"',
+    `printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'`,
+    'if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then',
+    'echo "commit=$published_commit" >> "$GITHUB_OUTPUT"',
+  ]);
   const step = namedStep(job, "Record catalog delivery state");
+  add(
+    violations,
+    object(step?.env).PUBLISHED_COMMIT === "${{ steps.published.outputs.commit }}",
+    `${file} catalog delivery state must pin the commit resolved from the published release`,
+  );
   add(
     violations,
     step?.if === undefined && step?.["continue-on-error"] === undefined,
@@ -2768,13 +2814,20 @@ function catalogDeliveryStateViolations(file, job, delivery, handoff, installSte
     'if [ -n "$INPUT_MARKETPLACE_REVISION" ]; then',
     "Deferred catalog publication must not carry a live catalog revision",
     "build-marketplace-fixture.mjs",
+    // The fixture pins the PUBLISHED commit, never the workspace's own head. Building a catalog
+    // out of the tree that then verifies the install makes the source-tree comparison a
+    // tautology, which is how the plugin lane's deferred smoke became unable to fail.
+    '--commit "$published_commit"',
     'marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
     "local_fixture=true",
     `installer=${deferred.installer}`,
     // Neither branch may fall through: an unset or unexpected handoff is a hard failure, never a
     // silent default into the published identity.
     "catalog_published must be true or false",
-    'test "$(printf \'%s\' "$marketplace_revision" | wc -c | tr -d \' \')" = 40',
+    // Immutability, not length. A 40-character string is not a commit: the published branch
+    // takes its revision from a `workflow_dispatch`-able input, and a length-only test admits
+    // any 40 characters of anything.
+    `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
     'echo "installer=$installer"',
   ]);
   const deliveryRun = executableRunText(String(step?.run ?? ""));
@@ -2894,6 +2947,7 @@ function validatePostPublish(workflows, violations, graph) {
       revision: "${{ inputs.marketplace_revision }}",
     },
     resolveStepName,
+    "${{ steps.release.outputs.tag }}",
   ));
   // The one place the delivery state reaches the release ledger. It must be the resolved value and
   // never a literal, or a deferred run could sign a cell saying the public catalog served it.
@@ -2915,6 +2969,9 @@ function validatePostPublish(workflows, violations, graph) {
   const resolveInstalled = namedStep(job, resolveStepName);
   requireStepRun(violations, file, job, resolveStepName, [
     'marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"',
+    // Re-checked here as an immutable identity, not merely as 40 characters: this job is
+    // dispatchable, so the published branch's revision can arrive from a human.
+    `printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'`,
     '"@openai/codex@$CODEX_CLI_VERSION"',
     "install-codestory-marketplace-proof.mjs",
     '--marketplace-source "${{ steps.delivery.outputs.marketplace_source }}"',
@@ -4791,6 +4848,7 @@ export function validatePluginRelease(workflows, violations, graph) {
       revision: "${{ needs.marketplace-publish.outputs.marketplace_revision }}",
     },
     installStepName,
+    "v${{ inputs.version }}",
   ));
   const smokeIf = String(smoke.if ?? "");
   add(
@@ -4798,8 +4856,10 @@ export function validatePluginRelease(workflows, violations, graph) {
     smokeIf.includes("always()")
       && smokeIf.includes("needs.preflight.result == 'success'")
       && smokeIf.includes("needs.publish.result == 'success'")
-      && !smokeIf.includes("needs.marketplace-publish.result"),
-    `${file} post-publish smoke must require a successful publish without gating on marketplace-publish succeeding`,
+      // Any reference at all, not just `.result`: an `outputs.catalog_published == 'true'`
+      // conjunct here is the same hard gate wearing a different name.
+      && !smokeIf.includes("needs.marketplace-publish"),
+    `${file} post-publish smoke must require a successful publish without gating on marketplace-publish in any form`,
   );
 
   const auto = workflows.get("auto-release.yml");

@@ -213,7 +213,7 @@ jobs:
               https://github.com/TheGreenCedar/AgentPluginMarketplace.git \
               refs/heads/main | awk '{print $1}'
           )"
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
           rm -rf "$install_root"
           npm install \
@@ -235,7 +235,7 @@ jobs:
           # the fixture's own revision. The live revision above is still the one
           # the post-publish smoke consumes, so both are captured.
           fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"
-          test "$(printf '%s' "$fixture_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
@@ -609,7 +609,15 @@ jobs:
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW."
+          # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
+          # rejected push, not a missing credential. Saying so here keeps the recorded recovery
+          # instruction one that can actually be followed.
+          if [ "$TOKEN_OUTCOME" != "success" ]; then
+            recovery="provision the marketplace-publish credential, then run $RECOVERY_WORKFLOW (it mints the same token, so it defers as well when that credential is absent)"
+          else
+            recovery="re-run $RECOVERY_WORKFLOW with this version and commit"
+          fi
+          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW: $recovery."
           echo "Catalog delivery: DEFERRED. The release is published; the catalog still serves the previous release. Recover with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
 
   post-publish-smoke:

@@ -233,7 +233,7 @@ function uniqueById(values, label) {
 // the two states it is in, so the graph names both and pins a distinct installer identity to each.
 // A run that could not publish records the deferred identity in its post-publish cells; nothing in
 // the pipeline is allowed to record the published identity without the catalog push succeeding.
-function validateCatalogDelivery(policy, dependencies) {
+function validateCatalogDelivery(policy, dependencies, cellGroups) {
   const delivery = object(policy.catalog_delivery, "workflow_policy.catalog_delivery");
   const publishJob = nonEmptyText(delivery.publish_job, "workflow_policy.catalog_delivery.publish_job");
   if (dependencies[publishJob] === undefined) {
@@ -275,6 +275,26 @@ function validateCatalogDelivery(policy, dependencies) {
   }
   if (byId.get("deferred").live_catalog_revision !== false) {
     fail("workflow_policy.catalog_delivery deferred state must not consume a live catalog revision");
+  }
+  // Naming the two states is not enough on its own: something has to read the mark, or a
+  // deferred release's closeout verdict stays indistinguishable from a published one. This
+  // names the post-publish cell family whose signed `installer` identity the closeout resolves
+  // the delivery state from, so the graph cannot declare the states without a reader.
+  const installedCellGroup = nonEmptyText(
+    delivery.installed_cell_group,
+    "workflow_policy.catalog_delivery.installed_cell_group",
+  );
+  const group = cellGroups.get(installedCellGroup);
+  if (group === undefined) {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a closeout cell group`);
+  }
+  if (group.phase !== "post_publish") {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a post-publish cell group`);
+  }
+  for (const key of ["required_identity", "singleton_identity"]) {
+    if (!(group[key] ?? []).includes("installer")) {
+      fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must carry installer in ${key}`);
+    }
   }
   return delivery;
 }
@@ -816,7 +836,7 @@ export function validateReleaseClaimGraph(graph) {
     }
   }
   validatePluginChain(policy.plugin_chain);
-  validateCatalogDelivery(policy, dependencies);
+  validateCatalogDelivery(policy, dependencies, cellGroups);
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");

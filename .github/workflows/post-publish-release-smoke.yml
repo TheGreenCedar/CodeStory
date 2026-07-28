@@ -106,6 +106,32 @@ jobs:
           ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
 
+      # The tag is a local name until GitHub agrees it is a published one. Every later step pins
+      # the commit resolved here, so the fixture catalog, the Codex resolve, and the byte
+      # comparison all name a release GitHub is actually serving -- never merely whatever tree
+      # this job happens to be standing in.
+      - name: Bind this smoke to the published release
+        id: published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" != "false" ]; then
+            echo "::error::Published release $TAG is a draft."
+            exit 1
+          fi
+          published_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
+          if [ "$published_commit" != "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" ]; then
+            echo "::error::Checked-out tree is not the commit published at $TAG."
+            exit 1
+          fi
+          echo "commit=$published_commit" >> "$GITHUB_OUTPUT"
+          echo "Smoking the release published at $TAG ($published_commit)." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install pinned Python
         if: runner.os != 'macOS'
         uses: actions/setup-python@v7.0.0
@@ -231,8 +257,12 @@ jobs:
         env:
           CATALOG_PUBLISHED: ${{ inputs.catalog_published }}
           INPUT_MARKETPLACE_REVISION: ${{ inputs.marketplace_revision }}
+          PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
         run: |
           set -euo pipefail
+          # The commit GitHub reports for the published tag, bound in the previous step.
+          published_commit="$PUBLISHED_COMMIT"
+          printf '%s' "$published_commit" | grep -Eq '^[0-9a-f]{40}$'
           fixture_root="$RUNNER_TEMP/codestory-marketplace-delivery/fixture"
           rm -rf "$fixture_root"
           if [ "$CATALOG_PUBLISHED" = "true" ]; then
@@ -252,7 +282,7 @@ jobs:
             node .github/scripts/build-marketplace-fixture.mjs \
               --out "$fixture_root" \
               --source-repository "$GITHUB_WORKSPACE" \
-              --commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+              --commit "$published_commit"
             marketplace_source="$fixture_root"
             marketplace_revision="$(git -C "$fixture_root" rev-parse HEAD)"
             local_fixture=true
@@ -262,7 +292,7 @@ jobs:
             echo "::error::catalog_published must be true or false, not '$CATALOG_PUBLISHED'."
             exit 1
           fi
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           {
             echo "marketplace_source=$marketplace_source"
             echo "marketplace_revision=$marketplace_revision"
@@ -284,7 +314,7 @@ jobs:
           codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
           isolated_home="$install_root/isolated-home"
           marketplace_revision="${{ steps.delivery.outputs.marketplace_revision }}"
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           rm -rf "$install_root"
           mkdir -p "$isolated_home"
           npm install \
