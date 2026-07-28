@@ -204,14 +204,14 @@ pub(super) fn push_search_plan_symbol_term_subquery(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_query_terms(terms);
-    if symbol_terms.is_empty() {
+    let query_terms = sorted_search_plan_query_terms(terms);
+    if query_terms.is_empty() {
         return;
     }
     push_search_plan_subquery(
         subqueries,
         seen,
-        symbol_terms
+        query_terms
             .iter()
             .take(8)
             .cloned()
@@ -230,8 +230,8 @@ pub(super) fn push_search_plan_named_anchor_subqueries(
     seen: &mut HashSet<String>,
     terms: &SearchPlanTermsDto,
 ) {
-    let symbol_terms = sorted_search_plan_query_terms(terms);
-    for term in symbol_terms
+    let query_terms = sorted_search_plan_query_terms(terms);
+    for term in query_terms
         .iter()
         .filter(|term| search_plan_named_anchor_term(term))
         .take(5)
