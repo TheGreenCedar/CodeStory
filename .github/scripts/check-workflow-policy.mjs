@@ -2936,13 +2936,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(calibrationMacos.with).calibration_mode === true,
     `${file} protected macOS calibration must call Metal proof in calibration mode`,
   );
-  const calibrationWindows = requireJob(violations, file, workflow, "calibration-windows");
-  add(
-    violations,
-    calibrationWindows.uses === "./.github/workflows/windows-vulkan-proof.yml"
-      && object(calibrationWindows.with).calibration_mode === true,
-    `${file} protected Windows calibration must call Vulkan proof in calibration mode`,
-  );
   add(
     violations,
     at(workflow, "jobs", "macos-source") === undefined,
@@ -2960,9 +2953,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       "route",
       "calibration-linux",
       "calibration-macos",
-      "calibration-windows",
     ]),
-    `${file} calibration assembly must wait for every independent calibration cell`,
+    `${file} calibration assembly must wait for both independent calibration cells`,
   );
   requireStepRun(
     violations,
@@ -2971,7 +2963,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     "Assemble frozen calibration candidate",
     [
       "--assemble-calibration-bundle",
-      'test "${#runs[@]}" = 9',
+      'test "${#runs[@]}" = 6',
       "--calibration-producer-workflow-path",
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
@@ -3572,7 +3564,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "Build and package native CLI",
       "Authenticate calibration bundle producer",
       "Prove protected Windows Vulkan runtime",
-      "Collect three independent Vulkan calibration runs",
       "Stage isolated candidate-managed Windows install",
       "Prove candidate-installed Windows Vulkan runtime",
     ]) {
@@ -3591,8 +3582,6 @@ function validateRemainingWorkflows(workflows, violations) {
     requireStepRun(violations, vulkanFile, job, "Validate candidate-installed mode", [
       'if ("${{ inputs.server_behavior_only }}" -ne "true")',
       "candidate_installed_proof requires server_behavior_only",
-      'if ("${{ inputs.calibration_mode }}" -ne "false")',
-      "candidate_installed_proof cannot run in calibration mode",
     ]);
     const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
     add(
@@ -3622,30 +3611,21 @@ function validateRemainingWorkflows(workflows, violations) {
     add(
       violations,
       namedStep(job, "Install pinned Rust")?.if
-        === "${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}",
+        === "${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}",
       `${vulkanFile} packaged server-behavior proof must skip unused Rust installation`,
     );
     add(
       violations,
       namedStep(job, "Build qualification driver")?.if
-        === "${{ inputs.calibration_mode || !inputs.server_behavior_only }}",
+        === "${{ !inputs.server_behavior_only }}",
       `${vulkanFile} packaged server-behavior proof must skip the qualification driver`,
     );
     requireCalibrationProducerBoundary(
       violations,
       vulkanFile,
       job,
-      "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
+      "${{ !inputs.server_behavior_only }}",
     );
-    requireStepRun(violations, vulkanFile, job, "Collect three independent Vulkan calibration runs", [
-      "(Get-Content crates/codestory-llama-sys/per-user-embedding-server-constant-set.json -Raw | ConvertFrom-Json).status",
-      '-ne "unfrozen"',
-      "--proof-tier calibration",
-      "--qualification-matrix-cell protected_windows_x64_vulkan",
-      "--calibration-run-index",
-      "--calibration-run-output",
-      "if ($LASTEXITCODE -ne 0)",
-    ]);
     const engine = namedStep(job, "Prove protected Windows Vulkan runtime");
     requireStepRun(violations, vulkanFile, job, "Prove protected Windows Vulkan runtime", [
       "--engine-policy accelerated",
@@ -3670,14 +3650,14 @@ function validateRemainingWorkflows(workflows, violations) {
     );
     add(
       violations,
-      engine?.if === "${{ !inputs.calibration_mode && !inputs.candidate_installed_proof }}",
+      engine?.if === "${{ !inputs.candidate_installed_proof }}",
       `${vulkanFile} protected Windows Vulkan proof must yield to the candidate-installed lane`,
     );
     const candidateStage = namedStep(job, "Stage isolated candidate-managed Windows install");
     add(
       violations,
-      candidateStage?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
-      `${vulkanFile} candidate-managed staging must require candidate mode outside calibration`,
+      candidateStage?.if === "inputs.candidate_installed_proof",
+      `${vulkanFile} candidate-managed staging must require explicit candidate mode`,
     );
     requireStepRun(violations, vulkanFile, job, "Stage isolated candidate-managed Windows install", [
       "--prepare-candidate-installed-proof",
@@ -3701,8 +3681,8 @@ function validateRemainingWorkflows(workflows, violations) {
     const candidateProof = namedStep(job, "Prove candidate-installed Windows Vulkan runtime");
     add(
       violations,
-      candidateProof?.if === "${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}",
-      `${vulkanFile} candidate-installed Vulkan proof must require candidate mode outside calibration`,
+      candidateProof?.if === "inputs.candidate_installed_proof",
+      `${vulkanFile} candidate-installed Vulkan proof must require explicit candidate mode`,
     );
     requireStepRun(violations, vulkanFile, job, "Prove candidate-installed Windows Vulkan runtime", [
       "--proof-tier installed_runtime",
@@ -3756,8 +3736,8 @@ function validateRemainingWorkflows(workflows, violations) {
     const releaseCell = namedStep(job, "Emit authenticated Vulkan release cell");
     add(
       violations,
-      releaseCell?.if === "inputs.emit_release_cells && !inputs.calibration_mode",
-      `${vulkanFile} accelerated proof must retain the authenticated Vulkan release cell outside calibration`,
+      releaseCell?.if === "inputs.emit_release_cells",
+      `${vulkanFile} accelerated proof must retain the authenticated Vulkan release cell`,
     );
     const vulkanCellUpload = namedStep(job, "Upload authenticated Vulkan release cell");
     add(
@@ -4212,10 +4192,6 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
       name: "embedding-calibration-macos-${{ inputs.version }}",
       path: "target/calibration-runs/macos",
-    }],
-    ["windows-vulkan-proof.yml/packaged-vulkan/Upload Vulkan calibration runs", {
-      name: "embedding-calibration-windows-${{ inputs.version }}",
-      path: "target/calibration-runs/windows",
     }],
     ["release.yml/pre-publish-closeout/Upload accepted pre-publish closeout", {
       name: "release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}",
