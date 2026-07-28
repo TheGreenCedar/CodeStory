@@ -202,10 +202,8 @@ def _verify_calibration_matrix(matrix: dict, calibration_matrix: object) -> None
         == {
             "hosted_linux_x64_cpu",
             "protected_macos_arm64_metal",
-            "protected_windows_x64_vulkan",
         },
-        "measurement calibration matrix must contain the Linux CPU, macOS Metal, "
-        "and Windows Vulkan pre-publish lanes",
+        "measurement calibration matrix must contain the Linux CPU and macOS Metal pre-publish lanes",
     )
     for cell_id, cell in calibration_matrix.items():
         require(

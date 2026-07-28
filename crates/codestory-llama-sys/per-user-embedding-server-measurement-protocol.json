@@ -82,16 +82,6 @@
       "cache_state": "reused",
       "residency_state": "resident",
       "accelerator_claim": "metal"
-    },
-    "protected_windows_x64_vulkan": {
-      "asset_target": "windows-x64",
-      "proof_tier": "calibration",
-      "host_class": "protected_self_hosted_windows_x64",
-      "policy": "accelerated",
-      "backend": "vulkan",
-      "cache_state": "reused",
-      "residency_state": "resident",
-      "accelerator_claim": "vulkan"
     }
   },
   "host_package_matrix": {
@@ -565,7 +555,7 @@
       }
     },
     "post_result_formula_changes": false,
-    "slow_host_floor_rationale": "The calibration matrix is hosted Linux x64, protected macOS arm64, and protected Windows x64 only, so while Windows named-pipe hosts now contribute to the maxima these budgets scale, no host without SHA hardware acceleration does. A release executable also embeds the model, and the spawned server hashes its whole image before it binds, so the spawn budget must cover a multi-hundred-megabyte read on a cold cache. 1.50x over a CI maximum does not cover that population. The floors are the pre-freeze draft values, which were the vetted conservative behavior. Thresholds are deliberately not floored: qualification keeps measuring regressions against the calibrated maxima while users get budgets sized for the slowest supported host."
+    "slow_host_floor_rationale": "The calibration matrix is hosted Linux x64 and protected macOS arm64 only, so no Windows named-pipe host and no host without SHA hardware acceleration contributes to the maxima these budgets scale. A release executable also embeds the model, and the spawned server hashes its whole image before it binds, so the spawn budget must cover a multi-hundred-megabyte read on a cold cache. 1.50x over a CI maximum does not cover that population. The floors are the pre-freeze draft values, which were the vetted conservative behavior. Thresholds are deliberately not floored: qualification keeps measuring regressions against the calibrated maxima while users get budgets sized for the slowest supported host."
   },
   "threshold_selection": {
     "minimum_clean_calibration_runs_per_matrix_cell": 3,

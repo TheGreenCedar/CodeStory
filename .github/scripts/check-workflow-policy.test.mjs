@@ -526,8 +526,8 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
   const packagedCoordinatorFile = "packaged-platform-pr.yml";
   const packagedProofFile = "packaged-platform-proof.yml";
   const linuxVulkanFile = "linux-vulkan-proof.yml";
-  const metalProofFile = "macos-metal-proof.yml";
   const windowsVulkanFile = "windows-vulkan-proof.yml";
+  const metalProofFile = "macos-metal-proof.yml";
   const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
   const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
 
@@ -726,59 +726,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
         "per-user-embedding-server-constant-set.json",
       );
     }, /Collect three independent Metal calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
-    ["Vulkan calibration reads the calibration contract from an unpinned location", windowsVulkanFile, workflow => {
-      const step = draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Collect three independent Vulkan calibration runs",
-      );
-      step.run = step.run.replaceAll(
-        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
-        "per-user-embedding-server-constant-set.json",
-      );
-    }, /Collect three independent Vulkan calibration runs must run \(Get-Content crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json -Raw \| ConvertFrom-Json\)\.status/u],
-    ["Vulkan calibration accepts a frozen constant set", windowsVulkanFile, workflow => {
-      const step = draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Collect three independent Vulkan calibration runs",
-      );
-      step.run = step.run.replace('-ne "unfrozen"', '-ne "frozen"');
-    }, /Collect three independent Vulkan calibration runs must run -ne "unfrozen"/u],
-    ["Vulkan calibration masks a failed early run", windowsVulkanFile, workflow => {
-      const step = draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Collect three independent Vulkan calibration runs",
-      );
-      step.run = step.run.replace("if ($LASTEXITCODE -ne 0) {", "if ($false) {");
-    }, /Collect three independent Vulkan calibration runs must run if \(\$LASTEXITCODE -ne 0\)/u],
-    ["Vulkan release cell is emitted during calibration", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
-        = "inputs.emit_release_cells";
-    }, /must retain the authenticated Vulkan release cell outside calibration/u],
     ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
       delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
     }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],
-    ["Vulkan candidate staging runs during calibration", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Stage isolated candidate-managed Windows install").if
-        = "inputs.candidate_installed_proof";
-    }, /candidate-managed staging must require candidate mode outside calibration/u],
-    ["Vulkan candidate proof runs during calibration", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Prove candidate-installed Windows Vulkan runtime").if
-        = "inputs.candidate_installed_proof";
-    }, /candidate-installed Vulkan proof must require candidate mode outside calibration/u],
-    ["protected Windows Vulkan proof runs during calibration", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Prove protected Windows Vulkan runtime").if
-        = "${{ !inputs.candidate_installed_proof }}";
-    }, /protected Windows Vulkan proof must yield to the candidate-installed lane/u],
-    ["Vulkan qualification driver skips calibration", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Build qualification driver").if
-        = "${{ !inputs.server_behavior_only }}";
-    }, /packaged server-behavior proof must skip the qualification driver/u],
-    ["Vulkan calibration downloads a frozen bundle", windowsVulkanFile, workflow => {
-      draftStep(workflow.jobs["packaged-vulkan"], "Authenticate calibration bundle producer").if
-        = "${{ !inputs.server_behavior_only }}";
-      draftStep(workflow.jobs["packaged-vulkan"], "Download frozen calibration bundle").if
-        = "${{ !inputs.server_behavior_only }}";
-    }, /calibration authentication and download must run only for qualification or freeze lineage/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
@@ -1003,20 +953,6 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
       workflow.jobs["calibration-linux"].with.hermetic_linux = true;
     }, /hosted Linux calibration must call packaged proof in calibration mode/u],
-    ["Windows calibration cell leaves calibration mode", coordinatorFile, workflow => {
-      workflow.jobs["calibration-windows"].with.calibration_mode = false;
-    }, /protected Windows calibration must call Vulkan proof in calibration mode/u],
-    ["Windows calibration cell reroutes to the package workflow", coordinatorFile, workflow => {
-      workflow.jobs["calibration-windows"].uses = "./.github/workflows/packaged-platform-proof.yml";
-    }, /protected Windows calibration must call Vulkan proof in calibration mode/u],
-    ["calibration assembly skips the Windows cell", coordinatorFile, workflow => {
-      workflow.jobs["calibration-assemble"].needs = workflow.jobs["calibration-assemble"].needs
-        .filter(name => name !== "calibration-windows");
-    }, /calibration assembly must wait for every independent calibration cell/u],
-    ["calibration assembly accepts the pre-Windows run count", coordinatorFile, workflow => {
-      const step = draftStep(workflow.jobs["calibration-assemble"], "Assemble frozen calibration candidate");
-      step.run = step.run.replace('test "${#runs[@]}" = 9', 'test "${#runs[@]}" = 6');
-    }, /Assemble frozen calibration candidate must run test "\$\{#runs\[@\]\}" = 9/u],
     ["coordinator adds a macOS source hard gate", coordinatorFile, workflow => {
       workflow.jobs["macos-source"] = {
         "runs-on": "macos-14",
