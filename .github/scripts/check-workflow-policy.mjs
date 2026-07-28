@@ -4416,19 +4416,53 @@ export function validateCargoTestFilters(
   }
 }
 
-export function validatePluginRelease(workflows, violations) {
+// The only secret read the plugin lane is allowed is the marketplace app identity, and only in the
+// step that mints the scoped token. Return a copy of the workflow with exactly that read removed,
+// so whatever still names the secrets context afterwards is a read nobody sanctioned. Both the key
+// and the expression must match exactly: swapping either value for a different secret leaves the
+// mention in place rather than inheriting the exemption.
+const MARKETPLACE_IDENTITY_READS = new Map([
+  ["app-id", "${{ secrets.MARKETPLACE_APP_ID }}"],
+  ["private-key", "${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}"],
+]);
+
+function withoutMarketplaceIdentity(workflow) {
+  const redacted = JSON.parse(JSON.stringify(workflow));
+  const tokenStep = namedStep(
+    object(object(redacted.jobs)["marketplace-publish"]),
+    "Mint a scoped marketplace token",
+  );
+  const inputs = object(tokenStep?.with);
+  for (const [key, expression] of MARKETPLACE_IDENTITY_READS) {
+    if (inputs[key] === expression) delete inputs[key];
+  }
+  return redacted;
+}
+
+export function validatePluginRelease(workflows, violations, graph) {
   const file = "plugin-release.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
     violations.push(`${file} must exist`);
     return;
   }
+  const pluginChain = object(object(at(graph, "workflow_policy", "plugin_chain")).dependencies);
   const scalars = scalarStrings(workflow);
   add(violations, hasExactKeys(object(workflow.on), ["workflow_call"]), `${file} must be callable only`);
+  // Nothing is built or signed on the plugin lane, so it declares no callable secret surface and
+  // its caller forwards none. The one credential it may read is the marketplace app identity, and
+  // only where the scoped token is minted.
+  //
+  // The rule stays a whole-workflow substring scan, no weaker than the blanket ban it replaces,
+  // because "secrets." is not the only way to reach the context: `toJSON(secrets)`,
+  // `secrets['NAME']`, a `secrets:` key, a secret smuggled through a bare array element, and
+  // `SECRETS.NAME` (contexts are case-insensitive) all name it without that substring. Instead of
+  // pattern-matching the smuggling shapes, redact the two permitted identity reads at their exact
+  // position and require the remainder to mention secrets nowhere at all.
   add(
     violations,
-    !JSON.stringify(workflow).includes("secrets"),
-    `${file} must not receive or forward secrets: nothing is built or signed on the plugin lane`,
+    !/secrets/iu.test(JSON.stringify(withoutMarketplaceIdentity(workflow))),
+    `${file} must not receive or forward secrets beyond the minted marketplace app identity: nothing is built or signed on the plugin lane`,
   );
   walk(workflow, (key, value) => {
     if (/^APPLE_/u.test(key) || (typeof value === "string" && /\bAPPLE_[A-Z0-9_]+\b/u.test(value))) {
@@ -4438,9 +4472,16 @@ export function validatePluginRelease(workflows, violations) {
   const jobs = object(workflow.jobs);
   add(
     violations,
-    hasExactKeys(jobs, ["workflow-policy", "preflight", "plugin-proof", "publish", "post-publish-smoke"]),
-    `${file} must keep its exact five-job plugin lane`,
+    hasExactKeys(jobs, ["workflow-policy", ...Object.keys(pluginChain)]),
+    `${file} must keep exactly the plugin lane the release claim graph declares`,
   );
+  for (const [name, dependencies] of Object.entries(pluginChain)) {
+    add(
+      violations,
+      sameMembers(needs(object(jobs[name])), dependencies),
+      `${file} ${name} dependencies must match the release claim graph`,
+    );
+  }
   for (const [name, job] of Object.entries(jobs)) {
     const permissions = object(job).permissions;
     add(
@@ -4473,14 +4514,51 @@ export function validatePluginRelease(workflows, violations) {
   ]);
   add(
     violations,
-    sameStrings(nonCommentLines(object(jobs.publish).needs === undefined ? "" : ""), []) ||
-      JSON.stringify(object(jobs.publish).needs) === JSON.stringify(["preflight", "plugin-proof"]),
-    `${file} publish must wait on preflight and plugin proof`,
+    !scalars.some((value) => /cargo\s+(?:build|test)/u.test(value)),
+    `${file} must not build native code`,
+  );
+
+  // The catalog a host installs from is only correct once it names this release, so the plugin
+  // lane owns the same publication step the native lane does.
+  const marketplacePublish = object(jobs["marketplace-publish"]);
+  add(
+    violations,
+    marketplacePublish.environment === "marketplace-publish",
+    `${file} marketplace publication must hold its cross-repository credential in its own environment`,
+  );
+  const tokenStep = namedStep(marketplacePublish, "Mint a scoped marketplace token");
+  add(
+    violations,
+    String(tokenStep?.uses ?? "").startsWith("actions/create-github-app-token@")
+      && fullSha.test(String(tokenStep?.uses ?? "").split("@")[1] ?? "")
+      && object(tokenStep?.with).owner === "TheGreenCedar"
+      && object(tokenStep?.with).repositories === "AgentPluginMarketplace",
+    `${file} marketplace token must be a SHA-pinned app token scoped to the marketplace repository`,
+  );
+  requireStepRun(violations, file, marketplacePublish, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+    '--version "${{ inputs.version }}"',
+  ]);
+  add(
+    violations,
+    object(marketplacePublish.outputs).marketplace_revision
+      === "${{ steps.publish.outputs.marketplace_revision }}",
+    `${file} marketplace publication must publish the revision it pushed`,
+  );
+
+  // Preflight runs before the release exists, so a revision captured there names the *previous*
+  // release. Smoke must install from the revision this run published or it proves nothing.
+  const smoke = object(jobs["post-publish-smoke"]);
+  add(
+    violations,
+    object(preflight.outputs).marketplace_revision === undefined,
+    `${file} preflight must not capture a marketplace revision that predates publication`,
   );
   add(
     violations,
-    !scalars.some((value) => /cargo\s+(?:build|test)/u.test(value)),
-    `${file} must not build native code`,
+    object(namedStep(smoke, "Prove the public marketplace install path")?.env).MARKETPLACE_REVISION
+      === "${{ needs.marketplace-publish.outputs.marketplace_revision }}",
+    `${file} post-publish smoke must install from the marketplace revision this release published`,
   );
 
   const auto = workflows.get("auto-release.yml");
@@ -4505,7 +4583,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
     violations.push(...basicWorkflowViolations(file, workflow));
   }
   validateCargoTestFilters(workflows, violations);
-  validatePluginRelease(workflows, violations);
+  validatePluginRelease(workflows, violations, graph);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);

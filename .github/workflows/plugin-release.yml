@@ -39,7 +39,6 @@ jobs:
     timeout-minutes: 15
     outputs:
       pinned_cli_version: ${{ steps.pin.outputs.pinned_cli_version }}
-      marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -128,15 +127,6 @@ jobs:
           node .github/scripts/extract-codestory-release-notes.mjs --version "${{ inputs.version }}" > /tmp/plugin-release-notes.md
           test -s /tmp/plugin-release-notes.md
 
-      - name: Capture the live marketplace revision
-        id: marketplace
-        shell: bash
-        run: |
-          set -euo pipefail
-          revision="$(git ls-remote https://github.com/TheGreenCedar/AgentPluginMarketplace.git refs/heads/main | cut -f1)"
-          test -n "$revision"
-          echo "marketplace_revision=$revision" >> "$GITHUB_OUTPUT"
-
   plugin-proof:
     needs: preflight
     strategy:
@@ -193,8 +183,43 @@ jobs:
             --title "CodeStory plugin ${{ inputs.version }}" \
             --notes-file /tmp/plugin-release-notes.md
 
-  post-publish-smoke:
+  # The catalog is what a host installs from, so the plugin lane publishes it too. Without this the
+  # smoke below would resolve the previous release and fail after the tag is already irreversible.
+  marketplace-publish:
     needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: marketplace-publish
+    outputs:
+      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mint a scoped marketplace token
+        id: token
+        uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
+        with:
+          app-id: ${{ secrets.MARKETPLACE_APP_ID }}
+          private-key: ${{ secrets.MARKETPLACE_APP_PRIVATE_KEY }}
+          owner: TheGreenCedar
+          repositories: AgentPluginMarketplace
+
+      # Publication already happened, so a failure here leaves the catalog serving the previous
+      # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      - name: Point the catalog at the published release
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/publish-marketplace-catalog.mjs \
+            --source-repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA" \
+            --version "${{ inputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  post-publish-smoke:
+    needs: [preflight, publish, marketplace-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -203,7 +228,7 @@ jobs:
       - name: Prove the public marketplace install path
         env:
           CODEX_CLI_VERSION: "0.144.5"
-          MARKETPLACE_REVISION: ${{ needs.preflight.outputs.marketplace_revision }}
+          MARKETPLACE_REVISION: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
         run: |
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-marketplace-postpublish"

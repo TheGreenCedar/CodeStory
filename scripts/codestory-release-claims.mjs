@@ -351,6 +351,77 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
   }
 }
 
+// The plugin lane's job DAG lives in the claim graph rather than in check-workflow-policy.mjs, and
+// the checker only asserts that the workflow's `needs:` match whatever this data says. That makes
+// this the only place left that can tell a real ordering contract from an empty one: with the
+// dependency lists blanked out, both gates would pass while `gh release create` ran with the
+// release-authority checks and the whole plugin-proof matrix detached from it.
+const PLUGIN_CHAIN_ROOT = "workflow-policy";
+const PLUGIN_CHAIN_ORDER = [
+  // Tagging is irreversible, so everything that can still refuse the release runs before it.
+  ["publish", "preflight"],
+  ["publish", "plugin-proof"],
+  // The catalog and the install proof that reads it only mean anything once the release exists.
+  ["marketplace-publish", "publish"],
+  ["post-publish-smoke", "publish"],
+  ["post-publish-smoke", "marketplace-publish"],
+];
+
+function pluginChainAncestors(dependencies, job, seen = new Set()) {
+  for (const dependency of dependencies[job] ?? []) {
+    if (seen.has(dependency)) continue;
+    seen.add(dependency);
+    pluginChainAncestors(dependencies, dependency, seen);
+  }
+  return seen;
+}
+
+function validatePluginChain(value) {
+  const chain = object(value, "workflow_policy.plugin_chain");
+  const dependencies = object(chain.dependencies, "workflow_policy.plugin_chain.dependencies");
+  const jobs = Object.keys(dependencies);
+  if (jobs.length === 0) {
+    fail("workflow_policy.plugin_chain.dependencies must declare at least one job");
+  }
+  const declared = new Set([PLUGIN_CHAIN_ROOT, ...jobs]);
+  // Null-prototype so a job named after an Object member cannot smuggle a dependency list past the
+  // reachability walk below.
+  const resolved = Object.create(null);
+  for (const job of jobs) {
+    nonEmptyText(job, "workflow_policy.plugin_chain.dependencies job");
+    if (job === PLUGIN_CHAIN_ROOT) {
+      fail(`workflow_policy.plugin_chain.dependencies must not redeclare ${PLUGIN_CHAIN_ROOT}`);
+    }
+    resolved[job] = stringArray(
+      dependencies[job],
+      `workflow_policy.plugin_chain.dependencies.${job}`,
+      { nonEmpty: true },
+    );
+    for (const dependency of resolved[job]) {
+      if (!declared.has(dependency)) {
+        fail(`workflow_policy.plugin_chain.dependencies.${job} names undeclared job ${dependency}`);
+      }
+    }
+  }
+  for (const job of jobs) {
+    const ancestors = pluginChainAncestors(resolved, job);
+    if (ancestors.has(job)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} cannot depend on itself`);
+    }
+    if (!ancestors.has(PLUGIN_CHAIN_ROOT)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${PLUGIN_CHAIN_ROOT}`);
+    }
+  }
+  for (const [job, required] of PLUGIN_CHAIN_ORDER) {
+    if (!declared.has(job) || !declared.has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies must declare ${job} and ${required}`);
+    }
+    if (!pluginChainAncestors(resolved, job).has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${required}`);
+    }
+  }
+}
+
 export function canonicalReleaseClaimValue(value) {
   if (Array.isArray(value)) return value.map(canonicalReleaseClaimValue);
   if (value !== null && typeof value === "object") {
@@ -692,6 +763,7 @@ export function validateReleaseClaimGraph(graph) {
       fail("optional release evidence must not block a standard release job");
     }
   }
+  validatePluginChain(policy.plugin_chain);
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");

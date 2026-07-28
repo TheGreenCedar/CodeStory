@@ -1090,6 +1090,29 @@
         ]
       }
     },
+    "plugin_chain": {
+      "dependencies": {
+        "preflight": [
+          "workflow-policy"
+        ],
+        "plugin-proof": [
+          "preflight"
+        ],
+        "publish": [
+          "preflight",
+          "plugin-proof"
+        ],
+        "marketplace-publish": [
+          "preflight",
+          "publish"
+        ],
+        "post-publish-smoke": [
+          "preflight",
+          "publish",
+          "marketplace-publish"
+        ]
+      }
+    },
     "artifact_workflows": [
       "source-proof.yml",
       "release-candidate-evidence.yml",

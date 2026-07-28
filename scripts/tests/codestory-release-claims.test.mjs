@@ -291,6 +291,57 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   }
 });
 
+// check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
+// chain that parses but orders nothing would let both gates pass while `gh release create` ran
+// detached from the release-authority checks and the plugin-proof matrix. Every mutation below
+// leaves the workflow and the graph agreeing with each other; only the schema can refuse them.
+test("the plugin chain must order the lane, not merely name it", async (t) => {
+  const chain = (graphValue) => graphValue.workflow_policy.plugin_chain.dependencies;
+  const mutations = [
+    ["the ordering contract is dropped wholesale", (mutated) => {
+      delete mutated.workflow_policy.plugin_chain;
+    }, /workflow_policy\.plugin_chain must be an object/u],
+    ["the dependencies key is not a mapping", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = [];
+    }, /workflow_policy\.plugin_chain\.dependencies must be an object/u],
+    ["the lane declares no jobs at all", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = {};
+    }, /plugin_chain\.dependencies must declare at least one job/u],
+    ["tagging is cut loose from every gate", (mutated) => {
+      chain(mutated).publish = [];
+    }, /plugin_chain\.dependencies\.publish must be a non-empty array/u],
+    ["the install proof is cut loose from every gate", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = [];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must be a non-empty array/u],
+    ["tagging stops waiting on the plugin proof", (mutated) => {
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies\.publish must run behind plugin-proof/u],
+    ["the plugin proof is deleted from the lane", (mutated) => {
+      delete chain(mutated)["plugin-proof"];
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies must declare publish and plugin-proof/u],
+    ["catalog publication races the release it advertises", (mutated) => {
+      chain(mutated)["marketplace-publish"] = ["preflight"];
+    }, /plugin_chain\.dependencies\.marketplace-publish must run behind publish/u],
+    ["the install proof stops waiting on catalog publication", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = ["preflight", "publish"];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must run behind marketplace-publish/u],
+    ["a dependency names a job the lane never declares", (mutated) => {
+      chain(mutated).publish = ["preflight", "plugin-proof", "imaginary-gate"];
+    }, /plugin_chain\.dependencies\.publish names undeclared job imaginary-gate/u],
+    ["the lane closes into a cycle no job can enter", (mutated) => {
+      chain(mutated).preflight = ["plugin-proof"];
+    }, /plugin_chain\.dependencies\.(?:preflight|plugin-proof) cannot depend on itself/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const mutated = structuredClone(graph);
+      mutate(mutated);
+      assert.throws(() => validateReleaseClaimGraph(mutated), expected);
+    });
+  }
+});
+
 test("evaluation requires exact repository and source-tree identity", () => {
   const fixture = positiveFixture();
   delete fixture.expected_identity.source_tree;
