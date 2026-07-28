@@ -231,13 +231,18 @@ jobs:
             --out "$fixture_root" \
             --source-repository "$GITHUB_WORKSPACE" \
             --commit "$GITHUB_SHA"
+          # The resolver reads the fixture, so provenance must be checked against
+          # the fixture's own revision. The live revision above is still the one
+          # the post-publish smoke consumes, so both are captured.
+          fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"
+          test "$(printf '%s' "$fixture_revision" | wc -c | tr -d ' ')" = 40
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
             --marketplace-source "$fixture_root" \
             --marketplace-name TheGreenCedar \
-            --marketplace-revision "$marketplace_revision" \
+            --marketplace-revision "$fixture_revision" \
             --local-fixture true \
             --expected-version "$VERSION" \
             --source-repository "$GITHUB_WORKSPACE" \

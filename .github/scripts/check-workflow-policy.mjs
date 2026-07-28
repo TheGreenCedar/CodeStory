@@ -1683,6 +1683,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
       "install-codestory-marketplace-proof.mjs",
       '--source-repository "$GITHUB_WORKSPACE"',
       "marketplace_revision=$marketplace_revision",
+      // Fixture mode resolves from the locally built catalog, so provenance is
+      // checked against that repository's own revision. Checking it against the
+      // live revision can never match, which is how the fixture path shipped
+      // unexercised.
+      'fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"',
+      '--marketplace-revision "$fixture_revision"',
     ],
   );
   add(
