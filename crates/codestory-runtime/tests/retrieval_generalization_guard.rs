@@ -1313,17 +1313,20 @@ const PRE_DERIVATION_SPLIT_BAN_FLOOR: &[&str] = &[
 
 #[test]
 fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
+    // The two fixture families must not nest as substrings: a report for
+    // `joined-1.rs` must never be mistaken for a report on `floor-1.rs`, or a
+    // lost ban reads as a covered one.
     let mut fixtures = Vec::new();
     for (index, planted) in PRE_DERIVATION_BAN_FLOOR.iter().enumerate() {
         fixtures.push((
-            format!("floor_{index}.rs"),
+            format!("floor-{index}.rs"),
             format!("pub fn planted_{index}() -> &'static str {{ \"{planted}\" }}\n"),
         ));
     }
     for (index, planted) in PRE_DERIVATION_SPLIT_BAN_FLOOR.iter().enumerate() {
         fixtures.push((
-            format!("split_floor_{index}.rs"),
-            format!("pub fn split_planted_{index}() -> [&'static str; 2] {{ [{planted}] }}\n"),
+            format!("joined-{index}.rs"),
+            format!("pub fn joined_planted_{index}() -> [&'static str; 2] {{ [{planted}] }}\n"),
         ));
     }
     let borrowed: Vec<(&str, &str)> = fixtures
@@ -1339,12 +1342,12 @@ fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
 
     let mut lost = Vec::new();
     for (index, planted) in PRE_DERIVATION_BAN_FLOOR.iter().enumerate() {
-        if !stderr.contains(&format!("floor_{index}.rs")) {
+        if !stderr.contains(&format!("floor-{index}.rs")) {
             lost.push(*planted);
         }
     }
     for (index, planted) in PRE_DERIVATION_SPLIT_BAN_FLOOR.iter().enumerate() {
-        if !stderr.contains(&format!("split_floor_{index}.rs")) {
+        if !stderr.contains(&format!("joined-{index}.rs")) {
             lost.push(*planted);
         }
     }

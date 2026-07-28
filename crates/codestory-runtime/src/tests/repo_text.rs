@@ -254,6 +254,15 @@ fn architecture_repo_text_window_preserves_non_crate_source_surfaces() {
     );
     // The question never says "storage", so nothing admits a storage surface on
     // its behalf; only the words the question used can pull a late hit forward.
+    //
+    // This is a knowing loss on this task. `add_search_plan_inferred_architecture_terms`
+    // used to read ("data" + "accessed" + "application") and add the words
+    // "access", "storage", and "persistence", which is how these two files
+    // reached the window. Those two files are the expected files of a holdout
+    // task, and the rule that fetched them was written from that task, so it
+    // could only ever have paid on the corpus it was written against. No
+    // benchmark run is claimed here: this asserts the mechanism is gone, and
+    // accepts that this question's recall drops with it.
     for unasked in [
         "src/lib/data/storage/StorageAccess.h",
         "src/lib/data/storage/StorageAccessProxy.cpp",
