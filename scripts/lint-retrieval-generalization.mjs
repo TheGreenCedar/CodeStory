@@ -193,17 +193,20 @@ const structuralScanDirs = readdirSync(path.join(repoRoot, "crates"), { withFile
   .map((entry) => path.join(repoRoot, "crates", entry.name, "src"))
   .filter(existsSync);
 
+// Corpus-derived patterns already reach every `crates/*/src` file, but the
+// holdout *names* only ever reached the agent and retrieval directories --
+// which is why a banned entry-point name literal sat in grounding.rs for a
+// release with this lint green. The whole runtime crate now carries the name
+// ban, so a ranking module added tomorrow is covered on the day it is written
+// rather than on the day someone remembers to list it.
 const requiredScanDirs = [
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [];
-
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
-  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
-    .filter((requiredPath) => !existsSync(requiredPath))
+  ? requiredScanDirs.filter((requiredPath) => !existsSync(requiredPath))
   : [];
 if (missingRequiredPaths.length > 0) {
   console.error("lint-retrieval-generalization: missing required production scan path(s)");
@@ -219,8 +222,6 @@ const scanDirs = [
     : explicitScanRoots.filter((root) => root && existsSync(root))),
   ...extraScanRoots.filter((root) => root && existsSync(root)),
 ];
-
-const productionOnlyFiles = usesDefaultScanRoots ? requiredProductionOnlyFiles : [];
 
 const evalOnlyProductionFiles = new Set([
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
@@ -275,7 +276,7 @@ if (missingBenchmarkBoundaryFiles.length > 0) {
   process.exit(2);
 }
 
-if (scanDirs.length === 0 && productionOnlyFiles.length === 0) {
+if (scanDirs.length === 0) {
   console.error("lint-retrieval-generalization: no scan roots found");
   process.exit(2);
 }
@@ -382,6 +383,21 @@ const bannedPatterns = [
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
   "--with-holdout-clone",
+  // Framework-filename and path-fragment shapes the ranking rebuild deleted.
+  // Each sat below the specificity threshold of the holdout *name* patterns
+  // above, which is how they survived the v0.16.1 audit inside ranking code.
+  "payload-types",
+  "payload\\.config",
+  "next\\.config",
+  "app\\.svelte",
+  "/src/collections/",
+  "/exec/src/",
+  // The decomposed-evasion shape itself: a holdout type name spelled as two
+  // generic tokens tested close together, which is how `SourceGroup` steering
+  // stayed under a literal-name ban. Catching the adjacency, not the spelling,
+  // is what stops the same trick returning under a different pair of words.
+  "\"source\"[^\\n]{0,80}\"group\"",
+  "\"group\"[^\\n]{0,80}\"source\"",
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
@@ -410,6 +426,14 @@ const bannedCompactPatterns = [
   "datarequest",
   "sessiondelegate",
   "sourceanimatecss",
+  // Punctuation-free forms of the framework-filename shapes this ranking
+  // rebuild removed, so a decomposed spelling cannot bring them back.
+  "payloadtypes",
+  "payloadconfig",
+  "nextconfig",
+  "appsvelte",
+  "srccollections",
+  "execsrc",
   ...evalCorpusCompactPatternList,
 ];
 
@@ -869,6 +893,10 @@ function isExcludedRustFile(filePath) {
   return (
     segments.includes("tests")
     || baseName.endsWith("_tests.rs")
+    // A `tests.rs` beside a `mod tests;` is the module's test body, the same
+    // test surface as a `tests/` directory. `maskCfgTestItems` cannot see it
+    // because the `#[cfg(test)]` sits on the `mod` in the parent file.
+    || baseName === "tests.rs"
   );
 }
 
@@ -1918,7 +1946,7 @@ function scanRankerFilenameLiterals(prepared) {
 
 let failed = false;
 
-const scanFiles = new Set(productionOnlyFiles);
+const scanFiles = new Set();
 for (const root of scanDirs) {
   for (const filePath of walkRustProductionFiles(root)) {
     scanFiles.add(filePath);

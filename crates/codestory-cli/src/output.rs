@@ -91,6 +91,8 @@ fn grounding_orientation_uncertainty_label(
         }
         GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth => "limited_subsystem_breadth",
         GroundingOrientationUncertaintyDto::CompressedPresentation => "compressed_presentation",
+        GroundingOrientationUncertaintyDto::GraphSignalThin => "graph_signal_thin",
+        GroundingOrientationUncertaintyDto::LexicalFallback => "lexical_fallback",
     }
 }
 
@@ -112,6 +114,12 @@ fn grounding_orientation_uncertainty_note(
         }
         GroundingOrientationUncertaintyDto::CompressedPresentation => {
             "orientation evidence was compressed for the selected budget"
+        }
+        GroundingOrientationUncertaintyDto::GraphSignalThin => {
+            "no evaluated candidate carried call-graph evidence; ordering is structural"
+        }
+        GroundingOrientationUncertaintyDto::LexicalFallback => {
+            "no entrypoint or graph evidence; ordering is lexical and structural only"
         }
     }
 }
@@ -4948,6 +4956,7 @@ mod tests {
                     "Open the exact indexed hit with symbol, trail, and snippet before answering."
                         .to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,
@@ -5032,6 +5041,7 @@ mod tests {
                     "Open the exact indexed hit with symbol, trail, and snippet before answering."
                         .to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,
@@ -5381,6 +5391,7 @@ mod tests {
                 recommended_next_action: Some(
                     "Run retrieval index to restore full sidecar mode, then rerun search --why with a shorter concrete symbol.".to_string(),
                 ),
+                orientation: None,
             }),
             search_plan: None,
             explain: true,

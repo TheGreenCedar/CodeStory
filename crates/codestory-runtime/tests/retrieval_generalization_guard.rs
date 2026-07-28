@@ -1,5 +1,6 @@
 //! Ensures the retrieval generalization lint script stays runnable from the workspace root.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
@@ -73,7 +74,7 @@ fn run_lint_with_scan_root(repo_root: &Path, script: &Path, scan_root: &Path) ->
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(script)
         .current_dir(repo_root)
@@ -115,7 +116,7 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -150,7 +151,7 @@ fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -175,7 +176,7 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock lint script subprocess");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -810,4 +811,77 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
             "lint should report banned literals in {file}, stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn linter_catches_framework_filename_shapes_the_ranking_rebuild_deleted() {
+    for probe in [
+        "payload.config.ts",
+        "payload-types.ts",
+        "next.config.ts",
+        "app.svelte",
+        "/src/collections/posts",
+        "/exec/src/cli.rs",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_framework_shape() -> &'static str {{ {probe:?} }}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "framework filename shape `{probe}` must not be reintroducible, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_scans_every_runtime_source_file_for_holdout_names() {
+    // The scope hole this lane closed: the ranking files decide root order but
+    // were outside the banned-name scan, so an entry-point name catalog shipped
+    // with this lint green. A file count cannot hold the scope -- any set of
+    // files satisfies a count -- so assert that a file the lint has never been
+    // told about is scanned the moment it exists.
+    let repo_root = workspace_root();
+    let planted = repo_root
+        .join("crates")
+        .join("codestory-runtime")
+        .join("src")
+        .join("ranking_scope_probe_generated.rs");
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let baseline = run_default_lint(&repo_root);
+    assert!(
+        baseline.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+
+    fs::write(
+        &planted,
+        "pub fn unlisted_ranking_module() -> &'static str { \"createApplication\" }\n",
+    )
+    .expect("plant unlisted ranking module");
+    let planted_output = run_default_lint(&repo_root);
+    let _ = fs::remove_file(&planted);
+
+    let stderr = String::from_utf8_lossy(&planted_output.stderr);
+    assert!(
+        !planted_output.status.success(),
+        "a runtime source file nobody listed must still be scanned, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ranking_scope_probe_generated.rs"),
+        "the lint should name the unlisted file it rejected, stderr={stderr}"
+    );
+}
+
+fn run_default_lint(repo_root: &Path) -> Output {
+    Command::new("node")
+        .arg(lint_script(repo_root))
+        .current_dir(repo_root)
+        .output()
+        .expect("run generalization lint")
 }

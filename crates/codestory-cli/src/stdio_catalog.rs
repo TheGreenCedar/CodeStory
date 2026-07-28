@@ -761,6 +761,8 @@ const GROUNDING_ORIENTATION_UNCERTAINTY: &[&str] = &[
     "entrypoint_evidence_omitted",
     "limited_subsystem_breadth",
     "compressed_presentation",
+    "graph_signal_thin",
+    "lexical_fallback",
 ];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
 const PACKET_PROBE_EXACT_PATH_KIND: &[&str] = &["exact_path"];

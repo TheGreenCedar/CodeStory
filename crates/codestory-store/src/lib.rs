@@ -24,6 +24,7 @@ pub use storage_impl::{
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, DenseAnchorInputStats, DenseAnchorPublicationManifest,
     DenseReasonCounts, FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole,
+    GroundingCallDegree,
     GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata,
     GroundingSnapshotState, IndexArtifactCacheReader, IndexArtifactCacheWrite,
     IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,

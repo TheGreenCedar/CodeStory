@@ -159,7 +159,7 @@ impl AppController {
             .collect::<Vec<_>>();
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right)
+            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
         });
         hits.truncate(max_results.clamp(1, 50));
         Ok(hits)

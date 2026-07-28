@@ -11,6 +11,13 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
+/// Canonical-id namespaces written by structural source collectors.
+///
+/// Ranking consumes this list so it never spells a collector's namespace
+/// itself; adding a collector is a change in the layer that owns the collector,
+/// not in retrieval ranking.
+pub const STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES: &[&str] = &["payload:collection:"];
+
 pub mod access;
 pub mod definition;
 pub mod error;
