@@ -885,6 +885,119 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
     ))
 }
 
+/// Test-support: stage the store a *served* full publication actually has.
+///
+/// Readiness derives freshness from
+/// `storage_admission_refusal_reason_for_runtime`, which recounts the symbol
+/// docs, dense anchors, and dense-reason histogram in the store and refuses a
+/// manifest that disagrees with them. Upserting only the manifest row
+/// therefore stages a publication the sidecar would *refuse*: a manifest whose
+/// recorded counts nothing in the store backs is exactly the core-only-refresh
+/// shape readiness is supposed to catch, so such a fixture can never stand in
+/// for a healthy project. Seed the rows the manifest's own counts describe, so
+/// a fixture that calls itself healthy is healthy.
+///
+/// Returns the manifest as published: `dense_reason_counts_json` is rewritten
+/// to the histogram of the anchors this seeds, because admission compares the
+/// manifest's copy against a recount rather than trusting it.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn publish_admissible_retrieval_manifest(
+    storage: &mut Storage,
+    manifest: &codestory_store::RetrievalIndexManifest,
+) -> Result<codestory_store::RetrievalIndexManifest, ApiError> {
+    use crate::semantic_projection::{
+        DenseAnchorReason, LLM_SYMBOL_DOC_SCHEMA_VERSION, SYMBOL_SEARCH_DOC_PROVENANCE,
+    };
+    use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind};
+    use codestory_store::{DenseAnchorInput, SymbolSearchDoc};
+
+    fn storage_error(context: &str, error: impl std::fmt::Display) -> ApiError {
+        ApiError::internal(format!("{context}: {error}"))
+    }
+
+    let mut manifest = manifest.clone();
+    let symbol_doc_count = manifest.symbol_doc_count.unwrap_or(0).max(0);
+    let dense_count = manifest
+        .dense_projection_count
+        .or(manifest.projection_count)
+        .unwrap_or(0)
+        .max(0);
+    let selection_reason = DenseAnchorReason::PublicApi.as_str().to_string();
+    manifest.dense_reason_counts_json = Some(if dense_count > 0 {
+        serde_json::json!({ selection_reason.clone(): dense_count }).to_string()
+    } else {
+        "{}".to_string()
+    });
+
+    // Nodes first: symbol docs and dense anchors are keyed by node id.
+    let node_count = symbol_doc_count.max(dense_count);
+    let nodes = (1..=node_count)
+        .map(|id| Node {
+            id: CoreNodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("admissible_{id:02}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage
+        .insert_nodes_batch(&nodes)
+        .map_err(|error| storage_error("Failed to seed admissible publication nodes", error))?;
+
+    let symbol_docs = (1..=symbol_doc_count)
+        .map(|id| SymbolSearchDoc {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: format!("admissible_{id:02}"),
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: format!("admissible-doc-{id:02}"),
+            policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.to_string(),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .upsert_symbol_search_docs_batch(&symbol_docs)
+        .map_err(|error| {
+            storage_error("Failed to seed admissible publication symbol docs", error)
+        })?;
+
+    let dense_inputs = (1..=dense_count)
+        .map(|id| DenseAnchorInput {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            file_role: codestory_store::FileRole::Source,
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: format!("admissible_{id:02}"),
+            document_hash: format!("admissible-anchor-{id:02}"),
+            selection_reason: selection_reason.clone(),
+            policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: format!("core:admissible_{id:02}"),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .upsert_dense_anchor_inputs_batch(&dense_inputs)
+        .map_err(|error| {
+            storage_error("Failed to seed admissible publication dense anchors", error)
+        })?;
+
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .map_err(|error| storage_error("Failed to publish admissible retrieval manifest", error))?;
+    Ok(manifest)
+}
+
 fn published_dense_projection_count(manifest: &codestory_store::RetrievalIndexManifest) -> u32 {
     match manifest.dense_projection_count {
         Some(count) if count > 0 => u32::try_from(count).unwrap_or(u32::MAX),

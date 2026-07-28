@@ -112,10 +112,19 @@ fn index_next_commands_use_sidecar_repair_for_missing_embedding_runtime() {
     );
 }
 
-/// Publish `manifest` for a fresh temp project and run the production
-/// readiness projection against it, exactly as `doctor` consumes it.
-fn doctor_retrieval_state_for_manifest(
+/// Publish a full sidecar manifest for a fresh temp project, let `stage`
+/// disturb the store afterwards, and run the production readiness projection
+/// against the result exactly as `doctor` consumes it.
+///
+/// The publication goes through `publish_admissible_retrieval_manifest_for_test`
+/// so the seeded symbol docs and dense anchors back the manifest's own counts.
+/// Readiness derives freshness from the same storage recount sidecar admission
+/// runs, so a fixture that upserts only the manifest row stages a publication
+/// admission *refuses*: every case below would then report stale for that one
+/// reason and none of these checks would prove anything.
+fn doctor_retrieval_state_for_publication(
     mutate: impl FnOnce(&mut codestory_retrieval::RetrievalIndexManifest),
+    stage: impl FnOnce(&Path, &Path, &codestory_retrieval::RetrievalIndexManifest),
 ) -> codestory_contracts::api::RetrievalStateDto {
     let temp = tempfile::tempdir().expect("temp dir");
     let project_root = temp.path().join("project");
@@ -128,14 +137,22 @@ fn doctor_retrieval_state_for_manifest(
     manifest.symbol_doc_count = Some(8);
     manifest.dense_projection_count = Some(2);
     mutate(&mut manifest);
-    codestory_runtime::publish_retrieval_manifest_for_test(&storage_path, &manifest)
-        .expect("publish retrieval manifest");
+    let published =
+        codestory_runtime::publish_admissible_retrieval_manifest_for_test(&storage_path, &manifest)
+            .expect("publish retrieval manifest");
+    stage(&storage_path, &project_root, &published);
     codestory_runtime::retrieval_state_from_manifest_storage_for_test(
         &storage_path,
         &project_root,
         &temp.path().join("cache"),
     )
     .expect("retrieval state")
+}
+
+fn doctor_retrieval_state_for_manifest(
+    mutate: impl FnOnce(&mut codestory_retrieval::RetrievalIndexManifest),
+) -> codestory_contracts::api::RetrievalStateDto {
+    doctor_retrieval_state_for_publication(mutate, |_, _, _| {})
 }
 
 #[test]
@@ -153,6 +170,11 @@ fn doctor_semantic_check_is_healthy_for_fresh_manifest_published_store() {
         retrieval.stored_embedding.is_some(),
         "build_doctor_output only includes the semantic check when a stored contract exists"
     );
+    assert!(
+        retrieval.semantic_ready,
+        "a servable publication must reach doctor as semantic-ready: {:?}",
+        retrieval.fallback_message
+    );
     let check = semantic_contract_check(&retrieval);
 
     assert_eq!(
@@ -162,6 +184,78 @@ fn doctor_semantic_check_is_healthy_for_fresh_manifest_published_store() {
     );
     assert!(
         check.message.contains("semantic ok"),
+        "unexpected doctor message: {}",
+        check.message
+    );
+}
+
+#[test]
+fn doctor_semantic_check_warns_after_a_core_only_refresh() {
+    // The other direction, at the surface that renders it. A core-only refresh
+    // republishes the core index without rebuilding the sidecar: the manifest
+    // and its aggregates still agree, but an indexed file is now newer than the
+    // publication, so sidecar admission refuses the very next search with
+    // `indexed_file_newer_than_retrieval_manifest`. Doctor must say so rather
+    // than call the store healthy — this is #1557's over-claim, asserted here
+    // because the runtime crate alone is not the blast radius of a readiness
+    // change that CLI surfaces consume.
+    let retrieval = doctor_retrieval_state_for_publication(
+        |_| {},
+        |storage_path, project_root, manifest| {
+            codestory_runtime::stage_core_only_refresh_for_test(
+                storage_path,
+                project_root,
+                manifest.built_at_epoch_ms + 60_000,
+            )
+            .expect("stage core-only refresh");
+        },
+    );
+
+    assert!(
+        !retrieval.semantic_ready,
+        "readiness must not promise hybrid retrieval admission refuses to serve"
+    );
+    let check = semantic_contract_check(&retrieval);
+
+    assert_eq!(
+        check.status, "warn",
+        "a core-only refresh must not be reported as healthy: {}",
+        check.message
+    );
+    assert!(
+        check.message.contains("semantic stale"),
+        "unexpected doctor message: {}",
+        check.message
+    );
+}
+
+#[test]
+fn doctor_semantic_check_warns_for_an_interrupted_incremental_run() {
+    // The second half of #1557: an interrupted incremental run leaves the
+    // manifest, symbol-doc count, dense anchors, and indexed-file mtimes all
+    // agreeing, so manifest-shape freshness sees nothing wrong, while admission
+    // refuses with `incomplete_incremental_index_run`.
+    let retrieval = doctor_retrieval_state_for_publication(
+        |_| {},
+        |storage_path, _, _| {
+            codestory_runtime::stage_incomplete_incremental_run_for_test(storage_path)
+                .expect("stage interrupted incremental run");
+        },
+    );
+
+    assert!(
+        !retrieval.semantic_ready,
+        "readiness must not promise hybrid retrieval admission refuses to serve"
+    );
+    let check = semantic_contract_check(&retrieval);
+
+    assert_eq!(
+        check.status, "warn",
+        "an interrupted incremental run must not be reported as healthy: {}",
+        check.message
+    );
+    assert!(
+        check.message.contains("semantic stale"),
         "unexpected doctor message: {}",
         check.message
     );
