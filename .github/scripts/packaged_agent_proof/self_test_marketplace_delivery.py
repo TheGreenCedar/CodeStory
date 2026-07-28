@@ -521,6 +521,32 @@ def _run_retained_provenance_self_tests() -> None:
         raise ProofFailure(f"retained installed evidence accepted {description}")
 
 
+def _run_shared_identity_self_tests() -> None:
+    """The producer and the verifier must name the two states identically.
+
+    `.github/scripts/marketplace-delivery-identity.mjs` writes the installer identity and the
+    attestation repository; this module's predicate decides which shape to accept from them. If
+    the two ever drift, a real release resolves through a Codex install the predicate refuses --
+    which is precisely the failure this whole path was repaired for, and it would surface only
+    after the tag was already pushed.
+    """
+    source = (
+        REPOSITORY_ROOT / ".github" / "scripts" / "marketplace-delivery-identity.mjs"
+    ).read_text(encoding="utf-8")
+    for name, value in (
+        ("LIVE_INSTALLATION_SOURCE", LIVE_INSTALLATION_SOURCE),
+        ("DEFERRED_INSTALLATION_SOURCE", DEFERRED_INSTALLATION_SOURCE),
+        ("LIVE_MARKETPLACE_REPOSITORY", _LIVE_REPOSITORY),
+        ("DEFERRED_MARKETPLACE_REPOSITORY", _DEFERRED_REPOSITORY),
+        ("FIXTURE_MARKER_FILENAME", _MARKER_FILENAME),
+        ("FIXTURE_MARKER_PURPOSE", _MARKER_PURPOSE),
+    ):
+        require(
+            f'export const {name} = "{value}";' in source,
+            f"marketplace delivery identity {name} differs between the producer and the verifier",
+        )
+
+
 def run_marketplace_delivery_self_tests() -> None:
     manifest = _manifest()
     with tempfile.TemporaryDirectory(prefix="codestory-marketplace-delivery-") as raw:
@@ -528,3 +554,4 @@ def run_marketplace_delivery_self_tests() -> None:
         _run_deferred_self_tests(root, manifest)
         _run_live_self_tests(root, manifest)
     _run_retained_provenance_self_tests()
+    _run_shared_identity_self_tests()
