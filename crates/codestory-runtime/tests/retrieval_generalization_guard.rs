@@ -1014,6 +1014,36 @@ fn a_holdout_named_after_one_of_our_crates_is_not_mistaken_for_this_repository()
 }
 
 #[test]
+fn a_holdout_cannot_claim_the_exemption_by_calling_itself_this_repository() {
+    // #1580. `repo.name` is free text a task author writes, and the exemption's
+    // whole effect is that the task contributes no banned markers -- so if the
+    // name were honoured, a holdout could switch the lint off for its own
+    // corpus while pointing anywhere, and a diff of the lint script would show
+    // nothing. Only the URL is evidence of subject.
+    // Residual, deliberately not asserted: a repository genuinely *named*
+    // `codestory` under another owner would still claim the exemption, because
+    // `productRepositoryNames` is derived from crate-name prefixes and carries
+    // no owner to compare. Closing that needs an owner pin, which is a
+    // different decision; the label-only impostor below needs none.
+    for url in [
+        "https://github.com/axios/axios.git",
+        "https://github.com/BurntSushi/ripgrep.git",
+    ] {
+        let derived = derived_patterns_with_extra_task(&self_subject_probe_manifest(
+            "codestory",
+            url,
+            "probeGadgetHandler",
+        ));
+        assert!(
+            derived
+                .iter()
+                .any(|pattern| pattern.contains("probeGadgetHandler")),
+            "a holdout at {url} calling itself `codestory` must still ban its own symbols"
+        );
+    }
+}
+
+#[test]
 fn this_repositorys_own_name_still_claims_the_self_subject_exemption() {
     let derived = derived_patterns_with_extra_task(&self_subject_probe_manifest(
         "codestory",

@@ -891,9 +891,15 @@ function benchmarkTaskFamily(task, filePath) {
     : path.relative(repoRoot, filePath).replaceAll(path.sep, "/");
 }
 
+// Only the URL decides this. `repo.name` is a free-text label a task author
+// writes, so honouring it lets any holdout claim the self-subject exemption --
+// and the exemption's whole effect is that the task contributes no banned
+// markers, so a manifest that names itself `codestory` while pointing at
+// somebody else's repository would switch the lint off for its own corpus,
+// invisibly in a diff of this file. The real self-tasks lose nothing: their
+// URLs already yield the repository segment.
 function benchmarkRepoIsProduct(repo) {
-  return [repo?.name, ...repoUrlSlugs(repo?.url)]
-    .filter((value) => typeof value === "string")
+  return repoUrlSlugs(repo?.url)
     .some((value) => productRepositoryNames.has(value.split("/").pop().toLowerCase()));
 }
 
