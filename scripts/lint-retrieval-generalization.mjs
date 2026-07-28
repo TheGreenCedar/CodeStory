@@ -194,31 +194,63 @@ const requiredScanDirs = [
 
 // The product's own crate vocabulary: a benchmark task that runs against this
 // repository names these, and the product has to keep naming itself.
-const crateNameTokens = readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
+const checkedInCrateNames = readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
   .filter((entry) => entry.isDirectory())
-  .map((entry) => entry.name.split(/[^A-Za-z0-9]+/).filter(Boolean));
+  .map((entry) => entry.name);
+// Additive only, and provably non-widening: an extra name joins the count and
+// the total, and the derived name still has to start a crate that is actually
+// checked in. Extra names can therefore make the derivation fail closed, never
+// hand the self-subject exemption to a name this workspace does not carry.
+const extraCrateNames = (process.env.CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_CRATE_NAMES ?? "")
+  .split(path.delimiter)
+  .filter(Boolean);
+const nameTokens = (name) => name.split(/[^A-Za-z0-9]+/).filter(Boolean);
+const crateNameTokens = checkedInCrateNames.map(nameTokens);
 const productIdentityTokens = new Set(
   crateNameTokens.flat().map((token) => token.toLowerCase()),
 );
 
 // This repository's own name, read from the crates rather than written down:
-// every crate is `codestory-<layer>`, so the token they all share is what the
+// every crate is `codestory-<layer>`, so the token that starts them is what the
 // repository is called. Deciding self-subjecthood on any crate-name token
 // instead would hand the exclusion to a holdout that happened to be called
 // `store`, `runtime`, or `bench`, and silently switch this lint off for it.
+//
+// A strict majority, not unanimity. Unanimity reads the same on today's tree
+// and is far more brittle: one crate that does not follow the convention -- a
+// vendored shim, a scratch member -- leaves no shared prefix and turns this
+// lint off for the whole repository with an exit 2 no contributor can connect
+// to their change. A majority still admits exactly one token, so a holdout
+// named `store` cannot claim the exemption unless half this workspace is
+// named after it.
+const crateNamePrefixCounts = new Map();
+for (const tokens of [...crateNameTokens, ...extraCrateNames.map(nameTokens)]) {
+  const prefix = tokens[0]?.toLowerCase();
+  if (prefix == null) {
+    continue;
+  }
+  crateNamePrefixCounts.set(prefix, (crateNamePrefixCounts.get(prefix) ?? 0) + 1);
+}
+const checkedInCratePrefixes = new Set(
+  crateNameTokens.map((tokens) => tokens[0]?.toLowerCase()).filter(Boolean),
+);
+const countedCrateNameTotal = crateNameTokens.length + extraCrateNames.length;
 const productRepositoryNames = new Set(
-  crateNameTokens.length === 0
-    ? []
-    : crateNameTokens
-      .map((tokens) => tokens[0]?.toLowerCase())
-      .filter((token, _index, tokens) =>
-        token != null && tokens.every((other) => other === token)
-      ),
+  [...crateNamePrefixCounts]
+    .filter(([prefix, count]) =>
+      count * 2 > countedCrateNameTotal && checkedInCratePrefixes.has(prefix)
+    )
+    .map(([prefix]) => prefix),
 );
 if (productRepositoryNames.size === 0) {
+  const seen = [...crateNamePrefixCounts]
+    .map(([prefix, count]) => `${prefix} (${count})`)
+    .sort()
+    .join(", ");
   console.error(
-    "lint-retrieval-generalization: crate names share no common prefix, so this "
-    + "repository's own name cannot be derived",
+    "lint-retrieval-generalization: no crate-name prefix starts a majority of this "
+    + `workspace's ${countedCrateNameTotal} crate(s), so this repository's own name `
+    + `cannot be derived; prefixes seen: ${seen || "none"}`,
   );
   process.exit(2);
 }
@@ -330,6 +362,28 @@ const evalCorpusRoots = [
   path.join(repoRoot, "crates", "codestory-cli", "tests", "fixtures", "packet_search_eval"),
   path.join(repoRoot, "crates", "codestory-bench", "tests", "fixtures", "agent_quality"),
 ];
+
+// The repository paths whose contents decide this lint's verdict: the
+// production it reads, the corpus its bans are derived from, and the files that
+// make up the lint itself. A CI trigger that does not cover all of them runs
+// the gate on everything except the code it guards, so the guard suite reads
+// this list out of the lint rather than keeping a second copy that can drift.
+const dumpGuardedPathsPath = process.env.CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_GUARDED_PATHS;
+if (dumpGuardedPathsPath) {
+  const asRepoPath = (absolute) =>
+    path.relative(repoRoot, absolute).replaceAll(path.sep, "/");
+  writeFileSync(dumpGuardedPathsPath, JSON.stringify({
+    productionDirs: requiredScanDirs.map(asRepoPath),
+    productionFiles: requiredProductionOnlyFiles.map(asRepoPath),
+    corpusDirs: [asRepoPath(benchmarkTaskRoot)],
+    lintFiles: [
+      "scripts/lint-retrieval-generalization.mjs",
+      "scripts/cross-repo-sourcetrail-queries.mjs",
+      asRepoPath(pendingSurfacePath),
+    ],
+  }));
+  process.exit(0);
+}
 
 const missingBenchmarkBoundaryFiles = [
   ...benchmarkIdentityScriptFiles,
@@ -512,10 +566,18 @@ function benchmarkManifestDerivedPatterns() {
 // Repository identity is short enough ("swr", "okio", "mdn") that substring
 // matching would flag unrelated words, so identity tokens carry their own
 // boundaries instead of relying on length.
+//
+// The boundary is alphanumeric-only on purpose. `_` is a word character to a
+// regex but a *separator* to a programmer: `sourcetrail_index`,
+// `axios_adapter`, and `SOURCETRAIL_PATH_BOOST` are exactly the shape a
+// re-introduced steering site takes in Rust, and treating `_` as part of the
+// identifier would let every one of them through while the bare token still
+// failed. Only a letter or digit glued to the token makes it a different word
+// (`tokio` around `okio`, `answerswrongly` around `swr`).
 function benchmarkIdentityDerivedPatterns() {
   return [...benchmarkCorpusMarkerSet.identity]
     .sort()
-    .map((token) => `(?:^|[^A-Za-z0-9_])${escapeRegExp(token)}(?![A-Za-z0-9_])`);
+    .map((token) => `(?:^|[^A-Za-z0-9])${escapeRegExp(token)}(?![A-Za-z0-9])`);
 }
 
 // Split string literals rejoin into the same marker, so the compact scan needs

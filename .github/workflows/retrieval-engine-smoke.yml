@@ -21,6 +21,21 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, and on the
+      # lint itself. crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      # keeps this list equal to the paths the lint reports as guarded.
+      - crates/codestory-runtime/src/agent/**
+      - crates/codestory-runtime/src/search_plan.rs
+      - crates/codestory-runtime/src/search_scoring.rs
+      - crates/codestory-runtime/src/search_terms.rs
+      - crates/codestory-retrieval/src/**
+      - crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      - benchmarks/tasks/**
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/cross-repo-sourcetrail-queries.mjs
+      - scripts/retrieval-generalization-pending.json
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/scripts/install-windows-vulkan-sdk.ps1
@@ -50,6 +65,21 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, and on the
+      # lint itself. crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      # keeps this list equal to the paths the lint reports as guarded.
+      - crates/codestory-runtime/src/agent/**
+      - crates/codestory-runtime/src/search_plan.rs
+      - crates/codestory-runtime/src/search_scoring.rs
+      - crates/codestory-runtime/src/search_terms.rs
+      - crates/codestory-retrieval/src/**
+      - crates/codestory-runtime/tests/retrieval_generalization_guard.rs
+      - benchmarks/tasks/**
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/cross-repo-sourcetrail-queries.mjs
+      - scripts/retrieval-generalization-pending.json
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/scripts/install-windows-vulkan-sdk.ps1

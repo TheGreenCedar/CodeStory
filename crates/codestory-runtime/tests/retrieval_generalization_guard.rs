@@ -920,6 +920,315 @@ fn adding_a_benchmark_task_bans_its_symbols_without_editing_the_lint() {
     );
 }
 
+/// One task manifest naming the repository it is about, written into a corpus
+/// root of its own. The self-subject rule reads `repo`, so these probes are how
+/// a test can ask "would a holdout called `store` be mistaken for us?" without
+/// adding a task to the checked-in corpus.
+fn self_subject_probe_manifest(repo_name: &str, repo_url: &str, symbol: &str) -> String {
+    format!(
+        r#"{{
+  "id": "{repo_name}-self-subject-probe",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {{
+    "name": "{repo_name}",
+    "url": "{repo_url}",
+    "ref": "{ref_sha}"
+  }},
+  "prompt": "Explain how the probe repository handles its own requests end to end.",
+  "expected_files": ["src/probe_gadget.rs"],
+  "expected_symbols": [
+    {{ "name": "{symbol}", "path": "src/probe_gadget.rs", "kind": "function" }}
+  ],
+  "expected_claims": [],
+  "forbidden_claims": []
+}}
+"#,
+        ref_sha = "0".repeat(40),
+    )
+}
+
+/// The bans the lint derives from the corpus when one extra task manifest is
+/// added, separated from the residual literals. The lint writes this itself, so
+/// the test reads the same construction the scan uses.
+fn derived_patterns_with_extra_task(manifest: &str) -> Vec<String> {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let probe_root = TempDir::new().expect("create probe root");
+    let task_root = probe_root.path().join("tasks");
+    let scan_root = probe_root.path().join("src");
+    std::fs::create_dir_all(&task_root).expect("create probe task root");
+    std::fs::create_dir_all(&scan_root).expect("create probe scan root");
+    std::fs::write(task_root.join("probe.task.json"), manifest).expect("write probe manifest");
+    std::fs::write(scan_root.join("probe.rs"), "pub fn probe() {}\n").expect("write probe fixture");
+    let dump_path = probe_root.path().join("patterns.json");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    let output = Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env("CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS", &scan_root)
+        .env("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS", &task_root)
+        .env("CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS", &dump_path)
+        .output()
+        .expect("run lint with self-subject probe");
+    assert!(
+        output.status.success(),
+        "lint failed to dump patterns, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dumped = std::fs::read_to_string(&dump_path).expect("read dumped patterns");
+    let doc: serde_json::Value = serde_json::from_str(&dumped).expect("parse dumped patterns");
+    doc.get("derived")
+        .and_then(|derived| derived.as_array())
+        .expect("dumped patterns carry a derived list")
+        .iter()
+        .filter_map(|pattern| pattern.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The self-subject rule decides which tasks may not contribute symbol bans.
+/// Deciding it on any crate-name token would hand that exemption to a holdout
+/// repository called `store`, `runtime`, or `bench` and switch this lint off
+/// for it silently. This lives beside the Rust guards on purpose: it is the
+/// same contract `scripts/tests/lint-retrieval-generalization.test.mjs` states,
+/// and only the Rust suite runs under the workspace test job that has no path
+/// filter, so the node test alone can be skipped by a trigger that misses.
+#[test]
+fn a_holdout_named_after_one_of_our_crates_is_not_mistaken_for_this_repository() {
+    for impostor in ["store", "runtime", "bench", "indexer"] {
+        let derived = derived_patterns_with_extra_task(&self_subject_probe_manifest(
+            impostor,
+            &format!("https://github.com/example/{impostor}.git"),
+            "probeGadgetHandler",
+        ));
+        assert!(
+            derived
+                .iter()
+                .any(|pattern| pattern.contains("probeGadgetHandler")),
+            "a holdout named `{impostor}` must still ban its own symbols"
+        );
+    }
+}
+
+#[test]
+fn this_repositorys_own_name_still_claims_the_self_subject_exemption() {
+    let derived = derived_patterns_with_extra_task(&self_subject_probe_manifest(
+        "codestory",
+        "https://github.com/TheGreenCedar/CodeStory.git",
+        "probeGadgetHandler",
+    ));
+    assert!(
+        !derived
+            .iter()
+            .any(|pattern| pattern.contains("probeGadgetHandler")),
+        "a task whose subject is this repository must not ban this repository's symbols"
+    );
+}
+
+/// Runs the lint over a neutral fixture with extra crate names counted into the
+/// workspace, which is how a test can ask what happens when a crate does not
+/// follow this repository's `codestory-<layer>` naming convention without
+/// creating a crate directory in the working tree.
+fn run_lint_with_extra_crate_names(extra_crate_names: &[&str]) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    std::fs::write(
+        fixture_root.path().join("fixture.rs"),
+        "pub fn repository_neutral_fixture() {}\n",
+    )
+    .expect("write neutral fixture");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_CRATE_NAMES",
+            extra_crate_names.join(if cfg!(windows) { ";" } else { ":" }),
+        )
+        .output()
+        .expect("run lint with extra crate names")
+}
+
+#[test]
+fn one_crate_off_the_naming_convention_does_not_switch_the_whole_lint_off() {
+    // The repository's own name is derived from its crates so it is not written
+    // down anywhere. Requiring every crate to agree makes a single vendored or
+    // scratch member -- a change with nothing to do with retrieval -- fail the
+    // derivation and exit 2 for the entire repository, which reads to the
+    // contributor as an unrelated, unexplained CI failure.
+    let output = run_lint_with_extra_crate_names(&["probe-vendor-shim"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "one crate off the convention must not stop the lint, stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot be derived"),
+        "the repository's own name must still be derivable, stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_name_this_workspace_does_not_carry_cannot_claim_the_self_subject_exemption() {
+    // The other direction, and the reason the derivation exists: the exemption
+    // may never move to a token that does not start a crate that is actually
+    // checked in, however many members claim it. Failing closed here is the
+    // point -- an undeclared name silently claiming the exemption would switch
+    // this lint off for the holdout that shares it.
+    let crowded: Vec<&str> = vec![
+        "store-a", "store-b", "store-c", "store-d", "store-e", "store-f", "store-g", "store-h",
+        "store-i", "store-j", "store-k", "store-l",
+    ];
+    let output = run_lint_with_extra_crate_names(&crowded);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an undeclared name claiming the majority must fail closed, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be derived"),
+        "the refusal must name what it could not derive, stderr={stderr}"
+    );
+}
+
+/// The repository paths this lint's verdict depends on, read out of the lint
+/// itself so the trigger contract below cannot drift from what is guarded.
+fn lint_guarded_paths() -> Vec<String> {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let dump_root = TempDir::new().expect("create guarded-path dump root");
+    let dump_path = dump_root.path().join("guarded.json");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    let output = Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_GUARDED_PATHS",
+            &dump_path,
+        )
+        .output()
+        .expect("run lint guarded-path dump");
+    assert!(
+        output.status.success(),
+        "lint failed to dump its guarded paths, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump_path).expect("read guarded paths"))
+            .expect("parse guarded paths");
+    let mut guarded = Vec::new();
+    for group in ["productionDirs", "productionFiles", "corpusDirs", "lintFiles"] {
+        for entry in doc
+            .get(group)
+            .and_then(|value| value.as_array())
+            .unwrap_or_else(|| panic!("guarded-path dump carries {group}"))
+        {
+            guarded.push(entry.as_str().expect("guarded path is a string").to_owned());
+        }
+    }
+    assert!(
+        guarded.len() >= 8,
+        "the lint should report every surface it reads, got {guarded:?}"
+    );
+    guarded
+}
+
+/// The `paths:` list of one workflow trigger. The workflow's trigger filters are
+/// plain scalar sequences, so a targeted reader beats adding a YAML dependency
+/// to this crate for one assertion.
+fn workflow_trigger_paths(workflow: &str, trigger: &str) -> Vec<String> {
+    let header = format!("  {trigger}:");
+    let mut lines = workflow.lines().skip_while(|line| line.trim_end() != header);
+    assert!(
+        lines.next().is_some(),
+        "workflow has no `{trigger}:` trigger"
+    );
+    let mut paths = Vec::new();
+    let mut inside_paths = false;
+    for line in lines {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if line.len() - trimmed.len() <= 2 {
+            break;
+        }
+        if trimmed == "paths:" {
+            inside_paths = true;
+            continue;
+        }
+        if inside_paths {
+            match trimmed.strip_prefix("- ") {
+                Some(entry) => paths.push(entry.trim().to_owned()),
+                None => inside_paths = false,
+            }
+        }
+    }
+    paths
+}
+
+fn trigger_filter_covers(filter: &str, guarded: &str) -> bool {
+    if filter == guarded {
+        return true;
+    }
+    match filter.strip_suffix("/**") {
+        Some(prefix) => guarded == prefix || guarded.starts_with(&format!("{prefix}/")),
+        None => false,
+    }
+}
+
+#[test]
+fn retrieval_smoke_workflow_triggers_on_every_path_the_lint_guards() {
+    // The generalization gate runs in retrieval-engine-smoke, and that workflow
+    // is path-filtered. A filter that omits the guarded production, the corpus
+    // the bans are derived from, or the lint itself means a PR that reintroduces
+    // steering, edits the lint, or adds a pending excuse never runs the gate --
+    // the gate the docs claim, not firing on the code it guards.
+    let workflow_path = workspace_root().join(".github/workflows/retrieval-engine-smoke.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("read retrieval smoke workflow");
+    let guarded = lint_guarded_paths();
+
+    for trigger in ["pull_request", "push"] {
+        let filters = workflow_trigger_paths(&workflow, trigger);
+        assert!(
+            filters.len() > 5,
+            "`{trigger}` paths did not parse, got {filters:?}"
+        );
+        let uncovered: Vec<&String> = guarded
+            .iter()
+            .filter(|path| {
+                !filters
+                    .iter()
+                    .any(|filter| trigger_filter_covers(filter, path))
+            })
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "retrieval-engine-smoke `{trigger}` never fires on these paths the generalization \
+             lint reads: {uncovered:?}"
+        );
+    }
+}
+
 #[test]
 fn a_probe_task_root_never_writes_into_the_checked_in_corpus() {
     let corpus = workspace_root().join("benchmarks/tasks");
@@ -944,6 +1253,73 @@ fn a_probe_task_root_never_writes_into_the_checked_in_corpus() {
         corpus_manifest_names(&corpus),
         "the checked-in corpus must be untouched by a lint probe"
     );
+}
+
+/// Every banned pattern the lint reported, keyed by the fixture file it named.
+/// Asserting only that a fixture's name appears in stderr cannot tell "the ban
+/// I planted fired" from "some unrelated ban matched the same file", so a lost
+/// ban reads as a covered one. Reading the pattern out of the report closes
+/// that gap, and every test that plants a ban uses it.
+fn reported_patterns_by_fixture(stderr: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut reported: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in stderr.lines() {
+        let Some(rest) = [
+            "Banned pattern /",
+            "Banned literal pattern /",
+            "Banned compact benchmark marker /",
+        ]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix)) else {
+            continue;
+        };
+        // A pattern can contain `/` itself (`data/indexer`, `lib/axios\.js`), so
+        // the header is split at the last `/ in `, not the first slash.
+        let Some(split) = rest.rfind("/ in ") else {
+            continue;
+        };
+        let (pattern, tail) = rest.split_at(split);
+        let tail = &tail["/ in ".len()..];
+        let Some(path_end) = tail.rfind(" (") else {
+            continue;
+        };
+        let file = tail[..path_end]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        reported.entry(file).or_default().push(pattern.to_owned());
+    }
+    reported
+}
+
+/// The corpus text a reported pattern is about, with its regex scaffolding
+/// removed: identity bans carry their own boundaries, and every ban escapes its
+/// literal. Comparing this against the planted text is what turns "something
+/// fired" into "the ban I planted fired".
+fn banned_pattern_core(pattern: &str) -> String {
+    pattern
+        .trim_start_matches("(?:^|[^A-Za-z0-9])")
+        .trim_start_matches("(?:^|[^A-Za-z0-9_])")
+        .trim_end_matches("(?![A-Za-z0-9])")
+        .trim_end_matches("(?![A-Za-z0-9_])")
+        .replace('\\', "")
+        .to_lowercase()
+}
+
+/// True when the lint's report for `fixture` names a ban that is about
+/// `planted` rather than about some incidental text in the fixture wrapper.
+fn ban_fired_for(
+    reported: &std::collections::BTreeMap<String, Vec<String>>,
+    fixture: &str,
+    planted: &str,
+) -> bool {
+    let planted = planted.to_lowercase();
+    reported.get(fixture).is_some_and(|patterns| {
+        patterns
+            .iter()
+            .any(|pattern| planted.contains(&banned_pattern_core(pattern)))
+    })
 }
 
 fn corpus_manifest_names(corpus: &Path) -> Vec<String> {
@@ -1054,12 +1430,57 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
         "expected the corpus to name many repositories, found {names:?}"
     );
 
+    // Each name is planted four ways. The bare literal is the easy shape -- it
+    // is already delimited by its own quotes, so a boundary that treats `_` as
+    // part of the identifier still reports it. The other three are the shapes a
+    // re-introduced steering site actually takes in Rust, where `_` is the word
+    // separator: `sourcetrail_index`, `index_sourcetrail`,
+    // `redis_command_boost`, `AXIOS_PATH_BOOST`. A ban that only survives the
+    // first shape is lost in practice, and only planting the evading shapes can
+    // say so.
     let mut fixtures = Vec::new();
+    let mut planted: Vec<(String, String)> = Vec::new();
     for (index, name) in names.iter().enumerate() {
-        fixtures.push((
-            format!("repo_name_{index}.rs"),
-            format!("pub const PLANTED: &str = \"{name} cache key\";\n"),
-        ));
+        let mut shapes = vec![
+            (
+                format!("repo_name_{index}.rs"),
+                format!("pub const PLANTED: &str = \"{name} cache key\";\n"),
+                format!("{name} cache key"),
+            ),
+            (
+                format!("repo_glue_{index}.rs"),
+                format!("pub const PLANTED: &str = \"boost_{name}_paths\";\n"),
+                format!("boost_{name}_paths"),
+            ),
+        ];
+        // The identifier shapes need a name that is legal identifier text; the
+        // hyphenated slugs (`chinook-database`) can only be planted as literals.
+        if name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        {
+            shapes.push((
+                format!("repo_fn_{index}.rs"),
+                format!(
+                    "pub fn {}_command_boost(path: &str) -> f32 {{ 1.0 }}\n",
+                    name.to_lowercase()
+                ),
+                format!("{}_command_boost", name.to_lowercase()),
+            ));
+            shapes.push((
+                format!("repo_const_{index}.rs"),
+                format!(
+                    "pub const {}_PATH_BOOST: f32 = 1.5;\n",
+                    name.to_uppercase()
+                ),
+                format!("{}_PATH_BOOST", name.to_uppercase()),
+            ));
+        }
+        for (file_name, contents, text) in shapes {
+            fixtures.push((file_name.clone(), contents));
+            planted.push((file_name, text));
+        }
     }
     let borrowed: Vec<(&str, &str)> = fixtures
         .iter()
@@ -1067,21 +1488,35 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
         .collect();
     let output = run_lint_with_named_fixtures(&borrowed);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let reported_patterns = reported_patterns_by_fixture(&stderr);
+    let planted_by_file: std::collections::BTreeMap<&str, &str> = planted
+        .iter()
+        .map(|(file, text)| (file.as_str(), text.as_str()))
+        .collect();
 
     let mut unbanned = Vec::new();
     let mut stale_rulings = Vec::new();
     for (index, name) in names.iter().enumerate() {
-        let reported = stderr.contains(&format!("repo_name_{index}.rs"));
-        match (reported, ruled_out.contains_key(name.as_str())) {
-            (false, false) => unbanned.push(name.clone()),
-            (true, true) => stale_rulings.push(name.clone()),
-            _ => {}
+        let is_ruled_out = ruled_out.contains_key(name.as_str());
+        for prefix in ["repo_name", "repo_glue", "repo_fn", "repo_const"] {
+            let fixture = format!("{prefix}_{index}.rs");
+            let Some(text) = planted_by_file.get(fixture.as_str()) else {
+                continue;
+            };
+            // The ban has to be about the name we planted, not about some other
+            // corpus marker that happened to match the same fixture.
+            let reported = ban_fired_for(&reported_patterns, &fixture, text);
+            match (reported, is_ruled_out) {
+                (false, false) => unbanned.push(format!("{name} ({fixture})")),
+                (true, true) => stale_rulings.push(format!("{name} ({fixture})")),
+                _ => {}
+            }
         }
     }
     assert!(
         unbanned.is_empty(),
-        "these corpus repository names are not banned and are not ruled out in \
-         CORPUS_NAMES_RULED_OUT_OF_THE_BAN: {unbanned:?}"
+        "these corpus repository names are not banned in the shape shown and are not ruled out \
+         in CORPUS_NAMES_RULED_OUT_OF_THE_BAN: {unbanned:?}"
     );
     assert!(
         stale_rulings.is_empty(),
@@ -1089,7 +1524,20 @@ fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
          rulings: {stale_rulings:?}"
     );
 
-    let unrelated = run_lint_with_fixture(r#"pub const PROSE: &str = "answers welcome";"#);
+    // The boundary must stay a boundary. A letter or digit glued to the token
+    // makes a different word, and widening the ban to catch `sourcetrail_index`
+    // must not also ban `tokio` (`okio`) or `answerswrongly` (`swr`).
+    let unrelated = run_lint_with_fixture(
+        r#"use tokio::sync::Mutex;
+
+pub const PROSE: &str = "answers welcome";
+pub const ADVERB: &str = "answerswrongly";
+
+pub fn held() -> Mutex<u8> {
+    Mutex::new(0)
+}
+"#,
+    );
     assert!(
         unrelated.status.success(),
         "a repository name must not match inside ordinary words, stderr={}",
@@ -1340,9 +1788,13 @@ fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
         "the pre-derivation ban floor must fail lint, stderr={stderr}"
     );
 
+    // A report is only proof of coverage if the ban it names is about the text
+    // we planted; "the fixture appears in stderr" would also be satisfied by an
+    // unrelated marker matching the same line.
+    let reported = reported_patterns_by_fixture(&stderr);
     let mut lost = Vec::new();
     for (index, planted) in PRE_DERIVATION_BAN_FLOOR.iter().enumerate() {
-        if !stderr.contains(&format!("floor-{index}.rs")) {
+        if !ban_fired_for(&reported, &format!("floor-{index}.rs"), planted) {
             lost.push(*planted);
         }
     }
@@ -1355,5 +1807,87 @@ fn linter_still_reports_every_ban_it_had_before_the_corpus_was_derived() {
         lost.is_empty(),
         "deriving the corpus lost these bans; derive them again or add them to \
          residualBannedLiterals in scripts/lint-retrieval-generalization.mjs: {lost:?}"
+    );
+}
+
+#[test]
+fn linter_still_reports_its_bans_when_a_separator_is_glued_to_them() {
+    // The floor above plants each ban alone inside `"..."`, so the quotes
+    // already delimit it and a boundary that counts `_` as identifier text
+    // still reports it. That is not the shape a re-introduced steering site
+    // takes: Rust spells its steering `sourcetrail_index`, `axios_adapter`,
+    // `redis_command_boost`, `AXIOS_PATH_BOOST`. Planting the same floor glued
+    // to `_` is the only way the floor can tell "still banned" from "banned
+    // only in the shape nobody writes".
+    let glued: Vec<&&str> = PRE_DERIVATION_BAN_FLOOR
+        .iter()
+        .filter(|planted| {
+            planted.chars().all(|c| c.is_ascii_alphanumeric())
+                && planted.starts_with(|c: char| c.is_ascii_alphabetic())
+        })
+        .collect();
+    assert!(
+        glued.len() > 30,
+        "the floor should have many single-token bans to glue, found {}",
+        glued.len()
+    );
+
+    let mut fixtures = Vec::new();
+    let mut planted_by_file: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (index, planted) in glued.iter().enumerate() {
+        for (shape, file_name, contents, text) in [
+            (
+                "literal",
+                format!("glued-lit-{index}.rs"),
+                format!("pub const PLANTED: &str = \"boost_{planted}_paths\";\n"),
+                format!("boost_{planted}_paths"),
+            ),
+            (
+                "function",
+                format!("glued-fn-{index}.rs"),
+                format!(
+                    "pub fn {}_command_boost(path: &str) -> f32 {{ 1.0 }}\n",
+                    planted.to_lowercase()
+                ),
+                format!("{}_command_boost", planted.to_lowercase()),
+            ),
+            (
+                "constant",
+                format!("glued-const-{index}.rs"),
+                format!(
+                    "pub const {}_PATH_BOOST: f32 = 1.5;\n",
+                    planted.to_uppercase()
+                ),
+                format!("{}_PATH_BOOST", planted.to_uppercase()),
+            ),
+        ] {
+            let _ = shape;
+            fixtures.push((file_name.clone(), contents));
+            planted_by_file.insert(file_name, text);
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = fixtures
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let output = run_lint_with_named_fixtures(&borrowed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the glued ban floor must fail lint, stderr={stderr}"
+    );
+
+    let reported = reported_patterns_by_fixture(&stderr);
+    let mut lost = Vec::new();
+    for (file_name, text) in &planted_by_file {
+        if !ban_fired_for(&reported, file_name, text) {
+            lost.push(text.clone());
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "these bans are lost the moment a separator touches them, which is how a \
+         steering site would actually spell them: {lost:?}"
     );
 }
