@@ -1629,6 +1629,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "node .github/scripts/run-actionlint.mjs",
   ]);
   requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
+    ".github/scripts/build-marketplace-fixture.test.mjs",
     "scripts/tests/codestory-release-claims.test.mjs",
     "scripts/tests/codestory-release-cell-manifest.test.mjs",
     "scripts/tests/codestory-release-closeout.test.mjs",

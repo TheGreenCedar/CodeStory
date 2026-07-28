@@ -55,18 +55,30 @@ if (typeof manifest.version !== "string" || !manifest.version) {
 
 const catalogDirectory = path.join(path.resolve(args.out), ".agents", "plugins");
 mkdirSync(catalogDirectory, { recursive: true });
+// Mirrors the live catalog's shape at .agents/plugins/marketplace.json. The
+// resolver rejects a catalog missing `name`, and the live catalog carries no
+// version field at either level - the pinned `sha` is what selects the plugin,
+// so inventing one here would prove an install path the real catalog cannot
+// produce.
 const catalog = {
-  version: 1,
+  name: "TheGreenCedar",
+  interface: {
+    displayName: "TheGreenCedar",
+  },
   plugins: [
     {
       name: "codestory",
-      version: manifest.version,
       source: {
         source: "git-subdir",
-        path: "plugins/codestory",
         url: "https://github.com/TheGreenCedar/CodeStory.git",
+        path: "plugins/codestory",
         sha: commit,
       },
+      policy: {
+        installation: "AVAILABLE",
+        authentication: "ON_INSTALL",
+      },
+      category: "Developer Tools",
     },
   ],
 };
