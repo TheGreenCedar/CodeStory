@@ -62,6 +62,7 @@ jobs:
       - name: Check release claim and evidence contracts
         run: >-
           node --test
+          .github/scripts/build-marketplace-fixture.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-cell-manifest.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
