@@ -409,13 +409,21 @@ def _run_deferred_self_tests(root: Path, manifest: dict) -> None:
     _git(world["marketplace_root"], "remote", "add", "origin", _LIVE_URL)
     dressed = copy.deepcopy(world["attestation"])
     _restamp(dressed, _git(world["marketplace_root"], "rev-parse", "HEAD"))
+    # The refusal is recorded, not raised inside the `try`: a sentinel raised there is caught by
+    # this very handler, so the case would pass whether or not the predicate refused anything.
+    refusal: ProofFailure | None = None
     try:
         _verify(world, dressed, root, manifest)
-        raise ProofFailure(
-            "installed-runtime identity accepted a fixture wearing the live marketplace origin"
-        )
-    except ProofFailure:
-        pass
+    except ProofFailure as exc:
+        refusal = exc
+    require(
+        refusal is not None,
+        "installed-runtime identity accepted a fixture wearing the live marketplace origin",
+    )
+    require(
+        "invalid or mutable Git identity" in str(refusal),
+        f"a fixture wearing the live marketplace origin was refused for the wrong reason: {refusal}",
+    )
 
 
 def _restamp(attestation: dict, revision: str) -> None:
