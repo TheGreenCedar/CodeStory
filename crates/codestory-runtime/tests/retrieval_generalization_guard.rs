@@ -811,3 +811,97 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
         );
     }
 }
+
+/// Removes a probe manifest from the checked-in corpus even if the test panics.
+struct ProbeManifest {
+    path: PathBuf,
+}
+
+impl ProbeManifest {
+    fn write(repo_root: &Path, symbol: &str) -> Self {
+        let path = repo_root.join("benchmarks/tasks/generalization-lint-probe.task.json");
+        let manifest = format!(
+            r#"{{
+  "id": "generalization-lint-probe",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {{
+    "name": "generalization-lint-probe-repo",
+    "url": "https://github.com/example/generalization-lint-probe.git",
+    "ref": "{ref_sha}"
+  }},
+  "prompt": "Explain how the probe repository moves a request into its own storage layer.",
+  "expected_files": ["src/probe/generalization_probe_surface.ts"],
+  "expected_symbols": [
+    {{ "name": "{symbol}", "path": "src/probe/generalization_probe_surface.ts" }}
+  ],
+  "expected_claims": [{{ "text": "The probe repository owns its own request path." }}],
+  "forbidden_claims": [],
+  "quality_thresholds": {{
+    "min_expected_anchor_recall": 0.8,
+    "min_expected_file_recall": 0.8,
+    "min_expected_symbol_recall": 0.8,
+    "min_expected_claim_recall": 0.8,
+    "min_citation_coverage": 0.8,
+    "max_forbidden_claims": 0
+  }}
+}}
+"#,
+            ref_sha = "0".repeat(40),
+            symbol = symbol,
+        );
+        std::fs::write(&path, manifest).expect("write probe manifest");
+        Self { path }
+    }
+}
+
+impl Drop for ProbeManifest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn adding_a_benchmark_task_bans_its_symbols_without_editing_the_lint() {
+    let fixture = r#"pub const PLANTED: &str = "GeneralizationProbeAnchor";"#;
+    let before = run_lint_with_fixture(fixture);
+    assert!(
+        before.status.success(),
+        "the probe symbol should be unknown before its task manifest exists, stderr={}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    let _manifest = ProbeManifest::write(&workspace_root(), "GeneralizationProbeAnchor");
+    let after = run_lint_with_fixture(fixture);
+    let stderr = String::from_utf8_lossy(&after.stderr);
+    assert!(
+        !after.status.success(),
+        "a new task manifest should extend the ban on its own, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("GeneralizationProbeAnchor"),
+        "lint should report the symbol the new manifest introduced, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
+    let leaked = run_lint_with_fixture(r#"pub const PLANTED: &str = "swr cache key";"#);
+    let leaked_stderr = String::from_utf8_lossy(&leaked.stderr);
+    assert!(
+        !leaked.status.success(),
+        "a holdout repository name should fail lint, stderr={leaked_stderr}"
+    );
+    assert!(
+        leaked_stderr.contains("swr"),
+        "lint should report the holdout repository name, stderr={leaked_stderr}"
+    );
+
+    let unrelated = run_lint_with_fixture(r#"pub const PROSE: &str = "answers welcome";"#);
+    assert!(
+        unrelated.status.success(),
+        "a repository name must not match inside ordinary words, stderr={}",
+        String::from_utf8_lossy(&unrelated.stderr)
+    );
+}

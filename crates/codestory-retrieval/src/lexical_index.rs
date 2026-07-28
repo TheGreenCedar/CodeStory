@@ -1078,10 +1078,7 @@ fn command_query_tokens(query: &str) -> Vec<String> {
     for character in query.chars() {
         if character == '`' {
             if in_backticks {
-                for token in lexical_query_tokens(&current)
-                    .into_iter()
-                    .filter(|token| token != "codex")
-                {
+                for token in lexical_query_tokens(&current) {
                     if !tokens.iter().any(|existing| existing == &token) {
                         tokens.push(token);
                     }

@@ -191,7 +191,75 @@ const requiredScanDirs = [
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [];
+// The product's own crate vocabulary: a benchmark task that runs against this
+// repository names these, and the product has to keep naming itself.
+const productIdentityTokens = new Set(
+  readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => entry.name.split(/[^A-Za-z0-9]+/))
+    .filter(Boolean)
+    .map((token) => token.toLowerCase()),
+);
+
+// Corpus repositories whose name is also ordinary code vocabulary. Banning the
+// bare token would flag `std::fmt` or an HTTP mention, so these repositories
+// stay covered by their file, symbol, and prompt markers instead. Everything
+// here must be a word production code is expected to use on its own terms.
+const genericIdentityTokens = new Set([
+  "fmt",
+  "http",
+  "requests",
+]);
+
+// Corpus markers that are ordinary vocabulary once normalised. Same rule as
+// above: production code owns these words, so a corpus that happens to contain
+// one stays covered by its other markers.
+const genericBenchmarkMarkers = new Set([
+  "codestory",
+  "request",
+  "requests",
+  "response",
+  "responses",
+  "dispatch",
+  "router",
+  "routepath",
+  "approute",
+  "comments",
+  "indexfile",
+  "runindex",
+  "buildindex",
+  "servicesrs",
+  "sourcegroup",
+  "indexercommand",
+  "subcommand",
+  "eventprocessor",
+  "jsonoutput",
+  "jsonlevent",
+  "schema",
+  "source",
+  "storage",
+  "indexing",
+  "configuration",
+  "validation",
+  "serialize",
+  "serializes",
+  "serialized",
+  "serialization",
+  "foreignkey",
+  "references",
+  "formatto",
+  "formaterror",
+  "formaterrorcode",
+  "formatwindowserror",
+  "internalmutate",
+]);
+
+// Search-plan term extraction is where holdout symbol injection lived before
+// the v0.16.1 audit, so it is scanned by name even though the search modules
+// around it are not yet under the corpus scan.
+const requiredProductionOnlyFiles = [
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "search_terms.rs"),
+];
 
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
@@ -236,6 +304,7 @@ const benchmarkPromptScriptFiles = [
   },
 ];
 const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
+const pendingSurfacePath = path.join(repoRoot, "scripts", "retrieval-generalization-pending.json");
 const benchmarkEvalProbeManifestPath = path.join(benchmarkTaskRoot, "eval-probes.json");
 const benchmarkEvalProbeSourcePath = path.join(
   repoRoot,
@@ -285,126 +354,30 @@ const corpusHarnessCompactPatternList = compactBoundaryPatterns(
   corpusHarnessDependencyPatternList,
 );
 
-const bannedPatterns = [
-  "payload_config",
-  "freelancer",
-  "traderotate",
-  "vscode",
-  "codex-rs",
-  "sourcetrail",
-  "extHostCommands",
-  "extensionService",
-  "workbench\\.ts",
-  "codex_exec::",
-  "exec_events",
-  "StorageAccess",
-  "PersistentStorage",
-  "SourceGroupCxxCdb",
-  "IndexerJava",
-  "data[/\\\\]indexer",
-  "ExecSharedCliOptions",
-  "EventProcessorWithJsonOutput",
-  "Subcommand::Exec",
-  "ThreadStartParams",
-  "TurnStartParams",
-  "chinook",
-  "mdn",
-  "okio",
-  "monolog",
-  "alamofire",
-  "ChinookDatabase",
-  "form-validation",
-  "commonMain/kotlin/okio",
-  "src/Monolog",
-  "Source/Core/Session\\.swift",
-  "SocialEntries",
-  "ElsewhereFeed",
-  "src/lib_cxx",
-  "src/lib_java",
-  "src/lib/data/storage",
-  "getPayloadClient",
-  "comment_submission_guard",
-  "axios",
-  "redis",
-  "ripgrep",
-  "createInstance",
-  "InterceptorManager",
-  "dispatchRequest",
-  "readQueryFromClient",
-  "processCommand",
-  "aeMain",
-  "aeProcessEvents",
-  "HiArgs",
-  "SearchWorker",
-  "search_parallel",
-  "adapters\\.js",
-  "server\\.c",
-  "ae\\.c",
-  "networking\\.c",
-  "core/main\\.rs",
-  "flags/hiargs\\.rs",
-  "haystack\\.rs",
-  "lib/axios\\.js",
-  "lib/core/Axios\\.js",
-  "StringUtils",
-  "commons-lang",
-  "PreparedRequest",
-  "HTTPAdapter",
-  "createApplication",
-  "app\\.use",
-  "lib/express\\.js",
-  "Jekyll",
-  "LogRecord",
-  "AbstractProcessingHandler",
-  "useSWR",
-  "swr",
-  "gin\\.go",
-  "RouterGroup\\.Handle",
-  "Engine\\.addRoute",
-  "Engine\\.handleHTTPRequest",
-  "AutoMapper",
-  "TypeMapPlanBuilder",
-  "RealBufferedSource",
-  "RealBufferedSink",
-  "DataRequest",
-  "SessionDelegate",
-  "novalidate",
-  "showError",
-  "source/animate\\.css",
-  "nvm",
-  "install\\.sh\\s+nvm",
-  "bash_completion\\s+__nvm",
-  "--with-holdout-clone",
+// Every banned corpus token is read out of the checked-in benchmark surfaces,
+// so adding a task manifest extends the ban with that task's repository,
+// symbols, and files instead of waiting for someone to remember this file.
+const benchmarkCorpusMarkerSet = benchmarkCorpusMarkers();
+
+// Corpora overlap by design, so the same marker arrives from several of them;
+// one pattern per marker keeps the report readable.
+const bannedPatterns = [...new Set([
   ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
   ...benchmarkScriptPromptDerivedPatterns(),
   ...benchmarkQueryCatalogDerivedPatterns(),
-];
+  ...benchmarkIdentityDerivedPatterns(),
+])];
 
 const bannedLiteralPatterns = [
   "payload_collection",
 ];
 
-const bannedCompactPatterns = [
-  "swr",
-  "useswr",
-  "stringutils",
-  "charsequenceutils",
-  "preparedrequest",
-  "httpadapter",
-  "createapplication",
-  "appuse",
-  "jekyll",
-  "logrecord",
-  "automapper",
-  "realbufferedsource",
-  "realbufferedsink",
-  "datarequest",
-  "sessiondelegate",
-  "sourceanimatecss",
+const bannedCompactPatterns = [...new Set([
+  ...benchmarkCorpusCompactPatterns(),
   ...evalCorpusCompactPatternList,
-];
+])];
 
 const allowedPatternLines = [
   {
@@ -454,10 +427,81 @@ function compactBoundaryPatterns(boundaryPatterns) {
 }
 
 function benchmarkManifestDerivedPatterns() {
+  return [...benchmarkCorpusMarkerSet.descriptive].sort().map(escapeRegExp);
+}
+
+// Repository identity is short enough ("swr", "okio", "mdn") that substring
+// matching would flag unrelated words, so identity tokens carry their own
+// boundaries instead of relying on length.
+function benchmarkIdentityDerivedPatterns() {
+  return [...benchmarkCorpusMarkerSet.identity]
+    .sort()
+    .map((token) => `(?:^|[^A-Za-z0-9_])${escapeRegExp(token)}(?![A-Za-z0-9_])`);
+}
+
+// Split string literals rejoin into the same marker, so the compact scan needs
+// the same corpus vocabulary the line scan uses.
+function benchmarkCorpusCompactPatterns() {
+  const compact = new Set();
+  for (const marker of benchmarkCorpusMarkerSet.descriptive) {
+    const normalized = compactProductionSource(marker);
+    // `useSWR` rejoins from "use" and "SWR"; the compact scan needs the short
+    // identifiers too, and it compares whole literals so it can afford them.
+    const floor = identifierShapedMarker(marker) ? 6 : 8;
+    if (normalized.length >= floor && !genericBenchmarkMarkers.has(normalized)) {
+      compact.add(normalized);
+    }
+  }
+  for (const token of benchmarkCorpusMarkerSet.identity) {
+    const normalized = compactProductionSource(token);
+    if (normalized.length >= 3) {
+      compact.add(normalized);
+    }
+  }
+  return [...compact].sort();
+}
+
+function benchmarkCorpusMarkers() {
+  const records = [
+    ...benchmarkManifestMarkerRecords(),
+    ...benchmarkScriptRepoMarkerRecords(),
+    ...benchmarkFixtureNameMarkerRecords(),
+  ];
+  const descriptive = new Set();
+  const identity = new Set();
+  const coverage = new Map();
+  for (const record of records) {
+    if (!coverage.has(record.family)) {
+      coverage.set(record.family, 0);
+    }
+    const accepted = record.kind === "identity"
+      ? addIdentityMarker(identity, record.marker)
+      : addSpecificMarker(descriptive, record.marker, record.options);
+    if (accepted) {
+      coverage.set(record.family, coverage.get(record.family) + 1);
+    }
+  }
+  if (coverage.size === 0 || descriptive.size === 0 || identity.size === 0) {
+    throw new Error("benchmark corpora produced no generalization markers");
+  }
+  // A family whose every marker was filtered out is invisible to this lint, and
+  // a silent gap is worse than a loud one: name it instead of shipping it.
+  const uncovered = [...coverage]
+    .filter(([, count]) => count === 0)
+    .map(([family]) => family)
+    .sort();
+  if (uncovered.length > 0) {
+    throw new Error(
+      `benchmark corpus families produced no generalization markers: ${uncovered.join(", ")}`,
+    );
+  }
+  return { descriptive, identity };
+}
+
+function benchmarkManifestMarkerRecords() {
   if (!existsSync(benchmarkTaskRoot)) {
     throw new Error(`benchmark task root is missing: ${benchmarkTaskRoot}`);
   }
-  const markers = new Set();
   const manifestFiles = walkFiles(
     benchmarkTaskRoot,
     (candidate) => candidate.endsWith(".task.json"),
@@ -465,6 +509,7 @@ function benchmarkManifestDerivedPatterns() {
   if (manifestFiles.length === 0) {
     throw new Error(`benchmark task root has no .task.json manifests: ${benchmarkTaskRoot}`);
   }
+  const records = [];
   let parsedTaskCount = 0;
   for (const filePath of manifestFiles) {
     let manifest;
@@ -475,36 +520,199 @@ function benchmarkManifestDerivedPatterns() {
     }
     for (const task of benchmarkManifestTasks(manifest)) {
       parsedTaskCount += 1;
-      addSpecificMarker(markers, task.id);
-      addRepoMarkers(markers, task.repo);
-      addSpecificMarker(markers, task.prompt, { allowExactPhrase: true });
-      for (const expectedFile of task.expected_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      const family = benchmarkTaskFamily(task, filePath);
+      const push = (marker, options) => records.push({ family, marker, options });
+      push(task.id);
+      push(task.prompt, { allowExactPhrase: true });
+      for (const claim of [...task.expected_claims ?? [], ...task.forbidden_claims ?? []]) {
+        push(claim?.text, { allowExactPhrase: true });
       }
-      for (const expectedFile of task.expected_verification_files ?? []) {
-        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      for (const marker of repoIdentityMarkers(task.repo)) {
+        records.push({ family, ...marker });
       }
-      for (const symbol of task.expected_symbols ?? []) {
-        if (typeof symbol === "string") {
-          addSpecificMarker(markers, symbol);
-        } else {
-          addSpecificMarker(markers, symbol?.name);
-          addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
-          addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+      // A task on this repository lists the product's own files and symbols;
+      // banning those would ban the product from naming itself. Its prompt and
+      // claims still may not appear in production.
+      if (benchmarkRepoIsProduct(task.repo)) {
+        continue;
+      }
+      const expectedFiles = [
+        ...task.expected_files ?? [],
+        ...task.expected_verification_files ?? [],
+      ];
+      for (const expectedFile of expectedFiles) {
+        for (const variant of pathMarkerVariants(expectedFile)) {
+          push(variant, { allowSpecificComposite: true });
         }
       }
-      for (const claim of task.expected_claims ?? []) {
-        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
-      }
-      for (const claim of task.forbidden_claims ?? []) {
-        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
+      for (const symbol of task.expected_symbols ?? []) {
+        const name = typeof symbol === "string" ? symbol : symbol?.name;
+        for (const variant of symbolMarkerVariants(name)) {
+          push(variant, { allowIdentifier: true });
+        }
+        if (typeof symbol !== "string") {
+          push(symbol?.qualified_name, { allowSpecificComposite: true });
+          for (const variant of pathMarkerVariants(symbol?.path)) {
+            push(variant, { allowSpecificComposite: true });
+          }
+        }
       }
     }
   }
-  if (parsedTaskCount === 0 || markers.size === 0) {
-    throw new Error("benchmark manifests produced no generalization markers");
+  if (parsedTaskCount === 0) {
+    throw new Error("benchmark manifests produced no tasks");
   }
-  return [...markers].sort().map(escapeRegExp);
+  return records;
+}
+
+// The A/B harness carries repositories that have no manifest of their own; they
+// are corpus identity all the same.
+function benchmarkScriptRepoMarkerRecords() {
+  const records = [];
+  for (const { filePath, startMarker, endMarker } of benchmarkPromptScriptFiles) {
+    const source = readFileSync(filePath, "utf8");
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start + startMarker.length);
+    if (start < 0 || end < 0 || end <= start) {
+      throw new Error(
+        `benchmark prompt script is missing corpus boundary markers: ${filePath}`,
+      );
+    }
+    const corpusSource = source.slice(start, end);
+    const repoEntries = [...corpusSource.matchAll(/^ {2}([A-Za-z][A-Za-z0-9_-]*):\s*\{/gm)];
+    if (repoEntries.length === 0) {
+      throw new Error(`benchmark prompt script declared no repositories: ${filePath}`);
+    }
+    for (const [index, entry] of repoEntries.entries()) {
+      const family = entry[1];
+      const entryEnd = index + 1 < repoEntries.length
+        ? repoEntries[index + 1].index
+        : corpusSource.length;
+      const entrySource = corpusSource.slice(entry.index, entryEnd);
+      records.push({ family, kind: "identity", marker: family });
+      const url = entrySource.match(/\burl\s*:\s*"([^"]*)"/);
+      for (const marker of repoIdentityMarkers({ url: url?.[1] })) {
+        records.push({ family, ...marker });
+      }
+    }
+  }
+  return records;
+}
+
+// Fixture file names identify their corpus repository even when the fixture
+// carries no manifest fields at all.
+function benchmarkFixtureNameMarkerRecords() {
+  const fixtures = walkFiles(
+    benchmarkTaskRoot,
+    (candidate) => candidate.endsWith(".json") && !candidate.endsWith(".schema.json"),
+  );
+  if (fixtures.length === 0) {
+    throw new Error(`benchmark task root has no corpus fixtures: ${benchmarkTaskRoot}`);
+  }
+  return fixtures.map((filePath) => ({
+    family: "benchmark fixture names",
+    marker: path.basename(filePath).replace(/\.[^.]+$/, "").replace(/\.task$/, ""),
+    options: { allowSpecificComposite: true },
+  }));
+}
+
+function benchmarkTaskFamily(task, filePath) {
+  const name = typeof task?.repo?.name === "string" ? task.repo.name.trim() : "";
+  if (name.length > 0) {
+    return name;
+  }
+  return typeof task?.id === "string" && task.id.trim().length > 0
+    ? task.id.trim()
+    : path.relative(repoRoot, filePath).replaceAll(path.sep, "/");
+}
+
+function benchmarkRepoIsProduct(repo) {
+  return [repo?.name, ...repoUrlSlugs(repo?.url)]
+    .filter((value) => typeof value === "string")
+    .some((value) => productIdentityTokens.has(value.split("/").pop().toLowerCase()));
+}
+
+function repoIdentityMarkers(repo) {
+  const markers = [];
+  const slugs = repoUrlSlugs(repo?.url);
+  for (const value of [repo?.name, ...slugs]) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      continue;
+    }
+    if (value.includes("/")) {
+      markers.push({ marker: value, options: { allowSpecificComposite: true } });
+      for (const part of value.split("/")) {
+        markers.push({ kind: "identity", marker: part });
+      }
+      continue;
+    }
+    markers.push({ kind: "identity", marker: value });
+  }
+  return markers;
+}
+
+// A corpus file is quoted in pieces as often as whole, so windows of the path
+// count too. `src/main/java` or `index.js` name a build layout rather than a
+// repository, so a window has to carry a segment that could only have come from
+// this corpus.
+function pathMarkerVariants(filePath) {
+  if (typeof filePath !== "string" || filePath.trim().length === 0) {
+    return [];
+  }
+  const segments = filePath.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (segments.length === 0) {
+    return [];
+  }
+  const windows = [segments[segments.length - 1]];
+  for (let index = 0; index + 1 < segments.length; index += 1) {
+    windows.push(`${segments[index]}/${segments[index + 1]}`);
+  }
+  // A directory such as `form-validation` or `lib_cxx` is quoted on its own as
+  // readily as with its neighbours. Two joined words are the bar: `Execution`
+  // and `_internal` are words any tree may use.
+  windows.push(...segments.filter(pathSegmentNamesTwoWords));
+  return [
+    segments.join("/"),
+    ...windows.filter(pathWindowIsDistinctive),
+  ];
+}
+
+function pathWindowIsDistinctive(window) {
+  if (window.split("/").some(pathSegmentIsDistinctive)) {
+    return true;
+  }
+  // `src/main` and `index.js` are build layout; `data/indexer` and
+  // `core/main.rs` are only long enough to be somebody's actual tree.
+  return compactProductionSource(window).length >= 10;
+}
+
+function pathSegmentNamesTwoWords(segment) {
+  return /[_-]/.test(segment)
+    && segment.split(/[^A-Za-z0-9]+/).filter((word) => word.length >= 3).length >= 2;
+}
+
+function pathSegmentIsDistinctive(segment) {
+  if (/[_-]/.test(segment) || /[A-Z]/.test(segment)) {
+    return true;
+  }
+  return segment.replace(/\.[^.]+$/, "").length >= 8;
+}
+
+// A qualified symbol carries its own member name, but only an identifier-shaped
+// member is corpus identity: `DataRequest.validate` names one repository,
+// `validate` names half the trade.
+function symbolMarkerVariants(name) {
+  if (typeof name !== "string" || name.trim().length === 0) {
+    return [];
+  }
+  const trimmed = name.trim();
+  return [
+    trimmed,
+    ...trimmed
+      .split(/::|[.#]/)
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0 && identifierShapedMarker(part)),
+  ];
 }
 
 function benchmarkScriptPromptDerivedPatterns() {
@@ -689,21 +897,19 @@ function benchmarkManifestTasks(manifest) {
   return [];
 }
 
-function addRepoMarkers(markers, repo) {
-  addSpecificMarker(markers, repo?.name);
-  for (const slug of repoUrlSlugs(repo?.url)) {
-    addSpecificMarker(markers, slug);
-  }
-}
-
 function repoUrlSlugs(url) {
   if (typeof url !== "string" || url.trim().length === 0) {
     return [];
   }
   const trimmed = url.trim().replace(/\.git$/i, "");
-  let pathname;
+  let pathname = trimmed;
+  // A hosted URL owns its owner segment; a local clone path does not, and its
+  // parent directory names a checkout layout rather than a repository.
+  let hosted = false;
   try {
-    pathname = new URL(trimmed).pathname;
+    const parsed = new URL(trimmed);
+    pathname = parsed.pathname;
+    hosted = parsed.host.length > 0;
   } catch {
     pathname = trimmed;
   }
@@ -715,7 +921,7 @@ function repoUrlSlugs(url) {
     return [];
   }
   const repoName = parts[parts.length - 1];
-  const ownerName = parts.length >= 2
+  const ownerName = hosted && parts.length >= 2
     ? `${parts[parts.length - 2]}/${repoName}`
     : null;
   return [ownerName, repoName].filter(Boolean);
@@ -768,13 +974,47 @@ function walkProtectedNonRustFiles(root) {
 
 function addSpecificMarker(markers, value, options = {}) {
   if (typeof value !== "string") {
-    return;
+    return false;
   }
   const marker = value.trim();
-  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker, options)) {
-    return;
+  if (marker.length < markerLengthFloor(marker, options)) {
+    return false;
+  }
+  if (benchmarkMarkerTooGeneric(marker, options)) {
+    return false;
   }
   markers.add(marker);
+  return true;
+}
+
+// Identifiers such as `useSWR` or `aeMain` are shorter than descriptive markers
+// and still name exactly one corpus repository.
+function markerLengthFloor(marker, options) {
+  return options.allowIdentifier && identifierShapedMarker(marker) ? 5 : 8;
+}
+
+// Multi-word identifiers only: `HTTPAdapter` and `use_swr` name something,
+// `Session` and `validate` are vocabulary every repository shares.
+function identifierShapedMarker(marker) {
+  return /^[A-Za-z][A-Za-z0-9_]*$/.test(marker)
+    && (marker.includes("_") || /[a-z][A-Z]/.test(marker) || /[A-Z][A-Z][a-z]/.test(marker));
+}
+
+function addIdentityMarker(markers, value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const token = value.trim().toLowerCase();
+  if (
+    token.length < 3
+    || !/^[a-z0-9][a-z0-9._-]*$/.test(token)
+    || productIdentityTokens.has(token)
+    || genericIdentityTokens.has(token)
+  ) {
+    return false;
+  }
+  markers.add(token);
+  return true;
 }
 
 function benchmarkMarkerTooGeneric(marker, options = {}) {
@@ -790,46 +1030,8 @@ function benchmarkMarkerTooGeneric(marker, options = {}) {
   }
   const normalized = marker.toLowerCase().replace(/[^a-z0-9]+/g, "");
   return (
-    normalized.length < 8 ||
-    [
-      "codestory",
-      "request",
-      "requests",
-      "response",
-      "responses",
-      "dispatch",
-      "router",
-      "routepath",
-      "approute",
-      "comments",
-      "indexfile",
-      "runindex",
-      "buildindex",
-      "servicesrs",
-      "sourcegroup",
-      "indexercommand",
-      "subcommand",
-      "eventprocessor",
-      "jsonoutput",
-      "jsonlevent",
-      "schema",
-      "source",
-      "storage",
-      "indexing",
-      "configuration",
-      "validation",
-      "serialize",
-      "serializes",
-      "serialized",
-      "serialization",
-      "foreignkey",
-      "references",
-      "formatto",
-      "formaterror",
-      "formaterrorcode",
-      "formatwindowserror",
-      "internalmutate",
-    ].includes(normalized)
+    normalized.length < markerLengthFloor(marker, options)
+    || genericBenchmarkMarkers.has(normalized)
   );
 }
 
@@ -1880,6 +2082,54 @@ function isEvalOnlyProductionFile(filePath) {
   return evalOnlyProductionFiles.has(path.resolve(filePath));
 }
 
+// The inventory records benchmark-family surfaces that already exist; it never
+// grants a file blanket cover, and an entry that stops matching is an error, so
+// deleting a surface has to delete its entry too.
+function loadPendingSurfaces() {
+  let inventory;
+  try {
+    inventory = JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
+  } catch (error) {
+    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
+    process.exit(2);
+  }
+  const surfaces = new Map();
+  for (const [file, markers] of Object.entries(inventory?.surfaces ?? {})) {
+    if (!Array.isArray(markers) || markers.some((marker) => typeof marker !== "string")) {
+      console.error(`lint-retrieval-generalization: invalid pending entry for ${file}`);
+      process.exit(2);
+    }
+    surfaces.set(path.resolve(repoRoot, file), new Set(markers));
+  }
+  return surfaces;
+}
+
+function pendingSurfaceCovers(filePath, marker) {
+  const markers = pendingSurfaces.get(path.resolve(filePath));
+  if (!markers?.has(marker)) {
+    return false;
+  }
+  observedPendingSurfaces.add(`${path.resolve(filePath)} ${marker}`);
+  return true;
+}
+
+function stalePendingSurfaces() {
+  // The inventory describes the shipped tree; a caller-supplied scan root has
+  // no reason to reach any of it.
+  if (!usesDefaultScanRoots) {
+    return [];
+  }
+  const stale = [];
+  for (const [filePath, markers] of pendingSurfaces) {
+    for (const marker of markers) {
+      if (!observedPendingSurfaces.has(`${filePath} ${marker}`)) {
+        stale.push(`${path.relative(repoRoot, filePath)}: ${marker}`);
+      }
+    }
+  }
+  return stale.sort();
+}
+
 function scanRankerFilenameLiterals(prepared) {
   const lines = prepared.lines;
   const hits = [];
@@ -1892,6 +2142,9 @@ function scanRankerFilenameLiterals(prepared) {
 }
 
 let failed = false;
+
+const pendingSurfaces = loadPendingSurfaces();
+const observedPendingSurfaces = new Set();
 
 const scanFiles = new Set(productionOnlyFiles);
 for (const root of scanDirs) {
@@ -1928,7 +2181,7 @@ for (const filePath of [...scanFiles].sort()) {
     );
     for (const { pattern } of bannedRegexPatterns) {
       const hits = productionHits.get(pattern) ?? [];
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern)) {
         console.error(
           `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -1937,7 +2190,7 @@ for (const filePath of [...scanFiles].sort()) {
     }
     for (const { pattern, re } of bannedLiteralRegexPatterns) {
       const hits = scanProductionStringLiterals(prepared, pattern, re);
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern)) {
         console.error(
           `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -1946,7 +2199,7 @@ for (const filePath of [...scanFiles].sort()) {
     }
     for (const pattern of bannedCompactPatterns) {
       const hits = scanProductionCompactPatterns(prepared, pattern);
-      if (hits.length > 0) {
+      if (hits.length > 0 && !pendingSurfaceCovers(filePath, pattern)) {
         console.error(
           `Banned compact benchmark marker /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
@@ -2062,6 +2315,14 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
   }
 }
 
+const stalePending = stalePendingSurfaces();
+if (stalePending.length > 0) {
+  console.error(
+    `Pending benchmark-family surfaces no longer match; delete them from ${path.relative(repoRoot, pendingSurfacePath)}:\n${stalePending.join("\n")}\n`,
+  );
+  failed = true;
+}
+
 if (failed) {
   console.error(
     "retrieval generalization lint failed: remove eval/query dependencies from protected product paths",
@@ -2069,6 +2330,8 @@ if (failed) {
   process.exit(1);
 }
 
+const pendingSurfaceCount = [...pendingSurfaces.values()]
+  .reduce((total, markers) => total + markers.size, 0);
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) in ${pendingSurfaces.size} file(s) awaiting deletion)`,
 );
