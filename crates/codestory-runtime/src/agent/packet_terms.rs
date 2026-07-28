@@ -879,4 +879,16 @@ mod tests {
         );
         assert!(packet_terms_indicate_shell_install_dispatch_flow(&terms));
     }
+
+    #[test]
+    fn a_command_server_prompt_is_not_a_shell_install_prompt() {
+        // "command server bootstrap ... dispatches commands" satisfied the old bootstrap/dispatch
+        // pair on its own. Nothing in such a repository is a shell script, so the shell
+        // requirements it raised could never be closed once claim wording stopped standing in for
+        // cited evidence.
+        let terms = packet_probe_terms(
+            "Trace how a command server bootstrap enters an event loop, reads network command input, and dispatches commands through a command table.",
+        );
+        assert!(!packet_terms_indicate_shell_install_dispatch_flow(&terms));
+    }
 }
