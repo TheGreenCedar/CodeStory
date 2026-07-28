@@ -36,7 +36,11 @@ jobs:
       # and double quotes do not stop command substitution, so a value spliced into script text runs
       # as a command on the runner -- here with the default token and, later, the marketplace app
       # token. Shape is checked before the ref is resolved or any token is minted.
+      # `[[ =~ ]]` is a bash construct. Under a POSIX shell it is a missing command inside an `if`,
+      # which `set -e` does not treat as an error, so the refusal below would be skipped and the
+      # guard would exit 0 on the value it exists to reject. The shell is declared, not inherited.
       - name: Validate the dispatched release coordinates
+        shell: bash
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
           INPUT_VERSION: ${{ inputs.version }}
@@ -64,6 +68,7 @@ jobs:
           fetch-depth: 0
 
       - name: Require a published release for this commit
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_COMMIT: ${{ inputs.commit }}
@@ -92,6 +97,7 @@ jobs:
           repositories: AgentPluginMarketplace
 
       - name: Point the catalog at the published release
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           INPUT_COMMIT: ${{ inputs.commit }}

@@ -4613,6 +4613,14 @@ export function validateMarketplaceSync(workflows, violations) {
     violations.push(`${file} must exist`);
     return;
   }
+  // Pinning the dispatch input names while leaving the trigger set open closes one door and
+  // leaves another: `workflow_call` carries its own inputs, which `on.workflow_dispatch.inputs`
+  // says nothing about, and a caller-supplied value would reach the same steps.
+  add(
+    violations,
+    hasExactKeys(object(workflow.on), ["workflow_dispatch"]),
+    `${file} must be reachable only by manual dispatch`,
+  );
   add(
     violations,
     hasExactKeys(at(workflow, "on", "workflow_dispatch", "inputs"), ["version", "commit"]),
@@ -4623,23 +4631,77 @@ export function validateMarketplaceSync(workflows, violations) {
     INPUT_COMMIT: "${{ inputs.commit }}",
     INPUT_VERSION: "${{ inputs.version }}",
   };
-  for (const [index, rawStep] of list(job.steps).entries()) {
-    const step = object(rawStep);
-    if (typeof step.run !== "string") continue;
-    // Interpolation is textual and quoting does not stop command substitution, so a dispatched
-    // value spliced into script text executes on the runner -- here beside repository tokens.
-    add(
-      violations,
-      !step.run.includes("${{"),
-      `${file} jobs.sync.steps.${index} must read dispatch inputs from env, not interpolated script text`,
-    );
-    for (const [name, expected] of Object.entries(bindings)) {
-      if (!step.run.includes(`$${name}`)) continue;
+  const checkout = "Checkout the published commit";
+  // GitHub serves the same dispatched value under a second name, `github.event.inputs.commit`, and
+  // the guard validates only what arrives as `inputs.commit`. The checkout already refuses the
+  // other spelling for its own `ref`; this refuses it everywhere in the file, including the job
+  // level, where a step's own binding check cannot see it.
+  add(
+    violations,
+    scalarStrings(workflow)
+      .flatMap(text => [...text.matchAll(/\$\{\{[^}]*\binputs\b[^}]*\}\}/gu)].map(match => match[0]))
+      .every(expression => Object.values(bindings).includes(expression)),
+    `${file} must name a dispatch input only as ${bindings.INPUT_COMMIT} or ${bindings.INPUT_VERSION}`,
+  );
+  // The ban is a property of the file, not of one job. A second job added beside `sync` runs on a
+  // runner with the same repository token and the same marketplace environment, so a scan scoped
+  // to `jobs.sync` would exempt exactly the code an attacker would add.
+  for (const [jobName, rawJob] of Object.entries(object(workflow.jobs))) {
+    for (const [index, rawStep] of list(object(rawJob).steps).entries()) {
+      const step = object(rawStep);
+      const where = `${file} jobs.${jobName}.steps.${index}`;
+      if (typeof step.run === "string") {
+        // Interpolation is textual and quoting does not stop command substitution, so a dispatched
+        // value spliced into script text executes on the runner -- here beside repository tokens.
+        add(
+          violations,
+          !step.run.includes("${{"),
+          `${where} must read dispatch inputs from env, not interpolated script text`,
+        );
+        // A `run:` body is executed by the shell the step declares, so the script and its
+        // interpreter are one artifact. The guard's whole-value test is `[[ =~ ]]`, which POSIX
+        // shells do not have: under `shell: sh` the condition is a missing command, `set -e` does
+        // not fire inside an `if`, the refusal branch never runs, and the guard exits 0 on the very
+        // value it exists to reject. Nothing in the script's own text can see that, so the shell is
+        // pinned here.
+        add(
+          violations,
+          step.shell === "bash",
+          `${where} must declare shell: bash so its script runs under the shell it was reviewed under`,
+        );
+      }
+      // `env:` is the sanctioned channel into a step. Every other scalar is an action input or
+      // script text, and an action can evaluate what it is handed -- `actions/github-script` runs
+      // its `script:` input. The checkout `ref` is the single exception: it is not an executable
+      // surface and is separately pinned below to the value the guard validated. That exemption is
+      // scoped to `sync`, the only job the guard runs in; a like-named step elsewhere is not covered
+      // by it and so is not exempt either.
+      const surfaces = { ...step };
+      delete surfaces.env;
+      if (jobName === "sync" && step.name === checkout) {
+        surfaces.with = { ...object(step.with) };
+        delete surfaces.with.ref;
+      }
       add(
         violations,
-        object(step.env)[name] === expected,
-        `${file} jobs.sync.steps.${index} must bind ${name} to ${expected}`,
+        !scalarStrings(surfaces).some(text => /\$\{\{[^}]*\binputs\b/u.test(text)),
+        `${where} must not splice a dispatch input into an action input`,
       );
+      for (const [name, expected] of Object.entries(bindings)) {
+        // `$NAME` and `${NAME}` are the same read; gating on the bare form alone let a step consume
+        // `${INPUT_COMMIT}` with no binding at all. Checking the declaration too closes the other
+        // direction: a binding of the unvalidated `github.event.inputs` spelling is a violation
+        // whether or not this step is the one that reads it.
+        const consumed = typeof step.run === "string"
+          && new RegExp(`\\$\\{?${name}\\b`, "u").test(step.run);
+        const declared = Object.hasOwn(object(step.env), name);
+        if (!consumed && !declared) continue;
+        add(
+          violations,
+          object(step.env)[name] === expected,
+          `${where} must bind ${name} to ${expected}`,
+        );
+      }
     }
   }
   // Shape is proven before the checkout resolves the ref and before any marketplace token exists.
@@ -4665,7 +4727,6 @@ export function validateMarketplaceSync(workflows, violations) {
   );
   // Ordering only buys something if the guard covers what the next step consumes. Without this the
   // checkout could resolve `github.ref` and the validated commit would gate nothing.
-  const checkout = "Checkout the published commit";
   add(
     violations,
     object(object(namedStep(job, checkout)).with).ref === bindings.INPUT_COMMIT,
