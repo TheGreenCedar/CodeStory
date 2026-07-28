@@ -30,6 +30,15 @@
   input constraints, because "adminPanel" contains "min". Words are now matched
   whole, and a step also checks that the symbol belongs to the subsystem in
   question, so unrelated results no longer make a packet look complete.
+- The folder a result sits in no longer decides which step it proves. Half of
+  the steps were matched by asking what kind of result something was, and that
+  question is largely answered by the file's directory — so everything under a
+  folder called `views`, `runtime`, `store` or `flags` proved whichever step
+  named that kind, whatever the result actually was. A chart renderer stood in
+  for a web server's entrypoint and a cache deletion stood in for an indexer
+  storing symbols. A result now has to say what it is by its own name, with the
+  folder only able to narrow that down, so a step is proved by evidence for that
+  step whichever half of the machinery matched it.
 - When a question names more files than fit in the follow-up list, the missing
   parts of the flow are no longer pushed out of it. Follow-ups for requested
   files and for unproven steps now alternate, so both survive the limit.

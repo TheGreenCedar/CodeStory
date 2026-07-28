@@ -154,6 +154,10 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
             && normalized_display.contains("indexer")
             && normalized_display.contains("queue"))
         || normalized_display.contains("indexercommand")
+        // The mirror of the `search` + `entrypoint` clause below. Until this existed an indexing
+        // entrypoint could only be recognised by the directory it sat in, so `runtime/` handed the
+        // role to everything filed there and to nothing that named itself.
+        || (normalized_display.contains("index") && normalized_display.contains("entrypoint"))
     {
         Some(PacketEvidenceRole::IndexingWorkQueue)
     } else if normalized_display.contains("interceptor") || path.contains("interceptor") {
@@ -174,6 +178,12 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         || normalized_display.contains("event_loop")
         || (normalized_display.contains("event") && normalized_display.contains("poll"))
         || (normalized_display.contains("event") && normalized_display.contains("dispatch"))
+        // "process events" is the loop; "event processor" is the output stage below. The plural
+        // separates them, and naming the loop from the symbol rather than from its directory is
+        // what lets a coverage requirement stop trusting the directory.
+        || (normalized_display.contains("events")
+            && normalized_display.contains("process")
+            && !normalized_display.contains("processor"))
         || path.contains("/event/")
         || path.contains("/events/")
     {
@@ -235,8 +245,14 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         || path.contains("jsonl")
     {
         Some(PacketEvidenceRole::EventOutputProcessing)
-    } else if (display.contains("thread") || display.contains("turn"))
-        && display.contains("startparams")
+    } else if ((display.contains("thread") || display.contains("turn"))
+        && display.contains("startparams"))
+        // The name each ecosystem gives the server-to-application gateway. Without these the role
+        // was reachable only through a `protocol/` directory, which meant it was granted to every
+        // symbol filed there and to no symbol that actually says what it is.
+        || normalized_display.contains("wsgi")
+        || normalized_display.contains("asgi")
+        || normalized_display.contains("servlet")
         || path.contains("/protocol/")
     {
         Some(PacketEvidenceRole::AppServerRequestProtocol)

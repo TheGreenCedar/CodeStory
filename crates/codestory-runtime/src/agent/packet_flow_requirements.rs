@@ -13,7 +13,11 @@ use crate::agent::packet_evidence_carriers::{
     citation_owns_log_record_creation, citation_owns_mapper_configuration,
     citation_owns_mapper_execution, citation_owns_shell_completion,
     citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
-    citation_owns_site_lifecycle, citation_owns_site_terminal,
+    citation_owns_site_lifecycle, citation_owns_site_terminal, flow_belongs_to_client_request,
+    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session,
 };
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -93,22 +97,66 @@ pub(crate) enum CoverageMode {
 /// citation, never the claim's wording.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EvidencePredicate {
-    /// Covered by a citation the evidence-role classifier already places in this part of the flow.
-    CitedRoles(&'static [PacketEvidenceRole]),
+    /// Covered by a citation the evidence-role classifier places in this part of the flow *and*
+    /// that belongs to the subsystem this flow is about.
+    ///
+    /// The role alone is not enough. The classifier answers a ranking question — "what kind of
+    /// evidence is this" — and much of it reads the path: every symbol under `runtime/` is runtime
+    /// orchestration, every symbol under `app/` or `views/` is route handling, every symbol under
+    /// `flags/` is argument planning. Without the subsystem factor a requirement inherited every
+    /// symbol filed in those directories, so `renderChart` in `src/views/` proved a server's
+    /// request entrypoint and `Store.delete` proved an indexer's persistence step.
+    CitedRoles {
+        subsystem: fn(&AgentCitationDto) -> bool,
+        roles: &'static [PacketEvidenceRole],
+    },
     /// Covered by a citation that passes a structural ownership check, used where the evidence
-    /// role is too coarse to separate a requirement from its siblings.
+    /// role is too coarse to separate a requirement from its siblings. The carriers carry their own
+    /// subsystem factor.
     CitedCarrier(fn(&AgentCitationDto) -> bool),
 }
 
 impl EvidencePredicate {
     pub(crate) fn citation_proves(self, citation: &AgentCitationDto) -> bool {
         match self {
-            Self::CitedRoles(roles) => {
-                packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
+            Self::CitedRoles { subsystem, roles } => {
+                subsystem(citation)
+                    && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
+                    && role_survives_without_its_directory(citation, roles)
             }
             Self::CitedCarrier(carrier) => carrier(citation),
         }
     }
+}
+
+/// Whether the citation still earns one of `roles` once its directories are taken away.
+///
+/// A path says where a symbol was filed. It cannot say what the symbol does, and the shared role
+/// classifier reads it anyway: anything under `runtime/` is runtime orchestration, anything under
+/// `app/`, `views/` or `pages/` is route handling, anything under `flags/` is argument planning,
+/// anything under `protocol/` is the app-server request protocol. A requirement that took any role
+/// the classifier produced therefore inherited every symbol filed in those directories — a symbol
+/// named `request` in `src/runtime/` closed a server's dispatch step, and one named `handler` in
+/// `app/views/` closed its entrypoint.
+///
+/// Asking the question a second time with only the file name left makes the path a *narrowing*
+/// factor: a `tests/` path still classifies as test coverage and still fails, an extension is still
+/// there for the `.sql` roles, but no directory can hand out a role on its own. This can only
+/// reject citations the first question already accepted, never admit new ones.
+fn role_survives_without_its_directory(
+    citation: &AgentCitationDto,
+    roles: &[PacketEvidenceRole],
+) -> bool {
+    let Some(path) = citation.file_path.as_deref() else {
+        return true;
+    };
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if file_name == path {
+        return true;
+    }
+    let mut without_directories = citation.clone();
+    without_directories.file_path = Some(file_name.to_string());
+    packet_evidence_role(&without_directories).is_some_and(|role| roles.contains(&role))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,24 +388,30 @@ const INDEXING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["indexing entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::IndexingWorkQueue,
-            PacketEvidenceRole::CommandEntrypoint,
-            PacketEvidenceRole::RuntimeOrchestration,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_indexing,
+            roles: &[
+                PacketEvidenceRole::IndexingWorkQueue,
+                PacketEvidenceRole::CommandEntrypoint,
+                PacketEvidenceRole::RuntimeOrchestration,
+            ],
+        },
     },
     FlowRequirement {
         id: "indexing_storage",
         role: FlowRole::StateOrStorage,
         query_seeds: &["file discovery", "symbol extraction", "storage persistence"],
         coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::PersistenceAndSearchProjection,
-            PacketEvidenceRole::SymbolExtraction,
-            PacketEvidenceRole::SnapshotRefresh,
-            PacketEvidenceRole::WorkspaceDiscoveryAndPlanning,
-            PacketEvidenceRole::CandidateFileConstruction,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_indexing,
+            roles: &[
+                PacketEvidenceRole::PersistenceAndSearchProjection,
+                PacketEvidenceRole::SymbolExtraction,
+                PacketEvidenceRole::SnapshotRefresh,
+                PacketEvidenceRole::WorkspaceDiscoveryAndPlanning,
+                PacketEvidenceRole::CandidateFileConstruction,
+            ],
+        },
     },
 ];
 
@@ -367,32 +421,41 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Registration,
         query_seeds: &["request entrypoint", "route registration"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::RouteHandling,
-            PacketEvidenceRole::AppServerRequestProtocol,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[
+                PacketEvidenceRole::RouteHandling,
+                PacketEvidenceRole::AppServerRequestProtocol,
+            ],
+        },
     },
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "handler dispatch", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::RequestDispatch,
-            PacketEvidenceRole::CommandDispatch,
-            PacketEvidenceRole::RuntimeOrchestration,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[
+                PacketEvidenceRole::RequestDispatch,
+                PacketEvidenceRole::CommandDispatch,
+                PacketEvidenceRole::RuntimeOrchestration,
+            ],
+        },
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response finalization", "transport send"],
         coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::TransportAdapter,
-            PacketEvidenceRole::EventOutputProcessing,
-            PacketEvidenceRole::BufferedIo,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_request_terminal,
+            roles: &[
+                PacketEvidenceRole::TransportAdapter,
+                PacketEvidenceRole::EventOutputProcessing,
+                PacketEvidenceRole::BufferedIo,
+            ],
+        },
     },
 ];
 
@@ -402,24 +465,33 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::ClientFactory,
-            PacketEvidenceRole::CommandEntrypoint,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_client_request,
+            roles: &[
+                PacketEvidenceRole::ClientFactory,
+                PacketEvidenceRole::CommandEntrypoint,
+            ],
+        },
     },
     FlowRequirement {
         id: "request_dispatch",
         role: FlowRole::Dispatch,
         query_seeds: &["request dispatch", "adapters", "transport adapter"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::RequestDispatch]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_client_request,
+            roles: &[PacketEvidenceRole::RequestDispatch],
+        },
     },
     FlowRequirement {
         id: "request_terminal",
         role: FlowRole::TerminalBoundary,
         query_seeds: &["response finalization", "transport send"],
         coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::TransportAdapter]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_request_terminal,
+            roles: &[PacketEvidenceRole::TransportAdapter],
+        },
     },
 ];
 
@@ -437,23 +509,29 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["session request creation", "request task resume"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::ClientFactory,
-            PacketEvidenceRole::AppServerRequestProtocol,
-            PacketEvidenceRole::CommandEntrypoint,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_url_session,
+            roles: &[
+                PacketEvidenceRole::ClientFactory,
+                PacketEvidenceRole::AppServerRequestProtocol,
+                PacketEvidenceRole::CommandEntrypoint,
+            ],
+        },
     },
     FlowRequirement {
         id: "session_callbacks",
         role: FlowRole::Dispatch,
         query_seeds: &["session delegate callbacks", "data request validation"],
         coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::RequestDispatch,
-            PacketEvidenceRole::EventLoop,
-            PacketEvidenceRole::RouteHandling,
-            PacketEvidenceRole::TransportAdapter,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_url_session,
+            roles: &[
+                PacketEvidenceRole::RequestDispatch,
+                PacketEvidenceRole::EventLoop,
+                PacketEvidenceRole::RouteHandling,
+                PacketEvidenceRole::TransportAdapter,
+            ],
+        },
     },
 ];
 
@@ -462,7 +540,10 @@ const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["http top level helper", "public client facade"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::ClientFactory]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_client_request,
+        roles: &[PacketEvidenceRole::ClientFactory],
+    },
 };
 
 const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -486,10 +567,13 @@ const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["transport send", "client send implementation"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[
-        PacketEvidenceRole::TransportAdapter,
-        PacketEvidenceRole::RequestDispatch,
-    ]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_client_request,
+        roles: &[
+            PacketEvidenceRole::TransportAdapter,
+            PacketEvidenceRole::RequestDispatch,
+        ],
+    },
 };
 
 const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -537,10 +621,13 @@ const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Entrypoint,
     query_seeds: &["server bootstrap", "command server entrypoint"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[
-        PacketEvidenceRole::CommandEntrypoint,
-        PacketEvidenceRole::RuntimeOrchestration,
-    ]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_command_server,
+        roles: &[
+            PacketEvidenceRole::CommandEntrypoint,
+            PacketEvidenceRole::RuntimeOrchestration,
+        ],
+    },
 };
 
 const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -548,7 +635,10 @@ const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["event loop", "event loop source"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::EventLoop]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_event_loop,
+        roles: &[PacketEvidenceRole::EventLoop],
+    },
 };
 
 const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -556,7 +646,10 @@ const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["network input", "network command input"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::NetworkCommandInput]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_network_input,
+        roles: &[PacketEvidenceRole::NetworkCommandInput],
+    },
 };
 
 const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -564,10 +657,13 @@ const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
     role: FlowRole::Dispatch,
     query_seeds: &["command dispatch", "command table dispatch"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    evidence: EvidencePredicate::CitedRoles(&[
-        PacketEvidenceRole::CommandDispatch,
-        PacketEvidenceRole::RequestDispatch,
-    ]),
+    evidence: EvidencePredicate::CitedRoles {
+        subsystem: flow_belongs_to_command_dispatch,
+        roles: &[
+            PacketEvidenceRole::CommandDispatch,
+            PacketEvidenceRole::RequestDispatch,
+        ],
+    },
 };
 
 const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
@@ -576,14 +672,20 @@ const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
         role: FlowRole::StateOrStorage,
         query_seeds: &["sql table definitions", "CREATE TABLE"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
-        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::SqlTableDefinition]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_sql_schema,
+            roles: &[PacketEvidenceRole::SqlTableDefinition],
+        },
     },
     FlowRequirement {
         id: "sql_relationships",
         role: FlowRole::Configuration,
         query_seeds: &["foreign key relationships", "schema constraints"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
-        evidence: EvidencePredicate::CitedRoles(&[PacketEvidenceRole::SqlRelationshipConstraint]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_sql_schema,
+            roles: &[PacketEvidenceRole::SqlRelationshipConstraint],
+        },
     },
 ];
 
@@ -780,11 +882,14 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
         role: FlowRole::Entrypoint,
         query_seeds: &["search entrypoint", "argument planning"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::SearchDriver,
-            PacketEvidenceRole::ArgumentPlanning,
-            PacketEvidenceRole::CommandEntrypoint,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_search,
+            roles: &[
+                PacketEvidenceRole::SearchDriver,
+                PacketEvidenceRole::ArgumentPlanning,
+                PacketEvidenceRole::CommandEntrypoint,
+            ],
+        },
     },
     FlowRequirement {
         id: "search_dispatch",
@@ -795,10 +900,13 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
             "search execution unit",
         ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-        evidence: EvidencePredicate::CitedRoles(&[
-            PacketEvidenceRole::SearchExecutionUnit,
-            PacketEvidenceRole::CandidateFileConstruction,
-        ]),
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_search,
+            roles: &[
+                PacketEvidenceRole::SearchExecutionUnit,
+                PacketEvidenceRole::CandidateFileConstruction,
+            ],
+        },
     },
 ];
 
@@ -1495,25 +1603,751 @@ mod tests {
             witness("parseTimestamp", "src/time/parse.ts", NodeKind::FUNCTION),
             witness("RowIterator", "src/db/rows.rs", NodeKind::STRUCT),
             witness("MigrationRunner", "src/db/migrate.rb", NodeKind::CLASS),
+            // Each of these closed a requirement at exactly this path. The first six are role
+            // classified, where the *directory* assigned the role: `/views/` and `/app/` mean route
+            // handling, `store` means persistence, `/flags/` means argument planning. The last four
+            // sit inside the very flow they were accepted by, which is the case a corpus of
+            // symbols from elsewhere in the repository can never reach.
+            witness("Store.delete", "src/store/store.rs", NodeKind::METHOD),
+            witness(
+                "serializeSettings",
+                "src/store/serialize.ts",
+                NodeKind::FUNCTION,
+            ),
+            witness("readManifest", "src/store/manifest.rs", NodeKind::FUNCTION),
+            witness("renderChart", "src/views/chart.js", NodeKind::FUNCTION),
+            witness("Cache.write", "app/views/cache.rb", NodeKind::METHOD),
+            witness(
+                "FeatureFlags.options",
+                "src/flags/feature.rs",
+                NodeKind::METHOD,
+            ),
+            witness("handleClick", "src/logging/ui.php", NodeKind::FUNCTION),
+            witness(
+                "createUserRecord",
+                "src/logging/audit.php",
+                NodeKind::FUNCTION,
+            ),
+            witness("use_temp_dir", "src/index/tmp.ts", NodeKind::FUNCTION),
+            witness("Store.get", "lib/client.dart", NodeKind::METHOD),
         ]
     }
 
+    /// Shapes of symbol name a repository is full of, none of which is evidence for any step in any
+    /// flow in the tables.
+    ///
+    /// These are families, not examples, and each one is a way a predicate here has been fooled or
+    /// could be. A **verb-named accessor** meets a carrier that matched the HTTP method set on a
+    /// symbol's terminal segment, so every `.get`, `.delete` and `.options` in the repository was a
+    /// client's request method. A **`handle*` callback** meets a carrier that matched "handle" as a
+    /// prefix of "handler", so every front end's click and scroll handlers were a logging
+    /// framework's record processing. A **`*Record` builder** meets a carrier that matched the word
+    /// "record", so every database row constructor was a logger's record creation. A **snake- or
+    /// kebab-cased `use_*`** meets a carrier that treated `_` and `-` as the front-end hook naming
+    /// convention. The last family is ordinary vocabulary from subsystems no flow here covers.
+    ///
+    /// The property that makes a name a negative, and the bar a new entry has to clear, is that no
+    /// requirement's *two* factors are both satisfied by it. Sharing one is allowed and is the point:
+    /// `Cache.write` names a step word the site build reads, `Matrix.post` names one of its subjects,
+    /// `Store.get` names an HTTP verb — and each must still be rejected, because none of them names
+    /// both. A name that names both is not a negative; it is evidence.
+    fn off_subject_symbol_names() -> Vec<(&'static str, NodeKind)> {
+        let mut names = Vec::new();
+        for name in [
+            "Store.get",
+            "Store.delete",
+            "Cache.put",
+            "FeatureFlags.options",
+            "Queue.head",
+            "Matrix.post",
+            "Palette.patch",
+        ] {
+            names.push((name, NodeKind::METHOD));
+        }
+        for name in [
+            "handleClick",
+            "handleKeypress",
+            "handleDragStart",
+            "handleScroll",
+            "handleResize",
+        ] {
+            names.push((name, NodeKind::FUNCTION));
+        }
+        for name in [
+            "createUserRecord",
+            "createDnsRecord",
+            "addBillingRecord",
+            "makeInventoryRecord",
+        ] {
+            names.push((name, NodeKind::FUNCTION));
+        }
+        for name in ["use_temp_dir", "use-legacy-mode", "use_default_locale"] {
+            names.push((name, NodeKind::FUNCTION));
+        }
+        for name in [
+            "compareVersions",
+            "parseTimestamp",
+            "TooltipAnchor",
+            "ColorPalette",
+            "computeChecksum",
+            "encodeBase64",
+            "serializeSettings",
+            "readManifest",
+            "renderChart",
+            "MigrationRunner",
+            "RowIterator",
+            "ProjectSettings",
+            "adminPanel",
+            "terminalWidth",
+            "determineFieldOrder",
+            "userProfile",
+            "submitTelemetry",
+            "Uri.prepare",
+            "Cache.write",
+        ] {
+            names.push((name, NodeKind::FUNCTION));
+        }
+        names
+    }
+
+    /// Every directory the corpus places an off-subject symbol in.
+    ///
+    /// The first half is derived from the witness table, so every flow's *own* folder is covered
+    /// and stays covered as requirements are added — a symbol sitting beside a flow's real evidence
+    /// is the case a corpus of symbols from elsewhere in the repository cannot reach, and path
+    /// tokens are what re-open a scoped predicate. The second half is every path fragment the
+    /// shared evidence-role classifier will assign a role from on its own, read out of
+    /// `packet_evidence_roles`: those directories hand out a role to whatever is filed in them.
+    fn off_subject_directories() -> Vec<String> {
+        let mut directories = Vec::new();
+        let mut push = |directory: String| {
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        };
+        for ((_, _), witness) in requirement_witnesses() {
+            let path = witness.file_path.clone().unwrap_or_default();
+            push(match path.rfind('/') {
+                Some(index) => path[..index + 1].to_string(),
+                None => String::new(),
+            });
+        }
+        for directory in [
+            "src/routes/",
+            "src/router/",
+            "src/controllers/",
+            "src/views/",
+            "src/pages/",
+            "app/",
+            "app/views/",
+            "src/event/",
+            "src/events/",
+            "src/flags/",
+            "src/protocol/",
+            "src/networking/",
+            "src/runtime/",
+            "src/store/",
+            "src/indexer/",
+            "src/workspace/",
+            "src/interceptors/",
+            "src/dispatch/",
+            "src/collections/",
+            "src/source_group/",
+            // The same directories a Windows citation arrives with. Two code paths disagree about
+            // separators — the role classifier normalizes them, the carriers lowercase and replace
+            // them, and stripping a directory has to split on both — so the corpus carries both.
+            "app\\views\\",
+            "src\\store\\",
+            "src\\runtime\\",
+        ] {
+            push(directory.to_string());
+        }
+        directories
+    }
+
+    /// The extensions the corpus crosses its directories with.
+    ///
+    /// Derived from the witness paths, minus the document surfaces. A stylesheet, a markup
+    /// document, a schema file and a shell script are proved *by the file*: their anchors are
+    /// selectors, attributes and statements, not identifiers, and "a code identifier inside a
+    /// `.css` file" is not a citation retrieval can produce. Those requirements are still exercised
+    /// by this corpus — they have to reject every code path in it.
+    fn off_subject_code_extensions() -> Vec<String> {
+        let document_surfaces = [
+            ".css", ".scss", ".sass", ".less", ".html", ".htm", ".sql", ".sh",
+        ];
+        let mut extensions = Vec::new();
+        for ((_, _), witness) in requirement_witnesses() {
+            let path = witness.file_path.clone().unwrap_or_default();
+            let Some(index) = path.rfind('.') else {
+                continue;
+            };
+            let extension = path[index..].to_ascii_lowercase();
+            if document_surfaces.contains(&extension.as_str()) || extensions.contains(&extension) {
+                continue;
+            }
+            extensions.push(extension);
+        }
+        extensions
+    }
+
+    /// The generated corpus: every off-subject name, in every flow's directory and every
+    /// role-granting directory, under every code extension, as every kind of behavior owner.
+    fn generated_off_subject_symbols() -> Vec<AgentCitationDto> {
+        let mut symbols = Vec::new();
+        for (name, kind) in off_subject_symbol_names() {
+            for directory in off_subject_directories() {
+                for extension in off_subject_code_extensions() {
+                    for owner_kind in [
+                        kind,
+                        NodeKind::CLASS,
+                        NodeKind::STRUCT,
+                        NodeKind::INTERFACE,
+                        NodeKind::CONSTANT,
+                    ] {
+                        symbols.push(witness(
+                            name,
+                            &format!("{directory}elsewhere{extension}"),
+                            owner_kind,
+                        ));
+                    }
+                }
+            }
+        }
+        symbols
+    }
+
+    /// `MapPlanner` is the one reported acceptance the corpus above cannot carry, and the reason is
+    /// worth stating rather than leaving as a silent omission.
+    ///
+    /// It was reported against `indexing_storage`, which took it because the shared classifier reads
+    /// "plan" as workspace planning; that is closed, and this pins it. But it is *not* off-subject
+    /// for `mapper_execution`: that requirement asks for an object mapper (`map`) and an execution
+    /// plan (`plan`), and both words are literally in the name. No predicate that reads names can
+    /// separate a mapping plan from a route-map planner, so `mapper_execution` still accepts it,
+    /// wherever it is filed. Putting it in the universal corpus would only be a lie about which
+    /// property holds.
+    #[test]
+    fn the_reported_map_planner_acceptance_is_closed_where_it_was_reported() {
+        let anchor = witness("MapPlanner", "src/store/planner.rs", NodeKind::STRUCT);
+        let requirement_named = |id: &str| {
+            all_flow_requirements()
+                .into_iter()
+                .find(|requirement| requirement.id == id)
+                .unwrap_or_else(|| panic!("{id} should be in the tables"))
+        };
+
+        assert!(
+            !requirement_named("indexing_storage")
+                .evidence
+                .citation_proves(&anchor),
+            "a planner named after maps is not an indexer's storage step"
+        );
+        assert!(
+            requirement_named("mapper_execution")
+                .evidence
+                .citation_proves(&anchor),
+            "if this stops being true the note above is stale and should be deleted, not updated"
+        );
+    }
+
+    /// The complete set of bare, one-word symbol names that close a requirement, as
+    /// `requirement | word`.
+    ///
+    /// A one-word name carries no second factor: there is no room in it for both "which subsystem
+    /// is this" and "which step of it". So every entry here is a word that, on its own, anywhere in
+    /// any repository, under any directory and any language, proves a step — and the list is
+    /// therefore the exact surface on which an unrelated symbol can still be mistaken for evidence.
+    ///
+    /// Each of these words *is* the requirement's subject: a class named `Buffer` is the buffer, a
+    /// function named `main` is the entrypoint, a method named `request` is the client's request
+    /// method. That is the intended reading of a name-driven predicate. What must not happen is the
+    /// list growing quietly: an entry appearing here means some carrier's two factors collapsed
+    /// into one word, which is how `renderChart` proved a site renderer and every `.get` in the
+    /// repository proved a client's convenience method.
+    const ONE_WORD_EVIDENCE_SURFACE: &[&str] = &[
+        "buffered_storage | buffer",
+        "buffered_storage | segment",
+        "client_interface_helpers | request",
+        "client_transport_send | adapter",
+        "command_dispatch | dispatch",
+        "command_dispatch | dispatcher",
+        "command_server_bootstrap | main",
+        "form_custom_validation | validate",
+        "form_custom_validation | validates",
+        "form_custom_validation | validation",
+        "form_custom_validation | validity",
+        "form_submit_guard | preventdefault",
+        "hook_mutation_flow | mutat",
+        "hook_mutation_flow | mutate",
+        "hook_mutation_flow | mutation",
+        "indexing_storage | indexer",
+        "indexing_storage | indexers",
+        "indexing_storage | snapshot",
+        "indexing_storage | snapshots",
+        "indexing_storage | symbol",
+        "indexing_storage | symbols",
+        "request_dispatch | dispatch",
+        "request_dispatch | dispatcher",
+        "request_entrypoint | asgi",
+        "request_entrypoint | route",
+        "request_entrypoint | router",
+        "request_entrypoint | routers",
+        "request_entrypoint | routes",
+        "request_entrypoint | servlet",
+        "request_entrypoint | wsgi",
+        "request_terminal | adapter",
+        "search_entrypoint | main",
+    ];
+
+    /// Every word any predicate in this crate reads, so the sweep below covers the whole vocabulary
+    /// the tables are written in rather than a sample of it. Held to the carriers' own source by
+    /// `the_one_word_sweep_covers_every_word_the_carriers_match_on`, so it cannot fall behind them.
+    fn evidence_vocabulary() -> Vec<&'static str> {
+        vec![
+            "request",
+            "requests",
+            "route",
+            "routes",
+            "router",
+            "routing",
+            "controller",
+            "handler",
+            "handlers",
+            "endpoint",
+            "server",
+            "middleware",
+            "http",
+            "protocol",
+            "dispatch",
+            "dispatcher",
+            "wsgi",
+            "asgi",
+            "rack",
+            "servlet",
+            "gateway",
+            "client",
+            "clients",
+            "instance",
+            "factory",
+            "session",
+            "transport",
+            "adapter",
+            "adapters",
+            "send",
+            "fetch",
+            "url",
+            "connection",
+            "response",
+            "socket",
+            "stream",
+            "writer",
+            "sink",
+            "buffer",
+            "sender",
+            "task",
+            "delegate",
+            "index",
+            "indexer",
+            "indexing",
+            "symbol",
+            "symbols",
+            "snapshot",
+            "workspace",
+            "candidate",
+            "catalog",
+            "ingest",
+            "crawl",
+            "serve",
+            "daemon",
+            "bootstrap",
+            "startup",
+            "init",
+            "main",
+            "listen",
+            "listener",
+            "event",
+            "events",
+            "loop",
+            "poll",
+            "select",
+            "epoll",
+            "reactor",
+            "tick",
+            "network",
+            "networking",
+            "query",
+            "wire",
+            "command",
+            "commands",
+            "table",
+            "exec",
+            "execute",
+            "search",
+            "searcher",
+            "grep",
+            "match",
+            "matcher",
+            "args",
+            "argv",
+            "arg",
+            "worker",
+            "printer",
+            "log",
+            "logger",
+            "logging",
+            "record",
+            "records",
+            "site",
+            "page",
+            "post",
+            "layout",
+            "template",
+            "document",
+            "collection",
+            "static",
+            "theme",
+            "asset",
+            "renderer",
+            "generator",
+            "build",
+            "builder",
+            "pipeline",
+            "process",
+            "run",
+            "start",
+            "generate",
+            "render",
+            "write",
+            "read",
+            "output",
+            "emit",
+            "map",
+            "mapper",
+            "mapping",
+            "typemap",
+            "plan",
+            "execution",
+            "config",
+            "profile",
+            "option",
+            "options",
+            "format",
+            "formatter",
+            "fmt",
+            "vformat",
+            "error",
+            "throw",
+            "fail",
+            "assert",
+            "fallback",
+            "panic",
+            "cache",
+            "caches",
+            "helper",
+            "key",
+            "keys",
+            "serialize",
+            "mutate",
+            "mutation",
+            "form",
+            "validate",
+            "validity",
+            "guard",
+            "submit",
+            "required",
+            "pattern",
+            "min",
+            "max",
+            "install",
+            "setup",
+            "download",
+            "completion",
+            "prepare",
+            "finalize",
+            "materialize",
+            "interceptor",
+            "storage",
+            "persist",
+            "manifest",
+            "get",
+            "put",
+            "patch",
+            "delete",
+            "head",
+            "https",
+            "transports",
+            "sends",
+            "finaliz",
+            "finalis",
+            "prepar",
+            "to",
+            "body",
+            "responses",
+            "bytes",
+            "settle",
+            "settled",
+            "transform",
+            "materiali",
+            "use",
+            "serializ",
+            "serialis",
+            "hash",
+            "stable",
+            "stringify",
+            "helpers",
+            "provider",
+            "context",
+            "state",
+            "store",
+            "make",
+            "creat",
+            "mutat",
+            "app",
+            "root",
+            "shell",
+            "module",
+            "script",
+            "mount",
+            "import",
+            "forward",
+            "keyframes",
+            "animation",
+            "animated",
+            "transition",
+            "duration",
+            "delay",
+            "iteration",
+            "fillmode",
+            "forms",
+            "fieldset",
+            "validation",
+            "validations",
+            "validates",
+            "invalid",
+            "constraint",
+            "constraints",
+            "guards",
+            "preventdefault",
+            "minlength",
+            "maxlength",
+            "inputtype",
+            "inputmode",
+            "validator",
+            "customvalid",
+            "checkvalid",
+            "reportvalid",
+            "submits",
+            "submitt",
+            "source",
+            "case",
+            "compgen",
+            "complete",
+            "alias",
+            "segment",
+            "reads",
+            "writes",
+            "emits",
+            "flush",
+            "skip",
+            "copy",
+            "copyto",
+            "readfrom",
+            "writeto",
+            "logs",
+            "loggers",
+            "handle",
+            "add",
+            "create",
+            "push",
+            "pop",
+            "remove",
+            "set",
+            "register",
+            "batch",
+            "interface",
+            "sites",
+            "pages",
+            "posts",
+            "layouts",
+            "templates",
+            "documents",
+            "collections",
+            "themes",
+            "assets",
+            "file",
+            "files",
+            "html",
+            "phases",
+            "writ",
+            "outputs",
+            "renders",
+            "maps",
+            "mappers",
+            "mappings",
+            "execut",
+            "formats",
+            "formatters",
+            "formatting",
+            "printf",
+            "sprintf",
+            "fprintf",
+            "arguments",
+            "value",
+            "values",
+            "err",
+            "indexes",
+            "indexed",
+            "indexers",
+            "snapshots",
+            "workspaces",
+            "candidates",
+            "catalogs",
+            "routers",
+            "controllers",
+            "endpoints",
+            "servers",
+            "cgi",
+            "fastcgi",
+            "instances",
+            "factories",
+            "sessions",
+            "urls",
+            "connections",
+            "sockets",
+            "streams",
+            "tasks",
+            "delegates",
+            "loops",
+            "polling",
+            "kqueue",
+            "queries",
+            "searches",
+            "matchers",
+        ]
+    }
+
+    /// The sweep is only as wide as the vocabulary it sweeps, so the vocabulary is checked against
+    /// the carriers' own source instead of being maintained beside them by hand.
+    ///
+    /// Every bare lowercase word a carrier matches on is a word that can move a predicate on its
+    /// own. A word present there and absent here is a blind spot in the sweep — and it would sit
+    /// exactly where the next widening lands, because a widening *is* a word being added to a
+    /// carrier.
+    #[test]
+    fn the_one_word_sweep_covers_every_word_the_carriers_match_on() {
+        let vocabulary = evidence_vocabulary();
+        let mut missing: Vec<String> = Vec::new();
+        for line in include_str!("packet_evidence_carriers.rs").lines() {
+            let code = line.trim_start();
+            if code.starts_with("#[cfg(test)]") {
+                // Below here are the carriers' own fixtures, whose literals are anchors rather
+                // than needles.
+                break;
+            }
+            if code.starts_with("//") {
+                continue;
+            }
+            for (index, literal) in code.split('"').enumerate() {
+                if index % 2 == 0
+                    || literal.len() < 2
+                    || !literal
+                        .chars()
+                        .all(|character| character.is_ascii_lowercase())
+                    || vocabulary.contains(&literal)
+                    || missing.iter().any(|word| word == literal)
+                {
+                    continue;
+                }
+                missing.push(literal.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these words move a carrier but are never swept as a one-word symbol name, so the \
+             recorded surface below cannot see what they admit: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn one_word_names_close_only_the_requirements_they_are_the_subject_of() {
+        let requirements = all_flow_requirements();
+        let directories = off_subject_directories();
+        let mut live: Vec<String> = Vec::new();
+        for word in evidence_vocabulary() {
+            for directory in &directories {
+                // Every directory, because a directory handing out a role is what this sweep looks
+                // for. Two languages and three kinds, because nothing else is reachable: `.ts`
+                // stands for every script surface and `.rs` for every non-script one, and `STRUCT`
+                // is treated identically to `CLASS` by every predicate in the crate. The whole
+                // language set and the non-behavior kinds are crossed against the corpus above.
+                for extension in [".rs", ".ts"] {
+                    for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
+                        let citation = witness(word, &format!("{directory}one{extension}"), kind);
+                        for requirement in &requirements {
+                            if !requirement.evidence.citation_proves(&citation) {
+                                continue;
+                            }
+                            let entry = format!("{} | {word}", requirement.id);
+                            if !live.contains(&entry) {
+                                live.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        live.sort();
+
+        let mut recorded = ONE_WORD_EVIDENCE_SURFACE
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect::<Vec<_>>();
+        recorded.sort();
+
+        let added = live
+            .iter()
+            .filter(|entry| !recorded.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            added.is_empty(),
+            "a bare one-word symbol name now closes a requirement it did not before; a name with \
+             no second word cannot say both which subsystem it is in and which step it is, so this \
+             is a predicate whose two factors collapsed into one: {added:?}"
+        );
+        let removed = recorded
+            .iter()
+            .filter(|entry| !live.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            removed.is_empty(),
+            "these one-word names no longer close their requirement; if that is intended, take \
+             them out of the recorded surface in the diff a reviewer reads: {removed:?}"
+        );
+    }
+
+    /// No requirement — role-classified or carrier-backed — may be closed by a symbol that has
+    /// nothing to do with it.
+    ///
+    /// Both halves of the tables are held to this. The earlier version of this invariant skipped
+    /// every `CitedRoles` requirement on the grounds that the role classifier is coarse by design,
+    /// which left exactly half the tables untested; running this corpus against them turned up
+    /// acceptances in nine of them, all from the same cause. A role is not scoped to a flow, and
+    /// much of the classifier reads the path, so `renderChart` under `src/views/` was a server's
+    /// request entrypoint, `Store.delete` was an indexer's persistence step, and every symbol under
+    /// `runtime/` was a runtime orchestration entrypoint for three different flows at once.
     #[test]
     fn no_requirement_is_closed_by_an_unrelated_repository_symbol() {
         let mut checked = 0;
+        let corpus = unrelated_repository_symbols()
+            .into_iter()
+            .chain(generated_off_subject_symbols())
+            .collect::<Vec<_>>();
         for requirement in all_flow_requirements() {
-            // `CitedRoles` requirements delegate to the evidence-role classifier, which is coarse
-            // on purpose: it answers "is this source evidence at all", not "does this prove my
-            // step". The carriers are the per-requirement checks and the only predicates that
-            // claim to separate one requirement from everything else, so they are what this
-            // corpus holds to account.
-            if !matches!(requirement.evidence, EvidencePredicate::CitedCarrier(_)) {
-                continue;
-            }
-            for symbol in unrelated_repository_symbols() {
+            for symbol in &corpus {
                 checked += 1;
                 assert!(
-                    !requirement.evidence.citation_proves(&symbol),
+                    !requirement.evidence.citation_proves(symbol),
                     "requirement {} is closed by `{}` at `{}`, which has nothing to do with it: a \
                      predicate that accepts arbitrary repository symbols reports sufficient on \
                      packets that proved nothing",
@@ -1524,8 +2358,35 @@ mod tests {
             }
         }
         assert!(
-            checked >= 300,
+            checked >= 4_000_000,
             "the negative corpus must actually be exercised against the tables (checked {checked})"
+        );
+    }
+
+    /// The generated corpus has to keep covering the whole space as the tables change: a flow added
+    /// without its directory reaching the corpus is a flow this invariant cannot see into.
+    #[test]
+    fn the_generated_corpus_covers_every_flows_own_directory() {
+        let directories = off_subject_directories();
+        for ((requirement_id, _), witness) in requirement_witnesses() {
+            let path = witness.file_path.clone().unwrap_or_default();
+            let directory = match path.rfind('/') {
+                Some(index) => path[..index + 1].to_string(),
+                None => String::new(),
+            };
+            assert!(
+                directories.contains(&directory),
+                "the corpus never places an off-subject symbol beside {requirement_id}'s own \
+                 evidence in `{directory}`"
+            );
+        }
+        assert!(
+            off_subject_code_extensions().len() >= 8,
+            "the corpus must cross its directories with the languages the witnesses use"
+        );
+        assert!(
+            generated_off_subject_symbols().len() >= 2_000,
+            "the generated corpus collapsed; it is meant to be a cross product, not a list"
         );
     }
 
@@ -1551,13 +2412,6 @@ mod tests {
                     if left.id == right.id {
                         continue;
                     }
-                    // Role-classified predicates are deliberately coarse; the carriers are the
-                    // per-requirement checks, so they are what this invariant holds to account.
-                    if !matches!(left.evidence, EvidencePredicate::CitedCarrier(_))
-                        || !matches!(right.evidence, EvidencePredicate::CitedCarrier(_))
-                    {
-                        continue;
-                    }
                     checked_pairs += 1;
                     let left_witness = witness_for(left);
                     let right_witness = witness_for(right);
@@ -1579,7 +2433,7 @@ mod tests {
             }
         }
         assert!(
-            checked_pairs >= 15,
+            checked_pairs >= 40,
             "this invariant must actually be exercising carrier-backed requirement pairs (checked \
              {checked_pairs})"
         );

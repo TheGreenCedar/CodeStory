@@ -5,8 +5,22 @@
 //! wording produced that role closed every requirement wearing it. Two requirements in the same
 //! flow routinely share a role — a client's request finalization and its transport send are both
 //! steps of one dispatch — so a single piece of evidence closed both, and prose alone could close
-//! either. Every carrier here reads only the citation, so a requirement is closed by evidence for
-//! that requirement and by nothing else.
+//! either. Every carrier here reads only the citation, never the claim's wording.
+//!
+//! What each carrier asks for is two independent factors: which subsystem the anchor belongs to,
+//! and which step of it the anchor is. One word may not answer both — a carrier whose subsystem
+//! list and step list share a word has one factor, which is how a symbol named `renderChart`
+//! proved a static site's renderer. The subsystem factor is read from the anchor's own *name*
+//! wherever a name can carry it; a directory says where a symbol was filed, not what it does, and
+//! a path-sourced subsystem re-opens the moment an off-subject symbol is filed beside the evidence
+//! it is impersonating.
+//!
+//! Two surfaces are the exception, stated so the limit is visible rather than assumed. A
+//! stylesheet, a markup document and a schema file are proved *by the file*: their anchors are
+//! selectors, attributes and statements with no identifier to scope by, so there the path is the
+//! subsystem. And the static-site carriers take their subsystem from either, because a build phase
+//! is named for its phase and not for the site — which is why those two carry a second name-side
+//! factor of their own.
 
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
@@ -141,8 +155,13 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
 
 /// The convenience request method a caller reaches first: a verb-named method on a client type.
 /// Distinct from the factory that builds the client and from the adapter that finally sends.
+///
+/// The verb list is the whole HTTP method set, so the terminal-segment test alone accepts every
+/// `.get`, `.post`, `.delete` and `.options` in a repository — `Store.get`, `Queue.head`,
+/// `FeatureFlags.options`. The receiver has to be a client before its verb means anything.
 pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && belongs_to_http_client(citation)
         && matches!(
             terminal(citation).as_str(),
             "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
@@ -151,8 +170,12 @@ pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -
 
 /// Anchors that belong to an HTTP client at all. `Uri.prepare` is a URL utility that happens to be
 /// named "prepare"; without this scoping it closed the finalization step of any client flow.
+///
+/// Read from the symbol's own name and not its path. A directory named `client/` or `http/` holds
+/// plenty of symbols that are not the client — moving `Store.get` into `lib/client.dart` must not
+/// turn it into the client's request method, and a path-sourced subsystem is exactly what would.
 fn belongs_to_http_client(citation: &AgentCitationDto) -> bool {
-    names_or_path_token(
+    names_token(
         citation,
         &[
             "request",
@@ -164,7 +187,9 @@ fn belongs_to_http_client(citation: &AgentCitationDto) -> bool {
             "adapter",
             "adapters",
             "transport",
+            "transports",
             "send",
+            "sends",
             "fetch",
         ],
     )
@@ -216,35 +241,51 @@ fn is_script_surface(citation: &AgentCitationDto) -> bool {
 /// `use` followed by a capital is the hook naming convention — `useData`, `useQuery`.
 /// `userProfile` and `useragentString` merely start with the same three letters, and a
 /// `starts_with("use")` test could not tell them apart.
+///
+/// Only a capital counts. Admitting `use_` and `use-` as well handed the convention to every
+/// snake-cased and kebab-cased `use_temp_dir`, `use_default_locale` and `use-legacy-mode` in any
+/// repository, none of which is a data-fetching hook — the convention this recognises exists in
+/// `camelCase` front-end code and nowhere else, which is also why the export has to sit on a
+/// script surface.
 fn names_a_hook(citation: &AgentCitationDto) -> bool {
     let segment = terminal_segment_raw(&citation.display_name);
     let Some(rest) = segment.strip_prefix("use") else {
         return false;
     };
-    match rest.chars().next() {
-        Some(next) => next.is_ascii_uppercase() || next == '_' || next == '-',
-        None => false,
-    }
+    rest.chars()
+        .next()
+        .is_some_and(|next| next.is_ascii_uppercase())
 }
 
 pub(crate) fn citation_owns_hook_public_export(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && is_script_surface(citation)
         && names_a_hook(citation)
         && !names_token(citation, &["cache", "caches"])
 }
 
+/// Serializing *the cache key*. Being a `serialize*` function on a script surface is the shape of
+/// every `serializeSettings`, `serializeForm` and `serializeQueryString` ever written; the
+/// requirement is about the key, so the key has to be named.
 pub(crate) fn citation_owns_hook_key_serialization(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && is_script_surface(citation)
+        && names_token(citation, &["key", "keys"])
         && (names_token_prefix(citation, &["serializ", "serialis"])
-            || (names_token(citation, &["key", "keys"])
-                && names_token(citation, &["hash", "stable", "stringify"])))
+            || names_token(citation, &["hash", "stable", "stringify"]))
 }
 
+/// The helper that holds cache state, not any method that touches a cache. `Cache.put` and
+/// `Cache.get` are the cache's own API on every cache in every repository; this requirement is the
+/// hook library's helper *around* one, so the anchor has to name the helper.
 pub(crate) fn citation_owns_hook_cache_helper(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && is_script_surface(citation)
         && names_token(citation, &["cache", "caches"])
+        && (names_token(
+            citation,
+            &["helper", "helpers", "provider", "context", "state", "store"],
+        ) || names_token_prefix(citation, &["make", "creat", "init"]))
 }
 
 pub(crate) fn citation_owns_hook_mutation_flow(citation: &AgentCitationDto) -> bool {
@@ -439,22 +480,38 @@ pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bo
 // Logger record + handler
 // ---------------------------------------------------------------------------
 
+/// Anchors that belong to a logging subsystem. "record" and "handler" are two of the most reused
+/// words in any codebase — `createUserRecord` is a database row and `handleClick` is a UI callback —
+/// so a carrier that reads only those words speaks for every subsystem at once.
+fn belongs_to_logging(citation: &AgentCitationDto) -> bool {
+    names_or_path_token(citation, &["log", "logs", "logger", "loggers", "logging"])
+}
+
+/// Creating the record a logger emits. The logging factor is read from the *name*: a
+/// `createUserRecord` that happens to sit in `src/logging/` is still a database row, and letting
+/// the directory supply the subsystem is how an off-subject symbol inside a flow's own folder
+/// closes that flow's requirement.
 pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && {
         let tokens = name_tokens(citation);
-        has_token(&tokens, &["record", "records"])
+        has_token(&tokens, &["log", "logs", "logger", "loggers", "logging"])
+            && has_token(&tokens, &["record", "records"])
             && !any_token_starts_with(&tokens, &["handler", "handle"])
-            && (has_token(&tokens, &["add", "create", "make", "build", "log"])
-                || tokens.as_slice() == ["record"])
+            && has_token(&tokens, &["add", "create", "make", "build", "log"])
     }
 }
 
 /// Processing a record, not registering something that might: a symbol that pushes a handler onto
 /// a stack names a handler but does nothing with a record, so it must not close this requirement.
+///
+/// The anchor has to name the *handler* — the noun — and not merely start with the verb "handle".
+/// `handleClick`, `handleScroll` and `handleResize` are callbacks in every front end ever written
+/// and were each accepted here, because `handle` is a prefix of `handler` and the second factor
+/// accepted the same prefix again.
 pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && {
+    owns_behavior(citation) && belongs_to_logging(citation) && {
         let tokens = name_tokens(citation);
-        let names_a_handler = any_token_starts_with(&tokens, &["handler", "handle"]);
+        let names_a_handler = has_token(&tokens, &["handler", "handlers"]);
         let only_registers = has_token(
             &tokens,
             &["push", "pop", "add", "remove", "set", "register"],
@@ -462,7 +519,7 @@ pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) 
         names_a_handler
             && !only_registers
             && (has_token(&tokens, &["write", "emit", "flush", "batch", "interface"])
-                || any_token_starts_with(&tokens, &["handle", "process"]))
+                || any_token_starts_with(&tokens, &["process"]))
     }
 }
 
@@ -472,6 +529,12 @@ pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) 
 
 /// Anchors that belong to a static-site build. Without this, `Cache.write` in `lib/cache.rb` closed
 /// the site's terminal boundary purely because its name contains "write".
+///
+/// Two words are deliberately absent. "view"/"views" is the MVC directory every server framework
+/// ships — `app/views/` in a Rails app is not a static site, and admitting it let `Cache.write` and
+/// `renderChart` back in through the path. "render" is this flow's *step*, not its subject: a
+/// carrier whose subsystem factor and step factor can both be satisfied by one word has one factor,
+/// which is how `renderChart` proved a site renderer. The noun `renderer` stays.
 fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
     names_or_path_token(
         citation,
@@ -495,29 +558,77 @@ fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
             "themes",
             "asset",
             "assets",
-            "view",
-            "views",
-            "render",
             "renderer",
             "generator",
         ],
     )
 }
 
+/// The site-build flow is the one place a *path* still supplies the subsystem: a build phase is
+/// named for its phase (`Build#process`), not for the site, so requiring the site in the name would
+/// reject the real anchors. That makes the two carriers below responsible for a second, independent
+/// factor read from the name — otherwise every symbol filed under `lib/site/` closed them, which is
+/// how `buildDnsRecord`, `readManifest` and `Cache.write` each proved a static-site build.
+///
+/// The name has to say *what* is being built or written, and separately *what is being done to it*.
+/// One word may not do both jobs.
+fn names_site_build_object(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "site",
+            "sites",
+            "build",
+            "builder",
+            "generator",
+            "pipeline",
+            "page",
+            "pages",
+            "post",
+            "posts",
+            "document",
+            "documents",
+            "layout",
+            "layouts",
+            "template",
+            "templates",
+            "collection",
+            "collections",
+            "renderer",
+            "asset",
+            "assets",
+            "theme",
+            "themes",
+            "file",
+            "files",
+            "html",
+        ],
+    )
+}
+
 pub(crate) fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && belongs_to_site_build(citation) && {
-        let tokens = name_tokens(citation);
-        has_token(&tokens, &["site", "build", "process", "pipeline"])
-            && !has_token(&tokens, &["render", "write", "read"])
-            && !any_token_starts_with(&tokens, &["render", "writ", "read"])
-    }
+    owns_behavior(citation)
+        && belongs_to_site_build(citation)
+        && names_site_build_object(citation)
+        && {
+            let tokens = name_tokens(citation);
+            has_token(
+                &tokens,
+                &["process", "run", "start", "execute", "generate", "phases"],
+            ) && !has_token(&tokens, &["render", "write", "read"])
+                && !any_token_starts_with(&tokens, &["render", "writ", "read"])
+        }
 }
 
 pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_site_build(citation)
-        && (names_token(citation, &["output", "outputs", "emit", "emits"])
-            || names_token_prefix(citation, &["render", "writ", "read"]))
+        && names_site_build_object(citation)
+        // `render` is matched whole while `writ`/`read` stay prefixes, because "renderer" is in the
+        // object list above: a prefix here would let that one word satisfy both factors, and a
+        // carrier whose two factors can be satisfied by one word has one factor.
+        && (names_token(citation, &["output", "outputs", "emit", "emits", "render", "renders"])
+            || names_token_prefix(citation, &["writ", "read"]))
 }
 
 // ---------------------------------------------------------------------------
@@ -526,8 +637,11 @@ pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
 
 /// Anchors that belong to an object mapper. "profile" and "plan" are ordinary words — `userProfile`
 /// closed the mapper's configuration requirement until the carrier asked which subsystem it is in.
+///
+/// Read from the name: any symbol dropped into a `mapping/` directory would otherwise inherit the
+/// subsystem it happens to be filed under.
 fn belongs_to_object_mapper(citation: &AgentCitationDto) -> bool {
-    names_or_path_token(
+    names_token(
         citation,
         &[
             "map", "maps", "mapper", "mappers", "mapping", "mappings", "typemap",
@@ -546,14 +660,14 @@ pub(crate) fn citation_owns_mapper_configuration(citation: &AgentCitationDto) ->
         && !names_token_prefix(citation, &["plan", "execut", "pipeline"])
 }
 
+/// The plan a mapper executes. "mapper" and "mapping" are absent from the step list on purpose:
+/// they are what `belongs_to_object_mapper` already asks for, so listing them here let a symbol
+/// named nothing but `Mapper` satisfy both of this carrier's factors at once.
 pub(crate) fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_object_mapper(citation)
         && !names_mapper_configuration(citation)
-        && names_token_prefix(
-            citation,
-            &["plan", "execut", "pipeline", "mapper", "mapping"],
-        )
+        && names_token_prefix(citation, &["plan", "execut", "pipeline"])
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +679,7 @@ pub(crate) fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> boo
 /// it to the formatting surface is what stops `CliParseError` in `src/cli/parse.cc` from standing
 /// in for the formatter's fallback.
 fn belongs_to_runtime_formatting(citation: &AgentCitationDto) -> bool {
-    names_or_path_token(
+    names_token(
         citation,
         &[
             "format",
@@ -605,6 +719,260 @@ pub(crate) fn citation_owns_format_errors(citation: &AgentCitationDto) -> bool {
             citation,
             &["error", "throw", "fail", "assert", "fallback", "panic"],
         )
+}
+
+// ---------------------------------------------------------------------------
+// Subsystem scopes for the role-classified requirements
+//
+// The other half of the requirement tables does not use a carrier at all: it asks the shared
+// evidence-role classifier "what kind of thing is this citation". That classifier is deliberately
+// coarse — it answers a ranking question, not a coverage one — and a great deal of it keys on the
+// *path*: anything under `runtime/` is runtime orchestration, anything under `indexer/` is symbol
+// extraction, anything under `app/`, `views/` or `pages/` is route handling, anything under
+// `flags/` is argument planning. So every symbol in those directories closed the requirement that
+// listed the role, whatever the symbol actually was.
+//
+// These scopes are the same second factor the carriers already carry, made available to the
+// role-classified requirements. They read the citation's own *name*: a directory can tell you where
+// a symbol was filed, never what it does, and letting a directory supply the subsystem is precisely
+// what lets an off-subject symbol inside a flow's own folder close that flow's requirement.
+// ---------------------------------------------------------------------------
+
+/// Indexing: discovering files, extracting symbols, and persisting them.
+pub(crate) fn flow_belongs_to_indexing(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "index",
+            "indexes",
+            "indexed",
+            "indexer",
+            "indexers",
+            "indexing",
+            "symbol",
+            "symbols",
+            "snapshot",
+            "snapshots",
+            "workspace",
+            "workspaces",
+            "candidate",
+            "candidates",
+            "catalog",
+            "catalogs",
+            "ingest",
+            "crawl",
+        ],
+    )
+}
+
+/// A server receiving and routing an inbound request.
+pub(crate) fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "request",
+            "requests",
+            "route",
+            "routes",
+            "router",
+            "routers",
+            "routing",
+            "controller",
+            "controllers",
+            "handler",
+            "handlers",
+            "endpoint",
+            "endpoints",
+            "server",
+            "servers",
+            "middleware",
+            "http",
+            "https",
+            "protocol",
+            "dispatch",
+            "dispatcher",
+            // The name each ecosystem gives the server-to-application gateway. These are protocol
+            // names in the same sense as "http", not product names: a server's request entrypoint
+            // is routinely called `wsgi_app`, `rack_app` or `service` with no other request word in
+            // sight.
+            "wsgi",
+            "asgi",
+            "cgi",
+            "fastcgi",
+            "rack",
+            "servlet",
+            "gateway",
+        ],
+    )
+}
+
+/// A client assembling and issuing an outbound request.
+pub(crate) fn flow_belongs_to_client_request(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "client",
+            "clients",
+            "http",
+            "https",
+            "request",
+            "requests",
+            "instance",
+            "instances",
+            "factory",
+            "factories",
+            "session",
+            "sessions",
+            "transport",
+            "transports",
+            "adapter",
+            "adapters",
+            "send",
+            "sends",
+            "fetch",
+            "url",
+            "urls",
+            "connection",
+            "connections",
+        ],
+    )
+}
+
+/// Where a request leaves the process and a response comes back.
+pub(crate) fn flow_belongs_to_request_terminal(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "adapter",
+            "adapters",
+            "transport",
+            "transports",
+            "response",
+            "responses",
+            "socket",
+            "sockets",
+            "stream",
+            "streams",
+            "writer",
+            "sink",
+            "buffer",
+            "send",
+            "sends",
+            "sender",
+        ],
+    )
+}
+
+/// A URL session and the delegate callbacks it drives.
+pub(crate) fn flow_belongs_to_url_session(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "session",
+            "sessions",
+            "task",
+            "tasks",
+            "delegate",
+            "delegates",
+            "url",
+            "urls",
+            "request",
+            "requests",
+            "response",
+            "responses",
+            "client",
+            "clients",
+            "transport",
+            "connection",
+            "connections",
+        ],
+    )
+}
+
+/// Bringing a command server up.
+pub(crate) fn flow_belongs_to_command_server(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "server",
+            "servers",
+            "serve",
+            "daemon",
+            "bootstrap",
+            "startup",
+            "init",
+            "main",
+            "listen",
+            "listener",
+        ],
+    )
+}
+
+/// The loop that waits for readiness and fires callbacks.
+pub(crate) fn flow_belongs_to_event_loop(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "event", "events", "loop", "loops", "poll", "polling", "select", "epoll", "kqueue",
+            "reactor", "tick",
+        ],
+    )
+}
+
+/// Reading a command off the wire.
+pub(crate) fn flow_belongs_to_network_input(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "network",
+            "networking",
+            "socket",
+            "sockets",
+            "connection",
+            "connections",
+            "client",
+            "clients",
+            "query",
+            "queries",
+            "protocol",
+            "wire",
+        ],
+    )
+}
+
+/// Choosing and running the command a request named.
+pub(crate) fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "command",
+            "commands",
+            "dispatch",
+            "dispatcher",
+            "table",
+            "handler",
+            "handlers",
+            "exec",
+            "execute",
+        ],
+    )
+}
+
+/// Planning and running a search.
+pub(crate) fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "search", "searches", "searcher", "query", "queries", "grep", "match", "matcher",
+            "matchers", "args", "argv", "arg", "main", "worker", "printer",
+        ],
+    )
+}
+
+/// A schema requirement is proved by the schema file, so here the file *is* the subsystem: a `.sql`
+/// anchor has no identifier of its own to scope by.
+pub(crate) fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
+    path_has_any_extension(citation, &[".sql"])
 }
 
 #[cfg(test)]
@@ -784,6 +1152,165 @@ mod tests {
         assert!(citation_owns_client_request_finalization(&citation(
             "BaseRequest.finalize",
             "lib/base_request.dart",
+            NodeKind::METHOD
+        )));
+    }
+
+    /// Each of these is a whole *family* of symbol, not one symbol: the HTTP verb set on any
+    /// receiver, the `handle*` callback on any event, the `*Record` builder for any row, and the
+    /// snake- or kebab-cased `use_*` in any language. Each family was accepted in full, and each
+    /// is put back inside its own subsystem here rather than excluded by name.
+    ///
+    /// The receiver of each rejection sits in the accepting flow's *own* directory, because a
+    /// carrier scoped by path rather than by name re-opens the moment a symbol is filed next to
+    /// the evidence it is impersonating.
+    #[test]
+    fn carriers_reject_whole_families_of_off_subject_name() {
+        // A verb-named accessor is not a client's convenience method, wherever it is filed.
+        for name in [
+            "Store.get",
+            "Store.delete",
+            "Cache.put",
+            "FeatureFlags.options",
+            "Queue.head",
+            "Matrix.post",
+            "Palette.patch",
+        ] {
+            assert!(
+                !citation_owns_client_request_method(&citation(
+                    name,
+                    "lib/client.dart",
+                    NodeKind::METHOD
+                )),
+                "{name} is a verb-named accessor, not an HTTP client's request method"
+            );
+        }
+        assert!(citation_owns_client_request_method(&citation(
+            "Client.get",
+            "lib/client.dart",
+            NodeKind::METHOD
+        )));
+
+        // A `handle*` callback is not a logging framework's record processing.
+        for name in [
+            "handleClick",
+            "handleKeypress",
+            "handleDragStart",
+            "handleScroll",
+            "handleResize",
+        ] {
+            assert!(
+                !citation_owns_log_handler_processing(&citation(
+                    name,
+                    "src/logging/Handler.php",
+                    NodeKind::FUNCTION
+                )),
+                "{name} names the verb `handle`, not a log handler"
+            );
+        }
+        assert!(citation_owns_log_handler_processing(&citation(
+            "AbstractProcessingHandler.write",
+            "src/logging/Handler.php",
+            NodeKind::METHOD
+        )));
+
+        // A `*Record` builder is not a logger's record creation.
+        for name in [
+            "createUserRecord",
+            "createDnsRecord",
+            "addBillingRecord",
+            "makeInventoryRecord",
+        ] {
+            assert!(
+                !citation_owns_log_record_creation(&citation(
+                    name,
+                    "src/logging/Logger.php",
+                    NodeKind::FUNCTION
+                )),
+                "{name} builds a row, not a log record"
+            );
+        }
+        assert!(citation_owns_log_record_creation(&citation(
+            "Logger.addRecord",
+            "src/logging/Logger.php",
+            NodeKind::METHOD
+        )));
+
+        // `use_` and `use-` are not the hook naming convention, and a hook lives on a script.
+        for name in ["use_temp_dir", "use-legacy-mode", "use_default_locale"] {
+            assert!(
+                !citation_owns_hook_public_export(&citation(
+                    name,
+                    "src/index/use-data.ts",
+                    NodeKind::FUNCTION
+                )),
+                "{name} is not the `use` + capital hook convention"
+            );
+        }
+        assert!(!citation_owns_hook_public_export(&citation(
+            "useData",
+            "src/index/use_data.rs",
+            NodeKind::FUNCTION
+        )));
+        assert!(citation_owns_hook_public_export(&citation(
+            "useData",
+            "src/index/use-data.ts",
+            NodeKind::FUNCTION
+        )));
+
+        // Serializing something on a script surface is not serializing the cache key, and calling
+        // a cache is not the hook's cache helper.
+        assert!(!citation_owns_hook_key_serialization(&citation(
+            "serializeSettings",
+            "src/_internal/utils/serialize.ts",
+            NodeKind::FUNCTION
+        )));
+        assert!(citation_owns_hook_key_serialization(&citation(
+            "serializeKey",
+            "src/_internal/utils/serialize.ts",
+            NodeKind::FUNCTION
+        )));
+        for name in ["Cache.put", "Cache.get", "Cache.write"] {
+            assert!(
+                !citation_owns_hook_cache_helper(&citation(
+                    name,
+                    "src/_internal/utils/helper.ts",
+                    NodeKind::METHOD
+                )),
+                "{name} is a cache's own API, not the hook library's helper around one"
+            );
+        }
+        assert!(citation_owns_hook_cache_helper(&citation(
+            "makeCacheHelper",
+            "src/_internal/utils/helper.ts",
+            NodeKind::FUNCTION
+        )));
+
+        // A step word inside the site build's own directory is not the site build.
+        for name in [
+            "Cache.write",
+            "readManifest",
+            "renderChart",
+            "buildDnsRecord",
+        ] {
+            let anchor = citation(name, "lib/site/renderer.rb", NodeKind::METHOD);
+            assert!(
+                !citation_owns_site_terminal(&anchor),
+                "{name} names no page, post, document or renderer to write"
+            );
+            assert!(
+                !citation_owns_site_lifecycle(&anchor),
+                "{name} names no site-build phase"
+            );
+        }
+        assert!(citation_owns_site_terminal(&citation(
+            "Renderer.render",
+            "lib/site/renderer.rb",
+            NodeKind::METHOD
+        )));
+        assert!(citation_owns_site_lifecycle(&citation(
+            "Build.process",
+            "lib/site/build.rb",
             NodeKind::METHOD
         )));
     }
