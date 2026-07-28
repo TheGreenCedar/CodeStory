@@ -1,5 +1,5 @@
 {
-  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code, with the number of production lines each marker occupies today. They are recorded, not excused: the lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file.",
+  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused: the lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file.",
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
       "FOREIGN KEY": 5,
@@ -201,6 +201,25 @@
       "formatto": 1,
       "routergroup": 1,
       "typemap": 1
+    },
+    "crates/codestory-runtime/src/search_scoring.rs": {
+      "Project\\.cpp": 1,
+      "SourceGroup": 1,
+      "buildindex": 1,
+      "content-data": 3,
+      "contentdata": 3,
+      "event_processor": 2,
+      "eventprocessor": 2,
+      "indexercommandcxx": 1,
+      "indexerjava": 1,
+      "persistentstorage": 1,
+      "projectbuildindex": 1,
+      "projectcpp": 1,
+      "social_entries": 1,
+      "socialentries": 1,
+      "source_group": 2,
+      "storageaccess": 2,
+      "storageaccessproxy": 1
     }
   }
 }

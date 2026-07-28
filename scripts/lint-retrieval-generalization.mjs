@@ -223,6 +223,7 @@ const productVocabularyRoots = [
 // the corpus scan.
 const requiredProductionOnlyFiles = [
   path.join(repoRoot, "crates", "codestory-runtime", "src", "search_plan.rs"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "search_scoring.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "search_terms.rs"),
 ];
 
