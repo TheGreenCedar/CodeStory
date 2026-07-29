@@ -78,6 +78,65 @@ fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
 }
 
 #[test]
+fn search_plan_terms_never_name_a_symbol_the_question_did_not() {
+    for query in [
+        "Explain how ProjectForge turns project/source-group configuration into indexing work, then how indexed data is accessed by the application. Cite the source files that support the path.",
+        "Explain how `forge exec --json` flows from the top-level CLI into the exec runtime, thread and turn start requests, and JSONL event output.",
+        "Explain how Root & Runtime public writing and social surfaces connect through collections, comment auth, RSS, and the elsewhere feed.",
+    ] {
+        let terms = search_plan_terms(query);
+        let lower = query.to_ascii_lowercase();
+        for term in &terms.extracted {
+            assert!(
+                lower.contains(&term.to_ascii_lowercase()),
+                "extracted term `{term}` was never asked for in `{query}`: {:?}",
+                terms.extracted
+            );
+        }
+        for dropped in &terms.dropped {
+            assert!(
+                lower.contains(&dropped.term.to_ascii_lowercase()),
+                "dropped term `{}` was never asked for in `{query}`: {:?}",
+                dropped.term,
+                terms.dropped
+            );
+        }
+    }
+}
+
+#[test]
+fn content_flow_questions_keep_every_word_the_question_used() {
+    let query = "Explain how Root & Runtime public writing and social surfaces connect through collections, comment auth, RSS, and the elsewhere feed.";
+    let terms = search_plan_terms(query);
+    for expected in [
+        "root",
+        "runtime",
+        "collections",
+        "comment",
+        "auth",
+        "elsewhere",
+        "feed",
+    ] {
+        assert!(
+            terms
+                .extracted
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case(expected)),
+            "asked term `{expected}` should survive extraction: {:?}",
+            terms.extracted
+        );
+    }
+    for dropped in &terms.dropped {
+        assert!(
+            ["too_short", "natural_language_filler"].contains(&dropped.reason.as_str()),
+            "terms may only be dropped for length or filler, got `{}` for `{}`",
+            dropped.reason,
+            dropped.term
+        );
+    }
+}
+
+#[test]
 fn multi_anchor_agent_question_prioritizes_named_anchor_subquery_terms() {
     let query = "Explain how ProjectAlpha turns configuration into processing work, then how processed data is accessed by the application. Anchor the answer around ConfigGroup, WorkerRunner, and DataAccess.";
     assert!(
@@ -150,6 +209,108 @@ fn broad_explain_how_search_plan_survives_generic_exact_hits() {
     assert!(
         !orientation_query(ordinary_exact_query),
         "a bare symbol query must not enter the orientation regime"
+    );
+}
+
+#[test]
+fn the_orientation_regime_gate_reads_question_shape_and_no_domain_noun() {
+    // Three questions of one shape asking about three unrelated domains. The
+    // gate that admits them may only read the shape: the moment it consults a
+    // noun table -- indexer, storage, persistence, or the holdout equivalents --
+    // the storefront and the laboratory stop being orientation questions while
+    // this repository's own subject matter keeps working, and the regression is
+    // invisible to any test written about this repository. Only a domain this
+    // product has no vocabulary for can catch that, so two of the three are.
+    for query in [
+        "Explain how a checkout moves from the storefront into payment capture, ledger posting, and receipt delivery.",
+        "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.",
+        "Explain how a lab sample moves from intake through the assay queue into reported results.",
+    ] {
+        assert!(
+            orientation_query(query),
+            "a flow question should enter the orientation regime whatever it asks about: `{query}`"
+        );
+        assert!(
+            search_plan_eligible(query, 0),
+            "with no exact anchor the question should get a plan: `{query}`"
+        );
+        // The suppression is evidence-based, not word-based: it has to fire the
+        // same way for all three, or the exact-first rule is reading the domain.
+        assert!(
+            !search_plan_eligible(query, 7),
+            "exact hits without seed anchors keep exact-first for every domain: `{query}`"
+        );
+    }
+}
+
+#[test]
+fn questions_that_name_an_identifier_stay_exact_first() {
+    for query in [
+        "Explain how run_index moves work through the runtime.",
+        "Explain how RuntimeContext::ensure_open_from_summary opens a stored snapshot.",
+        "Explain how WorkspaceIndexer moves files into the store.",
+    ] {
+        assert!(
+            !search_plan_eligible(query, 2),
+            "the asker named this symbol, so its exact hits answer the question: `{query}`"
+        );
+        // Not vacuous: naming an identifier is not itself what suppresses the
+        // plan. Take the exact hits away and the same question plans again, so
+        // the assertion above is about the evidence and not about the wording.
+        assert!(
+            search_plan_eligible(query, 0),
+            "without exact hits the same question should still plan: `{query}`"
+        );
+    }
+}
+
+#[test]
+fn repo_text_identifiers_come_from_the_file_rather_than_a_noun_list() {
+    let temp = tempdir().expect("create temp dir");
+    let source_path = temp.path().join("src").join("queue.go");
+    fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+    fs::write(
+        &source_path,
+        "package queue\n\nfunc dispatch() {}\n\n\n\n// dispatch hands the job to the next worker\n",
+    )
+    .expect("write source");
+    let symbol_hit = search_plan_test_hit(
+        "symbol",
+        "dispatch",
+        &source_path,
+        3,
+        SearchHitOrigin::IndexedSymbol,
+        false,
+    );
+    let repo_hit = search_plan_test_hit(
+        "repo",
+        "src/queue.go:7",
+        &source_path,
+        7,
+        SearchHitOrigin::TextMatch,
+        false,
+    );
+    let query = "how does a job reach the next worker";
+    let terms = search_plan_terms(query);
+
+    let groups = search_plan_anchor_groups(
+        query,
+        &terms,
+        &[],
+        &[repo_hit],
+        &[symbol_hit],
+        &HashMap::new(),
+        None,
+    );
+
+    assert!(
+        groups.iter().any(|group| {
+            group
+                .chosen_symbol
+                .as_ref()
+                .is_some_and(|hit| hit.display_name == "dispatch")
+        }),
+        "a lowercase symbol named by the file's own text should still bind: {groups:#?}"
     );
 }
 
