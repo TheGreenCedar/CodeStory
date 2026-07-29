@@ -160,6 +160,26 @@ jobs:
           version: ${{ env.SCCACHE_VERSION }}
           disable_annotations: true
 
+      - name: Capture pinned sccache identity
+        id: sccache-identity
+        shell: bash
+        run: |
+          sccache_path="$(command -v sccache)"
+          test -x "$sccache_path"
+          sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$sccache_path"
+          )"
+          {
+            echo "path=$sccache_path"
+            echo "sha256=$sccache_sha256"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Configure bounded compiler cache
         shell: bash
         run: |
@@ -342,8 +362,21 @@ jobs:
         id: linux-build
         if: matrix.asset_target == 'linux-x64'
         shell: bash
+        env:
+          SCCACHE_BINARY: ${{ steps.sccache-identity.outputs.path }}
+          SCCACHE_SHA256: ${{ steps.sccache-identity.outputs.sha256 }}
         run: |
-          test -x "$SCCACHE_PATH"
+          test -x "$SCCACHE_BINARY"
+          actual_sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$SCCACHE_BINARY"
+          )"
+          test "$actual_sccache_sha256" = "$SCCACHE_SHA256"
           mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"
           model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
           docker run --rm --platform linux/amd64 \
@@ -359,7 +392,7 @@ jobs:
             --env CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache \
             --volume "$CARGO_HOME:/cargo" \
             --volume "$PWD:/workspace" \
-            --volume "$SCCACHE_PATH:/sccache/sccache:ro" \
+            --volume "$SCCACHE_BINARY:/sccache/sccache:ro" \
             --volume "$SCCACHE_DIR:/sccache/cache" \
             --workdir /workspace \
             codestory-linux-glibc-build \
@@ -394,19 +427,29 @@ jobs:
             (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
             (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
           )
+        shell: bash
         run: node .github/scripts/cargo-cache-contract.mjs stop
 
       - name: Finalize compiler objects
-        if: >-
-          always() &&
-          (
-            (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
-            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
-          )
+        if: always() && steps.package-build.outcome == 'success'
         shell: bash
+        env:
+          SCCACHE_BINARY: ${{ steps.sccache-identity.outputs.path }}
+          SCCACHE_SHA256: ${{ steps.sccache-identity.outputs.sha256 }}
         run: |
-          sccache --show-stats
-          sccache --stop-server
+          test -x "$SCCACHE_BINARY"
+          actual_sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$SCCACHE_BINARY"
+          )"
+          test "$actual_sccache_sha256" = "$SCCACHE_SHA256"
+          "$SCCACHE_BINARY" --show-stats
+          "$SCCACHE_BINARY" --stop-server
 
       - name: Bound Cargo dependency cache
         id: cargo-dependency-cache-size
