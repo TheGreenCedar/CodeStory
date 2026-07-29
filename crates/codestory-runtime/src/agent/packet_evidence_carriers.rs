@@ -18,19 +18,40 @@
 //! One word may not answer both questions even when it appears twice. `Layout.render` in
 //! `src/components/layout.tsx` reads as two factors — a subsystem word and a step word — until you
 //! notice that the subsystem word and the folder are the same noun, and that the noun is one every
-//! front end uses. So a subsystem factor is satisfied either by a word specific to that subsystem,
-//! or by two *different* generic words; and a compound noun whose head is the flow's subject
-//! (`FrameBuffer`, `sourceMap`, `PaymentHandler`) has to say with its other word that it belongs
-//! here.
+//! front end uses. So a subsystem factor has to be answered by a word that is *specific to that
+//! subsystem*, and a compound noun whose head is the flow's subject (`FrameBuffer`, `sourceMap`,
+//! `PaymentHandler`) has to say with its other word that it belongs here.
 //!
-//! Two surfaces are the exception, stated so the limit is visible rather than assumed. A
-//! stylesheet, a markup document and a schema file are proved *by the file*: their anchors are
-//! selectors, attributes and statements with no identifier to scope by, so there the path is the
-//! subsystem — this is why `is_form_validation_surface` still reads the path for a `.html` anchor
-//! and only for that. And the static-site carriers take their subsystem from either, because a
-//! build phase is named for its phase and not for the site — which is why those two carry a second
-//! name-side factor of their own, and why the word they read from a directory has to be one only a
-//! static site uses.
+//! Two generic words are not a substitute for one specific one, and the static-site carriers are
+//! where that was tried. They accepted any two *different* web nouns from `page`, `layout`,
+//! `template`, `document`, `collection`, `asset`, `theme`, `renderer` and `generator` — on the
+//! theory that one such noun is a component framework's and two are a site generator's. A name
+//! carries two as easily as one: `AssetCollection.process` and `PageTemplate.render`, filed under
+//! `src/ui/`, closed that whole flow between them out of a repository with no static site in it.
+//!
+//! One surface is the exception, stated so the limit is visible rather than assumed. A stylesheet,
+//! an HTML document and a schema file are proved *by the file*: what the indexer emits from them
+//! are selectors, attributes and statements — `:root`, `required`, `CREATE TABLE` — with no
+//! identifier to scope by, so there the path is the subsystem. That is the whole of the exception:
+//! `is_form_validation_surface` reads the path for a `.html`, `.htm` or `.xhtml` anchor and for
+//! nothing else.
+//!
+//! A single-file component looks like that surface and is not it. The indexer blanks an SFC's
+//! template before parsing it (`codestory_indexer::template_pipeline::prepare_template_source`), so
+//! a `.vue` or `.svelte` citation names a `<script>` export — `greet`, `bump`, `clampMin` — an
+//! ordinary identifier that can carry a subsystem word of its own. While those two extensions
+//! counted as markup the path supplied the form factor for them, and `clampMin`, `submitJob` and
+//! `validityWindow` in `src/forms/Widget.vue` closed all three steps of a form validation flow
+//! between them without one of the three naming a form.
+//!
+//! The static-site carriers used to be a second exception, on the grounds that a build phase is
+//! named for its phase and not for the site. They are not any more. What they carried instead of a
+//! name-side subsystem was the generic-noun list above, so a subject word in a *directory* plus one
+//! such noun plus a step verb closed the flow — `AssetPipeline.run` and `Layout.render` under
+//! `lib/site/` proved a static-site build between them, and so did `Pipeline.run` and `Page.render`.
+//! No static site is obliged to live in a directory called `site/`, and a site generator's lifecycle
+//! and output methods hang off the site object itself, so the subject is read from the name where
+//! every other carrier here reads it.
 
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
@@ -189,8 +210,9 @@ pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -
 /// named "prepare"; without this scoping it closed the finalization step of any client flow.
 ///
 /// Read from the symbol's own name and not its path. A directory named `client/` or `http/` holds
-/// plenty of symbols that are not the client — moving `Store.get` into `lib/client.dart` must not
-/// turn it into the client's request method, and a path-sourced subsystem is exactly what would.
+/// plenty of symbols that are not the client — moving `Store.get` into a file named for the client
+/// must not turn it into the client's request method, and a path-sourced subsystem is exactly what
+/// would.
 const HTTP_CLIENT_WORDS: &[&str] = &[
     "request",
     "requests",
@@ -243,8 +265,12 @@ pub(crate) fn citation_owns_client_response_materialization(citation: &AgentCita
 // Data-fetching hook + cache
 // ---------------------------------------------------------------------------
 
-/// The hook flow lives in front-end scripts. `Cache.write` in `lib/cache.rb` is a server-side cache
-/// and must not stand in for the hook's cache helper.
+/// A surface whose citations are script identifiers. `Cache.write` in `lib/cache.rb` is a
+/// server-side cache and must not stand in for the hook's cache helper.
+///
+/// `.vue` and `.svelte` are here because that is what the indexer produces from them: their
+/// templates are blanked and only the `<script>` block is parsed, so a citation from a single-file
+/// component is a function or method with a name to read, not a markup attribute.
 fn is_script_surface(citation: &AgentCitationDto) -> bool {
     path_has_any_extension(
         citation,
@@ -314,8 +340,19 @@ pub(crate) fn citation_owns_hook_mutation_flow(citation: &AgentCitationDto) -> b
 // HTML / CSS structure
 // ---------------------------------------------------------------------------
 
+/// A document whose indexed anchors are *not* identifiers: an HTML file yields ids, classes and
+/// attributes — a mount-point id, `required`, `pattern` — and there is no name in one of those to
+/// read a
+/// subsystem out of. This is the module header's declared exception, and the only place a path is
+/// allowed to answer "which subsystem is this".
+///
+/// `.vue` and `.svelte` used to be here and are gone. They are single-file components, and the
+/// indexer blanks their templates before parsing, so a citation from one names a `<script>` export
+/// like any other script symbol. While they counted as markup the exception applied to them, and
+/// every symbol filed in a component library's `forms/` directory inherited the form factor from
+/// the folder.
 fn is_markup_document(citation: &AgentCitationDto) -> bool {
-    path_has_any_extension(citation, &[".html", ".htm", ".xhtml", ".vue", ".svelte"])
+    path_has_any_extension(citation, &[".html", ".htm", ".xhtml"])
 }
 
 fn is_stylesheet(citation: &AgentCitationDto) -> bool {
@@ -375,9 +412,18 @@ pub(crate) fn citation_owns_css_animation_structure(citation: &AgentCitationDto)
 /// requirement while the identical `clampMin` in `src/render/layout.ts` closed nothing, so the
 /// folder — not the symbol — decided whether the packet was sufficient.
 ///
-/// A **markup document** is the exception the module header states: its anchors are attributes and
-/// selectors like `required` or `pattern`, which have no identifier to scope by, so there the file
-/// is the subsystem and the path may carry the form factor.
+/// A **markup document** is the exception the module header states, and it is narrower than the
+/// surface: it belongs to `citation_owns_form_native_constraint` alone. Those anchors really are
+/// markup — `required`, `pattern`, `minlength` are attributes written in the document, with no
+/// identifier to scope by — so there the file is the subsystem and the path may carry the form
+/// factor. The other two steps are script behaviour, and their own witnesses are `.js` files; while
+/// they took the exception too, one HTML document under a `forms/` path closed all three steps of
+/// the flow out of any three lexical hits in it, which is a sufficient verdict over a packet that
+/// proved one step at most.
+///
+/// The exception is `.html`, `.htm` and `.xhtml` and nothing else. A `.vue` or `.svelte` citation is
+/// a `<script>` export with a name of its own, so it reads its form factor from the name like any
+/// other script.
 /// Words that say the anchor is about a *form*.
 ///
 /// "validate", "validates", "validation", "validations", "invalid" and "preventdefault" used to be
@@ -402,16 +448,24 @@ const FORM_SUBSYSTEM_WORDS: &[&str] = &[
     "guards",
 ];
 
+/// The anchor names a form, on a surface a form is written on. A browser document counts as such a
+/// surface because a `<script>` block inside one is indexed as script, so `setCustomValidity` in an
+/// browser document still reads as what it is — but the form factor comes from the name there, as it
+/// does everywhere else.
 fn is_form_validation_surface(citation: &AgentCitationDto) -> bool {
-    if is_markup_document(citation) {
-        return names_or_path_token(citation, FORM_SUBSYSTEM_WORDS);
-    }
-    path_has_any_extension(citation, &[".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"])
+    (is_script_surface(citation) || is_markup_document(citation))
         && names_token(citation, FORM_SUBSYSTEM_WORDS)
 }
 
+/// The one place the path may answer the form question: a constraint attribute written into a
+/// markup document. `required` and `pattern` are the whole anchor, and neither can say which
+/// document it was written in.
+fn is_form_constraint_markup(citation: &AgentCitationDto) -> bool {
+    is_markup_document(citation) && names_or_path_token(citation, FORM_SUBSYSTEM_WORDS)
+}
+
 pub(crate) fn citation_owns_form_native_constraint(citation: &AgentCitationDto) -> bool {
-    is_form_validation_surface(citation)
+    (is_form_validation_surface(citation) || is_form_constraint_markup(citation))
         && names_token(
             citation,
             &[
@@ -651,140 +705,79 @@ pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) 
 // Static-site build
 // ---------------------------------------------------------------------------
 
-/// The words that name a *static site* and little else.
+/// The words that name a *static site*.
 ///
 /// "view"/"views" is deliberately absent: it is the MVC directory every server framework ships, and
 /// `app/views/` in a Rails app is not a static site. "render" is absent because it is this flow's
 /// *step*, not its subject — a carrier whose subsystem factor and step factor can both be satisfied
-/// by one word has one factor, which is how `renderChart` proved a site renderer. The noun
-/// `renderer` stays.
-const SITE_BUILD_STRONG_SUBJECT_WORDS: &[&str] = &["site", "sites", "static"];
-
-/// Web nouns a static site shares with every other front end.
+/// by one word has one factor, which is how `renderChart` proved a site renderer.
 ///
-/// `layout`, `page`, `template` and `document` are as much a component framework's vocabulary as a
-/// site generator's, so one of them on its own does not put an anchor in this flow. Treating them
-/// as sufficient is what let `Layout.render` in `src/components/layout.tsx`, `Page.render`,
-/// `Template.render` and `document.write` each close the site's terminal boundary: the same single
-/// word answered both "is this a static site" and "what is being rendered", so the carrier that
-/// documents itself as having two factors had one.
-const SITE_BUILD_WEAK_SUBJECT_WORDS: &[&str] = &[
-    "page",
-    "pages",
-    "post",
-    "posts",
-    "layout",
-    "layouts",
-    "template",
-    "templates",
-    "document",
-    "documents",
-    "collection",
-    "collections",
-    "theme",
-    "themes",
-    "asset",
-    "assets",
-    "renderer",
-    "generator",
-];
+/// "static" is gone with the directory that justified it. It earned its place as the
+/// `public/static/` spelling of a site root, and a folder is no longer read here; as a word in a
+/// *name* it is the storage-class keyword every C-family language ships, so `StaticInitializer.run`
+/// and `StaticAnalyzer.process` would have inherited a static-site build from it.
+const SITE_BUILD_SUBJECT_WORDS: &[&str] = &["site", "sites"];
 
-/// Singular and plural of one noun are one word, so `asset` in a name and `assets` in its directory
-/// are not two independent signals.
-fn is_the_same_word(left: &str, right: &str) -> bool {
-    let stem = |word: &str| word.strip_suffix('s').unwrap_or(word).to_string();
-    stem(left) == stem(right)
+/// A `site` beside a `map` is a *sitemap* — the navigation artifact every server-rendered
+/// application emits — and not the static site this flow is about. This is the same reading
+/// `belongs_to_object_mapper` gives the word from the other side: the compound decides which of the
+/// two nouns is the head, so `SiteMapGenerator.process` and `SiteMap.write` are neither a build
+/// lifecycle nor a build's output boundary.
+fn names_a_sitemap(citation: &AgentCitationDto) -> bool {
+    names_token(citation, &["map", "maps", "sitemap", "sitemaps"])
 }
 
 /// Anchors that belong to a static-site build. Without this, `Cache.write` in `lib/cache.rb` closed
 /// the site's terminal boundary purely because its name contains "write".
 ///
-/// This flow is the module header's declared path exception, so the subsystem may be read from the
-/// directory — but what is read has to be a word only a static site uses, or two different generic
-/// web nouns. One generic noun repeated between the name and the folder it sits in is one signal,
-/// not two.
+/// Read from the **name**, like every other subsystem factor in this module, and it has to be the
+/// site itself. Two things were wrong with the version this replaces, and they compounded.
+///
+/// The first was the directory. This flow used to be the module header's second path exception, so
+/// `site` in a *folder* answered the subsystem question outright and the name was left carrying one
+/// generic web noun and one step verb — the one-word-plus-a-folder shape the rest of the module
+/// exists to reject. `AssetPipeline.run` and `Layout.render` under `lib/site/` closed the entire
+/// flow between them, as did `Pipeline.run` and `Page.render`, and the identical symbols one
+/// directory over closed nothing.
+///
+/// The second was the fallback that survived taking the directory away: two *different* generic web
+/// nouns. `page`, `layout`, `template`, `document`, `collection`, `asset`, `theme`, `renderer` and
+/// `generator` are as much a component framework's vocabulary as a site generator's, and a name
+/// carries two of them as easily as one — `AssetCollection.process` and `PageTemplate.render` in
+/// `src/ui/` closed this flow with no site anywhere in the packet. Two generic words are two
+/// signals of the same generic thing, not one specific one.
+///
+/// What is left is narrower than the corpus's full anchor set, and deliberately: a site generator's
+/// helper classes are named `Renderer` and `Reader`, and those no longer close a step on their own.
+/// The build's phases hang off the site object, which does say it, so both requirements stay
+/// reachable — and a false negative on a helper is the safe direction, while the fallback above was
+/// the unsafe one.
 fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
-    let mut tokens = name_tokens(citation);
-    tokens.extend(path_tokens(citation));
-    if has_token(&tokens, SITE_BUILD_STRONG_SUBJECT_WORDS) {
-        return true;
-    }
-    let mut weak: Vec<&String> = Vec::new();
-    for token in &tokens {
-        if !SITE_BUILD_WEAK_SUBJECT_WORDS.contains(&token.as_str()) {
-            continue;
-        }
-        if !weak.iter().any(|seen| is_the_same_word(seen, token)) {
-            weak.push(token);
-        }
-    }
-    weak.len() >= 2
+    names_token(citation, SITE_BUILD_SUBJECT_WORDS) && !names_a_sitemap(citation)
 }
 
-/// The site-build flow is the one place a *path* still supplies the subsystem: a build phase is
-/// named for its phase (`Build#process`), not for the site, so requiring the site in the name would
-/// reject the real anchors. That makes the two carriers below responsible for a second, independent
-/// factor read from the name — otherwise every symbol filed under `lib/site/` closed them, which is
-/// how `buildDnsRecord`, `readManifest` and `Cache.write` each proved a static-site build.
-///
-/// The name has to say *what* is being built or written, and separately *what is being done to it*.
-/// One word may not do both jobs.
-///
-/// "file"/"files" and "document"/"documents" are gone. They are what every `readFile`, `writeFile`
-/// and `document.write` in every repository rode in on: a file is what *any* program reads and
-/// writes, so as the object of a build step it says nothing, and the words that remain name
-/// something a site build in particular produces.
-fn names_site_build_object(citation: &AgentCitationDto) -> bool {
-    names_token(
-        citation,
-        &[
-            "site",
-            "sites",
-            "build",
-            "builder",
-            "generator",
-            "pipeline",
-            "page",
-            "pages",
-            "post",
-            "posts",
-            "layout",
-            "layouts",
-            "template",
-            "templates",
-            "collection",
-            "collections",
-            "renderer",
-            "asset",
-            "assets",
-            "theme",
-            "themes",
-            "html",
-        ],
-    )
-}
-
+/// The two carriers below used to carry a third condition, `names_site_build_object` — a list of
+/// nouns a site build produces (`page`, `layout`, `asset`, `renderer`, `pipeline`, `html`, …). It
+/// was there to stand in for a name-side subsystem while the subsystem came from the directory, and
+/// it is gone with the directory. It cannot narrow anything now: "site" was itself the first entry
+/// in that list, so every name `belongs_to_site_build` accepts satisfies it. Leaving it in would
+/// read as a second factor and be none.
 pub(crate) fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation)
-        && belongs_to_site_build(citation)
-        && names_site_build_object(citation)
-        && {
-            let tokens = name_tokens(citation);
-            has_token(
-                &tokens,
-                &["process", "run", "start", "execute", "generate", "phases"],
-            ) && !has_token(&tokens, &["render", "write", "read"])
-                && !any_token_starts_with(&tokens, &["render", "writ", "read"])
-        }
+    owns_behavior(citation) && belongs_to_site_build(citation) && {
+        let tokens = name_tokens(citation);
+        has_token(
+            &tokens,
+            &["process", "run", "start", "execute", "generate", "phases"],
+        ) && !has_token(&tokens, &["render", "write", "read"])
+            && !any_token_starts_with(&tokens, &["render", "writ", "read"])
+    }
 }
 
 pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_site_build(citation)
-        && names_site_build_object(citation)
-        // `render` is matched whole while `writ`/`read` stay prefixes, because "renderer" is in the
-        // object list above: a prefix here would let that one word satisfy both factors, and a
-        // carrier whose two factors can be satisfied by one word has one factor.
+        // Sibling of `site_lifecycle`, which excludes these same three stems, so one anchor cannot
+        // close both steps.
         && (names_token(citation, &["output", "outputs", "emit", "emits", "render", "renders"])
             || names_token_prefix(citation, &["writ", "read"]))
 }
@@ -795,7 +788,8 @@ pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
 
 /// The things an object mapper maps. A bare `map` is the most overloaded noun in the language, and
 /// the compound it heads is what says which kind: `sourceMap` is a build artifact, `roadMap` and
-/// `siteMap` are navigation, `heatMap` and `tileMap` are graphics. `typeMap` is an object mapper's
+/// `siteMap` are navigation, `heatMap` and `tileMap` are graphics. A map of types is an object
+/// mapper's
 /// own noun, and so are the model words beside it.
 const OBJECT_MAPPER_SUBJECT_WORDS: &[&str] = &[
     "type",
@@ -900,7 +894,7 @@ pub(crate) fn citation_owns_format_arguments(citation: &AgentCitationDto) -> boo
 /// The error/fallback path a runtime formatter takes when an argument cannot be formatted. This is
 /// the only carrier for `FlowRole::ErrorOrFallback`; without it the role would ask for evidence no
 /// packet could ever cite.
-pub(crate) fn citation_owns_format_errors(citation: &AgentCitationDto) -> bool {
+pub(crate) fn citation_owns_formatter_fallback(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_runtime_formatting(citation)
         && names_token_prefix(
@@ -984,8 +978,8 @@ pub(crate) fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> boo
             // with one word and closed the dispatch step of two different flows.
             // The name each ecosystem gives the server-to-application gateway. These are protocol
             // names in the same sense as "http", not product names: a server's request entrypoint
-            // is routinely called `wsgi_app`, `rack_app` or `service` with no other request word in
-            // sight.
+            // is routinely named for the gateway it speaks and for nothing else, with no other
+            // request word anywhere in the symbol.
             "wsgi",
             "asgi",
             "cgi",
@@ -1214,8 +1208,8 @@ mod tests {
         );
 
         assert!(citation_owns_format_arguments(&arguments));
-        assert!(!citation_owns_format_errors(&arguments));
-        assert!(citation_owns_format_errors(&errors));
+        assert!(!citation_owns_formatter_fallback(&arguments));
+        assert!(citation_owns_formatter_fallback(&errors));
         assert!(!citation_owns_format_arguments(&errors));
     }
 
@@ -1262,23 +1256,23 @@ mod tests {
     #[test]
     fn carriers_reject_anchors_from_other_subsystems() {
         // "error" anywhere in the repository used to prove the formatter's fallback path.
-        assert!(!citation_owns_format_errors(&citation(
+        assert!(!citation_owns_formatter_fallback(&citation(
             "CliParseError",
             "src/cli/parse.cc",
             NodeKind::FUNCTION
         )));
-        assert!(!citation_owns_format_errors(&citation(
+        assert!(!citation_owns_formatter_fallback(&citation(
             "assert_valid_utf8",
             "src/text/utf8.rs",
             NodeKind::FUNCTION
         )));
-        assert!(!citation_owns_format_errors(&citation(
+        assert!(!citation_owns_formatter_fallback(&citation(
             "panic_hook",
             "src/runtime/panic.rs",
             NodeKind::FUNCTION
         )));
         // ...while the formatter's own failure path still closes it.
-        assert!(citation_owns_format_errors(&citation(
+        assert!(citation_owns_formatter_fallback(&citation(
             "throw_format_error",
             "include/fmt/format.h",
             NodeKind::FUNCTION
@@ -1325,8 +1319,8 @@ mod tests {
             NodeKind::METHOD
         )));
         assert!(citation_owns_site_terminal(&citation(
-            "Renderer.render",
-            "lib/site/renderer.rb",
+            "Site.write",
+            "lib/site/site.rb",
             NodeKind::METHOD
         )));
 
@@ -1473,32 +1467,85 @@ mod tests {
             NodeKind::FUNCTION
         )));
 
-        // A step word inside the site build's own directory is not the site build.
+        // A step word inside the site build's own directory is not the site build; neither is one
+        // generic web noun beside a step verb, nor two of them. The receiver sits in the flow's own
+        // folder, because a carrier scoped by path re-opens the moment a symbol is filed there.
         for name in [
             "Cache.write",
             "readManifest",
             "renderChart",
             "buildDnsRecord",
+            // One generic web noun and a step verb.
+            "Layout.render",
+            "Page.render",
+            "Template.render",
+            "AssetPipeline.run",
+            "Pipeline.run",
+            "PaymentPageAllocator.process",
+            "CrashReportCollection.generate",
+            // Two *different* generic web nouns and a step verb — the fallback that survived
+            // taking the directory away, and closed the flow on its own.
+            "AssetCollection.process",
+            "PageTemplate.render",
+            "ThemeGenerator.run",
+            "PostLayout.write",
+            "DocumentTemplate.write",
+            "LayoutRenderer.output",
+            // A sitemap is navigation, not a static site, however the folder is spelled.
+            "SiteMapGenerator.process",
+            "SiteMap.write",
         ] {
             let anchor = citation(name, "lib/site/renderer.rb", NodeKind::METHOD);
             assert!(
                 !citation_owns_site_terminal(&anchor),
-                "{name} names no page, post, document or renderer to write"
+                "{name} names no static site to write, only the folder it was filed in"
             );
             assert!(
                 !citation_owns_site_lifecycle(&anchor),
-                "{name} names no site-build phase"
+                "{name} names no static site to build, only the folder it was filed in"
             );
         }
         assert!(citation_owns_site_terminal(&citation(
-            "Renderer.render",
-            "lib/site/renderer.rb",
+            "Site.write",
+            "lib/site/site.rb",
             NodeKind::METHOD
         )));
         assert!(citation_owns_site_lifecycle(&citation(
-            "Build.process",
-            "lib/site/build.rb",
+            "Site.process",
+            "lib/site/site.rb",
             NodeKind::METHOD
+        )));
+
+        // A single-file component is a script surface, so its own name has to say "form". While
+        // `.vue` counted as markup, the `forms/` folder said it for every symbol in the file, and
+        // these three closed the whole flow between them.
+        for name in ["clampMin", "submitJob"] {
+            let anchor = citation(name, "src/forms/Widget.vue", NodeKind::FUNCTION);
+            assert!(
+                !citation_owns_form_native_constraint(&anchor)
+                    && !citation_owns_form_custom_validation(&anchor)
+                    && !citation_owns_form_submit_guard(&anchor),
+                "{name} in a single-file component names no form; the directory did"
+            );
+        }
+        // `validityWindow` still closes one step, and is meant to: "validity" is the recorded
+        // `form_custom_validation | validity` surface, a word that is both the form factor and the
+        // step. It closes exactly the same step in a `.ts` file, which is the point — the extension
+        // no longer decides. Its two siblings stay open, so the flow does not close.
+        let validity_window =
+            citation("validityWindow", "src/forms/Widget.vue", NodeKind::FUNCTION);
+        assert!(citation_owns_form_custom_validation(&validity_window));
+        assert!(!citation_owns_form_native_constraint(&validity_window));
+        assert!(!citation_owns_form_submit_guard(&validity_window));
+        assert!(citation_owns_form_custom_validation(&citation(
+            "setCustomValidity",
+            "src/forms/Widget.vue",
+            NodeKind::FUNCTION
+        )));
+        assert!(citation_owns_form_native_constraint(&citation(
+            "required",
+            "examples/form.html",
+            NodeKind::FUNCTION
         )));
     }
 }

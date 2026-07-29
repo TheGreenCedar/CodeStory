@@ -5158,9 +5158,13 @@ mod tests {
                 "Reader is responsible for reading site content.",
                 anchor_at("Reader.read_content", "lib/site/reader.rb"),
             ),
+            // `Site.render`, not `Renderer.render`. The site's terminal boundary reads the name
+            // and not the `lib/site/` folder now, and a renderer that does not say which renderer
+            // it is is the shape `Layout.render` and `Page.render` evaded with. The render phase
+            // hangs off the site object, which is where this claim's anchor takes it from.
             evidence_claim(
-                "Renderer renders pages and documents.",
-                anchor_at("Renderer.render", "lib/site/renderer.rb"),
+                "The site render phase renders pages and documents.",
+                anchor_at("Site.render", "lib/site/renderer.rb"),
             ),
         ];
 

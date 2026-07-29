@@ -6,18 +6,18 @@ use crate::agent::packet_evidence_carriers::{
     citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
     citation_owns_css_animation_structure, citation_owns_css_structure,
     citation_owns_form_custom_validation, citation_owns_form_native_constraint,
-    citation_owns_form_submit_guard, citation_owns_format_arguments, citation_owns_format_errors,
-    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
-    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
-    citation_owns_html_app_shell, citation_owns_log_handler_processing,
-    citation_owns_log_record_creation, citation_owns_mapper_configuration,
-    citation_owns_mapper_execution, citation_owns_shell_completion,
-    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
-    citation_owns_site_lifecycle, citation_owns_site_terminal, flow_belongs_to_client_request,
-    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
-    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
-    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
-    flow_belongs_to_url_session,
+    citation_owns_form_submit_guard, citation_owns_format_arguments,
+    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
+    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
+    citation_owns_hook_public_export, citation_owns_html_app_shell,
+    citation_owns_log_handler_processing, citation_owns_log_record_creation,
+    citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
+    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
+    citation_owns_site_terminal, flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
+    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
+    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
+    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
 };
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -882,7 +882,7 @@ const RUNTIME_FORMATTING_FLOW: &[FlowRequirement] = &[
         role: FlowRole::ErrorOrFallback,
         query_seeds: &["format error", "error formatting"],
         coverage_mode: CoverageMode::AllowsSourceRange,
-        evidence: EvidencePredicate::CitedCarrier(citation_owns_format_errors),
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_formatter_fallback),
     },
 ];
 
@@ -990,6 +990,7 @@ mod tests {
     use super::*;
     use crate::agent::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
+    use std::collections::BTreeMap;
 
     fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
         packet_flow_requirements_for_terms(
@@ -1439,13 +1440,19 @@ mod tests {
                     NodeKind::METHOD,
                 ),
             ),
+            // The site object's own lifecycle and output methods. `Build.process` and
+            // `Renderer.render` stood here before, and both took their subsystem entirely from the
+            // `lib/site/` folder they were filed in — which is what made a directory look
+            // load-bearing for this flow. A site generator's build phases hang off the site, and
+            // that is what the two anchors say now; the folder is left in place so the corpus keeps
+            // filing off-subject symbols beside them.
             (
                 ("site_lifecycle", "entrypoint"),
-                witness("Build.process", "lib/site/build.rb", NodeKind::METHOD),
+                witness("Site.process", "lib/site/site.rb", NodeKind::METHOD),
             ),
             (
                 ("site_terminal", "terminal_boundary"),
-                witness("Renderer.render", "lib/site/renderer.rb", NodeKind::METHOD),
+                witness("Site.write", "lib/site/renderer.rb", NodeKind::METHOD),
             ),
             (
                 ("mapper_config", "configuration"),
@@ -1587,7 +1594,7 @@ mod tests {
     ///
     /// The positive witnesses above only show each predicate accepts *one* hand-picked anchor. They
     /// cannot see a predicate that also accepts everything else, and that is exactly what happened:
-    /// `citation_owns_format_errors` matched any symbol whose name contained "error" anywhere in
+    /// `citation_owns_formatter_fallback` matched any symbol whose name contained "error" anywhere in
     /// the repository, `citation_owns_hook_public_export` matched any name starting with the three
     /// letters "use", and `citation_owns_form_native_constraint` matched the unanchored substring
     /// "min" — so `CliParseError`, `userProfile` and `adminPanel` each closed a requirement they
@@ -1954,14 +1961,41 @@ mod tests {
     /// list growing quietly: an entry appearing here means some carrier's two factors collapsed
     /// into one word, which is how `renderChart` proved a site renderer and every `.get` in the
     /// repository proved a client's convenience method.
+    ///
+    /// The stylesheet, markup and shell entries arrived when the sweep started crossing every
+    /// surface class a carrier branches on rather than `.rs` and `.ts`. They are not a collapse:
+    /// on those surfaces the anchor is a selector, an attribute or a shell function, which is the
+    /// declared exception, and no code identifier can reach them because the extension gate will
+    /// not have it. What the widening was for is the case that is *not* an exception — a `.vue`
+    /// anchor was taking the markup branch while the `.ts` beside it took the name branch, and a
+    /// sweep that only ever asked about `.ts` could not see the difference.
     const ONE_WORD_EVIDENCE_SURFACE: &[&str] = &[
         "buffered_storage | buffer",
         "client_interface_helpers | request",
         "command_server_bootstrap | main",
+        "css_animation_entrypoint | forward",
+        "css_animation_entrypoint | import",
+        "css_animation_entrypoint | use",
+        "css_animation_structure | animated",
+        "css_animation_structure | animation",
+        "css_animation_structure | delay",
+        "css_animation_structure | duration",
+        "css_animation_structure | fillmode",
+        "css_animation_structure | iteration",
+        "css_animation_structure | keyframes",
+        "css_animation_structure | transition",
         "form_custom_validation | validity",
         "hook_mutation_flow | mutat",
         "hook_mutation_flow | mutate",
         "hook_mutation_flow | mutation",
+        "html_app_shell | app",
+        "html_app_shell | body",
+        "html_app_shell | main",
+        "html_app_shell | module",
+        "html_app_shell | mount",
+        "html_app_shell | root",
+        "html_app_shell | script",
+        "html_app_shell | shell",
         "indexing_storage | indexer",
         "indexing_storage | indexers",
         "indexing_storage | snapshot",
@@ -1976,6 +2010,27 @@ mod tests {
         "request_entrypoint | servlet",
         "request_entrypoint | wsgi",
         "search_entrypoint | main",
+        "shell_completion | alias",
+        "shell_completion | compgen",
+        "shell_completion | complete",
+        "shell_completion | completion",
+        "shell_function_dispatch | case",
+        "shell_function_dispatch | command",
+        "shell_function_dispatch | commands",
+        "shell_function_dispatch | dispatch",
+        "shell_function_dispatch | dispatcher",
+        "shell_function_dispatch | exec",
+        "shell_function_dispatch | execut",
+        "shell_function_dispatch | execute",
+        "shell_function_dispatch | execution",
+        "shell_function_dispatch | run",
+        "shell_function_dispatch | use",
+        "shell_installer_bootstrap | bootstrap",
+        "shell_installer_bootstrap | download",
+        "shell_installer_bootstrap | install",
+        "shell_installer_bootstrap | setup",
+        "shell_installer_bootstrap | source",
+        "shell_installer_bootstrap | sources",
     ];
 
     /// Every word any predicate in this crate reads, so the sweep below covers the whole vocabulary
@@ -2349,6 +2404,11 @@ mod tests {
             "destination",
             "class",
             "classes",
+            // A `site` beside a `map` is a sitemap, which the static-site carriers now reject. The
+            // rejecting word has to be swept too: a word that *narrows* a carrier is a word whose
+            // removal widens it, and the sweep is what would notice.
+            "sitemap",
+            "sitemaps",
         ]
     }
 
@@ -2406,28 +2466,98 @@ mod tests {
         ]
     }
 
-    /// The directories the compound sweep crosses its names with.
+    /// One file per *surface class* a carrier branches on, in each directory that used to hand out
+    /// a subsystem.
     ///
-    /// Fewer than the bare-word sweep uses, and deliberately so: after `role_survives_without_its_path`
-    /// no directory can grant a role at all, and the one invariant that still has to see every
-    /// directory — `no_requirement_is_closed_by_an_unrelated_repository_symbol` — already crosses
-    /// the full list. What is left that reads a path is the declared exception, so the set here is
-    /// the repository root, a plain source directory, and one directory per exception: the
-    /// static-site subject word, the `static/` spelling of it, a logging folder and a form example
-    /// folder.
-    fn compound_sweep_directories() -> Vec<&'static str> {
+    /// This replaces a directory list crossed with `[".rs", ".ts"]` and a comment asserting that
+    /// "`.ts` stands for every script surface". That was not true and the sweep could not see it:
+    /// `is_form_validation_surface`, `is_markup_document` and `is_stylesheet` each branch on the
+    /// extension into a *path-reading* code path, and `.vue` took the markup branch, so every
+    /// symbol in a component library's `forms/` directory inherited the form factor from its folder
+    /// while the sweep only ever asked about `.rs` and `.ts`. Nothing here is asserted any more:
+    /// `the_sweeps_stand_for_every_surface_a_carrier_branches_on` checks each of these against
+    /// every extension a carrier actually reads.
+    ///
+    /// Fewer directories than the bare-word sweep uses, and deliberately so: after
+    /// `role_survives_without_its_path` no directory can grant a role at all, and the one invariant
+    /// that still has to see every directory — `no_requirement_is_closed_by_an_unrelated_repository_symbol`
+    /// — already crosses the full list. What is left that reads a path is the declared document
+    /// exception, so this is the repository root, a plain source directory, and the folders that a
+    /// carrier used to take a subsystem from: the static-site subject word, the `static/` spelling
+    /// of it, a logging folder and a form example folder.
+    fn sweep_surfaces() -> Vec<&'static str> {
         vec![
-            "",
-            "src/",
-            "lib/site/",
-            "public/static/",
-            "src/logging/",
-            "examples/form/",
+            "one.rs",
+            "src/one.ts",
+            "lib/site/one.rs",
+            "lib/site/one.ts",
+            "public/static/one.ts",
+            "src/logging/one.rs",
+            "examples/form/one.ts",
+            "examples/form/one.vue",
+            "examples/form/one.html",
+            "src/styles/one.css",
+            "scripts/install",
+            "db/one.sql",
+        ]
+    }
+
+    /// The file names the bare-word sweep crosses its (much longer) directory list with: one per
+    /// surface class, for the same reason as above.
+    fn sweep_surface_files() -> Vec<&'static str> {
+        vec![
+            "one.rs", "one.ts", "one.vue", "one.html", "one.css", "one.sh", "one.sql", "install",
+        ]
+    }
+
+    /// Every extension a carrier reads, paired with the sweep file that stands for it.
+    ///
+    /// The left column is checked against the carriers' own source, so an extension added to a
+    /// carrier without a representative here fails the gate rather than opening a hole in it. The
+    /// right column is checked *behaviourally*: a representative that stopped behaving like the
+    /// extension it stands for is exactly the `.vue`-as-markup defect, and it now fails.
+    fn carrier_surface_classes() -> Vec<(&'static str, &'static str)> {
+        vec![
+            // Script surfaces. `.vue` and `.svelte` are here rather than with the markup documents
+            // because the indexer blanks a single-file component's template and parses only its
+            // `<script>` block, so their citations are identifiers.
+            (".js", "one.ts"),
+            (".mjs", "one.ts"),
+            (".cjs", "one.ts"),
+            (".ts", "one.ts"),
+            (".mts", "one.ts"),
+            (".cts", "one.ts"),
+            (".jsx", "one.ts"),
+            (".tsx", "one.ts"),
+            (".vue", "one.ts"),
+            (".svelte", "one.ts"),
+            // Markup documents: ids, classes and attributes, with no identifier to scope by.
+            (".html", "one.html"),
+            (".htm", "one.html"),
+            (".xhtml", "one.html"),
+            // Stylesheets: selectors and at-rules.
+            (".css", "one.css"),
+            (".scss", "one.css"),
+            (".sass", "one.css"),
+            (".less", "one.css"),
+            // Shell scripts, including the extensionless installer `is_shell_script` accepts.
+            (".sh", "one.sh"),
+            (".bash", "one.sh"),
+            (".zsh", "one.sh"),
+            ("install", "install"),
+            // Schemas.
+            (".sql", "one.sql"),
         ]
     }
 
     /// The compound names the sweep crosses each vocabulary word into: the word as the head of an
     /// off-subject compound, as its qualifier, and as a method on an off-subject receiver.
+    ///
+    /// Every name here carries exactly one vocabulary word. That is the limit of what this shape
+    /// can see, and it is why `no_carrier_flow_closes_on_evidence_that_never_names_it` exists: a
+    /// carrier needs an object word *and* a step verb, so a name with one vocabulary word in it can
+    /// never reach the second factor. `ChartPipeline` closed nothing while `ChartPipeline.run`
+    /// closed a static-site build, and this generator produced the first and never the second.
     fn compound_shapes_for(word: &str) -> Vec<String> {
         let mut capitalized = word.chars();
         let capitalized = match capitalized.next() {
@@ -2484,14 +2614,57 @@ mod tests {
     ///   `indexing_storage` unreachable for Sourcetrail, whose storage anchors are `IndexerJava`,
     ///   `StorageAccess` and `PersistentStorage`. A false negative on a live task is not a good
     ///   trade for this, so it stays open and named.
+    ///
+    /// The list tripled when the sweep started crossing the surface classes the carriers actually
+    /// branch on instead of `.rs` and `.ts`. Nothing widened to cause that: every added entry is a
+    /// stylesheet, markup, shell or schema family that has always been admitted and that a sweep
+    /// asking only about two code extensions could not reach. They are the module header's declared
+    /// exception seen from the outside — on those surfaces the anchor is a selector, an attribute or
+    /// a statement, so a `css_animation_structure | keyframes` entry says "an at-rule in a
+    /// stylesheet closes the animation structure step", which is what it is supposed to say and
+    /// what no code identifier can imitate, because `is_stylesheet` will not have it.
+    ///
+    /// The exception is bounded by how much of a flow it can close, and that is what changed:
+    /// `form_custom_validation` and `form_submit_guard` used to be admitted from a markup path too,
+    /// so one HTML document under a `forms/` directory closed all three steps of form validation out
+    /// of any three lexical hits in it. They read the form from the name now, on every surface, and
+    /// only `form_native_constraints` — whose anchors genuinely are the document's own attributes —
+    /// still takes the path.
     const COMPOUND_EVIDENCE_SURFACE: &[&str] = &[
         "buffered_storage | buffer",
         "client_interface_helpers | request",
+        "css_animation_entrypoint | forward",
+        "css_animation_entrypoint | import",
+        "css_animation_entrypoint | use",
+        "css_animation_structure | animated",
+        "css_animation_structure | animation",
+        "css_animation_structure | delay",
+        "css_animation_structure | duration",
+        "css_animation_structure | fillmode",
+        "css_animation_structure | iteration",
+        "css_animation_structure | keyframes",
+        "css_animation_structure | transition",
         "form_custom_validation | validity",
+        "form_native_constraints | inputmode",
+        "form_native_constraints | inputtype",
+        "form_native_constraints | max",
+        "form_native_constraints | maxlength",
+        "form_native_constraints | min",
+        "form_native_constraints | minlength",
+        "form_native_constraints | pattern",
+        "form_native_constraints | required",
         "hook_mutation_flow | mutat",
         "hook_mutation_flow | mutate",
         "hook_mutation_flow | mutation",
         "hook_public_export | use",
+        "html_app_shell | app",
+        "html_app_shell | body",
+        "html_app_shell | main",
+        "html_app_shell | module",
+        "html_app_shell | mount",
+        "html_app_shell | root",
+        "html_app_shell | script",
+        "html_app_shell | shell",
         "indexing_storage | indexer",
         "indexing_storage | indexers",
         "indexing_storage | snapshot",
@@ -2505,40 +2678,178 @@ mod tests {
         "request_entrypoint | routes",
         "request_entrypoint | servlet",
         "request_entrypoint | wsgi",
+        "shell_completion | alias",
+        "shell_completion | compgen",
+        "shell_completion | complete",
+        "shell_completion | completion",
+        "shell_function_dispatch | case",
+        "shell_function_dispatch | command",
+        "shell_function_dispatch | commands",
+        "shell_function_dispatch | dispatch",
+        "shell_function_dispatch | dispatcher",
+        "shell_function_dispatch | exec",
+        "shell_function_dispatch | execut",
+        "shell_function_dispatch | execute",
+        "shell_function_dispatch | execution",
+        "shell_function_dispatch | run",
+        "shell_function_dispatch | use",
+        "shell_installer_bootstrap | bootstrap",
+        "shell_installer_bootstrap | download",
+        "shell_installer_bootstrap | install",
+        "shell_installer_bootstrap | setup",
+        "shell_installer_bootstrap | source",
+        "shell_installer_bootstrap | sources",
     ];
+
+    /// The requirements no anchor *name* can be wrong about, because on their own surface the file
+    /// is the evidence.
+    ///
+    /// A `.css` citation is a selector or an at-rule; `css_structure` asks for a stylesheet and
+    /// nothing more, so every name in the sweep closes it there. That is the module header's
+    /// declared exception rather than a word deciding a step, and recording it as one line instead
+    /// of 362 is what keeps the surface below readable. An entry appearing here means a requirement
+    /// stopped reading its anchor at all.
+    const FILE_IS_THE_EVIDENCE_SURFACE: &[&str] = &["css_structure | src/styles/one.css"];
+
+    /// The sweeps cross names with one file per surface class rather than with every extension the
+    /// carriers read. That reduction is only sound while each representative behaves exactly like
+    /// the extensions it stands for, so it is checked rather than asserted in a comment.
+    ///
+    /// This is the test that would have caught the single-file-component defect. `.vue` was in
+    /// `is_markup_document`, so a `.vue` anchor took the path-reading branch of
+    /// `is_form_validation_surface` while `.ts` took the name-reading one — the two extensions
+    /// disagreed, and the sweeps, which only ever asked about `.ts`, could not see it.
+    #[test]
+    fn the_sweeps_stand_for_every_surface_a_carrier_branches_on() {
+        let classes = carrier_surface_classes();
+
+        // Every extension literal in the carriers' own source has to be accounted for, so a new
+        // surface added to a carrier fails here rather than opening a hole in the sweeps.
+        let mut unaccounted: Vec<String> = Vec::new();
+        for line in include_str!("packet_evidence_carriers.rs").lines() {
+            let code = line.trim_start();
+            if code.starts_with("#[cfg(test)]") {
+                break;
+            }
+            if code.starts_with("//") {
+                continue;
+            }
+            for (index, literal) in code.split('"').enumerate() {
+                if index % 2 == 0 || !literal.starts_with('.') || literal.len() < 2 {
+                    continue;
+                }
+                if !literal[1..].chars().all(|c| c.is_ascii_lowercase())
+                    || classes.iter().any(|(extension, _)| *extension == literal)
+                    || unaccounted.iter().any(|seen| seen == literal)
+                {
+                    continue;
+                }
+                unaccounted.push(literal.to_string());
+            }
+        }
+        assert!(
+            unaccounted.is_empty(),
+            "a carrier branches on these file extensions but no sweep surface stands for them, so \
+             the recorded surfaces cannot see what they admit: {unaccounted:?}"
+        );
+
+        let requirements = all_flow_requirements();
+        let verdicts = |file: &str, name: &str, directory: &str, kind| {
+            let citation = witness(name, &format!("{directory}{file}"), kind);
+            requirements
+                .iter()
+                .filter(|requirement| requirement.evidence.citation_proves(&citation))
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>()
+        };
+        for (extension, representative) in &classes {
+            let file = if extension.starts_with('.') {
+                format!("one{extension}")
+            } else {
+                (*extension).to_string()
+            };
+            for word in evidence_vocabulary() {
+                for name in [word.to_string(), format!("Chart{word}.run")] {
+                    // The root and the one directory a carrier is still allowed to read.
+                    for directory in ["", "examples/form/"] {
+                        for kind in [NodeKind::FUNCTION, NodeKind::CLASS] {
+                            assert_eq!(
+                                verdicts(&file, &name, directory, kind),
+                                verdicts(representative, &name, directory, kind),
+                                "`{directory}{file}` and the `{representative}` that stands for it \
+                                 in the sweeps disagree about `{name}`: the sweeps are asking about \
+                                 a surface class that no longer has one behaviour, which is how a \
+                                 `.vue` anchor took a path-reading branch that `.ts` did not"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn compound_names_close_only_the_requirements_the_word_is_the_subject_of() {
         let requirements = all_flow_requirements();
         let mut live: Vec<String> = Vec::new();
         let mut checked = 0_u64;
+        let mut names_swept = 0_usize;
+        let mut closes_every_name: BTreeMap<String, usize> = BTreeMap::new();
         for word in evidence_vocabulary() {
             for name in compound_shapes_for(word) {
-                for directory in compound_sweep_directories() {
-                    // `.rs` and `.ts` for the same reason the bare-word sweep uses them: one script
-                    // surface and one non-script one. Document surfaces are deliberately absent —
-                    // a `.html` anchor is the module header's declared exception where the file is
-                    // the subsystem, so sweeping it would record the exception rather than the
-                    // name families this list is about. The corpus above crosses every extension.
-                    for extension in [".rs", ".ts"] {
-                        for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
-                            let citation =
-                                witness(&name, &format!("{directory}one{extension}"), kind);
-                            for requirement in &requirements {
-                                checked += 1;
-                                if !requirement.evidence.citation_proves(&citation) {
-                                    continue;
-                                }
-                                let entry = format!("{} | {word}", requirement.id);
-                                if !live.contains(&entry) {
-                                    live.push(entry);
-                                }
+                for surface in sweep_surfaces() {
+                    names_swept += 1;
+                    let mut closed_here: Vec<&str> = Vec::new();
+                    for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
+                        let citation = witness(&name, surface, kind);
+                        for requirement in &requirements {
+                            checked += 1;
+                            if !requirement.evidence.citation_proves(&citation) {
+                                continue;
                             }
+                            if !closed_here.contains(&requirement.id) {
+                                closed_here.push(requirement.id);
+                            }
+                        }
+                    }
+                    for id in closed_here {
+                        *closes_every_name
+                            .entry(format!("{id} | {surface}"))
+                            .or_default() += 1;
+                        let entry = format!("{id} | {word}");
+                        if !live.contains(&entry) {
+                            live.push(entry);
                         }
                     }
                 }
             }
         }
+
+        // A requirement that closes for *every* name on one surface is not admitting a word — it is
+        // the declared exception where the file is the evidence. Recording 362 words for it would
+        // bury the list this test exists to keep readable, so it is recorded once, as the surface.
+        let names_per_surface = names_swept / sweep_surfaces().len();
+        let mut by_file: Vec<String> = closes_every_name
+            .into_iter()
+            .filter(|(_, count)| *count == names_per_surface)
+            .map(|(entry, _)| entry)
+            .collect();
+        by_file.sort();
+        assert_eq!(
+            by_file,
+            FILE_IS_THE_EVIDENCE_SURFACE
+                .iter()
+                .map(|entry| (*entry).to_string())
+                .collect::<Vec<_>>(),
+            "the set of requirements proved by their file alone changed; each one is a place where \
+             no anchor name can make a packet wrong, so the list belongs in the diff a reviewer \
+             reads"
+        );
+        live.retain(|entry| {
+            !by_file
+                .iter()
+                .any(|proved| proved.split(" | ").next() == entry.split(" | ").next())
+        });
         assert!(
             checked >= 2_000_000,
             "the compound sweep must actually cross the vocabulary with off-subject qualifiers \
@@ -2581,13 +2892,14 @@ mod tests {
         for word in evidence_vocabulary() {
             for directory in &directories {
                 // Every directory, because a directory handing out a role is what this sweep looks
-                // for. Two languages and three kinds, because nothing else is reachable: `.ts`
-                // stands for every script surface and `.rs` for every non-script one, and `STRUCT`
-                // is treated identically to `CLASS` by every predicate in the crate. The whole
-                // language set and the non-behavior kinds are crossed against the corpus above.
-                for extension in [".rs", ".ts"] {
+                // for, crossed with one file per surface class. It used to be `.rs` and `.ts` under
+                // a comment claiming `.ts` stood for every script surface; that claim is now a
+                // test rather than a comment, and it was false while `.vue` took the markup branch.
+                // `STRUCT` is treated identically to `CLASS` by every predicate in the crate, and
+                // the non-behavior kinds are crossed against the corpus above.
+                for file in sweep_surface_files() {
                     for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
-                        let citation = witness(word, &format!("{directory}one{extension}"), kind);
+                        let citation = witness(word, &format!("{directory}{file}"), kind);
                         for requirement in &requirements {
                             if !requirement.evidence.citation_proves(&citation) {
                                 continue;
@@ -2601,6 +2913,11 @@ mod tests {
                 }
             }
         }
+        live.retain(|entry| {
+            !FILE_IS_THE_EVIDENCE_SURFACE
+                .iter()
+                .any(|proved| proved.split(" | ").next() == entry.split(" | ").next())
+        });
         live.sort();
 
         let mut recorded = ONE_WORD_EVIDENCE_SURFACE
@@ -2629,17 +2946,6 @@ mod tests {
              them out of the recorded surface in the diff a reviewer reads: {removed:?}"
         );
     }
-
-    /// No requirement — role-classified or carrier-backed — may be closed by a symbol that has
-    /// nothing to do with it.
-    ///
-    /// Both halves of the tables are held to this. The earlier version of this invariant skipped
-    /// every `CitedRoles` requirement on the grounds that the role classifier is coarse by design,
-    /// which left exactly half the tables untested; running this corpus against them turned up
-    /// acceptances in nine of them, all from the same cause. A role is not scoped to a flow, and
-    /// much of the classifier reads the path, so `renderChart` under `src/views/` was a server's
-    /// request entrypoint, `Store.delete` was an indexer's persistence step, and every symbol under
-    /// `runtime/` was a runtime orchestration entrypoint for three different flows at once.
 
     /// The acceptance bar for this round, one case per carrier-backed flow.
     ///
@@ -2818,6 +3124,423 @@ mod tests {
         }
     }
 
+    /// The packets that reached a fully-closed *Sufficient* verdict on evidence that proved none of
+    /// the flow they answered, named one by one so they cannot come back quietly.
+    ///
+    /// Rejecting these names is not what makes the fix a fix — `no_carrier_flow_closes_on_evidence_that_never_names_it`
+    /// is, because it generates the whole shape rather than the examples. This test is the other
+    /// half of the bar: the verdict has to be partial *and* it has to name the step the evidence
+    /// genuinely fails to prove. A packet that is partial for the wrong reason still tells the
+    /// caller the wrong thing.
+    #[test]
+    fn the_false_safe_packets_are_partial_and_name_the_step_they_do_not_prove() {
+        let site = "Trace how the static site build command creates a site and runs the read, \
+                    generate, render, and write phases.";
+        let form = "Explain how the form validation examples combine native HTML constraints with \
+                    custom JavaScript validation and a submit guard.";
+
+        let cases: Vec<(&str, &str, Vec<AgentCitationDto>, &[&str])> = vec![
+            // The subject came from the `lib/site/` directory, so neither name had to say "site".
+            (
+                "the acceptance bar's own citations, one directory over",
+                site,
+                vec![
+                    witness("AssetPipeline.run", "lib/site/assets.rb", NodeKind::METHOD),
+                    witness("Layout.render", "lib/site/layout.tsx", NodeKind::METHOD),
+                ],
+                &["site_lifecycle", "site_terminal"],
+            ),
+            (
+                "a build pipeline and a render pipeline in the site folder",
+                site,
+                vec![
+                    witness("DataPipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
+                    witness("RenderPipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
+                    witness("Pipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
+                ],
+                &["site_lifecycle", "site_terminal"],
+            ),
+            // `public/static/` was the second spelling of the site root, and bundled vendor
+            // JavaScript is what actually lives there.
+            (
+                "bundled vendor script under the static asset root",
+                site,
+                vec![
+                    witness(
+                        "AssetPipeline.run",
+                        "public/static/vendor.ts",
+                        NodeKind::METHOD,
+                    ),
+                    witness("Layout.render", "public/static/vendor.ts", NodeKind::METHOD),
+                ],
+                &["site_lifecycle", "site_terminal"],
+            ),
+            (
+                "a generator directory in a server-rendered application",
+                site,
+                vec![
+                    witness("Pages.generate", "src/generator/pages.rb", NodeKind::METHOD),
+                    witness("Pages.render", "src/generator/pages.rb", NodeKind::METHOD),
+                ],
+                &["site_lifecycle", "site_terminal"],
+            ),
+            // Two different generic web nouns, which is what survived taking the directory away.
+            (
+                "two generic web nouns and a step verb, filed nowhere near a site",
+                site,
+                vec![
+                    witness(
+                        "AssetCollection.process",
+                        "src/ui/assets.ts",
+                        NodeKind::METHOD,
+                    ),
+                    witness("PageTemplate.render", "src/ui/page.tsx", NodeKind::METHOD),
+                    witness("ThemeGenerator.run", "src/ui/theme.ts", NodeKind::METHOD),
+                    witness(
+                        "LayoutRenderer.output",
+                        "src/ui/layout.ts",
+                        NodeKind::METHOD,
+                    ),
+                ],
+                &["site_lifecycle", "site_terminal"],
+            ),
+            // A single-file component was a markup document, so its `forms/` folder answered the
+            // form question for every symbol in the file. `validityWindow` still closes one step,
+            // and is meant to: "validity" is the recorded `form_custom_validation | validity`
+            // surface and it closes exactly the same step in the `.ts` next to it.
+            (
+                "one component's exports, when a component was markup",
+                form,
+                vec![
+                    witness("clampMin", "src/forms/Widget.vue", NodeKind::FUNCTION),
+                    witness("submitJob", "src/forms/Widget.vue", NodeKind::FUNCTION),
+                    witness("validityWindow", "src/forms/Widget.vue", NodeKind::FUNCTION),
+                ],
+                &["form_native_constraints", "form_submit_guard"],
+            ),
+            (
+                "components and a document across three form directories",
+                form,
+                vec![
+                    witness("maxRetries", "src/forms/Card.vue", NodeKind::FUNCTION),
+                    witness(
+                        "submitTransaction",
+                        "app/forms/Checkout.svelte",
+                        NodeKind::FUNCTION,
+                    ),
+                    witness(
+                        "setValidityPeriod",
+                        "src/forms/page.html",
+                        NodeKind::FUNCTION,
+                    ),
+                ],
+                &["form_native_constraints", "form_submit_guard"],
+            ),
+        ];
+
+        for (label, prompt, citations, expected_missing) in cases {
+            let requirements = packet_flow_requirements_for_terms(
+                &packet_probe_terms(prompt),
+                PacketTaskClassDto::DataFlow,
+            );
+            assert!(
+                !requirements.is_empty(),
+                "{label}: the prompt must raise its flow, or this case proves nothing"
+            );
+            let missing = requirements
+                .iter()
+                .filter(|requirement| {
+                    !citations
+                        .iter()
+                        .any(|citation| requirement.evidence.citation_proves(citation))
+                })
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                missing, expected_missing,
+                "{label}: this packet reported a different set of open steps than the one its \
+                 evidence actually leaves open"
+            );
+        }
+    }
+
+    /// One carrier-backed flow: the question that raises it, the words that put an anchor in it,
+    /// the surfaces its evidence turns up on, and the steps that an anchor naming none of those
+    /// words can still close.
+    struct CarrierFlow {
+        flow: &'static str,
+        prompt: &'static str,
+        /// Mirrors the subsystem list the flow's carriers read. Held to them by
+        /// `no_carrier_flow_closes_on_evidence_that_never_names_it`: a word dropped from a carrier's
+        /// subsystem list widens what closes without it, and the sweep is what notices.
+        subject_words: &'static [&'static str],
+        surfaces: &'static [&'static str],
+        /// The requirements of this flow that a name carrying no subject word still closes, as
+        /// `requirement | surface`. Every entry is a residual, stated rather than left to be found.
+        closable_without_the_subject: &'static [&'static str],
+    }
+
+    fn carrier_flows() -> Vec<CarrierFlow> {
+        vec![
+            CarrierFlow {
+                flow: "form validation",
+                prompt: "Explain how the form validation examples combine native HTML constraints \
+                         with custom JavaScript validation and a submit guard.",
+                subject_words: &[
+                    "form",
+                    "forms",
+                    "fieldset",
+                    "validity",
+                    "constraint",
+                    "constraints",
+                    "guard",
+                    "guards",
+                ],
+                surfaces: &[
+                    "src/one.ts",
+                    "src/forms/one.ts",
+                    "src/forms/one.vue",
+                    "src/forms/one.html",
+                ],
+                // The module header's declared exception, and the whole of what is left of it: a
+                // constraint attribute is the entire anchor a markup document yields, so under a
+                // `forms/` path the file answers the form question for that one step. Its two
+                // siblings are script behaviour and read the form from the name, so an HTML
+                // document cannot close the flow by itself — it did while all three took the
+                // exception, out of any three lexical hits in one file.
+                //
+                // `.vue` used to take the exception too, which is what let `clampMin`, `submitJob`
+                // and `validityWindow` in a single component close the flow; a single-file
+                // component's citations are `<script>` exports, so it behaves like the `.ts` beside
+                // it and closes nothing here.
+                closable_without_the_subject: &["form_native_constraints | src/forms/one.html"],
+            },
+            CarrierFlow {
+                flow: "static-site build",
+                prompt: "Trace how the static site build command creates a site and runs the read, \
+                         generate, render, and write phases.",
+                subject_words: &["site", "sites"],
+                surfaces: &["lib/site/one.rs", "public/static/one.ts", "src/ui/one.tsx"],
+                closable_without_the_subject: &[],
+            },
+            CarrierFlow {
+                flow: "logger record + handler",
+                prompt: "Explain how a logger turns a log call into a record object and passes it \
+                         through handlers.",
+                subject_words: &["log", "logs", "logger", "loggers", "logging"],
+                surfaces: &["src/logging/one.rs", "src/one.ts"],
+                // A record pipeline qualifies its handler classes structurally — `AbstractHandler`,
+                // `HandlerInterface`, `ProcessorChain` — and that vocabulary is what separates them
+                // from a `PaymentHandler`. It does not say "log", so a structurally-qualified
+                // handler closes the dispatch step without one. Its sibling `logger_event` still
+                // needs the log word, so the flow does not close on this.
+                closable_without_the_subject: &[
+                    "handler_processing | src/logging/one.rs",
+                    "handler_processing | src/one.ts",
+                ],
+            },
+            CarrierFlow {
+                flow: "object mapper configuration + execution",
+                prompt: "Explain how mapper configuration and runtime mapper APIs cooperate to map \
+                         source objects to destination objects through type map plans.",
+                subject_words: &["map", "maps", "mapper", "mappers", "mapping", "mappings"],
+                surfaces: &["src/mapping/one.rs", "src/one.ts"],
+                closable_without_the_subject: &[],
+            },
+            CarrierFlow {
+                flow: "buffered io",
+                prompt: "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move \
+                         bytes through reads and writes.",
+                subject_words: &["buffer"],
+                surfaces: &["src/io/one.rs", "src/one.ts"],
+                // The read/write step accepts a source, a sink or a stream beside its verb, because
+                // that is what the operations of a byte pipeline are named for and requiring the
+                // container in the name would make the step unreachable. The container step
+                // `buffered_storage` still needs the buffer, so the flow does not close on this.
+                closable_without_the_subject: &[
+                    "buffered_read_write | src/io/one.rs",
+                    "buffered_read_write | src/one.ts",
+                ],
+            },
+            CarrierFlow {
+                flow: "runtime formatting",
+                prompt: "Explain how formatting arguments become type-erased format args and reach \
+                         the vformat error fallback path.",
+                subject_words: &[
+                    "format",
+                    "formats",
+                    "formatter",
+                    "formatters",
+                    "formatting",
+                    // `belongs_to_runtime_formatting` reads "format" as a *prefix*, so every
+                    // vocabulary word that starts with it is a subject word. Leaving this one out
+                    // showed up below as both steps of the flow closing without a subject, which is
+                    // what this list being wrong is supposed to look like.
+                    "formatted",
+                    "fmt",
+                    "vformat",
+                    "printf",
+                    "sprintf",
+                    "fprintf",
+                ],
+                surfaces: &["src/fmt/one.rs", "src/one.ts"],
+                closable_without_the_subject: &[],
+            },
+        ]
+    }
+
+    /// The names the two-factor sweep builds from an object word and a step verb.
+    ///
+    /// `compound_shapes_for` puts exactly one vocabulary word in a name, which is why the recorded
+    /// surfaces could not see the shape that was actually evading them: a carrier asks for an object
+    /// *and* a step, so one vocabulary word can never reach the second factor. `ChartPipeline`
+    /// closed nothing and `ChartPipeline.run` closed a static-site build; only the second is a
+    /// counter-example, and only this generator produces it.
+    ///
+    /// Three spellings, because they are not interchangeable. The dotted form puts the step in the
+    /// terminal segment, which is what the HTTP-verb and single-token-segment tests read; the
+    /// qualified form adds an off-subject noun so the name is one a real repository contains; the
+    /// lower-camel form is the only one that can carry the `use` + capital hook convention.
+    fn two_factor_shapes_for(object: &str, step: &str) -> [String; 3] {
+        let capitalize = |word: &str| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        };
+        [
+            format!("{}.{step}", capitalize(object)),
+            format!("Chart{}.{step}", capitalize(object)),
+            format!("{object}{}", capitalize(step)),
+        ]
+    }
+
+    /// **No carrier-backed flow may be closed by citations that never name it.**
+    ///
+    /// This is the invariant the lane exists for, generated rather than exampled. For each flow it
+    /// builds every object-word + step-verb name the evidence vocabulary can spell out of words
+    /// that are *not* that flow's subject, files each one on the flow's own surfaces, and records
+    /// which of the flow's steps such a name can close. At least one step must survive — a flow
+    /// with none left reports `Sufficient` on a packet that proved nothing, which is the
+    /// disqualifying class.
+    ///
+    /// Two shapes of defect this catches that nothing before it did. `AssetPipeline.run` and
+    /// `Layout.render` under `lib/site/` closed the static-site flow completely: the subject came
+    /// from the directory, so neither name needed to say "site". `AssetCollection.process` and
+    /// `PageTemplate.render` closed it again after the directory was taken away, because two
+    /// generic web nouns stood in for one specific one. Both are two-word-plus-verb shapes, and the
+    /// one-vocabulary-word sweeps are structurally blind to them.
+    ///
+    /// `NodeKind::METHOD` alone, and provably so: every requirement in these six flows is a
+    /// `CitedCarrier`, and every carrier's kind test is either `owns_behavior` — which accepts
+    /// `FUNCTION`, `METHOD`, `CLASS` and `STRUCT` alike — or `FUNCTION | METHOD`. No carrier can
+    /// accept a kind it rejects for a method, so widening the axis could only cost time.
+    #[test]
+    fn no_carrier_flow_closes_on_evidence_that_never_names_it() {
+        let vocabulary = evidence_vocabulary();
+        let flows = carrier_flows();
+        assert_eq!(flows.len(), 6, "one entry per carrier-backed flow");
+
+        let mut checked = 0_u64;
+        for flow in &flows {
+            let requirements = packet_flow_requirements_for_terms(
+                &packet_probe_terms(flow.prompt),
+                PacketTaskClassDto::DataFlow,
+            );
+            assert!(
+                requirements.len() >= 2,
+                "the {} prompt must raise its whole flow, or this proves nothing",
+                flow.flow
+            );
+            for requirement in &requirements {
+                assert!(
+                    matches!(requirement.evidence, EvidencePredicate::CitedCarrier(_)),
+                    "{} is not carrier-backed, so the METHOD-only kind axis below is no longer \
+                     sound for the {} flow",
+                    requirement.id,
+                    flow.flow
+                );
+            }
+
+            let off_subject = vocabulary
+                .iter()
+                .filter(|word| !flow.subject_words.contains(*word))
+                .collect::<Vec<_>>();
+            let mut closable: Vec<String> = Vec::new();
+            for object in &off_subject {
+                for step in &off_subject {
+                    for name in two_factor_shapes_for(object, step) {
+                        for surface in flow.surfaces {
+                            let citation = witness(&name, surface, NodeKind::METHOD);
+                            for requirement in &requirements {
+                                checked += 1;
+                                if !requirement.evidence.citation_proves(&citation) {
+                                    continue;
+                                }
+                                let entry = format!("{} | {surface}", requirement.id);
+                                if !closable.contains(&entry) {
+                                    closable.push(entry);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            closable.sort();
+
+            let mut recorded = flow
+                .closable_without_the_subject
+                .iter()
+                .map(|entry| (*entry).to_string())
+                .collect::<Vec<_>>();
+            recorded.sort();
+            assert_eq!(
+                closable, recorded,
+                "the {} flow's set of steps closable by a name that never mentions its subject \
+                 changed. Every entry is evidence CodeStory would report as proving a step it does \
+                 not prove, so the list belongs in the diff a reviewer reads",
+                flow.flow
+            );
+
+            // The property that matters: whatever the residual above, some step of the flow still
+            // has no off-subject name that closes it, so the flow can never report sufficient on
+            // evidence that never names it.
+            let unreachable = requirements
+                .iter()
+                .filter(|requirement| {
+                    !closable
+                        .iter()
+                        .any(|entry| entry.starts_with(&format!("{} |", requirement.id)))
+                })
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>();
+            assert!(
+                !unreachable.is_empty(),
+                "every step of the {} flow can be closed by a name that never mentions the flow's \
+                 subject, so an off-subject packet reports Sufficient: the disqualifying class for \
+                 this lane",
+                flow.flow
+            );
+        }
+
+        assert!(
+            checked >= 5_000_000,
+            "the two-factor sweep must actually cross the vocabulary with itself (checked \
+             {checked})"
+        );
+    }
+
+    /// No requirement — role-classified or carrier-backed — may be closed by a symbol that has
+    /// nothing to do with it.
+    ///
+    /// Both halves of the tables are held to this. The earlier version of this invariant skipped
+    /// every `CitedRoles` requirement on the grounds that the role classifier is coarse by design,
+    /// which left exactly half the tables untested; running this corpus against them turned up
+    /// acceptances in nine of them, all from the same cause. A role is not scoped to a flow, and
+    /// much of the classifier reads the path, so `renderChart` under `src/views/` was a server's
+    /// request entrypoint, `Store.delete` was an indexer's persistence step, and every symbol under
+    /// `runtime/` was a runtime orchestration entrypoint for three different flows at once.
     #[test]
     fn no_requirement_is_closed_by_an_unrelated_repository_symbol() {
         let mut checked = 0;
