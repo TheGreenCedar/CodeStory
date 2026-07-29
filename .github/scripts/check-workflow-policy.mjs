@@ -414,6 +414,19 @@ function requireExactStepScript(violations, file, job, name, expectedDigest, sub
   );
 }
 
+// A line that begins with `#` is not necessarily a shell comment when the
+// preceding line opened a quote. Hash raw text for scripts with multiline
+// quoted programs so quote-context rewrites cannot disappear from the digest.
+function requireExactRawStepScript(violations, file, job, name, expectedDigest, subject) {
+  const run = exactResolverRunText(stepRun(job, name));
+  const digest = createHash("sha256").update(run).digest("hex");
+  add(
+    violations,
+    run.length > 0 && digest === expectedDigest,
+    `${file} step ${name} must match the reviewed ${subject} script exactly`,
+  );
+}
+
 function stepIndex(job, name) {
   return list(job?.steps).map(object).findIndex(step => step.name === name);
 }
@@ -526,6 +539,23 @@ const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c
 // executable text as well as its reader-facing invariants.
 const packagedPlatformCloseoutDigest =
   "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a";
+// This workflow builds release archives on three operating systems and carries
+// state between many shell steps through GITHUB_ENV and GITHUB_PATH. Pin its
+// parsed executable structure so an unreviewed earlier step cannot replace an
+// owner binary while leaving the locally digested finalizer unchanged.
+const packagedPlatformWorkflowDigest =
+  "6cb226d673bdbe5679b9f7010aad18c2c2a956129b51cff69ba457ed91962132";
+// Linux owns its compiler server inside Docker, while macOS and Windows own one
+// in the host shell. Pin both executable programs so a swallowed stop or a
+// dead-code copy cannot satisfy the ownership fragments below.
+const packagedSccacheIdentityDigest =
+  "35f1976fd420c0ca6f2213c49ec3879dfa136d649529bbe3fe175f6b5ca633c6";
+const packagedLinuxBuildDigest =
+  "fc02f682c294983989d5f63151f8af9b31febda2da6fa0933aa9b1f7c221b4aa";
+const packagedCompileClockStopDigest =
+  "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5";
+const packagedHostCompilerFinalizerDigest =
+  "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -2733,6 +2763,12 @@ function validatePackagedProof(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
+  add(
+    violations,
+    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
+      === packagedPlatformWorkflowDigest,
+    `${file} must match the reviewed canonical workflow structure`,
+  );
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
   const refInput = object(at(workflow, "on", "workflow_call", "inputs", "ref"));
   add(
@@ -2826,6 +2862,25 @@ function validatePackagedProof(workflows, violations, graph) {
     sccacheSetup?.uses === sccacheAction
       && object(sccacheSetup?.with).version === "${{ env.SCCACHE_VERSION }}",
     `${file} must install the pinned sccache action and binary`,
+  );
+  const sccacheIdentity = namedStep(job, "Capture pinned sccache identity");
+  add(
+    violations,
+    sccacheIdentity?.id === "sccache-identity"
+      && sccacheIdentity?.shell === "bash"
+      && sccacheIdentity?.env === undefined
+      && sccacheIdentity?.["continue-on-error"] === undefined
+      && stepIndex(job, "Capture pinned sccache identity")
+        === stepIndex(job, "Install pinned sccache") + 1,
+    `${file} must capture the pinned sccache identity immediately after installation`,
+  );
+  requireExactRawStepScript(
+    violations,
+    file,
+    job,
+    "Capture pinned sccache identity",
+    packagedSccacheIdentityDigest,
+    "pinned sccache identity capture",
   );
   requireStepRun(violations, file, job, "Configure short Windows Cargo target", [
     '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
@@ -2986,24 +3041,90 @@ function validatePackagedProof(workflows, violations, graph) {
   requireStepRun(violations, file, job, "Compile native workspace path regression on Windows", [
     "cargo test --locked -p codestory-workspace repository_identity --no-run",
   ]);
+  const packageBuild = namedStep(job, "Build codestory-cli");
+  const linuxBuild = namedStep(job, "Build Linux x64 at the glibc 2.31 baseline");
+  const expectedSccacheIdentityEnv = {
+    SCCACHE_BINARY: "${{ steps.sccache-identity.outputs.path }}",
+    SCCACHE_SHA256: "${{ steps.sccache-identity.outputs.sha256 }}",
+  };
   requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
-    'mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"',
+    'test -x "$SCCACHE_BINARY"',
+    'test "$actual_sccache_sha256" = "$SCCACHE_SHA256"',
     "RUSTC_WRAPPER=/sccache/sccache",
     "SCCACHE_DIR=/sccache/cache",
     "CMAKE_C_COMPILER_LAUNCHER=/sccache/sccache",
     "CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache",
-    "$SCCACHE_PATH:/sccache/sccache:ro",
+    "$SCCACHE_BINARY:/sccache/sccache:ro",
     "$SCCACHE_DIR:/sccache/cache",
-    "/sccache/sccache --stop-server",
   ]);
+  add(
+    violations,
+    linuxBuild?.if === "matrix.asset_target == 'linux-x64'"
+      && linuxBuild?.shell === "bash"
+      && hasExactKeys(object(linuxBuild?.env), Object.keys(expectedSccacheIdentityEnv))
+      && Object.entries(expectedSccacheIdentityEnv).every(
+        ([key, value]) => object(linuxBuild?.env)[key] === value,
+      )
+      && linuxBuild?.["continue-on-error"] === undefined,
+    `${file} Linux container must strictly report and stop its owned compiler server`,
+  );
+  requireExactRawStepScript(
+    violations,
+    file,
+    job,
+    "Build Linux x64 at the glibc 2.31 baseline",
+    packagedLinuxBuildDigest,
+    "Linux container build and compiler-server ownership",
+  );
+  const stopCompilationClock = namedStep(job, "Stop compilation clock");
+  add(
+    violations,
+    stopCompilationClock?.id === "compile-clock-stop"
+      && stopCompilationClock?.shell === "bash"
+      && stopCompilationClock?.env === undefined
+      && stopCompilationClock?.["continue-on-error"] === undefined,
+    `${file} compiler clock stop must remain a strict telemetry-only boundary`,
+  );
+  requireExactRawStepScript(
+    violations,
+    file,
+    job,
+    "Stop compilation clock",
+    packagedCompileClockStopDigest,
+    "compiler clock stop",
+  );
   const finalizeCompilerObjects = namedStep(job, "Finalize compiler objects");
   add(
     violations,
-    String(finalizeCompilerObjects?.if ?? "")
-      .includes("steps.linux-build.outcome == 'success'")
-      && String(finalizeCompilerObjects?.if ?? "")
-        .includes("steps.package-build.outcome == 'success'"),
-    `${file} must stop the compiler server that performed each selected build`,
+    String(finalizeCompilerObjects?.if ?? "").trim()
+      === "always() && steps.package-build.outcome == 'success'"
+      && finalizeCompilerObjects?.shell === "bash"
+      && hasExactKeys(
+        object(finalizeCompilerObjects?.env),
+        Object.keys(expectedSccacheIdentityEnv),
+      )
+      && Object.entries(expectedSccacheIdentityEnv).every(
+        ([key, value]) => object(finalizeCompilerObjects?.env)[key] === value,
+      )
+      && finalizeCompilerObjects?.["continue-on-error"] === undefined
+      && packageBuild?.if === "matrix.asset_target != 'linux-x64'",
+    `${file} host finalizer must strictly stop only the host package-build compiler server`,
+  );
+  requireExactRawStepScript(
+    violations,
+    file,
+    job,
+    "Finalize compiler objects",
+    packagedHostCompilerFinalizerDigest,
+    "host compiler-server finalizer",
+  );
+  add(
+    violations,
+    stepIndex(job, "Stop compilation clock")
+      === stepIndex(job, "Build Linux x64 at the glibc 2.31 baseline") + 1
+      && stepIndex(job, "Finalize compiler objects")
+        === stepIndex(job, "Stop compilation clock") + 1,
+    `${file} compiler owner build, clock stop, and finalizer must remain adjacent`,
   );
   add(
     violations,
@@ -3041,7 +3162,6 @@ function validatePackagedProof(workflows, violations, graph) {
       `${file} Bullseye native build must preserve compiler contract ${fragment}`,
     );
   }
-  const packageBuild = namedStep(job, "Build codestory-cli");
   add(
     violations,
     packageBuild?.env === undefined,
