@@ -94,7 +94,7 @@ def isolated_environment(
             "TEMP": str(temp),
             "TMP": str(temp),
             "XDG_RUNTIME_DIR": str(runtime),
-            "CODESTORY_EMBED_ALLOW_CPU": "1" if policy == "cpu_explicit" else "0",
+            "CODESTORY_EMBED_ALLOW_CPU": "0",
         }
     )
     if offline:

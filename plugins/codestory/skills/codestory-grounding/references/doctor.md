@@ -28,7 +28,8 @@ Codex host/app session.
 
 - `doctor` does not accept `--refresh`; it is a read-only health surface.
 - The `attention:` block repeats warnings first so agents do not miss semantic partial/stale/failure messages buried in the full check list.
-- Environment rows report the explicit `CODESTORY_EMBED_ALLOW_CPU` policy when set.
+- Environment rows report `CODESTORY_EMBED_ALLOW_CPU` when set so a prohibited
+  CPU selector cannot be mistaken for supported runtime evidence.
 - Maintainer JSON identifies the exact model digest, linked ggml build, selected backend and physical adapter, live smoke timing, and process engine identity. Ordinary tool UX reports only whether retrieval is ready.
 - Treat `semantic ok` plus `retrieval_mode=full` as the health state suitable for broad repository explanation prompts. Under `graph_first_v2`, a zero dense-anchor count is valid only when graph and lexical artifacts are current. Treat `semantic partial`, `semantic stale`, `semantic failed`, vector-count mismatch, and non-`full` retrieval modes as unavailable broad evidence until automatic preparation or a maintainer-directed rebuild publishes a complete generation.
 - Prefer JSON for CI or doc-contract checks.

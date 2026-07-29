@@ -11,7 +11,9 @@ use super::{
     WorkerRequest,
 };
 use crate::qualification::output::write_atomic_json;
-use crate::qualification::request::read_private_request;
+use crate::qualification::request::{
+    QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, read_private_request,
+};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{EmbeddingQualificationParameters, EmbeddingServerSnapshot};
 use serde_json::{Value, json};
@@ -142,7 +144,8 @@ impl<'a> ScenarioRunner<'a> {
         }
         write_atomic_json(&request_path, &request)?;
         let started_ns = self.clock.now_ns();
-        let child = Command::new(&self.executable.path)
+        let mut command = Command::new(&self.executable.path);
+        command
             .arg(WORKER_COMMAND)
             .arg("--request")
             .arg(&request_path)
@@ -150,7 +153,15 @@ impl<'a> ScenarioRunner<'a> {
             .arg(&output_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        bridge_constant_worker_gate(
+            &mut command,
+            self.context.output_directory,
+            self.context
+                .worker_nonce
+                .map(|_| self.qualification_nonce.as_str()),
+        );
+        let child = command
             .spawn()
             .with_context(|| format!("spawn qualification worker {invocation_id}"))?;
         let pid = child.id();
@@ -290,5 +301,54 @@ impl<'a> ScenarioRunner<'a> {
                 Some(snapshot.clone()),
             ));
         Ok(snapshot)
+    }
+}
+
+fn bridge_constant_worker_gate(command: &mut Command, directory: &Path, nonce: Option<&str>) {
+    if let Some(nonce) = nonce {
+        command
+            .env(QUALIFICATION_DIR_ENV, directory)
+            .env(QUALIFICATION_NONCE_ENV, nonce);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_constant_worker_gate;
+    use crate::qualification::request::{QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV};
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    #[test]
+    fn constant_worker_gate_is_child_local_and_full_qualification_still_inherits() {
+        let mut constant = Command::new("unused");
+        bridge_constant_worker_gate(
+            &mut constant,
+            std::path::Path::new("/private/calibration"),
+            Some("constant-nonce"),
+        );
+        let constant_env = constant
+            .get_envs()
+            .map(|(name, value)| (name, value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            constant_env.get(OsStr::new(QUALIFICATION_DIR_ENV)),
+            Some(&Some(OsStr::new("/private/calibration")))
+        );
+        assert_eq!(
+            constant_env.get(OsStr::new(QUALIFICATION_NONCE_ENV)),
+            Some(&Some(OsStr::new("constant-nonce")))
+        );
+
+        let mut qualification = Command::new("unused");
+        bridge_constant_worker_gate(
+            &mut qualification,
+            std::path::Path::new("/private/qualification"),
+            None,
+        );
+        assert!(
+            qualification.get_envs().next().is_none(),
+            "the full qualification path must continue inheriting its existing gate"
+        );
     }
 }

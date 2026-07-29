@@ -10,14 +10,6 @@ from pathlib import Path
 from .contract_primitives import canonical_sha256, sha256, write_json
 from .foundation import TARGET_CONTRACTS
 
-_MEMORY_ROLES = (
-    "plugin_host_a",
-    "plugin_cli_a",
-    "plugin_host_b",
-    "plugin_cli_b",
-    "embedding_server",
-)
-
 _SUCCESSFUL_METRICS = {
     "cold_first_vector",
     "first_product_ready",
@@ -59,29 +51,6 @@ def _self_test_operands(
         operands["completed_documents"] = 1
     elif metric == "bulk_tokens_per_second":
         operands["completed_tokens"] = 1
-    elif metric == "total_codestory_process_memory":
-        operands["processes"] = [
-            {
-                "role": role,
-                "pid": pid + index + 1,
-                "process_start_id": f"boot:{pid + index + 1}",
-                "executable_sha256": hashlib.sha256(f"exe:{role}".encode()).hexdigest(),
-                "resident_bytes": 1,
-                "measurement_api": "self_test",
-            }
-            for index, role in enumerate(_MEMORY_ROLES)
-        ]
-    elif metric == "backend_observed_accelerator_residency":
-        accelerated = cell["policy"] == "accelerated"
-        operands = {
-            "policy": cell["policy"],
-            "backend": cell["backend"],
-            "accelerator_execution_verified": accelerated,
-            "resident_accelerator_tensor_count": 1 if accelerated else 0,
-            "resident_accelerator_tensor_bytes": 1 if accelerated else 0,
-            "offloaded_layer_count": 1 if accelerated else 0,
-            "model_layer_count": 1,
-        }
     return operands
 
 
@@ -91,7 +60,6 @@ def _self_test_sample(
     metric_position: int,
     repeat: int,
 ) -> dict:
-    policy = context.protocol["metric_sampling"][metric]
     pid = (
         10_000
         + context.cell_position * 1_000
@@ -99,19 +67,11 @@ def _self_test_sample(
         + metric_position * 10
         + repeat
     )
-    independent = policy.get("independence") == "distinct_server_instance_per_sample"
-    identity_seed = (
-        f"{context.seed}:{metric}:{repeat}"
-        if independent
-        else f"{context.seed}:{metric}"
-    )
+    identity_seed = context.seed
     server_id = "server:" + hashlib.sha256(identity_seed.encode()).hexdigest()
-    server_start = (
-        f"boot:{pid}"
-        if independent
-        else "boot:"
-        + hashlib.sha256(f"server-start:{context.seed}:{metric}".encode()).hexdigest()
-    )
+    server_start = "boot:" + hashlib.sha256(
+        f"server-start:{context.seed}".encode()
+    ).hexdigest()
     started_ns = repeat * 2_000_000
     finished_ns = started_ns + 1_000_000
     boot_id = f"boot-{context.cell_position}"
@@ -136,11 +96,11 @@ def _self_test_sample(
             "resolution_ns": 1,
         },
         "start": {
-            "phase": context.protocol["phase_boundaries"][metric][0],
+            "phase": context.protocol["calibration_phase_boundaries"][metric][0],
             "observed_ns": started_ns,
         },
         "end": {
-            "phase": context.protocol["phase_boundaries"][metric][1],
+            "phase": context.protocol["calibration_phase_boundaries"][metric][1],
             "observed_ns": finished_ns,
         },
         "operands": _self_test_operands(
@@ -163,14 +123,14 @@ def _self_test_sample(
 
 def _self_test_metrics(context: SelfTestRunContext) -> dict:
     metrics = {}
-    names = sorted(set(context.protocol["required_metrics"]) - {"retrieval_quality"})
+    names = sorted(context.protocol["calibration_required_metrics"])
     for position, metric in enumerate(names):
-        policy = context.protocol["metric_sampling"][metric]
+        policy = context.protocol["calibration_metric_sampling"][metric]
         metrics[metric] = {
             "unit": context.protocol["metric_contracts"][metric]["unit"],
             "samples": [
                 _self_test_sample(context, metric, position, repeat)
-                for repeat in range(1, policy["sample_count"] + 1)
+                for repeat in range(1, policy["sample_count_per_run"] + 1)
             ],
         }
     return metrics
@@ -201,6 +161,7 @@ def _self_test_run(context: SelfTestRunContext) -> tuple[dict, str]:
         "source": context.source,
         "contracts": context.contracts,
         "package": package,
+        "materialized_reused": context.run_index > 1,
         "clean": True,
         "unplanned_suspend": False,
         "metrics": _self_test_metrics(context),
@@ -217,8 +178,11 @@ def _self_test_run(context: SelfTestRunContext) -> tuple[dict, str]:
             "source": context.source,
             "contracts": context.contracts,
             "package": package,
+            "materialized_reused": context.run_index > 1,
             "raw_artifact": {
-                "name": "measurements.raw.json",
+                "name": (
+                    f"constant-calibration-run-{context.run_index}.raw.json"
+                ),
                 "sha256": digest,
                 "payload": payload,
             },
@@ -258,46 +222,31 @@ def _self_test_runs(
     return runs, digests
 
 
-def _self_test_selection(protocol: dict) -> tuple[dict, dict]:
-    constants = {
+def _self_test_selection() -> dict:
+    return {
         "connect_timeout_ms": 2000,
         "spawn_convergence_timeout_ms": 15000,
         "request_deadlines_ms": {
             "query_request_deadline_ms": 10000,
-            "bulk_replay_success_budget_ms": 10000,
-            "bulk_request_deadline_ms": 25005,
+            "bulk_replay_success_budget_ms": 144537,
+            "bulk_request_deadline_ms": 564239,
         },
         "capacity_retry_policy": {
-            "retry_after_ms": 1,
+            "retry_after_ms": 40,
             "retry_class": "after_capacity_change",
             "retry_condition_source": "named_condition_from_typed_capacity_response",
         },
         "election_backoff_policy": {
-            "initial_backoff_ms": 1,
-            "maximum_backoff_ms": 1,
+            "initial_backoff_ms": 7,
+            "maximum_backoff_ms": 102,
             "jitter": (
                 "sha256(process_start_id||attempt) modulo inclusive "
                 "[initial_backoff_ms,maximum_backoff_ms]"
             ),
         },
-        "hard_native_no_progress_ms": 4,
-        "watchdog_cadence_ms": 1,
+        "hard_native_no_progress_ms": 385431,
+        "watchdog_cadence_ms": 19271,
     }
-    thresholds = {
-        metric: (
-            1.0
-            if metric == "retrieval_quality"
-            else 1
-            if metric == "backend_observed_accelerator_residency"
-            else 800
-            if metric in {"bulk_documents_per_second", "bulk_tokens_per_second"}
-            else 6
-            if metric == "total_codestory_process_memory"
-            else 2
-        )
-        for metric in protocol["required_metrics"]
-    }
-    return constants, thresholds
 
 
 def _frozen_self_test_contract(
@@ -326,7 +275,7 @@ def _frozen_self_test_contract(
         "calibration_freeze_digest": bundle["freeze_digest"],
         "run_artifact_sha256s": sorted(digests),
         "selection_rule": (
-            "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1"
+            "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2"
         ),
         "selected_at": "self-test",
     }
@@ -348,7 +297,10 @@ def build_calibration_self_test_bundle(
         "input_constant_set_sha256": measurement_contract["constant_set_sha256"],
     }
     runs, digests = _self_test_runs(protocol, contracts, source)
-    constants, thresholds = _self_test_selection(protocol)
+    constants = _self_test_selection()
+    thresholds = json.loads(
+        json.dumps(measurement_contract["constant_set"]["qualification_thresholds"])
+    )
     producer = {
         "repository": "TheGreenCedar/CodeStory",
         "workflow_path": ".github/workflows/packaged-platform-pr.yml",
@@ -366,7 +318,6 @@ def build_calibration_self_test_bundle(
         "contracts": contracts,
         "run_artifact_sha256s": sorted(digests),
         "calibration_required_values": constants,
-        "qualification_thresholds": thresholds,
     }
     bundle = {
         "schema_version": 1,

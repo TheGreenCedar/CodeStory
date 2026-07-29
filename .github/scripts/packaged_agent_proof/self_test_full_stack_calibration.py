@@ -12,7 +12,8 @@ from .calibration_self_test import (
     build_calibration_self_test_bundle,
 )
 from .calibration_verification import verify_calibration_bundle
-from .contract_primitives import canonical_sha256, write_json
+from .constant_calibration import _validate_driver_output
+from .contract_primitives import canonical_sha256, sha256, write_json
 from .foundation import TARGET_CONTRACTS, ProofFailure, require
 from .measurement_samples import selected_qualification_matrix_cell
 from .package_contracts import verify_package_server_contracts
@@ -127,8 +128,8 @@ def _calibration_bundle_tests(
         )
     )
     require(
-        assembled["run_count"] == 6
-        and assembled["matrix_cell_count"] == 2
+        assembled["run_count"] == 3
+        and assembled["matrix_cell_count"] == 1
         and assembled_bundle_path.is_file()
         and assembled_constant_path.is_file(),
         "calibration assembler did not produce the exact frozen artifacts",
@@ -139,8 +140,8 @@ def _calibration_bundle_tests(
         enforce_source_lineage=False,
     )
     require(
-        calibration_result["run_count"] == 6
-        and calibration_result["matrix_cell_count"] == 2,
+        calibration_result["run_count"] == 3
+        and calibration_result["matrix_cell_count"] == 1,
         "calibration bundle self-test did not verify the full matrix",
     )
     require(
@@ -192,15 +193,12 @@ def _measurement_window_semantics_tests(
     inclusive_api = protocol["clock_policy"]["suspend_detection"]["platform_apis"][
         target_os
     ]
-    raw_metric_names = frozenset(
-        set(protocol["required_metrics"])
-        - {"retrieval_quality", "total_codestory_process_memory"}
-    )
+    raw_metric_names = frozenset(protocol["calibration_required_metrics"])
     validation = MeasurementValidationContract(
         contracts={},
         protocol=protocol,
         metric_contracts=protocol["metric_contracts"],
-        phase_boundaries=protocol["phase_boundaries"],
+        phase_boundaries=protocol["calibration_phase_boundaries"],
         matrix_cell_id=cell_id,
         matrix_cell=cell,
         expected_policy=cell["policy"],
@@ -336,20 +334,253 @@ def _calibration_hostile_tests(
         pass
     else:
         raise ProofFailure("duplicate calibration sample identity was accepted")
-    hostile_frozen_contract = json.loads(json.dumps(frozen_measurement_contract))
-    hostile_frozen_contract["constant_set"]["qualification_thresholds"][
+
+    hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+    hostile_run = hostile_calibration["runs"][0]
+    hostile_metric = hostile_run["raw_artifact"]["payload"]["metrics"][
         "warm_query_ipc"
-    ] += 1
+    ]
+    duplicate_sample = json.loads(json.dumps(hostile_metric["samples"][0]))
+    duplicate_sample["repeat"] = 2
+    duplicate_sample["sample_id"] += "-repeat"
+    hostile_metric["samples"].append(duplicate_sample)
+    hostile_run["raw_artifact"]["sha256"] = canonical_sha256(
+        hostile_run["raw_artifact"]["payload"]
+    )
+    write_json(hostile_calibration_path, hostile_calibration)
     try:
         verify_calibration_bundle(
-            calibration_bundle_path,
-            hostile_frozen_contract,
+            hostile_calibration_path,
+            frozen_measurement_contract,
             enforce_source_lineage=False,
         )
     except ProofFailure:
         pass
     else:
-        raise ProofFailure("post-result calibration threshold change was accepted")
+        raise ProofFailure("three-by-three calibration sampling was accepted")
+
+    hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+    hostile_run = hostile_calibration["runs"][0]
+    source_sample = hostile_run["raw_artifact"]["payload"]["metrics"][
+        "warm_query_ipc"
+    ]["samples"][0]
+    qualification_metric = json.loads(json.dumps(source_sample))
+    qualification_metric["sample_id"] += "-true-idle"
+    qualification_metric["workload_id"] = "true-idle-qualification"
+    hostile_run["raw_artifact"]["payload"]["metrics"]["true_idle_exit"] = {
+        "unit": "milliseconds",
+        "samples": [qualification_metric],
+    }
+    hostile_run["raw_artifact"]["sha256"] = canonical_sha256(
+        hostile_run["raw_artifact"]["payload"]
+    )
+    write_json(hostile_calibration_path, hostile_calibration)
+    try:
+        verify_calibration_bundle(
+            hostile_calibration_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=False,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("qualification-only metric was accepted in calibration")
+
+    hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+    first_run = hostile_calibration["runs"][0]
+    second_run = hostile_calibration["runs"][1]
+    first_metrics = first_run["raw_artifact"]["payload"]["metrics"]
+    second_metrics = second_run["raw_artifact"]["payload"]["metrics"]
+    for metric in second_metrics:
+        second_metrics[metric]["samples"][0]["server_identity"] = json.loads(
+            json.dumps(first_metrics[metric]["samples"][0]["server_identity"])
+        )
+    second_run["raw_artifact"]["sha256"] = canonical_sha256(
+        second_run["raw_artifact"]["payload"]
+    )
+    write_json(hostile_calibration_path, hostile_calibration)
+    try:
+        verify_calibration_bundle(
+            hostile_calibration_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=False,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("calibration reused a server generation across clean runs")
+
+    hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+    hostile_run = hostile_calibration["runs"][1]
+    hostile_run["materialized_reused"] = False
+    hostile_run["raw_artifact"]["payload"]["materialized_reused"] = False
+    hostile_run["raw_artifact"]["sha256"] = canonical_sha256(
+        hostile_run["raw_artifact"]["payload"]
+    )
+    write_json(hostile_calibration_path, hostile_calibration)
+    try:
+        verify_calibration_bundle(
+            hostile_calibration_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=False,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("calibration repeated model materialization after run one")
+
+    hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+    hostile_calibration["qualification_thresholds"] = {
+        "warm_query_ipc": 1,
+    }
+    write_json(hostile_calibration_path, hostile_calibration)
+    try:
+        verify_calibration_bundle(
+            hostile_calibration_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=False,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("calibration bundle was allowed to select thresholds")
+
+
+def _constant_collector_driver_tests(
+    fixture: FullStackFixture,
+    calibration: CalibrationFixture,
+) -> None:
+    protocol = calibration.frozen_measurement_contract["measurement_protocol"]
+    measurement_contract = calibration.frozen_measurement_contract
+    cell_id, cell = next(iter(protocol["calibration_matrix"].items()))
+    private_root = fixture.root / "constant-driver"
+    private_root.mkdir()
+    package = calibration.bundle_payload["runs"][0]["package"]
+    driver_package = {
+        key: package[key]
+        for key in (
+            "archive_sha256",
+            "executable_sha256",
+            "asset_target",
+            "release_version",
+            "model_sha256",
+        )
+    }
+    driver_contracts = {
+        "protocol_sha256": measurement_contract["protocol_sha256"],
+        "constant_set_sha256": measurement_contract["constant_set_sha256"],
+        "measurement_protocol_sha256": measurement_contract[
+            "measurement_protocol_sha256"
+        ],
+    }
+    request = {
+        "schema_version": 1,
+        "source": fixture.manifest["source"],
+        "package": driver_package,
+        "contracts": driver_contracts,
+        "runtime": {
+            "engine_policy": "accelerated",
+            "expected_backend": cell["backend"],
+            "offline": True,
+            "matrix_cell_id": cell_id,
+            "cache_state": cell["cache_state"],
+            "residency_state": cell["residency_state"],
+        },
+    }
+    request_path = private_root / "request.json"
+    write_json(request_path, request)
+    summaries = []
+    for run in calibration.bundle_payload["runs"]:
+        run_index = run["run_index"]
+        metrics = run["raw_artifact"]["payload"]["metrics"]
+        identity = next(iter(metrics.values()))["samples"][0]["server_identity"]
+        artifact_name = f"constant-calibration-run-{run_index}.raw.json"
+        raw = {
+            "schema_version": 1,
+            "run_index": run_index,
+            "contracts": driver_contracts,
+            "metrics": metrics,
+            "server_identities": [identity],
+            "backend": cell["backend"],
+            "policy": "accelerated",
+            "model_sha256": package["model_sha256"],
+            "materialized_reused": run_index > 1,
+        }
+        write_json(private_root / artifact_name, raw)
+        summaries.append(
+            {
+                "run_index": run_index,
+                "measurements": {
+                    "artifact": artifact_name,
+                    "metric_count": 9,
+                    "sample_count": 9,
+                },
+                "server_identities": [identity],
+                "backend": cell["backend"],
+                "policy": "accelerated",
+                "model_sha256": package["model_sha256"],
+                "materialized_reused": run_index > 1,
+            }
+        )
+    output = {
+        "schema_version": 1,
+        "source": request["source"],
+        "package": driver_package,
+        "contracts": driver_contracts,
+        "runtime": request["runtime"],
+        "request_sha256": sha256(request_path),
+        "calibration_runs": summaries,
+    }
+    validated = _validate_driver_output(
+        output,
+        request=request,
+        request_path=request_path,
+        private_root=private_root,
+        protocol=protocol,
+        matrix_cell=cell,
+    )
+    require(
+        len(validated) == 3,
+        "constant-calibration driver output did not retain three clean runs",
+    )
+
+    hostile = json.loads(json.dumps(output))
+    hostile["calibration_runs"][0]["backend"] = "cpu"
+    try:
+        _validate_driver_output(
+            hostile,
+            request=request,
+            request_path=request_path,
+            private_root=private_root,
+            protocol=protocol,
+            matrix_cell=cell,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("constant-calibration driver output accepted CPU")
+
+    raw_path = private_root / "constant-calibration-run-1.raw.json"
+    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw["metrics"]["true_idle_exit"] = json.loads(
+        json.dumps(raw["metrics"]["warm_query_ipc"])
+    )
+    write_json(raw_path, raw)
+    try:
+        _validate_driver_output(
+            output,
+            request=request,
+            request_path=request_path,
+            private_root=private_root,
+            protocol=protocol,
+            matrix_cell=cell,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure(
+            "constant-calibration driver output accepted a qualification-only metric"
+        )
 
 
 def run_calibration_self_tests(fixture: FullStackFixture) -> dict:
@@ -357,4 +588,5 @@ def run_calibration_self_tests(fixture: FullStackFixture) -> dict:
     calibration = _calibration_bundle_tests(fixture, measurement_contract)
     _measurement_window_semantics_tests(fixture, calibration)
     _calibration_hostile_tests(fixture, calibration)
+    _constant_collector_driver_tests(fixture, calibration)
     return measurement_contract

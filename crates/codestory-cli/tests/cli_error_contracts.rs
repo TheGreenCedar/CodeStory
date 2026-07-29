@@ -184,7 +184,7 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::O
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1");
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 
@@ -298,6 +298,25 @@ fn top_level_help_names_command_purposes() {
             "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
         );
     }
+}
+
+#[test]
+fn product_cli_rejects_the_removed_cpu_embedding_selector() {
+    let output = test_support::cli_command()
+        .args(["doctor", "--format", "json"])
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .output()
+        .expect("run removed CPU selector");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CPU embeddings are unsupported"));
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["error"]["code"], "unsupported_embedding_policy");
+    assert_eq!(
+        json["error"]["details"]["failed_layer"],
+        "embedding_backend"
+    );
+    assert_eq!(json["context"]["environment"], "CODESTORY_EMBED_ALLOW_CPU");
 }
 
 #[test]

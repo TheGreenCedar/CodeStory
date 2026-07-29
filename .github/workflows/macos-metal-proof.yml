@@ -168,24 +168,55 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
 
+      - name: Start Metal constant calibration clock
+        if: inputs.calibration_mode
+        id: calibration-clock
+        shell: bash
+        run: echo "started-ns=$(python3 -c 'import time; print(time.monotonic_ns())')" >> "$GITHUB_OUTPUT"
+
       - name: Prepare checksum-pinned embedded model
+        id: model-prepare
         if: ${{ !inputs.use_packaged_cli_artifact }}
-        run: node scripts/prepare-embedded-model.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          model_prepare_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          node scripts/prepare-embedded-model.mjs
+          model_prepare_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "duration-ms=$(((model_prepare_finished_ns - model_prepare_started_ns) / 1000000))" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Build and package native CLI
+        id: native-build-package
         if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
         run: |
           set -euo pipefail
+          build_package_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
           version="${VERSION#v}"
-          cargo build --release -p codestory-cli --locked
+          cargo_args=(
+            -p codestory-cli
+            --bin codestory-cli
+            --bin codestory-cli-runtime
+          )
+          if [ "$CALIBRATION_MODE" = true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_constant_calibration
+            )
+          fi
+          cargo build --release --locked "${cargo_args[@]}"
           python3 .github/scripts/package-codestory-release.py \
             --version "$version" \
             --target macos-arm64 \
             --binary target/release/codestory-cli \
             --out-dir target/release-dist
+          build_package_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "duration-ms=$(((build_package_finished_ns - build_package_started_ns) / 1000000))" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Download packaged CLI artifact
         if: inputs.use_packaged_cli_artifact
@@ -267,7 +298,7 @@ jobs:
           ditto -x -k "$archive" target/release-dist
 
       - name: Build qualification driver
-        if: inputs.calibration_mode || !inputs.server_behavior_only
+        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
         shell: bash
         run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
@@ -277,6 +308,64 @@ jobs:
         with:
           name: ${{ inputs.quality_evidence_artifact }}
           path: target/release-quality-evidence
+
+      - name: Produce exact-head holdout quality on protected Metal
+        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          archive="target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz"
+          quality_root=target/release-quality-evidence
+          packaged_root="$(mktemp -d "$RUNNER_TEMP/codestory-quality-cli.XXXXXX")"
+          export CODESTORY_CACHE_ROOT
+          CODESTORY_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-quality-cache.XXXXXX")"
+          export CODESTORY_STDIO_CACHE_ROOT
+          CODESTORY_STDIO_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-quality-stdio.XXXXXX")"
+          rm -rf "$quality_root"
+          mkdir -p "$quality_root"
+          tar -xzf "$archive" -C "$packaged_root"
+          packaged_cli="$(
+            find "$packaged_root" -type f -name codestory-cli -print
+          )"
+          test "$(printf '%s\n' "$packaged_cli" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test -x "$packaged_cli"
+          export CODESTORY_RELEASE_EVIDENCE_COMMIT
+          CODESTORY_RELEASE_EVIDENCE_COMMIT="$(git rev-parse HEAD)"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_PROFILE=protected-macos-arm64-metal
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v1
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/holdout-retrieval-v1.json
+          export CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-holdout-v1
+          export CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT
+          CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT="$(
+            shasum -a 256 target/macos-metal-proof/host.txt | awk '{print $1}'
+          )"
+          node scripts/codestory-agent-ab-benchmark.mjs \
+            --packet-runtime \
+            --packet-runtime-mode cold-cli \
+            --task-suite holdout-retrieval \
+            --materialize-repos \
+            --repeats 3 \
+            --publishable \
+            --max-source-reads-after-packet 0 \
+            --codestory-cli "$packaged_cli" \
+            --timeout-ms 180000 \
+            --out-dir "$quality_root/packet"
+
+      - name: Upload exact-head protected Metal quality evidence
+        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frozen-candidate-quality-${{ inputs.ref || github.sha }}
+          path: target/release-quality-evidence
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
 
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
@@ -370,7 +459,7 @@ jobs:
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
 
-      - name: Collect three independent Metal calibration runs
+      - name: Collect three independent Metal constant calibration runs
         if: inputs.calibration_mode
         shell: bash
         env:
@@ -384,29 +473,73 @@ jobs:
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           export TMPDIR="${RUNNER_TEMP}/codestory metal calibration ü"
           mkdir -p "$TMPDIR" target/calibration-runs/macos
-          for run_index in 1 2 3; do
-            python3 .github/scripts/check-packaged-agent-proof.py \
-              --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
-              --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
-              --expected-version "$version" \
-              --project "${{ github.workspace }}" \
-              --plugin-root plugins/codestory \
-              --plugin-handoff \
-              --engine-policy accelerated \
-              --expected-backend Metal \
-              --offline \
-              --proof-tier calibration \
-              --qualification-matrix-cell protected_macos_arm64_metal \
-              --produce-qualification-evidence \
-              --qualification-driver target/release/codestory_embedding_qualification \
-              --qualification-evidence "target/calibration-runs/macos/qualification-${run_index}.json" \
-              --calibration-run-index "$run_index" \
-              --calibration-run-output "target/calibration-runs/macos/run-${run_index}.json" \
-              --expected-source-sha "$source_sha" \
-              --expected-source-tree "$source_tree" \
-              --timeout-secs 1800 \
-              --out-dir "target/calibration-runs/macos/proof-${run_index}"
-          done
+          python3 .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
+            --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
+            --expected-version "$version" \
+            --engine-policy accelerated \
+            --expected-backend Metal \
+            --offline \
+            --proof-tier calibration \
+            --qualification-matrix-cell protected_macos_arm64_metal \
+            --collect-constant-calibration \
+            --constant-calibration-output-dir target/calibration-runs/macos \
+            --qualification-driver target/release/codestory_embedding_constant_calibration \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --timeout-secs 1800 \
+            --out-dir target/calibration-proof/macos
+
+      - name: Publish Metal constant calibration timing
+        if: inputs.calibration_mode
+        shell: bash
+        env:
+          CALIBRATION_STARTED_NS: ${{ steps.calibration-clock.outputs.started-ns }}
+          MODEL_PREPARATION_DURATION_MS: ${{ steps.model-prepare.outputs.duration-ms }}
+          BUILD_PACKAGE_DURATION_MS: ${{ steps.native-build-package.outputs.duration-ms }}
+        run: |
+          set -euo pipefail
+          timing_path=target/calibration-runs/macos/timing.json
+          calibration_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          [[ "$CALIBRATION_STARTED_NS" =~ ^[0-9]+$ ]]
+          [[ "$MODEL_PREPARATION_DURATION_MS" =~ ^[0-9]+$ ]]
+          [[ "$BUILD_PACKAGE_DURATION_MS" =~ ^[0-9]+$ ]]
+          calibration_total_ms=$(((calibration_finished_ns - CALIBRATION_STARTED_NS) / 1000000))
+          test "$calibration_total_ms" -ge 0
+          test "$calibration_total_ms" -lt 600000
+          test "$BUILD_PACKAGE_DURATION_MS" -ge 0
+          jq -e '
+            .schema_version == 1
+            and all(
+              [
+                .archive_authentication_unpack_ms,
+                .project_and_request_setup_ms,
+                .measurement_ms,
+                .retention_validation_ms,
+                .end_to_end_ms
+              ][];
+              type == "number" and . >= 0
+            )
+          ' "$timing_path" >/dev/null
+          {
+            echo "### Metal constant calibration timing"
+            echo
+            echo "| Phase | Duration |"
+            echo "|---|---:|"
+            printf '| Model preparation | %s ms |\n' "$MODEL_PREPARATION_DURATION_MS"
+            printf '| Shared CLI build and package | %s ms |\n' "$BUILD_PACKAGE_DURATION_MS"
+            jq -r '
+              [
+                ["Archive authentication and unpack", .archive_authentication_unpack_ms],
+                ["Project and request setup", .project_and_request_setup_ms],
+                ["Measurement", .measurement_ms],
+                ["Retention validation", .retention_validation_ms],
+                ["Archive through retained evidence", .end_to_end_ms]
+              ][]
+              | "| \(.[0]) | \(.[1]) ms |"
+            ' "$timing_path"
+            printf '| Total calibration wall time | %s ms |\n' "$calibration_total_ms"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage isolated candidate-managed macOS install
         if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}

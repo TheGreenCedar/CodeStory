@@ -151,8 +151,10 @@ Maintainer-only engine details: [retrieval operations](../ops/retrieval-engine.m
 | `CODESTORY_IDE_COMMAND` | Optional shell command template for definition-open actions. Supports `{file}`, `{line}`, and `{col}`; set only trusted local templates because the template runs through your shell. |
 | `CODESTORY_NO_TUI` | Disable TUI for `explore` in CI or scripts |
 | `CODESTORY_SUMMARY_ENDPOINT` | Trusted summary endpoint |
-| `CODESTORY_EMBED_ALLOW_CPU` | Explicitly allow CPU embeddings. Intended for hosted CI and maintainer diagnostics; production does not fall back silently. |
 | `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | Process-wide opt-in allowing trusted project files to configure summary endpoints |
+
+CPU embeddings are unsupported. Broad retrieval requires an eligible Metal or
+Vulkan device and never falls back to CPU.
 
 ## Further reading
 

@@ -42,6 +42,8 @@ class CalibrationAccumulator:
     artifact_digests: set[str]
     packages_by_cell: dict[str, dict]
     sample_ids: set[str]
+    server_identities_by_run: dict[tuple[str, int], set[tuple[str, str, int]]]
+    materialization_reused_by_run: dict[tuple[str, int], bool]
     metric_values: dict[str, list[float | int]]
     duration_values_ms: dict[str, list[float]]
 
@@ -50,6 +52,7 @@ class CalibrationAccumulator:
 class CalibrationRun:
     position: int
     matrix_cell_id: str
+    run_index: int
     matrix_cell: dict
     package: dict
     metrics: dict
@@ -203,7 +206,7 @@ def _calibration_bundle(
 
 
 def _calibration_accumulator(bundle: CalibrationBundle) -> CalibrationAccumulator:
-    metrics = set(bundle.protocol["required_metrics"]) - {"retrieval_quality"}
+    metrics = set(bundle.protocol["calibration_required_metrics"])
     return CalibrationAccumulator(
         expected_run_cells={
             (cell_id, run_index)
@@ -215,6 +218,8 @@ def _calibration_accumulator(bundle: CalibrationBundle) -> CalibrationAccumulato
         artifact_digests=set(),
         packages_by_cell={},
         sample_ids=set(),
+        server_identities_by_run={},
+        materialization_reused_by_run={},
         metric_values={metric: [] for metric in metrics},
         duration_values_ms={
             "existing_owner_connect_duration": [],
@@ -281,7 +286,8 @@ def _calibration_raw_payload(
     require(isinstance(value, dict), f"{field} is malformed")
     require_exact_keys(value, {"name", "sha256", "payload"}, field)
     require(
-        value["name"] == "measurements.raw.json",
+        value["name"]
+        == f"constant-calibration-run-{expected_identity['run_index']}.raw.json",
         f"calibration run {position} raw artifact has the wrong name",
     )
     digest = require_sha256(value["sha256"], f"{field} sha256")
@@ -310,6 +316,7 @@ def _calibration_raw_payload(
             "source",
             "contracts",
             "package",
+            "materialized_reused",
             "clean",
             "unplanned_suspend",
             "metrics",
@@ -347,6 +354,7 @@ def _calibration_run(
             "source",
             "contracts",
             "package",
+            "materialized_reused",
             "raw_artifact",
         },
         field,
@@ -373,6 +381,13 @@ def _calibration_run(
         raw_run["clean"] is True and raw_run["unplanned_suspend"] is False,
         f"calibration run {position} was not a clean awake run",
     )
+    materialized_reused = raw_run["materialized_reused"]
+    require(
+        isinstance(materialized_reused, bool)
+        and materialized_reused is (run_index > 1),
+        f"calibration run {position} repeated or skipped model materialization",
+    )
+    accumulator.materialization_reused_by_run[run_cell] = materialized_reused
     require(
         raw_run["source"] == bundle.source and raw_run["contracts"] == bundle.contracts,
         f"calibration run {position} changed source, tree, or protocol identity",
@@ -396,6 +411,7 @@ def _calibration_run(
             "source": bundle.source,
             "contracts": bundle.contracts,
             "package": package,
+            "materialized_reused": materialized_reused,
         },
         accumulator=accumulator,
     )
@@ -404,7 +420,7 @@ def _calibration_run(
         isinstance(metrics, dict) and set(metrics) == set(accumulator.metric_values),
         f"calibration run {position} omitted a required metric",
     )
-    return CalibrationRun(position, cell_id, matrix_cell, package, metrics)
+    return CalibrationRun(position, cell_id, run_index, matrix_cell, package, metrics)
 
 
 _CALIBRATION_SAMPLE_FIELDS = {
@@ -470,13 +486,17 @@ def _calibration_sample(
         ),
         require_positive_int(server["load_generation"], f"{field} load_generation"),
     )
+    accumulator.server_identities_by_run.setdefault(
+        (run.matrix_cell_id, run.run_index),
+        set(),
+    ).add(identity)
     target_os = TARGET_CONTRACTS[run.matrix_cell["asset_target"]]["target_os"]
     clock_policy = bundle.protocol["clock_policy"]
     value = qualification_measurement_sample_value(
         metric,
         sample,
         contracts=bundle.contracts,
-        phase_boundaries=bundle.protocol["phase_boundaries"],
+        phase_boundaries=bundle.protocol["calibration_phase_boundaries"],
         allowed_awake_apis=set(clock_policy["platform_apis"][target_os]),
         inclusive_api=clock_policy["suspend_detection"]["platform_apis"][target_os],
         maximum_suspend_ns=maximum_suspend_ns,

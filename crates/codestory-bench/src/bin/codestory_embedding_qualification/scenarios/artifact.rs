@@ -13,7 +13,9 @@ use std::time::Duration;
 
 mod runner;
 
-pub(in crate::qualification) use runner::{run_measurements, run_scenario};
+pub(in crate::qualification) use runner::{
+    run_constant_calibration, run_measurements, run_scenario,
+};
 
 const WORKER_COMMAND: &str = "internal-embedding-qualification-worker";
 const POLL: Duration = Duration::from_millis(25);
@@ -39,6 +41,7 @@ pub(in crate::qualification) struct ScenarioContext<'a> {
     pub(in crate::qualification) qualification_runtime: &'a QualificationRuntime,
     pub(in crate::qualification) output_directory: &'a Path,
     pub(in crate::qualification) nonce_sha256: &'a str,
+    pub(in crate::qualification) worker_nonce: Option<&'a str>,
     pub(in crate::qualification) executable: &'a QualificationExecutable,
 }
 
@@ -197,6 +200,79 @@ pub(in crate::qualification) struct MeasurementArtifact {
     metrics: BTreeMap<String, RawMetric>,
 }
 
+#[derive(Debug, Serialize)]
+pub(in crate::qualification) struct ConstantCalibrationRunArtifact {
+    schema_version: u32,
+    run_index: u32,
+    contracts: QualificationContracts,
+    metrics: BTreeMap<String, RawMetric>,
+    server_identities: Vec<RawServerIdentity>,
+    backend: String,
+    policy: String,
+    model_sha256: String,
+    materialized_reused: bool,
+}
+
+impl ConstantCalibrationRunArtifact {
+    fn new(
+        run_index: u32,
+        contracts: QualificationContracts,
+        metrics: BTreeMap<String, RawMetric>,
+        server_identities: Vec<RawServerIdentity>,
+        backend: String,
+        policy: String,
+        model_sha256: String,
+        materialized_reused: bool,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            run_index,
+            contracts,
+            metrics,
+            server_identities,
+            backend,
+            policy,
+            model_sha256,
+            materialized_reused,
+        }
+    }
+
+    pub(in crate::qualification) fn run_index(&self) -> u32 {
+        self.run_index
+    }
+
+    pub(in crate::qualification) fn metric_count(&self) -> u64 {
+        self.metrics.len() as u64
+    }
+
+    pub(in crate::qualification) fn sample_count(&self) -> u64 {
+        self.metrics
+            .values()
+            .map(|metric| metric.samples.len() as u64)
+            .sum()
+    }
+
+    pub(in crate::qualification) fn server_identities(&self) -> &[RawServerIdentity] {
+        &self.server_identities
+    }
+
+    pub(in crate::qualification) fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    pub(in crate::qualification) fn policy(&self) -> &str {
+        &self.policy
+    }
+
+    pub(in crate::qualification) fn model_sha256(&self) -> &str {
+        &self.model_sha256
+    }
+
+    pub(in crate::qualification) fn materialized_reused(&self) -> bool {
+        self.materialized_reused
+    }
+}
+
 impl MeasurementArtifact {
     pub(in crate::qualification) fn summary(
         &self,
@@ -243,11 +319,11 @@ struct RawMetricProcess {
     process_start_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct RawServerIdentity {
-    server_instance_id: String,
-    process_start_id: String,
-    load_generation: u64,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::qualification) struct RawServerIdentity {
+    pub(in crate::qualification) server_instance_id: String,
+    pub(in crate::qualification) process_start_id: String,
+    pub(in crate::qualification) load_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

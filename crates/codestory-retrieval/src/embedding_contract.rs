@@ -25,7 +25,14 @@ const MAX_BATCH_SEQUENCES: u32 = 6;
 pub(crate) fn native_engine_config(allow_cpu: bool) -> Result<EmbeddingEngineConfig> {
     let capabilities = compiled_engine_capabilities();
     let (backend, device_class) = if allow_cpu {
-        ("cpu", NativeDeviceClass::Cpu)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            ("cpu", NativeDeviceClass::Cpu)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            bail!("embedding_backend_policy_cpu_unsupported")
+        }
     } else {
         let backend = match capabilities.target_os {
             "macos" => "metal",
@@ -116,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_policy_is_explicit_and_never_uses_implicit_cpu_fallback() {
+    fn product_backend_is_accelerated_while_test_support_can_model_cpu() {
         let cpu = native_engine_config(true).expect("explicit CPU config");
         assert_eq!(cpu.backend.backend, "cpu");
         assert_eq!(cpu.backend.device_class, NativeDeviceClass::Cpu);

@@ -39,12 +39,12 @@ High-signal environment toggles:
 | Variable | Use |
 |----------|-----|
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol symbol-doc scope for diagnostics. Accepted aliases are `all`, `full`, `all-symbols`, and `all_symbols`; omitted or other values default to durable symbols. |
-| `CODESTORY_EMBED_ALLOW_CPU=1` | Explicitly allow CPU embeddings for hosted CI or a maintainer diagnostic. Production never falls back to CPU silently. |
 | `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
 The model, tokenizer, pooling, normalization, and batching contract is compiled
 into the executable. There is no embedding endpoint or backend download to
-configure.
+configure. CPU embeddings are unsupported; full retrieval requires Metal or
+Vulkan acceleration.
 Agent packet/search readiness requires `retrieval_mode=full`; see
 [status-contract.md](status-contract.md) and [retrieval-rollout.md](retrieval-rollout.md).
 

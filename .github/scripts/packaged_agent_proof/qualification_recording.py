@@ -67,25 +67,6 @@ def record_retained_qualification(
     summary["package_contract"]["highest_proof_tier"] = args.proof_tier
 
 
-def record_calibration_qualification(
-    args: argparse.Namespace,
-    summary: dict[str, object],
-) -> None:
-    if args.qualification_evidence is None or not args.qualification_evidence.is_file():
-        return
-    calibration = load_evidence(
-        args.qualification_evidence,
-        "calibration evidence",
-    )
-    require(
-        calibration.get("schema_version") == 1
-        and calibration.get("status") == "calibration"
-        and calibration.get("tier") == "calibration",
-        "calibration evidence has the wrong schema, status, or tier",
-    )
-    summary["qualification"] = calibration
-
-
 def record_qualification_contract(
     args: argparse.Namespace,
     summary: dict[str, object],
@@ -121,9 +102,11 @@ def record_qualification_contract(
         }
         summary["package_contract"]["release_readiness_claim"] = True
         summary["package_contract"]["highest_proof_tier"] = args.proof_tier
-    elif args.proof_tier == "calibration":
-        record_calibration_qualification(args, summary)
     else:
+        require(
+            args.proof_tier != "calibration",
+            "constant calibration cannot enter frozen-candidate qualification recording",
+        )
         record_retained_qualification(
             args,
             summary,

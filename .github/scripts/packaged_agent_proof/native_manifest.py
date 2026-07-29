@@ -446,8 +446,8 @@ def _verify_model(
 def _verify_accelerator(parts: ManifestParts, target_contract: dict) -> None:
     accelerator = parts.accelerator
     require(
-        accelerator.get("cpu_fallback") == "explicit_only",
-        "native manifest permits implicit CPU fallback",
+        accelerator.get("cpu_fallback") == "unsupported",
+        "native manifest permits CPU fallback",
     )
     require(
         accelerator.get("package_claim") == "compiled_capability_only",

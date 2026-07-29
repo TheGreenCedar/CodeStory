@@ -23,8 +23,8 @@ function unsupportedRetrievalContractRequests(env = process.env) {
     blockers.push("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
   }
   const cpuPolicy = String(env.CODESTORY_EMBED_ALLOW_CPU ?? "").trim();
-  if (cpuPolicy && cpuPolicy !== "0" && cpuPolicy !== "1") {
-    blockers.push("CODESTORY_EMBED_ALLOW_CPU must be 0 or 1");
+  if (cpuPolicy && cpuPolicy !== "0") {
+    blockers.push("CODESTORY_EMBED_ALLOW_CPU must be 0; CPU embeddings are unsupported");
   }
   return blockers;
 }
@@ -39,7 +39,7 @@ function retrievalContractSummary(env = process.env) {
     retrieval_contract: "in_process_v1",
     retrieval_enabled: !unsupportedRetrievalDisabledRequest(env),
     embedding_engine: "process_shared",
-    execution_policy: env.CODESTORY_EMBED_ALLOW_CPU === "1" ? "cpu_explicit" : "accelerated",
+    execution_policy: "accelerated",
   };
 }
 

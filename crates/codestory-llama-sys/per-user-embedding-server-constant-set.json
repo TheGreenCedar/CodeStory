@@ -40,27 +40,10 @@
     "maximum_payload_bytes": 16777216,
     "protocol_schema_version": 1,
     "pure_embedding_rpc_replay_limit": 1,
-    "query_queue_capacity": 64
+    "query_queue_capacity": 64,
+    "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": {
-    "calibration_bundle_sha256": "bdaf0d80a19af41cb1acdcc4d0ee7dbca4b90481d4e5616f72416b65923f5b0e",
-    "calibration_freeze_digest": "67e0af9456ddc1afc7ba2298b546024f36b1f92034b9b9e7363936ffbedae0b1",
-    "input_constant_set_sha256": "fb0326d180cc5e2e6cae46d70e5a7706d5ed423c30fb95b4b983ed61dcdc2e2c",
-    "measurement_protocol_sha256": "6d29a6a92dc6f9552d004806f0bb0785c040e57a9de25e3877d26bb76e78f04b",
-    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
-    "run_artifact_sha256s": [
-      "184d5aa079369f8057acb71576a6a1e4dfd2f4e2f56ec20d17a9aab147c9f8dc",
-      "2fd6767d1195f9852ca56dfffb8511eb3c001e7f65450aed33c77e27a5b60d44",
-      "5ef180010acdcb6f518fefc9dac00a9da8277b4c4d397c0006efd9e1424d2c42",
-      "6e5e26f19b6028d87bd19ffca8d4dbec5d3ebaa0fd2037003723f7eef9d9f557",
-      "943449b5c7c187c397f2530011d08d5f56b9f41509bd182fbd7b03f970678116",
-      "fcad9b4c59792c1493ccc4ae96c9d3377efced89460b561cd1c4a2c7017377d7"
-    ],
-    "selected_at": "github-actions-run:30329118684:1",
-    "selection_rule": "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1",
-    "selection_source_commit": "6b0f4b2edb7d99fe43b63cfb0bd3a85ca9d0032c",
-    "selection_source_tree": "c759c770b6de9b0b5051a145d5862444052d5cdd"
-  },
+  "freeze_record": null,
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -72,11 +55,11 @@
     "retrieval_quality": 1.0,
     "spawn_convergence": 486,
     "total_codestory_process_memory": 3366597428,
-    "true_idle_exit": 71374,
+    "true_idle_exit": 62500,
     "warm_bulk_ipc": 29119,
     "warm_query_ipc": 577
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "frozen"
+  "status": "unfrozen"
 }

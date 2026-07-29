@@ -14,7 +14,6 @@ def _calibration_freeze(
     bundle: CalibrationBundle,
     accumulator: CalibrationAccumulator,
     selected_constants: dict,
-    thresholds: dict,
     *,
     compare_frozen_constant_set: bool,
     frozen_source: dict | None,
@@ -26,10 +25,6 @@ def _calibration_freeze(
             bundle.constant_set["calibration_required_values"] == selected_constants,
             "frozen compiled constants do not match the preregistered calibration formulas",
         )
-        require(
-            bundle.constant_set["qualification_thresholds"] == thresholds,
-            "frozen qualification thresholds do not match the preregistered calibration formulas",
-        )
     digests = sorted(accumulator.artifact_digests)
     freeze_digest = canonical_sha256(
         {
@@ -39,7 +34,6 @@ def _calibration_freeze(
             "contracts": bundle.contracts,
             "run_artifact_sha256s": digests,
             "calibration_required_values": selected_constants,
-            "qualification_thresholds": thresholds,
         }
     )
     lineage = None
@@ -84,6 +78,6 @@ def _verify_calibration_freeze_record(
         and record["calibration_freeze_digest"] == freeze_digest
         and sorted(record["run_artifact_sha256s"]) == digests
         and record["selection_rule"]
-        == "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1",
+        == "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
         "constant-set freeze record does not bind the exact recomputed calibration bundle",
     )

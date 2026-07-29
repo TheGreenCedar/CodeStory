@@ -212,6 +212,37 @@ pub(in crate::embedding_qualification::worker) fn run_measure_spawn_hello(
     Ok(measurement(span, resident))
 }
 
+/// Constant calibration's spawn sample stops after the compatible hello. It
+/// deliberately leaves the fresh owner without a resident model so the next
+/// product request can measure first-vector latency on this same generation.
+pub(in crate::embedding_qualification::worker) fn run_measure_constant_spawn_hello(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<WorkerMeasurement> {
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let client = PerUserEmbeddingClient::for_runtime(runtime)?;
+    if client.observe()?.is_some() {
+        bail!("embedding_constant_calibration_spawn_owner_present");
+    }
+    let start = begin_span(clock)?;
+    let spawn_attempt = transport.spawn_exact_current_exe()?;
+    let mut stream = connect_until(
+        &transport,
+        clock,
+        SPAWN_CONVERGENCE_BUDGET,
+        Some(&spawn_attempt),
+    )?;
+    let hello = validated_hello(&mut stream, &transport, runtime, clock)?;
+    let span = finish_span(clock, start)?;
+    if hello.process.server_instance_id.is_empty()
+        || hello.process.process_start_id.is_empty()
+        || hello.engine.is_some()
+    {
+        bail!("embedding_constant_calibration_spawn_not_cold");
+    }
+    Ok(measurement(span, hello))
+}
+
 /// `cold_first_vector` and `first_product_ready`: span
 /// [`product_request_started(...)` -> `..._validated`] around client
 /// construction plus one `embed_query`; the client validates identity,
@@ -236,6 +267,41 @@ pub(in crate::embedding_qualification::worker) fn run_measure_product_query(
         .observe()?
         .filter(resident_engine_generation)
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_product_owner_missing"))?;
+    Ok(measurement(span, snapshot))
+}
+
+/// Constant calibration decomposes process spawn from first model use. The
+/// fresh owner must still have no resident generation when this interval
+/// starts, and the first product query must load the model on that same server
+/// generation.
+pub(in crate::embedding_qualification::worker) fn run_measure_constant_cold_query(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+    workload_id: &str,
+    repeat: u32,
+    input_bytes: u32,
+) -> Result<WorkerMeasurement> {
+    let client = PerUserEmbeddingClient::for_runtime(runtime)?;
+    let cold_owner = client
+        .observe()?
+        .filter(|snapshot| snapshot.engine.is_none())
+        .ok_or_else(|| anyhow::anyhow!("embedding_constant_calibration_owner_not_cold"))?;
+    let input = workload_input(workload_id, repeat, 0, input_bytes.max(1) as usize);
+    let start = begin_span(clock)?;
+    let vector = client.embed_query(&input)?;
+    let span = finish_span(clock, start)?;
+    if vector.is_empty() {
+        bail!("embedding_constant_calibration_product_vector_missing");
+    }
+    let snapshot = client
+        .observe()?
+        .filter(resident_engine_generation)
+        .ok_or_else(|| anyhow::anyhow!("embedding_constant_calibration_product_owner_missing"))?;
+    if snapshot.process.server_instance_id != cold_owner.process.server_instance_id
+        || snapshot.process.process_start_id != cold_owner.process.process_start_id
+    {
+        bail!("embedding_constant_calibration_generation_changed");
+    }
     Ok(measurement(span, snapshot))
 }
 

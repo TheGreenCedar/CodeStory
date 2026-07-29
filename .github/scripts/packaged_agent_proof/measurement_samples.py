@@ -375,12 +375,6 @@ def _accelerator_residency_value(
         and tensor_count > 0
         and tensor_bytes > 0
         and offloaded == model_layers
-    ) or (
-        expected_policy == "cpu_explicit"
-        and operands["accelerator_execution_verified"] is False
-        and tensor_count == 0
-        and tensor_bytes == 0
-        and offloaded == 0
     )
     require(
         valid,

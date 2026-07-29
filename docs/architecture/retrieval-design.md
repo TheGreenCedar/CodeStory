@@ -48,10 +48,10 @@ batching contract.
 | Windows x64 | v0.16 package with verified Vulkan acceleration |
 | Linux x64 | v0.16 package with verified Vulkan acceleration |
 | Other targets | no v0.16 package or runtime claim |
-| Hosted CI or maintainer diagnostic | CPU only with `CODESTORY_EMBED_ALLOW_CPU=1` |
 
-There is no silent GPU-to-CPU fallback. Software adapters such as llvmpipe,
-lavapipe, WARP, and SwiftShader do not satisfy accelerated policy.
+CPU embeddings are unsupported. There is no GPU-to-CPU fallback. Software
+adapters such as llvmpipe, lavapipe, WARP, and SwiftShader do not satisfy
+accelerated policy.
 
 ## Per-project artifact layout
 
@@ -173,7 +173,7 @@ publication. Broad agent surfaces additionally require:
 - a current core and source identity;
 - the exact server and producer identity;
 - a current or automatically restorable timed embedding smoke;
-- `accelerated` or explicitly permitted `cpu_explicit` policy;
+- `accelerated` policy with CPU embeddings disabled;
 - an allowed packet/search/context surface.
 
 This preserves the wire contract while preventing a full manifest from
