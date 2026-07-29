@@ -143,6 +143,25 @@ def _calibration_bundle_tests(
         and calibration_result["matrix_cell_count"] == 2,
         "calibration bundle self-test did not verify the full matrix",
     )
+    require(
+        calibration_result["source_lineage"] is None,
+        "an unenforced verification reported a calibration source lineage",
+    )
+    # The flag must not be inert: with lineage enforcement on and no packaged
+    # source to bind, the freeze has to refuse rather than silently skip the
+    # guard the release workflow now depends on.
+    try:
+        verify_calibration_bundle(
+            calibration_bundle_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=True,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure(
+            "enforced calibration source lineage was skipped without a packaged source"
+        )
     return CalibrationFixture(
         bundle_path=calibration_bundle_path,
         bundle_payload=calibration_bundle_payload,

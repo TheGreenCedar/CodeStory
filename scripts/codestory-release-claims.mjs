@@ -172,23 +172,52 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
   };
 }
 
+/// What each reuse binding's own construction determines, and may therefore equate.
+///
+/// Reuse always reads a reused row's *commit* at the release commit -- that is what anchoring to
+/// the earlier run means. Equating goes further: it lets a reused row keep an identity whose value
+/// differs from this release's, so it may only ever name a key the binding itself determines. The
+/// graph declares which of these keys each binding actually uses (`evidence_policy.reuse.bindings`)
+/// and why; this map is the ceiling, stated next to the proofs that establish it, so a graph edit
+/// alone can never grant an equation no binding proves.
+///
+///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
+///     substituting: every tree-derived identity a reused row declares is still checkable directly
+///     against this release, and equating one would replace a live check with nothing. Hence [].
+///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
+///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
+///     determines the built accelerator, so accelerator execution evidence transfers across the
+///     source_tree difference the binding exists to tolerate. It determines nothing about the
+///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
+const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
+  source_tree: Object.freeze([]),
+  native_fingerprint: Object.freeze(["source_tree"]),
+});
+
 /// Verify a reuse binding against the local repository and return its recorded value.
 ///
 /// Both sides of the release ledger need this: the producer proves the binding before it admits
 /// cross-run evidence, and the closeout re-proves it against its own checkout before it anchors a
 /// reused row to the earlier run.
 export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
+  if (!Object.hasOwn(REUSE_BINDING_EQUATABLE_IDENTITY, binding)) {
+    fail(`unknown reuse binding ${binding}`);
+  }
+  // Ancestry is a property of reuse itself, not of any one binding: evidence may only be inherited
+  // forward along this release's own history. Without it, a binding that compares content alone --
+  // a fingerprint, say -- would admit a run from a fork or an abandoned branch that happens to
+  // share the content, which is a different repository's proof wearing this release's clothes.
+  if (spawnSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
+    cwd: repository,
+    encoding: "utf8",
+  }).status !== 0) {
+    fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
+  }
   if (binding === "source_tree") {
     const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
     const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
     if (releaseTree !== reusedTree) {
       fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
-    }
-    if (spawnSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
-      cwd: repository,
-      encoding: "utf8",
-    }).status !== 0) {
-      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
     }
     return releaseTree;
   }
@@ -212,7 +241,8 @@ export function verifyReuseBinding({ binding, repository, releaseCommit, reusedC
     }
     return releasePrint;
   }
-  fail(`unknown reuse binding ${binding}`);
+  // Reachable only if a binding is added to the equation ceiling above without a proof here.
+  fail(`reuse binding ${binding} has no verification`);
 }
 
 function uniqueById(values, label) {
@@ -250,6 +280,55 @@ function cellsByProducerJobName(cellGroups) {
     }
   }
   return byJobName;
+}
+
+/// What each reuse binding is permitted to equate, declared per binding by the graph.
+///
+/// A reused row is read at the release commit; every other identity it carries is checked as
+/// written unless its binding declares that key here. That declaration is the whole authorisation:
+/// no cell group gets an exception, and no group narrows its own `required_identity` to make room
+/// for one, because narrowing would drop the check for fresh evidence too. So the equation has to
+/// survive three separate refusals before the closeout will honour it:
+///
+///   * The key must be one the binding's construction determines -- `REUSE_BINDING_EQUATABLE_IDENTITY`
+///     above is the ceiling, stated beside the proofs, so a graph edit alone cannot invent one.
+///   * The key must be part of the release identity binding (minus `commit`, which reuse anchors
+///     rather than equates), so the closeout always holds an authoritative release-side value and
+///     an authoritative reused-side value to put in its place.
+///   * The graph must say, in prose, why that particular key follows from that particular proof.
+///     An equation nobody can justify in a sentence is one nobody should be granting.
+function validateReuseBindings(evidencePolicy, identityBinding) {
+  const reuse = object(evidencePolicy.reuse, "release claim graph.evidence_policy.reuse");
+  nonEmptyText(reuse.equation, "release claim graph.evidence_policy.reuse.equation");
+  nonEmptyText(reuse.verification, "release claim graph.evidence_policy.reuse.verification");
+  const bindings = object(reuse.bindings, "release claim graph.evidence_policy.reuse.bindings");
+  const implemented = Object.keys(REUSE_BINDING_EQUATABLE_IDENTITY).sort();
+  if (JSON.stringify(Object.keys(bindings).sort()) !== JSON.stringify(implemented)) {
+    fail(`release claim graph reuse bindings must declare exactly ${implemented.join(", ")}`);
+  }
+  const equatable = new Set(identityBinding.filter((key) => key !== "commit"));
+  for (const [id, value] of Object.entries(bindings)) {
+    const binding = object(value, `release claim graph reuse binding ${id}`);
+    nonEmptyText(binding.admits, `release claim graph reuse binding ${id}.admits`);
+    if (!Array.isArray(binding.equates)) {
+      fail(`release claim graph reuse binding ${id}.equates must be an array`);
+    }
+    const determines = new Set(REUSE_BINDING_EQUATABLE_IDENTITY[id]);
+    const declared = new Set();
+    for (const [index, entryValue] of binding.equates.entries()) {
+      const entry = object(entryValue, `release claim graph reuse binding ${id}.equates[${index}]`);
+      const key = nonEmptyText(entry.identity, `release claim graph reuse binding ${id}.equates[${index}].identity`);
+      nonEmptyText(entry.justification, `release claim graph reuse binding ${id} equated identity ${key}.justification`);
+      if (declared.has(key)) fail(`release claim graph reuse binding ${id} equates ${key} twice`);
+      declared.add(key);
+      if (!equatable.has(key)) {
+        fail(`release claim graph reuse binding ${id} may not equate identity ${key} outside the release identity binding`);
+      }
+      if (!determines.has(key)) {
+        fail(`release claim graph reuse binding ${id} may not equate identity ${key}, which its construction does not determine`);
+      }
+    }
+  }
 }
 
 /// How much of a release may go unproven and still publish. Withholding exists so one dead host
@@ -704,6 +783,7 @@ export function validateReleaseClaimGraph(graph) {
   for (const key of identityBinding) {
     if (!identityFormats[key]) fail(`identity ${key} must declare a format`);
   }
+  validateReuseBindings(evidencePolicy, identityBinding);
 
   const exceptionPolicy = object(graph.exception_policy, "release claim graph.exception_policy");
   if (exceptionPolicy.schema !== "codestory.model-microbenchmark-exception/v1") {
@@ -881,6 +961,15 @@ export function validateReleaseClaimGraph(graph) {
     }
     if (!new Set(["none", "pre_publish", "post_publish_compare"]).has(group.archive_role)) {
       fail(`closeout cell group ${id} has unknown archive_role ${String(group.archive_role)}`);
+    }
+    // A group admits cross-run evidence by naming a binding the reuse policy declares -- and only
+    // by that. What the binding may then equate is the binding's business, stated once beside the
+    // proof, never a per-group exception.
+    if (group.reuse_binding !== undefined) {
+      const binding = nonEmptyText(group.reuse_binding, `closeout cell group ${id}.reuse_binding`);
+      if (!Object.hasOwn(evidencePolicy.reuse.bindings, binding)) {
+        fail(`closeout cell group ${id} names undeclared reuse binding ${binding}`);
+      }
     }
     const requiredIdentity = stringArray(
       group.required_identity,

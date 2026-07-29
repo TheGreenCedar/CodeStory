@@ -28,7 +28,8 @@ use crate::search_terms::{
     SEARCH_PLAN_BASE_SOURCE_TRUTH_CHECKS, SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER,
     SEARCH_PLAN_MAX_SEED_ANCHORS, SEARCH_PLAN_OPTIONAL_SUBQUERY_LIMIT,
     SEARCH_PLAN_REPO_TEXT_SOURCE_TRUTH_CHECK, SEARCH_PLAN_SEED_ANCHOR_MARKER,
-    search_plan_identifier_shaped_term, search_plan_query_token_closure, search_plan_terms,
+    SEARCH_PLAN_STOPWORDS, search_plan_identifier_shaped_term, search_plan_query_token_closure,
+    search_plan_terms,
 };
 use crate::symbol_query::{OrientationEvidence, OrientationHitEvidence, is_non_primary_source_hit};
 use codestory_contracts::api::{GroundingOrientationDto, GroundingOrientationUncertaintyDto};
@@ -618,17 +619,29 @@ pub(super) fn repo_text_line_identifiers(
         .join("\n");
     let mut identifiers = Vec::new();
     let mut seen = HashSet::new();
+    // Every candidate here is answered by the repository, not by this function:
+    // the caller only keeps a candidate that exactly matches a symbol indexed in
+    // this same file. That is what makes it safe to have no vocabulary at all.
+    // The whitelist this replaced -- auth, feed, posts, storage, indexer,
+    // service, trail, snippet -- named the domains of four holdout repositories
+    // and admitted them from any query whatsoever.
     for token in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         if token.len() < 3 {
             continue;
         }
-        // A bare lowercase word only counts when the query itself supplies it.
-        // The replaced domain whitelist admitted the holdout's nouns from any
-        // query at all.
+        // Camel and snake shapes are self-evidently identifiers. A bare
+        // lowercase word is admitted when the query supplies it, and otherwise
+        // when it is not language-level filler: Go, C, and Python declare
+        // `dispatch`, `enqueue`, `render` with no shape to give them away, and
+        // requiring the asker to have spelled the name is requiring them to
+        // already know the answer. The stopword list is the one table that
+        // cannot encode a repository -- it names question filler -- so this
+        // widening adds no vocabulary the generalization lint could object to.
         let lower = token.to_ascii_lowercase();
         let looks_symbolic = token.chars().any(|ch| ch.is_ascii_uppercase())
             || token.contains('_')
-            || query_closure.contains(&lower);
+            || query_closure.contains(&lower)
+            || !SEARCH_PLAN_STOPWORDS.contains(&lower.as_str());
         if looks_symbolic && seen.insert(lower) {
             identifiers.push(token.to_string());
         }

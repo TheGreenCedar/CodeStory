@@ -440,7 +440,21 @@ export function validateReleaseCellManifest({ manifest, cell, graph, version }) 
 /// checkout, the binding the claim graph declares for that cell's group. Every rejecting path
 /// records its reason and falls back to the same-run anchor, so unverifiable reuse also fails the
 /// run identity checks that follow.
-function producerAnchor({ cell, row, trustedProducers, gitIdentity, bindings, verify, errors }) {
+///
+/// A verified anchor also carries the identity keys that binding is declared to equate, together
+/// with the reused commit's own value for each, re-derived here rather than taken from the row.
+/// That pair is what makes an equation honest: the release's value may stand in for the reused
+/// commit's value, but the row still has to be carrying the reused commit's value to begin with.
+function producerAnchor({
+  cell,
+  row,
+  trustedProducers,
+  gitIdentity,
+  bindings,
+  verify,
+  resolveCommitIdentity,
+  errors,
+}) {
   const sameRun = { runId: trustedProducers.run_id, headSha: gitIdentity.commit, reused: false };
   const reused = row.reused_from;
   if (reused === undefined) return sameRun;
@@ -448,7 +462,8 @@ function producerAnchor({ cell, row, trustedProducers, gitIdentity, bindings, ve
     errors.push(`trusted producer map ${cell.id} reuse record must be an object`);
     return sameRun;
   }
-  const binding = bindings.get(cell.group_id);
+  const declared = bindings.get(cell.group_id);
+  const binding = declared?.id;
   if (binding === undefined || reused.binding !== binding) {
     errors.push(`trusted producer map ${cell.id} reuses evidence under an undeclared binding`);
     return sameRun;
@@ -484,7 +499,36 @@ function producerAnchor({ cell, row, trustedProducers, gitIdentity, bindings, ve
     errors.push(`trusted producer map ${cell.id} recorded ${binding} value does not bind this release`);
     return sameRun;
   }
-  return { runId: reused.run_id, headSha: reused.head_sha, reused: true };
+  // An equated identity is the one place a reused row is allowed to differ from this release, so
+  // the value it is allowed to differ *to* is not the row's word: it is the reused commit's own,
+  // read from this checkout. With no way to read it, the equation is unproven and the reuse is
+  // refused outright rather than granted on the producer map's say-so.
+  const equated = new Map();
+  if (declared.equates.length > 0) {
+    if (typeof resolveCommitIdentity !== "function") {
+      errors.push(
+        `trusted producer map ${cell.id} equates ${declared.equates.join(", ")} `
+        + "this closeout cannot resolve",
+      );
+      return sameRun;
+    }
+    let reusedIdentity;
+    try {
+      reusedIdentity = resolveCommitIdentity(reused.head_sha);
+    } catch (error) {
+      errors.push(`trusted producer map ${cell.id} reused commit identity is unreadable: ${error.message}`);
+      return sameRun;
+    }
+    for (const key of declared.equates) {
+      const value = reusedIdentity?.[key];
+      if (typeof value !== "string" || value === "" || typeof gitIdentity[key] !== "string") {
+        errors.push(`trusted producer map ${cell.id} reused commit has no ${key} identity to equate`);
+        return sameRun;
+      }
+      equated.set(key, value);
+    }
+  }
+  return { runId: reused.run_id, headSha: reused.head_sha, reused: true, equated };
 }
 
 function trustedProducerIndex({
@@ -494,6 +538,7 @@ function trustedProducerIndex({
   graph,
   phase,
   verifyReuseBinding: verify,
+  resolveCommitIdentity,
 }) {
   const errors = [];
   if (trustedProducers === null || typeof trustedProducers !== "object" || Array.isArray(trustedProducers)) {
@@ -574,9 +619,21 @@ function trustedProducerIndex({
   for (const cellId of byCell.keys()) {
     if (!required.has(cellId)) errors.push(`trusted producer map contains undeclared cell ${cellId}`);
   }
+  // What a group's binding is, and what that binding is declared to equate. Both come from the
+  // graph: the group names a binding, the reuse policy says what that binding may substitute. A
+  // group that names a binding the policy never declared equates nothing here, and its rows are
+  // refused as undeclared -- the graph validator refuses that shape outright, and this is what
+  // makes an unvalidated graph fail closed rather than fail open.
+  const declaredBindings = graph.evidence_policy?.reuse?.bindings ?? {};
   const bindings = new Map((graph.closeout.cell_groups ?? [])
     .filter((group) => typeof group.reuse_binding === "string")
-    .map((group) => [group.id, group.reuse_binding]));
+    .filter((group) => Object.hasOwn(declaredBindings, group.reuse_binding))
+    .map((group) => [group.id, {
+      id: group.reuse_binding,
+      equates: (declaredBindings[group.reuse_binding].equates ?? [])
+        .map((entry) => entry?.identity)
+        .filter((key) => typeof key === "string" && key !== ""),
+    }]));
   const reusedByCell = new Map();
   for (const cell of cells) {
     const row = byCell.get(cell.id);
@@ -624,9 +681,12 @@ function trustedProducerIndex({
       gitIdentity,
       bindings,
       verify,
+      resolveCommitIdentity,
       errors,
     });
-    if (anchor.reused) reusedByCell.set(cell.id, anchor.headSha);
+    if (anchor.reused) {
+      reusedByCell.set(cell.id, { commit: anchor.headSha, equated: anchor.equated });
+    }
     if (row.producer_run_id !== anchor.runId) {
       errors.push(`trusted producer map ${cell.id} run identity differs from the Actions run`);
     }
@@ -707,7 +767,7 @@ function trustedProducerIndex({
   return { byCell, reusedByCell, errors };
 }
 
-function producerAuthenticationProblems(manifest, trustedProducer, reusedCommit) {
+function producerAuthenticationProblems(manifest, trustedProducer, reuse) {
   if (!trustedProducer) return ["manifest producer is absent from the trusted producer map"];
   const identity = manifest.evidence?.identity ?? {};
   const problems = [];
@@ -732,8 +792,18 @@ function producerAuthenticationProblems(manifest, trustedProducer, reusedCommit)
   // read at the release commit instead, so that comparison no longer binds it to anything --
   // this does. The binding proof covers exactly one earlier commit, and it is the only commit
   // this manifest may declare.
-  if (reusedCommit !== undefined && identity.commit !== reusedCommit) {
+  if (reuse !== undefined && identity.commit !== reuse.commit) {
     problems.push("manifest commit is not the reused commit the closeout proved bound to this release");
+  }
+  // Same argument, one step further out, for every identity the binding equates. Reading the row
+  // at this release's value for such a key removes the only check that key was performing, so the
+  // row has to be carrying the reused commit's own value for it -- re-derived from this checkout,
+  // never the producer's word. A row claiming some third tree is not the evidence the binding
+  // proved anything about.
+  for (const [key, value] of reuse?.equated ?? []) {
+    if (identity[key] !== value) {
+      problems.push(`manifest ${key} is not the reused commit's ${key} the binding equates`);
+    }
   }
   return problems;
 }
@@ -920,17 +990,30 @@ function evaluateCell({
   }
   // A reused row was produced at an earlier commit, which is the whole point of the binding the
   // closeout just re-proved against its own checkout. Reading it at the release commit applies
-  // that binding; the row's own source tree is still compared against this release, so a binding
-  // that does not equate the trees still fails. The ledger keeps the manifest identity untouched.
+  // that binding, along with each identity the graph declares that binding may equate -- and only
+  // those: `native_fingerprint` equates `source_tree` because an equal fingerprint means every
+  // input determining the native binary is identical, so accelerator execution evidence carries
+  // across a tree that differs only in code the accelerator never runs. `source_tree` equates
+  // nothing, because there the trees are identical and nothing is being substituted. Any identity
+  // outside that declaration is compared against this release exactly as it is written, so a
+  // reused row from another repository, of another version, or naming another host still fails.
+  // The ledger keeps the manifest identity untouched.
   //
-  // The substitution is granted to exactly the commit the proof covered. A row declaring any
-  // other commit is not the evidence that was proved, so it is read as written and fails the
-  // claim evaluator's commit check -- the same check that binds every same-run row.
+  // The substitution is granted to exactly the commit the proof covered, and to a row that
+  // actually carries the reused commit's own value for each equated key. A row declaring any
+  // other commit -- or some third tree -- is not the evidence that was proved, so it is read as
+  // written and fails the claim evaluator's identity checks, the same checks that bind every
+  // same-run row.
   const evidence = evidenceCells.map((dependency) => {
     const row = manifests.get(dependency.id).evidence;
-    const provedCommit = reusedByCell.get(dependency.id);
-    if (provedCommit === undefined || row.identity?.commit !== provedCommit) return row;
-    return { ...row, identity: { ...row.identity, commit: gitIdentity.commit } };
+    const reuse = reusedByCell.get(dependency.id);
+    if (reuse === undefined || row.identity?.commit !== reuse.commit) return row;
+    const identity = { ...row.identity, commit: gitIdentity.commit };
+    for (const [key, value] of reuse.equated) {
+      if (row.identity?.[key] !== value) return row;
+      identity[key] = gitIdentity[key];
+    }
+    return { ...row, identity };
   });
   const requestedClaims = claims.map((claim) => ({
     id: claim.id,
@@ -1157,6 +1240,9 @@ export function evaluateReleaseCloseout({
   // Re-proves a reuse binding against this closeout's own checkout. Absent, every reuse block is
   // refused rather than trusted on the producer map's say-so.
   verifyReuseBinding: verify = null,
+  // Reads one commit's trusted identity out of this closeout's own checkout, for the identities a
+  // binding equates. Absent, a binding that equates anything is refused the same way.
+  resolveCommitIdentity = null,
 }) {
   if (!SEMVER.test(version)) fail("version must be semantic version text without a leading v");
   const evaluatedEpoch = Date.parse(evaluatedAt);
@@ -1172,6 +1258,7 @@ export function evaluateReleaseCloseout({
     graph,
     phase,
     verifyReuseBinding: verify,
+    resolveCommitIdentity,
   });
   const performanceCell = cells.find(({ id }) => id === graph.exception_policy.eligible_evidence_type);
   const trustedException = trustedExceptionInput({
@@ -1600,6 +1687,9 @@ function main() {
     artifactBindings: downloaded.artifactBindings,
     verifyReuseBinding: ({ binding, releaseCommit, reusedCommit }) =>
       verifyReuseBinding({ binding, repository: repoRoot, releaseCommit, reusedCommit }),
+    // Same derivation the release identity itself came from, applied to the reused commit: an
+    // equated identity is only ever replaced by this checkout's reading of both ends.
+    resolveCommitIdentity: (commit) => deriveTrustedGitIdentity({ repoRoot, expectedSha: commit }),
   });
   writeReleaseCloseout(text(values["out-dir"], "--out-dir"), result);
   console.log(JSON.stringify(result.summary, null, 2));

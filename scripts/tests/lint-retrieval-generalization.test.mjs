@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fs from "node:fs";
+import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -102,4 +102,77 @@ test("tasks about other repositories still ban their symbols", () => {
       `${foreign} belongs to a holdout repository and must stay banned, got: ${[...banned].join(", ")}`,
     );
   }
+});
+
+/// Run the lint with one extra task manifest, additively, and report the banned
+/// patterns over a production tree of our choosing. The extra root never touches
+/// the checked-in corpus every other run reads.
+function bannedPatternsWithExtraTask(task) {
+  const root = mkdtempSync(path.join(os.tmpdir(), "generalization-lint-"));
+  try {
+    const taskRoot = path.join(root, "tasks");
+    const scanRoot = path.join(root, "src");
+    mkdirSync(taskRoot);
+    mkdirSync(scanRoot);
+    writeFileSync(path.join(taskRoot, "probe.task.json"), JSON.stringify(task));
+    writeFileSync(path.join(scanRoot, "probe.rs"), "pub fn probe() {}\n");
+    const dumpPath = path.join(root, "patterns.json");
+    try {
+      execFileSync(
+        process.execPath,
+        [path.join(repositoryRoot, "scripts/lint-retrieval-generalization.mjs")],
+        {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS: scanRoot,
+            CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS: taskRoot,
+            CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS: dumpPath,
+          },
+        },
+      );
+    } catch (error) {
+      throw new Error(`lint failed to dump patterns: ${error.stderr ?? error}`);
+    }
+    return JSON.parse(readFileSync(dumpPath, "utf8"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("a holdout named after one of our crates is not mistaken for this repository", () => {
+  // The self-subject rule decides which tasks may not contribute symbol bans.
+  // Deciding it on any crate-name token would hand that exemption to a holdout
+  // repository called `store`, `runtime`, or `bench` and switch this lint off
+  // for it silently. Only this repository's own name may claim the exemption.
+  for (const impostor of ["store", "runtime", "bench", "indexer"]) {
+    const { derived } = bannedPatternsWithExtraTask({
+      id: `${impostor}-probe-task`,
+      repo: { name: impostor, url: `https://github.com/example/${impostor}.git` },
+      prompt: "Explain how the probe repository handles its own requests end to end.",
+      expected_symbols: [
+        { name: "probeGadgetHandler", path: "src/probe_gadget.rs", kind: "function" },
+      ],
+    });
+    assert.ok(
+      derived.some((pattern) => pattern.includes("probeGadgetHandler")),
+      `a holdout named \`${impostor}\` must still ban its own symbols`,
+    );
+  }
+});
+
+test("this repository's own name still claims the self-subject exemption", () => {
+  const { derived } = bannedPatternsWithExtraTask({
+    id: "codestory-probe-task",
+    repo: { name: "codestory", url: "https://github.com/TheGreenCedar/CodeStory.git" },
+    prompt: "Explain how the probe repository handles its own requests end to end.",
+    expected_symbols: [
+      { name: "probeGadgetHandler", path: "src/probe_gadget.rs", kind: "function" },
+    ],
+  });
+  assert.ok(
+    !derived.some((pattern) => pattern.includes("probeGadgetHandler")),
+    "a task whose subject is this repository must not ban this repository's symbols",
+  );
 });

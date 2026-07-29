@@ -800,4 +800,86 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     }),
     /unknown reuse binding source_history/u,
   );
+  // Ancestry belongs to reuse itself, not to any one binding. Read the other way round, v0.16.1
+  // is not on v0.16.0's history, and the fingerprints are equal -- content equality alone would
+  // admit a run from a fork or an abandoned branch as this release's own proof.
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "native_fingerprint",
+      repository: root,
+      releaseCommit: priorTag,
+      reusedCommit: releaseTag,
+    }),
+    /is not an ancestor of the release commit/u,
+  );
+});
+
+test("a reuse binding may equate only identities its own construction determines", () => {
+  // What a reused row is allowed to differ from this release in is declared per binding, in the
+  // graph, with a reason -- never per cell group, and never by narrowing a group's
+  // required_identity, which would drop the check for fresh evidence too (#1567).
+  const declared = graph.evidence_policy.reuse.bindings;
+  assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
+  assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
+  assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
+
+  // The fingerprint determines the built native binary. It says nothing about which repository
+  // produced the row, so it may not equate that -- graph text alone cannot grant an equation.
+  const foreignRepository = structuredClone(graph);
+  foreignRepository.evidence_policy.reuse.bindings.native_fingerprint.equates = [
+    { identity: "repository", justification: "same organisation, surely" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(foreignRepository),
+    /native_fingerprint may not equate identity repository, which its construction does not determine/u,
+  );
+
+  // The tree binding proves the reused commit resolves to this release's own tree, so there is
+  // nothing to substitute: equating the tree there would replace a live check with nothing.
+  const vacuousEquation = structuredClone(graph);
+  vacuousEquation.evidence_policy.reuse.bindings.source_tree.equates = [
+    { identity: "source_tree", justification: "the trees are equal anyway" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(vacuousEquation),
+    /source_tree may not equate identity source_tree, which its construction does not determine/u,
+  );
+
+  // An identity outside the release identity binding has no authoritative release-side value the
+  // closeout could put in its place, so it can never be equated whatever a binding proves.
+  const unboundIdentity = structuredClone(graph);
+  unboundIdentity.evidence_policy.reuse.bindings.native_fingerprint.equates = [
+    { identity: "artifact_sha256", justification: "the inputs were identical" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(unboundIdentity),
+    /may not equate identity artifact_sha256 outside the release identity binding/u,
+  );
+
+  // An equation nobody can justify in a sentence is one nobody should be granting.
+  const unjustified = structuredClone(graph);
+  delete unjustified.evidence_policy.reuse.bindings.native_fingerprint.equates[0].justification;
+  assert.throws(
+    () => validateReleaseClaimGraph(unjustified),
+    /equated identity source_tree.justification must be a non-empty string/u,
+  );
+
+  // Every binding the verifier implements has to say what it equates, so a new binding cannot
+  // arrive with its equations left unstated.
+  const undeclaredBinding = structuredClone(graph);
+  delete undeclaredBinding.evidence_policy.reuse.bindings.native_fingerprint;
+  assert.throws(
+    () => validateReleaseClaimGraph(undeclaredBinding),
+    /reuse bindings must declare exactly native_fingerprint, source_tree/u,
+  );
+
+  // And a cell group admits cross-run evidence only under a binding the policy declares.
+  const inventedBinding = structuredClone(graph);
+  inventedBinding.closeout.cell_groups.find(({ id }) => id === "accelerator_execution")
+    .reuse_binding = "source_history";
+  assert.throws(
+    () => validateReleaseClaimGraph(inventedBinding),
+    /accelerator_execution names undeclared reuse binding source_history/u,
+  );
 });

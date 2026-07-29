@@ -1,5 +1,12 @@
 use super::{HashSet, SearchPlanDroppedTermDto, SearchPlanTermsDto};
 
+// Search-plan terms come from the asked question only. Domain vocabulary,
+// inferred symbol names, and repository-specific term expansion belong to the
+// indexed repository, not to a table in this crate: a curated vocabulary here
+// can only encode the corpora it was written against.
+// Stopwords stay language-level: instruction and filler words that carry no
+// repository meaning in any repository.
+//
 // "anchor", "answer", "around", "cite", "cited", and "cites" are
 // CodeStory's own prompt and skill vocabulary -- they appear throughout the
 // shipped grounding skill and back SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER -- not

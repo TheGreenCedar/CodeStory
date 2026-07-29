@@ -216,6 +216,19 @@ adapter to compensate for incorrect upstream state.
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
+- Release ordering is **bump-then-calibrate**. Bump the version first,
+  calibrate the per-user embedding server on the bumped tree, land the
+  constant-set freeze commit, then package and release. The frozen-candidate
+  `qualification` dispatch enforces this -- it is the only lane that carries a
+  calibration bundle, and its packaged proof runs
+  `Prove frozen calibration source lineage` whenever one arrives: the
+  calibration commit must be an ancestor of the packaged commit and
+  `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` must
+  be the only file that differs between them. A calibrate-then-bump ordering
+  fails the guard by name; the fix is to move the bump ahead of calibration and
+  recalibrate on the bumped tree, never to widen the allowed path set. Any other
+  commit -- a doc fix, a CI tweak, a rebase -- between calibration and the
+  package also fails, so recalibrate rather than reorder history.
 - Validate release changes with
   `python .github/scripts/check-codestory-release.py --version <version>` and
   `node .github/scripts/check-workflow-policy.mjs`.

@@ -21,10 +21,23 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
-      - .github/scripts/check-packaged-agent-proof.py
-      - .github/scripts/install-linux-vulkan-build-deps.sh
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, on the
+      # non-Rust product surfaces it also scans, and on the lint itself.
+      # crates/codestory-runtime/tests/retrieval_generalization_guard.rs keeps
+      # this list covering every path the lint reports as guarded. The globs are
+      # whole trees on purpose: the lint reads every crate's `src`, all three
+      # eval corpora, and every file under `scripts/`, `.github/`,
+      # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
+      # lint reads is a gate that never fires on the code it guards.
+      - crates/**
+      - benchmarks/tasks/**
+      - scripts/**
+      - .github/**
+      - .cursor/rules/**
+      - plugins/codestory/**
+      - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
-      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/rust-ci.yml
       - scripts/lint-retrieval-generalization.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
@@ -52,10 +65,23 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
-      - .github/scripts/check-packaged-agent-proof.py
-      - .github/scripts/install-linux-vulkan-build-deps.sh
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, on the
+      # non-Rust product surfaces it also scans, and on the lint itself.
+      # crates/codestory-runtime/tests/retrieval_generalization_guard.rs keeps
+      # this list covering every path the lint reports as guarded. The globs are
+      # whole trees on purpose: the lint reads every crate's `src`, all three
+      # eval corpora, and every file under `scripts/`, `.github/`,
+      # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
+      # lint reads is a gate that never fires on the code it guards.
+      - crates/**
+      - benchmarks/tasks/**
+      - scripts/**
+      - .github/**
+      - .cursor/rules/**
+      - plugins/codestory/**
+      - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
-      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/rust-ci.yml
       - scripts/lint-retrieval-generalization.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
