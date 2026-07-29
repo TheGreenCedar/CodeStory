@@ -180,9 +180,45 @@ Frozen calibration bundles are accepted only from a successful
 `workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every
 consumer binds the run ID, exact `embedding-calibration-bundle-<source-sha>`
 artifact name, unexpired artifact record, source commit, and bundle producer
-identity before applying the frozen thresholds. The exact
-unfrozen-to-frozen source lineage is checked once at the freeze transition; it
-is not reinterpreted as a requirement for every later package proof.
+identity before applying the frozen thresholds.
+
+The `Prove frozen calibration source lineage` step of
+`packaged-platform-proof.yml` passes `--enforce-calibration-freeze-lineage`, so
+the exact calibration-to-package source lineage is proved rather than assumed:
+the calibration commit must be an ancestor of the packaged commit, the
+verification checkout must be that packaged commit, and
+`crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` must be
+the only path that differs between them. The packaged proof therefore checks out
+full history.
+
+That step runs on every packaged proof that is handed an authenticated
+calibration bundle, which is the manually dispatched `qualification` mode of
+`packaged-platform-pr.yml` -- the frozen-candidate lane. It is a `--version-only`
+invocation: it verifies the package identity, the frozen contract, and the bundle
+with its lineage, and stops before the runtime proof. Without the enforcement
+flag a `--version-only` proof rejects calibration inputs outright, so the flag
+cannot be dropped without the step failing.
+
+The full frozen `hosted_package` qualification in the same workflow carries the
+same flag, but it cannot run today: `--produce-qualification-evidence` requires
+the exact-head release-evidence `packet-runtime-summary.json` at any
+non-calibration tier, and `packaged-platform-pr.yml` is required to pass no
+release evidence to package proof. The `protected_hardware` bundle consumers on
+the Metal, Windows Vulkan, and Linux Vulkan lanes are likewise exempt: on the
+release path they run `--server-behavior-only`, which takes their no-bundle
+branch, and on the coordinator path they carry the same release-evidence
+requirement. The lineage is proved once, on the frozen candidate, and the later
+package proofs consume the already-frozen constant set rather than re-proving how
+it was reached.
+
+That rule fixes the release ordering to **bump-then-calibrate**: bump the
+version first with `node scripts/bump-version.mjs --version <version>`,
+calibrate on the bumped tree, then land the constant-set freeze commit as the
+only commit between calibration and the packaged release. Calibrating first and
+bumping afterwards puts a second commit in that range, and the guard rejects it
+by name -- the failure lists the offending paths and repeats this ordering. The
+fix is always to move the bump ahead of calibration and recalibrate on the
+bumped tree, never to widen the allowed path set.
 
 Platform proof boundaries:
 

@@ -734,6 +734,84 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       );
       step.if = "matrix.asset_target == 'linux-x64'";
     }, /packaged-platform-proof\.yml/u],
+    ["frozen qualification stops enforcing the calibration freeze lineage", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      const removed = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
+      assert.notEqual(removed, step.run, "freeze lineage flag was already absent");
+      step.run = removed;
+    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
+    ["freeze lineage enforcement moves onto the unfrozen calibration invocation", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      const moved = step.run
+        .replace("  --enforce-calibration-freeze-lineage \\\n", "")
+        .replace(
+          "      --proof-tier calibration \\\n",
+          "      --proof-tier calibration \\\n      --enforce-calibration-freeze-lineage \\\n",
+        );
+      assert.match(moved, /--proof-tier calibration \\\n\s+--enforce-calibration-freeze-lineage/u);
+      step.run = moved;
+    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
+    ["package build loses the history the freeze lineage probe reads", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Checkout").with["fetch-depth"] = 1;
+    }, /package build must keep full history for the calibration freeze lineage probe/u],
+    // A flag pinned only by "appears after this anchor" is defeated by parking a
+    // copy on a later decoy line while the real invocation loses it. Both freeze
+    // lineage pins read the single backslash-continued command instead.
+    ["freeze lineage flag parked on a decoy after the frozen invocation", packagedProofFile, workflow => {
+      const step = draftStep(
+        workflow.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      const stripped = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
+      assert.notEqual(stripped, step.run, "freeze lineage flag was already absent");
+      step.run = `${stripped}echo skipping python .github/scripts/check-packaged-agent-proof.py \\\n  --enforce-calibration-freeze-lineage \\\n  --out-dir target/decoy\n`;
+    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
+    ["reachable lineage proof stops enforcing the freeze lineage", packagedProofFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
+      const removed = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
+      assert.notEqual(removed, step.run, "freeze lineage flag was already absent");
+      step.run = removed;
+    }, /must pass --enforce-calibration-freeze-lineage on the invocation that reads the calibration bundle/u],
+    ["reachable lineage proof parks the flag on a decoy", packagedProofFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
+      const stripped = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
+      assert.notEqual(stripped, step.run, "freeze lineage flag was already absent");
+      step.run = `${stripped}echo skipping python .github/scripts/check-packaged-agent-proof.py \\\n  --enforce-calibration-freeze-lineage \\\n  --out-dir target/decoy\n`;
+    }, /must pass --enforce-calibration-freeze-lineage on the invocation that reads the calibration bundle/u],
+    ["reachable lineage proof stops binding the verified source identity", packagedProofFile, workflow => {
+      delete draftStep(workflow.jobs.build, "Prove frozen calibration source lineage").env.SOURCE_SHA;
+    }, /must bind the verified source identity and the authenticated producer/u],
+    ["reachable lineage proof is removed entirely", packagedProofFile, workflow => {
+      workflow.jobs.build.steps = workflow.jobs.build.steps
+        .filter(({ name }) => name !== "Prove frozen calibration source lineage");
+    }, /must contain named step Prove frozen calibration source lineage/u],
+    // Reachability, not presence. Each of these leaves the flag exactly where it
+    // is and only makes the step impossible to reach from the frozen-candidate
+    // coordinator -- which is how the guard went dark the first time.
+    ["lineage proof re-gated on the release evidence its caller cannot pass", packagedProofFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
+      step.if = `${step.if} && inputs.quality_evidence_artifact != ''`;
+    }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
+    ["lineage proof re-gated onto the unfrozen calibration collection", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Prove frozen calibration source lineage").if
+        = "matrix.asset_target == 'linux-x64' && inputs.calibration_mode && inputs.calibration_bundle_artifact != ''";
+    }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
+    ["lineage proof moved onto a package cell the matrix never builds", packagedProofFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
+      step.if = step.if.replace("linux-x64", "linux-arm64");
+    }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
+    ["frozen-candidate coordinator stops forwarding the calibration bundle", packagedCoordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.calibration_bundle_artifact = "";
+    }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
+    ["frozen-candidate coordinator stops forwarding the producer run", packagedCoordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].with.calibration_bundle_run_id = "";
+    }, /packaged proof must forward the dispatched calibration bundle identity so the freeze lineage guard can run/u],
     ["package evaluation downloads calibration on the standard path", packagedProofFile, workflow => {
       draftStep(workflow.jobs.build, "Authenticate calibration bundle producer").if
         = "matrix.asset_target == 'linux-x64'";
