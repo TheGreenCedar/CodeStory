@@ -9,7 +9,7 @@ use super::analysis::{
 };
 use super::process::{
     busy_retry_marker_timeout, busy_retry_worker_timeout, measurement_worker_timeout,
-    query_parameters, require_worker_success,
+    query_parameters,
 };
 use super::{RunningWorker, ScenarioRunner, WorkerOutput, push_metric};
 use crate::qualification::request::REQUIRED_METRICS;
@@ -294,14 +294,6 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        let idle_worker = self.spawn_worker("query", query_parameters(1), None)?;
-        let idle_output = self.finish_worker(idle_worker, measurement_worker_timeout("query"))?;
-        require_worker_success(&idle_output, "true_idle_owner")?;
-        let idle_owner =
-            self.record_worker_snapshot("measurement_true_idle_owner", &idle_output)?;
-        if !snapshot_has_resident_generation(&idle_owner) {
-            bail!("embedding_qualification_true_idle_owner_not_resident");
-        }
         let measured = self.run_measure_worker(
             "measure_true_idle",
             "true_idle_exit",

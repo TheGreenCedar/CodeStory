@@ -1,6 +1,4 @@
-use super::super::{
-    CONTROL_TIMEOUT, ControlEvent, IDLE_EXIT_GRACE, POLL, QUEUE_SETUP_TIMEOUT, SNAPSHOT_TIMEOUT,
-};
+use super::super::{CONTROL_TIMEOUT, ControlEvent, POLL, QUEUE_SETUP_TIMEOUT, SNAPSHOT_TIMEOUT};
 use super::analysis::elapsed;
 use super::{
     EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, ProcessInvocation, RunningWorker, WorkerOutput,
@@ -16,6 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::time::Duration;
+
+pub(super) const MEASUREMENT_OWNER_ABSENCE_GRACE: Duration = Duration::from_secs(30);
 
 pub(super) fn existing_control_events(directory: &Path) -> Result<Vec<ControlEvent>> {
     published_control_events(&directory.join(format!("{}.events.jsonl", qualification_nonce()?)))
@@ -284,12 +284,17 @@ pub(super) fn stall_worker_timeout() -> Duration {
 pub(super) fn measurement_worker_timeout(operation: &str) -> Duration {
     let budgets = EmbeddingClientBudgets::current();
     if operation == "measure_true_idle" {
-        // The idle worker first proves the resident owner quiescent (bounded
-        // by the snapshot allowance), then waits out the server's own idle
-        // deadline plus the exit grace before the absence observation.
-        return Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
-            .saturating_add(IDLE_EXIT_GRACE)
-            .saturating_add(SNAPSHOT_TIMEOUT)
+        // The idle worker runs the product request that starts the measured
+        // idle epoch itself, then waits out the server's idle deadline plus
+        // the exit grace before the absence observation.
+        return budgets
+            .connect
+            .saturating_add(budgets.spawn)
+            .saturating_add(budgets.query_request)
+            .saturating_add(Duration::from_millis(
+                PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+            ))
+            .saturating_add(MEASUREMENT_OWNER_ABSENCE_GRACE)
             .saturating_add(SNAPSHOT_TIMEOUT)
             .saturating_add(CONTROL_TIMEOUT);
     }
