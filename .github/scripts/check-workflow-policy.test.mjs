@@ -1935,6 +1935,9 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     draftStep(packagedJob(workflow), "Capture reusable build cache contract");
 
   const mutations = [
+    ["packaged workflow injects an earlier Node preload", packagedFile, workflow => {
+      workflow.env.NODE_OPTIONS = "--require ./fake-hash.cjs";
+    }, /packaged-platform-proof\.yml must match the reviewed canonical workflow structure/u],
     ["release workflow policy loses its full history", releaseFile, workflow => {
       delete workflow.jobs["workflow-policy"].steps[0].with;
     }, /workflow-policy must check out full history for the reuse-binding contracts/u],
@@ -2051,6 +2054,20 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
         .replace("--identity qualification_driver=disabled", "--workload ignored");
     }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
+    ["pinned sccache identity capture moves away from installation", packagedFile, workflow => {
+      moveNamedStepAfter(
+        packagedJob(workflow),
+        "Capture pinned sccache identity",
+        "Configure bounded compiler cache",
+      );
+    }, /must capture the pinned sccache identity immediately after installation/u],
+    ["pinned sccache identity capture stops hashing the binary", packagedFile, workflow => {
+      const capture = draftStep(packagedJob(workflow), "Capture pinned sccache identity");
+      capture.run = capture.run.replace(
+        'createHash("sha256").update(readFileSync(process.argv[1])).digest("hex")',
+        '"unverified"',
+      );
+    }, /pinned sccache identity capture script exactly/u],
     ["source compiler cache waits for tests", sourceFile, workflow => {
       moveNamedStepAfter(
         sourceJob(workflow),
@@ -2173,10 +2190,149 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
         },
       });
     }, /frozen Linux fresh-target qualification must not restore compiler output/u],
-    ["Linux compiler cache exits with an active server", packagedFile, workflow => {
+    ["Linux compiler cache omits server shutdown", packagedFile, workflow => {
       const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
       build.run = build.run.replace("/sccache/sccache --stop-server", "true");
-    }, /step Build Linux x64 at the glibc 2\.31 baseline must run \/sccache\/sccache --stop-server/u],
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler cache makes statistics advisory", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace(
+        "/sccache/sccache --show-stats",
+        "/sccache/sccache --show-stats || true",
+      );
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler cache makes shutdown advisory", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace(
+        "/sccache/sccache --stop-server",
+        "/sccache/sccache --stop-server || true",
+      );
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler shutdown is parked in dead code", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = `if false; then\n${build.run}\nfi\n`;
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler shutdown hides behind an exact dead-code decoy", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace(
+        "/sccache/sccache --stop-server",
+        "/sccache/sccache --stop-server || true",
+      );
+      build.run += "\nif false; then\n  /sccache/sccache --stop-server\nfi\n";
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler shutdown escapes through a stripped quote-context comment", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace(
+        "    /sccache/sccache --show-stats",
+        "    # '; exit 0; : '\n    /sccache/sccache --show-stats",
+      );
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler shutdown is inverted", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = build.run.replace("docker run --rm", "! docker run --rm");
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler shutdown is bypassed by an early exit", packagedFile, workflow => {
+      const build = draftStep(packagedJob(workflow), "Build Linux x64 at the glibc 2.31 baseline");
+      build.run = `exit 0\n${build.run}`;
+    }, /Linux container build and compiler-server ownership script exactly/u],
+    ["Linux compiler build shell absorbs failure", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Build Linux x64 at the glibc 2.31 baseline",
+      ).shell = "bash {0} || true";
+    }, /Linux container must strictly report and stop its owned compiler server/u],
+    ["Linux compiler cache step becomes advisory", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Build Linux x64 at the glibc 2.31 baseline",
+      )["continue-on-error"] = true;
+    }, /Linux container must strictly report and stop its owned compiler server/u],
+    ["Linux compiler cache rebinds the pinned binary", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Build Linux x64 at the glibc 2.31 baseline",
+      ).env.SCCACHE_BINARY = "sccache";
+    }, /Linux container must strictly report and stop its owned compiler server/u],
+    ["host compiler finalizer is restored on Linux", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Finalize compiler objects").if =
+        "always() && ((matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') || (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success'))";
+    }, /host finalizer must strictly stop only the host package-build compiler server/u],
+    ["host package build becomes Linux-reachable", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Build codestory-cli").if = "always()";
+    }, /host finalizer must strictly stop only the host package-build compiler server/u],
+    ["clock stop prepends a fake compiler cache binary", packagedFile, workflow => {
+      const stop = draftStep(packagedJob(workflow), "Stop compilation clock");
+      stop.run += [
+        "",
+        'fake_dir="$RUNNER_TEMP/fake-sccache"',
+        'mkdir -p "$fake_dir"',
+        "printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$fake_dir/sccache\"",
+        'chmod +x "$fake_dir/sccache"',
+        'echo "$fake_dir" >> "$GITHUB_PATH"',
+      ].join("\n");
+    }, /compiler clock stop script exactly/u],
+    ["clock stop shell absorbs failure", packagedFile, workflow => {
+      draftStep(packagedJob(workflow), "Stop compilation clock").shell = "bash {0} || true";
+    }, /compiler clock stop must remain a strict telemetry-only boundary/u],
+    ["a prep step is inserted before compiler finalization", packagedFile, workflow => {
+      const steps = packagedJob(workflow).steps;
+      const finalizeIndex = steps.findIndex(step => step.name === "Finalize compiler objects");
+      steps.splice(finalizeIndex, 0, {
+        name: "Shadow compiler cache",
+        shell: "bash",
+        run: 'echo "$RUNNER_TEMP/fake-sccache" >> "$GITHUB_PATH"',
+      });
+    }, /compiler owner build, clock stop, and finalizer must remain adjacent/u],
+    ["host compiler statistics become advisory", packagedFile, workflow => {
+      const finalize = draftStep(packagedJob(workflow), "Finalize compiler objects");
+      finalize.run = finalize.run.replace(
+        '"$SCCACHE_BINARY" --show-stats',
+        '"$SCCACHE_BINARY" --show-stats || true',
+      );
+    }, /host compiler-server finalizer script exactly/u],
+    ["host compiler shutdown becomes advisory", packagedFile, workflow => {
+      const finalize = draftStep(packagedJob(workflow), "Finalize compiler objects");
+      finalize.run = finalize.run.replace(
+        '"$SCCACHE_BINARY" --stop-server',
+        '"$SCCACHE_BINARY" --stop-server || true',
+      );
+    }, /host compiler-server finalizer script exactly/u],
+    ["host compiler shutdown hides behind exact dead-code decoys", packagedFile, workflow => {
+      const finalize = draftStep(packagedJob(workflow), "Finalize compiler objects");
+      finalize.run = [
+        "sccache --show-stats || true",
+        "sccache --stop-server || true",
+        "if false; then",
+        "  sccache --show-stats",
+        "  sccache --stop-server",
+        "fi",
+      ].join("\n");
+    }, /host compiler-server finalizer script exactly/u],
+    ["host compiler finalizer shell absorbs failure", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Finalize compiler objects",
+      ).shell = "bash {0} || true";
+    }, /host finalizer must strictly stop only the host package-build compiler server/u],
+    ["host compiler finalizer step becomes advisory", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Finalize compiler objects",
+      )["continue-on-error"] = true;
+    }, /host finalizer must strictly stop only the host package-build compiler server/u],
+    ["host compiler finalizer rebinds the pinned binary", packagedFile, workflow => {
+      draftStep(
+        packagedJob(workflow),
+        "Finalize compiler objects",
+      ).env.SCCACHE_BINARY = "sccache";
+    }, /host finalizer must strictly stop only the host package-build compiler server/u],
+    ["host compiler finalizer resolves through PATH again", packagedFile, workflow => {
+      const finalize = draftStep(packagedJob(workflow), "Finalize compiler objects");
+      finalize.run = finalize.run.replace(
+        '"$SCCACHE_BINARY" --show-stats',
+        "sccache --show-stats",
+      );
+    }, /host compiler-server finalizer script exactly/u],
     ["package checkout accepts a fallback SHA", packagedFile, workflow => {
       draftStep(packagedJob(workflow), "Checkout").with.ref = "${{ inputs.ref || github.sha }}";
     }, /package jobs must checkout only the requested exact SHA/u],
