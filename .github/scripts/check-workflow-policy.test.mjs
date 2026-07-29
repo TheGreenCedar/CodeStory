@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -1920,6 +1921,109 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
   }
 });
 
+test("Windows package proof retains the readable native sccache executable", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-windows-sccache-"));
+  try {
+    const extensionlessPath = path.join(directory, "sccache");
+    const nativePath = `${extensionlessPath}.exe`;
+    const captureOutput = path.join(directory, "capture-output");
+    const nativeCalls = path.join(directory, "native-calls");
+    const decoyCalls = path.join(directory, "decoy-calls");
+    const decoyDirectory = path.join(directory, "decoy");
+    const decoyPath = path.join(decoyDirectory, "sccache");
+    mkdirSync(decoyDirectory);
+    writeFileSync(
+      nativePath,
+      "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SCCACHE_CALL_LOG\"\n",
+    );
+    chmodSync(nativePath, 0o755);
+    writeFileSync(
+      decoyPath,
+      "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DECOY_CALL_LOG\"\n",
+    );
+    chmodSync(decoyPath, 0o755);
+    writeFileSync(captureOutput, "");
+    writeFileSync(nativeCalls, "");
+    writeFileSync(decoyCalls, "");
+
+    const workflow = loadWorkflows().get("packaged-platform-proof.yml");
+    const captureRun = draftStep(
+      workflow.jobs.build,
+      "Capture pinned sccache identity",
+    ).run;
+    const captureResult = spawnSync(
+      "bash",
+      ["-c", `command() {
+  if [[ "$1" == "-v" && "$2" == "sccache" ]]; then
+    printf '%s\\n' "$SYNTHETIC_SCCACHE_COMMAND"
+  else
+    builtin command "$@"
+  fi
+}
+test() {
+  if [[ "$1" == "-x" && "$2" == "$SYNTHETIC_SCCACHE_COMMAND" ]]; then
+    return 0
+  fi
+  builtin test "$@"
+}
+${captureRun}`],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_OUTPUT: captureOutput,
+          RUNNER_OS: "Windows",
+          SYNTHETIC_SCCACHE_COMMAND: extensionlessPath,
+        },
+      },
+    );
+    assert.equal(
+      captureResult.status,
+      0,
+      `capture failed:\n${captureResult.stdout}\n${captureResult.stderr}`,
+    );
+    const captured = Object.fromEntries(
+      readFileSync(captureOutput, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)];
+        }),
+    );
+    assert.equal(captured.path, nativePath);
+    assert.equal(
+      captured.sha256,
+      createHash("sha256").update(readFileSync(nativePath)).digest("hex"),
+    );
+
+    const finalizerRun = draftStep(
+      workflow.jobs.build,
+      "Finalize compiler objects",
+    ).run;
+    const finalizerResult = spawnSync("bash", ["-c", finalizerRun], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DECOY_CALL_LOG: decoyCalls,
+        PATH: `${decoyDirectory}:${process.env.PATH}`,
+        SCCACHE_BINARY: captured.path,
+        SCCACHE_CALL_LOG: nativeCalls,
+        SCCACHE_SHA256: captured.sha256,
+      },
+    });
+    assert.equal(
+      finalizerResult.status,
+      0,
+      `finalizer failed:\n${finalizerResult.stdout}\n${finalizerResult.stderr}`,
+    );
+    assert.equal(readFileSync(nativeCalls, "utf8"), "--show-stats\n--stop-server\n");
+    assert.equal(readFileSync(decoyCalls, "utf8"), "");
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -2066,6 +2170,27 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
       capture.run = capture.run.replace(
         'createHash("sha256").update(readFileSync(process.argv[1])).digest("hex")',
         '"unverified"',
+      );
+    }, /pinned sccache identity capture script exactly/u],
+    ["Windows sccache identity strips the native extension", packagedFile, workflow => {
+      const capture = draftStep(packagedJob(workflow), "Capture pinned sccache identity");
+      capture.run = capture.run.replace(
+        'sccache_path="${sccache_path}.exe"',
+        'sccache_path="${sccache_path%.exe}"',
+      );
+    }, /pinned sccache identity capture script exactly/u],
+    ["sccache identity returns to PATH after native resolution", packagedFile, workflow => {
+      const capture = draftStep(packagedJob(workflow), "Capture pinned sccache identity");
+      capture.run = capture.run.replace(
+        'test -f "$sccache_path"',
+        'sccache_path="$(command -v sccache)"\ntest -f "$sccache_path"',
+      );
+    }, /pinned sccache identity capture script exactly/u],
+    ["sccache identity hashes one path and retains another", packagedFile, workflow => {
+      const capture = draftStep(packagedJob(workflow), "Capture pinned sccache identity");
+      capture.run = capture.run.replace(
+        'echo "path=$sccache_path"',
+        'echo "path=$(command -v sccache)"',
       );
     }, /pinned sccache identity capture script exactly/u],
     ["source compiler cache waits for tests", sourceFile, workflow => {
@@ -2253,7 +2378,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
         "Build Linux x64 at the glibc 2.31 baseline",
       ).env.SCCACHE_BINARY = "sccache";
     }, /Linux container must strictly report and stop its owned compiler server/u],
-    ["host compiler finalizer is restored on Linux", packagedFile, workflow => {
+    ["Linux gains a host compiler finalizer fallback", packagedFile, workflow => {
       draftStep(packagedJob(workflow), "Finalize compiler objects").if =
         "always() && ((matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') || (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success'))";
     }, /host finalizer must strictly stop only the host package-build compiler server/u],
