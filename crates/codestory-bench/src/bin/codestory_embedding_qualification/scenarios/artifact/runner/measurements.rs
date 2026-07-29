@@ -841,7 +841,7 @@ fn validate_constant_engine_evidence(
         || identity.load_error.is_some()
         || identity.policy != "accelerated"
         || identity.backend.eq_ignore_ascii_case("cpu")
-        || !identity.backend.eq_ignore_ascii_case(expected_backend)
+        || !constant_backend_matches_expected(&identity.backend, expected_backend)
         || identity.model_digest != expected_model_sha256
         || identity.materialized_model_sha256 != expected_model_sha256
         || !identity.embedded_model
@@ -850,6 +850,29 @@ fn validate_constant_engine_evidence(
         bail!("embedding_constant_calibration_engine_identity_invalid");
     }
     Ok(())
+}
+
+fn constant_backend_matches_expected(observed: &str, expected: &str) -> bool {
+    let Some(expected_family) = constant_backend_family(expected) else {
+        return false;
+    };
+    constant_backend_family(observed) == Some(expected_family)
+}
+
+fn constant_backend_family(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "metal" | "mtl" => Some("metal"),
+        "vulkan" => Some("vulkan"),
+        value
+            if value.strip_prefix("vulkan").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            Some("vulkan")
+        }
+        _ => None,
+    }
 }
 
 fn expected_materialization_reuse(run_index: u32) -> Result<bool> {
@@ -1088,11 +1111,42 @@ mod constant_calibration_tests {
     fn engine_precondition_binds_accelerated_backend_model_and_reuse_only() {
         let server = server_identity("server-a");
         let metal = engine_identity("server-a", "Metal", false);
-        validate_constant_engine_evidence(&metal, &server, "metal", &"a".repeat(64), false)
-            .expect("Metal identity");
-        let vulkan = engine_identity("server-a", "Vulkan", false);
-        validate_constant_engine_evidence(&vulkan, &server, "vulkan", &"a".repeat(64), false)
-            .expect("Vulkan identity");
+        for (observed, expected) in [
+            ("Metal", "metal"),
+            ("MTL", "metal"),
+            ("Vulkan", "vulkan"),
+            ("Vulkan0", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            validate_constant_engine_evidence(&identity, &server, expected, &"a".repeat(64), false)
+                .unwrap_or_else(|error| {
+                    panic!("{observed} must satisfy expected GPU family {expected}: {error}")
+                });
+        }
+        for (observed, expected) in [
+            ("CPU", "metal"),
+            ("cpu_explicit", "metal"),
+            ("", "metal"),
+            ("unknown", "metal"),
+            ("metal-cpu", "metal"),
+            ("mtl0", "metal"),
+            ("MTL", "vulkan"),
+            ("Vulkan", "metal"),
+            ("vulkan-cpu", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            assert!(
+                validate_constant_engine_evidence(
+                    &identity,
+                    &server,
+                    expected,
+                    &"a".repeat(64),
+                    false,
+                )
+                .is_err(),
+                "{observed} must not satisfy expected GPU family {expected}"
+            );
+        }
 
         let mut invalid = metal.clone();
         invalid.policy = "cpu_explicit".into();
