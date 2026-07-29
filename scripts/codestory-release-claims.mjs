@@ -78,6 +78,8 @@ const REQUIRED_FAILURE_CONTROLS = [
   "sidecar_runtime_mismatch",
   "stale_or_partial_publication",
 ];
+const BENCHMARK_LEAKAGE_COMMAND =
+  "node --test scripts/tests/lint-retrieval-generalization.test.mjs";
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -914,7 +916,13 @@ export function validateReleaseClaimGraph(graph) {
     if (!claims.has(control.claim)) fail(`failure control ${id} references unknown claim ${control.claim}`);
     if (control.control !== "negative_gate") fail(`failure control ${id} must be a negative_gate`);
     const command = nonEmptyText(control.command, `failure control ${id}.command`);
-    if (!command.startsWith("cargo test --locked ")) fail(`failure control ${id} must name a locked executable Cargo test`);
+    if (id === "benchmark_leakage") {
+      if (command !== BENCHMARK_LEAKAGE_COMMAND) {
+        fail(`failure control ${id} must be exactly ${BENCHMARK_LEAKAGE_COMMAND}`);
+      }
+    } else if (!command.startsWith("cargo test --locked ")) {
+      fail(`failure control ${id} must name a locked executable Cargo test`);
+    }
   }
 
   const closeout = object(graph.closeout, "release claim graph.closeout");

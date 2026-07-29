@@ -24,8 +24,8 @@ on:
       # This job runs the generalization gate, so it has to trigger on the code
       # that gate guards, on the corpus its bans are derived from, on the
       # non-Rust product surfaces it also scans, and on the lint itself.
-      # crates/codestory-runtime/tests/retrieval_generalization_guard.rs keeps
-      # this list covering every path the lint reports as guarded. The globs are
+      # scripts/tests/lint-retrieval-generalization.test.mjs keeps this list
+      # covering every path the lint reports as guarded. The globs are
       # whole trees on purpose: the lint reads every crate's `src`, all three
       # eval corpora, and every file under `scripts/`, `.github/`,
       # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
@@ -40,6 +40,7 @@ on:
       - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/rust-ci.yml
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/lib/retrieval-generalization-lint.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
@@ -68,8 +69,8 @@ on:
       # This job runs the generalization gate, so it has to trigger on the code
       # that gate guards, on the corpus its bans are derived from, on the
       # non-Rust product surfaces it also scans, and on the lint itself.
-      # crates/codestory-runtime/tests/retrieval_generalization_guard.rs keeps
-      # this list covering every path the lint reports as guarded. The globs are
+      # scripts/tests/lint-retrieval-generalization.test.mjs keeps this list
+      # covering every path the lint reports as guarded. The globs are
       # whole trees on purpose: the lint reads every crate's `src`, all three
       # eval corpora, and every file under `scripts/`, `.github/`,
       # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
@@ -84,6 +85,7 @@ on:
       - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/rust-ci.yml
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/lib/retrieval-generalization-lint.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
@@ -115,7 +117,7 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
-      - name: Generalization lint self-subject contracts
+      - name: Generalization lint hostile matrix
         run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
 
       - name: Release evidence gate contracts
@@ -146,9 +148,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Generalization lint regression contracts
-        run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
 
       - name: Runtime retrieval and packet contract tests
         run: |

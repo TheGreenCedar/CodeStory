@@ -1144,6 +1144,101 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
   }
 });
 
+test("source proof keeps retrieval generalization parallel on the resolved head", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const sourceFile = "source-proof.yml";
+  const job = workflow => workflow.jobs["retrieval-generalization"];
+
+  const mutations = [
+    ["job removed", workflow => {
+      delete workflow.jobs["retrieval-generalization"];
+    }, /retrieval-generalization/u],
+    ["job serialized after Rust", workflow => {
+      job(workflow).needs = ["resolve", "full-source-gate"];
+    }, /must run in parallel on the resolved exact head/u],
+    ["reuse guard widened", workflow => {
+      job(workflow).if = "always()";
+    }, /must run in parallel on the resolved exact head/u],
+    ["job made optional", workflow => {
+      job(workflow)["continue-on-error"] = true;
+    }, /must run in parallel on the resolved exact head/u],
+    ["runner changed", workflow => {
+      job(workflow)["runs-on"] = "windows-latest";
+    }, /must run in parallel on the resolved exact head/u],
+    ["timeout widened", workflow => {
+      job(workflow)["timeout-minutes"] = 60;
+    }, /must run in parallel on the resolved exact head/u],
+    ["checkout ref widened", workflow => {
+      job(workflow).steps[0].with.ref = "${{ github.sha }}";
+    }, /must check out the resolved exact ref/u],
+    ["Node version changed", workflow => {
+      job(workflow).steps[1].with["node-version"] = "22";
+    }, /must use blocking Node 24/u],
+    ["hostile matrix changed", workflow => {
+      draftStep(job(workflow), "Generalization lint hostile matrix").run
+        = "node --test scripts/tests/something-else.test.mjs";
+    }, /hostile matrix must run its exact blocking Node command/u],
+    ["hostile matrix made optional", workflow => {
+      draftStep(job(workflow), "Generalization lint hostile matrix")["continue-on-error"] = true;
+    }, /hostile matrix must run its exact blocking Node command/u],
+    ["full source reuse guard widened", workflow => {
+      workflow.jobs["full-source-gate"].if = "always()";
+    }, /full source gate may skip only a completed exact-head proof/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(sourceFile));
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
+test("source proof reuse accepts only whole successful workflow runs", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const mutations = [
+    ["source self-reuse", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Reuse a completed gate for this exact head",
+      );
+      step.run = step.run.replace(
+        '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
+        '(.event == "pull_request" or .event == "workflow_dispatch")',
+      );
+    }, /source-proof\.yml step Reuse a completed gate.*workflow_dispatch.*conclusion/u],
+    ["release preflight reuse", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        ".head_repository.full_name == $repo and .conclusion == \"success\"",
+        ".head_repository.full_name == $repo",
+      );
+    }, /release\.yml step Resolve reusable prior evidence.*conclusion/u],
+    ["packaged prior proof lookup", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require successful exact-head source proof",
+      );
+      step.run = step.run.replace(
+        '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
+        '(.event == "pull_request" or .event == "workflow_dispatch")',
+      );
+    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
 test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -1665,6 +1760,9 @@ test("retrieval cache producer triggers cover every draft manifest consumer", as
     "crates/**/Cargo.toml",
     "vendor/**/Cargo.toml",
     ".github/workflows/rust-ci.yml",
+    "scripts/lint-retrieval-generalization.mjs",
+    "scripts/lib/retrieval-generalization-lint.mjs",
+    "scripts/tests/lint-retrieval-generalization.test.mjs",
   ];
   for (const event of ["pull_request", "push"]) {
     for (const requiredPath of requiredPaths) {
@@ -1695,6 +1793,52 @@ test("retrieval cache producer triggers cover every draft manifest consumer", as
       /retrieval cache producer must run on dev\/codestory-next pushes/u,
     );
   });
+});
+
+test("retrieval smoke keeps the one-process generalization lane blocking", async (t) => {
+  assert.deepEqual(windowsManifestProofPolicyViolations(retrievalSourceWorkflow()), []);
+
+  const mutations = [
+    ["wrong Node version", workflow => {
+      workflow.jobs["linux-contracts"].steps
+        .find(({ uses }) => uses === "actions/setup-node@v5")
+        .with["node-version"] = "22";
+    }, /must use blocking Node 24/u],
+    ["production smoke removed", workflow => {
+      workflow.jobs["linux-contracts"].steps = workflow.jobs["linux-contracts"].steps
+        .filter(({ name }) => name !== "Generalization lint (production paths)");
+    }, /production paths.*exact blocking Node command/u],
+    ["hostile matrix replaced", workflow => {
+      draftStep(
+        workflow.jobs["linux-contracts"],
+        "Generalization lint hostile matrix",
+      ).run = "node --test scripts/tests/something-else.test.mjs";
+    }, /hostile matrix.*exact blocking Node command/u],
+    ["hostile matrix made optional", workflow => {
+      draftStep(
+        workflow.jobs["linux-contracts"],
+        "Generalization lint hostile matrix",
+      )["continue-on-error"] = true;
+    }, /hostile matrix.*exact blocking Node command/u],
+    ["serialized Rust wrapper restored", workflow => {
+      workflow.jobs["linux-contracts"].steps.push({
+        name: "Legacy generalization wrapper",
+        run: "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard",
+      });
+    }, /must not restore the serialized Rust subprocess wrapper/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const candidate = retrievalSourceWorkflow();
+      mutate(candidate);
+      const violations = windowsManifestProofPolicyViolations(candidate);
+      assert.match(violations.join("\n"), expectedReason);
+      const workflows = loadWorkflows();
+      workflows.set(retrievalFile, candidate);
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
 });
 
 test("Windows manifest-missing proof freezes routing, native topology, and exact cache identity", async (t) => {
