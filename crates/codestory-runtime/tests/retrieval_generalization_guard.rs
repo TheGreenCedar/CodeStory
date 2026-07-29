@@ -1,5 +1,6 @@
 //! Ensures the retrieval generalization lint script stays runnable from the workspace root.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -105,7 +106,10 @@ fn run_lint_with_named_fixtures(fixtures: &[(&str, &str)]) -> Output {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
     for (name, contents) in fixtures {
-        std::fs::write(fixture_root.path().join(name), contents).expect("write fixture");
+        let file_path = fixture_root.path().join(name);
+        std::fs::create_dir_all(file_path.parent().expect("fixture parent"))
+            .expect("create fixture parent");
+        std::fs::write(file_path, contents).expect("write fixture");
     }
     run_lint_with_scan_root(&repo_root, &script, fixture_root.path())
 }
@@ -176,16 +180,23 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
 
-    let _guard = lint_script_lock();
-    let output = Command::new("node")
-        .arg(&script)
-        .current_dir(&repo_root)
-        .env(
-            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
-            fixture_root.path(),
-        )
-        .output()
-        .expect("run lint-retrieval-generalization.mjs");
+    // The lock is released before the assertions: a failing assertion must
+    // report itself, not poison the mutex and turn every later guard test into
+    // a lock error that hides its own result. `lint_script_lock` recovers from a
+    // poison the same way, for the panics no scope can move out from under the
+    // guard -- the two together are what keeps one real failure reported once.
+    let output = {
+        let _guard = lint_script_lock();
+        Command::new("node")
+            .arg(&script)
+            .current_dir(&repo_root)
+            .env(
+                "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
+                fixture_root.path(),
+            )
+            .output()
+            .expect("run lint-retrieval-generalization.mjs")
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1537,6 +1548,29 @@ fn shape_fixture_source(index: usize, text: &str) -> String {
 }
 
 #[test]
+fn a_corpus_path_ban_holds_with_either_separator() {
+    // The ban that deriving the corpus replaced wrote the alternation out by
+    // hand (`data[/\\]indexer`): a Windows path literal is how the same steering
+    // site is spelled on the other platform. Derivation reads the manifest, and
+    // manifests spell paths with `/`, so the line pattern now covers one half
+    // and the compact pass -- which strips punctuation before matching -- covers
+    // the other. That is a coverage argument spread across two passes, which is
+    // exactly the kind that stops being true without anyone noticing: raise the
+    // compact length floor and the backslash half is gone, on a machine that
+    // never writes one.
+    for probe in ["data/indexer", r"data\indexer"] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_corpus_path() -> &'static str {{ {probe:?} }}\n"
+        ));
+        assert!(
+            !output.status.success(),
+            "corpus path `{probe}` must be banned with either separator, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn linter_bans_holdout_repository_names_on_identifier_boundaries() {
     let ruled_out: std::collections::BTreeMap<&str, &str> =
         CORPUS_NAMES_RULED_OUT_OF_THE_BAN.iter().copied().collect();
@@ -1747,6 +1781,138 @@ pub const REASON: &str = "natural_language_filler";
         stopwords.status.success(),
         "the language-level stopword list is not a repository's vocabulary, stderr={}",
         String::from_utf8_lossy(&stopwords.stderr)
+    );
+}
+
+#[test]
+fn a_qualified_holdout_member_is_banned_in_its_own_case_and_not_in_ours() {
+    // `Route.Path` is an exported Go method of a holdout. Folding its case bans
+    // `route.route.path` -- ordinary Rust field access this product writes about
+    // its own routes, which steers nothing and cannot be spelled around. The
+    // member itself must still fail in the case the corpus wrote.
+    let ours = run_lint_with_fixture(
+        "pub fn workflow_route_path(route: &crate::Route) -> String {\n    \
+         route.route.path.clone()\n}\n",
+    );
+    assert!(
+        ours.status.success(),
+        "a lowercase field access is not a holdout member, stderr={}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+
+    let theirs =
+        run_lint_with_fixture("pub fn leaked_member() -> &'static str { \"Route.Path\" }\n");
+    let stderr = String::from_utf8_lossy(&theirs.stderr);
+    assert!(
+        !theirs.status.success(),
+        "the holdout member in its own case must stay banned, stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_holdout_file_name_stays_case_folded() {
+    // The other half of the same rule, and the reason it reads provenance
+    // instead of shape. `Logger.php` and `Route.Path` are the same shape to a
+    // regex, but a file name is compared in whatever case the product folds a
+    // path to -- `path.ends_with("logger.php")` is exactly the corpus
+    // dependency the audit found. Case-folding must survive for these.
+    // Asserting only "the lint failed" would not discriminate: the bounded
+    // identity ban carries its own case folding and would report the line even
+    // if the file-name ban had gone case-sensitive. The file-name pattern has to
+    // be the one that names it.
+    for probe in ["logger.php", "Logger.php", "LOGGER.PHP"] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_corpus_file(path: &str) -> bool {{ path.ends_with({probe:?}) }}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "corpus file name `{probe}` must stay banned in every case, stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(r"Banned pattern /Logger\.php/"),
+            "the file-name ban itself must fire on `{probe}`, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_comment_that_quotes_the_words_a_table_holds_is_not_itself_a_table() {
+    // The shape that broke when the whole runtime crate came under this scan:
+    // the comment above `SEARCH_PLAN_STOPWORDS` quotes the six words the list
+    // deliberately keeps, and the rule counted the quotes as the table. A file
+    // must not be punished for explaining which words it holds and why.
+    let documented = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"// "anchor", "answer", "around", "cite", "cited", and "cites" are this
+// product's own prompt vocabulary, not benchmark phrasing, so they stay.
+pub fn documented_choice() -> usize {
+    7
+}
+"#,
+    )]);
+    assert!(
+        documented.status.success(),
+        "prose that quotes words is not a vocabulary table, stderr={}",
+        String::from_utf8_lossy(&documented.stderr)
+    );
+}
+
+#[test]
+fn a_word_table_cannot_hide_behind_a_trailing_comment() {
+    // The evasion the comment-stripping opens if it is done by line rather than
+    // by position: append `//` to every entry and the table disappears. Only the
+    // text after the comment marker may be dropped, so the same table with a
+    // note on each line has to fail exactly as it does without one.
+    let commented = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const PLANTED_SYMBOL_TERMS: &[&str] = &[
+    "indexer", // pending
+    "service", // pending
+    "storage", // pending
+    "store", // pending
+    "posts", // pending
+    "feed", // pending
+    "auth", // pending
+    "trail", // pending
+];
+"#,
+    )]);
+    let stderr = String::from_utf8_lossy(&commented.stderr);
+    assert!(
+        !commented.status.success(),
+        "a table whose lines carry trailing comments is still a table, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Term vocabulary table"),
+        "lint should name the vocabulary table it found, stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_url_literal_is_not_read_as_a_comment_marker() {
+    // `//` inside a string literal must not truncate the line: doing so would
+    // drop every literal after a URL and open a hole in the same scan.
+    let planted = run_lint_with_named_fixtures(&[(
+        "search_terms.rs",
+        r#"pub const PLANTED_TERMS: &[(&str, &str)] = &[
+    ("https://example.test/a", "indexer"),
+    ("https://example.test/b", "service"),
+    ("https://example.test/c", "storage"),
+    ("https://example.test/d", "store"),
+    ("https://example.test/e", "posts"),
+    ("https://example.test/f", "feed"),
+];
+"#,
+    )]);
+    let stderr = String::from_utf8_lossy(&planted.stderr);
+    assert!(
+        !planted.status.success(),
+        "literals after a URL must still be read, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Term vocabulary table"),
+        "lint should name the vocabulary table it found, stderr={stderr}"
     );
 }
 
@@ -2052,4 +2218,216 @@ fn linter_does_not_ban_a_corpus_name_that_is_only_a_substring_of_one_word() {
         "a corpus name buried inside one unbroken word must not be banned; the boundaries exist \
          so that ordinary product vocabulary keeps compiling, stderr={stderr}"
     );
+}
+
+#[test]
+fn linter_catches_framework_filename_shapes_the_ranking_rebuild_deleted() {
+    for probe in [
+        "payload.config.ts",
+        "payload-types.ts",
+        "next.config.ts",
+        "app.svelte",
+        "/src/collections/posts",
+        "/exec/src/cli.rs",
+    ] {
+        let output = run_lint_with_fixture(&format!(
+            "pub fn leaked_framework_shape() -> &'static str {{ {probe:?} }}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "framework filename shape `{probe}` must not be reintroducible, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_scans_every_runtime_source_file_for_holdout_names() {
+    // The scope hole this lane closed: the ranking files decide root order but
+    // were outside the banned-name scan, so an entry-point name catalog shipped
+    // with this lint green. A file count cannot hold the scope -- any set of
+    // files satisfies a count -- so assert that a file the lint has never been
+    // told about is scanned the moment it exists. Only a file inside the real
+    // default scan roots can prove that; a temp fixture root proves the rule,
+    // not the scope, because it replaces those roots outright.
+    let repo_root = workspace_root();
+    let (baseline, planted_output) = run_default_lint_with_planted_source(
+        &repo_root,
+        Path::new("crates/codestory-runtime/src/ranking_scope_probe_generated.rs"),
+        "pub fn unlisted_ranking_module() -> &'static str { \"createApplication\" }\n",
+    );
+
+    assert!(
+        baseline.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&planted_output.stderr);
+    assert!(
+        !planted_output.status.success(),
+        "a runtime source file nobody listed must still be scanned, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ranking_scope_probe_generated.rs"),
+        "the lint should name the unlisted file it rejected, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_scans_a_tests_dot_rs_that_no_parent_declares_cfg_test() {
+    // The hole a `baseName == "tests.rs"` exclusion would open: any shipped
+    // module named `tests.rs` would leave the lint entirely, with nothing in
+    // the file itself marking it test-only. This probe is a plain module body
+    // that nothing declares under `#[cfg(test)]`, carrying both a holdout name
+    // and an eval-corpus path, so both passes have to reject it.
+    let repo_root = workspace_root();
+    let (baseline, planted_output) = run_default_lint_with_planted_source(
+        &repo_root,
+        Path::new("crates/codestory-runtime/src/ranking_probe/tests.rs"),
+        concat!(
+            "pub fn ranking_probe_entry_points() -> [&'static str; 2] {\n",
+            "    [\"createApplication\", \"benchmarks/tasks\"]\n",
+            "}\n"
+        ),
+    );
+
+    assert!(
+        baseline.status.success(),
+        "default lint run should pass, stderr={}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&planted_output.stderr);
+    assert!(
+        !planted_output.status.success(),
+        "a `tests.rs` no parent marks `#[cfg(test)]` must stay linted, stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("Banned pattern") && line.contains("ranking_probe/tests.rs")
+        }),
+        "the holdout-name pass must report the planted module, stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("Production dependency on eval/query corpus")
+                && line.contains("ranking_probe/tests.rs")
+        }),
+        "the corpus pass must report the planted module, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_excludes_only_module_bodies_their_parent_declares_cfg_test() {
+    // The exclusion has to read the declaration, not the file name. Same file
+    // name, same banned contents, opposite verdicts - the only difference is
+    // whether the parent's `mod` item carries `#[cfg(test)]`.
+    let excluded = run_lint_with_named_fixtures(&[
+        (
+            "app.rs",
+            "pub fn shipped_entry() {}\n#[cfg(test)]\nmod tests;\n",
+        ),
+        (
+            "app/tests.rs",
+            "const HOLDOUT: &str = \"createApplication\";\n",
+        ),
+    ]);
+    assert!(
+        excluded.status.success(),
+        "a module body declared `#[cfg(test)] mod tests;` is compiled out of the product, stderr={}",
+        String::from_utf8_lossy(&excluded.stderr)
+    );
+
+    let shipped = run_lint_with_named_fixtures(&[
+        ("app.rs", "pub fn shipped_entry() {}\nmod tests;\n"),
+        (
+            "app/tests.rs",
+            "const HOLDOUT: &str = \"createApplication\";\n",
+        ),
+    ]);
+    let stderr = String::from_utf8_lossy(&shipped.stderr);
+    assert!(
+        !shipped.status.success(),
+        "a module body declared with a plain `mod tests;` ships, so it stays linted, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("app/tests.rs"),
+        "the lint should name the shipped module body, stderr={stderr}"
+    );
+
+    let orphan = run_lint_with_named_fixtures(&[(
+        "app/tests.rs",
+        "const HOLDOUT: &str = \"createApplication\";\n",
+    )]);
+    let stderr = String::from_utf8_lossy(&orphan.stderr);
+    assert!(
+        !orphan.status.success(),
+        "a `tests.rs` with no declaring parent at all must stay linted, stderr={stderr}"
+    );
+}
+
+/// Writes `contents` at `relative_path` inside the repository, runs the lint
+/// with its real default scan roots before and after, and removes the planted
+/// file (and any directory created for it) again, including on panic.
+fn run_default_lint_with_planted_source(
+    repo_root: &Path,
+    relative_path: &Path,
+    contents: &str,
+) -> (Output, Output) {
+    // `PlantedSource::write` asserts while this guard is held, so the lock has
+    // to be taken through the poison-recovering helper: otherwise one planted
+    // probe colliding with a real file would turn every later guard test into a
+    // `PoisonError` panic that says nothing about what actually broke.
+    let _guard = lint_script_lock();
+    let baseline = run_default_lint(repo_root);
+    let planted = PlantedSource::write(repo_root.join(relative_path), contents);
+    let planted_output = run_default_lint(repo_root);
+    drop(planted);
+    (baseline, planted_output)
+}
+
+/// A source file planted in the real tree for the duration of one assertion.
+/// `Drop` runs while a failing assertion unwinds, so a red test cannot leave a
+/// stray module behind for the next `cargo build` to trip over.
+struct PlantedSource {
+    path: PathBuf,
+    created_directory: Option<PathBuf>,
+}
+
+impl PlantedSource {
+    fn write(path: PathBuf, contents: &str) -> Self {
+        assert!(
+            !path.exists(),
+            "planted probe would overwrite an existing file: {}",
+            path.display()
+        );
+        let parent = path.parent().expect("planted probe parent").to_path_buf();
+        let created_directory = if parent.exists() {
+            None
+        } else {
+            fs::create_dir_all(&parent).expect("create planted probe directory");
+            Some(parent)
+        };
+        fs::write(&path, contents).expect("plant probe source file");
+        Self {
+            path,
+            created_directory,
+        }
+    }
+}
+
+impl Drop for PlantedSource {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(directory) = &self.created_directory {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
+fn run_default_lint(repo_root: &Path) -> Output {
+    Command::new("node")
+        .arg(lint_script(repo_root))
+        .current_dir(repo_root)
+        .output()
+        .expect("run generalization lint")
 }

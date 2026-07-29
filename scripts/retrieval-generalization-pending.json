@@ -1,6 +1,6 @@
 {
   "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion, and total_markers must equal the number of markers listed below, so this file cannot grow without a reviewable diff that raises a stated number.",
-  "total_markers": 204,
+  "total_markers": 191,
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
@@ -267,27 +267,14 @@
         "typemap": 1
       }
     },
-    "crates/codestory-runtime/src/search_scoring.rs": {
+    "crates/codestory-runtime/src/route_coverage.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-      "reason": "Architecture coverage scoring keeps holdout file names to decide a result set covers an architecture question. This branch brings the file under the corpus scan; rewriting the scorer on indexed structure is the follow-up.",
+      "reason": "The published catalog of web frameworks whose route syntax the indexer extracts. `gin` and `flask` are framework names the indexer independently recognises, not steering toward a holdout, but two of the corpus repositories are named after the frameworks they implement, so the derived identity bans cannot tell the two apart from this file alone. Recorded rather than excused: the catalog has to be derived from the indexer's own declared extractors, and then no framework name is written in the runtime crate at all.",
       "markers": {
-        "Project\\.cpp": 1,
-        "SourceGroup": 1,
-        "buildindex": 1,
-        "content-data": 3,
-        "contentdata": 3,
-        "event_processor": 2,
-        "eventprocessor": 2,
-        "indexercommandcxx": 1,
-        "indexerjava": 1,
-        "persistentstorage": 1,
-        "projectbuildindex": 1,
-        "projectcpp": 1,
-        "social_entries": 1,
-        "socialentries": 1,
-        "source_group": 2,
-        "storageaccess": 2,
-        "storageaccessproxy": 1
+        "(?:^|[^A-Za-z0-9])flask(?![A-Za-z0-9])": 1,
+        "(?:^|[^A-Za-z0-9])gin(?![A-Za-z0-9])": 1,
+        "flask": 1,
+        "gin": 1
       }
     }
   }

@@ -1,5 +1,6 @@
 mod test_support;
 
+use codestory_contracts::api::GroundingOrientationUncertaintyDto;
 use fs4::fs_std::FileExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,41 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+
+/// Every wire value `GroundingOrientationUncertaintyDto` can serialize to.
+///
+/// The match is exhaustive on purpose: the declared MCP output schema is
+/// hand-maintained in `stdio_catalog.rs`, so a variant added to the DTO without
+/// a matching schema entry would otherwise ship as an undeclared enum value and
+/// the generated catalog would agree with the stale schema rather than the DTO.
+/// Adding a variant breaks this build until both are updated.
+const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
+    use GroundingOrientationUncertaintyDto as Variant;
+    let all = [
+        Variant::BoundedCandidateWindow,
+        Variant::NoEntrypointEvidence,
+        Variant::EntrypointEvidenceOmitted,
+        Variant::LimitedSubsystemBreadth,
+        Variant::CompressedPresentation,
+        Variant::GraphSignalThin,
+        Variant::LexicalFallback,
+    ];
+    let mut values = [""; 7];
+    let mut index = 0;
+    while index < all.len() {
+        values[index] = match all[index] {
+            Variant::BoundedCandidateWindow => "bounded_candidate_window",
+            Variant::NoEntrypointEvidence => "no_entrypoint_evidence",
+            Variant::EntrypointEvidenceOmitted => "entrypoint_evidence_omitted",
+            Variant::LimitedSubsystemBreadth => "limited_subsystem_breadth",
+            Variant::CompressedPresentation => "compressed_presentation",
+            Variant::GraphSignalThin => "graph_signal_thin",
+            Variant::LexicalFallback => "lexical_fallback",
+        };
+        index += 1;
+    }
+    values
+};
 
 struct StdioFixture {
     workspace: TempDir,
@@ -2074,13 +2110,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             assert_schema_enum_values(
                 orientation,
                 "/properties/uncertainty/items/enum",
-                &[
-                    "bounded_candidate_window",
-                    "no_entrypoint_evidence",
-                    "entrypoint_evidence_omitted",
-                    "limited_subsystem_breadth",
-                    "compressed_presentation",
-                ],
+                &GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES,
             );
         }
         if name == "files" {

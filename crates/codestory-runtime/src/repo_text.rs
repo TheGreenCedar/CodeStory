@@ -143,7 +143,7 @@ impl AppController {
         }
 
         hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root, query, left, right)
+            compare_search_hits_with_project_root(project_root, query, left, right, None)
         });
         hits.truncate(limit);
         stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());

@@ -39,6 +39,8 @@ on:
       - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/rust-ci.yml
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -81,6 +83,8 @@ on:
       - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/rust-ci.yml
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -111,7 +115,7 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
-      - name: Generalization lint self-repository contracts
+      - name: Generalization lint self-subject contracts
         run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
 
       - name: Release evidence gate contracts

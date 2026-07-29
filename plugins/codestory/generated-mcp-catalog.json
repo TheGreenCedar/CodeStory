@@ -1084,7 +1084,9 @@
                     "no_entrypoint_evidence",
                     "entrypoint_evidence_omitted",
                     "limited_subsystem_breadth",
-                    "compressed_presentation"
+                    "compressed_presentation",
+                    "graph_signal_thin",
+                    "lexical_fallback"
                   ],
                   "type": "string"
                 },

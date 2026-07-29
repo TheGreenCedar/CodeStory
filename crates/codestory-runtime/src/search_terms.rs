@@ -6,6 +6,11 @@ use super::{HashSet, SearchPlanDroppedTermDto, SearchPlanTermsDto};
 // can only encode the corpora it was written against.
 // Stopwords stay language-level: instruction and filler words that carry no
 // repository meaning in any repository.
+//
+// "anchor", "answer", "around", "cite", "cited", and "cites" are
+// CodeStory's own prompt and skill vocabulary -- they appear throughout the
+// shipped grounding skill and back SEARCH_PLAN_EXPLICIT_ANCHOR_MARKER -- not
+// benchmark phrasing, so they stay.
 pub(super) const SEARCH_PLAN_STOPWORDS: &[&str] = &[
     "a",
     "an",
@@ -121,8 +126,44 @@ pub(super) fn search_plan_terms(query: &str) -> SearchPlanTermsDto {
             }
         }
     }
-
     SearchPlanTermsDto { extracted, dropped }
+}
+
+/// True when a term looks like an identifier a repository would actually
+/// declare.
+///
+/// This replaces the fixed noun list that decided which extracted terms were
+/// worth a typed-symbol subquery. Shape, not vocabulary: a term qualifies by
+/// carrying a separator, an interior capital, or enough alphabetic length to be
+/// a name rather than filler.
+pub(super) fn search_plan_identifier_shaped_term(term: &str) -> bool {
+    if term.contains('_') || term.contains("::") {
+        return true;
+    }
+    let has_interior_uppercase = term
+        .chars()
+        .skip(1)
+        .any(|character| character.is_ascii_uppercase());
+    if has_interior_uppercase {
+        return true;
+    }
+    term.len() >= 5
+        && term
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && !SEARCH_PLAN_STOPWORDS.contains(&term.to_ascii_lowercase().as_str())
+}
+
+/// Every token the query itself supplies, including camel and snake splits.
+///
+/// Anything a generated subquery contains must be a member of this set, so the
+/// plan can never inject vocabulary the caller did not write.
+pub(super) fn search_plan_query_token_closure(query: &str) -> HashSet<String> {
+    search_plan_terms(query)
+        .extracted
+        .into_iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect()
 }
 
 pub(super) fn add_search_plan_term(
