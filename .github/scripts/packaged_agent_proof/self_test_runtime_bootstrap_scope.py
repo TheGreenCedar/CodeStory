@@ -16,6 +16,9 @@ _PROJECT_B = Path("/self-test/small-project")
 _QUESTION_A = "How does the large project activate?"
 _QUERY_A = "large_project_probe"
 _QUERY_B = "small_project_probe"
+_CALIBRATION_LIVE_QUERY = (
+    "small_project_probe calibration live encode verification"
+)
 _MANIFEST = {"asset_target": "linux-x64"}
 
 
@@ -56,39 +59,64 @@ def _run_live_retrieval_case(
     proof_tier: str,
     *,
     trap_project_a: bool = False,
-) -> Mock:
+) -> tuple[Mock, dict]:
     setup = _setup()
     cold = _cold()
     args = _args(proof_tier)
     host_a = Mock()
     host_b = Mock()
+    cache_state = {
+        "successful_encode_count": cold.snapshot_a["engine"][
+            "successful_encode_count"
+        ],
+        "seen_queries": {_QUERY_B},
+    }
+
+    def advance_for_packet(*_arguments: object) -> tuple[dict, int]:
+        cache_state["successful_encode_count"] += 1
+        return {"self_test": "packet"}, 1
+
     if trap_project_a:
         host_a.tool_until_ready.side_effect = ProofFailure(
             "calibration scheduled a second broad project-A request"
         )
     else:
-        host_a.tool_until_ready.return_value = ({"self_test": "packet"}, 1)
+        host_a.tool_until_ready.side_effect = advance_for_packet
     host_a.search_until_ready.side_effect = ProofFailure(
         f"{proof_tier} moved its broad project-A request from packet to search"
     )
-    host_b.search_until_ready.return_value = ({"self_test": "search"}, 1)
-    host_b.engine_diagnostics.return_value = {"self_test": "diagnostics"}
+
+    def search_project_b(arguments: dict, _label: str) -> tuple[dict, int]:
+        query = arguments["query"]
+        if query not in cache_state["seen_queries"]:
+            cache_state["seen_queries"].add(query)
+            cache_state["successful_encode_count"] += 1
+        return {"self_test": "search"}, 1
+
+    def engine_diagnostics(*_arguments: object) -> dict:
+        return {
+            "engine": {
+                "successful_encode_count": cache_state[
+                    "successful_encode_count"
+                ]
+            },
+            "process": {"server_instance_id": "server-self-test"},
+        }
+
+    host_b.search_until_ready.side_effect = search_project_b
+    host_b.engine_diagnostics.side_effect = engine_diagnostics
     hosts = SimpleNamespace(
         host_a=host_a,
         host_b=host_b,
         start_a="host-a-start",
         start_b="host-b-start",
     )
-    after = {
-        "engine": {"successful_encode_count": 8},
-        "process": {"server_instance_id": "server-self-test"},
-    }
     memory = {"self_test": "five-process-memory"}
     with (
         patch.object(
             runtime_bootstrap_continuity,
             "server_snapshot",
-            return_value=after,
+            side_effect=lambda diagnostics, _manifest, *, require_resident: diagnostics,
         ) as snapshot_check,
         patch.object(
             runtime_bootstrap_continuity,
@@ -107,13 +135,23 @@ def _run_live_retrieval_case(
         observed == memory,
         f"{proof_tier} live retrieval omitted five-process memory evidence",
     )
+    expected_query = (
+        _CALIBRATION_LIVE_QUERY
+        if proof_tier == "calibration"
+        else _QUERY_B
+    )
+    if proof_tier == "calibration":
+        require(
+            expected_query.strip().lower() != _QUERY_B.strip().lower(),
+            "calibration live query reused the cold-phase embedding cache key",
+        )
     require(
         host_b.method_calls
         == [
             call.search_until_ready(
                 {
                     "project": str(_PROJECT_B),
-                    "query": _QUERY_B,
+                    "query": expected_query,
                     "why": True,
                 },
                 "search-b-live",
@@ -122,8 +160,13 @@ def _run_live_retrieval_case(
         ],
         f"{proof_tier} live retrieval changed the bounded project-B path",
     )
+    after = memory_check.call_args.kwargs["snapshot"]
+    require(
+        after["engine"]["successful_encode_count"] == 8,
+        f"{proof_tier} live retrieval did not model one fresh native encode",
+    )
     snapshot_check.assert_called_once_with(
-        host_b.engine_diagnostics.return_value,
+        after,
         _MANIFEST,
         require_resident=True,
     )
@@ -140,17 +183,24 @@ def _run_live_retrieval_case(
         manifest=_MANIFEST,
         expected_backend="CPU",
     )
-    return host_a
+    return host_a, cache_state
 
 
 def _live_retrieval_scope_tests() -> None:
-    host_a = _run_live_retrieval_case("calibration", trap_project_a=True)
+    host_a, cache_state = _run_live_retrieval_case(
+        "calibration",
+        trap_project_a=True,
+    )
     require(
         host_a.method_calls == [],
         "calibration scheduled a second broad operation on project A",
     )
+    require(
+        cache_state["seen_queries"] == {_QUERY_B, _CALIBRATION_LIVE_QUERY},
+        "calibration did not prove a cache-distinct project-B query",
+    )
     for proof_tier in ("hosted_package", "protected_hardware", "installed_runtime"):
-        host_a = _run_live_retrieval_case(proof_tier)
+        host_a, cache_state = _run_live_retrieval_case(proof_tier)
         require(
             host_a.method_calls
             == [
@@ -165,6 +215,10 @@ def _live_retrieval_scope_tests() -> None:
                 )
             ],
             f"{proof_tier} no longer requires the project-A packet path",
+        )
+        require(
+            cache_state["seen_queries"] == {_QUERY_B},
+            f"{proof_tier} changed the established project-B query",
         )
 
 
