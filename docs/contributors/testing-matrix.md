@@ -218,14 +218,21 @@ claim.
 `--proof-tier calibration` may collect draft measurements, but cannot satisfy a
 package, hardware, installed, or release claim. A higher qualification tier
 requires a frozen constant set and a retained qualification record.
-`--proof-tier hosted_package` also passes
+A packaged proof handed an authenticated calibration bundle -- the manually
+dispatched `qualification` frozen-candidate lane -- runs one extra
+`--version-only --proof-tier hosted_package` invocation with
 `--enforce-calibration-freeze-lineage`, which requires the calibration commit to
 be an ancestor of the packaged commit with
 `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` as the
 only differing path. Release ordering is therefore bump-then-calibrate: bump the
 version, calibrate on the bumped tree, then freeze and release. A
 calibrate-then-bump ordering fails the guard, which names the offending paths
-and the required ordering in its failure message.
+and the required ordering in its failure message. Dropping the flag does not
+weaken that invocation, it breaks it: a `--version-only` proof rejects
+calibration inputs unless the lineage is enforced. The heavier frozen
+`hosted_package` qualification carries the same flag but stays dark while it
+requires the optional release-evidence packet that package proof must not
+depend on.
 `--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through

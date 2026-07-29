@@ -807,10 +807,14 @@ jobs:
           path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
+        # Gated on the bundle itself, not on optional release evidence. The
+        # frozen-candidate qualification lane is the only caller that names a
+        # bundle, and it is forbidden from carrying release evidence, so
+        # gating these steps on quality evidence made them unreachable.
         if: >-
           matrix.asset_target == 'linux-x64' &&
           !inputs.calibration_mode &&
-          inputs.quality_evidence_artifact != ''
+          inputs.calibration_bundle_artifact != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -836,13 +840,68 @@ jobs:
         if: >-
           matrix.asset_target == 'linux-x64' &&
           !inputs.calibration_mode &&
-          inputs.quality_evidence_artifact != ''
+          inputs.calibration_bundle_artifact != ''
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
           path: target/calibration-bundle
           run-id: ${{ inputs.calibration_bundle_run_id }}
           github-token: ${{ github.token }}
+
+      - name: Prove frozen calibration source lineage
+        # This is the reachable half of the freeze proof. The full frozen
+        # hosted_package qualification below additionally requires the optional
+        # exact-head release-evidence packet, which the frozen-candidate
+        # coordinator is forbidden to pass, so that invocation never runs. The
+        # source-lineage guard needs none of that: it needs the authenticated
+        # bundle and full history, both of which the qualification lane has.
+        # --version-only stops before the runtime proof but still loads and
+        # verifies the bundle, and without --enforce-calibration-freeze-lineage
+        # a version-only proof *rejects* calibration inputs outright -- so
+        # deleting the flag breaks this step loudly instead of silently
+        # dropping the guard.
+        if: >-
+          matrix.asset_target == 'linux-x64' &&
+          !inputs.calibration_mode &&
+          inputs.calibration_bundle_artifact != ''
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          set -euo pipefail
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz" \
+            --checksum-file target/release-dist/SHA256SUMS.txt \
+            --expected-version "$INPUT_VERSION" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-source-tree "$SOURCE_TREE" \
+            --version-only \
+            --proof-tier hosted_package \
+            --calibration-bundle "$calibration_bundle" \
+            --calibration-producer-run-id "$CALIBRATION_RUN_ID" \
+            --calibration-producer-artifact "$CALIBRATION_ARTIFACT" \
+            --enforce-calibration-freeze-lineage \
+            --out-dir target/packaged-calibration-lineage
+
+      - name: Upload frozen calibration lineage proof
+        if: >-
+          always() &&
+          matrix.asset_target == 'linux-x64' &&
+          !inputs.calibration_mode &&
+          inputs.calibration_bundle_artifact != ''
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: packaged-calibration-lineage-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
+          path: target/packaged-calibration-lineage
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Packaged per-user server calibration or qualification
         if: >-

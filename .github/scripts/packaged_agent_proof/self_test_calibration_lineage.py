@@ -12,6 +12,7 @@ calibrate-then-bump ordering that the enabled guard now rejects.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -19,11 +20,12 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
+from . import archive_proof
 from .calibration_lineage import (
     CONSTANT_SET_FREEZE_PATH,
     verify_calibration_source_lineage,
 )
-from .foundation import ProofFailure, require
+from .foundation import REPOSITORY_ROOT, ProofFailure, require
 
 CARGO_MANIFEST_PATH = "crates/codestory-cli/Cargo.toml"
 _GIT_ENVIRONMENT = {
@@ -254,6 +256,141 @@ def _rejects_missing_freeze_and_unrelated_history(
     )
 
 
+_PROBE_MANIFEST = {
+    "source": {"commit": "a" * 40, "tree": "b" * 40, "tracked_dirty": False},
+    "asset_target": "linux-x64",
+    "release_version": "0.0.0",
+}
+_PROBE_CONTRACT = {
+    "constant_set": {},
+    "protocol_sha256": "protocol",
+    "constant_set_sha256": "constants",
+    "measurement_protocol_sha256": "measurement",
+}
+
+
+def _lineage_probe_arguments(**overrides: object) -> argparse.Namespace:
+    """The exact argument shape the packaged proof lineage step dispatches."""
+    values: dict[str, object] = {
+        "archive": Path("archive.tar.gz"),
+        "checksum_file": Path("SHA256SUMS.txt"),
+        "expected_version": "0.0.0",
+        "expected_source_sha": "a" * 40,
+        "expected_source_tree": "b" * 40,
+        "measurement_protocol": Path("measurement-protocol.json"),
+        "out_dir": Path("target/packaged-calibration-lineage"),
+        "project": None,
+        "engine_policy": None,
+        "offline": False,
+        "version_only": True,
+        "proof_tier": "hosted_package",
+        "server_behavior_only": False,
+        "ground_only": False,
+        "produce_qualification_evidence": False,
+        "qualification_evidence": None,
+        "retrieval_quality_evidence": None,
+        "enforce_calibration_freeze_lineage": True,
+        "calibration_bundle": Path("calibration-bundle.json"),
+        "calibration_producer_run_id": "1234567890",
+        "calibration_producer_artifact": "embedding-calibration-bundle-" + "c" * 40,
+        "timeout_secs": 1800,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _run_lineage_probe(args: argparse.Namespace) -> dict:
+    """Run the real proof pipeline with only archive and CLI layers stubbed.
+
+    Everything the lineage step depends on -- the frozen-contract requirement,
+    the calibration bundle load, and the enforcement flag reaching
+    ``verify_calibration_bundle`` -- stays real. Unpacking a synthetic archive
+    and executing a packaged binary do not, because neither decides whether the
+    guard runs.
+    """
+    observed: dict = {}
+    originals: dict = {}
+
+    def stub(name: str, value: object) -> None:
+        originals[name] = getattr(archive_proof, name)
+        setattr(archive_proof, name, value)
+
+    def record_contracts(manifest, protocol, *, require_frozen):
+        observed["require_frozen"] = require_frozen
+        return _PROBE_CONTRACT
+
+    def record_bundle(path, contract, **kwargs):
+        observed["bundle_verification"] = {"path": path, **kwargs}
+        return {"freeze_digest": "digest", "source_lineage": {"verified": True}}
+
+    stub("unpack_archive", lambda archive, destination: None)
+    stub("find_cli", lambda root: Path("codestory-cli"))
+    stub("load_native_manifest", lambda root, cli, version: _PROBE_MANIFEST)
+    stub("verify_package_source", lambda args, manifest: None)
+    stub("verify_package_server_contracts", record_contracts)
+    stub("verify_calibration_bundle", record_bundle)
+    stub("isolated_environment", lambda root, policy, offline: {})
+    stub("package_summary", lambda *call, **keywords: {"package_contract": {}})
+    stub("write_json", lambda path, payload: None)
+    try:
+        archive_proof.run_archive_proof(args)
+        observed["outcome"] = "accepted"
+    except ProofFailure as failure:
+        observed["outcome"] = str(failure)
+    finally:
+        for name, value in originals.items():
+            setattr(archive_proof, name, value)
+    return observed
+
+
+def _version_only_invocation_enforces_the_lineage() -> None:
+    """Pin the CLI shape the reachable packaged-proof lineage step dispatches.
+
+    The full frozen ``hosted_package`` qualification cannot run without the
+    optional exact-head release-evidence packet, which the frozen-candidate
+    coordinator is forbidden to carry. ``--version-only`` stops before the
+    runtime proof but still loads and verifies the authenticated bundle, so it
+    is the shape that can actually enforce the freeze lineage in CI. If that
+    stops being true this test fails rather than the guard silently going dark.
+    """
+    enforced = _run_lineage_probe(_lineage_probe_arguments())
+    require(
+        enforced["outcome"] == "accepted",
+        f"the version-only lineage invocation was rejected: {enforced['outcome']}",
+    )
+    require(
+        enforced.get("require_frozen") is True,
+        "the version-only lineage invocation stopped requiring a frozen contract",
+    )
+    verification = enforced.get("bundle_verification")
+    require(
+        isinstance(verification, dict)
+        and verification.get("enforce_source_lineage") is True
+        and verification.get("frozen_source") == _PROBE_MANIFEST["source"]
+        and verification.get("repository_root") == REPOSITORY_ROOT
+        and verification.get("expected_producer_run_id") == "1234567890"
+        and verification.get("expected_producer_artifact")
+        == "embedding-calibration-bundle-" + "c" * 40,
+        "the version-only lineage invocation did not enforce the source lineage "
+        f"against the packaged source: {verification}",
+    )
+    # The flag is load-bearing rather than decorative here: dropping it does not
+    # quietly downgrade this step to an unchecked package smoke, it makes the
+    # bundle arguments illegal and the step fails closed.
+    unenforced = _run_lineage_probe(
+        _lineage_probe_arguments(enforce_calibration_freeze_lineage=False)
+    )
+    require(
+        unenforced["outcome"] == "qualification proof rejects calibration inputs",
+        "a version-only proof accepted calibration inputs without enforcing the "
+        f"freeze lineage: {unenforced['outcome']}",
+    )
+    require(
+        "bundle_verification" not in unenforced,
+        "an unenforced version-only proof still verified the calibration bundle",
+    )
+
+
 def run_calibration_lineage_self_tests() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw) / "calibration-lineage"
@@ -263,3 +400,4 @@ def run_calibration_lineage_self_tests() -> None:
         _rejects_identity_and_checkout_drift(root, calibration, frozen)
         _rejects_calibrate_then_bump(root, calibration)
         _rejects_missing_freeze_and_unrelated_history(root, frozen)
+    _version_only_invocation_enforces_the_lineage()

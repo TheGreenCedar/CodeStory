@@ -116,6 +116,215 @@ function occurrenceCount(value, fragment) {
   return value.split(fragment).length - 1;
 }
 
+// A backslash-continued shell command is one logical invocation. Asserting a
+// flag appears "somewhere after" an anchor is defeatable by parking the flag on
+// a later decoy line, so every invocation-level pin below reads the single
+// logical command that carries its anchor.
+function shellInvocationsContaining(run, anchor) {
+  const commands = [];
+  let current = [];
+  for (const line of executableRunText(run).split(/\r?\n/u)) {
+    current.push(line);
+    if (!/\\\s*$/u.test(line)) {
+      commands.push(current.join("\n"));
+      current = [];
+    }
+  }
+  if (current.length > 0) commands.push(current.join("\n"));
+  return commands.filter(command => command.includes(anchor));
+}
+
+function requireFlagOnInvocation(violations, message, run, anchor, flag) {
+  const invocations = shellInvocationsContaining(run, anchor);
+  add(
+    violations,
+    invocations.length === 1
+      && invocations[0].includes(flag)
+      && occurrenceCount(executableRunText(run), flag) === 1,
+    message,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reachability of a guarded step.
+//
+// A policy that only asserts a flag is present proves nothing when the step
+// carrying it cannot run: that is exactly how the calibration freeze lineage
+// guard sat "enabled" on a branch gated behind an input every caller pinned
+// empty. The helpers below evaluate a step's own `if` against the input
+// bindings a named caller actually passes, so making the step unreachable --
+// by narrowing the condition or by stopping the caller forwarding what it
+// reads -- is a policy violation rather than a silent regression.
+const conditionTokenPattern = /^(&&|\|\||!=|==|!|\(|\)|'[^']*'|[A-Za-z_][A-Za-z0-9_.-]*)/u;
+
+function tokenizeCondition(expression) {
+  const tokens = [];
+  let rest = String(expression).replace(/\s+/gu, " ").trim();
+  while (rest.length > 0) {
+    const match = rest.match(conditionTokenPattern);
+    if (!match) {
+      throw new Error(`unsupported condition syntax near ${JSON.stringify(rest)}`);
+    }
+    tokens.push(match[1]);
+    rest = rest.slice(match[1].length).trimStart();
+  }
+  return tokens;
+}
+
+function conditionTruthy(value) {
+  return typeof value === "string" ? value !== "" : Boolean(value);
+}
+
+function evaluateCondition(expression, lookup) {
+  const tokens = tokenizeCondition(expression);
+  let position = 0;
+  const peek = () => tokens[position];
+  const take = () => tokens[position++];
+  function primary() {
+    const token = take();
+    if (token === undefined) throw new Error("condition ended early");
+    if (token === "(") {
+      const value = disjunction();
+      if (take() !== ")") throw new Error("unbalanced condition parentheses");
+      return value;
+    }
+    if (token === "!") return !conditionTruthy(primary());
+    if (token === "true") return true;
+    if (token === "false") return false;
+    if (token.startsWith("'")) return token.slice(1, -1);
+    return lookup(token);
+  }
+  function comparison() {
+    const left = primary();
+    if (peek() === "==" || peek() === "!=") {
+      const operator = take();
+      const right = primary();
+      return operator === "==" ? left === right : left !== right;
+    }
+    return left;
+  }
+  function conjunction() {
+    let value = comparison();
+    while (peek() === "&&") {
+      take();
+      const right = comparison();
+      value = conditionTruthy(value) ? right : value;
+    }
+    return value;
+  }
+  function disjunction() {
+    let value = conjunction();
+    while (peek() === "||") {
+      take();
+      const right = conjunction();
+      value = conditionTruthy(value) ? value : right;
+    }
+    return value;
+  }
+  const result = disjunction();
+  if (position !== tokens.length) throw new Error("trailing condition tokens");
+  return conditionTruthy(result);
+}
+
+function calleeInputSpecifications(workflow) {
+  const declared = object(at(workflow, "on", "workflow_call", "inputs"));
+  const specifications = new Map();
+  for (const [name, raw] of Object.entries(declared)) {
+    const specification = object(raw);
+    const boolean = specification.type === "boolean";
+    specifications.set(name, {
+      boolean,
+      default: specification.default ?? (boolean ? false : ""),
+    });
+  }
+  return specifications;
+}
+
+const dispatchForwardedPattern
+  = /^\$\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*''\s*\}\}$/u;
+
+// Classify what a caller can make each callee input be. A literal is fixed for
+// every run of that caller; a dispatch input forwarded verbatim is chosen by
+// whoever dispatches; anything else is treated as free so this check never
+// invents reachability the caller cannot actually deliver.
+function callerInputBindings(callerWorkflow, callerJob, specifications) {
+  const supplied = object(callerJob.with);
+  const dispatchInputs = object(at(callerWorkflow, "on", "workflow_dispatch", "inputs"));
+  const bindings = new Map();
+  for (const [name, specification] of specifications) {
+    const domain = specification.boolean ? [true, false] : ["", "supplied-by-dispatch"];
+    if (!(name in supplied)) {
+      bindings.set(name, { fixed: true, values: [specification.default] });
+      continue;
+    }
+    const value = supplied[name];
+    if (typeof value !== "string") {
+      bindings.set(name, { fixed: true, values: [value] });
+      continue;
+    }
+    if (!value.includes("${{")) {
+      bindings.set(name, { fixed: true, values: [value] });
+      continue;
+    }
+    const forwarded = value.match(dispatchForwardedPattern);
+    if (forwarded !== null && forwarded[1] in dispatchInputs) {
+      bindings.set(name, { fixed: false, values: domain });
+      continue;
+    }
+    bindings.set(name, { fixed: false, values: domain });
+  }
+  return bindings;
+}
+
+// Enumerate every value the named caller can produce for the identifiers the
+// condition reads, and report whether any of them makes the step run.
+function conditionIsSatisfiable(condition, bindings, extraDomains) {
+  let identifiers;
+  try {
+    identifiers = [...new Set(tokenizeCondition(condition).filter(token =>
+      token.includes(".")))];
+  } catch {
+    return { satisfiable: false, reason: "condition syntax is not evaluable" };
+  }
+  const domains = [];
+  for (const identifier of identifiers) {
+    if (identifier in extraDomains) {
+      domains.push([identifier, extraDomains[identifier]]);
+      continue;
+    }
+    if (!identifier.startsWith("inputs.")) {
+      return { satisfiable: false, reason: `${identifier} is not a caller-bound input` };
+    }
+    const binding = bindings.get(identifier.slice("inputs.".length));
+    if (binding === undefined) {
+      return { satisfiable: false, reason: `${identifier} is not a declared input` };
+    }
+    domains.push([identifier, binding.values]);
+  }
+  const assignment = new Map();
+  const search = (index) => {
+    if (index === domains.length) {
+      try {
+        return evaluateCondition(condition, name => {
+          if (!assignment.has(name)) throw new Error(`unbound ${name}`);
+          return assignment.get(name);
+        });
+      } catch {
+        return false;
+      }
+    }
+    const [identifier, values] = domains[index];
+    for (const value of values) {
+      assignment.set(identifier, value);
+      if (search(index + 1)) return true;
+    }
+    return false;
+  };
+  return search(0)
+    ? { satisfiable: true, reason: "" }
+    : { satisfiable: false, reason: "no caller dispatch satisfies the condition" };
+}
+
 function requireNoCalibrationReferences(violations, file, workflow) {
   add(
     violations,
@@ -2233,6 +2442,22 @@ function expectedPostPublishRows() {
   ];
 }
 
+// The asset targets the default (full) scope actually builds. A step gated on
+// matrix.asset_target is only reachable while its target survives here.
+function packageMatrixAssetTargets(expression) {
+  const match = typeof expression === "string" && expression.match(
+    /\|\| '([^']+)'\) \}\}$/u,
+  );
+  if (!match) return [];
+  try {
+    return list(object(JSON.parse(match[1])).include)
+      .map(row => object(row).asset_target)
+      .filter(target => typeof target === "string");
+  } catch {
+    return [];
+  }
+}
+
 function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
     /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
@@ -2742,11 +2967,16 @@ function validatePackagedProof(workflows, violations, graph) {
       === "matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')",
     `${file} qualification driver must skip the standard server-behavior path`,
   );
+  // The calibration bundle -- not the optional release-evidence packet -- is
+  // what these steps consume, and the frozen-candidate coordinator is forbidden
+  // to pass release evidence at all. Gating them on quality evidence made the
+  // whole frozen branch unreachable; gating them on the bundle they download is
+  // what the freeze lineage proof below needs to run.
   requireCalibrationProducerBoundary(
     violations,
     file,
     job,
-    "matrix.asset_target == 'linux-x64' && !inputs.calibration_mode && inputs.quality_evidence_artifact != ''",
+    "matrix.asset_target == 'linux-x64' && !inputs.calibration_mode && inputs.calibration_bundle_artifact != ''",
   );
   requireStepRun(
     violations,
@@ -2777,30 +3007,99 @@ function validatePackagedProof(workflows, violations, graph) {
     job,
     "Packaged per-user server calibration or qualification",
   );
-  // The calibration-to-package source-lineage guard exists only when this flag
-  // reaches the frozen invocation. Without it the packaged release can ship a
-  // constant set measured on a materially different tree, so pin the flag to
-  // the hosted_package call rather than anywhere in the step, and keep the
-  // build checkout deep enough for the ancestor and diff probes it performs.
-  const packagedProofExecutable = executableRunText(packagedProofRun);
-  const frozenInvocationIndex = packagedProofExecutable
-    .indexOf("--proof-tier hosted_package");
+  // The full frozen hosted_package qualification also carries the flag, and
+  // must keep carrying it, but it cannot run: --produce-qualification-evidence
+  // hard-requires the exact-head release-evidence packet at any non-calibration
+  // tier, and every caller of this workflow is pinned to pass no release
+  // evidence. That invocation is therefore a latent contract, not the live
+  // guard. Pin the flag to the hosted_package invocation itself -- the same
+  // logical command, so a decoy line after it does not count.
+  requireFlagOnInvocation(
+    violations,
+    `${file} frozen packaged qualification must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed`,
+    packagedProofRun,
+    "--proof-tier hosted_package",
+    "--enforce-calibration-freeze-lineage",
+  );
+  // The live guard. --version-only stops before the runtime proof, so it needs
+  // no release evidence and no qualification driver, but it still loads and
+  // verifies the authenticated calibration bundle -- and without the
+  // enforcement flag a version-only proof rejects calibration inputs outright,
+  // so removing the flag breaks this step loudly instead of disabling the
+  // guard. `check-packaged-agent-proof.py --self-test` proves both directions.
+  const lineageStepName = "Prove frozen calibration source lineage";
+  const lineageProof = namedStep(job, lineageStepName);
+  requireStepRun(violations, file, job, lineageStepName, [
+    'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen',
+    "calibration-bundle.json",
+    '--calibration-bundle "$calibration_bundle"',
+    "--calibration-producer-run-id",
+    "--calibration-producer-artifact",
+    "--proof-tier hosted_package",
+    "--version-only",
+    '--expected-source-sha "$SOURCE_SHA"',
+    '--expected-source-tree "$SOURCE_TREE"',
+    "--enforce-calibration-freeze-lineage",
+  ]);
+  requireFlagOnInvocation(
+    violations,
+    `${file} ${lineageStepName} must pass --enforce-calibration-freeze-lineage on the invocation that reads the calibration bundle`,
+    stepRun(job, lineageStepName),
+    "--calibration-bundle",
+    "--enforce-calibration-freeze-lineage",
+  );
   add(
     violations,
-    frozenInvocationIndex >= 0
-      && occurrenceCount(
-        packagedProofExecutable,
-        "--enforce-calibration-freeze-lineage",
-      ) === 1
-      && packagedProofExecutable
-        .slice(frozenInvocationIndex)
-        .includes("--enforce-calibration-freeze-lineage"),
-    `${file} frozen packaged qualification must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed`,
+    lineageProof?.shell === "bash"
+      && object(lineageProof?.env).SOURCE_SHA === "${{ steps.source-identity.outputs.sha }}"
+      && object(lineageProof?.env).SOURCE_TREE === "${{ steps.source-identity.outputs.tree }}"
+      && object(lineageProof?.env).CALIBRATION_ARTIFACT
+        === "${{ inputs.calibration_bundle_artifact }}"
+      && object(lineageProof?.env).CALIBRATION_RUN_ID
+        === "${{ inputs.calibration_bundle_run_id }}",
+    `${file} ${lineageStepName} must bind the verified source identity and the authenticated producer`,
   );
   add(
     violations,
     object(namedStep(job, "Checkout")?.with)["fetch-depth"] === 0,
     `${file} package build must keep full history for the calibration freeze lineage probe`,
+  );
+  // Reachability, not presence. A flag on a step no caller can reach is the
+  // vacuous guard this check exists to prevent, so evaluate the step's own
+  // condition against the bindings the frozen-candidate coordinator passes and
+  // require some real dispatch of it to run the step.
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const coordinator = workflows.get(coordinatorFile);
+  const coordinatorPackaged = object(at(coordinator, "jobs", "packaged-proof"));
+  const bindings = callerInputBindings(
+    object(coordinator),
+    coordinatorPackaged,
+    calleeInputSpecifications(workflow),
+  );
+  const fullScopeTargets = packageMatrixAssetTargets(
+    at(workflow, "jobs", "build", "strategy", "matrix"),
+  );
+  for (const [stepName, stepValue] of [
+    [lineageStepName, lineageProof],
+    ["Authenticate calibration bundle producer", namedStep(job, "Authenticate calibration bundle producer")],
+    ["Download frozen calibration bundle", namedStep(job, "Download frozen calibration bundle")],
+  ]) {
+    const reachability = conditionIsSatisfiable(
+      String(stepValue?.if ?? "false"),
+      bindings,
+      { "matrix.asset_target": fullScopeTargets },
+    );
+    add(
+      violations,
+      reachability.satisfiable,
+      `${file} step ${stepName} must be reachable from a ${coordinatorFile} frozen-candidate dispatch: ${reachability.reason}`,
+    );
+  }
+  add(
+    violations,
+    bindings.get("calibration_bundle_artifact")?.fixed === false
+      && bindings.get("calibration_bundle_run_id")?.fixed === false,
+    `${coordinatorFile} packaged proof must forward the dispatched calibration bundle identity so the freeze lineage guard can run`,
   );
   const hostedCalibrationUpload = namedStep(job, "Upload hosted Linux calibration runs");
   add(
