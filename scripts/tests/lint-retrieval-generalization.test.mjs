@@ -1,178 +1,1130 @@
-// The generalization lint bans benchmark identifiers from production. Its corpus is
-// derived from benchmarks/tasks/**, which includes tasks whose subject is this
-// repository - those name our own symbols, so they must not become bans. The rule
-// that excludes them can fail in two directions, and both are silent: under-firing
-// makes the product illegal to itself, over-firing disables the lint for a whole
-// holdout repository.
-//
-// Both directions are probed against a planted fixture rather than against the real
-// source tree. A scan of `crates/**` only reports a foreign symbol while some file
-// there happens to contain one, so an over-firing rule and a tree that simply stopped
-// naming holdout fixtures are indistinguishable - the over-firing guard would go
-// quietly vacuous the day the tree was cleaned up. The fixture names all four probe
-// symbols itself, so each assertion fails for exactly one reason.
-
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import crypto from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  deriveProductRepositoryNames,
+  parseBenchmarkPromptLiterals,
+  runRetrievalGeneralizationLint,
+} from "../lib/retrieval-generalization-lint.mjs";
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../..",
 );
 
-// `RefreshMode` is a codestory-workspace product type and `crates/...` is where our
-// code lives. Both reach the corpus only through
-// readme-with-without/codestory-index-refresh-mode.task.json, whose subject is
-// CodeStory itself. `TicTacToe` and `createServer` come from foreign holdout
-// manifests. One fixture carries all four, so a single lint run answers both
-// directions over identical input.
-const PROBE_FIXTURE = [
-  "pub fn generalization_probe() -> [&'static str; 4] {",
-  '    ["RefreshMode", "crates/codestory-workspace/src/lib.rs", "TicTacToe", "createServer"]',
-  "}",
-  "",
-].join("\n");
+const PRE_DERIVATION_BAN_FLOOR = [
+  "payload_config",
+  "freelancer",
+  "traderotate",
+  "vscode",
+  "codex-rs",
+  "sourcetrail",
+  "extHostCommands",
+  "extensionService",
+  "workbench.ts",
+  "codex_exec::run",
+  "exec_events",
+  "StorageAccess",
+  "PersistentStorage",
+  "SourceGroupCxxCdb",
+  "IndexerJava",
+  "data/indexer",
+  "ExecSharedCliOptions",
+  "EventProcessorWithJsonOutput",
+  "Subcommand::Exec",
+  "ThreadStartParams",
+  "TurnStartParams",
+  "chinook",
+  "mdn",
+  "okio",
+  "monolog",
+  "alamofire",
+  "ChinookDatabase",
+  "form-validation",
+  "commonMain/kotlin/okio",
+  "src/Monolog",
+  "Source/Core/Session.swift",
+  "SocialEntries",
+  "ElsewhereFeed",
+  "src/lib_cxx",
+  "src/lib_java",
+  "src/lib/data/storage",
+  "getPayloadClient",
+  "comment_submission_guard",
+  "axios",
+  "redis",
+  "ripgrep",
+  "createInstance",
+  "InterceptorManager",
+  "dispatchRequest",
+  "readQueryFromClient",
+  "processCommand",
+  "aeMain",
+  "aeProcessEvents",
+  "HiArgs",
+  "SearchWorker",
+  "search_parallel",
+  "adapters.js",
+  "server.c",
+  "ae.c",
+  "networking.c",
+  "core/main.rs",
+  "flags/hiargs.rs",
+  "haystack.rs",
+  "lib/axios.js",
+  "lib/core/Axios.js",
+  "StringUtils",
+  "commons-lang",
+  "PreparedRequest",
+  "HTTPAdapter",
+  "createApplication",
+  "app.use",
+  "lib/express.js",
+  "Jekyll",
+  "LogRecord",
+  "AbstractProcessingHandler",
+  "useSWR",
+  "swr",
+  "gin.go",
+  "RouterGroup.Handle",
+  "Engine.addRoute",
+  "Engine.handleHTTPRequest",
+  "AutoMapper",
+  "TypeMapPlanBuilder",
+  "RealBufferedSource",
+  "RealBufferedSink",
+  "DataRequest",
+  "SessionDelegate",
+  "novalidate",
+  "showError",
+  "source/animate.css",
+  "nvm",
+  "install.sh nvm",
+  "bash_completion __nvm",
+  "--with-holdout-clone",
+  "payload_collection",
+];
 
-const OWN_IDENTIFIERS = ["RefreshMode", "crates"];
-const FOREIGN_IDENTIFIERS = ["TicTacToe", "createServer"];
+const PRE_DERIVATION_SPLIT_BAN_FLOOR = [
+  '"CharSequence", "Utils"',
+  '"app", ".use"',
+  '"source/animate", ".css"',
+];
 
-/// Run the lint over one directory and return every banned pattern it reported.
-function bannedPatternsOver(scanRoot) {
-  let output;
-  try {
-    output = execFileSync(
-      process.execPath,
-      [path.join(repositoryRoot, "scripts/lint-retrieval-generalization.mjs")],
-      {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS: scanRoot,
-        },
-      },
-    );
-  } catch (error) {
-    // A failing lint still prints its findings; the exit code is the point.
-    output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+const CORPUS_NAMES_RULED_OUT_OF_THE_BAN = new Set([
+  "CodeStory",
+  "codestory",
+  "express",
+  "fmt",
+  "http",
+  "requests",
+]);
+
+const CURRENT_HOLDOUT_LITERALS = [
+  "axios",
+  "redis",
+  "ripgrep",
+  "dispatchRequest",
+  "readQueryFromClient",
+  "HiArgs",
+  "server.c",
+  "core/main.rs",
+  "haystack.rs",
+];
+
+const MANIFEST_MARKERS = [
+  "A bug report says response helpers sometimes choose the wrong status, body, or content type when callers use res.send, res.json, or sendFile. Identify the primary files and functions to inspect before editing.",
+  "Project::buildIndex directly parses source files instead of building indexing tasks.",
+  "/data/indexer/",
+  "run_exec_session",
+  "createCacheHelper",
+];
+const IN_PHRASE_MARKER =
+  "Application-level registration starts in the sansio app registration method.";
+
+function write(root, relativePath, contents) {
+  const destination = path.join(root, relativePath);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.writeFileSync(destination, contents);
+  return destination;
+}
+
+function treeDigest(root) {
+  const hash = crypto.createHash("sha256");
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      const relativePath = path.relative(root, entryPath).replaceAll(path.sep, "/");
+      const type = entry.isDirectory()
+        ? "d"
+        : entry.isSymbolicLink()
+          ? "l"
+          : "f";
+      hash.update(`${type}:${relativePath}\0`);
+      if (entry.isDirectory()) {
+        stack.push(entryPath);
+      } else if (entry.isSymbolicLink()) {
+        hash.update(fs.readlinkSync(entryPath));
+      } else if (entry.isFile()) {
+        hash.update(fs.readFileSync(entryPath));
+      }
+    }
   }
-  return new Set(
-    [...output.matchAll(/Banned pattern \/(.+?)\/ in/gu)].map((match) => match[1]),
+  return hash.digest("hex");
+}
+
+function identifierWordShapes(token) {
+  const lower = token.toLowerCase();
+  const upper = token.toUpperCase();
+  const capital = `${lower.slice(0, 1).toUpperCase()}${lower.slice(1)}`;
+  return [
+    ["separator_prefix", `boost_${lower}_paths`],
+    ["separator_suffix", `${lower}_command_boost`],
+    ["screaming_separator", `${upper}_PATH_BOOST`],
+    ["pascal_type", `${capital}Ranker`],
+    ["pascal_lead", `${capital}IndexBoost`],
+    ["pascal_middle", `BoostFor${capital}Index`],
+    ["camel_tail", `boostFor${capital}`],
+    ["camel_tail_acronym", `boostFor${upper}`],
+    ["acronym_then_word", `${upper}Index`],
+    ["digit_suffix", `${lower}2`],
+    ["digit_prefix", `rank2${capital}`],
+    ["digit_then_lower", `rank2${lower}`],
+  ];
+}
+
+function isIdentifierText(value) {
+  return /^[A-Za-z][A-Za-z0-9]*$/u.test(value);
+}
+
+function shapeFixture(index, text) {
+  const declaration = /^[A-Z]/u.test(text)
+    ? `pub struct ${text};`
+    : `pub fn ${text}() -> f32 { 1.0 }`;
+  return `pub const PLANTED_${index}: &str = "${text}";\n${declaration}\n`;
+}
+
+function taskManifest({ id, name, url, symbol }) {
+  return JSON.stringify({
+    id,
+    version: 1,
+    suite: "public-core",
+    task_class: "architecture_explanation",
+    repo: {
+      name,
+      url,
+      ref: "0".repeat(40),
+    },
+    prompt: "Explain how the probe repository handles its own requests end to end.",
+    expected_files: ["src/probe_gadget.rs"],
+    expected_symbols: [
+      { name: symbol, path: "src/probe_gadget.rs", kind: "function" },
+    ],
+    expected_claims: [],
+    forbidden_claims: [],
+  });
+}
+
+function collectCorpusRepositoryNames(root) {
+  const names = new Set();
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(entryPath);
+      } else if (entry.name.endsWith(".task.json")) {
+        const document = JSON.parse(fs.readFileSync(entryPath, "utf8"));
+        const tasks = Array.isArray(document.tasks) ? document.tasks : [document];
+        for (const task of tasks) {
+          const name = task?.repo?.name?.trim();
+          if (name) names.add(name);
+          const url = task?.repo?.url?.trim();
+          const slug = url
+            ?.replace(/\/+$/u, "")
+            .replace(/\.git$/u, "")
+            .split("/")
+            .pop();
+          if (slug) names.add(slug);
+        }
+      }
+    }
+  }
+  return [...names].sort();
+}
+
+function findingFor(result, relativePath, predicate = () => true) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  return result.findings.some((finding) =>
+    finding.file?.replaceAll("\\", "/").endsWith(normalized) && predicate(finding)
   );
 }
 
-/// Every banned pattern the lint reports against a fixture naming all four probes.
-function bannedPatternsOverProbeFixture() {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "generalization-probe-"));
+function patternCore(pattern) {
+  let core = pattern;
+  for (const prefix of ["(?:^|[^A-Za-z0-9])", "(?:^|[^A-Za-z0-9_])"]) {
+    if (core.startsWith(prefix)) core = core.slice(prefix.length);
+  }
+  for (const suffix of ["(?![A-Za-z0-9])", "(?![A-Za-z0-9_])"]) {
+    if (core.endsWith(suffix)) core = core.slice(0, -suffix.length);
+  }
+  return core.replaceAll("\\", "").toLowerCase();
+}
+
+function normalizedFindingPattern(pattern) {
+  return pattern?.replaceAll("\\", "").toLowerCase() ?? null;
+}
+
+function banFiredFor(result, relativePath, planted) {
+  const lower = planted.toLowerCase();
+  return findingFor(
+    result,
+    relativePath,
+    ({ pattern }) => pattern != null && lower.includes(patternCore(pattern)),
+  );
+}
+
+function rankerFilenameLiteral(line) {
+  for (const match of line.matchAll(/(["'`])([^"'`]+)\1/gu)) {
+    const token = match[2];
+    if (
+      /^[A-Za-z0-9]/u.test(token)
+      && token.includes(".")
+      && /^[a-z0-9._-]+$/u.test(token)
+    ) {
+      return token;
+    }
+  }
+  return null;
+}
+
+function workflowTriggerPaths(workflow, triggerName) {
+  const lines = workflow.split(/\r?\n/u);
+  const start = lines.findIndex((line) => line.trimEnd() === `  ${triggerName}:`);
+  assert.notEqual(start, -1, `workflow has no ${triggerName} trigger`);
+  const paths = [];
+  let insidePaths = false;
+  for (const line of lines.slice(start + 1)) {
+    const trimmed = line.trimStart();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
+    if (line.length - trimmed.length <= 2) break;
+    if (trimmed === "paths:") {
+      insidePaths = true;
+      continue;
+    }
+    if (insidePaths) {
+      const match = trimmed.match(/^- ['"]?(.*?)['"]?$/u);
+      if (match == null) {
+        insidePaths = false;
+      } else {
+        paths.push(match[1]);
+      }
+    }
+  }
+  return paths;
+}
+
+function triggerCovers(filter, guarded) {
+  if (filter === guarded) return true;
+  return filter.endsWith("/**")
+    && (guarded === filter.slice(0, -3) || guarded.startsWith(filter.slice(0, -2)));
+}
+
+test("the full hostile matrix shares one policy load and never writes into the checkout", {
+  timeout: 90_000,
+}, () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"));
+  const productionRepositoryRoot = path.join(
+    fixtureRoot,
+    " in synthetic-repository",
+  );
+  const rustRoot = path.join(
+    productionRepositoryRoot,
+    "crates",
+    "codestory-runtime",
+    "src",
+  );
+  const retrievalRoot = path.join(
+    productionRepositoryRoot,
+    "crates",
+    "codestory-retrieval",
+    "src",
+  );
+  const extraRustRoot = path.join(fixtureRoot, "extra-rust");
+  const nonRustRoot = path.join(fixtureRoot, "non-rust");
+  const taskRoot = path.join(fixtureRoot, "tasks");
+  fs.mkdirSync(rustRoot, { recursive: true });
+  fs.mkdirSync(retrievalRoot, { recursive: true });
+  fs.mkdirSync(extraRustRoot);
+  fs.mkdirSync(nonRustRoot);
+  fs.mkdirSync(taskRoot);
+  assert.ok(
+    path.relative(repositoryRoot, fixtureRoot).startsWith(".."),
+    "hostile fixtures must live outside the checkout",
+  );
+  // Snapshot bytes, paths, and symlink targets for the whole intentionally
+  // dirty worktree. Comparing the same state before and after is independent of
+  // HEAD/index cleanliness and also catches a newly planted untracked fixture.
+  const checkoutBefore = treeDigest(repositoryRoot);
+  for (const fileName of ["search_plan.rs", "search_scoring.rs", "search_terms.rs"]) {
+    write(rustRoot, fileName, "pub fn neutral_default_surface() {}\n");
+  }
+  write(retrievalRoot, "lib.rs", "pub fn neutral_retrieval_surface() {}\n");
+  write(
+    extraRustRoot,
+    "extra-default-additive.rs",
+    'pub const EXTRA_ROOT_LEAK: &str = "createApplication";\n',
+  );
+
+  const rejected = [];
+  const allowed = [];
+  const reject = (relativePath, contents) => {
+    rejected.push(relativePath);
+    write(rustRoot, relativePath, contents);
+  };
+  const allow = (relativePath, contents) => {
+    allowed.push(relativePath);
+    write(rustRoot, relativePath, contents);
+  };
+
+  reject("cfg-after-test.rs", `
+#[cfg(test)]
+mod tests { const TEST_ONLY: &str = "codex-rs/test/src/lib.rs"; }
+pub fn leaked() -> &'static str { "codex-rs/prod/src/lib.rs" }
+`);
+  reject("fake-cfg.rs", `
+// #[cfg(test)]
+pub const NOTE: &str = "#[cfg(test)]";
+pub const RAW_NOTE: &str = r#"#[cfg(test)]"#;
+pub fn leaked() -> &'static str { "codex-rs/prod/src/lib.rs" }
+`);
+  reject("current-holdouts.rs", `
+pub const HOLDOUTS: &[&str] = &[
+  "axios", "redis", "ripgrep", "dispatchRequest", "readQueryFromClient",
+  "HiArgs", "server.c", "core/main.rs", "haystack.rs",
+];
+`);
+  reject("query-phrase.rs", `
+pub const QUERY: &str =
+  "project loads settings refreshes source groups computes refresh info and builds an index";
+`);
+  reject("manifest-derived.rs", `
+pub const PROMPT: &str = "A bug report says response helpers sometimes choose the wrong status, body, or content type when callers use res.send, res.json, or sendFile. Identify the primary files and functions to inspect before editing.";
+pub const CLAIM: &str = "Project::buildIndex directly parses source files instead of building indexing tasks.";
+pub const PATH: &str = "/data/indexer/";
+pub const PROBE_A: &str = "run_exec_session";
+pub const PROBE_B: &str = "createCacheHelper";
+`);
+  reject(
+    "pattern-containing-in.rs",
+    `pub const CLAIM: &str = ${JSON.stringify(IN_PHRASE_MARKER)};\n`,
+  );
+  reject("corpus-dependencies.rs", `
+pub const TASKS: &str = "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json";
+pub const QUERIES: &str = "scripts/cross-repo-sourcetrail-queries.mjs";
+pub const PROBES: &str = "benchmarks/tasks/eval-probes.json";
+`);
+  reject("constructed-corpus-dependencies.rs", `
+pub const TASKS: &str = concat!("benchmarks", "/tasks", "/eval-probes.json");
+pub const PACKETS: &str = concat!("crates/codestory-cli/tests/fixtures/", "packet_search_eval");
+pub const QUALITY: &str = concat!("crates/codestory-bench/tests/", "fixtures/agent_quality");
+pub const INCLUDED: &str = include_str!(concat!("../../benchmarks/", "tasks/eval-probes.json"));
+`);
+  reject("nested-manifest-claim.rs", `
+pub fn leaked() -> &'static str {
+  "The top-level request helper opens a Session and delegates to Session.request."
+}
+`);
+  allow("nested-manifest-test-only.rs", `
+#[cfg(test)]
+mod tests {
+  const CLAIM: &str =
+    "The top-level request helper opens a Session and delegates to Session.request.";
+}
+pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
+`);
+  const splitConstructionFiles = new Map([
+    ["split-family/use-s-wr.rs", {
+      source: 'pub fn leaked() -> String { ["use", "s", "wr"].concat() }\n',
+      marker: "useswr",
+    }],
+    ["split-family/string-utils.rs", {
+      source: 'pub fn leaked() -> String { ["string", "utils"].concat() }\n',
+      marker: "stringutils",
+    }],
+    ["split-family/charsequence-utils.rs", {
+      source: 'pub fn leaked() -> String { ["charsequence", "utils"].concat() }\n',
+      marker: "charsequenceutils",
+    }],
+    ["split-family/source-animate-css.rs", {
+      source: 'pub fn leaked() -> String { ["source/animate", ".css"].concat() }\n',
+      marker: "sourceanimatecss",
+    }],
+    ["split-family/multiline-swr.rs", {
+      source: 'pub fn leaked() -> String {\n  [\n    "s",\n    "wr",\n  ].concat()\n}\n',
+      marker: "swr",
+    }],
+    ["split-family/auto-mapper.rs", {
+      source: 'pub fn leaked() -> String {\n  [\n    "auto",\n    "mapper",\n  ].concat()\n}\n',
+      marker: "automapper",
+    }],
+    ["split-family/raw-swr.rs", {
+      source: 'pub fn leaked() -> String {\n  [\n    r#"s"#,\n    r#"wr"#,\n  ].concat()\n}\n',
+      marker: "swr",
+    }],
+    ["split-family/raw-string-utils.rs", {
+      source: 'pub fn leaked() -> String {\n  [\n    r#"string"#,\n    r#"utils"#,\n  ].concat()\n}\n',
+      marker: "stringutils",
+    }],
+  ]);
+  for (const [relativePath, { source }] of splitConstructionFiles) {
+    reject(relativePath, source);
+  }
+  allow("cfg-forms.rs", `
+#[doc = "codex-rs/test-only"]
+#[cfg(test)]
+mod tests { const TEST_ONLY: &str = "codex-rs/test/src/lib.rs"; }
+#[cfg_attr(test, doc = "codex-rs/test-only")]
+pub fn production() -> &'static str { "workspace/app/src/lib.rs" }
+#[cfg(not(not(test)))]
+mod equivalent { const TEST_ONLY: &str = "codex-rs/test/src/lib.rs"; }
+`);
+  for (const name of ["test_support.rs", "eval_probes.rs", "diagnostics.rs", "fixtures.rs"]) {
+    reject(`testlike/${name}`, 'pub const LEAK: &str = "createApplication";\n');
+  }
+  reject("paths/unix.rs", 'pub const PATH: &str = "data/indexer";\n');
+  reject("paths/windows.rs", 'pub const PATH: &str = "data\\\\indexer";\n');
+  for (const symbol of ["SourceGroup", "BuildIndex", "IndexerCommand", "EventProcessor"]) {
+    reject(`injection-${symbol}.rs`, `pub const LEAK: &str = "${symbol}";\n`);
+  }
+  allow("product-vocabulary.rs", `
+use serde::Serialize;
+#[derive(Serialize)]
+pub struct SubcommandStorage { pub subcommand: String, pub storage: String }
+pub fn serialize_subcommand(value: &SubcommandStorage) -> String {
+  serde_json::to_string(value).unwrap_or_default()
+}
+`);
+  allow("hosting-accounts.rs", `
+pub fn licence_notice() -> &'static str { "apache square gorilla pallets" }
+`);
+  allow("lowercase-route-path.rs", `
+pub fn workflow_route_path(route: &crate::Route) -> String { route.route.path.clone() }
+`);
+  reject("qualified-route-path.rs", 'pub const LEAK: &str = "Route.Path";\n');
+  const loggerFiles = new Map();
+  for (const [index, probe] of ["logger.php", "Logger.php", "LOGGER.PHP"].entries()) {
+    const relativePath = `logger-${index}.rs`;
+    loggerFiles.set(relativePath, probe);
+    reject(
+      relativePath,
+      `pub fn leaked(path: &str) -> bool { path.ends_with("${probe}") }\n`,
+    );
+  }
+  allow("documented/search_terms.rs", `
+// "anchor", "answer", "around", "cite", "cited", and "cites" are product words.
+pub fn documented_choice() -> usize { 7 }
+`);
+  allow("stopwords/search_terms.rs", `
+pub const SEARCH_PLAN_STOPWORDS: &[&str] = &[
+  "and", "explain", "from", "how", "into", "show", "then", "with",
+];
+pub const REASON: &str = "natural_language_filler";
+`);
+  reject("word-table/search_terms.rs", `
+pub const PLANTED_SYMBOL_TERMS: &[&str] =
+  &["indexer", "service", "storage", "store", "posts", "feed", "auth", "trail"];
+`);
+  reject("commented-table/search_terms.rs", `
+pub const PLANTED_SYMBOL_TERMS: &[&str] = &[
+  "indexer", // pending
+  "service", // pending
+  "storage", // pending
+  "store", // pending
+  "posts", // pending
+  "feed", // pending
+  "auth", // pending
+  "trail", // pending
+];
+`);
+  reject("url-table/search_terms.rs", `
+pub const PLANTED_TERMS: &[(&str, &str)] = &[
+  ("https://example.test/a", "indexer"),
+  ("https://example.test/b", "service"),
+  ("https://example.test/c", "storage"),
+  ("https://example.test/d", "store"),
+  ("https://example.test/e", "posts"),
+  ("https://example.test/f", "feed"),
+];
+`);
+  const frameworkFiles = new Map();
+  for (const probe of [
+    "payload.config.ts",
+    "payload-types.ts",
+    "next.config.ts",
+    "app.svelte",
+    "/src/collections/posts",
+    "/exec/src/cli.rs",
+  ]) {
+    const relativePath = `framework-${frameworkFiles.size}.rs`;
+    frameworkFiles.set(relativePath, probe);
+    reject(
+      relativePath,
+      `pub fn leaked() -> &'static str { "${probe}" }\n`,
+    );
+  }
+
+  reject(
+    "deep/new/ranking_scope_probe_generated.rs",
+    'pub const LEAK: &str = "createApplication";\n',
+  );
+  reject(
+    "orphan/app/tests.rs",
+    [
+      'pub const LEAK: &str = "createApplication";',
+      'pub const CORPUS: &str = "benchmarks/tasks";',
+      "",
+    ].join("\n"),
+  );
+  allow("excluded/app.rs", "pub fn shipped() {}\n#[cfg(test)]\nmod tests;\n");
+  allow(
+    "excluded/app/tests.rs",
+    'pub const TEST_ONLY: &str = "createApplication";\n',
+  );
+  write(rustRoot, "shipped/app.rs", "pub fn shipped() {}\nmod tests;\n");
+  reject(
+    "shipped/app/tests.rs",
+    'pub const LEAK: &str = "createApplication";\n',
+  );
+
+  const floorFiles = new Map();
+  PRE_DERIVATION_BAN_FLOOR.forEach((planted, index) => {
+    const relativePath = `floor/floor-${index}.rs`;
+    floorFiles.set(relativePath, planted);
+    reject(
+      relativePath,
+      `pub fn planted_${index}() -> &'static str { ${JSON.stringify(planted)} }\n`,
+    );
+  });
+  PRE_DERIVATION_SPLIT_BAN_FLOOR.forEach((planted, index) => {
+    const relativePath = `floor/joined-${index}.rs`;
+    reject(
+      relativePath,
+      `pub fn joined_${index}() -> [&'static str; 2] { [${planted}] }\n`,
+    );
+  });
+
+  const identifierFloor = PRE_DERIVATION_BAN_FLOOR.filter(isIdentifierText);
+  const identifierShapeFiles = new Map();
+  let shapeIndex = 0;
+  for (const token of identifierFloor) {
+    for (const [shape, text] of identifierWordShapes(token)) {
+      const relativePath = `identifier-shapes/shape-${shapeIndex}.rs`;
+      identifierShapeFiles.set(relativePath, { token, shape, text });
+      reject(relativePath, shapeFixture(shapeIndex, text));
+      shapeIndex += 1;
+    }
+  }
+  assert.ok(shapeIndex > 300, `expected >300 identifier shapes, got ${shapeIndex}`);
+
+  const corpusNames = collectCorpusRepositoryNames(
+    path.join(repositoryRoot, "benchmarks", "tasks"),
+  );
+  assert.ok(corpusNames.length > 20, "benchmark corpus should name many repositories");
+  const corpusNameFiles = new Map();
+  let corpusIndex = 0;
+  for (const name of corpusNames) {
+    const literalPath = `corpus-names/literal-${corpusIndex}.rs`;
+    corpusNameFiles.set(literalPath, { name, text: `${name} cache key` });
+    write(
+      rustRoot,
+      literalPath,
+      `pub const PLANTED: &str = "${name} cache key";\n`,
+    );
+    if (isIdentifierText(name)) {
+      for (const [shape, text] of identifierWordShapes(name)) {
+        const relativePath = `corpus-names/${shape}-${corpusIndex}.rs`;
+        corpusNameFiles.set(relativePath, { name, text });
+        write(rustRoot, relativePath, shapeFixture(corpusIndex, text));
+      }
+    }
+    corpusIndex += 1;
+  }
+  for (const word of [
+    "tokio", "Tokio", "TokioRuntime", "useTokio",
+    "answerswrongly", "AnswersWrongly", "plugin", "PluginHost",
+    "pluginHost", "PLUGIN_HOST", "login", "LoginHandler",
+    "origin", "OriginBoost", "ORIGIN_BOOST", "invite",
+    "InviteToken", "demux", "DemuxState",
+  ]) {
+    allow(
+      `substrings/product-${allowed.length}.rs`,
+      `pub const PRODUCT_WORD: &str = "${word}";\n`,
+    );
+  }
+  for (const [index, name] of corpusNames.filter(isIdentifierText).entries()) {
+    allow(
+      `substrings/lower-${index}.rs`,
+      `pub const INSIDE_ONE_WORD: &str = "zz${name.toLowerCase()}zz";\n`,
+    );
+    allow(
+      `substrings/upper-${index}.rs`,
+      `pub const INSIDE_ONE_WORD: &str = "ZZ${name.toUpperCase()}ZZ";\n`,
+    );
+  }
+
+  const extraTasks = [
+    {
+      id: "foreign-anchor",
+      name: "generalization-probe",
+      url: "https://github.com/example/generalization-probe.git",
+      symbol: "ForeignGeneralizationAnchorHandler",
+      banned: true,
+    },
+    ...["store", "runtime", "bench", "indexer"].map((name) => ({
+      id: `impostor-${name}`,
+      name,
+      url: `https://github.com/example/${name}.git`,
+      symbol: `Foreign${name[0].toUpperCase()}${name.slice(1)}ProbeHandler`,
+      banned: true,
+    })),
+    {
+      id: "false-label-axios",
+      name: "codestory",
+      url: "https://github.com/axios/axios.git",
+      symbol: "FalseLabelAxiosProbeHandler",
+      banned: true,
+    },
+    {
+      id: "false-label-ripgrep",
+      name: "codestory",
+      url: "https://github.com/BurntSushi/ripgrep.git",
+      symbol: "FalseLabelRipgrepProbeHandler",
+      banned: true,
+    },
+    {
+      id: "real-codestory",
+      name: "codestory",
+      url: "https://github.com/TheGreenCedar/CodeStory.git",
+      symbol: "RealCodeStorySelfProbeHandler",
+      banned: false,
+    },
+  ];
+  for (const task of extraTasks) {
+    write(taskRoot, `${task.id}.task.json`, taskManifest(task));
+  }
+
+  const rejectedNonRust = [
+    ["leaked.ps1", "$corpus = \"scripts\\cross-repo-\" + `\n  \"sourcetrail-queries.mjs\"\n", ["scriptscrossreposourcetrailqueriesmjs"]],
+    ["leaked.sh", "prefix=./scripts\nscript=${prefix#./}/fetch-holdout-repos.mjs\ncorpus=benchmarks/ta\\\nsks/eval-probes.json\n", ["fetch-holdout-repos.mjs", "benchmarks/tasks/eval-probes.json"]],
+    ["workflow-command.yml", "run: |2-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n", ["fetch-holdout-repos.mjs"]],
+    ["surrounding-command.mjs", "const command = \"node scripts/fetch-\" + \"holdout-repos.mjs --json\";\nconst config = \"prefix benchmarks/ta\" + \"sks/eval-probes.json suffix\";\n", ["fetchholdoutreposmjs", "benchmarkstasksevalprobesjson"]],
+    ["line-continuation.mjs", "const script = \"scripts/fetch-holdout-\\\nrepos.mjs\";\n", ["scripts/fetch-holdout-repos.mjs"]],
+    ["joined-shell-word.sh", "node scripts/fetch-'holdout-repos.mjs'\n", ["fetch-holdout-repos.mjs"]],
+    ["joined-workflow-word.yml", "run: |\n  node scripts/fetch-'holdout-repos.mjs'\n", ["fetch-holdout-repos.mjs"]],
+    ["quoted-run-key.yml", "steps:\n  - \"run\": |\n      node scripts/fetch-'holdout-repos.mjs'\n", ["fetch-holdout-repos.mjs"]],
+    ["escaped-shell-word.sh", "node scripts/fetch\\-holdout-repos.mjs\n", ["fetch-holdout-repos.mjs"]],
+    ["quoted-yaml-scalar.yml", "value: 'clean # scripts/fetch-holdout-repos.mjs'\n", ["fetch-holdout-repos.mjs"]],
+    ["quoted-block-scalar.yml", "run: |\n  value='clean # scripts/fetch-holdout-repos.mjs'\n", ["fetch-holdout-repos.mjs"]],
+    ["github-script.yml", "uses: actions/github-script@v8\nwith:\n  script: |\n    const script = \"scripts/fetch-\" + \"holdout-repos.mjs\";\n", ["fetchholdoutreposmjs"]],
+    ["direct-harness-import.mjs", "import \"./scripts/codestory-agent-ab-benchmark.mjs\";\n", ["codestory-agent-ab-benchmark.mjs"]],
+    ["constructed-harness-import.mjs", "const harness = \"scripts/codestory-agent-ab-\" + \"benchmark.mjs\";\nawait import(harness);\n", ["scriptscodestoryagentabbenchmarkmjs"]],
+    ["unapproved-policy-reference.mjs", "const workflows = [\".github/workflows/retrieval-engine-smoke.yml\", \"unrelated.yml\"];\n", ["retrieval-engine-smoke.yml"]],
+    ["plugins/codestory/skills/codestory-grounding/SKILL.md", "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n", ["fetch-holdout-repos.mjs"]],
+    [".cursor/rules/codestory.mdc", "Read benchmarks/tasks/eval-probes.json before answering.\n", ["benchmarks/tasks"]],
+    [".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n        \".github/workflows/retrieval-engine-smoke.yml\",\nawait import(\".github/workflows/retrieval-engine-smoke.yml\");\n", ["retrieval-engine-smoke.yml"]],
+    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"engine-smoke.yml\";\n", ["githubworkflowsretrievalenginesmokeyml"]],
+  ];
+  for (const [relativePath, contents] of rejectedNonRust) {
+    write(nonRustRoot, `rejected/${relativePath}`, contents);
+  }
+  const allowedNonRust = [
+    ["prose.md", "The benchmark harness reads `benchmarks/tasks/eval-probes.json`; production code must not.\n"],
+    ["quoted-shell.sh", "value='scripts/fetch-\\\nholdout-repos.mjs'\n"],
+    ["unrelated-list.yml", "- scripts/fetch-\\\n- holdout-repos.mjs\n"],
+    ["template-comment.mjs", "const value = `${({ clean: true }).clean /* scripts/fetch-holdout-repos.mjs */}`;\n"],
+    ["quoted-shell-comment.sh", "value='clean\\' # scripts/fetch-holdout-repos.mjs\n"],
+    ["quoted-powershell-comment.ps1", "$value = 'clean`' # scripts/fetch-holdout-repos.mjs\n"],
+    ["quoted-yaml-comment.yml", "value: 'clean\\' # scripts/fetch-holdout-repos.mjs\n"],
+    ["folded-workflow.yml", "run: >-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n"],
+    ["comment-only.yml", "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n"],
+    ["plain-apostrophe.yml", "message: don't load it # scripts/fetch-holdout-repos.mjs\n"],
+    ["punctuated-apostrophe.yml", "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n"],
+    ["doubled-single-quote.yml", "value: 'scripts/fetch-''holdout-repos.mjs'\n"],
+    [".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n"],
+    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\n"],
+  ];
+  for (const [relativePath, contents] of allowedNonRust) {
+    write(nonRustRoot, `allowed/${relativePath}`, contents);
+  }
+  write(nonRustRoot, "rejected/neutral.rs", "pub fn neutral() {}\n");
+  write(nonRustRoot, "allowed/neutral.rs", "pub fn neutral() {}\n");
+
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !name.startsWith("CODESTORY_RETRIEVAL_GENERALIZATION_"),
+    ),
+  );
+  Object.assign(environment, {
+    CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS: extraRustRoot,
+    CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS: taskRoot,
+    GITHUB_ACTIONS: "true",
+    GITHUB_WORKSPACE: path.join(fixtureRoot, "hostile-github-workspace"),
+  });
+
   try {
-    fs.writeFileSync(path.join(fixtureRoot, "probe.rs"), PROBE_FIXTURE);
-    return bannedPatternsOver(fixtureRoot);
+    const result = runRetrievalGeneralizationLint({
+      repositoryRoot,
+      productionRepositoryRoot,
+      environment,
+      structuralScanRoots: [rustRoot, extraRustRoot],
+      defaultNonRustScanRoots: [
+        path.join(nonRustRoot, "rejected"),
+        path.join(nonRustRoot, "allowed"),
+      ],
+      validatePendingSurfaceInventory: false,
+    });
+    assert.equal(
+      treeDigest(repositoryRoot),
+      checkoutBefore,
+      "lint changed the whole checkout tree, including tracked bytes or untracked paths",
+    );
+    assert.equal(result.exitCode, 1, result.stderr);
+    for (const finding of result.findings) {
+      assert.ok(finding.file != null, `unattributed lint failure: ${finding.message}`);
+      const findingPath = path.resolve(repositoryRoot, finding.file);
+      assert.ok(
+        findingPath === fixtureRoot
+          || findingPath.startsWith(`${fixtureRoot}${path.sep}`),
+        `hostile matrix reported a non-synthetic path: ${finding.file}`,
+      );
+    }
+    assert.deepEqual(
+      result.scanDirs,
+      [rustRoot, retrievalRoot, extraRustRoot],
+      "the canonical runtime/retrieval defaults must remain present before the additive extra root",
+    );
+    assert.ok(
+      findingFor(result, "deep/new/ranking_scope_probe_generated.rs"),
+      "default runtime-root discovery missed an unlisted nested production file",
+    );
+    assert.ok(
+      banFiredFor(result, "extra-default-additive.rs", "createApplication"),
+      "the additive extra scan root was not scanned alongside the production defaults",
+    );
+    assert.ok(result.stats.rustFiles > 300, "the synthetic hostile matrix became vacuous");
+
+    for (const relativePath of rejected) {
+      assert.ok(
+        findingFor(result, relativePath),
+        `expected a finding for rejected Rust fixture ${relativePath}`,
+      );
+    }
+    for (const relativePath of allowed) {
+      const fixtureFindings = result.findings.filter((finding) =>
+        finding.file?.replaceAll("\\", "/").endsWith(relativePath)
+      );
+      assert.ok(
+        fixtureFindings.length === 0,
+        `allowed Rust fixture ${relativePath} received findings: ${JSON.stringify(fixtureFindings)}`,
+      );
+    }
+    assert.ok(!result.stderr.includes("codex-rs/test/src/lib.rs"));
+    assert.ok(result.stderr.includes("codex-rs/prod/src/lib.rs"));
+    assert.ok(!result.stderr.includes("crates/codestory-retrieval/src/ranker.rs (production slice)"));
+
+    for (const marker of CURRENT_HOLDOUT_LITERALS) {
+      assert.ok(
+        banFiredFor(result, "current-holdouts.rs", marker),
+        `the current holdout fixture lost its ${marker} ban`,
+      );
+    }
+    for (const marker of MANIFEST_MARKERS) {
+      assert.ok(
+        banFiredFor(result, "manifest-derived.rs", marker),
+        `the manifest-derived fixture lost its ${marker} ban`,
+      );
+    }
+    assert.ok(
+      findingFor(
+        result,
+        "pattern-containing-in.rs",
+        ({ pattern }) =>
+          normalizedFindingPattern(pattern) === IN_PHRASE_MARKER.toLowerCase(),
+      ),
+      "structured findings must retain a complete derived pattern containing ` in `",
+    );
+    assert.ok(
+      banFiredFor(
+        result,
+        "query-phrase.rs",
+        "project loads settings refreshes source groups computes refresh info and builds an index",
+      ),
+      "the cross-repository query phrase lost its attributed ban",
+    );
+    for (const marker of [
+      "benchmarks/tasks",
+      "scripts/cross-repo-sourcetrail-queries.mjs",
+      "benchmarks/tasks/eval-probes.json",
+    ]) {
+      assert.ok(
+        banFiredFor(result, "corpus-dependencies.rs", marker),
+        `the direct corpus boundary lost ${marker}`,
+      );
+    }
+    for (const marker of ["benchmarkstasks", "packetsearcheval", "agentquality"]) {
+      assert.ok(
+        findingFor(
+          result,
+          "constructed-corpus-dependencies.rs",
+          ({ message }) => message.toLowerCase().includes(marker),
+        ),
+        `the constructed corpus boundary lost ${marker}`,
+      );
+    }
+    for (const [relativePath, { marker }] of splitConstructionFiles) {
+      assert.ok(
+        banFiredFor(result, relativePath, marker),
+        `the split construction ${relativePath} lost its ${marker} ban`,
+      );
+    }
+    assert.ok(
+      banFiredFor(result, "orphan/app/tests.rs", "createApplication"),
+      "an orphan tests.rs escaped the holdout-name pass",
+    );
+    assert.ok(
+      findingFor(
+        result,
+        "orphan/app/tests.rs",
+        ({ kind, pattern }) =>
+          kind === "Production dependency on eval/query corpus"
+          && normalizedFindingPattern(pattern) === "benchmarks/tasks",
+      ),
+      "an orphan tests.rs escaped the independent corpus-dependency pass",
+    );
+    assert.ok(
+      findingFor(
+        result,
+        "qualified-route-path.rs",
+        ({ pattern }) => pattern === "Route\\.Path",
+      ),
+      "the qualified member must be attributed to the case-sensitive Route.Path ban",
+    );
+    for (const [relativePath, probe] of loggerFiles) {
+      assert.ok(
+        findingFor(
+          result,
+          relativePath,
+          ({ pattern }) => pattern === "Logger\\.php",
+        ),
+        `the case-folded filename ban itself did not report ${probe}`,
+      );
+    }
+    for (const symbol of ["SourceGroup", "BuildIndex", "IndexerCommand", "EventProcessor"]) {
+      assert.ok(
+        banFiredFor(result, `injection-${symbol}.rs`, symbol),
+        `the audited injection symbol lost its ${symbol} ban`,
+      );
+    }
+    for (const [relativePath, marker] of frameworkFiles) {
+      assert.ok(
+        banFiredFor(result, relativePath, marker),
+        `the framework filename shape lost ${marker}`,
+      );
+    }
+    for (const relativePath of [
+      "word-table/search_terms.rs",
+      "commented-table/search_terms.rs",
+      "url-table/search_terms.rs",
+    ]) {
+      assert.ok(
+        findingFor(
+          result,
+          relativePath,
+          ({ kind }) => kind === "Term vocabulary table",
+        ),
+        `the vocabulary table detector did not attribute ${relativePath}`,
+      );
+    }
+
+    for (const [relativePath, planted] of floorFiles) {
+      assert.ok(
+        banFiredFor(result, relativePath, planted),
+        `the pre-derivation floor lost ${planted}`,
+      );
+    }
+    for (const [relativePath, { token, shape, text }] of identifierShapeFiles) {
+      assert.ok(
+        banFiredFor(result, relativePath, text),
+        `the identifier floor lost ${token} as ${shape} (${text})`,
+      );
+    }
+    for (const [relativePath, { name, text }] of corpusNameFiles) {
+      assert.equal(
+        banFiredFor(result, relativePath, text),
+        !CORPUS_NAMES_RULED_OUT_OF_THE_BAN.has(name),
+        `corpus-name ruling drifted for ${name} in ${relativePath}`,
+      );
+    }
+
+    for (const task of extraTasks) {
+      const baseDerived = result.baseDerivedPatterns.some((pattern) =>
+        pattern.includes(task.symbol)
+      );
+      const derived = result.derivedPatterns.some((pattern) =>
+        pattern.includes(task.symbol)
+      );
+      assert.equal(
+        baseDerived,
+        false,
+        `extra task symbol ${task.symbol} was already present before the extra root`,
+      );
+      assert.equal(
+        derived,
+        task.banned,
+        `self-subject derivation drifted for ${task.id}`,
+      );
+    }
+
+    for (const [relativePath, , expectedPatterns] of rejectedNonRust) {
+      const fixtureFindings = result.findings.filter((finding) =>
+        finding.file?.replaceAll("\\", "/").endsWith(`rejected/${relativePath}`)
+      );
+      for (const expectedPattern of expectedPatterns) {
+        assert.ok(
+          fixtureFindings.some(({ pattern }) =>
+            normalizedFindingPattern(pattern) === expectedPattern.toLowerCase()
+          ),
+          `expected exact pattern ${expectedPattern} for rejected non-Rust fixture ${relativePath}: ${JSON.stringify(fixtureFindings)}`,
+        );
+      }
+    }
+    const routeFindings = result.findings.filter((finding) =>
+      finding.file?.replaceAll("\\", "/")
+        .endsWith("rejected/.github/scripts/route-ci-proof.mjs")
+    );
+    assert.ok(
+      routeFindings.some(({ message }) =>
+        message.includes(
+          ':3:await import(".github/workflows/retrieval-engine-smoke.yml");',
+        )
+      ),
+      `the exact hostile route line was masked by another finding: ${JSON.stringify(routeFindings)}`,
+    );
+    const policyFindings = result.findings.filter((finding) =>
+      finding.file?.replaceAll("\\", "/")
+        .endsWith("rejected/.github/scripts/check-workflow-policy.mjs")
+    );
+    assert.ok(
+      policyFindings.some(({ message }) =>
+        message.includes(
+          ':2:const hostile = ".github/workflows/retrieval-" + "engine-smoke.yml";',
+        )
+      ),
+      `the exact hostile policy split was masked by another finding: ${JSON.stringify(policyFindings)}`,
+    );
+    for (const [relativePath] of allowedNonRust) {
+      assert.ok(
+        !findingFor(result, `allowed/${relativePath}`),
+        `allowed non-Rust fixture ${relativePath} received a finding`,
+      );
+    }
+
+    const guardedGroups = Object.keys(result.guardedPaths).sort();
+    assert.deepEqual(guardedGroups, [
+      "corpusDirs",
+      "corpusFiles",
+      "lintFiles",
+      "productionDirs",
+      "productionFiles",
+      "protectedNonRustDirs",
+      "protectedNonRustFiles",
+    ]);
+    const expectedProductionDirs = fs.readdirSync(
+      path.join(repositoryRoot, "crates"),
+      { withFileTypes: true },
+    )
+      .filter((entry) => entry.isDirectory() && entry.name !== "codestory-bench")
+      .map((entry) => `crates/${entry.name}/src`)
+      .filter((relativePath) => fs.existsSync(path.join(repositoryRoot, relativePath)));
+    for (const expectedDir of expectedProductionDirs) {
+      assert.ok(
+        result.guardedPaths.productionDirs.includes(expectedDir),
+        `guarded production roots lost ${expectedDir}`,
+      );
+    }
+    const workflow = fs.readFileSync(
+      path.join(repositoryRoot, ".github/workflows/retrieval-engine-smoke.yml"),
+      "utf8",
+    );
+    const guarded = Object.values(result.guardedPaths)
+      .flat()
+      .filter((entry) => !entry.startsWith(".."));
+    assert.ok(guarded.length >= 40, "guarded-path inventory became vacuous");
+    for (const trigger of ["pull_request", "push"]) {
+      const filters = workflowTriggerPaths(workflow, trigger);
+      const uncovered = guarded.filter(
+        (entry) => !filters.some((filter) => triggerCovers(filter, entry)),
+      );
+      assert.deepEqual(uncovered, [], `${trigger} misses guarded paths`);
+    }
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
-}
-
-test("a task about this repository cannot ban this repository's own symbols", () => {
-  const banned = bannedPatternsOverProbeFixture();
-  // The fixture names foreign symbols too, so an empty report means the lint never
-  // ran rather than that our own identifiers were spared.
-  assert.ok(banned.size > 0, "the lint reported no banned patterns at all");
-  for (const own of OWN_IDENTIFIERS) {
-    assert.ok(
-      ![...banned].some((pattern) => pattern.includes(own)),
-      `${own} is a CodeStory identifier and must not be banned, got: ${[...banned].join(", ")}`,
-    );
-  }
 });
 
-test("tasks about other repositories still ban their symbols", () => {
-  // The guard against over-firing: if the self-subject rule ever matched every task,
-  // the lint would report nothing and pass silently. These come from foreign holdout
-  // manifests and must survive.
-  const banned = bannedPatternsOverProbeFixture();
-  assert.ok(banned.size > 0, "the lint reported no banned patterns at all");
-  for (const foreign of FOREIGN_IDENTIFIERS) {
-    assert.ok(
-      [...banned].some((pattern) => pattern.includes(foreign)),
-      `${foreign} belongs to a holdout repository and must stay banned, got: ${[...banned].join(", ")}`,
-    );
-  }
+test("crate-name derivation tolerates one outlier and rejects a foreign majority", () => {
+  const checkedIn = fs.readdirSync(path.join(repositoryRoot, "crates"), {
+    withFileTypes: true,
+  })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  assert.deepEqual(
+    [...deriveProductRepositoryNames(checkedIn, ["probe-vendor-shim"])],
+    ["codestory"],
+  );
+  const crowded = Array.from({ length: 12 }, (_, index) => `store-${index}`);
+  assert.throws(
+    () => deriveProductRepositoryNames(checkedIn, crowded),
+    /cannot be derived/u,
+  );
 });
 
-/// Run the lint with one extra task manifest, additively, and report the banned
-/// patterns over a production tree of our choosing. The extra root never touches
-/// the checked-in corpus every other run reads.
-function bannedPatternsWithExtraTask(task) {
-  const root = mkdtempSync(path.join(os.tmpdir(), "generalization-lint-"));
-  try {
-    const taskRoot = path.join(root, "tasks");
-    const scanRoot = path.join(root, "src");
-    mkdirSync(taskRoot);
-    mkdirSync(scanRoot);
-    writeFileSync(path.join(taskRoot, "probe.task.json"), JSON.stringify(task));
-    writeFileSync(path.join(scanRoot, "probe.rs"), "pub fn probe() {}\n");
-    const dumpPath = path.join(root, "patterns.json");
-    try {
-      execFileSync(
-        process.execPath,
-        [path.join(repositoryRoot, "scripts/lint-retrieval-generalization.mjs")],
-        {
-          cwd: repositoryRoot,
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS: scanRoot,
-            CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS: taskRoot,
-            CODESTORY_RETRIEVAL_GENERALIZATION_DUMP_PATTERNS: dumpPath,
-          },
-        },
-      );
-    } catch (error) {
-      throw new Error(`lint failed to dump patterns: ${error.stderr ?? error}`);
-    }
-    return JSON.parse(readFileSync(dumpPath, "utf8"));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-test("a holdout named after one of our crates is not mistaken for this repository", () => {
-  // The self-subject rule decides which tasks may not contribute symbol bans.
-  // Deciding it on any crate-name token would hand that exemption to a holdout
-  // repository called `store`, `runtime`, or `bench` and switch this lint off
-  // for it silently. Only this repository's own name may claim the exemption.
-  for (const impostor of ["store", "runtime", "bench", "indexer"]) {
-    const { derived } = bannedPatternsWithExtraTask({
-      id: `${impostor}-probe-task`,
-      repo: { name: impostor, url: `https://github.com/example/${impostor}.git` },
-      prompt: "Explain how the probe repository handles its own requests end to end.",
-      expected_symbols: [
-        { name: "probeGadgetHandler", path: "src/probe_gadget.rs", kind: "function" },
-      ],
-    });
-    assert.ok(
-      derived.some((pattern) => pattern.includes("probeGadgetHandler")),
-      `a holdout named \`${impostor}\` must still ban its own symbols`,
-    );
-  }
+test("prompt corpus parsing fails closed on one dynamic entry", () => {
+  assert.throws(
+    () => parseBenchmarkPromptLiterals(`
+const PUBLIC_REPOS = {
+  alphaprobe: { prompt: "first benchmark prompt remains a static literal for the guard" },
+  betaprobe: { prompt: buildPromptAtRuntime() },
+};
+const ALL_REPOS = { ...PUBLIC_REPOS };
+`),
+    /discovered 2 prompt properties but parsed 1 literal prompts/u,
+  );
 });
 
-test("this repository's own name still claims the self-subject exemption", () => {
-  const { derived } = bannedPatternsWithExtraTask({
-    id: "codestory-probe-task",
-    repo: { name: "codestory", url: "https://github.com/TheGreenCedar/CodeStory.git" },
-    prompt: "Explain how the probe repository handles its own requests end to end.",
-    expected_symbols: [
-      { name: "probeGadgetHandler", path: "src/probe_gadget.rs", kind: "function" },
-    ],
-  });
-  assert.ok(
-    !derived.some((pattern) => pattern.includes("probeGadgetHandler")),
-    "a task whose subject is this repository must not ban this repository's symbols",
+test("ranker production has no repository filename literals", () => {
+  const rankerPath = path.join(
+    repositoryRoot,
+    "crates/codestory-retrieval/src/ranker.rs",
+  );
+  const source = fs.readFileSync(rankerPath, "utf8");
+  const production = source.split("#[cfg(test)]", 1)[0];
+  const finding = production.split(/\r?\n/u)
+    .map((line, index) => ({ line: index + 1, token: rankerFilenameLiteral(line) }))
+    .find(({ token }) => token != null);
+  assert.equal(
+    finding,
+    undefined,
+    `ranker production contains a repository filename literal: ${JSON.stringify(finding)}`,
   );
 });

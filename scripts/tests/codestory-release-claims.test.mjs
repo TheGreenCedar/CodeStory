@@ -159,6 +159,29 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
 });
 
+test("benchmark leakage names only the one-process Node contract", () => {
+  const benchmarkLeakage = graph.failure_controls
+    .find(({ id }) => id === "benchmark_leakage");
+  assert.equal(
+    benchmarkLeakage.command,
+    "node --test scripts/tests/lint-retrieval-generalization.test.mjs",
+  );
+
+  for (const command of [
+    "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard",
+    "node scripts/lint-retrieval-generalization.mjs",
+  ]) {
+    const mutated = structuredClone(graph);
+    mutated.failure_controls
+      .find(({ id }) => id === "benchmark_leakage")
+      .command = command;
+    assert.throws(
+      () => validateReleaseClaimGraph(mutated),
+      /failure control benchmark_leakage must be exactly node --test scripts\/tests\/lint-retrieval-generalization\.test\.mjs/u,
+    );
+  }
+});
+
 test("public support, assets, and release notes derive from the package and closeout graph", () => {
   assert.doesNotThrow(() => validatePublicSupportDocuments(graph, root));
   assert.deepEqual(
