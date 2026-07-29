@@ -325,10 +325,25 @@ function conditionIsSatisfiable(condition, bindings, extraDomains) {
     : { satisfiable: false, reason: "no caller dispatch satisfies the condition" };
 }
 
-function requireNoCalibrationReferences(violations, file, workflow) {
+function requireNoCalibrationReferences(
+  violations,
+  file,
+  workflow,
+  allowedSteps = [],
+) {
+  const inspected = structuredClone(workflow);
+  for (const [jobName, job] of Object.entries(object(inspected.jobs))) {
+    if (!Array.isArray(job.steps)) continue;
+    job.steps = job.steps.filter(
+      step => !allowedSteps.some(
+        ([allowedJob, allowedName]) =>
+          allowedJob === jobName && allowedName === object(step).name,
+      ),
+    );
+  }
   add(
     violations,
-    !JSON.stringify(workflow).toLowerCase().includes("calibration"),
+    !JSON.stringify(inspected).toLowerCase().includes("calibration"),
     `${file} standard release path must not reference calibration`,
   );
 }
@@ -1952,7 +1967,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     at(release, "on", "workflow_dispatch", "inputs", "publish_release") === undefined,
     `${releaseFile} workflow_dispatch must not expose publication authority`,
   );
-  requireNoCalibrationReferences(violations, releaseFile, release);
+  const releaseLineageStepName = "Verify release-head calibration lineage";
+  add(
+    violations,
+    release.env === undefined && release.defaults === undefined,
+    `${releaseFile} release workflow must not override the release-head calibration execution environment`,
+  );
+  requireNoCalibrationReferences(
+    violations,
+    releaseFile,
+    release,
+    [["preflight", releaseLineageStepName]],
+  );
   const policy = requireJob(violations, releaseFile, release, "workflow-policy");
   // The reuse-binding contracts resolve real release commits, which a depth-1
   // clone does not carry: it answered only while the referenced commit happened
@@ -1986,6 +2012,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
+  add(
+    violations,
+    hasExactKeys(
+      preflight,
+      ["name", "needs", "runs-on", "timeout-minutes", "outputs", "steps"],
+    )
+      && preflight.name === "Release preflight"
+      && preflight["runs-on"] === "ubuntu-latest"
+      && preflight["timeout-minutes"] === 10,
+    `${releaseFile} preflight must retain the exact trusted job environment`,
+  );
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
   requireStepRun(violations, releaseFile, preflight, "Validate release authority", [
     'if [ "$PUBLISH_RELEASE" = "true" ]; then',
@@ -2000,6 +2037,52 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     'repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next',
     "dev/codestory-next moved from proved head",
   ]);
+  const releaseLineage = namedStep(preflight, releaseLineageStepName);
+  add(
+    violations,
+    preflight.if === undefined
+      && preflight["continue-on-error"] === undefined
+      && hasExactKeys(
+        releaseLineage,
+        ["name", "env", "shell", "working-directory", "run"],
+      )
+      && hasExactKeys(object(releaseLineage?.env), ["BASH_ENV"])
+      && object(releaseLineage?.env).BASH_ENV === "/dev/null"
+      && releaseLineage?.shell === "/bin/bash --noprofile --norc -e -o pipefail {0}"
+      && releaseLineage?.["working-directory"] === "${{ github.workspace }}",
+    `${releaseFile} release-head calibration lineage must be unconditional and fail closed`,
+  );
+  add(
+    violations,
+    sameStrings(
+      nonCommentLines(releaseLineage?.run),
+      [
+        "/usr/bin/python3 -E -s "
+          + '"$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py" '
+          + '--repo "$GITHUB_WORKSPACE" --expected-sha "$GITHUB_SHA"',
+      ],
+    ),
+    `${releaseFile} release-head calibration lineage must use the pinned interpreter on the exact release checkout`,
+  );
+  const preflightCheckout = namedStep(preflight, "Checkout");
+  add(
+    violations,
+    hasExactKeys(preflightCheckout, ["name", "uses", "with"])
+      && preflightCheckout?.uses === "actions/checkout@v5"
+      && hasExactKeys(object(preflightCheckout?.with), ["fetch-depth"])
+      && object(preflightCheckout?.with)["fetch-depth"] === 0,
+    `${releaseFile} preflight checkout must retain the exact trusted shape`,
+  );
+  add(
+    violations,
+    stepIndex(preflight, "Checkout") === 0
+      && stepIndex(preflight, releaseLineageStepName) === 1
+      && stepIndex(preflight, releaseLineageStepName)
+        < stepIndex(preflight, "Validate release authority")
+      && stepIndex(preflight, releaseLineageStepName)
+        < stepIndex(preflight, "Verify release version"),
+    `${releaseFile} release-head calibration lineage must run immediately after checkout and before other release work`,
+  );
   requireStepRun(violations, releaseFile, preflight, "Validate versioned changelog notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     '--version "$VERSION"',
