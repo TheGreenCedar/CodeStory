@@ -114,11 +114,23 @@
     },
     "native_reuse": "version_only_delta",
     "reuse": {
+      "equation": "Reuse anchors a row to the earlier run and commit it was produced by, so the commit identity is read at the release commit for every binding. Any further identity a reused row would otherwise be held to is checked as written unless the binding declares it below. A binding may declare an identity key only when the binding's own construction determines that key for the evidence being inherited, and an equated key is never dropped: the reused row must still carry the reused commit's own value for it, which the binding is what makes admissible in place of this release's.",
       "bindings": {
-        "source_tree": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
-        "native_fingerprint": "Accelerator evidence from the previous published release is admissible when the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited."
+        "source_tree": {
+          "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
+          "equates": []
+        },
+        "native_fingerprint": {
+          "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The fingerprint covers every input that determines the native binary -- crates/**, Cargo.lock, vendor/**, the packaging scripts and the toolchain pins, with the version stamp normalized away -- so an equal fingerprint means the accelerator this evidence exercised is built from identical inputs. The source tree is what that evidence's identity would otherwise be standing in for, and here it is the one thing the two commits are known to differ in, in non-native code the accelerator never runs. Nothing else is equated: the fingerprint says nothing about which repository, which packaged bytes, which host, or which version produced the row, so those stay checked as written."
+            }
+          ]
+        }
       },
-      "verification": "The trusted producer map verifies the binding, the reused run's job success, artifact expiry, and container digest exactly as same-run evidence, and records the reused run, commit, and binding value in the ledger."
+      "verification": "The trusted producer map verifies the binding, the reused run's job success, artifact expiry, and container digest exactly as same-run evidence, and records the reused run, commit, and binding value in the ledger. The closeout re-proves the binding against its own checkout, and re-derives the reused commit's own value for every equated identity, before it reads any reused row at the release identity."
     }
   },
   "exception_policy": {
