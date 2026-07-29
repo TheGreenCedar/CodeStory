@@ -426,3 +426,25 @@ jobs:
           path: target/release-cells/source_behavior.json
           if-no-files-found: error
           retention-days: 30
+
+  retrieval-generalization:
+    name: retrieval-generalization
+    needs: resolve
+    if: needs.resolve.outputs.reuse != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Generalization lint (production paths)
+        run: node scripts/lint-retrieval-generalization.mjs
+
+      - name: Generalization lint hostile matrix
+        run: node --test scripts/tests/lint-retrieval-generalization.test.mjs

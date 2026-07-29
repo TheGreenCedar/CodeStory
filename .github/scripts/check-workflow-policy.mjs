@@ -572,6 +572,9 @@ const retrievalProducerTriggerPaths = [
   "vendor/**/Cargo.toml",
   ".github/scripts/install-windows-vulkan-sdk.ps1",
   ".github/workflows/rust-ci.yml",
+  "scripts/lint-retrieval-generalization.mjs",
+  "scripts/lib/retrieval-generalization-lint.mjs",
+  "scripts/tests/lint-retrieval-generalization.test.mjs",
 ];
 const windowsVulkanInstaller = ".github/scripts/install-windows-vulkan-sdk.ps1";
 const windowsNativeGenerator = "Ninja";
@@ -803,12 +806,45 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
   const workflow = object(workflowValue);
   const triggers = object(workflow.on);
   const job = object(at(workflow, "jobs", "windows-manifest-missing"));
+  const linux = object(at(workflow, "jobs", "linux-contracts"));
   const steps = list(job.steps).map(object);
 
   add(
     violations,
     hasExactKeys(workflow.jobs, ["linux-contracts", "windows-manifest-missing"]),
     "Windows manifest proof workflow must contain exactly linux-contracts and windows-manifest-missing jobs",
+  );
+  const nodeSetup = list(linux.steps).map(object)
+    .find((step) => step.uses === "actions/setup-node@v5");
+  add(
+    violations,
+    object(nodeSetup?.with)["node-version"] === "24"
+      && object(nodeSetup?.with)["package-manager-cache"] === false
+      && nodeSetup?.["continue-on-error"] === undefined,
+    "retrieval generalization producer must use blocking Node 24 without a package-manager cache",
+  );
+  for (const [name, command] of [
+    ["Generalization lint (production paths)", "node scripts/lint-retrieval-generalization.mjs"],
+    [
+      "Generalization lint hostile matrix",
+      "node --test scripts/tests/lint-retrieval-generalization.test.mjs",
+    ],
+  ]) {
+    const step = namedStep(linux, name);
+    add(
+      violations,
+      sameStrings(nonCommentLines(step?.run), [command])
+        && step?.["continue-on-error"] === undefined
+        && step?.if === undefined,
+      `retrieval generalization producer ${name} must run its exact blocking Node command`,
+    );
+  }
+  add(
+    violations,
+    !scalarStrings(linux).some((value) =>
+      value.includes("cargo test --locked -p codestory-runtime --test retrieval_generalization_guard")
+    ),
+    "retrieval generalization producer must not restore the serialized Rust subprocess wrapper",
   );
   add(
     violations,
@@ -1638,8 +1674,87 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "--ref $head_ref",
     ]);
     requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
+    requireStepRun(violations, sourceFile, resolve, "Reuse a completed gate for this exact head", [
+      '.path == ".github/workflows/source-proof.yml"',
+      '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
+      '.name == "full-source-gate" and .conclusion == "success"',
+    ]);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
+    add(
+      violations,
+      full.if === "needs.resolve.outputs.reuse != 'true'",
+      `${sourceFile} full source gate may skip only a completed exact-head proof`,
+    );
+    const generalization = requireJob(
+      violations,
+      sourceFile,
+      source,
+      "retrieval-generalization",
+    );
+    add(
+      violations,
+      hasExactKeys(generalization, [
+        "name",
+        "needs",
+        "if",
+        "runs-on",
+        "timeout-minutes",
+        "steps",
+      ]),
+      `${sourceFile} retrieval generalization job must keep its exact blocking shape`,
+    );
+    add(
+      violations,
+      generalization.name === "retrieval-generalization"
+        && sameMembers(needs(generalization), ["resolve"])
+        && generalization.if === "needs.resolve.outputs.reuse != 'true'"
+        && generalization["runs-on"] === "ubuntu-latest"
+        && generalization["timeout-minutes"] === 5
+        && generalization["continue-on-error"] === undefined,
+      `${sourceFile} retrieval generalization job must run in parallel on the resolved exact head`,
+    );
+    const generalizationSteps = list(generalization.steps).map(object);
+    add(
+      violations,
+      generalizationSteps.length === 4,
+      `${sourceFile} retrieval generalization job must contain exactly checkout, Node, smoke, and matrix steps`,
+    );
+    const generalizationCheckout = generalizationSteps[0];
+    add(
+      violations,
+      generalizationCheckout?.uses === "actions/checkout@v5"
+        && hasExactKeys(generalizationCheckout, ["uses", "with"])
+        && object(generalizationCheckout?.with).ref === "${{ needs.resolve.outputs.ref }}"
+        && generalizationCheckout?.["continue-on-error"] === undefined,
+      `${sourceFile} retrieval generalization must check out the resolved exact ref`,
+    );
+    const generalizationNode = generalizationSteps[1];
+    add(
+      violations,
+      generalizationNode?.uses === "actions/setup-node@v5"
+        && hasExactKeys(generalizationNode, ["uses", "with"])
+        && object(generalizationNode?.with)["node-version"] === "24"
+        && object(generalizationNode?.with)["package-manager-cache"] === false
+        && generalizationNode?.["continue-on-error"] === undefined,
+      `${sourceFile} retrieval generalization must use blocking Node 24 without a package-manager cache`,
+    );
+    for (const [name, command] of [
+      ["Generalization lint (production paths)", "node scripts/lint-retrieval-generalization.mjs"],
+      [
+        "Generalization lint hostile matrix",
+        "node --test scripts/tests/lint-retrieval-generalization.test.mjs",
+      ],
+    ]) {
+      const step = namedStep(generalization, name);
+      add(
+        violations,
+        sameStrings(nonCommentLines(step?.run), [command])
+          && hasExactKeys(step, ["name", "run"])
+          && step?.["continue-on-error"] === undefined,
+        `${sourceFile} retrieval generalization ${name} must run its exact blocking Node command`,
+      );
+    }
     add(
       violations,
       object(source.env).SCCACHE_VERSION === sccacheVersion
@@ -2148,6 +2263,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "merge-base --is-ancestor",
     "full-source-gate",
     '.path == ".github/workflows/source-proof.yml"',
+    '.head_repository.full_name == $repo and .conclusion == "success"',
   ]);
   const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
@@ -3729,6 +3845,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',
+    '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
     '.name == "full-source-gate" and .conclusion == "success"',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [

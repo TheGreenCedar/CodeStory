@@ -580,7 +580,7 @@
       "id": "benchmark_leakage",
       "claim": "answer_quality",
       "control": "negative_gate",
-      "command": "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard"
+      "command": "node --test scripts/tests/lint-retrieval-generalization.test.mjs"
     }
   ],
   "closeout": {
