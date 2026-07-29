@@ -153,6 +153,10 @@ jobs:
               echo "::error::Calibration collection does not consume prior proof artifacts."
               exit 1
             fi
+          elif [ "$mode" = "qualification" ]; then
+            test -z "$INPUT_SOURCE_RUN_ID"
+            test -n "$INPUT_CALIBRATION_ARTIFACT"
+            test -n "$INPUT_CALIBRATION_RUN_ID"
           fi
           {
             echo "head_sha=$current_head"
@@ -264,17 +268,6 @@ jobs:
           python .github/scripts/check-codestory-release.py --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  calibration-linux:
-    if: needs.route.outputs.mode == 'calibration'
-    needs: route
-    uses: ./.github/workflows/packaged-platform-proof.yml
-    with:
-      version: ${{ needs.route.outputs.version }}
-      ref: ${{ needs.route.outputs.head_sha }}
-      scope: full
-      proof_key: calibration-linux-${{ needs.route.outputs.head_sha }}
-      calibration_mode: true
-
   calibration-macos:
     if: needs.route.outputs.mode == 'calibration'
     needs: route
@@ -291,11 +284,9 @@ jobs:
       always() &&
       needs.route.result == 'success' &&
       needs.route.outputs.mode == 'calibration' &&
-      needs.calibration-linux.result == 'success' &&
       needs.calibration-macos.result == 'success'
     needs:
       - route
-      - calibration-linux
       - calibration-macos
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -305,12 +296,6 @@ jobs:
         with:
           ref: ${{ needs.route.outputs.head_sha }}
           fetch-depth: 0
-
-      - name: Download hosted Linux calibration runs
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: embedding-calibration-linux-${{ needs.route.outputs.version }}
-          path: target/calibration-inputs/linux
 
       - name: Download protected macOS calibration runs
         uses: actions/download-artifact@v8.0.1
@@ -326,11 +311,11 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
           mapfile -t runs < <(
-            find target/calibration-inputs -type f \
+            find target/calibration-inputs/macos -type f \
               \( -name 'run-1.json' -o -name 'run-2.json' -o -name 'run-3.json' \) \
               -print | sort
           )
-          test "${#runs[@]}" = 6
+          test "${#runs[@]}" = 3
           run_args=()
           for run in "${runs[@]}"; do
             run_args+=(--calibration-run "$run")
@@ -365,8 +350,8 @@ jobs:
             --arg source_head_sha "$EXPECTED_HEAD_SHA" \
             --arg producer_run_id "$GITHUB_RUN_ID" \
             '.selection_source.commit == $source_head_sha
-             and .run_count == 6
-             and .matrix_cell_count == 2
+             and .run_count == 3
+             and .matrix_cell_count == 1
              and .producer_run_id == $producer_run_id' \
             target/calibration-freeze/manifest.json >/dev/null
 
@@ -417,7 +402,6 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
       hermetic_linux: ${{ needs.route.outputs.mode == 'qualification' }}
-      quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
 
@@ -440,9 +424,9 @@ jobs:
       quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
-      candidate_installed_proof: true
+      candidate_installed_proof: ${{ needs.route.outputs.mode != 'qualification' }}
       candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
-      server_behavior_only: true
+      server_behavior_only: ${{ needs.route.outputs.mode != 'qualification' }}
 
   windows-vulkan-proof:
     if: >-
@@ -450,22 +434,24 @@ jobs:
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
       needs.route.outputs.mode != 'package' &&
+      (needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success') &&
       (needs.route.outputs.scope == 'windows' || needs.route.outputs.scope == 'full')
     needs:
       - route
       - packaged-proof
+      - macos-metal-proof
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
-      quality_evidence_artifact: ""
+      quality_evidence_artifact: ${{ needs.route.outputs.mode == 'qualification' && format('frozen-candidate-quality-{0}', needs.route.outputs.head_sha) || '' }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
-      candidate_installed_proof: true
+      candidate_installed_proof: ${{ needs.route.outputs.mode != 'qualification' }}
       candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
-      server_behavior_only: true
+      server_behavior_only: ${{ needs.route.outputs.mode != 'qualification' }}
 
   linux-vulkan-proof:
     if: >-
@@ -473,6 +459,7 @@ jobs:
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
       needs.route.outputs.mode != 'package' &&
+      needs.route.outputs.mode != 'qualification' &&
       (needs.route.outputs.scope == 'linux' || needs.route.outputs.scope == 'full')
     needs:
       - route
@@ -556,7 +543,11 @@ jobs:
             else
               require_result "$METAL_RESULT" success macos-metal-proof
               require_result "$WINDOWS_VULKAN_RESULT" success windows-vulkan-proof
-              require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+              if [ "$MODE" = qualification ]; then
+                require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+              else
+                require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+              fi
             fi
           fi
           if [ "$MODE" = integration ]; then

@@ -22,6 +22,7 @@ from .measurement_constant_selection import (
 )
 from .measurement_protocol_validation import (
     _measurement_document,
+    _verify_calibration_sampling,
     _verify_measurement_matrices,
     _verify_measurement_sampling,
     _verify_scenario_and_metric_contracts,
@@ -33,6 +34,7 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     required_metrics, metric_contracts = _verify_scenario_and_metric_contracts(protocol)
     _verify_measurement_matrices(protocol)
     _verify_measurement_sampling(protocol, required_metrics, metric_contracts)
+    _verify_calibration_sampling(protocol, required_metrics)
     _verify_constant_selection(protocol)
     _verify_thresholds_and_clock(protocol)
     return protocol, sha256(path)

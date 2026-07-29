@@ -156,8 +156,8 @@ export function cacheProvenanceBlockers(result) {
   if (!provenance.embedding_engine_instance_id && !packetExecutionProven) {
     reasons.push("missing CodeStory embedding engine identity");
   }
-  if (!["accelerated", "cpu_explicit"].includes(provenance.embedding_policy)) {
-    reasons.push(`CodeStory embedding policy=${provenance.embedding_policy ?? "unknown"}; expected accelerated or cpu_explicit`);
+  if (provenance.embedding_policy !== "accelerated") {
+    reasons.push(`CodeStory embedding policy=${provenance.embedding_policy ?? "unknown"}; expected accelerated`);
   }
   if (provenance.semantic_backend == null) {
     reasons.push("missing CodeStory semantic backend");
@@ -201,8 +201,8 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
   if (proof.embedding_engine !== "process_shared") {
     reasons.push(`cold packet embedding engine=${proof.embedding_engine ?? "unknown"}; expected process_shared`);
   }
-  if (!["accelerated", "cpu_explicit"].includes(proof.embedding_policy)) {
-    reasons.push(`cold packet embedding policy=${proof.embedding_policy ?? "unknown"}; expected accelerated or cpu_explicit`);
+  if (proof.embedding_policy !== "accelerated") {
+    reasons.push(`cold packet embedding policy=${proof.embedding_policy ?? "unknown"}; expected accelerated`);
   }
   if (proof.retrieval_mode !== "full") {
     reasons.push(`cold packet retrieval mode=${proof.retrieval_mode ?? "unknown"}; expected full`);

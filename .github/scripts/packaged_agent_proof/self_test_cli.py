@@ -7,10 +7,9 @@ import tempfile
 from pathlib import Path
 
 from .archive_proof import claim_scope, load_calibration_bundle, requires_calibration_bundle
-from .cli import _resolve_optional_paths
+from .cli import _resolve_optional_paths, _validate_calibration_mode
 from .contract_primitives import write_json
 from .foundation import ProofFailure, require
-from .qualification_recording import record_calibration_qualification
 
 
 def run_cli_self_tests() -> None:
@@ -27,10 +26,21 @@ def run_cli_self_tests() -> None:
             publication_fault_evidence=None,
             retrieval_quality_evidence=None,
             calibration_bundle=None,
-            calibration_run_output=None,
+            collect_constant_calibration=False,
+            constant_calibration_output_dir=None,
             installed_plugin_attestation=attestation,
             installed_plugin_data=None,
+            out_dir=root / "proof",
             proof_tier="installed_runtime",
+            engine_policy="accelerated",
+            expected_backend="metal",
+            offline=True,
+            project=None,
+            plugin_root=None,
+            plugin_handoff=False,
+            additional_project=[],
+            additional_query=[],
+            produce_qualification_evidence=False,
             ground_only=True,
             server_behavior_only=False,
             version_only=False,
@@ -92,19 +102,57 @@ def run_cli_self_tests() -> None:
         args.enforce_calibration_freeze_lineage = False
         args.server_behavior_only = False
 
-        calibration = root / "calibration.json"
-        write_json(
-            calibration,
-            {
-                "schema_version": 1,
-                "status": "calibration",
-                "tier": "calibration",
-            },
-        )
-        args.qualification_evidence = calibration
-        summary: dict[str, object] = {}
-        record_calibration_qualification(args, summary)
-        require(
-            summary["qualification"]["status"] == "calibration",
-            "calibration qualification was not recorded",
-        )
+        calibration_args = argparse.Namespace(**vars(args))
+        calibration_args.proof_tier = "calibration"
+        calibration_args.ground_only = False
+        calibration_args.server_behavior_only = False
+        try:
+            _validate_calibration_mode(calibration_args)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "calibration tier reached the full qualification path without its collector"
+            )
+        calibration_args.collect_constant_calibration = True
+        calibration_args.constant_calibration_output_dir = root / "constant-runs"
+        calibration_args.qualification_driver = attestation
+        _validate_calibration_mode(calibration_args)
+        calibration_args.produce_qualification_evidence = True
+        try:
+            _validate_calibration_mode(calibration_args)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "constant calibration accepted a full qualification producer"
+            )
+        calibration_args.produce_qualification_evidence = False
+        calibration_args.plugin_handoff = True
+        try:
+            _validate_calibration_mode(calibration_args)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "constant calibration accepted packaged plugin handoff"
+            )
+        calibration_args.plugin_handoff = False
+        calibration_args.plugin_root = attestation
+        try:
+            _validate_calibration_mode(calibration_args)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "constant calibration accepted a packaged plugin root"
+            )
+        calibration_args.plugin_root = None
+        calibration_args.engine_policy = "cpu_explicit"
+        calibration_args.expected_backend = "cpu"
+        try:
+            _validate_calibration_mode(calibration_args)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("constant calibration accepted CPU execution")

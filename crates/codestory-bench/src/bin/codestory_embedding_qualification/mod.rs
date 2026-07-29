@@ -12,13 +12,16 @@ use scenarios::artifact::{ScenarioContext, run_measurements, run_scenario};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod constant_calibration;
 mod output;
 mod request;
 mod scenarios;
 
 const DIAGNOSTIC_SCENARIO_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIAGNOSTIC_SCENARIO";
 
-pub(super) fn run(cli: PathBuf, request_path: PathBuf, output_path: PathBuf) -> Result<()> {
+pub use constant_calibration::run as run_constant_calibration;
+
+pub fn run(cli: PathBuf, request_path: PathBuf, output_path: PathBuf) -> Result<()> {
     let validated = request::load(cli, &request_path, &output_path)?;
     let request::ValidatedRequest {
         request,
@@ -44,6 +47,7 @@ pub(super) fn run(cli: PathBuf, request_path: PathBuf, output_path: PathBuf) -> 
             qualification_runtime: &request.runtime,
             output_directory: &output_directory,
             nonce_sha256: &nonce_sha256,
+            worker_nonce: None,
             executable: &executable,
         })
         .context("run diagnostic embedding qualification scenario worker_stall")?;
@@ -61,6 +65,7 @@ pub(super) fn run(cli: PathBuf, request_path: PathBuf, output_path: PathBuf) -> 
         qualification_runtime: &request.runtime,
         output_directory: &output_directory,
         nonce_sha256: &nonce_sha256,
+        worker_nonce: None,
         executable: &executable,
     })
     .context("run embedding qualification measurements")?;
@@ -82,6 +87,7 @@ pub(super) fn run(cli: PathBuf, request_path: PathBuf, output_path: PathBuf) -> 
             qualification_runtime: &request.runtime,
             output_directory: &output_directory,
             nonce_sha256: &nonce_sha256,
+            worker_nonce: None,
             executable: &executable,
         })
         .with_context(|| format!("run named embedding qualification scenario {scenario}"))?;

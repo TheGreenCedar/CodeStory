@@ -13,29 +13,8 @@ from .calibration_records import (
     _calibration_sample,
     _record_calibration_durations,
 )
-from .contract_primitives import (
-    require_exact_keys,
-    require_nonnegative_int,
-    require_positive_int,
-)
+from .contract_primitives import require_exact_keys, require_nonnegative_int, require_positive_int
 from .foundation import require
-
-
-def _aggregate_calibration_values(
-    aggregation: str,
-    values: list[float | int],
-) -> float | int:
-    if aggregation == "maximum":
-        return max(values)
-    if aggregation == "minimum":
-        return min(values)
-    if aggregation == "exact":
-        return values[0]
-    require(
-        aggregation == "all_rows_pass_rate",
-        f"unknown calibration aggregation {aggregation}",
-    )
-    return sum(values) / len(values)
 
 
 def _calibration_metric_value(
@@ -55,9 +34,10 @@ def _calibration_metric_value(
         f"{field} used the wrong unit",
     )
     samples = record["samples"]
-    policy = bundle.protocol["metric_sampling"][metric]
+    policy = bundle.protocol["calibration_metric_sampling"][metric]
     require(
-        isinstance(samples, list) and len(samples) == policy["sample_count"],
+        isinstance(samples, list)
+        and len(samples) == policy["sample_count_per_run"] == 1,
         f"{field} sample count changed",
     )
     normalized = [
@@ -72,14 +52,6 @@ def _calibration_metric_value(
         )
         for index, sample in enumerate(samples)
     ]
-    identities = [sample.identity for sample in normalized]
-    if policy.get("independence") == "distinct_server_instance_per_sample":
-        require(
-            len({identity[:2] for identity in identities}) == len(normalized),
-            f"{field} samples are not independent",
-        )
-    else:
-        require(len(set(identities)) == 1, f"{field} changed server identity")
     for sample in normalized:
         _record_calibration_durations(
             metric,
@@ -87,10 +59,7 @@ def _calibration_metric_value(
             field=field,
             accumulator=accumulator,
         )
-    return _aggregate_calibration_values(
-        policy["aggregation"],
-        [sample.value for sample in normalized],
-    )
+    return normalized[0].value
 
 
 def _verified_calibration_runs(
@@ -123,6 +92,24 @@ def _verified_calibration_runs(
     require(
         accumulator.observed_run_cells == accumulator.expected_run_cells,
         "calibration bundle does not exactly cover every matrix cell three times",
+    )
+    require(
+        set(accumulator.server_identities_by_run) == accumulator.expected_run_cells
+        and set(accumulator.materialization_reused_by_run)
+        == accumulator.expected_run_cells
+        and all(
+            len(identities) == 1
+            for identities in accumulator.server_identities_by_run.values()
+        ),
+        "each calibration run must use exactly one fresh server generation",
+    )
+    run_identities = [
+        next(iter(accumulator.server_identities_by_run[run_cell]))
+        for run_cell in sorted(accumulator.expected_run_cells)
+    ]
+    require(
+        len(set(run_identities)) == len(run_identities),
+        "calibration clean runs reused a server generation",
     )
     packages = accumulator.packages_by_cell.values()
     require(
@@ -168,16 +155,55 @@ def _selected_calibration_constants(
         query_floor,
         math.ceil(max(durations["query_request_duration"]) * 1.50),
     )
-    replay = max(query, math.ceil(max(durations["bulk_request_duration"]) * 1.50))
-    retry = max(1, math.floor(min(durations["capacity_condition_duration"]) * 0.50))
+    replay_floor = require_positive_int(
+        formulas["request_deadlines_ms"]["bulk_request_deadline_ms"][
+            "replay_success_budget_slow_host_floor_ms"
+        ],
+        "bulk replay success slow-host floor",
+    )
+    retry_floor = require_positive_int(
+        formulas["capacity_retry_policy"]["retry_after_slow_host_floor_ms"],
+        "capacity retry slow-host floor",
+    )
+    initial_floor = require_positive_int(
+        formulas["election_backoff_policy"]["initial_backoff_slow_host_floor_ms"],
+        "election initial-backoff slow-host floor",
+    )
+    maximum_floor = require_positive_int(
+        formulas["election_backoff_policy"]["maximum_backoff_slow_host_floor_ms"],
+        "election maximum-backoff slow-host floor",
+    )
+    hard_floor = require_positive_int(
+        formulas["hard_native_no_progress_ms"]["slow_host_floor_ms"],
+        "native no-progress slow-host floor",
+    )
+    cadence_floor = require_positive_int(
+        formulas["watchdog_cadence_ms"]["slow_host_floor_ms"],
+        "watchdog cadence slow-host floor",
+    )
+    replay = max(
+        replay_floor,
+        query,
+        math.ceil(max(durations["bulk_request_duration"]) * 1.50),
+    )
+    retry = max(
+        retry_floor,
+        math.floor(min(durations["capacity_condition_duration"]) * 0.50),
+    )
     initial = max(
-        1, math.ceil(max(durations["existing_owner_connect_duration"]) * 0.50)
+        initial_floor,
+        math.ceil(max(durations["existing_owner_connect_duration"]) * 0.50),
     )
     maximum = max(
-        initial, math.ceil(max(durations["spawn_convergence_duration"]) * 0.25)
+        maximum_floor,
+        initial,
+        math.ceil(max(durations["spawn_convergence_duration"]) * 0.25),
     )
-    hard = max(1, math.ceil(max(durations["successful_operation_duration"]) * 4.00))
-    cadence = max(1, math.floor(hard / 20))
+    hard = max(
+        hard_floor,
+        math.ceil(max(durations["successful_operation_duration"]) * 4.00),
+    )
+    cadence = max(cadence_floor, math.floor(hard / 20))
     return {
         "connect_timeout_ms": connect,
         "spawn_convergence_timeout_ms": spawn,
@@ -202,25 +228,3 @@ def _selected_calibration_constants(
         "hard_native_no_progress_ms": hard,
         "watchdog_cadence_ms": cadence,
     }
-
-
-def _selected_calibration_thresholds(
-    values_by_metric: dict[str, list[float | int]],
-    metric_contracts: dict,
-) -> dict[str, float | int]:
-    thresholds: dict[str, float | int] = {}
-    for metric, values in values_by_metric.items():
-        comparison = metric_contracts[metric]["comparison"]
-        if comparison == "less_than_or_equal":
-            threshold: float | int = math.ceil(max(values) * 1.20)
-        elif comparison == "greater_than_or_equal":
-            threshold = math.floor(min(values) * 0.80)
-        else:
-            require(
-                len(set(values)) == 1,
-                f"calibration equal metric {metric} did not have one exact observed value",
-            )
-            threshold = values[0]
-        thresholds[metric] = threshold
-    thresholds["retrieval_quality"] = 1.0
-    return thresholds

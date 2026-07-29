@@ -19,7 +19,7 @@ const RUNTIME_ENV_KEYS: &[&str] = &[
     "CODESTORY_RETRIEVAL_RUN_ID",
     "CI",
     "GITHUB_ACTIONS",
-    "CODESTORY_EMBED_ALLOW_CPU",
+    "CODESTORY_TEST_EMBED_ALLOW_CPU",
     "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
     "CODESTORY_SEMANTIC_DOC_SCOPE",
     "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
@@ -97,9 +97,9 @@ impl SidecarProfile {
 
 /// Fixed process embedding policy.
 ///
-/// All model, tokenizer, pooling, normalization, and backend selection inputs
-/// are compile-time product contracts. The sole runtime policy is whether an
-/// explicitly requested CPU engine is allowed.
+/// Product builds require an accelerated backend. The boolean remains in the
+/// internal contract only so test-support builds can exercise CPU-shaped
+/// failure and compatibility boundaries without making CPU a product mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingRuntimeConfig {
     pub allow_cpu: bool,
@@ -153,7 +153,14 @@ impl SidecarProcessDefaults {
     }
 
     pub fn embedding_allow_cpu(&self) -> bool {
-        default_flag(&self.runtime, "CODESTORY_EMBED_ALLOW_CPU", false)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            default_flag(&self.runtime, "CODESTORY_TEST_EMBED_ALLOW_CPU", false)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
     }
 
     pub fn with_cache_root(&self, cache_root: PathBuf) -> Self {
@@ -691,9 +698,9 @@ mod tests {
     }
 
     #[test]
-    fn process_defaults_capture_the_only_embedding_policy() {
+    fn test_support_process_defaults_capture_the_cpu_fixture_policy() {
         let root = tempfile::tempdir().expect("cache root");
-        let defaults = defaults(root.path(), &[("CODESTORY_EMBED_ALLOW_CPU", "1")]);
+        let defaults = defaults(root.path(), &[("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")]);
         let runtime = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
             None,
             SidecarProfile::Local,

@@ -258,6 +258,21 @@ const allowedHarnessReferences = [
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    "retrieval-engine-smoke.yml",
+    '"retrieval-engine-smoke.yml",',
+  ],
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    "node scripts/codestory-agent-ab-benchmark.mjs",
+    '"node scripts/codestory-agent-ab-benchmark.mjs",',
+  ],
+  [
+    path.join(".github", "workflows", "macos-metal-proof.yml"),
+    "node scripts/codestory-agent-ab-benchmark.mjs",
+    "node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli $packaged_cli --timeout-ms 180000 --out-dir $quality_root/packet",
+  ],
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/retrieval-engine-smoke.yml",
     '".github/workflows/retrieval-engine-smoke.yml",',
   ],
@@ -2608,6 +2623,14 @@ function harnessDependencyAllowed(prepared, line, pattern, occurrence) {
   );
 }
 
+function harnessPatternLineAllowed(prepared, line, pattern) {
+  return allowedHarnessReferences.some(({ relativePath, includes, use }) =>
+    allowedReferenceFileMatches(prepared.filePath, relativePath)
+    && allowedReferenceUseMatches(prepared, use, line.startLine, line.endLine)
+    && pattern.test(normalizeNativeSeparators(includes))
+  );
+}
+
 function compactHarnessDependencyAllowed(prepared, literals, marker) {
   const startLine = Math.min(...literals.map(({ line }) => line));
   const endLine = Math.max(...literals.map(({ line }) => line));
@@ -2642,7 +2665,13 @@ function allowedReferenceUseMatches(prepared, use, startLine, endLine) {
     && matches[0].endLine === endLine;
 }
 
-function scanProductionFile(prepared, patterns, combinedRe, segmentIdentifiers = false) {
+function scanProductionFile(
+  prepared,
+  patterns,
+  combinedRe,
+  segmentIdentifiers = false,
+  matchAllowed = () => false,
+) {
   const lines = prepared.logicalLines ?? prepared.lines.map((text, index) => ({
     text,
     startLine: index + 1,
@@ -2662,7 +2691,11 @@ function scanProductionFile(prepared, patterns, combinedRe, segmentIdentifiers =
     }
     for (const { pattern, re } of patterns) {
       const sourceLine = sourceLines[line.startLine - 1];
-      if (re.test(normalizedLine) && !lineAllowedForPattern(pattern, sourceLine)) {
+      if (
+        re.test(normalizedLine)
+        && !lineAllowedForPattern(pattern, sourceLine)
+        && !matchAllowed(line, re)
+      ) {
         if (!hitsByPattern.has(pattern)) {
           hitsByPattern.set(pattern, []);
         }
@@ -3347,6 +3380,8 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
     prepared,
     corpusRegexPatterns,
     corpusCombinedRegex,
+    false,
+    (line, pattern) => harnessPatternLineAllowed(prepared, line, pattern),
   );
   for (const { pattern } of corpusRegexPatterns) {
     const hits = productionHits.get(pattern) ?? [];
@@ -3358,7 +3393,13 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
     }
   }
   for (const pattern of evalCorpusCompactPatternList) {
-    const hits = scanProductionCompactPatterns(prepared, pattern, 1, true);
+    const hits = scanProductionCompactPatterns(
+      prepared,
+      pattern,
+      1,
+      true,
+      (literals, marker) => compactHarnessDependencyAllowed(prepared, literals, marker),
+    );
     if (hits.length > 0) {
       console.error(
         `Constructed eval/query dependency /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,

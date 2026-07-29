@@ -35,7 +35,7 @@ def _verify_constant_sources(constant_selection: dict) -> None:
         }
         and all(
             isinstance(cell, dict)
-            and cell.get("artifact") == "measurements.raw.json"
+            and cell.get("artifact") == "constant-calibration-run-*.raw.json"
             and isinstance(cell.get("operand"), str)
             and bool(cell["operand"])
             and (
@@ -50,9 +50,10 @@ def _verify_constant_sources(constant_selection: dict) -> None:
         constant_selection["clean_run_requirements"]
         == {
             "minimum_runs_per_matrix_cell": 3,
-            "matrix_coverage": "every_calibration_matrix_cell",
+            "matrix_coverage": "every_required_calibration_matrix_cell",
             "source_identity": "one_exact_candidate_commit_and_tree",
             "artifact_selection": "all_preregistered_clean_runs",
+            "fresh_server_identity": "disjoint_across_clean_runs",
             "unplanned_suspend": False,
             "outlier_removal": "none",
         },
@@ -100,7 +101,11 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
         and formulas["request_deadlines_ms"]
         .get("bulk_request_deadline_ms", {})
         .get("replay_success_budget_formula")
-        == "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        == "max(144537,query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["request_deadlines_ms"]
+        .get("bulk_request_deadline_ms", {})
+        .get("replay_success_budget_slow_host_floor_ms")
+        == 144537
         and formulas["request_deadlines_ms"]
         .get("bulk_request_deadline_ms", {})
         .get("formula")
@@ -109,7 +114,9 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
     )
     require(
         formulas["capacity_retry_policy"].get("retry_after_ms_formula")
-        == "max(1,floor(minimum_raw_value_ms_across_all_selected_samples*0.50))"
+        == "max(40,floor(minimum_raw_value_ms_across_all_selected_samples*0.50))"
+        and formulas["capacity_retry_policy"].get("retry_after_slow_host_floor_ms")
+        == 40
         and formulas["capacity_retry_policy"].get("retry_class")
         == "after_capacity_change"
         and formulas["capacity_retry_policy"].get("retry_condition_source")
@@ -118,12 +125,25 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
     )
     require(
         formulas["election_backoff_policy"].get("initial_backoff_ms_formula")
-        == "max(1,ceiling(maximum_existing_owner_connect_duration_ms_across_all_selected_samples*0.50))"
+        == "max(7,ceiling(maximum_existing_owner_connect_duration_ms_across_all_selected_samples*0.50))"
+        and formulas["election_backoff_policy"].get("initial_backoff_slow_host_floor_ms")
+        == 7
         and formulas["election_backoff_policy"].get("maximum_backoff_ms_formula")
-        == "max(initial_backoff_ms,ceiling(maximum_spawn_convergence_duration_ms_across_all_selected_samples*0.25))"
+        == "max(102,initial_backoff_ms,ceiling(maximum_spawn_convergence_duration_ms_across_all_selected_samples*0.25))"
+        and formulas["election_backoff_policy"].get("maximum_backoff_slow_host_floor_ms")
+        == 102
         and formulas["election_backoff_policy"].get("jitter")
         == "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
         "election backoff selection formula changed",
+    )
+    require(
+        formulas["hard_native_no_progress_ms"].get("formula")
+        == "max(385431,ceiling(maximum_complete_successful_operation_duration_ms_across_all_selected_samples*4.00))"
+        and formulas["hard_native_no_progress_ms"].get("slow_host_floor_ms") == 385431
+        and formulas["watchdog_cadence_ms"].get("formula")
+        == "max(19271,floor(hard_native_no_progress_ms/20))"
+        and formulas["watchdog_cadence_ms"].get("slow_host_floor_ms") == 19271,
+        "native no-progress or watchdog slow-host floor changed",
     )
     require(
         constant_selection["post_result_formula_changes"] is False,
@@ -159,30 +179,23 @@ def _verify_constant_selection(protocol: dict) -> None:
 
 
 def _verify_thresholds_and_clock(protocol: dict) -> None:
-    threshold_selection = protocol.get("threshold_selection")
+    threshold_contract = protocol.get("qualification_threshold_contract")
     require(
-        isinstance(threshold_selection, dict)
-        and threshold_selection
+        isinstance(threshold_contract, dict)
+        and threshold_contract
         == {
-            "minimum_clean_calibration_runs_per_matrix_cell": 3,
-            "matrix_coverage": "every_calibration_matrix_cell",
-            "source_identity": "one_exact_candidate_commit_and_tree",
-            "producer_identity": (
-                "trusted_packaged_platform_pr_workflow_run_and_exact_artifact"
-            ),
-            "artifact_selection": "all_preregistered_clean_runs",
-            "less_than_or_equal": (
-                "ceiling(maximum_cell_aggregate_across_all_runs*1.20)"
-            ),
-            "greater_than_or_equal": (
-                "floor(minimum_cell_aggregate_across_all_runs*0.80)"
-            ),
-            "equal": "exact_observed_contract_value",
-            "retrieval_quality": 1.0,
-            "outlier_removal": "none",
-            "post_result_threshold_changes": False,
+            "source": "checked_in_frozen_candidate_contract",
+            "selected_by_calibration": False,
+            "omitted_measurements": "preserve_checked_in_thresholds",
+            "true_idle_exit": {
+                "idle_timeout_ms": 60_000,
+                "observation_grace_ms": 2_500,
+                "formula": "idle_timeout_ms+observation_grace_ms",
+                "required_threshold_ms": 62_500,
+                "qualification_runs_per_available_gpu_platform": 1,
+            },
         },
-        "measurement threshold-selection formula is incomplete or mutable",
+        "qualification-threshold contract is incomplete or mutable",
     )
     require(
         protocol.get("calibration_bundle_contract")
@@ -191,6 +204,7 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
             "required_for_frozen_qualification": True,
             "matrix_cells": "exactly_every_calibration_matrix_cell",
             "independent_clean_runs_per_matrix_cell": 3,
+            "samples_per_metric_per_run": 1,
             "source_identity": "one_exact_candidate_commit_and_tree",
             "producer_identity": (
                 "trusted_packaged_platform_pr_workflow_run_and_exact_artifact"
@@ -199,9 +213,7 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
                 "protocol_sha256",
                 "measurement_protocol_sha256",
             ],
-            "raw_artifact": (
-                "embedded_product_and_five_process_measurements_with_canonical_sha256"
-            ),
+            "raw_artifact": "nine_constant_source_metrics_with_canonical_sha256",
             "clock_witnesses": "awake_monotonic_plus_suspend_inclusive_per_sample",
             "successful_operation_operand": "successful_operation_duration_ns",
             "freeze_digest_inputs": [
@@ -211,16 +223,24 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
                 "contracts",
                 "run_artifact_sha256s",
                 "calibration_required_values",
-                "qualification_thresholds",
             ],
-            "constant_set_comparison": (
-                "exact_recomputed_values_thresholds_and_freeze_record"
-            ),
+            "constant_set_comparison": "exact_recomputed_runtime_constants_and_freeze_record",
             "qualification_boundary": (
-                "installed_runtime_cells_are_post_freeze_qualification_only"
+                "lifecycle_fault_idle_memory_quality_accelerator_and_performance_are_frozen_candidate_qualification_only"
             ),
         },
         "measurement calibration-bundle contract is incomplete or mutable",
+    )
+    rules = protocol.get("measurement_rules")
+    require(
+        isinstance(rules, dict)
+        and rules.get("calibration_and_qualification_are_distinct") is True
+        and rules.get("constants_frozen_before_qualification") is True
+        and rules.get("missing_required_cell_fails") is True
+        and rules.get("calibration_runs_full_qualification") is False
+        and rules.get("qualification_runs_once_per_available_gpu_platform") is True
+        and rules.get("threshold_movement_after_results") is False,
+        "calibration and qualification boundary is incomplete or mutable",
     )
     clock_policy = protocol.get("clock_policy")
     suspend = (

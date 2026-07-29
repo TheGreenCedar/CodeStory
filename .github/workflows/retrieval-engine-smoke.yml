@@ -1,5 +1,6 @@
-# Retrieval smoke: hosted jobs use the explicit CPU policy. Hardware workflows
-# own Metal and Vulkan claims.
+# Retrieval smoke: hosted jobs may use the test-only CPU fixture seam to
+# exercise CPU-shaped failure boundaries. It is not a product CPU mode and
+# makes no hardware claim; protected workflows own Metal and Vulkan proof.
 # Contract: docs/ops/retrieval-engine.md#proof-boundary
 
 name: retrieval-engine-smoke
@@ -105,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      CODESTORY_EMBED_ALLOW_CPU: "1"
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -194,7 +195,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      CODESTORY_EMBED_ALLOW_CPU: "1"
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1"
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v5

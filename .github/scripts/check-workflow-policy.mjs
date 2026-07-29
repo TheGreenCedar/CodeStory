@@ -85,6 +85,26 @@ function executableRunText(run) {
     .join("\n");
 }
 
+// Shell concatenates adjacent quoted and unquoted literal fragments before it
+// dispatches a command: `cpu_"explicit"` is the exact `cpu_explicit` argument
+// and `"c"pu` is `cpu`. Policy checks must inspect that executable spelling,
+// not the source-level quote placement an evasion chose.
+function shellLiteralNormalizedText(run) {
+  return executableRunText(String(run ?? "")).replaceAll(/['"]/gu, "");
+}
+
+function hasNonLiteralCpuAssignment(value) {
+  const normalized = shellLiteralNormalizedText(value);
+  return [...normalized.matchAll(
+    /\bCODESTORY_EMBED_ALLOW_CPU\s*=\s*([^\s;&|]+)/giu,
+  )].some(([, assigned]) => assigned !== "0");
+}
+
+function hasShellLoop(run) {
+  return /(?:^|[;\n])\s*(?:for|select|until|while)\b/imu
+    .test(shellLiteralNormalizedText(run));
+}
+
 function add(violations, condition, message) {
   if (!condition) violations.push(message);
 }
@@ -132,6 +152,14 @@ function shellInvocationsContaining(run, anchor) {
   }
   if (current.length > 0) commands.push(current.join("\n"));
   return commands.filter(command => command.includes(anchor));
+}
+
+function jobShellInvocationsContaining(job, anchor) {
+  return list(job?.steps).flatMap(step =>
+    shellInvocationsContaining(
+      shellLiteralNormalizedText(object(step).run),
+      shellLiteralNormalizedText(anchor),
+    ));
 }
 
 function requireFlagOnInvocation(violations, message, run, anchor, flag) {
@@ -488,10 +516,16 @@ const draftCachePaths = [
   "target",
 ];
 const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
-const platformResolverContractDigest = "12f5e887eb236625eec5e9718edd305ba625ab06f9a1467ed1146a8a80db0f74";
+const platformResolverContractDigest = "cb8eb03393f8e24bf9e083004be658c5d2f22fa118d3c43b8bc6b388f19ecddd";
 // check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
 // it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
 const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
+// This closeout is a small shell control-flow program. Substring checks can be
+// satisfied by parking the accepted qualification branch in dead code while
+// the live branch blocks on optional Linux hardware, so pin its reviewed
+// executable text as well as its reader-facing invariants.
+const packagedPlatformCloseoutDigest =
+  "ce7a7f5aa99f5fcbc037d4c1f06de5d841e4a4d114208820592a84c41c797b1a";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -814,6 +848,12 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
     hasExactKeys(workflow.jobs, ["linux-contracts", "windows-manifest-missing"]),
     "Windows manifest proof workflow must contain exactly linux-contracts and windows-manifest-missing jobs",
   );
+  add(
+    violations,
+    hasExactKeys(linux.env, ["CODESTORY_TEST_EMBED_ALLOW_CPU"])
+      && linux.env.CODESTORY_TEST_EMBED_ALLOW_CPU === "1",
+    "retrieval source tests must opt into the CPU test seam explicitly",
+  );
   const nodeSetup = list(linux.steps).map(object)
     .find((step) => step.uses === "actions/setup-node@v5");
   add(
@@ -887,10 +927,10 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
   add(violations, job["timeout-minutes"] === 30, "Windows manifest proof timeout must remain 30 minutes");
   add(
     violations,
-    hasExactKeys(job.env, ["CODESTORY_EMBED_ALLOW_CPU", "CMAKE_GENERATOR"])
-      && job.env.CODESTORY_EMBED_ALLOW_CPU === "1"
+    hasExactKeys(job.env, ["CODESTORY_TEST_EMBED_ALLOW_CPU", "CMAKE_GENERATOR"])
+      && job.env.CODESTORY_TEST_EMBED_ALLOW_CPU === "1"
       && job.env.CMAKE_GENERATOR === windowsNativeGenerator,
-    "Windows manifest proof must explicitly permit CPU runtime execution and use the Ninja native generator",
+    "Windows manifest proof source test must explicitly use the CPU test seam and Ninja native generator",
   );
   add(
     violations,
@@ -2659,7 +2699,7 @@ function packageMatrixAssetTargets(expression) {
 
 function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
-    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
+    /fromJSON\(inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
   );
   if (!match) {
     violations.push("packaged-platform-proof.yml matrix must select structural JSON by scope");
@@ -2672,7 +2712,6 @@ function validatePackageMatrixExpression(violations, expression, graph) {
   const macosArm64 = graph.workflow_policy.package_matrix.find(({ asset_target: target }) =>
     target === "macos-arm64");
   const expected = [
-    { include: [linuxX64] },
     { include: [linuxX64] },
     { include: [windowsX64] },
     { include: [macosArm64] },
@@ -2707,6 +2746,8 @@ function validatePackagedProof(workflows, violations, graph) {
     requireOptionalStringInput(violations, file, workflow, "workflow_call", key);
   }
   for (const key of [
+    "calibration_mode",
+    "quality_evidence_artifact",
     "candidate_installed_proof",
     "candidate_installed_only",
     "server_behavior_only",
@@ -2733,8 +2774,8 @@ function validatePackagedProof(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "build");
   add(
     violations,
-    job["timeout-minutes"] === "${{ inputs.calibration_mode && 180 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60) }}",
-    `${file} package build timeout must cover only calibration or signed macOS packaging`,
+    job["timeout-minutes"] === "${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}",
+    `${file} package build timeout must cover only signed macOS packaging`,
   );
   add(
     violations,
@@ -2813,9 +2854,8 @@ function validatePackagedProof(workflows, violations, graph) {
     violations,
     nativeIdentity?.id === "build-cache"
       && nativeIdentity?.shell === "bash"
-      && object(nativeIdentity?.env).CALIBRATION_MODE === "${{ inputs.calibration_mode }}"
-      && object(nativeIdentity?.env).QUALITY_EVIDENCE_ARTIFACT
-        === "${{ inputs.quality_evidence_artifact }}"
+      && object(nativeIdentity?.env).CALIBRATION_MODE === undefined
+      && object(nativeIdentity?.env).QUALITY_EVIDENCE_ARTIFACT === undefined
       && nativeIdentityRun.includes(`--namespace ${graph.workflow_policy.promotion.packaged_cache_namespace}`)
       && nativeIdentityRun.includes('--exact-sha "$EXACT_SHA"')
       && nativeIdentityRun.includes('--os "$RUNNER_OS"')
@@ -2831,8 +2871,7 @@ function validatePackagedProof(workflows, violations, graph) {
       && nativeIdentityRun.includes("--cargo-config .cargo/config.toml")
       && nativeIdentityRun.includes("--identity cargo_incremental=0")
       && nativeIdentityRun.includes("qualification_driver=disabled")
-      && nativeIdentityRun.includes("qualification_driver=enabled")
-      && nativeIdentityRun.includes('--identity "qualification_driver=$qualification_driver"')
+      && !nativeIdentityRun.includes("qualification_driver=enabled")
       && nativeIdentityRun.includes(".cargo/llama-dynamic-backends.cmake")
       && nativeIdentityRun.includes("git ls-files '*Cargo.toml'")
       && nativeIdentityRun.includes("model-contract.json")
@@ -2963,16 +3002,13 @@ function validatePackagedProof(workflows, violations, graph) {
     String(finalizeCompilerObjects?.if ?? "")
       .includes("steps.linux-build.outcome == 'success'")
       && String(finalizeCompilerObjects?.if ?? "")
-        .includes("steps.qualification-driver.outcome != 'skipped'")
-      && String(finalizeCompilerObjects?.if ?? "")
         .includes("steps.package-build.outcome == 'success'"),
     `${file} must stop the compiler server that performed each selected build`,
   );
   add(
     violations,
     compilerSaveIndex > stepIndex(job, "Build codestory-cli")
-      && compilerSaveIndex > stepIndex(job, "Build Linux x64 at the glibc 2.31 baseline")
-      && compilerSaveIndex > stepIndex(job, "Build qualification driver"),
+      && compilerSaveIndex > stepIndex(job, "Build Linux x64 at the glibc 2.31 baseline"),
     `${file} compiler cache must save after every selected compilation step`,
   );
   add(
@@ -3159,66 +3195,20 @@ function validatePackagedProof(workflows, violations, graph) {
     !executableRunText(String(linuxBaseline?.run ?? "")).includes("libvulkan"),
     `${file} Linux glibc baseline must not install a Vulkan loader`,
   );
-  const qualificationDriver = namedStep(job, "Build qualification driver");
   add(
     violations,
-    qualificationDriver?.if
-      === "matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')",
-    `${file} qualification driver must skip the standard server-behavior path`,
+    namedStep(job, "Build qualification driver") === undefined
+      && namedStep(job, "Packaged per-user server calibration or qualification") === undefined
+      && namedStep(job, "Upload hosted Linux calibration runs") === undefined
+      && namedStep(job, "Upload hosted Linux calibration failure evidence") === undefined
+      && namedStep(job, "Upload packaged agent proof artifacts") === undefined,
+    `${file} package-only workflow must not collect calibration or run hosted qualification`,
   );
-  // The calibration bundle -- not the optional release-evidence packet -- is
-  // what these steps consume, and the frozen-candidate coordinator is forbidden
-  // to pass release evidence at all. Gating them on quality evidence made the
-  // whole frozen branch unreachable; gating them on the bundle they download is
-  // what the freeze lineage proof below needs to run.
   requireCalibrationProducerBoundary(
     violations,
     file,
     job,
-    "matrix.asset_target == 'linux-x64' && !inputs.calibration_mode && inputs.calibration_bundle_artifact != ''",
-  );
-  requireStepRun(
-    violations,
-    file,
-    job,
-    "Packaged per-user server calibration or qualification",
-    [
-      "--proof-tier hosted_package",
-      "calibration-bundle.json",
-      '--calibration-bundle "$calibration_bundle"',
-      "--calibration-producer-run-id",
-      "--calibration-producer-artifact",
-      "--enforce-calibration-freeze-lineage",
-      'test -f "$quality_path"',
-      "--engine-policy cpu_explicit",
-      "--expected-backend CPU",
-      "--produce-qualification-evidence",
-      "--timeout-secs 1800",
-      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
-      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen',
-    ],
-  );
-  const packagedProofRun = stepRun(
-    job,
-    "Packaged per-user server calibration or qualification",
-  );
-  const packagedProof = namedStep(
-    job,
-    "Packaged per-user server calibration or qualification",
-  );
-  // The full frozen hosted_package qualification also carries the flag, and
-  // must keep carrying it, but it cannot run: --produce-qualification-evidence
-  // hard-requires the exact-head release-evidence packet at any non-calibration
-  // tier, and every caller of this workflow is pinned to pass no release
-  // evidence. That invocation is therefore a latent contract, not the live
-  // guard. Pin the flag to the hosted_package invocation itself -- the same
-  // logical command, so a decoy line after it does not count.
-  requireFlagOnInvocation(
-    violations,
-    `${file} frozen packaged qualification must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed`,
-    packagedProofRun,
-    "--proof-tier hosted_package",
-    "--enforce-calibration-freeze-lineage",
+    "matrix.asset_target == 'linux-x64' && inputs.calibration_bundle_artifact != ''",
   );
   // The live guard. --version-only stops before the runtime proof, so it needs
   // no release evidence and no qualification driver, but it still loads and
@@ -3299,53 +3289,6 @@ function validatePackagedProof(workflows, violations, graph) {
     bindings.get("calibration_bundle_artifact")?.fixed === false
       && bindings.get("calibration_bundle_run_id")?.fixed === false,
     `${coordinatorFile} packaged proof must forward the dispatched calibration bundle identity so the freeze lineage guard can run`,
-  );
-  const hostedCalibrationUpload = namedStep(job, "Upload hosted Linux calibration runs");
-  add(
-    violations,
-    hostedCalibrationUpload?.uses === "actions/upload-artifact@v7.0.1"
-      && hostedCalibrationUpload?.if
-        === "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode",
-    `${file} hosted calibration artifact must remain calibration-only`,
-  );
-  const hostedCalibrationFailureUpload = namedStep(
-    job,
-    "Upload hosted Linux calibration failure evidence",
-  );
-  add(
-    violations,
-    hostedCalibrationFailureUpload?.uses === "actions/upload-artifact@v7.0.1"
-      && hostedCalibrationFailureUpload?.if
-        === "failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode"
-      && object(hostedCalibrationFailureUpload?.with).path
-        === "target/calibration-runs/linux"
-      && object(hostedCalibrationFailureUpload?.with)["if-no-files-found"] === "warn",
-    `${file} hosted calibration failure evidence must stay a failure-only best-effort upload`,
-  );
-  const hostedEvaluationUpload = namedStep(job, "Upload packaged agent proof artifacts");
-  add(
-    violations,
-    hostedEvaluationUpload?.uses === "actions/upload-artifact@v7.0.1"
-      && String(hostedEvaluationUpload?.if ?? "").replace(/\s+/gu, " ")
-        === "always() && matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')",
-    `${file} hosted evaluation artifact must require explicit calibration or quality evidence`,
-  );
-  add(
-    violations,
-    String(packagedProof?.if ?? "").replace(/\s+/gu, " ")
-      === "matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')",
-    `${file} hosted CPU evaluation must require explicit calibration or quality evidence`,
-  );
-  add(
-    violations,
-    packagedProofRun.includes('if [ "$CALIBRATION_MODE" = true ]')
-      && packagedProofRun.includes("--proof-tier calibration")
-      && packagedProofRun.includes("--proof-tier hosted_package")
-      && occurrenceCount(packagedProofRun, "--calibration-bundle") === 1
-      && !packagedProofRun.includes("--server-behavior-only")
-      && !packagedProofRun.includes("--ground-only")
-      && !packagedProofRun.includes("--proof-tier installed_runtime"),
-    `${file} optional hosted CPU lane must remain evaluation-only`,
   );
   add(
     violations,
@@ -3782,6 +3725,114 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     return;
   }
   const promotion = graph.workflow_policy.promotion;
+  const calibrationPolicy = object(graph.workflow_policy.calibration);
+  const qualificationPolicy = object(graph.workflow_policy.qualification);
+  add(
+    violations,
+    sameMembers(Object.keys(object(workflow.jobs)), [
+      "route",
+      "calibration-macos",
+      "calibration-assemble",
+      "release-evidence",
+      "source-proof",
+      "packaged-proof",
+      "macos-metal-proof",
+      "windows-vulkan-proof",
+      "linux-vulkan-proof",
+      "closeout",
+    ]),
+    `${file} must retain the reviewed exact job set so no hidden hardware job can block calibration or qualification`,
+  );
+  add(
+    violations,
+    calibrationPolicy.coordinator_workflow === file
+      && calibrationPolicy.mode === "calibration"
+      && calibrationPolicy.assembly_job === "calibration-assemble"
+      && calibrationPolicy.runs_per_required_cell === 3
+      && calibrationPolicy.samples_per_metric_per_run === 1
+      && list(calibrationPolicy.required_cells).length === 1
+      && object(list(calibrationPolicy.required_cells)[0]).id
+        === "protected_macos_arm64_metal"
+      && list(calibrationPolicy.optional_cells).length === 1
+      && object(list(calibrationPolicy.optional_cells)[0]).id
+        === "protected_linux_x64_vulkan"
+      && object(list(calibrationPolicy.optional_cells)[0]).assembly_dependency === false
+      && object(list(calibrationPolicy.optional_cells)[0]).feeds_constant_selection === false,
+    `${file} must implement the release claim graph calibration contract`,
+  );
+  add(
+    violations,
+    qualificationPolicy.coordinator_workflow === file
+      && qualificationPolicy.mode === "qualification"
+      && qualificationPolicy.runs_per_available_cell === 1
+      && JSON.stringify(list(qualificationPolicy.required_cells))
+        === JSON.stringify([
+          {
+            id: "protected_macos_arm64_metal",
+            workflow: "macos-metal-proof.yml",
+            job: "packaged-metal",
+            policy: "accelerated",
+            backend: "metal",
+            produces_quality: true,
+          },
+          {
+            id: "protected_windows_x64_vulkan",
+            workflow: "windows-vulkan-proof.yml",
+            job: "packaged-vulkan",
+            policy: "accelerated",
+            backend: "vulkan",
+            produces_quality: false,
+          },
+        ])
+      && JSON.stringify(list(qualificationPolicy.optional_cells))
+        === JSON.stringify([
+          {
+            id: "protected_linux_x64_vulkan",
+            workflow: "linux-vulkan-proof.yml",
+            job: "packaged-vulkan",
+            trigger: "workflow_dispatch",
+            policy: "accelerated",
+            backend: "vulkan",
+            closeout_dependency: false,
+            blocking: false,
+          },
+        ])
+      && JSON.stringify(object(qualificationPolicy.quality_contract))
+        === JSON.stringify({
+          producer_cell: "protected_macos_arm64_metal",
+          corpus_id: "codestory-release-corpus-v1",
+          evaluation_contract: "publishable-three-repeat-packet/v1",
+          task_count: 3,
+          repeats_per_task: 3,
+          row_count: 9,
+        })
+      && sameMembers(list(qualificationPolicy.required_evidence), [
+        "qualification_scenarios",
+        "true_idle_exit",
+        "total_codestory_process_memory",
+        "retrieval_quality",
+        "backend_observed_accelerator_residency",
+      ])
+      && sameMembers(list(qualificationPolicy.required_scenarios), [
+        "client_death",
+        "cold_race",
+        "frozen_owner",
+        "incompatible_owner",
+        "mixed_queue",
+        "server_crash",
+        "true_idle_respawn",
+        "worker_stall",
+      ])
+      && qualificationPolicy.true_idle_timeout_ms === 60_000
+      && qualificationPolicy.true_idle_observation_grace_ms === 2_500
+      && sameMembers(list(qualificationPolicy.forbidden_policies), ["cpu_explicit"])
+      && sameMembers(list(qualificationPolicy.forbidden_backends), ["cpu"])
+      && sameMembers(
+        list(qualificationPolicy.forbidden_environment),
+        ["CODESTORY_EMBED_ALLOW_CPU=1"],
+      ),
+    `${file} must implement the release claim graph qualification contract`,
+  );
   const expectedConcurrency = [
     "proof-",
     promotion.proof_run_sha_expression,
@@ -3839,8 +3890,17 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     'test "$INPUT_HEAD_SHA" = "$dev_head"',
     'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
     'test "$GITHUB_SHA" = "$dev_head"',
+    'elif [ "$mode" = "qualification" ]; then',
+    'test -z "$INPUT_SOURCE_RUN_ID"',
+    'test -n "$INPUT_CALIBRATION_ARTIFACT"',
+    'test -n "$INPUT_CALIBRATION_RUN_ID"',
     "--ref $head_ref",
   ]);
+  requireStepEnv(violations, file, route, "Resolve trusted exact head", {
+    INPUT_SOURCE_RUN_ID: "${{ inputs.source_run_id }}",
+    INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
+    INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
+  });
   requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
@@ -3890,13 +3950,10 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && routeSteps.findIndex(step => step.uses === "actions/checkout@v5") > 0,
     `${file} must resolve exact workflow/ref identity before checkout`,
   );
-  const calibrationLinux = requireJob(violations, file, workflow, "calibration-linux");
   add(
     violations,
-    calibrationLinux.uses === "./.github/workflows/packaged-platform-proof.yml"
-      && object(calibrationLinux.with).calibration_mode === true
-      && object(calibrationLinux.with).hermetic_linux === undefined,
-    `${file} hosted Linux calibration must call packaged proof in calibration mode`,
+    at(workflow, "jobs", "calibration-linux") === undefined,
+    `${file} calibration must not schedule hosted Linux CPU or wait for optional Linux Vulkan evidence`,
   );
   const calibrationMacos = requireJob(violations, file, workflow, "calibration-macos");
   add(
@@ -3918,12 +3975,65 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    sameMembers(needs(calibrationAssemble), [
-      "route",
-      "calibration-linux",
-      "calibration-macos",
-    ]),
-    `${file} calibration assembly must wait for both independent calibration cells`,
+    sameMembers(needs(calibrationAssemble), ["route", "calibration-macos"])
+      && String(calibrationAssemble.if ?? "")
+        === "always() && needs.route.result == 'success' && needs.route.outputs.mode == 'calibration' && needs.calibration-macos.result == 'success'",
+    `${file} calibration assembly must wait only for required protected macOS Metal evidence`,
+  );
+  const calibrationAssemblySteps = list(calibrationAssemble.steps).map(object);
+  const calibrationCheckout = namedStep(
+    calibrationAssemble,
+    "Checkout exact calibration head",
+  );
+  const calibrationDownload = namedStep(
+    calibrationAssemble,
+    "Download protected macOS calibration runs",
+  );
+  const calibrationAssembly = namedStep(
+    calibrationAssemble,
+    "Assemble frozen calibration candidate",
+  );
+  const calibrationUpload = namedStep(
+    calibrationAssemble,
+    "Upload calibration bundle and frozen constant candidate",
+  );
+  add(
+    violations,
+    JSON.stringify(calibrationAssemblySteps.map(step => step.name))
+      === JSON.stringify([
+        "Checkout exact calibration head",
+        "Download protected macOS calibration runs",
+        "Assemble frozen calibration candidate",
+        "Upload calibration bundle and frozen constant candidate",
+      ])
+      && calibrationCheckout?.uses === "actions/checkout@v5"
+      && hasExactKeys(calibrationCheckout?.with, ["ref", "fetch-depth"])
+      && object(calibrationCheckout?.with).ref === "${{ needs.route.outputs.head_sha }}"
+      && object(calibrationCheckout?.with)["fetch-depth"] === 0
+      && calibrationDownload?.uses === "actions/download-artifact@v8.0.1"
+      && hasExactKeys(calibrationDownload?.with, ["name", "path"])
+      && object(calibrationDownload?.with).name
+        === "embedding-calibration-macos-${{ needs.route.outputs.version }}"
+      && object(calibrationDownload?.with).path === "target/calibration-inputs/macos"
+      && calibrationAssembly?.shell === "bash"
+      && hasExactKeys(calibrationAssembly?.env, ["EXPECTED_HEAD_SHA"])
+      && object(calibrationAssembly?.env).EXPECTED_HEAD_SHA
+        === "${{ needs.route.outputs.head_sha }}"
+      && calibrationUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(
+        calibrationUpload?.with,
+        ["name", "path", "if-no-files-found", "retention-days"],
+      )
+      && object(calibrationUpload?.with).name
+        === "embedding-calibration-bundle-${{ needs.route.outputs.head_sha }}"
+      && object(calibrationUpload?.with).path === "target/calibration-freeze"
+      && object(calibrationUpload?.with)["if-no-files-found"] === "error"
+      && object(calibrationUpload?.with)["retention-days"] === 30,
+    `${file} calibration assembly must keep the exact protected macOS-only step boundary`,
+  );
+  const calibrationAssemblyRun = stepRun(
+    calibrationAssemble,
+    "Assemble frozen calibration candidate",
   );
   requireStepRun(
     violations,
@@ -3932,11 +4042,20 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     "Assemble frozen calibration candidate",
     [
       "--assemble-calibration-bundle",
-      'test "${#runs[@]}" = 6',
+      "find target/calibration-inputs/macos",
+      'test "${#runs[@]}" = 3',
+      ".run_count == 3",
+      ".matrix_cell_count == 1",
       "--calibration-producer-workflow-path",
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
     ],
+  );
+  add(
+    violations,
+    !scalarStrings(calibrationAssemble).some(value => value.toLowerCase().includes("linux"))
+      && !calibrationAssemblyRun.includes("find target/calibration-inputs -type"),
+    `${file} calibration assembly must not select, discover, or gate on Linux evidence`,
   );
   requireStepUses(
     violations,
@@ -3981,7 +4100,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     !String(packaged.if ?? "").includes("release-evidence")
       && !needs(packaged).includes("release-evidence")
-      && object(packaged.with).quality_evidence_artifact === "",
+      && object(packaged.with).quality_evidence_artifact === undefined,
     `${file} package proof must not depend on optional release evidence`,
   );
   violations.push(...packagedPrSigningViolations(workflow));
@@ -3999,41 +4118,49 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
   add(
     violations,
-    object(metal.with).candidate_installed_proof === true,
-    `${file} must opt the accepted PR Metal package into candidate-installed proof`,
+    object(metal.with).candidate_installed_proof
+      === "${{ needs.route.outputs.mode != 'qualification' }}",
+    `${file} qualification must run full Metal proof rather than candidate-installed proof`,
   );
   add(
     violations,
-    object(metal.with).server_behavior_only === true
+    object(metal.with).server_behavior_only
+        === "${{ needs.route.outputs.mode != 'qualification' }}"
       && object(metal.with).quality_evidence_artifact === "",
-    `${file} Metal proof must use bounded readiness without optional quality evidence`,
+    `${file} qualification must run full Metal quality and lifecycle proof`,
   );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
-    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
-    `${file} Vulkan proof must wait only for routing and package proof`,
+    sameMembers(needs(vulkan), ["route", "packaged-proof", "macos-metal-proof"]),
+    `${file} Windows qualification must wait for successful protected Metal quality`,
   );
   add(
     violations,
-    String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'"),
-    `${file} package-only mode must skip protected Windows proof`,
+    String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
+      && String(vulkan.if ?? "").includes(
+        "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success')",
+      ),
+    `${file} package-only mode must skip Windows while qualification requires successful Metal`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   add(
     violations,
-    object(vulkan.with).candidate_installed_proof === true,
-    `${file} must opt the accepted PR Windows package into candidate-installed proof`,
+    object(vulkan.with).candidate_installed_proof
+      === "${{ needs.route.outputs.mode != 'qualification' }}",
+    `${file} qualification must run full Windows proof rather than candidate-installed proof`,
   );
   add(
     violations,
-    object(vulkan.with).quality_evidence_artifact === "",
-    `${file} Windows proof must not consume optional quality evidence`,
+    object(vulkan.with).quality_evidence_artifact
+      === "${{ needs.route.outputs.mode == 'qualification' && format('frozen-candidate-quality-{0}', needs.route.outputs.head_sha) || '' }}",
+    `${file} Windows qualification must consume the exact protected Metal quality artifact`,
   );
   add(
     violations,
-    object(vulkan.with).server_behavior_only === true,
-    `${file} Windows proof must use bounded retrieval readiness`,
+    object(vulkan.with).server_behavior_only
+      === "${{ needs.route.outputs.mode != 'qualification' }}",
+    `${file} qualification must run full Windows lifecycle and fault proof`,
   );
   const linuxVulkan = requireJob(violations, file, workflow, "linux-vulkan-proof");
   add(
@@ -4043,8 +4170,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'"),
-    `${file} package-only mode must skip protected Linux proof`,
+    String(linuxVulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
+      && String(linuxVulkan.if ?? "").includes(
+        "needs.route.outputs.mode != 'qualification'",
+      ),
+    `${file} package-only and qualification modes must skip coordinator Linux proof`,
   );
   add(
     violations,
@@ -4072,6 +4202,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     ]),
     `${file} closeout must wait for every selected platform proof`,
   );
+  add(
+    violations,
+    closeout.if
+      === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence' && needs.route.outputs.mode != 'calibration'"
+      && closeout["runs-on"] === "ubuntu-latest"
+      && closeout["timeout-minutes"] === 20
+      && closeout["continue-on-error"] === undefined,
+    `${file} closeout job must retain its reviewed unconditional result-checking activation`,
+  );
   const evidence = requireJob(violations, file, workflow, "release-evidence");
   add(
     violations,
@@ -4084,6 +4223,39 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && !scalarStrings(closeout).some(value => value.includes("EVIDENCE_RESULT")),
     `${file} normal closeout must not depend on optional release evidence`,
   );
+  const closeoutProofName = "Require one coherent accepted proof";
+  const closeoutProof = namedStep(closeout, closeoutProofName);
+  const closeoutRun = executableRunText(stepRun(closeout, closeoutProofName));
+  add(
+    violations,
+    list(closeout.steps).length === 1
+      && closeoutProof?.if === undefined
+      && closeoutProof?.["continue-on-error"] === undefined
+      && closeoutProof?.shell === "bash"
+      && closeoutProof?.["working-directory"] === undefined,
+    `${file} closeout must run one unconditional proof step under the reviewed Bash interpreter`,
+  );
+  const expectedCloseoutEnv = {
+    GH_TOKEN: "${{ github.token }}",
+    HEAD_SHA: "${{ needs.route.outputs.head_sha }}",
+    MODE: "${{ needs.route.outputs.mode }}",
+    SCOPE: "${{ needs.route.outputs.scope }}",
+    ROUTE_RESULT: "${{ needs.route.result }}",
+    SOURCE_RESULT: "${{ needs.source-proof.result }}",
+    PACKAGE_RESULT: "${{ needs.packaged-proof.result }}",
+    METAL_RESULT: "${{ needs.macos-metal-proof.result }}",
+    WINDOWS_VULKAN_RESULT: "${{ needs.windows-vulkan-proof.result }}",
+    LINUX_VULKAN_RESULT: "${{ needs.linux-vulkan-proof.result }}",
+  };
+  const closeoutEnv = object(closeoutProof?.env);
+  add(
+    violations,
+    hasExactKeys(closeoutEnv, Object.keys(expectedCloseoutEnv))
+      && Object.entries(expectedCloseoutEnv).every(
+        ([key, value]) => closeoutEnv[key] === value,
+      ),
+    `${file} closeout proof must bind every route and platform result from the reviewed jobs exactly`,
+  );
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
     'if [ "$MODE" = package ]',
     'require_result "$PACKAGE_RESULT" success packaged-proof',
@@ -4092,9 +4264,25 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     '[ "$SCOPE" = linux ]',
     "WINDOWS_VULKAN_RESULT",
     "LINUX_VULKAN_RESULT",
+    'if [ "$MODE" = qualification ]; then',
+    'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
     'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
     "dev/codestory-next moved from proved head",
   ]);
+  requireExactStepScript(
+    violations,
+    file,
+    closeout,
+    "Require one coherent accepted proof",
+    packagedPlatformCloseoutDigest,
+    "coordinator closeout",
+  );
+  add(
+    violations,
+    /if\s+\[\s*"\$MODE"\s*=\s*qualification\s*\];\s*then\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+skipped\s+linux-vulkan-proof\s+else\s+require_result\s+"\$LINUX_VULKAN_RESULT"\s+success\s+linux-vulkan-proof\s+fi/um
+      .test(closeoutRun),
+    `${file} qualification closeout must accept skipped optional Linux proof without blocking`,
+  );
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }
 
@@ -4170,7 +4358,8 @@ function validateRemainingWorkflows(workflows, violations) {
     add(
       violations,
       object(repoEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
-        === "codestory-release-corpus-v0.16-axios-js-ts-v2",
+        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
+        && object(repoEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${evidenceFile} repo evidence must bind the v0.16 Axios v2 corpus`,
     );
     const packetEvidence = namedStep(job, "Produce publishable packet evidence");
@@ -4178,8 +4367,9 @@ function validateRemainingWorkflows(workflows, violations) {
       violations,
       object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
         === "codestory-release-corpus-v0.16-axios-js-ts-v2"
-        && object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
-          === "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json",
+      && object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
+          === "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json"
+      && object(packetEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
       `${evidenceFile} packet evidence must bind the v0.16 Axios v2 corpus contract`,
     );
     const packetRun = String(packetEvidence?.run ?? "");
@@ -4274,6 +4464,34 @@ function validateRemainingWorkflows(workflows, violations) {
     });
     requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
+    const calibrationClock = namedStep(
+      job,
+      "Start Metal constant calibration clock",
+    );
+    const modelPreparation = namedStep(job, "Prepare checksum-pinned embedded model");
+    add(
+      violations,
+      calibrationClock?.if === "inputs.calibration_mode"
+        && calibrationClock?.id === "calibration-clock"
+        && calibrationClock?.shell === "bash"
+        && occurrenceCount(String(calibrationClock?.run ?? ""), "time.monotonic_ns()") === 1
+        && String(calibrationClock?.run ?? "").includes(
+          'echo "started-ns=',
+        )
+        && String(calibrationClock?.run ?? "").includes(">> \"$GITHUB_OUTPUT\"")
+        && modelPreparation?.id === "model-prepare"
+        && modelPreparation?.if === "${{ !inputs.use_packaged_cli_artifact }}"
+        && modelPreparation?.shell === "bash"
+        && occurrenceCount(
+          String(modelPreparation?.run ?? ""),
+          "time.monotonic_ns()",
+        ) === 2
+        && String(modelPreparation?.run ?? "").includes("duration-ms=")
+        && String(modelPreparation?.run ?? "").includes(">> \"$GITHUB_OUTPUT\"")
+        && stepIndex(job, "Start Metal constant calibration clock")
+          < stepIndex(job, "Prepare checksum-pinned embedded model"),
+      `${metalFile} calibration must time model preparation and total wall time from one explicit clock`,
+    );
     add(
       violations,
       namedStep(job, "Install pinned Rust")?.if
@@ -4283,8 +4501,43 @@ function validateRemainingWorkflows(workflows, violations) {
     add(
       violations,
       namedStep(job, "Build qualification driver")?.if
-        === "inputs.calibration_mode || !inputs.server_behavior_only",
-      `${metalFile} packaged server-behavior proof must skip the qualification driver`,
+        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
+      `${metalFile} calibration and packaged server-behavior proof must skip the qualification driver`,
+    );
+    const nativeBuild = namedStep(job, "Build and package native CLI");
+    const nativeBuildRun = executableRunText(String(nativeBuild?.run ?? ""));
+    const normalizedNativeBuildRun = shellLiteralNormalizedText(nativeBuildRun);
+    add(
+      violations,
+      object(nativeBuild?.env).CALIBRATION_MODE === "${{ inputs.calibration_mode }}"
+        && nativeBuild?.id === "native-build-package"
+        && shellInvocationsContaining(normalizedNativeBuildRun, "cargo build").length === 1
+        && normalizedNativeBuildRun.includes("-p codestory-cli")
+        && normalizedNativeBuildRun.includes("-p codestory-bench")
+        && normalizedNativeBuildRun.includes("--bin codestory-cli")
+        && normalizedNativeBuildRun.includes("--bin codestory-cli-runtime")
+        && normalizedNativeBuildRun.includes("--bin codestory_embedding_constant_calibration")
+        && shellInvocationsContaining(
+          normalizedNativeBuildRun,
+          "python3 .github/scripts/package-codestory-release.py",
+        ).length === 1
+        && jobShellInvocationsContaining(job, "cargo build").length === 2
+        && jobShellInvocationsContaining(
+          job,
+          ".github/scripts/package-codestory-release.py",
+        ).length === 1
+        && jobShellInvocationsContaining(
+          job,
+          "node scripts/prepare-embedded-model.mjs",
+        ).length === 1
+        && jobShellInvocationsContaining(
+          job,
+          ".github/scripts/check-packaged-agent-proof.py",
+        ).length === 4
+        && occurrenceCount(normalizedNativeBuildRun, "time.monotonic_ns()") === 2
+        && normalizedNativeBuildRun.includes("duration-ms=")
+        && normalizedNativeBuildRun.includes(">> $GITHUB_OUTPUT"),
+      `${metalFile} calibration must build CLI and constant collector once through one shared Cargo invocation and package once`,
     );
     const packagedArtifactDownload = namedStep(job, "Download packaged CLI artifact");
     add(
@@ -4307,15 +4560,177 @@ function validateRemainingWorkflows(workflows, violations) {
       "test \"$actual_digest\" = \"${expected_digest#sha256:}\"",
       "ditto -x -k",
     ]);
+    const qualityDownload = namedStep(
+      job,
+      "Download exact-head publishable packet quality evidence",
+    );
+    add(
+      violations,
+      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
+        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(qualityDownload?.with, ["name", "path"])
+        && object(qualityDownload?.with).name
+          === "${{ inputs.quality_evidence_artifact }}"
+        && object(qualityDownload?.with).path === "target/release-quality-evidence",
+      `${metalFile} imported quality evidence must bind the caller-selected exact artifact`,
+    );
+    const qualityProducerName = "Produce exact-head holdout quality on protected Metal";
+    const qualityProducer = namedStep(job, qualityProducerName);
+    const qualityProducerRun = shellLiteralNormalizedText(
+      stepRun(job, qualityProducerName),
+    );
+    add(
+      violations,
+      qualityProducer?.if
+        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
+        && qualityProducer?.shell === "bash"
+        && hasExactKeys(qualityProducer?.env, ["VERSION", "CODESTORY_EMBED_ALLOW_CPU"])
+        && object(qualityProducer?.env).VERSION === "${{ inputs.version }}"
+        && object(qualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+        && qualityProducerRun.includes(
+          "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
+        )
+        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cli.")
+        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cache.")
+        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-stdio.")
+        && qualityProducerRun.includes(
+          "CODESTORY_RELEASE_EVIDENCE_PROFILE=protected-macos-arm64-metal",
+        )
+        && qualityProducerRun.includes(
+          "CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v1",
+        )
+        && qualityProducerRun.includes(
+          "CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/holdout-retrieval-v1.json",
+        )
+        && qualityProducerRun.includes(
+          "CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-holdout-v1",
+        )
+        && shellInvocationsContaining(
+          qualityProducerRun,
+          "node scripts/codestory-agent-ab-benchmark.mjs",
+        ).length === 1
+        && qualityProducerRun.includes("--packet-runtime")
+        && qualityProducerRun.includes("--packet-runtime-mode cold-cli")
+        && qualityProducerRun.includes("--task-suite holdout-retrieval")
+        && qualityProducerRun.includes("--materialize-repos")
+        && qualityProducerRun.includes("--repeats 3")
+        && qualityProducerRun.includes("--publishable")
+        && qualityProducerRun.includes("--max-source-reads-after-packet 0")
+        && qualityProducerRun.includes("--codestory-cli $packaged_cli")
+        && qualityProducerRun.includes("--timeout-ms 180000")
+        && qualityProducerRun.includes("--out-dir $quality_root/packet"),
+      `${metalFile} protected Metal must generate one exact-head three-repeat holdout quality artifact for qualification`,
+    );
+    const qualityUploadName = "Upload exact-head protected Metal quality evidence";
+    const qualityUpload = namedStep(job, qualityUploadName);
+    add(
+      violations,
+      qualityUpload?.if
+        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
+        && qualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && hasExactKeys(
+          qualityUpload?.with,
+          ["name", "path", "if-no-files-found", "retention-days", "overwrite"],
+        )
+        && object(qualityUpload?.with).name
+          === "frozen-candidate-quality-${{ inputs.ref || github.sha }}"
+        && object(qualityUpload?.with).path === "target/release-quality-evidence"
+        && object(qualityUpload?.with)["if-no-files-found"] === "error"
+        && object(qualityUpload?.with)["retention-days"] === 30
+        && object(qualityUpload?.with).overwrite === true
+        && stepIndex(job, qualityUploadName) > stepIndex(job, qualityProducerName)
+        && stepIndex(job, "Prove protected Metal runtime")
+          > stepIndex(job, qualityUploadName),
+      `${metalFile} protected Metal quality must upload one exact-head stable handoff before qualification`,
+    );
     requireCalibrationProducerBoundary(
       violations,
       metalFile,
       job,
       "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
     );
-    requireStepRun(violations, metalFile, job, "Collect three independent Metal calibration runs", [
+    const calibrationStepName = "Collect three independent Metal constant calibration runs";
+    requireStepRun(violations, metalFile, job, calibrationStepName, [
       'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+      "--proof-tier calibration",
+      "--engine-policy accelerated",
+      "--expected-backend Metal",
+      "--qualification-matrix-cell protected_macos_arm64_metal",
+      "--collect-constant-calibration",
+      "--constant-calibration-output-dir target/calibration-runs/macos",
+      "--qualification-driver target/release/codestory_embedding_constant_calibration",
+      "--out-dir target/calibration-proof/macos",
     ]);
+    const calibrationRun = shellLiteralNormalizedText(
+      stepRun(job, calibrationStepName),
+    );
+    add(
+      violations,
+      shellInvocationsContaining(
+        calibrationRun,
+        "python3 .github/scripts/check-packaged-agent-proof.py",
+      ).length === 1
+        && occurrenceCount(calibrationRun, "--collect-constant-calibration") === 1
+        && !hasShellLoop(calibrationRun)
+        && !calibrationRun.includes("--produce-qualification-evidence")
+        && !calibrationRun.includes("--qualification-evidence")
+        && !calibrationRun.includes("--calibration-run-index")
+        && !calibrationRun.includes("--calibration-run-output")
+        && !calibrationRun.includes("--retrieval-quality-evidence")
+        && !calibrationRun.includes("--publication-fault-evidence")
+        && !calibrationRun.includes("--qualification-scenario")
+        && !calibrationRun.includes("--samples-per-metric")
+        && !calibrationRun.includes("true_idle_exit")
+        && !calibrationRun.includes("total_codestory_process_memory")
+        && !calibrationRun.includes("backend_observed_accelerator_residency")
+        && !calibrationRun.includes("--project")
+        && !calibrationRun.includes("--plugin-root")
+        && !calibrationRun.includes("--plugin-handoff"),
+      `${metalFile} calibration must use one three-run synthetic-project constant collector without full qualification or nested sampling`,
+    );
+    const calibrationTimingName = "Publish Metal constant calibration timing";
+    const calibrationTiming = namedStep(job, calibrationTimingName);
+    const calibrationTimingRun = stepRun(job, calibrationTimingName);
+    add(
+      violations,
+      calibrationTiming?.if === "inputs.calibration_mode"
+        && calibrationTiming?.shell === "bash"
+        && hasExactKeys(calibrationTiming?.env, [
+          "CALIBRATION_STARTED_NS",
+          "MODEL_PREPARATION_DURATION_MS",
+          "BUILD_PACKAGE_DURATION_MS",
+        ])
+        && object(calibrationTiming?.env).CALIBRATION_STARTED_NS
+          === "${{ steps.calibration-clock.outputs.started-ns }}"
+        && object(calibrationTiming?.env).MODEL_PREPARATION_DURATION_MS
+          === "${{ steps.model-prepare.outputs.duration-ms }}"
+        && object(calibrationTiming?.env).BUILD_PACKAGE_DURATION_MS
+          === "${{ steps.native-build-package.outputs.duration-ms }}"
+        && calibrationTimingRun.includes("timing_path=target/calibration-runs/macos/timing.json")
+        && calibrationTimingRun.includes(
+          "calibration_finished_ns=\"$(python3 -c 'import time; print(time.monotonic_ns())')\"",
+        )
+        && calibrationTimingRun.includes(
+          "calibration_total_ms=$(((calibration_finished_ns - CALIBRATION_STARTED_NS) / 1000000))",
+        )
+        && calibrationTimingRun.includes(
+          'test "$calibration_total_ms" -lt 600000',
+        )
+        && calibrationTimingRun.includes(
+          '[[ "$MODEL_PREPARATION_DURATION_MS" =~ ^[0-9]+$ ]]',
+        )
+        && calibrationTimingRun.includes("test \"$BUILD_PACKAGE_DURATION_MS\" -ge 0")
+        && calibrationTimingRun.includes("archive_authentication_unpack_ms")
+        && calibrationTimingRun.includes("project_and_request_setup_ms")
+        && calibrationTimingRun.includes("measurement_ms")
+        && calibrationTimingRun.includes("retention_validation_ms")
+        && calibrationTimingRun.includes("end_to_end_ms")
+        && calibrationTimingRun.includes("Model preparation")
+        && calibrationTimingRun.includes("Shared CLI build and package")
+        && calibrationTimingRun.includes("Total calibration wall time")
+        && calibrationTimingRun.includes(">> \"$GITHUB_STEP_SUMMARY\""),
+      `${metalFile} calibration must publish shared build/package and five-phase collector timing, including model preparation and an under-ten-minute total`,
+    );
     const engine = namedStep(job, "Prove protected Metal runtime");
     requireStepRun(violations, metalFile, job, "Prove protected Metal runtime", [
       "--engine-policy accelerated",
@@ -4467,6 +4882,20 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, vulkanFile, vulkan, event, key);
       }
+      const qualityInput = object(at(
+        vulkan,
+        "on",
+        event,
+        "inputs",
+        "quality_evidence_artifact",
+      ));
+      add(
+        violations,
+        qualityInput.required === false
+          && qualityInput.type === "string"
+          && (qualityInput.default === "" || qualityInput.default === undefined),
+        `${vulkanFile} ${event} quality_evidence_artifact must be an optional empty string`,
+      );
     }
     const candidateInput = object(at(
       vulkan,
@@ -4610,6 +5039,20 @@ function validateRemainingWorkflows(workflows, violations) {
         === "${{ !inputs.server_behavior_only }}",
       `${vulkanFile} packaged server-behavior proof must skip the qualification driver`,
     );
+    const qualityDownload = namedStep(
+      job,
+      "Download exact-head publishable packet quality evidence",
+    );
+    add(
+      violations,
+      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
+        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(qualityDownload?.with, ["name", "path"])
+        && object(qualityDownload?.with).name
+          === "${{ inputs.quality_evidence_artifact }}"
+        && object(qualityDownload?.with).path === "target/release-quality-evidence",
+      `${vulkanFile} qualification must download the exact protected Metal quality handoff`,
+    );
     requireCalibrationProducerBoundary(
       violations,
       vulkanFile,
@@ -4635,8 +5078,18 @@ function validateRemainingWorkflows(workflows, violations) {
       engineRun.includes("$calibrationArgs = @()")
         && engineRun.includes("@calibrationArgs")
         && engineRun.includes('$claimArgs = @("--server-behavior-only")')
-        && occurrenceCount(engineRun, "--calibration-bundle") === 1,
-      `${vulkanFile} server-behavior proof must omit calibration while qualification retains it`,
+        && engineRun.includes('"--produce-qualification-evidence"')
+        && engineRun.includes(
+          '"--qualification-driver", "target/release/codestory_embedding_qualification.exe"',
+        )
+        && engineRun.includes(
+          '"--qualification-evidence", "target/windows-vulkan-proof/qualification.json"',
+        )
+        && engineRun.includes('"--retrieval-quality-evidence", $qualityPath')
+        && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
+        && occurrenceCount(engineRun, "--calibration-bundle") === 1
+        && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
+      `${vulkanFile} server-behavior proof must omit calibration while qualification runs one full lifecycle and quality proof`,
     );
     add(
       violations,
@@ -4795,6 +5248,16 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, linuxVulkanFile, linuxVulkan, event, key);
       }
+      for (const key of ["quality_evidence_artifact", "quality_evidence_run_id"]) {
+        const input = object(at(linuxVulkan, "on", event, "inputs", key));
+        add(
+          violations,
+          input.required === false
+            && input.type === "string"
+            && (input.default === "" || input.default === undefined),
+          `${linuxVulkanFile} ${event} ${key} must be an optional empty string`,
+        );
+      }
       add(
         violations,
         at(linuxVulkan, "on", event, "inputs", "candidate_installed_only") === undefined,
@@ -4815,6 +5278,36 @@ function validateRemainingWorkflows(workflows, violations) {
         && candidateInput.default === false,
       `${linuxVulkanFile} reusable candidate-installed proof must be an explicit opt-in`,
     );
+    const optionalCalibrationInput = object(at(
+      linuxVulkan,
+      "on",
+      "workflow_dispatch",
+      "inputs",
+      "constant_calibration_mode",
+    ));
+    add(
+      violations,
+      at(linuxVulkan, "on", "workflow_call", "inputs", "constant_calibration_mode")
+        === undefined
+        && optionalCalibrationInput.required === false
+        && optionalCalibrationInput.type === "boolean"
+        && optionalCalibrationInput.default === false,
+      `${linuxVulkanFile} optional constant calibration must be manual-only and off by default`,
+    );
+    const manualPackageRunInput = object(at(
+      linuxVulkan,
+      "on",
+      "workflow_dispatch",
+      "inputs",
+      "package_run_id",
+    ));
+    add(
+      violations,
+      manualPackageRunInput.required === false
+        && manualPackageRunInput.type === "string"
+        && manualPackageRunInput.default === "",
+      `${linuxVulkanFile} standalone constant calibration must not require an upstream package run`,
+    );
     add(
       violations,
       at(
@@ -4827,7 +5320,41 @@ function validateRemainingWorkflows(workflows, violations) {
       ) === ".github/workflows/packaged-platform-pr.yml",
       `${linuxVulkanFile} manual candidate proof must trust the package-producing workflow`,
     );
+    const route = requireJob(violations, linuxVulkanFile, linuxVulkan, "route");
+    add(
+      violations,
+      JSON.stringify(route["runs-on"]) === JSON.stringify("ubuntu-latest")
+        && route["timeout-minutes"] === 5,
+      `${linuxVulkanFile} standalone dispatch validation must stay on a bounded hosted route job`,
+    );
+    requireStepRun(
+      violations,
+      linuxVulkanFile,
+      route,
+      "Require an upstream package for standalone protected proof",
+      [
+        'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$CONSTANT_CALIBRATION_MODE" != true ]; then',
+        'test -n "$PACKAGE_RUN_ID"',
+      ],
+    );
+    requireStepEnv(
+      violations,
+      linuxVulkanFile,
+      route,
+      "Require an upstream package for standalone protected proof",
+      {
+        EVENT_NAME: "${{ github.event_name }}",
+        CONSTANT_CALIBRATION_MODE: "${{ inputs.constant_calibration_mode }}",
+        PACKAGE_RUN_ID: "${{ inputs.package_run_id }}",
+      },
+    );
     const job = requireJob(violations, linuxVulkanFile, linuxVulkan, "packaged-vulkan");
+    add(
+      violations,
+      job.if === "${{ !inputs.constant_calibration_mode }}"
+        && sameMembers(needs(job), ["route"]),
+      `${linuxVulkanFile} release proof job must not run during standalone optional calibration`,
+    );
     requireStepUses(
       violations,
       linuxVulkanFile,
@@ -4866,6 +5393,91 @@ function validateRemainingWorkflows(workflows, violations) {
       job,
       "${{ !inputs.server_behavior_only }}",
     );
+    const qualificationRust = namedStep(
+      job,
+      "Install pinned Rust for frozen-candidate qualification",
+    );
+    const qualificationDriver = namedStep(job, "Build qualification driver");
+    add(
+      violations,
+      qualificationRust?.if === "${{ !inputs.server_behavior_only }}"
+        && qualificationRust?.shell === "bash"
+        && String(qualificationRust?.run ?? "").includes(
+          "rustup toolchain install 1.95.0 --profile minimal",
+        )
+        && qualificationDriver?.if === "${{ !inputs.server_behavior_only }}"
+        && qualificationDriver?.shell === "bash"
+        && String(qualificationDriver?.run ?? "")
+          === "cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification",
+      `${linuxVulkanFile} standalone qualification must build its pinned full qualification driver exactly once`,
+    );
+    const qualityAuthentication = namedStep(
+      job,
+      "Authenticate protected Metal quality producer",
+    );
+    const qualityAuthenticationRun = stepRun(
+      job,
+      "Authenticate protected Metal quality producer",
+    );
+    add(
+      violations,
+      qualityAuthentication?.if === "${{ !inputs.server_behavior_only }}"
+        && qualityAuthentication?.shell === "bash"
+        && hasExactKeys(qualityAuthentication?.env, [
+          "GH_TOKEN",
+          "QUALITY_ARTIFACT",
+          "QUALITY_RUN_ID",
+        ])
+        && object(qualityAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+        && object(qualityAuthentication?.env).QUALITY_ARTIFACT
+          === "${{ inputs.quality_evidence_artifact }}"
+        && object(qualityAuthentication?.env).QUALITY_RUN_ID
+          === "${{ inputs.quality_evidence_run_id }}"
+        && qualityAuthenticationRun.includes('test -n "$QUALITY_ARTIFACT"')
+        && qualityAuthenticationRun.includes('test -n "$QUALITY_RUN_ID"')
+        && qualityAuthenticationRun.includes(
+          'test "$(jq -r \'.head_repository.full_name\' <<<"$run")" = "$GITHUB_REPOSITORY"',
+        )
+        && qualityAuthenticationRun.includes(
+          'test "$(jq -r \'.path\' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"',
+        )
+        && qualityAuthenticationRun.includes(
+          'test "$(jq -r \'.event\' <<<"$run")" = workflow_dispatch',
+        )
+        && qualityAuthenticationRun.includes(
+          'test "$(jq -r \'.conclusion\' <<<"$run")" = success',
+        )
+        && qualityAuthenticationRun.includes(
+          'test "$producer_sha" = "$(git rev-parse HEAD)"',
+        )
+        && qualityAuthenticationRun.includes(
+          'test "$QUALITY_ARTIFACT" = "frozen-candidate-quality-$producer_sha"',
+        )
+        && qualityAuthenticationRun.includes('test "$artifact_count" = 1'),
+      `${linuxVulkanFile} standalone qualification must authenticate exact-head protected Metal quality`,
+    );
+    const qualityDownload = namedStep(
+      job,
+      "Download exact-head protected Metal quality evidence",
+    );
+    add(
+      violations,
+      qualityDownload?.if === "${{ !inputs.server_behavior_only }}"
+        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(
+          qualityDownload?.with,
+          ["name", "path", "run-id", "github-token"],
+        )
+        && object(qualityDownload?.with).name
+          === "${{ inputs.quality_evidence_artifact }}"
+        && object(qualityDownload?.with).path === "target/release-quality-evidence"
+        && object(qualityDownload?.with)["run-id"]
+          === "${{ inputs.quality_evidence_run_id }}"
+        && object(qualityDownload?.with)["github-token"] === "${{ github.token }}"
+        && stepIndex(job, "Download exact-head protected Metal quality evidence")
+          > stepIndex(job, "Authenticate protected Metal quality producer"),
+      `${linuxVulkanFile} standalone qualification must consume the authenticated protected Metal quality artifact`,
+    );
     const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
     requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
       "--engine-policy accelerated",
@@ -4883,6 +5495,7 @@ function validateRemainingWorkflows(workflows, violations) {
       `${linuxVulkanFile} protected proof must reject CPU fallback`,
     );
     const engineRun = stepRun(job, "Prove offline Linux Vulkan retrieval");
+    const normalizedEngineRun = shellLiteralNormalizedText(engineRun);
     add(
       violations,
       engine?.if === "${{ !inputs.candidate_installed_proof }}",
@@ -4893,8 +5506,22 @@ function validateRemainingWorkflows(workflows, violations) {
       engineRun.includes("calibration_args=()")
         && engineRun.includes('"${calibration_args[@]}"')
         && engineRun.includes('claim_args=(--server-behavior-only)')
-        && occurrenceCount(engineRun, "--calibration-bundle") === 1,
-      `${linuxVulkanFile} server-behavior proof must omit calibration while qualification retains it`,
+        && engineRun.includes("quality_args=()")
+        && engineRun.includes("qualification_args=()")
+        && normalizedEngineRun.includes(
+          "quality_args=(--retrieval-quality-evidence $quality_path)",
+        )
+        && normalizedEngineRun.includes("--produce-qualification-evidence")
+        && normalizedEngineRun.includes(
+          "--qualification-driver target/release/codestory_embedding_qualification",
+        )
+        && normalizedEngineRun.includes(
+          "--qualification-evidence target/linux-vulkan-proof/qualification.json",
+        )
+        && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
+        && occurrenceCount(engineRun, "--calibration-bundle") === 1
+        && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
+      `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one full lifecycle and quality proof`,
     );
     requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
       "--prepare-candidate-installed-proof",
@@ -4955,6 +5582,109 @@ function validateRemainingWorkflows(workflows, violations) {
       "Emit authenticated Linux Vulkan release cells",
       ["calibration"],
     );
+    const optionalCalibration = requireJob(
+      violations,
+      linuxVulkanFile,
+      linuxVulkan,
+      "optional-constant-calibration",
+    );
+    add(
+      violations,
+      optionalCalibration.if
+        === "${{ github.event_name == 'workflow_dispatch' && inputs.constant_calibration_mode }}"
+        && JSON.stringify(optionalCalibration["runs-on"])
+          === JSON.stringify(["self-hosted", "Linux", "X64", "codestory-linux-vulkan"])
+        && optionalCalibration.environment === "linux-vulkan-proof",
+      `${linuxVulkanFile} optional calibration must be a standalone protected manual Vulkan job`,
+    );
+    const optionalCollectorName = "Collect optional Linux Vulkan constant calibration";
+    requireStepRun(violations, linuxVulkanFile, optionalCalibration, optionalCollectorName, [
+      'test "$GITHUB_EVENT_NAME" = workflow_dispatch',
+      "--engine-policy accelerated",
+      "--expected-backend Vulkan",
+      "--proof-tier calibration",
+      "--qualification-matrix-cell protected_linux_x64_vulkan",
+      "--collect-constant-calibration",
+      "--constant-calibration-output-dir target/calibration-runs/linux-vulkan",
+      "--qualification-driver target/release/codestory_embedding_constant_calibration",
+      "--out-dir target/calibration-proof/linux-vulkan",
+    ]);
+    const optionalCollector = namedStep(optionalCalibration, optionalCollectorName);
+    const optionalCollectorRun = shellLiteralNormalizedText(
+      stepRun(optionalCalibration, optionalCollectorName),
+    );
+    add(
+      violations,
+      object(optionalCollector?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+        && shellInvocationsContaining(
+          optionalCollectorRun,
+          "python .github/scripts/check-packaged-agent-proof.py",
+        ).length === 1
+        && !optionalCollectorRun.includes("--produce-qualification-evidence")
+        && !optionalCollectorRun.includes("--qualification-evidence")
+        && !optionalCollectorRun.includes("--retrieval-quality-evidence")
+        && !optionalCollectorRun.includes("--publication-fault-evidence")
+        && !optionalCollectorRun.includes("--qualification-scenario")
+        && !optionalCollectorRun.includes("--samples-per-metric")
+        && !hasShellLoop(optionalCollectorRun)
+        && !optionalCollectorRun.includes("--project")
+        && !optionalCollectorRun.includes("--plugin-root")
+        && !optionalCollectorRun.includes("--plugin-handoff"),
+      `${linuxVulkanFile} optional calibration must collect accelerated constants once from a synthetic project without qualification`,
+    );
+    const optionalNativeBuild = namedStep(
+      optionalCalibration,
+      "Build and package native CLI and constant driver",
+    );
+    const optionalNativeBuildRun = shellLiteralNormalizedText(
+      String(optionalNativeBuild?.run ?? ""),
+    );
+    add(
+      violations,
+      object(optionalNativeBuild?.env).VERSION === "${{ inputs.version }}"
+        && shellInvocationsContaining(optionalNativeBuildRun, "cargo build").length === 1
+        && optionalNativeBuildRun.includes("-p codestory-cli")
+        && optionalNativeBuildRun.includes("--bin codestory-cli")
+        && optionalNativeBuildRun.includes("--bin codestory-cli-runtime")
+        && optionalNativeBuildRun.includes("-p codestory-bench")
+        && optionalNativeBuildRun.includes("--bin codestory_embedding_constant_calibration")
+        && shellInvocationsContaining(
+          optionalNativeBuildRun,
+          "python .github/scripts/package-codestory-release.py",
+        ).length === 1
+        && jobShellInvocationsContaining(optionalCalibration, "cargo build").length === 1
+        && jobShellInvocationsContaining(
+          optionalCalibration,
+          ".github/scripts/package-codestory-release.py",
+        ).length === 1
+        && jobShellInvocationsContaining(
+          optionalCalibration,
+          ".github/scripts/check-packaged-agent-proof.py",
+        ).length === 1
+        && optionalNativeBuildRun.includes("--target linux-x64")
+        && optionalNativeBuildRun.includes("--binary target/release/codestory-cli")
+        && jobShellInvocationsContaining(
+          optionalCalibration,
+          "node scripts/prepare-embedded-model.mjs",
+        ).length === 1
+        && namedStep(optionalCalibration, "Download exact Linux package") === undefined
+        && namedStep(optionalCalibration, "Build constant calibration driver") === undefined
+        && !scalarStrings(optionalCalibration).some(value =>
+          value.includes("inputs.package_run_id")),
+      `${linuxVulkanFile} optional calibration must prepare once, build CLI and collector once, and package that exact CLI once`,
+    );
+    const optionalUpload = namedStep(
+      optionalCalibration,
+      "Upload optional Linux Vulkan calibration evidence",
+    );
+    add(
+      violations,
+      optionalUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(object(optionalUpload?.with).name).includes("${{ github.run_attempt }}")
+        && String(object(optionalUpload?.with).path).includes("target/calibration-runs/linux-vulkan")
+        && String(object(optionalUpload?.with).path).includes("target/calibration-proof/linux-vulkan"),
+      `${linuxVulkanFile} optional calibration must upload attempt-scoped non-selecting evidence`,
+    );
     for (const name of [
       "Upload authenticated Linux accelerator release cell",
       "Upload authenticated Linux retrieval release cell",
@@ -5005,6 +5735,215 @@ function findNamedStep(workflow, name) {
     if (found) return found;
   }
   return undefined;
+}
+
+function releaseProofWorkflowFiles(workflows, graph) {
+  const files = new Set([
+    "auto-release.yml",
+    "packaged-platform-pr.yml",
+    object(graph.workflow_policy.calibration).coordinator_workflow,
+  ].filter(Boolean));
+  for (const evidenceType of list(graph.evidence_types)) {
+    for (const lane of list(object(evidenceType).proof_lanes)) {
+      files.add(path.basename(String(lane)));
+    }
+  }
+  for (const file of list(graph.workflow_policy.artifact_workflows)) {
+    files.add(path.basename(String(file)));
+  }
+  for (const contract of list(graph.workflow_policy.protected_jobs)) {
+    files.add(path.basename(String(object(contract).workflow)));
+  }
+  for (const cell of [
+    ...list(object(graph.workflow_policy.calibration).required_cells),
+    ...list(object(graph.workflow_policy.calibration).optional_cells),
+    ...list(object(graph.workflow_policy.qualification).required_cells),
+    ...list(object(graph.workflow_policy.qualification).optional_cells),
+  ]) {
+    files.add(path.basename(String(object(cell).workflow)));
+  }
+  files.add(path.basename(
+    String(object(graph.workflow_policy.qualification).coordinator_workflow ?? ""),
+  ));
+  files.delete("");
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const file of [...files]) {
+      for (const job of Object.values(object(workflows.get(file)?.jobs))) {
+        const reusable = String(object(job).uses ?? "");
+        const match = reusable.match(/^\.\/\.github\/workflows\/([^/]+\.yml)$/u);
+        if (match && !files.has(match[1])) {
+          files.add(match[1]);
+          changed = true;
+        }
+      }
+    }
+  }
+  return files;
+}
+
+function workflowCpuSelectorViolations(file, value) {
+  const violations = [];
+  function visit(current, location, key = "") {
+    if (Array.isArray(current)) {
+      current.forEach((item, index) => visit(item, `${location}[${index}]`));
+      return;
+    }
+    if (current !== null && typeof current === "object") {
+      for (const [childKey, childValue] of Object.entries(current)) {
+        visit(childValue, `${location}.${childKey}`, childKey);
+      }
+      return;
+    }
+    const text = String(current ?? "");
+    const normalizedKey = key.toLowerCase().replaceAll("-", "_");
+    const normalizedText = text.trim().toLowerCase();
+    if (
+      normalizedKey === "codestory_embed_allow_cpu"
+      && text !== "0"
+    ) {
+      violations.push(
+        `[cpu_selector] ${file} ${location} must set CODESTORY_EMBED_ALLOW_CPU to literal 0`,
+      );
+    }
+    if (
+      ["policy", "engine_policy", "execution_policy"].includes(normalizedKey)
+      && normalizedText === "cpu_explicit"
+    ) {
+      violations.push(`[cpu_selector] ${file} ${location} selects cpu_explicit`);
+    }
+    if (
+      ["backend", "expected_backend"].includes(normalizedKey)
+      && normalizedText === "cpu"
+    ) {
+      violations.push(`[cpu_selector] ${file} ${location} selects CPU backend`);
+    }
+    const executable = shellLiteralNormalizedText(text);
+    if (
+      hasNonLiteralCpuAssignment(executable)
+      || /\bcpu_explicit\b/iu.test(executable)
+      || /--expected-backend(?:\s+|=)cpu\b/iu.test(executable)
+      || /(?:expected_backend|backend)\s*=\s*cpu\b/iu.test(executable)
+    ) {
+      violations.push(`[cpu_selector] ${file} ${location} contains a CPU proof selector`);
+    }
+  }
+  visit(value, file);
+  return violations;
+}
+
+const cpuTestSeamAllowedJobs = new Map([
+  [
+    "retrieval-engine-smoke.yml",
+    new Set(["linux-contracts", "windows-manifest-missing"]),
+  ],
+]);
+
+function workflowCpuTestSeamViolations(file, value, releaseProofFiles) {
+  const violations = [];
+  function visit(current, location, pathParts, jobName) {
+    if (Array.isArray(current)) {
+      current.forEach((item, index) =>
+        visit(item, `${location}[${index}]`, [...pathParts, String(index)], jobName));
+      return;
+    }
+    if (current !== null && typeof current === "object") {
+      for (const [childKey, childValue] of Object.entries(current)) {
+        const childPath = [...pathParts, childKey];
+        const childLocation = `${location}.${childKey}`;
+        const childJob = pathParts.length === 1 && pathParts[0] === "jobs"
+          ? childKey
+          : jobName;
+        if (
+          childKey.toLowerCase().replaceAll("-", "_")
+            === "codestory_test_embed_allow_cpu"
+        ) {
+          const allowed = !releaseProofFiles.has(file)
+            && cpuTestSeamAllowedJobs.get(file)?.has(childJob) === true
+            && childPath.length === 4
+            && childPath[0] === "jobs"
+            && childPath[1] === childJob
+            && childPath[2] === "env"
+            && String(childValue) === "1";
+          add(
+            violations,
+            allowed,
+            `[cpu_test_seam] ${file} ${childLocation} may enable CPU only through the exact source-test job seam`,
+          );
+          continue;
+        }
+        visit(childValue, childLocation, childPath, childJob);
+      }
+      return;
+    }
+    if (
+      /\bCODESTORY_TEST_EMBED_ALLOW_CPU\b/iu.test(
+        shellLiteralNormalizedText(String(current ?? "")),
+      )
+    ) {
+      violations.push(
+        `[cpu_test_seam] ${file} ${location} may not reference the CPU test seam outside an allowlisted source-test job env`,
+      );
+    }
+  }
+  visit(value, file, [], "");
+  return violations;
+}
+
+export function releaseProofCpuSelectorViolations(
+  workflows,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+  supportSources,
+) {
+  const violations = [];
+  const releaseProofFiles = releaseProofWorkflowFiles(workflows, graph);
+  for (const [file, workflow] of workflows) {
+    // The product selector is never legal in a workflow. Source tests that
+    // exercise CPU behavior use the separately named, policy-owned test seam.
+    violations.push(...workflowCpuSelectorViolations(file, workflow));
+    violations.push(...workflowCpuTestSeamViolations(
+      file,
+      workflow,
+      releaseProofFiles,
+    ));
+  }
+  const sources = supportSources ?? new Map([
+    [
+      "scripts/release-evidence/guest-runner.sh",
+      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-runner.sh"), "utf8"),
+    ],
+    [
+      ".github/scripts/check-linux-glibc-baseline.sh",
+      fs.readFileSync(path.join(repositoryRoot, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
+    ],
+    [
+      "scripts/release-evidence/guest-verify.sh",
+      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-verify.sh"), "utf8"),
+    ],
+  ]);
+  for (const [file, source] of sources) {
+    if (
+      file.endsWith("guest-verify.sh")
+    ) {
+      add(
+        violations,
+        source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"')
+          && source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=1"'),
+        `[cpu_selector] ${file} must prove CPU is disabled in the runner service`,
+      );
+      continue;
+    }
+    const executable = shellLiteralNormalizedText(source);
+    if (
+      hasNonLiteralCpuAssignment(executable)
+      || /\bcpu_explicit\b/iu.test(executable)
+      || /--expected-backend(?:\s+|=)cpu\b/iu.test(executable)
+    ) {
+      violations.push(`[cpu_selector] ${file} contains a CPU proof selector`);
+    }
+  }
+  return violations;
 }
 
 export function releaseWorkflowContractViolations(
@@ -5646,10 +6585,6 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
       name: "release-evidence-${{ inputs.ref }}",
       path: "target/release-evidence",
     }],
-    ["packaged-platform-proof.yml/build/Upload hosted Linux calibration runs", {
-      name: "embedding-calibration-linux-${{ inputs.version }}",
-      path: "target/calibration-runs/linux",
-    }],
     ["packaged-platform-proof.yml/build/Upload release asset", {
       name: "codestory-cli-${{ matrix.asset_target }}",
       path: "target/release-dist/*.tar.gz\ntarget/release-dist/*.zip\ntarget/release-dist/*.sha256\ntarget/release-dist/SHA256SUMS.txt\n",
@@ -5657,6 +6592,10 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
       name: "embedding-calibration-macos-${{ inputs.version }}",
       path: "target/calibration-runs/macos",
+    }],
+    ["macos-metal-proof.yml/packaged-metal/Upload exact-head protected Metal quality evidence", {
+      name: "frozen-candidate-quality-${{ inputs.ref || github.sha }}",
+      path: "target/release-quality-evidence",
     }],
     ["release.yml/pre-publish-closeout/Upload accepted pre-publish closeout", {
       name: "release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}",
@@ -6212,6 +7151,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validatePostPublish(workflows, violations, graph);
   validatePackagedCoordinator(workflows, violations, graph);
   validateRemainingWorkflows(workflows, violations);
+  violations.push(...releaseProofCpuSelectorViolations(workflows, graph));
   validateReleaseCellUploadOwnership(workflows, violations);
   validateReleaseArtifactRerunSafety(workflows, violations);
   violations.push(...dispatchInputInterpolationViolations(workflows));

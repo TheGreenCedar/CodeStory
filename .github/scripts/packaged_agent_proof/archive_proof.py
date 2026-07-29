@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 from .archive_io import find_cli, unpack_archive
 from .calibration_verification import verify_calibration_bundle
-from .contract_primitives import write_json
+from .constant_calibration import collect_constant_calibration
+from .contract_primitives import sha256, write_json
 from .failure_evidence import preserve_failure_evidence
 from .foundation import LEGACY_HELP_TOKENS, REPOSITORY_ROOT, require
 from .installation_support import isolated_environment
@@ -81,6 +83,8 @@ def requires_calibration_bundle(args: argparse.Namespace) -> bool:
 
 
 def claim_scope(args: argparse.Namespace) -> str:
+    if getattr(args, "collect_constant_calibration", False):
+        return "constant_calibration"
     if args.ground_only:
         return (
             "installed_ground"
@@ -150,6 +154,7 @@ def _run_proof_phases(
     temporary_package_directory: FailurePreservingTemporaryDirectory,
     root: Path,
 ) -> None:
+    package_phase_started = time.perf_counter()
     unpack_archive(args.archive, root / "unpacked")
     cli = find_cli(root / "unpacked")
     manifest = load_native_manifest(
@@ -192,6 +197,20 @@ def _run_proof_phases(
         measurement_contract,
         calibration_bundle,
     )
+    if getattr(args, "collect_constant_calibration", False):
+        summary["constant_calibration"] = collect_constant_calibration(
+            args,
+            root=root,
+            unpacked_root=root / "unpacked",
+            cli=cli,
+            manifest=manifest,
+            measurement_contract=measurement_contract,
+            env=env,
+            archive_sha256=sha256(args.archive),
+            package_phase_started=package_phase_started,
+        )
+        write_json(args.out_dir / "summary.json", summary)
+        return
     if not args.version_only:
         require(
             args.project is not None,

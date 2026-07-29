@@ -58,9 +58,6 @@ def _prepare_contract_files(root: Path) -> tuple[Path, Path, Path]:
     unfrozen_constant_set["calibration_required_values"] = {
         field: None for field in unfrozen_constant_set["calibration_required_values"]
     }
-    unfrozen_constant_set["qualification_thresholds"] = {
-        field: None for field in unfrozen_constant_set["qualification_thresholds"]
-    }
     unfrozen_constant_set["freeze_record"] = None
     write_json(self_constant_set, unfrozen_constant_set)
     self_measurement_protocol = root / MEASUREMENT_PROTOCOL.name
@@ -205,7 +202,7 @@ def _native_manifest(contract: NativeContractFixture) -> dict:
         "embedding": contract.embedding,
         "tokenizer_config": contract.tokenizer,
         "accelerator": {
-            "cpu_fallback": "explicit_only",
+            "cpu_fallback": "unsupported",
             "package_claim": "compiled_capability_only",
             "runtime_execution": "not_proven_by_package",
             "expected_protected_backend": "metal",

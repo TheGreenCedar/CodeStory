@@ -18,7 +18,14 @@ use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
 pub(super) fn existing_control_events(directory: &Path) -> Result<Vec<ControlEvent>> {
-    published_control_events(&directory.join(format!("{}.events.jsonl", qualification_nonce()?)))
+    existing_control_events_for_nonce(directory, &qualification_nonce()?)
+}
+
+pub(super) fn existing_control_events_for_nonce(
+    directory: &Path,
+    nonce: &str,
+) -> Result<Vec<ControlEvent>> {
+    published_control_events(&directory.join(format!("{nonce}.events.jsonl")))
 }
 
 /// Read the records the server has finished publishing to its append-only
@@ -307,6 +314,7 @@ pub(super) fn measurement_worker_timeout(operation: &str) -> Duration {
         "bulk"
         | "measure_bulk_frame"
         | "measure_spawn_hello"
+        | "measure_constant_cold_query"
         | "measure_product_query"
         | "measure_resident_identity"
         | "resident_identity" => budgets.bulk_request,

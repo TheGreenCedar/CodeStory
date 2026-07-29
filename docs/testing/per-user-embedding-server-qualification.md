@@ -51,6 +51,9 @@ change. It cannot pass a package, hardware, installed-runtime, or release gate.
 Qualification starts only after the constant set says `frozen`, every selected
 value and threshold is non-null, and the freeze record names the source/tree,
 host profile, sample artifact hash, selection rule, and selected values.
+Calibration, qualification, and broad retrieval require physical Metal or
+Vulkan acceleration with CPU embeddings disabled. CPU-only hosts are
+unsupported.
 
 The qualification run cannot change its own thresholds. A failure returns to a
 new source revision, which requires a new binary and new evidence.
@@ -121,37 +124,43 @@ Synthetic self-tests validate the verifier only:
 python .github/scripts/check-packaged-agent-proof.py --self-test
 ```
 
-A draft exact-package run is explicitly calibration:
+A runtime-constant calibration run uses the protected Apple Silicon Metal cell:
 
 ```sh
 cargo build --release --locked -p codestory-bench \
-  --bin codestory_embedding_qualification
+  --bin codestory_embedding_constant_calibration
 python .github/scripts/check-packaged-agent-proof.py \
   --archive <archive> \
   --checksum-file <checksums> \
   --expected-version <version> \
-  --project <repo-a> \
-  --plugin-root plugins/codestory \
-  --plugin-handoff \
-  --engine-policy cpu_explicit \
-  --expected-backend CPU \
+  --engine-policy accelerated \
+  --expected-backend Metal \
   --proof-tier calibration \
-  --qualification-matrix-cell hosted_linux_x64_cpu \
-  --produce-qualification-evidence \
-  --qualification-driver target/release/codestory_embedding_qualification \
-  --qualification-evidence <calibration.json>
+  --qualification-matrix-cell protected_macos_arm64_metal \
+  --collect-constant-calibration \
+  --constant-calibration-output-dir <calibration-runs> \
+  --qualification-driver target/release/codestory_embedding_constant_calibration \
+  --out-dir <proof-output-outside-calibration-runs>
 ```
 
-The proof harness invokes this separate driver with `--cli` pointing at the
-exact unpacked packaged executable. Only the nonce-gated worker remains in the
-shipped CLI; scenario orchestration and evidence writing stay in the proof
-tool.
+The proof harness authenticates and unpacks once, prepares its projects and
+model once, then records three fresh server generations with one sample per
+constant-source metric. It does not run qualification scenarios or collect
+true-idle, memory, retrieval-quality, or accelerator evidence. Those belong to
+frozen-candidate qualification. Optional Linux Vulkan calibration is
+manual-only and cannot feed or block the frozen bundle.
+The collector owns its private synthetic project. The retained calibration
+directory must start empty, and ordinary proof output must remain outside it.
 
-Accuracy or performance qualification may replace `calibration` with its exact
-requested tier and pass `--retrieval-quality-evidence` the exact-head
-`packet-runtime-summary.json` emitted by the release-evidence workflow. v0.16
-release closeout does not consume that artifact. Hosted and protected package
-tiers may bind the unpacked archive through the source plugin launcher.
+Frozen-candidate qualification passes `--retrieval-quality-evidence` the
+exact-head `packet-runtime-summary.json` produced on protected Metal from the
+packaged candidate. That artifact covers all three checked-in
+`holdout-retrieval` tasks for three cold-CLI repeats. Metal and Windows Vulkan
+each consume it while running the full qualification suite once. Linux Vulkan
+may consume the same artifact through a standalone protected-runner dispatch;
+its absence does not block the coordinator. v0.16 release closeout does not
+consume this optional evaluation artifact. Hosted and protected package tiers
+may bind the unpacked archive through the source plugin launcher.
 `installed_runtime` instead requires the managed installed plugin and managed
 executable it claims; it rejects
 `CODESTORY_CLI`, a repository-source plugin root, and a direct unpacked binary
@@ -209,18 +218,11 @@ same ancestor and one-file-difference rule. It runs for both a proof-only
 head cannot authorize a later source tree. This check does not replace bundle
 authentication or turn package proof into a release-evidence consumer.
 
-The full frozen `hosted_package` qualification in the same workflow carries the
-same flag, but it cannot run today: `--produce-qualification-evidence` requires
-the exact-head release-evidence `packet-runtime-summary.json` at any
-non-calibration tier, and `packaged-platform-pr.yml` is required to pass no
-release evidence to package proof. The `protected_hardware` bundle consumers on
-the Metal, Windows Vulkan, and Linux Vulkan lanes are likewise exempt: on the
-release path they run `--server-behavior-only`, which takes their no-bundle
-branch, and on the coordinator path they carry the same release-evidence
-requirement. Those package and hardware invocations consume the already-frozen
-constant set without re-authenticating its bundle; the mandatory release
-preflight independently proves that the frozen source binding still covers the
-tree being released.
+Hosted package proof does not execute embeddings or produce qualification
+evidence. Protected Metal and Vulkan lanes and candidate-installed lanes own
+runtime proof. They consume the checked-in frozen constant set; mandatory
+release preflight independently proves that its source binding still covers
+the tree being released.
 
 That rule fixes the release ordering to **bump-then-calibrate**: bump the
 version first with `node scripts/bump-version.mjs --version <version>`,

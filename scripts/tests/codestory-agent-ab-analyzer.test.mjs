@@ -128,7 +128,7 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
     retrieval_contract: {
       retrieval_contract: "in_process_v1",
       embedding_engine: "process_shared",
-      execution_policy: "cpu_explicit",
+      execution_policy: "accelerated",
     },
     retrieval_status: { semantic_generation: "semantic-1" },
   };
@@ -164,7 +164,7 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
       transport_mode: "cold_cli_packet",
       retrieval_contract: "in_process_v1",
       embedding_engine: "process_shared",
-      embedding_policy: "cpu_explicit",
+      embedding_policy: "accelerated",
       retrieval_mode: "full",
       diagnostic_count: 2,
       full_diagnostic_count: 2,
@@ -1960,14 +1960,14 @@ function localCacheProvenance(overrides = {}) {
 function localColdPacketCacheProvenance(overrides = {}) {
   return localCacheProvenance({
     embedding_engine_instance_id: null,
-    embedding_policy: "cpu_explicit",
+    embedding_policy: "accelerated",
     semantic_ready: false,
     packet_embedding_execution: {
       source: "packet.answer.retrieval_trace",
       transport_mode: "cold_cli_packet",
       retrieval_contract: "in_process_v1",
       embedding_engine: "process_shared",
-      embedding_policy: "cpu_explicit",
+      embedding_policy: "accelerated",
       retrieval_mode: "full",
       diagnostic_count: 2,
       full_diagnostic_count: 2,
@@ -1997,7 +1997,7 @@ test("cold packet execution proof replaces only unavailable process-local identi
     ["source", "status", /source=status/],
     ["transport_mode", "warm_stdio_packet", /transport=warm_stdio_packet/],
     ["embedding_engine", "other", /embedding engine=other/],
-    ["embedding_policy", "accelerated", /embedding policy does not match cache provenance/],
+    ["embedding_policy", "cpu_explicit", /expected accelerated/],
     ["retrieval_mode", null, /retrieval mode=unknown/],
     ["diagnostic_count", 0, /no sidecar diagnostics/],
     ["full_diagnostic_count", 1, /non-full sidecar diagnostic/],
@@ -2022,7 +2022,7 @@ test("skipped or degraded semantic stages cannot replace live engine identity", 
     retrieval_contract: {
       retrieval_contract: "in_process_v1",
       embedding_engine: "process_shared",
-      execution_policy: "cpu_explicit",
+      execution_policy: "accelerated",
     },
     retrieval_status: { semantic_generation: "proj-current" },
   };

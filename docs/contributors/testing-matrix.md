@@ -137,7 +137,7 @@ Focused proof covers:
   for release builds;
 - embedded-model digest and atomic materialization;
 - linked ggml build identity;
-- explicit `accelerated` or `cpu_explicit` policy;
+- explicit `accelerated` policy with CPU embeddings disabled;
 - prohibited silent CPU fallback and software-adapter rejection;
 - live embedding smoke plus post-encode backend observations for execution
   device/backend, layer placement, resident tensor count/bytes, execution nodes,
@@ -183,13 +183,25 @@ alone is not treated as OS-level denial. This proves the Cargo release boundary,
 not that the separately packaged Linux archive was produced by that discarded
 fresh-target build.
 
-Hosted source/package jobs may set:
+CPU embeddings are unsupported in package, calibration, qualification, and
+release-proof jobs. Source-only contract tests may exercise CPU rejection, but
+cannot emit product or release evidence.
 
-```sh
-CODESTORY_EMBED_ALLOW_CPU=1
-```
+Runtime-constant calibration runs three clean protected Apple Silicon Metal
+generations with one sample per metric per run. It builds and packages once,
+prepares the projects and model once, and performs no lifecycle, fault,
+true-idle, memory, retrieval-quality, or accelerator qualification. A manually
+dispatched Linux Vulkan calibration may emit optional diagnostic evidence, but
+it does not feed or block the frozen calibration bundle.
 
-They must report `cpu_explicit` and make no acceleration claim.
+Frozen-candidate qualification is a separate one-run-per-platform lane.
+Protected Metal produces the exact three-task, three-repeat holdout quality
+artifact from the packaged candidate, then Metal and Windows Vulkan each run
+the full lifecycle, fault, true-idle, memory, quality, and accelerator suite
+once. Protected Linux Vulkan may consume those exact package, calibration, and
+quality artifacts through a standalone dispatch when its GPU runner is online;
+it is not a coordinator closeout dependency and cannot block qualification
+when that runner is absent.
 
 ### Packaged proof
 
@@ -207,17 +219,19 @@ commit and tree, executable digest, server protocol, accepted constant set, and
 measurement protocol. `--version-only` proves package structure, version, and
 help; it does not prove a running server.
 
-Full calibration and qualification use the ordinary plugin launcher with two
-independently started host processes and different repositories.
+Protected and installed qualification use the ordinary plugin launcher with
+two independently started host processes and different repositories.
 `--server-behavior-only` is the smaller release path: one host grounds one
 project, waits for search readiness in that same project, and verifies the
 resident engine and server against the package manifest. It rejects
 calibration and quality inputs and makes no two-host or broader lifecycle
 claim.
 
-`--proof-tier calibration` may collect draft measurements, but cannot satisfy a
-package, hardware, installed, or release claim. A higher qualification tier
-requires a frozen constant set and a retained qualification record.
+`--proof-tier calibration` collects draft runtime-constant measurements from a
+private synthetic project, but cannot satisfy a package, hardware, installed,
+or release claim. It never accepts a repository project, plugin root, or plugin
+handoff. A higher qualification tier requires a frozen constant set and a
+retained qualification record.
 A packaged proof handed an authenticated calibration bundle -- the manually
 dispatched `qualification` frozen-candidate lane -- runs one extra
 `--version-only --proof-tier hosted_package` invocation with
@@ -229,10 +243,7 @@ version, calibrate on the bumped tree, then freeze and release. A
 calibrate-then-bump ordering fails the guard, which names the offending paths
 and the required ordering in its failure message. Dropping the flag does not
 weaken that invocation, it breaks it: a `--version-only` proof rejects
-calibration inputs unless the lineage is enforced. The heavier frozen
-`hosted_package` qualification carries the same flag but stays dark while it
-requires the optional release-evidence packet that package proof must not
-depend on.
+calibration inputs unless the lineage is enforced.
 `--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through
@@ -244,15 +255,16 @@ fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship the runtime executable and native modules in one immutable generation
-selected by the public launcher through a single atomic pointer. Optional
-hosted Linux calibration and quality proof does not install a Vulkan loader
-before help, stdio initialization, or explicit diagnostic CPU execution. It
-cannot replace the protected Vulkan release proof.
+selected by the public launcher through a single atomic pointer. Help, status,
+and local navigation do not require a Vulkan loader, but broad retrieval does.
+Optional Linux constant calibration runs only on the protected Vulkan host and
+cannot feed or block the frozen bundle.
 
-Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
-to make the claim explicit. Protected and installed tiers additionally name
-their exact proof tier and retained qualification file. The harness self-test
-uses synthetic fixtures only:
+Non-calibration protected and installed tiers use `--plugin-handoff`,
+`--engine-policy accelerated`, `--expected-backend`, and `--offline` to make
+the claim explicit. Constant calibration uses only its synthetic-project
+collector flags and keeps proof output outside the initially empty retained
+calibration directory. The harness self-test uses synthetic fixtures only:
 
 ```sh
 python .github/scripts/check-packaged-agent-proof.py --self-test
@@ -433,7 +445,8 @@ primary, so evidence must use the reported matched key to distinguish them.
 
 The workflow-dispatch-only Windows manifest-missing lane installs the repository's
 checksum-pinned Vulkan SDK before it compiles and runs the real locked
-`ready_command` integration target with explicit CPU runtime permission. Its
+`ready_command` integration target. Any CPU-selector coverage in that lane is
+a test-only rejection or compatibility contract, not runtime evidence. Its
 exact-only cache binds the hosted OS, Rust release, host target, versioned proof
 shape, Ninja generator, CMake and Ninja versions, default feature topology,
 workspace and vendor manifests, installer script, and lockfile. It has no
@@ -447,7 +460,8 @@ hosted package cache also binds that generator and its CMake/Ninja tool versions
 the protected Vulkan lane pins the same generator before building its package
 and records both tool versions in the retained host evidence.
 
-That Windows lane is source and protocol evidence on a hosted CPU runner. The
+That Windows lane is source and protocol evidence on a hosted runner without
+protected GPU evidence. The
 SDK preserves the production-default native compile topology; it does not prove
 Vulkan execution, a packaged archive, an installed runtime, or protected
 hardware behavior. Those claims remain with the package and protected Windows
@@ -685,6 +699,7 @@ There is intentionally no `publish_release` field on this manual command.
 State the exact SHA, commands, machine/backend, cache state, and highest proof
 tier reached. Distinguish source, package, hardware, plugin, installed-runtime,
 and live behavior evidence. Include skipped work and platform evidence still
-owed; never upgrade a hosted CPU result into a Metal or Vulkan claim. A passing
+owed; never upgrade a hosted source or package result into a Metal or Vulkan
+claim. A passing
 lower-tier row cannot satisfy a higher-tier claim, and one current row cannot
 hide stale historical evidence for the same requirement.

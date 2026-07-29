@@ -231,6 +231,14 @@ adapter to compensate for incorrect upstream state.
   recalibrate on the bumped tree, never to widen the allowed path set. Any other
   commit -- a doc fix, a CI tweak, a rebase -- between calibration and the
   package also fails, so recalibrate rather than reorder history.
+- CPU embeddings are unsupported. Calibration and release-proof execution must
+  use `accelerated` policy with CPU fallback disabled. Runtime-constant
+  calibration requires exactly three fresh protected Apple Silicon Metal runs
+  with one sample per metric per run. Optional Linux Vulkan calibration is a
+  standalone, non-selecting diagnostic; it never joins or blocks calibration
+  assembly. Calibration freezes runtime constants only. Lifecycle, fault,
+  true-idle, memory, retrieval-quality, and accelerator qualification run later
+  against the frozen candidate.
 - Validate release changes with
   `python .github/scripts/check-codestory-release.py --version <version>` and
   `node .github/scripts/check-workflow-policy.mjs`.

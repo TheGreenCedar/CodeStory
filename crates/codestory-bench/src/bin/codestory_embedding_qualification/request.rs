@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
+pub(super) const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 pub(super) const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ARCHIVE_SHA256_ENV: &str = "CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256";
 const MANIFEST_PATH_ENV: &str = "CODESTORY_PLUGIN_CLI_MANIFEST_PATH";
@@ -195,7 +195,7 @@ fn validate_gate_and_paths(
     Ok((qualification_directory, output_path, nonce_sha256))
 }
 
-fn validate_source(source: &QualificationSource) -> Result<()> {
+pub(super) fn validate_source(source: &QualificationSource) -> Result<()> {
     if !is_lower_hex(&source.commit, 40) || !is_lower_hex(&source.tree, 40) || source.tracked_dirty
     {
         bail!("embedding_qualification_source_invalid");
@@ -299,7 +299,7 @@ fn validate_manifest(
     Ok(())
 }
 
-fn qualification_executable(path: PathBuf) -> Result<QualificationExecutable> {
+pub(super) fn qualification_executable(path: PathBuf) -> Result<QualificationExecutable> {
     if !path.is_absolute() || !path.is_file() {
         bail!("embedding_qualification_executable_invalid");
     }
@@ -330,7 +330,7 @@ fn qualification_executable(path: PathBuf) -> Result<QualificationExecutable> {
     })
 }
 
-fn validate_runtime(runtime: &QualificationRuntime) -> Result<()> {
+pub(super) fn validate_runtime(runtime: &QualificationRuntime) -> Result<()> {
     if runtime.expected_backend.trim().is_empty()
         || runtime.matrix_cell_id.is_empty()
         || !runtime
@@ -339,25 +339,15 @@ fn validate_runtime(runtime: &QualificationRuntime) -> Result<()> {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
         || runtime.cache_state != "reused"
         || runtime.residency_state != "resident"
-        || !matches!(
-            runtime.engine_policy.as_str(),
-            "accelerated" | "cpu_explicit"
-        )
+        || runtime.engine_policy != "accelerated"
     {
         bail!("embedding_qualification_runtime_invalid");
     }
     let allow_cpu = codestory_retrieval::sidecar_process_defaults().embedding_allow_cpu();
-    if (runtime.engine_policy == "cpu_explicit") != allow_cpu {
+    if allow_cpu {
         bail!("embedding_qualification_policy_mismatch");
     }
-    if runtime.engine_policy == "cpu_explicit"
-        && !runtime.expected_backend.eq_ignore_ascii_case("cpu")
-    {
-        bail!("embedding_qualification_backend_mismatch");
-    }
-    if runtime.engine_policy == "accelerated"
-        && runtime.expected_backend.eq_ignore_ascii_case("cpu")
-    {
+    if runtime.expected_backend.eq_ignore_ascii_case("cpu") {
         bail!("embedding_qualification_backend_mismatch");
     }
     Ok(())
@@ -385,6 +375,22 @@ fn validate_projects(projects: &[PathBuf]) -> Result<()> {
         bail!("embedding_qualification_projects_not_distinct");
     }
     Ok(())
+}
+
+pub(super) fn validate_project(project: &Path) -> Result<PathBuf> {
+    if !project.is_absolute() {
+        bail!("embedding_constant_calibration_project_not_absolute");
+    }
+    let metadata = fs::symlink_metadata(project).with_context(|| {
+        format!(
+            "inspect embedding constant calibration project {}",
+            project.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("embedding_constant_calibration_project_untrusted");
+    }
+    canonical_existing(project)
 }
 
 fn validate_exact_string_list(actual: &[String], expected: &[&str], field: &str) -> Result<()> {
@@ -471,7 +477,7 @@ pub(super) fn validate_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_private_file_metadata(metadata: &fs::Metadata) -> Result<()> {
+pub(super) fn validate_private_file_metadata(metadata: &fs::Metadata) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -490,14 +496,14 @@ pub(super) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn is_lower_hex(value: &str, length: usize) -> bool {
+pub(super) fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn compiled_asset_target() -> &'static str {
+pub(super) fn compiled_asset_target() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "linux-x64",
         ("linux", "aarch64") => "linux-arm64",
@@ -506,5 +512,58 @@ fn compiled_asset_target() -> &'static str {
         ("windows", "x86_64") => "windows-x64",
         ("windows", "aarch64") => "windows-arm64",
         _ => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        QualificationRuntime, REQUIRED_METRICS, REQUIRED_SCENARIOS, validate_exact_string_list,
+        validate_runtime,
+    };
+
+    #[test]
+    fn full_qualification_keeps_exact_scenario_and_metric_lists() {
+        let scenarios = REQUIRED_SCENARIOS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let metrics = REQUIRED_METRICS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        validate_exact_string_list(&scenarios, REQUIRED_SCENARIOS, "scenarios")
+            .expect("exact scenarios");
+        validate_exact_string_list(&metrics, REQUIRED_METRICS, "metrics").expect("exact metrics");
+
+        let mut missing = scenarios;
+        missing.pop();
+        assert!(validate_exact_string_list(&missing, REQUIRED_SCENARIOS, "scenarios").is_err());
+        let mut reordered = metrics.clone();
+        reordered.swap(0, 1);
+        assert!(validate_exact_string_list(&reordered, REQUIRED_METRICS, "metrics").is_err());
+        let mut extra = metrics;
+        extra.push("constant_only_escape".into());
+        assert!(validate_exact_string_list(&extra, REQUIRED_METRICS, "metrics").is_err());
+    }
+
+    #[test]
+    fn full_qualification_rejects_removed_cpu_backend_and_policy() {
+        let accelerated = QualificationRuntime {
+            engine_policy: "accelerated".into(),
+            expected_backend: "metal".into(),
+            offline: true,
+            matrix_cell_id: "macos-metal".into(),
+            cache_state: "reused".into(),
+            residency_state: "resident".into(),
+        };
+
+        let mut cpu_backend = accelerated.clone();
+        cpu_backend.expected_backend = "cpu".into();
+        assert!(validate_runtime(&cpu_backend).is_err());
+
+        let mut cpu_policy = accelerated;
+        cpu_policy.engine_policy = "cpu_explicit".into();
+        assert!(validate_runtime(&cpu_policy).is_err());
     }
 }
