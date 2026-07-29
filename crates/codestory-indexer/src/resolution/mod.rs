@@ -715,6 +715,14 @@ pub struct ResolutionPass {
     semantic_resolvers: SemanticResolverRegistry,
 }
 
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("resolution cancelled")]
+struct ResolutionCancelled;
+
+pub(crate) fn is_resolution_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ResolutionCancelled>().is_some()
+}
+
 impl Default for ResolutionPass {
     fn default() -> Self {
         Self::new()
@@ -836,7 +844,7 @@ impl ResolutionPass {
 
     fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<()> {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-            anyhow::bail!("resolution cancelled");
+            return Err(ResolutionCancelled.into());
         }
         Ok(())
     }
@@ -3398,6 +3406,22 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Instant;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolution_cancellation_signal_is_typed() {
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let cancellation = ResolutionPass::check_cancelled(Some(&cancel_token))
+            .expect_err("cancelled resolution should return its typed signal");
+        assert!(is_resolution_cancelled(&cancellation));
+
+        let unrelated = anyhow::anyhow!("resolution cancelled");
+        assert!(
+            !is_resolution_cancelled(&unrelated),
+            "matching text must not reclassify an unrelated resolution failure"
+        );
+    }
 
     fn create_node_table(conn: &Connection) -> Result<()> {
         conn.execute_batch(
