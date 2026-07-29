@@ -122,14 +122,14 @@ impl EvidencePredicate {
             Self::CitedRoles { subsystem, roles } => {
                 subsystem(citation)
                     && packet_evidence_role(citation).is_some_and(|role| roles.contains(&role))
-                    && role_survives_without_its_directory(citation, roles)
+                    && role_survives_without_its_path(citation, roles)
             }
             Self::CitedCarrier(carrier) => carrier(citation),
         }
     }
 }
 
-/// Whether the citation still earns one of `roles` once its directories are taken away.
+/// Whether the citation still earns one of `roles` once its path is taken away.
 ///
 /// A path says where a symbol was filed. It cannot say what the symbol does, and the shared role
 /// classifier reads it anyway: anything under `runtime/` is runtime orchestration, anything under
@@ -139,11 +139,20 @@ impl EvidencePredicate {
 /// named `request` in `src/runtime/` closed a server's dispatch step, and one named `handler` in
 /// `app/views/` closed its entrypoint.
 ///
-/// Asking the question a second time with only the file name left makes the path a *narrowing*
-/// factor: a `tests/` path still classifies as test coverage and still fails, an extension is still
-/// there for the `.sql` roles, but no directory can hand out a role on its own. This can only
-/// reject citations the first question already accepted, never admit new ones.
-fn role_survives_without_its_directory(
+/// The **file name** is a path segment like any other and the classifier reads it the same way, so
+/// stripping only the directories left the defect one level down: `runtime.c`, `store.ts`,
+/// `signal_dispatch.rs`, `*_events.jsonl` and a `buffer` stem each still handed out a role on their
+/// own, which is how `tooltipHandler` in `src/os/runtime.c` proved a server's dispatch step and
+/// `SnapshotDiffViewer` in `src/ui/store.ts` proved an indexer's persistence step. So the whole
+/// path goes, down to the extension.
+///
+/// Asking the question a second time against the bare extension makes the path a purely
+/// *narrowing* factor. A `tests/` path still classifies as test coverage on the first question and
+/// still fails there; the extension is still present for the `.sql` roles, which are the one place
+/// a file genuinely is the evidence. Nothing else about the path can grant a role, and because the
+/// full-path answer must match first, this can only reject citations that question already
+/// accepted — never admit new ones.
+fn role_survives_without_its_path(
     citation: &AgentCitationDto,
     roles: &[PacketEvidenceRole],
 ) -> bool {
@@ -151,12 +160,13 @@ fn role_survives_without_its_directory(
         return true;
     };
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    if file_name == path {
-        return true;
-    }
-    let mut without_directories = citation.clone();
-    without_directories.file_path = Some(file_name.to_string());
-    packet_evidence_role(&without_directories).is_some_and(|role| roles.contains(&role))
+    let extension = match file_name.rfind('.') {
+        Some(index) => &file_name[index..],
+        None => "",
+    };
+    let mut without_path = citation.clone();
+    without_path.file_path = Some(extension.to_string());
+    packet_evidence_role(&without_path).is_some_and(|role| roles.contains(&role))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1630,6 +1640,60 @@ mod tests {
             ),
             witness("use_temp_dir", "src/index/tmp.ts", NodeKind::FUNCTION),
             witness("Store.get", "lib/client.dart", NodeKind::METHOD),
+            // Each of these closed a requirement one level below the last round's fix. The first
+            // four are role-classified and the *file name* assigned the role — `runtime.c`,
+            // `signal_dispatch.rs`, `store.ts` — after the directories had already been stripped.
+            // The rest are carrier-backed, and each is a compound noun whose head is the flow's own
+            // subject word: a form's `min`, a logger's `handler`, a site's `layout`, a build's
+            // `post`, a buffer.
+            witness("tooltipHandler", "src/os/runtime.c", NodeKind::FUNCTION),
+            witness(
+                "panicHandler",
+                "src/os/signal_dispatch.rs",
+                NodeKind::FUNCTION,
+            ),
+            witness(
+                "workspaceSettings",
+                "src/config/store.ts",
+                NodeKind::FUNCTION,
+            ),
+            witness(
+                "MathSymbolTable",
+                "src/math/table_dispatch.rs",
+                NodeKind::STRUCT,
+            ),
+            witness("clampMin", "src/forms/layout.ts", NodeKind::FUNCTION),
+            witness(
+                "PaymentHandler.process",
+                "src/logging/payments.php",
+                NodeKind::METHOD,
+            ),
+            witness(
+                "Layout.render",
+                "src/components/layout.tsx",
+                NodeKind::METHOD,
+            ),
+            witness("readFile", "src/assets/io.ts", NodeKind::FUNCTION),
+            witness(
+                "PostMortem.generate",
+                "src/crash/report.rb",
+                NodeKind::METHOD,
+            ),
+            witness("FrameBuffer", "src/gfx/frame.cpp", NodeKind::STRUCT),
+            witness("SegmentTree.read", "src/algo/segtree.rs", NodeKind::METHOD),
+            witness(
+                "sourceMapOptions",
+                "src/build/config.ts",
+                NodeKind::FUNCTION,
+            ),
+            witness("RoadMapPlanner", "src/nav/planner.rs", NodeKind::STRUCT),
+            witness("dispatchRider", "src/delivery/rider.ts", NodeKind::FUNCTION),
+            witness(
+                "validationMinScore",
+                "src/auth/password.ts",
+                NodeKind::FUNCTION,
+            ),
+            witness("ChartAdapter", "src/charts/adapter.ts", NodeKind::CLASS),
         ]
     }
 
@@ -1817,19 +1881,18 @@ mod tests {
         symbols
     }
 
-    /// `MapPlanner` is the one reported acceptance the corpus above cannot carry, and the reason is
-    /// worth stating rather than leaving as a silent omission.
+    /// A bare `map` is not an object mapper, and the family that rides in on it is large.
     ///
-    /// It was reported against `indexing_storage`, which took it because the shared classifier reads
-    /// "plan" as workspace planning; that is closed, and this pins it. But it is *not* off-subject
-    /// for `mapper_execution`: that requirement asks for an object mapper (`map`) and an execution
-    /// plan (`plan`), and both words are literally in the name. No predicate that reads names can
-    /// separate a mapping plan from a route-map planner, so `mapper_execution` still accepts it,
-    /// wherever it is filed. Putting it in the universal corpus would only be a lie about which
-    /// property holds.
+    /// `MapPlanner` used to be documented here as an accepted limitation: `mapper_execution` asks
+    /// for an object mapper and an execution plan, and both words were literally in the name. But
+    /// the word carrying the subsystem was `map`, which is the head of `sourceMap`, `roadMap`,
+    /// `siteMap`, `heatMap` and `tileMap` — so the limitation was not one name, it was every
+    /// compound noun in software ending in "map", and `sourceMapOptions` (in every JavaScript build
+    /// configuration there is) plus `RoadMapPlanner` closed the whole two-step flow between them.
+    ///
+    /// A bare `map` now has to say what it maps. `TypeMapPlanBuilder`, the real anchor, does.
     #[test]
-    fn the_reported_map_planner_acceptance_is_closed_where_it_was_reported() {
-        let anchor = witness("MapPlanner", "src/store/planner.rs", NodeKind::STRUCT);
+    fn a_map_that_is_not_an_object_mapper_closes_nothing() {
         let requirement_named = |id: &str| {
             all_flow_requirements()
                 .into_iter()
@@ -1837,27 +1900,53 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} should be in the tables"))
         };
 
-        assert!(
-            !requirement_named("indexing_storage")
-                .evidence
-                .citation_proves(&anchor),
-            "a planner named after maps is not an indexer's storage step"
+        for (display_name, kind) in [
+            ("MapPlanner", NodeKind::STRUCT),
+            ("RoadMapPlanner", NodeKind::STRUCT),
+            ("SiteMapPlan", NodeKind::STRUCT),
+            ("TileMapExecutor", NodeKind::STRUCT),
+            ("sourceMapOptions", NodeKind::FUNCTION),
+            ("HeatMapConfig", NodeKind::STRUCT),
+            ("bitmapPipeline", NodeKind::FUNCTION),
+        ] {
+            for path in ["src/store/planner.rs", "src/mapping/plan.rs", "src/nav.ts"] {
+                let anchor = witness(display_name, path, kind);
+                for id in ["indexing_storage", "mapper_execution", "mapper_config"] {
+                    assert!(
+                        !requirement_named(id).evidence.citation_proves(&anchor),
+                        "`{display_name}` at `{path}` is not {id}: the word carrying the subsystem \
+                         is the head of a compound noun from another domain"
+                    );
+                }
+            }
+        }
+
+        let real = witness(
+            "TypeMapPlanBuilder",
+            "src/AutoMapper/Execution/Plan.cs",
+            NodeKind::CLASS,
         );
         assert!(
             requirement_named("mapper_execution")
                 .evidence
-                .citation_proves(&anchor),
-            "if this stops being true the note above is stale and should be deleted, not updated"
+                .citation_proves(&real),
+            "a type map's plan builder is still the mapper's execution step"
         );
     }
 
-    /// The complete set of bare, one-word symbol names that close a requirement, as
+    /// The complete set of *bare, one-word* symbol names that close a requirement, as
     /// `requirement | word`.
     ///
     /// A one-word name carries no second factor: there is no room in it for both "which subsystem
     /// is this" and "which step of it". So every entry here is a word that, on its own, anywhere in
-    /// any repository, under any directory and any language, proves a step — and the list is
-    /// therefore the exact surface on which an unrelated symbol can still be mistaken for evidence.
+    /// any repository, under any directory and any language, proves a step.
+    ///
+    /// This list is **not** the whole surface, and it used to claim to be. Every predicate in this
+    /// crate matches whole tokens *inside* a name, so a word that closes a requirement bare closes
+    /// it inside compounds too — `buffer` here meant `FrameBuffer` and `ZBuffer` as well, and the
+    /// list said nothing about it. `COMPOUND_EVIDENCE_SURFACE` above is the family version and is
+    /// the one to read for what an unrelated symbol can still be mistaken for; this one is the
+    /// stricter subset, kept because a *bare* word closing a requirement is a sharper signal.
     ///
     /// Each of these words *is* the requirement's subject: a class named `Buffer` is the buffer, a
     /// function named `main` is the entrypoint, a method named `request` is the client's request
@@ -1867,17 +1956,9 @@ mod tests {
     /// repository proved a client's convenience method.
     const ONE_WORD_EVIDENCE_SURFACE: &[&str] = &[
         "buffered_storage | buffer",
-        "buffered_storage | segment",
         "client_interface_helpers | request",
-        "client_transport_send | adapter",
-        "command_dispatch | dispatch",
-        "command_dispatch | dispatcher",
         "command_server_bootstrap | main",
-        "form_custom_validation | validate",
-        "form_custom_validation | validates",
-        "form_custom_validation | validation",
         "form_custom_validation | validity",
-        "form_submit_guard | preventdefault",
         "hook_mutation_flow | mutat",
         "hook_mutation_flow | mutate",
         "hook_mutation_flow | mutation",
@@ -1887,8 +1968,6 @@ mod tests {
         "indexing_storage | snapshots",
         "indexing_storage | symbol",
         "indexing_storage | symbols",
-        "request_dispatch | dispatch",
-        "request_dispatch | dispatcher",
         "request_entrypoint | asgi",
         "request_entrypoint | route",
         "request_entrypoint | router",
@@ -1896,7 +1975,6 @@ mod tests {
         "request_entrypoint | routes",
         "request_entrypoint | servlet",
         "request_entrypoint | wsgi",
-        "request_terminal | adapter",
         "search_entrypoint | main",
     ];
 
@@ -2224,6 +2302,53 @@ mod tests {
             "queries",
             "searches",
             "matchers",
+            // The IO peers a byte buffer sits between, the record-pipeline words a logging
+            // framework qualifies its handler classes with, and the model words an object mapper
+            // maps. Each became a way to satisfy a subsystem factor this round, so each has to be
+            // swept as a name in its own right.
+            "sources",
+            "sinks",
+            "byte",
+            "io",
+            "reader",
+            "input",
+            "pipe",
+            "channel",
+            "abstract",
+            "base",
+            "default",
+            "generic",
+            "null",
+            "noop",
+            "interfaces",
+            "impl",
+            "implementation",
+            "processing",
+            "processor",
+            "processors",
+            "entry",
+            "entries",
+            "formatted",
+            "group",
+            "chain",
+            "stack",
+            "type",
+            "types",
+            "object",
+            "objects",
+            "model",
+            "models",
+            "entity",
+            "entities",
+            "dto",
+            "dtos",
+            "member",
+            "members",
+            "property",
+            "properties",
+            "destination",
+            "class",
+            "classes",
         ]
     }
 
@@ -2266,6 +2391,185 @@ mod tests {
             missing.is_empty(),
             "these words move a carrier but are never swept as a one-word symbol name, so the \
              recorded surface below cannot see what they admit: {missing:?}"
+        );
+    }
+
+    /// Nouns from domains no flow in the tables covers.
+    ///
+    /// Crossing them with the evidence vocabulary builds the compound names a repository is
+    /// actually full of — `FrameBuffer`, `sourceMapOptions`, `PaymentHandler`, `symbolFont` — which
+    /// is the shape the bare-word sweep below cannot see.
+    fn off_subject_qualifiers() -> Vec<&'static str> {
+        vec![
+            "Frame", "Road", "Payment", "Math", "Picker", "Chart", "Pixel", "Crash", "Coupon",
+            "Rider",
+        ]
+    }
+
+    /// The directories the compound sweep crosses its names with.
+    ///
+    /// Fewer than the bare-word sweep uses, and deliberately so: after `role_survives_without_its_path`
+    /// no directory can grant a role at all, and the one invariant that still has to see every
+    /// directory — `no_requirement_is_closed_by_an_unrelated_repository_symbol` — already crosses
+    /// the full list. What is left that reads a path is the declared exception, so the set here is
+    /// the repository root, a plain source directory, and one directory per exception: the
+    /// static-site subject word, the `static/` spelling of it, a logging folder and a form example
+    /// folder.
+    fn compound_sweep_directories() -> Vec<&'static str> {
+        vec![
+            "",
+            "src/",
+            "lib/site/",
+            "public/static/",
+            "src/logging/",
+            "examples/form/",
+        ]
+    }
+
+    /// The compound names the sweep crosses each vocabulary word into: the word as the head of an
+    /// off-subject compound, as its qualifier, and as a method on an off-subject receiver.
+    fn compound_shapes_for(word: &str) -> Vec<String> {
+        let mut capitalized = word.chars();
+        let capitalized = match capitalized.next() {
+            Some(first) => first.to_ascii_uppercase().to_string() + capitalized.as_str(),
+            None => String::new(),
+        };
+        let mut names = Vec::new();
+        for qualifier in off_subject_qualifiers() {
+            names.push(format!("{qualifier}{capitalized}"));
+            let mut lowered = qualifier.chars();
+            let lowered = match lowered.next() {
+                Some(first) => first.to_ascii_lowercase().to_string() + lowered.as_str(),
+                None => String::new(),
+            };
+            names.push(format!("{word}{qualifier}"));
+            names.push(format!("{lowered}{capitalized}"));
+            names.push(format!("{qualifier}Kind.{word}"));
+        }
+        names
+    }
+
+    /// The surface each evidence word admits *as a token inside a name*, as `requirement | word`.
+    ///
+    /// `ONE_WORD_EVIDENCE_SURFACE` below records bare names, and for a long time its doc claimed to
+    /// be "the exact surface on which an unrelated symbol can still be mistaken for evidence". It
+    /// was not. Every predicate in this crate matches whole *tokens* inside a name, so a word that
+    /// closes a requirement on its own closes it inside every compound that contains it: the entry
+    /// `buffered_storage | buffer` read as "a class named `Buffer`" and meant `FrameBuffer`,
+    /// `ZBuffer` and `RingBufferStats` as well. This list is the honest version — a word appears
+    /// here when an off-subject compound built around it still closes the requirement.
+    ///
+    /// Each remaining entry is a word that *is* its requirement's subject in any compound: a
+    /// `*Symbol*` is a symbol, a `use*` in camelCase is a React hook, a name with `dispatch` in it
+    /// dispatches. Growth here is the signal to look at: a new entry means a predicate's two
+    /// factors collapsed into one word that a compound noun can carry.
+    ///
+    /// Four of these are irreducible against a positive anchor that has the identical shape, and
+    /// saying so is the point of recording them:
+    ///
+    /// - `client_interface_helpers | request` — the real anchor is `Axios.prototype.request`, whose
+    ///   only client word *is* the verb. `FrameKind.request` cannot be told apart from it by name.
+    /// - `buffered_storage | buffer` — a segment of a name that is nothing but "buffer" is the
+    ///   buffer; okio's own wrapper is a function called `buffer`.
+    /// - `hook_public_export | use` — `use` followed by a capital is the React hook convention, so
+    ///   every custom hook in a front end reads as a public hook export.
+    /// - `form_custom_validation | validity` — `validity` is both what makes an anchor a form
+    ///   control's and what makes it the validation step, and the real anchors `setCustomValidity`
+    ///   and `renderValidityMessage` carry no other form word. Its siblings
+    ///   `form_native_constraints` and `form_submit_guard` still need a second word, so the flow as
+    ///   a whole does not close on this.
+    /// - `indexing_storage | symbol,snapshot,indexer` — the widest one left. `symbolFont`,
+    ///   `SymbolPicker` and `SnapshotDiffViewer` close an indexer's persistence step. Requiring a
+    ///   storage verb beside the subsystem word would close it, and would also make
+    ///   `indexing_storage` unreachable for Sourcetrail, whose storage anchors are `IndexerJava`,
+    ///   `StorageAccess` and `PersistentStorage`. A false negative on a live task is not a good
+    ///   trade for this, so it stays open and named.
+    const COMPOUND_EVIDENCE_SURFACE: &[&str] = &[
+        "buffered_storage | buffer",
+        "client_interface_helpers | request",
+        "form_custom_validation | validity",
+        "hook_mutation_flow | mutat",
+        "hook_mutation_flow | mutate",
+        "hook_mutation_flow | mutation",
+        "hook_public_export | use",
+        "indexing_storage | indexer",
+        "indexing_storage | indexers",
+        "indexing_storage | snapshot",
+        "indexing_storage | snapshots",
+        "indexing_storage | symbol",
+        "indexing_storage | symbols",
+        "request_entrypoint | asgi",
+        "request_entrypoint | route",
+        "request_entrypoint | router",
+        "request_entrypoint | routers",
+        "request_entrypoint | routes",
+        "request_entrypoint | servlet",
+        "request_entrypoint | wsgi",
+    ];
+
+    #[test]
+    fn compound_names_close_only_the_requirements_the_word_is_the_subject_of() {
+        let requirements = all_flow_requirements();
+        let mut live: Vec<String> = Vec::new();
+        let mut checked = 0_u64;
+        for word in evidence_vocabulary() {
+            for name in compound_shapes_for(word) {
+                for directory in compound_sweep_directories() {
+                    // `.rs` and `.ts` for the same reason the bare-word sweep uses them: one script
+                    // surface and one non-script one. Document surfaces are deliberately absent —
+                    // a `.html` anchor is the module header's declared exception where the file is
+                    // the subsystem, so sweeping it would record the exception rather than the
+                    // name families this list is about. The corpus above crosses every extension.
+                    for extension in [".rs", ".ts"] {
+                        for kind in [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::CLASS] {
+                            let citation =
+                                witness(&name, &format!("{directory}one{extension}"), kind);
+                            for requirement in &requirements {
+                                checked += 1;
+                                if !requirement.evidence.citation_proves(&citation) {
+                                    continue;
+                                }
+                                let entry = format!("{} | {word}", requirement.id);
+                                if !live.contains(&entry) {
+                                    live.push(entry);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 2_000_000,
+            "the compound sweep must actually cross the vocabulary with off-subject qualifiers \
+             (checked {checked})"
+        );
+        live.sort();
+
+        let mut recorded = COMPOUND_EVIDENCE_SURFACE
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect::<Vec<_>>();
+        recorded.sort();
+
+        let added = live
+            .iter()
+            .filter(|entry| !recorded.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            added.is_empty(),
+            "an off-subject compound name now closes a requirement it did not before: one word \
+             inside a name is deciding a step, which is the collapse this module exists to \
+             prevent: {added:?}"
+        );
+        let removed = recorded
+            .iter()
+            .filter(|entry| !live.contains(entry))
+            .collect::<Vec<_>>();
+        assert!(
+            removed.is_empty(),
+            "these compound families no longer close their requirement; if that is intended, take \
+             them out of the recorded surface in the diff a reviewer reads: {removed:?}"
         );
     }
 
@@ -2336,6 +2640,184 @@ mod tests {
     /// much of the classifier reads the path, so `renderChart` under `src/views/` was a server's
     /// request entrypoint, `Store.delete` was an indexer's persistence step, and every symbol under
     /// `runtime/` was a runtime orchestration entrypoint for three different flows at once.
+
+    /// The acceptance bar for this round, one case per carrier-backed flow.
+    ///
+    /// Each case is a real question that raises a whole flow, answered with citations drawn from
+    /// somewhere else in the repository — the exact shape that reached a fully-closed *Sufficient*
+    /// verdict in five of these six flows. `clampMin`/`validateCoupon`/`submitOrder` closed form
+    /// validation; `AssetPipeline.run` + `Layout.render` closed a static-site build;
+    /// `Logger.addRecord` + `PaymentHandler.process` closed a logger and its handler;
+    /// `sourceMapOptions` + `RoadMapPlanner` closed an object mapper; `FrameBuffer` +
+    /// `SegmentTree.read` closed buffered IO.
+    ///
+    /// The property is not "these names are rejected" — a fix that only rejects the reported names
+    /// leaves the shape open, which is how this lane got here. It is that **each flow still names
+    /// the step it has no evidence for**: the verdict has to be partial *and* the gap has to be the
+    /// requirement the evidence genuinely fails to prove, not some other one.
+    #[test]
+    fn every_carrier_flow_reports_the_step_its_evidence_does_not_prove() {
+        struct Case {
+            flow: &'static str,
+            prompt: &'static str,
+            citations: Vec<AgentCitationDto>,
+            expected_missing: &'static [&'static str],
+        }
+
+        let cases = vec![
+            Case {
+                flow: "form validation",
+                prompt: "Explain how the form validation examples combine native HTML constraints \
+                         with custom JavaScript validation and a submit guard.",
+                citations: vec![
+                    witness("clampMin", "src/forms/layout.ts", NodeKind::FUNCTION),
+                    witness("validateCoupon", "src/forms/coupon.ts", NodeKind::FUNCTION),
+                    witness("submitOrder", "src/forms/order.ts", NodeKind::FUNCTION),
+                    witness(
+                        "validationMinScore",
+                        "src/auth/password.ts",
+                        NodeKind::FUNCTION,
+                    ),
+                ],
+                expected_missing: &[
+                    "form_native_constraints",
+                    "form_custom_validation",
+                    "form_submit_guard",
+                ],
+            },
+            Case {
+                flow: "static-site build",
+                prompt: "Trace how the static site build command creates a site and runs the read, \
+                         generate, render, and write phases.",
+                citations: vec![
+                    witness("AssetPipeline.run", "src/build/assets.rb", NodeKind::METHOD),
+                    witness(
+                        "Layout.render",
+                        "src/components/layout.tsx",
+                        NodeKind::METHOD,
+                    ),
+                    witness("readFile", "src/assets/io.ts", NodeKind::FUNCTION),
+                    witness(
+                        "PostMortem.generate",
+                        "src/crash/report.rb",
+                        NodeKind::METHOD,
+                    ),
+                ],
+                expected_missing: &["site_lifecycle", "site_terminal"],
+            },
+            Case {
+                flow: "logger record + handler",
+                prompt: "Explain how a logger turns a log call into a record object and passes it \
+                         through handlers.",
+                citations: vec![
+                    witness(
+                        "Logger.addRecord",
+                        "src/logging/payments.php",
+                        NodeKind::METHOD,
+                    ),
+                    witness(
+                        "PaymentHandler.process",
+                        "src/logging/payments.php",
+                        NodeKind::METHOD,
+                    ),
+                    witness("handleClick", "src/logging/ui.php", NodeKind::FUNCTION),
+                ],
+                expected_missing: &["handler_processing"],
+            },
+            Case {
+                flow: "object mapper configuration + execution",
+                prompt: "Explain how mapper configuration and runtime mapper APIs cooperate to map \
+                         source objects to destination objects through type map plans.",
+                citations: vec![
+                    witness(
+                        "sourceMapOptions",
+                        "src/build/config.ts",
+                        NodeKind::FUNCTION,
+                    ),
+                    witness("RoadMapPlanner", "src/nav/planner.rs", NodeKind::STRUCT),
+                    witness("HeatMapConfig", "src/charts/heat.ts", NodeKind::STRUCT),
+                    witness("TileMapExecutor", "src/gfx/tiles.rs", NodeKind::STRUCT),
+                ],
+                expected_missing: &["mapper_config", "mapper_execution"],
+            },
+            Case {
+                flow: "buffered io",
+                prompt: "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move \
+                         bytes through reads and writes.",
+                citations: vec![
+                    witness("FrameBuffer", "src/gfx/frame.cpp", NodeKind::STRUCT),
+                    witness("SegmentTree.read", "src/algo/segtree.rs", NodeKind::METHOD),
+                    witness("ZBuffer", "src/gfx/depth.cpp", NodeKind::STRUCT),
+                    witness("RingBufferStats", "src/metrics/ring.rs", NodeKind::STRUCT),
+                ],
+                expected_missing: &["buffered_storage", "buffered_read_write"],
+            },
+            Case {
+                flow: "runtime formatting",
+                prompt: "Explain how formatting arguments become type-erased format args and reach \
+                         the vformat error fallback path.",
+                citations: vec![
+                    witness("NumberFormatError", "src/num/parse.cc", NodeKind::STRUCT),
+                    witness(
+                        "formatCurrencyError",
+                        "src/money/fmt.cc",
+                        NodeKind::FUNCTION,
+                    ),
+                    witness("CliParseError", "src/cli/parse.cc", NodeKind::FUNCTION),
+                ],
+                expected_missing: &["format_arguments"],
+            },
+        ];
+
+        assert_eq!(cases.len(), 6, "one case per carrier-backed flow");
+
+        for case in cases {
+            let requirements = packet_flow_requirements_for_terms(
+                &packet_probe_terms(case.prompt),
+                PacketTaskClassDto::DataFlow,
+            );
+            assert!(
+                !requirements.is_empty(),
+                "the {} prompt must raise its flow, or this case proves nothing",
+                case.flow
+            );
+            for expected in case.expected_missing {
+                assert!(
+                    requirements.iter().any(|r| r.id == *expected),
+                    "the {} prompt must raise {expected}, or the gap below is vacuous",
+                    case.flow
+                );
+            }
+
+            let missing = requirements
+                .iter()
+                .filter(|requirement| {
+                    !case
+                        .citations
+                        .iter()
+                        .any(|citation| requirement.evidence.citation_proves(citation))
+                })
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>();
+
+            assert!(
+                !missing.is_empty(),
+                "the {} flow reports every step proved by citations that prove none of it: a \
+                 false-safe sufficient verdict is the disqualifying class for this lane",
+                case.flow
+            );
+            for expected in case.expected_missing {
+                assert!(
+                    missing.contains(expected),
+                    "the {} flow is partial but does not name {expected} as the gap; it named \
+                     {missing:?}. A verdict that is partial for the wrong reason still tells the \
+                     caller the wrong thing about what was proved",
+                    case.flow
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_requirement_is_closed_by_an_unrelated_repository_symbol() {
         let mut checked = 0;

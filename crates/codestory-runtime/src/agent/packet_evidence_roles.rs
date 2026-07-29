@@ -72,7 +72,26 @@ pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto
     }
     let terminal = normalize_identifier(&crate::terminal_symbol_segment(&citation.display_name));
     if matches!(citation.kind, NodeKind::CLASS | NodeKind::STRUCT) {
-        return terminal.ends_with("adapter");
+        // A type whose name merely ends in "adapter" is `ArrayAdapter`, `ListAdapter`,
+        // `RecyclerViewAdapter` — the most populated class-name suffix in mobile and UI code, and
+        // none of them is a transport. The requirements that list this role scope themselves with a
+        // word list that also contains "adapter", so accepting the suffix alone let one word
+        // satisfy both of their factors. The transport has to be named beside it, the way a real
+        // one is named for the protocol or the socket it speaks over.
+        return terminal.ends_with("adapter")
+            && [
+                "http",
+                "https",
+                "xhr",
+                "fetch",
+                "transport",
+                "request",
+                "client",
+                "socket",
+                "net",
+            ]
+            .iter()
+            .any(|transport| display.contains(transport));
     }
     [
         "select", "get", "resolve", "choose", "create", "build", "send",

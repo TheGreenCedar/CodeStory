@@ -15,12 +15,22 @@
 //! a path-sourced subsystem re-opens the moment an off-subject symbol is filed beside the evidence
 //! it is impersonating.
 //!
+//! One word may not answer both questions even when it appears twice. `Layout.render` in
+//! `src/components/layout.tsx` reads as two factors — a subsystem word and a step word — until you
+//! notice that the subsystem word and the folder are the same noun, and that the noun is one every
+//! front end uses. So a subsystem factor is satisfied either by a word specific to that subsystem,
+//! or by two *different* generic words; and a compound noun whose head is the flow's subject
+//! (`FrameBuffer`, `sourceMap`, `PaymentHandler`) has to say with its other word that it belongs
+//! here.
+//!
 //! Two surfaces are the exception, stated so the limit is visible rather than assumed. A
 //! stylesheet, a markup document and a schema file are proved *by the file*: their anchors are
 //! selectors, attributes and statements with no identifier to scope by, so there the path is the
-//! subsystem. And the static-site carriers take their subsystem from either, because a build phase
-//! is named for its phase and not for the site — which is why those two carry a second name-side
-//! factor of their own.
+//! subsystem — this is why `is_form_validation_surface` still reads the path for a `.html` anchor
+//! and only for that. And the static-site carriers take their subsystem from either, because a
+//! build phase is named for its phase and not for the site — which is why those two carry a second
+//! name-side factor of their own, and why the word they read from a directory has to be one only a
+//! static site uses.
 
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
@@ -159,6 +169,13 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
 /// The verb list is the whole HTTP method set, so the terminal-segment test alone accepts every
 /// `.get`, `.post`, `.delete` and `.options` in a repository — `Store.get`, `Queue.head`,
 /// `FeatureFlags.options`. The receiver has to be a client before its verb means anything.
+///
+/// "request" is the one verb in the method set that is also a word in the client list, so a symbol
+/// named `X.request` satisfies both factors with one word. That is not closable here: a real
+/// client's own request method is routinely spelled exactly that way, with the receiver naming the
+/// library rather than the word "client", and nothing in a name separates it from a
+/// `FrameKind.request` somewhere else in the repository. It is recorded as a family in
+/// `COMPOUND_EVIDENCE_SURFACE` rather than left for the next reviewer to find again.
 pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
         && belongs_to_http_client(citation)
@@ -174,25 +191,24 @@ pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -
 /// Read from the symbol's own name and not its path. A directory named `client/` or `http/` holds
 /// plenty of symbols that are not the client — moving `Store.get` into `lib/client.dart` must not
 /// turn it into the client's request method, and a path-sourced subsystem is exactly what would.
+const HTTP_CLIENT_WORDS: &[&str] = &[
+    "request",
+    "requests",
+    "http",
+    "https",
+    "client",
+    "clients",
+    "adapter",
+    "adapters",
+    "transport",
+    "transports",
+    "send",
+    "sends",
+    "fetch",
+];
+
 fn belongs_to_http_client(citation: &AgentCitationDto) -> bool {
-    names_token(
-        citation,
-        &[
-            "request",
-            "requests",
-            "http",
-            "https",
-            "client",
-            "clients",
-            "adapter",
-            "adapters",
-            "transport",
-            "transports",
-            "send",
-            "sends",
-            "fetch",
-        ],
-    )
+    names_token(citation, HTTP_CLIENT_WORDS)
 }
 
 /// The step that turns a configured request into a transport-ready one.
@@ -352,29 +368,46 @@ pub(crate) fn citation_owns_css_animation_structure(citation: &AgentCitationDto)
 /// Being a script or a document was the only scoping these carriers had, so `determineFieldOrder`
 /// in `src/layout.js` (whose name contains "min") and `submitTelemetry` in `src/telemetry.js` closed
 /// requirements about form markup they never touch.
+///
+/// On a **script** surface the form factor is read from the anchor's own name. Reading it from the
+/// path too meant a directory supplied the subsystem, and any off-subject symbol filed beside the
+/// real evidence inherited it: `clampMin` in `src/forms/layout.ts` closed the native-constraint
+/// requirement while the identical `clampMin` in `src/render/layout.ts` closed nothing, so the
+/// folder — not the symbol — decided whether the packet was sufficient.
+///
+/// A **markup document** is the exception the module header states: its anchors are attributes and
+/// selectors like `required` or `pattern`, which have no identifier to scope by, so there the file
+/// is the subsystem and the path may carry the form factor.
+/// Words that say the anchor is about a *form*.
+///
+/// "validate", "validates", "validation", "validations", "invalid" and "preventdefault" used to be
+/// here and are gone. Each is a word the carriers below use as their *step*, and a subsystem list
+/// and a step list that share a word give the carrier one factor rather than two. Validation is
+/// also universal — schema validation, licence validation, password-strength validation — so
+/// `validationMin`, `validationCheck` and `validationSubmit` closed all three requirements of this
+/// flow between them, out of a repository with no form in it.
+///
+/// "validity" stays, because it is the one of them that is a *form control's* own noun rather than
+/// a generic activity: `ValidityState` and `element.validity` are the constraint-validation API,
+/// which is where the real anchors `setCustomValidity` and `renderValidityMessage` get it from.
+/// That it is also `form_custom_validation`'s step word is recorded in the evidence surfaces.
+const FORM_SUBSYSTEM_WORDS: &[&str] = &[
+    "form",
+    "forms",
+    "fieldset",
+    "validity",
+    "constraint",
+    "constraints",
+    "guard",
+    "guards",
+];
+
 fn is_form_validation_surface(citation: &AgentCitationDto) -> bool {
-    let on_a_browser_surface = is_markup_document(citation)
-        || path_has_any_extension(citation, &[".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"]);
-    on_a_browser_surface
-        && names_or_path_token(
-            citation,
-            &[
-                "form",
-                "forms",
-                "fieldset",
-                "validation",
-                "validations",
-                "validate",
-                "validates",
-                "validity",
-                "invalid",
-                "constraint",
-                "constraints",
-                "guard",
-                "guards",
-                "preventdefault",
-            ],
-        )
+    if is_markup_document(citation) {
+        return names_or_path_token(citation, FORM_SUBSYSTEM_WORDS);
+    }
+    path_has_any_extension(citation, &[".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"])
+        && names_token(citation, FORM_SUBSYSTEM_WORDS)
 }
 
 pub(crate) fn citation_owns_form_native_constraint(citation: &AgentCitationDto) -> bool {
@@ -449,8 +482,43 @@ pub(crate) fn citation_owns_shell_completion(citation: &AgentCitationDto) -> boo
 // Buffered IO
 // ---------------------------------------------------------------------------
 
+/// "segment" is gone. It is the head of `SegmentTree`, `SegmentDescriptor` and every other
+/// segmented structure in software, and it was the whole of this factor: `SegmentTree.read` closed
+/// the read/write step of a byte-buffer flow it has nothing to do with. No expected symbol of the
+/// buffered-IO corpus is named for a segment.
 fn names_buffer(citation: &AgentCitationDto) -> bool {
-    names_token_prefix(citation, &["buffer", "segment"])
+    names_token_prefix(citation, &["buffer"])
+}
+
+/// The peers a byte buffer sits between. This is the second factor: it says the anchor is in an IO
+/// pipeline and not merely that some word in it ends in "buffer".
+fn names_io_peer(citation: &AgentCitationDto) -> bool {
+    names_token(
+        citation,
+        &[
+            "source", "sources", "sink", "sinks", "stream", "streams", "byte", "bytes", "io",
+            "reader", "writer", "input", "output", "socket", "pipe", "channel",
+        ],
+    )
+}
+
+/// Whether some segment of the symbol's name is *nothing but* the buffer word — the type called
+/// `Buffer`, the function called `buffer`, or a method hanging off either. Such a name is the
+/// buffer, which is the reading `ONE_WORD_EVIDENCE_SURFACE` records and intends.
+///
+/// `FrameBuffer`, `ZBuffer` and `RingBufferStats` are not: the word beside the head noun says which
+/// kind of buffer, and a pixel buffer is not the byte buffer this flow is about. Accepting them was
+/// the same collapse as everywhere else in this module — one word answering both "is this the
+/// buffered-IO subsystem" and "which step of it is this".
+fn names_the_buffer_itself(citation: &AgentCitationDto) -> bool {
+    citation
+        .display_name
+        .split(['.', ':', '/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            let tokens = identifier_tokens(segment);
+            tokens.len() == 1 && tokens[0].starts_with("buffer")
+        })
 }
 
 fn names_io_operation(citation: &AgentCitationDto) -> bool {
@@ -465,15 +533,23 @@ fn names_io_operation(citation: &AgentCitationDto) -> bool {
 
 /// The buffer itself — where bytes live between a source and a sink.
 pub(crate) fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && names_buffer(citation) && !names_io_operation(citation)
+    owns_behavior(citation)
+        && names_buffer(citation)
+        && !names_io_operation(citation)
+        && (names_the_buffer_itself(citation) || names_io_peer(citation))
 }
 
 /// The operations that move bytes across that buffer. Sibling of `buffer_storage`, so a citation
 /// that only names the container must not close it.
+///
+/// The buffer factor is `names_the_buffer_itself`, not `names_buffer`: reading a *frame* buffer or
+/// a *segment* tree is not this step, and both closed it while any token ending in the head noun
+/// counted. The `source`/`sink`/`stream` alternative is unchanged.
 pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && names_io_operation(citation)
-        && (names_buffer(citation) || names_token(citation, &["source", "sink", "stream"]))
+        && (names_the_buffer_itself(citation)
+            || names_token(citation, &["source", "sink", "stream"]))
 }
 
 // ---------------------------------------------------------------------------
@@ -483,8 +559,15 @@ pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bo
 /// Anchors that belong to a logging subsystem. "record" and "handler" are two of the most reused
 /// words in any codebase — `createUserRecord` is a database row and `handleClick` is a UI callback —
 /// so a carrier that reads only those words speaks for every subsystem at once.
+///
+/// Read from the *name*, the same way its sibling `citation_owns_log_record_creation` already reads
+/// it. While this asked the path as well the two carriers disagreed about what a subsystem is: a
+/// `createUserRecord` in `src/logging/` was correctly rejected as a database row, but a
+/// `PaymentHandler.process` in the very same directory was accepted as the logger's handler step.
+/// Closing the verb `handle*` left the noun-in-the-directory open, and any `*Handler.process` filed
+/// beside a logger closed its dispatch step.
 fn belongs_to_logging(citation: &AgentCitationDto) -> bool {
-    names_or_path_token(citation, &["log", "logs", "logger", "loggers", "logging"])
+    names_token(citation, &["log", "logs", "logger", "loggers", "logging"])
 }
 
 /// Creating the record a logger emits. The logging factor is read from the *name*: a
@@ -501,6 +584,47 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
     }
 }
 
+/// The words a logging framework qualifies its handler classes with.
+///
+/// "Handler" is the most reused noun in software, so the word beside it is what says whose handler
+/// it is. A record pipeline qualifies it structurally or by the pipeline itself — an interface, an
+/// abstract base, a processing stage, a group, a null implementation. Every other subsystem
+/// qualifies the same noun with the domain it serves: `PaymentHandler`, `ClickHandler`,
+/// `RequestHandler`. That difference is the only thing in the name that separates them, and it is
+/// what the directory was standing in for.
+const RECORD_PIPELINE_WORDS: &[&str] = &[
+    "abstract",
+    "base",
+    "default",
+    "generic",
+    "null",
+    "noop",
+    "interface",
+    "interfaces",
+    "impl",
+    "implementation",
+    "processing",
+    "processor",
+    "processors",
+    "record",
+    "records",
+    "entry",
+    "entries",
+    "formatter",
+    "formatters",
+    "formatted",
+    "group",
+    "chain",
+    "stack",
+    "fallback",
+];
+
+/// Whether the anchor belongs to a record pipeline: it says "log", or the words it qualifies its
+/// handler with are the pipeline's own structural vocabulary rather than a domain noun.
+fn belongs_to_record_pipeline(citation: &AgentCitationDto) -> bool {
+    belongs_to_logging(citation) || names_token(citation, RECORD_PIPELINE_WORDS)
+}
+
 /// Processing a record, not registering something that might: a symbol that pushes a handler onto
 /// a stack names a handler but does nothing with a record, so it must not close this requirement.
 ///
@@ -509,7 +633,7 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
 /// and were each accepted here, because `handle` is a prefix of `handler` and the second factor
 /// accepted the same prefix again.
 pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && belongs_to_logging(citation) && {
+    owns_behavior(citation) && belongs_to_record_pipeline(citation) && {
         let tokens = name_tokens(citation);
         let names_a_handler = has_token(&tokens, &["handler", "handlers"]);
         let only_registers = has_token(
@@ -527,41 +651,74 @@ pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) 
 // Static-site build
 // ---------------------------------------------------------------------------
 
+/// The words that name a *static site* and little else.
+///
+/// "view"/"views" is deliberately absent: it is the MVC directory every server framework ships, and
+/// `app/views/` in a Rails app is not a static site. "render" is absent because it is this flow's
+/// *step*, not its subject — a carrier whose subsystem factor and step factor can both be satisfied
+/// by one word has one factor, which is how `renderChart` proved a site renderer. The noun
+/// `renderer` stays.
+const SITE_BUILD_STRONG_SUBJECT_WORDS: &[&str] = &["site", "sites", "static"];
+
+/// Web nouns a static site shares with every other front end.
+///
+/// `layout`, `page`, `template` and `document` are as much a component framework's vocabulary as a
+/// site generator's, so one of them on its own does not put an anchor in this flow. Treating them
+/// as sufficient is what let `Layout.render` in `src/components/layout.tsx`, `Page.render`,
+/// `Template.render` and `document.write` each close the site's terminal boundary: the same single
+/// word answered both "is this a static site" and "what is being rendered", so the carrier that
+/// documents itself as having two factors had one.
+const SITE_BUILD_WEAK_SUBJECT_WORDS: &[&str] = &[
+    "page",
+    "pages",
+    "post",
+    "posts",
+    "layout",
+    "layouts",
+    "template",
+    "templates",
+    "document",
+    "documents",
+    "collection",
+    "collections",
+    "theme",
+    "themes",
+    "asset",
+    "assets",
+    "renderer",
+    "generator",
+];
+
+/// Singular and plural of one noun are one word, so `asset` in a name and `assets` in its directory
+/// are not two independent signals.
+fn is_the_same_word(left: &str, right: &str) -> bool {
+    let stem = |word: &str| word.strip_suffix('s').unwrap_or(word).to_string();
+    stem(left) == stem(right)
+}
+
 /// Anchors that belong to a static-site build. Without this, `Cache.write` in `lib/cache.rb` closed
 /// the site's terminal boundary purely because its name contains "write".
 ///
-/// Two words are deliberately absent. "view"/"views" is the MVC directory every server framework
-/// ships — `app/views/` in a Rails app is not a static site, and admitting it let `Cache.write` and
-/// `renderChart` back in through the path. "render" is this flow's *step*, not its subject: a
-/// carrier whose subsystem factor and step factor can both be satisfied by one word has one factor,
-/// which is how `renderChart` proved a site renderer. The noun `renderer` stays.
+/// This flow is the module header's declared path exception, so the subsystem may be read from the
+/// directory — but what is read has to be a word only a static site uses, or two different generic
+/// web nouns. One generic noun repeated between the name and the folder it sits in is one signal,
+/// not two.
 fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
-    names_or_path_token(
-        citation,
-        &[
-            "site",
-            "sites",
-            "page",
-            "pages",
-            "post",
-            "posts",
-            "layout",
-            "layouts",
-            "template",
-            "templates",
-            "document",
-            "documents",
-            "collection",
-            "collections",
-            "static",
-            "theme",
-            "themes",
-            "asset",
-            "assets",
-            "renderer",
-            "generator",
-        ],
-    )
+    let mut tokens = name_tokens(citation);
+    tokens.extend(path_tokens(citation));
+    if has_token(&tokens, SITE_BUILD_STRONG_SUBJECT_WORDS) {
+        return true;
+    }
+    let mut weak: Vec<&String> = Vec::new();
+    for token in &tokens {
+        if !SITE_BUILD_WEAK_SUBJECT_WORDS.contains(&token.as_str()) {
+            continue;
+        }
+        if !weak.iter().any(|seen| is_the_same_word(seen, token)) {
+            weak.push(token);
+        }
+    }
+    weak.len() >= 2
 }
 
 /// The site-build flow is the one place a *path* still supplies the subsystem: a build phase is
@@ -572,6 +729,11 @@ fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
 ///
 /// The name has to say *what* is being built or written, and separately *what is being done to it*.
 /// One word may not do both jobs.
+///
+/// "file"/"files" and "document"/"documents" are gone. They are what every `readFile`, `writeFile`
+/// and `document.write` in every repository rode in on: a file is what *any* program reads and
+/// writes, so as the object of a build step it says nothing, and the words that remain name
+/// something a site build in particular produces.
 fn names_site_build_object(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
@@ -586,8 +748,6 @@ fn names_site_build_object(citation: &AgentCitationDto) -> bool {
             "pages",
             "post",
             "posts",
-            "document",
-            "documents",
             "layout",
             "layouts",
             "template",
@@ -599,8 +759,6 @@ fn names_site_build_object(citation: &AgentCitationDto) -> bool {
             "assets",
             "theme",
             "themes",
-            "file",
-            "files",
             "html",
         ],
     )
@@ -635,18 +793,48 @@ pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
 // Object mapper
 // ---------------------------------------------------------------------------
 
+/// The things an object mapper maps. A bare `map` is the most overloaded noun in the language, and
+/// the compound it heads is what says which kind: `sourceMap` is a build artifact, `roadMap` and
+/// `siteMap` are navigation, `heatMap` and `tileMap` are graphics. `typeMap` is an object mapper's
+/// own noun, and so are the model words beside it.
+const OBJECT_MAPPER_SUBJECT_WORDS: &[&str] = &[
+    "type",
+    "types",
+    "object",
+    "objects",
+    "model",
+    "models",
+    "entity",
+    "entities",
+    "dto",
+    "dtos",
+    "member",
+    "members",
+    "property",
+    "properties",
+    "destination",
+    "class",
+    "classes",
+];
+
 /// Anchors that belong to an object mapper. "profile" and "plan" are ordinary words — `userProfile`
 /// closed the mapper's configuration requirement until the carrier asked which subsystem it is in.
 ///
 /// Read from the name: any symbol dropped into a `mapping/` directory would otherwise inherit the
 /// subsystem it happens to be filed under.
+///
+/// The noun forms — `mapper`, `mapping` — name the subsystem on their own. A bare `map` does not:
+/// it is the head of every `sourceMap`, `roadMap`, `siteMap`, `heatMap` and `tileMap` in software,
+/// and each of those satisfied this factor while a second, genuinely unrelated word ("options",
+/// "config", "plan", "planner", "executor") satisfied the step. So `sourceMapOptions` proved a
+/// mapper's configuration and `RoadMapPlanner` proved its execution plan, both of them anywhere in
+/// any repository. A bare `map` counts only when what it maps is named beside it — which is what
+/// the real anchors do, being named for the *type* map they build a plan for.
 fn belongs_to_object_mapper(citation: &AgentCitationDto) -> bool {
-    names_token(
-        citation,
-        &[
-            "map", "maps", "mapper", "mappers", "mapping", "mappings", "typemap",
-        ],
-    )
+    if names_token(citation, &["mapper", "mappers", "mapping", "mappings"]) {
+        return true;
+    }
+    names_token(citation, &["map", "maps"]) && names_token(citation, OBJECT_MAPPER_SUBJECT_WORDS)
 }
 
 fn names_mapper_configuration(citation: &AgentCitationDto) -> bool {
@@ -789,8 +977,11 @@ pub(crate) fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> boo
             "http",
             "https",
             "protocol",
-            "dispatch",
-            "dispatcher",
+            // "dispatch"/"dispatcher" are absent for the same reason "render" is absent from the
+            // static-site subject list: they are this flow's *step*, and the role classifier grants
+            // `RequestDispatch` from the same word. While both lists held it, `dispatchRider` — or
+            // any other name with "dispatch" in it — satisfied the subsystem factor and the role
+            // with one word and closed the dispatch step of two different flows.
             // The name each ecosystem gives the server-to-application gateway. These are protocol
             // names in the same sense as "http", not product names: a server's request entrypoint
             // is routinely called `wsgi_app`, `rack_app` or `service` with no other request word in
@@ -941,19 +1132,15 @@ pub(crate) fn flow_belongs_to_network_input(citation: &AgentCitationDto) -> bool
 }
 
 /// Choosing and running the command a request named.
+///
+/// "dispatch"/"dispatcher" are absent: the role classifier grants `RequestDispatch` and
+/// `CommandDispatch` from that same word, so listing it here let one word answer both "is this the
+/// command subsystem" and "is this its dispatch step". A command dispatcher says "command".
 pub(crate) fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
-            "command",
-            "commands",
-            "dispatch",
-            "dispatcher",
-            "table",
-            "handler",
-            "handlers",
-            "exec",
-            "execute",
+            "command", "commands", "table", "handler", "handlers", "exec", "execute",
         ],
     )
 }
