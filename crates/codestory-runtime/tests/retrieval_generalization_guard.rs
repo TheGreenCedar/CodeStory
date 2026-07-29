@@ -1,24 +1,68 @@
 //! Ensures the retrieval generalization lint script stays runnable from the workspace root.
 
-use std::fs;
+use fs4::fs_std::FileExt;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static LINT_SCRIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const LINT_SCRIPT_LOCK_HELPER_PATH: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_PATH";
+const LINT_SCRIPT_LOCK_HELPER_READY: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_READY";
+const LINT_SCRIPT_LOCK_HELPER_RELEASE: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_RELEASE";
 
-/// Serialises the lint subprocesses. The lock guards no shared state -- only the
-/// cost of running many `node` processes at once -- so a test that panics while
-/// holding it has corrupted nothing. Recovering from the poison rather than
-/// propagating it keeps one real failure reported as one failure: without this,
-/// the first genuine assertion turns every later test into a `PoisonError`
-/// panic, and the failure list says nothing about how much is actually broken.
-fn lint_script_lock() -> MutexGuard<'static, ()> {
-    LINT_SCRIPT_LOCK
+struct LintScriptGuard {
+    _thread_guard: MutexGuard<'static, ()>,
+    process_lock: File,
+}
+
+impl Drop for LintScriptGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.process_lock);
+    }
+}
+
+/// Serialises lint subprocesses in this test binary and across independent test
+/// processes. Cargo-nextest gives each test its own process, so the Rust mutex
+/// alone cannot protect a clean default-root scan from another test temporarily
+/// planting a hostile source file in the checkout.
+///
+/// Neither lock protects product state. Recovering a poisoned thread lock is
+/// therefore safe and keeps one real assertion failure from turning every later
+/// guard test into a `PoisonError` panic.
+fn lint_script_lock() -> LintScriptGuard {
+    lint_script_lock_at(&lint_script_lock_path(&workspace_root()))
+}
+
+fn lint_script_lock_at(lock_path: &Path) -> LintScriptGuard {
+    let thread_guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).expect("create lint script lock directory");
+    }
+    let process_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open lint script process lock");
+    FileExt::lock_exclusive(&process_lock).expect("lock lint script across test processes");
+    LintScriptGuard {
+        _thread_guard: thread_guard,
+        process_lock,
+    }
+}
+
+fn lint_script_lock_path(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join("target")
+        .join("retrieval-generalization-guard.lock")
 }
 
 fn production_source(contents: &str) -> &str {
@@ -212,6 +256,109 @@ fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     assert!(
         production_file_count > 0,
         "extra fixture root should not replace the real production scan roots, stdout={stdout}"
+    );
+}
+
+#[test]
+#[ignore = "spawned by lint_script_lock_serializes_independent_test_processes"]
+fn lint_script_lock_process_helper() {
+    let Some(lock_path) = std::env::var_os(LINT_SCRIPT_LOCK_HELPER_PATH) else {
+        return;
+    };
+    let ready_path =
+        PathBuf::from(std::env::var_os(LINT_SCRIPT_LOCK_HELPER_READY).expect("helper ready path"));
+    let release_path = PathBuf::from(
+        std::env::var_os(LINT_SCRIPT_LOCK_HELPER_RELEASE).expect("helper release path"),
+    );
+
+    let _guard = lint_script_lock_at(Path::new(&lock_path));
+    fs::write(&ready_path, b"ready").expect("mark lint script lock helper ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !release_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent never released lint script lock helper"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn lint_script_lock_serializes_independent_test_processes() {
+    let fixture = TempDir::new().expect("create process lock fixture");
+    let lock_path = fixture.path().join("lint-script.lock");
+    let ready_path = fixture.path().join("helper-ready");
+    let release_path = fixture.path().join("helper-release");
+    let mut helper = Command::new(std::env::current_exe().expect("current guard test executable"))
+        .arg("--exact")
+        .arg("lint_script_lock_process_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LINT_SCRIPT_LOCK_HELPER_PATH, &lock_path)
+        .env(LINT_SCRIPT_LOCK_HELPER_READY, &ready_path)
+        .env(LINT_SCRIPT_LOCK_HELPER_RELEASE, &release_path)
+        .spawn()
+        .expect("spawn lint script lock helper process");
+
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let mut early_exit = None;
+    while !ready_path.exists() && Instant::now() < ready_deadline {
+        if let Some(status) = helper.try_wait().expect("inspect lint script lock helper") {
+            early_exit = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready_path.exists() {
+        if early_exit.is_none() {
+            let _ = helper.kill();
+            early_exit = helper.wait().ok();
+        }
+        panic!("lint script lock helper did not acquire its lock; status={early_exit:?}");
+    }
+
+    let contender = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lint script lock contender");
+    let acquired_while_helper_held =
+        FileExt::try_lock_exclusive(&contender).expect("contend for held lint script lock");
+    if acquired_while_helper_held {
+        FileExt::unlock(&contender).expect("release unexpectedly acquired contender lock");
+    }
+
+    fs::write(&release_path, b"release").expect("release lint script lock helper");
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let helper_status = loop {
+        if let Some(status) = helper.try_wait().expect("inspect released lock helper") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = helper.kill();
+            break helper.wait().expect("reap stalled lint script lock helper");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let acquired_after_release =
+        FileExt::try_lock_exclusive(&contender).expect("acquire released lint script lock");
+    if acquired_after_release {
+        FileExt::unlock(&contender).expect("release lint script lock contender");
+    }
+
+    assert!(
+        !acquired_while_helper_held,
+        "a second process acquired the lint script lock before the holder released it"
+    );
+    assert!(
+        helper_status.success(),
+        "lint script lock helper failed: {helper_status}"
+    );
+    assert!(
+        acquired_after_release,
+        "process lock contender did not acquire after the holder released it"
     );
 }
 
