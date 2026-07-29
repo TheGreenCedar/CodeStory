@@ -346,16 +346,17 @@ impl<'a> ScenarioRunner<'a> {
         }
         require_one_run_server_identity(&sampled_identities, &warm_query_identity)?;
 
-        Ok(ConstantCalibrationRunArtifact::new(
+        Ok(ConstantCalibrationRunArtifact {
+            schema_version: 1,
             run_index,
-            self.context.contracts.clone(),
+            contracts: self.context.contracts.clone(),
             metrics,
-            sampled_identities.into_iter().collect(),
-            engine_backend,
-            engine_policy,
-            engine_model_sha256,
-            engine_materialized_reused,
-        ))
+            server_identities: sampled_identities.into_iter().collect(),
+            backend: engine_backend,
+            policy: engine_policy,
+            model_sha256: engine_model_sha256,
+            materialized_reused: engine_materialized_reused,
+        })
     }
 
     pub(super) fn measurements(&mut self) -> Result<MeasurementArtifact> {

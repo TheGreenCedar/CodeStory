@@ -329,7 +329,6 @@ mod tests {
         );
         let constant_env = constant
             .get_envs()
-            .map(|(name, value)| (name, value))
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
             constant_env.get(OsStr::new(QUALIFICATION_DIR_ENV)),

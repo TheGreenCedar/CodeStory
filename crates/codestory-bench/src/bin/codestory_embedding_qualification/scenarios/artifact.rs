@@ -214,29 +214,6 @@ pub(in crate::qualification) struct ConstantCalibrationRunArtifact {
 }
 
 impl ConstantCalibrationRunArtifact {
-    fn new(
-        run_index: u32,
-        contracts: QualificationContracts,
-        metrics: BTreeMap<String, RawMetric>,
-        server_identities: Vec<RawServerIdentity>,
-        backend: String,
-        policy: String,
-        model_sha256: String,
-        materialized_reused: bool,
-    ) -> Self {
-        Self {
-            schema_version: 1,
-            run_index,
-            contracts,
-            metrics,
-            server_identities,
-            backend,
-            policy,
-            model_sha256,
-            materialized_reused,
-        }
-    }
-
     pub(in crate::qualification) fn run_index(&self) -> u32 {
         self.run_index
     }
