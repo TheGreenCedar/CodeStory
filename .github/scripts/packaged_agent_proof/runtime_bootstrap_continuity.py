@@ -94,23 +94,25 @@ def _live_retrieval(
     cold: ColdProof,
     manifest: dict,
 ) -> dict | None:
-    run_parallel(
-        {
-            "packet-a": lambda: hosts.host_a.tool_until_ready(
-                "packet",
-                {
-                    "project": str(setup.project_a),
-                    "question": args.question,
-                    "budget": "compact",
-                },
-                "packet-a",
-            ),
-            "search-b-live": lambda: hosts.host_b.search_until_ready(
-                {"project": str(setup.project_b), "query": setup.query_b, "why": True},
-                "search-b-live",
-            ),
-        }
+    live_tasks = {}
+    # Calibration already proved both projects in the cold phase. Its draft
+    # measurements keep the resident process set live through the tiny project
+    # instead of starting another full-project activation.
+    if args.proof_tier != "calibration":
+        live_tasks["packet-a"] = lambda: hosts.host_a.tool_until_ready(
+            "packet",
+            {
+                "project": str(setup.project_a),
+                "question": args.question,
+                "budget": "compact",
+            },
+            "packet-a",
+        )
+    live_tasks["search-b-live"] = lambda: hosts.host_b.search_until_ready(
+        {"project": str(setup.project_b), "query": setup.query_b, "why": True},
+        "search-b-live",
     )
+    run_parallel(live_tasks)
     after = server_snapshot(
         hosts.host_b.engine_diagnostics(setup.project_b, "diagnostics-after-live"),
         manifest,
@@ -166,10 +168,18 @@ def _continuity_proof(
         == cold.shared_identity["server_instance_id"],
         "one client exit disrupted the surviving client or replaced the server",
     )
+    # Replacement-host continuity needs the same resident server, not a second
+    # activation of the full calibration source tree.
+    if args.proof_tier == "calibration":
+        rejoin_project = setup.project_b
+        rejoin_query = setup.query_b
+    else:
+        rejoin_project = setup.project_a
+        rejoin_query = args.query
     host_c = McpProcess(
         setup.command,
         env=setup.qualified_env,
-        cwd=setup.project_a,
+        cwd=rejoin_project,
         timeout=args.timeout_secs,
     )
     start_c = process_start_identity(host_c.process.pid)
@@ -184,10 +194,10 @@ def _continuity_proof(
         )
         host_c.initialize()
         host_c.search_until_ready(
-            {"project": str(setup.project_a), "query": args.query, "why": True},
+            {"project": str(rejoin_project), "query": rejoin_query, "why": True},
             "rejoin-search",
         )
-        diagnostics = host_c.engine_diagnostics(setup.project_a, "rejoin-diagnostics")
+        diagnostics = host_c.engine_diagnostics(rejoin_project, "rejoin-diagnostics")
         rejoin_identity = engine_identity(
             diagnostics,
             args.engine_policy,

@@ -2,10 +2,14 @@
 
 from .self_test_contract_scope import run_contract_scope_self_tests
 from .self_test_resource_identity import run_resource_identity_self_tests
+from .self_test_runtime_bootstrap_scope import (
+    run_runtime_bootstrap_scope_self_tests,
+)
 from .self_test_worker_schema import run_worker_schema_self_tests
 
 
 def run_contract_self_tests() -> None:
     run_contract_scope_self_tests()
+    run_runtime_bootstrap_scope_self_tests()
     run_resource_identity_self_tests()
     run_worker_schema_self_tests()
