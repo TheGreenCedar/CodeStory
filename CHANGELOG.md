@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.16.2
+## 0.16.3
 
 ### Fixed
 
@@ -48,6 +48,12 @@
   waits for it.
 - Windows and Linux start faster, and commands run at the same time no longer
   queue behind one another.
+
+## 0.16.2
+
+Withdrawn before distribution. The GitHub release was created and removed the same day, the
+marketplace catalog was never pointed at it, and no install path ever served it. Everything it
+contained ships in 0.16.3 above.
 
 ## 0.16.1
 
