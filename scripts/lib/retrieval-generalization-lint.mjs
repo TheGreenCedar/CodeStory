@@ -108,7 +108,7 @@ function decodePromptStringLiteral(literal) {
 function structuredFinding(message) {
   const header = String(message).split("\n", 1)[0];
   const patterned = header.match(
-    /^(?<kind>Banned pattern|Banned literal pattern|Banned compact benchmark marker|Production dependency on eval\/query corpus|Constructed production dependency on eval\/query corpus|Banned eval\/query pattern|Constructed eval\/query dependency|Evaluation\/proof harness dependency|Constructed evaluation\/proof harness dependency) \/(?<pattern>.*?)\/? in (?:protected non-Rust path )?(?<file>.+?)(?: \(|:|$)/u,
+    /^(?<kind>Banned pattern|Banned literal pattern|Banned compact benchmark marker|Production dependency on eval\/query corpus|Constructed production dependency on eval\/query corpus|Banned eval\/query pattern|Constructed eval\/query dependency|Evaluation\/proof harness dependency|Constructed evaluation\/proof harness dependency) \/(?<pattern>.*)\/ in (?:protected non-Rust path )?(?<file>.+?)(?: \(|:|$)/u,
   );
   if (patterned?.groups != null) {
     return { ...patterned.groups, message: String(message) };
@@ -349,6 +349,13 @@ const structuralScanDirs = structuralScanRoots == null
     .map((entry) => path.join(productionRepoRoot, "crates", entry.name, "src"))
     .filter(existsSync)
   : structuralScanRoots.map((root) => path.resolve(root)).filter(existsSync);
+const guardedStructuralScanDirs = readdirSync(
+  path.join(repoRoot, "crates"),
+  { withFileTypes: true },
+)
+  .filter((entry) => entry.isDirectory() && entry.name !== "codestory-bench")
+  .map((entry) => path.join(repoRoot, "crates", entry.name, "src"))
+  .filter(existsSync);
 
 // Corpus-derived patterns already reach every `crates/*/src` file, but the
 // holdout *names* only ever reached the agent and retrieval directories --
@@ -550,7 +557,7 @@ function guardedPathDocument() {
     // verdict, so both are guarded.
     productionDirs: asRepoPaths([
       ...guardedRequiredScanDirs,
-      ...(productionRepoRoot === repoRoot ? structuralScanDirs : []),
+      ...guardedStructuralScanDirs,
     ]),
     productionFiles: asRepoPaths([
       ...guardedRequiredProductionOnlyFiles,

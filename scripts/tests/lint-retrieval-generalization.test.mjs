@@ -143,6 +143,8 @@ const MANIFEST_MARKERS = [
   "run_exec_session",
   "createCacheHelper",
 ];
+const IN_PHRASE_MARKER =
+  "Application-level registration starts in the sansio app registration method.";
 
 function write(root, relativePath, contents) {
   const destination = path.join(root, relativePath);
@@ -419,6 +421,10 @@ pub const PATH: &str = "/data/indexer/";
 pub const PROBE_A: &str = "run_exec_session";
 pub const PROBE_B: &str = "createCacheHelper";
 `);
+  reject(
+    "pattern-containing-in.rs",
+    `pub const CLAIM: &str = ${JSON.stringify(IN_PHRASE_MARKER)};\n`,
+  );
   reject("corpus-dependencies.rs", `
 pub const TASKS: &str = "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json";
 pub const QUERIES: &str = "scripts/cross-repo-sourcetrail-queries.mjs";
@@ -846,6 +852,15 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
       );
     }
     assert.ok(
+      findingFor(
+        result,
+        "pattern-containing-in.rs",
+        ({ pattern }) =>
+          normalizedFindingPattern(pattern) === IN_PHRASE_MARKER.toLowerCase(),
+      ),
+      "structured findings must retain a complete derived pattern containing ` in `",
+    );
+    assert.ok(
       banFiredFor(
         result,
         "query-phrase.rs",
@@ -1031,6 +1046,19 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
       "protectedNonRustDirs",
       "protectedNonRustFiles",
     ]);
+    const expectedProductionDirs = fs.readdirSync(
+      path.join(repositoryRoot, "crates"),
+      { withFileTypes: true },
+    )
+      .filter((entry) => entry.isDirectory() && entry.name !== "codestory-bench")
+      .map((entry) => `crates/${entry.name}/src`)
+      .filter((relativePath) => fs.existsSync(path.join(repositoryRoot, relativePath)));
+    for (const expectedDir of expectedProductionDirs) {
+      assert.ok(
+        result.guardedPaths.productionDirs.includes(expectedDir),
+        `guarded production roots lost ${expectedDir}`,
+      );
+    }
     const workflow = fs.readFileSync(
       path.join(repositoryRoot, ".github/workflows/retrieval-engine-smoke.yml"),
       "utf8",
