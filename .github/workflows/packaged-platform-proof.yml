@@ -165,6 +165,10 @@ jobs:
         shell: bash
         run: |
           sccache_path="$(command -v sccache)"
+          if [[ "$RUNNER_OS" == "Windows" && "$sccache_path" != *.[eE][xX][eE] ]]; then
+            sccache_path="${sccache_path}.exe"
+          fi
+          test -f "$sccache_path"
           test -x "$sccache_path"
           sccache_sha256="$(
             node --input-type=module -e '

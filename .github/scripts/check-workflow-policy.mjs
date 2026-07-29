@@ -544,12 +544,12 @@ const packagedPlatformCloseoutDigest =
 // parsed executable structure so an unreviewed earlier step cannot replace an
 // owner binary while leaving the locally digested finalizer unchanged.
 const packagedPlatformWorkflowDigest =
-  "6cb226d673bdbe5679b9f7010aad18c2c2a956129b51cff69ba457ed91962132";
+  "b8d981623dfbec100ce23470559071d05c5dc384e81164a7f571f915d903b843";
 // Linux owns its compiler server inside Docker, while macOS and Windows own one
 // in the host shell. Pin both executable programs so a swallowed stop or a
 // dead-code copy cannot satisfy the ownership fragments below.
 const packagedSccacheIdentityDigest =
-  "35f1976fd420c0ca6f2213c49ec3879dfa136d649529bbe3fe175f6b5ca633c6";
+  "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342";
 const packagedLinuxBuildDigest =
   "fc02f682c294983989d5f63151f8af9b31febda2da6fa0933aa9b1f7c221b4aa";
 const packagedCompileClockStopDigest =
@@ -2882,6 +2882,17 @@ function validatePackagedProof(workflows, violations, graph) {
     packagedSccacheIdentityDigest,
     "pinned sccache identity capture",
   );
+  requireStepRun(violations, file, job, "Capture pinned sccache identity", [
+    'sccache_path="$(command -v sccache)"',
+    'if [[ "$RUNNER_OS" == "Windows" && "$sccache_path" != *.[eE][xX][eE] ]]',
+    'sccache_path="${sccache_path}.exe"',
+    'test -f "$sccache_path"',
+    'test -x "$sccache_path"',
+    'readFileSync(process.argv[1])',
+    "' \"$sccache_path\"",
+    'echo "path=$sccache_path"',
+    'echo "sha256=$sccache_sha256"',
+  ]);
   requireStepRun(violations, file, job, "Configure short Windows Cargo target", [
     '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
     '$runnerRoot = [System.IO.Path]::GetPathRoot($workspaceTarget)',
