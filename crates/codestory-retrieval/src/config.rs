@@ -155,7 +155,7 @@ impl SidecarProcessDefaults {
     pub fn embedding_allow_cpu(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         {
-            return default_flag(&self.runtime, "CODESTORY_TEST_EMBED_ALLOW_CPU", false);
+            default_flag(&self.runtime, "CODESTORY_TEST_EMBED_ALLOW_CPU", false)
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
