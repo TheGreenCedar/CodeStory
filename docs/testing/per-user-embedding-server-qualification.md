@@ -199,6 +199,16 @@ with its lineage, and stops before the runtime proof. Without the enforcement
 flag a `--version-only` proof rejects calibration inputs outright, so the flag
 cannot be dropped without the step failing.
 
+The release workflow has a second, unconditional binding. Before reusing source
+proof or building a package, `release.yml` runs
+`.github/scripts/check-calibration-release-lineage.py` against its exact
+checked-out `GITHUB_SHA`. The check reads the calibration commit and tree from
+the checked-in freeze record, derives the release tree from Git, and applies the
+same ancestor and one-file-difference rule. It runs for both a proof-only
+`dev/codestory-next` dispatch and the publishing `main` caller, so qualifying one
+head cannot authorize a later source tree. This check does not replace bundle
+authentication or turn package proof into a release-evidence consumer.
+
 The full frozen `hosted_package` qualification in the same workflow carries the
 same flag, but it cannot run today: `--produce-qualification-evidence` requires
 the exact-head release-evidence `packet-runtime-summary.json` at any
@@ -207,9 +217,10 @@ release evidence to package proof. The `protected_hardware` bundle consumers on
 the Metal, Windows Vulkan, and Linux Vulkan lanes are likewise exempt: on the
 release path they run `--server-behavior-only`, which takes their no-bundle
 branch, and on the coordinator path they carry the same release-evidence
-requirement. The lineage is proved once, on the frozen candidate, and the later
-package proofs consume the already-frozen constant set rather than re-proving how
-it was reached.
+requirement. Those package and hardware invocations consume the already-frozen
+constant set without re-authenticating its bundle; the mandatory release
+preflight independently proves that the frozen source binding still covers the
+tree being released.
 
 That rule fixes the release ordering to **bump-then-calibrate**: bump the
 version first with `node scripts/bump-version.mjs --version <version>`,

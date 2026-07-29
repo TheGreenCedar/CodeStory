@@ -95,6 +95,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify release-head calibration lineage
+        env:
+          BASH_ENV: /dev/null
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        working-directory: ${{ github.workspace }}
+        run: >-
+          /usr/bin/python3 -E -s
+          "$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py"
+          --repo "$GITHUB_WORKSPACE"
+          --expected-sha "$GITHUB_SHA"
+
       - name: Validate release authority
         env:
           EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
