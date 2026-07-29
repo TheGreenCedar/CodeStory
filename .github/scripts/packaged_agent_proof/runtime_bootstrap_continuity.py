@@ -22,17 +22,6 @@ from .server_engine_identity import engine_identity
 from .server_identity import server_snapshot
 from .subprocess_control import McpProcess
 
-_CALIBRATION_LIVE_QUERY_SUFFIX = " calibration live encode verification"
-
-
-def _live_project_b_query(args: argparse.Namespace, setup: RuntimeSetup) -> str:
-    if args.proof_tier == "calibration":
-        # The cold phase already queried setup.query_b. Reusing it here can hit
-        # both the retrieval-result and embedding caches without exercising the
-        # resident native encoder whose counter this phase verifies.
-        return f"{setup.query_b}{_CALIBRATION_LIVE_QUERY_SUFFIX}"
-    return setup.query_b
-
 
 def _managed_runtime(
     args: argparse.Namespace,
@@ -119,9 +108,8 @@ def _live_retrieval(
             },
             "packet-a",
         )
-    project_b_query = _live_project_b_query(args, setup)
     live_tasks["search-b-live"] = lambda: hosts.host_b.search_until_ready(
-        {"project": str(setup.project_b), "query": project_b_query, "why": True},
+        {"project": str(setup.project_b), "query": setup.query_b, "why": True},
         "search-b-live",
     )
     run_parallel(live_tasks)

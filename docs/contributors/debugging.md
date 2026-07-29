@@ -86,7 +86,9 @@ Check:
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
 - whether retrieval is not full or symbol docs / dense anchors are missing
-- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, or explicit CPU policy changed between runs
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`,
+  `CODESTORY_SEMANTIC_DOC_SCOPE`, or a prohibited CPU selector appeared
+  between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:

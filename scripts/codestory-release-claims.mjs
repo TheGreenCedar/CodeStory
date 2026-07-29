@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
-const GRAPH_VERSION = 8;
+const GRAPH_VERSION = 9;
 const KNOWN_PACKAGE_TARGETS = new Set([
   "linux-arm64",
   "linux-x64",
@@ -530,6 +530,227 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
   return delivery;
 }
 
+function validateCalibrationPolicy(value) {
+  const calibration = object(value, "workflow_policy.calibration");
+  if (
+    calibration.coordinator_workflow !== "packaged-platform-pr.yml"
+    || calibration.mode !== "calibration"
+    || calibration.assembly_job !== "calibration-assemble"
+  ) {
+    fail("workflow_policy.calibration must name the canonical calibration coordinator and assembly job");
+  }
+  if (calibration.runs_per_required_cell !== 3) {
+    fail("workflow_policy.calibration must require exactly three clean runs per required cell");
+  }
+  if (calibration.samples_per_metric_per_run !== 1) {
+    fail("workflow_policy.calibration must require exactly one sample per metric per run");
+  }
+  const requiredCells = calibration.required_cells;
+  if (!Array.isArray(requiredCells) || requiredCells.length !== 1) {
+    fail("workflow_policy.calibration must declare exactly one required cell");
+  }
+  const required = object(requiredCells[0], "workflow_policy.calibration.required_cells[0]");
+  if (
+    required.id !== "protected_macos_arm64_metal"
+    || required.workflow !== "macos-metal-proof.yml"
+    || required.job !== "packaged-metal"
+    || required.policy !== "accelerated"
+    || required.backend !== "metal"
+    || required.feeds_constant_selection !== true
+  ) {
+    fail("workflow_policy.calibration required cell must be protected macOS Metal");
+  }
+  const optionalCells = calibration.optional_cells;
+  if (!Array.isArray(optionalCells) || optionalCells.length !== 1) {
+    fail("workflow_policy.calibration must declare exactly one optional evidence cell");
+  }
+  const optional = object(optionalCells[0], "workflow_policy.calibration.optional_cells[0]");
+  if (
+    optional.id !== "protected_linux_x64_vulkan"
+    || optional.workflow !== "linux-vulkan-proof.yml"
+    || optional.job !== "optional-constant-calibration"
+    || optional.trigger !== "workflow_dispatch"
+    || optional.policy !== "accelerated"
+    || optional.backend !== "vulkan"
+    || optional.assembly_dependency !== false
+    || optional.feeds_constant_selection !== false
+  ) {
+    fail("workflow_policy.calibration optional cell must be standalone non-selecting Linux Vulkan evidence");
+  }
+  const expectedMetrics = [
+    "existing_owner_connect",
+    "spawn_convergence",
+    "cold_first_vector",
+    "first_product_ready",
+    "warm_query_ipc",
+    "warm_bulk_ipc",
+    "bulk_documents_per_second",
+    "bulk_tokens_per_second",
+    "busy_retry_usefulness",
+  ];
+  const metrics = stringArray(
+    calibration.constant_metrics,
+    "workflow_policy.calibration.constant_metrics",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(metrics) !== JSON.stringify(expectedMetrics)) {
+    fail("workflow_policy.calibration constant metrics must match the runtime-constant source set");
+  }
+  const expectedForbiddenEvidence = [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "retrieval_quality",
+    "backend_observed_accelerator_residency",
+  ];
+  const forbiddenEvidence = stringArray(
+    calibration.forbidden_evidence,
+    "workflow_policy.calibration.forbidden_evidence",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(forbiddenEvidence) !== JSON.stringify(expectedForbiddenEvidence)) {
+    fail("workflow_policy.calibration must exclude qualification-only evidence");
+  }
+  const forbiddenPolicies = stringArray(
+    calibration.forbidden_policies,
+    "workflow_policy.calibration.forbidden_policies",
+    { nonEmpty: true },
+  );
+  const forbiddenBackends = stringArray(
+    calibration.forbidden_backends,
+    "workflow_policy.calibration.forbidden_backends",
+    { nonEmpty: true },
+  );
+  const forbiddenEnvironment = stringArray(
+    calibration.forbidden_environment,
+    "workflow_policy.calibration.forbidden_environment",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify(forbiddenPolicies) !== JSON.stringify(["cpu_explicit"])
+    || JSON.stringify(forbiddenBackends) !== JSON.stringify(["cpu"])
+    || JSON.stringify(forbiddenEnvironment)
+      !== JSON.stringify(["CODESTORY_EMBED_ALLOW_CPU=1"])
+  ) {
+    fail("workflow_policy.calibration must forbid CPU environment, policy, and backend selection");
+  }
+}
+
+function validateQualificationPolicy(value) {
+  const qualification = object(value, "workflow_policy.qualification");
+  if (
+    qualification.coordinator_workflow !== "packaged-platform-pr.yml"
+    || qualification.mode !== "qualification"
+    || qualification.runs_per_available_cell !== 1
+  ) {
+    fail("workflow_policy.qualification must name the canonical one-run frozen-candidate coordinator");
+  }
+  const requiredCells = qualification.required_cells;
+  if (!Array.isArray(requiredCells) || requiredCells.length !== 2) {
+    fail("workflow_policy.qualification must require protected macOS Metal and Windows Vulkan");
+  }
+  const expectedRequiredCells = [
+    {
+      id: "protected_macos_arm64_metal",
+      workflow: "macos-metal-proof.yml",
+      job: "packaged-metal",
+      policy: "accelerated",
+      backend: "metal",
+      produces_quality: true,
+    },
+    {
+      id: "protected_windows_x64_vulkan",
+      workflow: "windows-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      policy: "accelerated",
+      backend: "vulkan",
+      produces_quality: false,
+    },
+  ];
+  if (JSON.stringify(requiredCells) !== JSON.stringify(expectedRequiredCells)) {
+    fail("workflow_policy.qualification required cells must be the protected Metal and Vulkan producers");
+  }
+  const optionalCells = qualification.optional_cells;
+  const expectedOptionalCells = [
+    {
+      id: "protected_linux_x64_vulkan",
+      workflow: "linux-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      trigger: "workflow_dispatch",
+      policy: "accelerated",
+      backend: "vulkan",
+      closeout_dependency: false,
+      blocking: false,
+    },
+  ];
+  if (JSON.stringify(optionalCells) !== JSON.stringify(expectedOptionalCells)) {
+    fail("workflow_policy.qualification Linux Vulkan cell must be standalone and nonblocking");
+  }
+  const quality = object(
+    qualification.quality_contract,
+    "workflow_policy.qualification.quality_contract",
+  );
+  if (
+    quality.producer_cell !== "protected_macos_arm64_metal"
+    || quality.corpus_id !== "codestory-release-corpus-v1"
+    || quality.evaluation_contract !== "publishable-three-repeat-packet/v1"
+    || quality.task_count !== 3
+    || quality.repeats_per_task !== 3
+    || quality.row_count !== 9
+  ) {
+    fail("workflow_policy.qualification quality contract must bind the protected Metal 3x3 holdout matrix");
+  }
+  const expectedEvidence = [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "retrieval_quality",
+    "backend_observed_accelerator_residency",
+  ];
+  if (
+    JSON.stringify(stringArray(
+      qualification.required_evidence,
+      "workflow_policy.qualification.required_evidence",
+      { nonEmpty: true },
+    )) !== JSON.stringify(expectedEvidence)
+  ) {
+    fail("workflow_policy.qualification must retain every frozen-candidate evidence class");
+  }
+  const expectedScenarios = [
+    "client_death",
+    "cold_race",
+    "frozen_owner",
+    "incompatible_owner",
+    "mixed_queue",
+    "server_crash",
+    "true_idle_respawn",
+    "worker_stall",
+  ];
+  if (
+    JSON.stringify(stringArray(
+      qualification.required_scenarios,
+      "workflow_policy.qualification.required_scenarios",
+      { nonEmpty: true },
+    )) !== JSON.stringify(expectedScenarios)
+  ) {
+    fail("workflow_policy.qualification must run each lifecycle and fault scenario once");
+  }
+  if (
+    qualification.true_idle_timeout_ms !== 60_000
+    || qualification.true_idle_observation_grace_ms !== 2_500
+  ) {
+    fail("workflow_policy.qualification true-idle bound must be the product timeout plus explicit grace");
+  }
+  if (
+    JSON.stringify(qualification.forbidden_policies) !== JSON.stringify(["cpu_explicit"])
+    || JSON.stringify(qualification.forbidden_backends) !== JSON.stringify(["cpu"])
+    || JSON.stringify(qualification.forbidden_environment)
+      !== JSON.stringify(["CODESTORY_EMBED_ALLOW_CPU=1"])
+  ) {
+    fail("workflow_policy.qualification must forbid CPU environment, policy, and backend selection");
+  }
+}
+
 function validatePublicSupport(graph, packageTargets, cellGroups) {
   const publicSupport = object(
     graph.public_support,
@@ -551,8 +772,8 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
     if (row.local_map !== "supported") {
       fail(`public_support package ${target} must support the local map`);
     }
-    if (!new Set(["accelerated", "cpu_explicit"]).has(row.broad_retrieval)) {
-      fail(`public_support package ${target} has an invalid broad retrieval path`);
+    if (row.broad_retrieval !== "accelerated") {
+      fail(`public_support package ${target} must require accelerated broad retrieval`);
     }
     if (!new Set(["none", "metal", "vulkan"]).has(row.accelerator_claim)) {
       fail(`public_support package ${target} has an invalid accelerator claim`);
@@ -580,11 +801,8 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
     ) {
       fail(`public accelerator claim ${target}/${row.accelerator_claim} has no required closeout cell`);
     }
-    if (
-      (row.accelerator_claim === "none")
-      !== (row.broad_retrieval === "cpu_explicit")
-    ) {
-      fail(`public_support package ${target} has inconsistent execution and accelerator claims`);
+    if (row.accelerator_claim === "none") {
+      fail(`public_support package ${target} must name its accelerator claim`);
     }
   }
 
@@ -1048,6 +1266,8 @@ export function validateReleaseClaimGraph(graph) {
     }
     targets.add(row.asset_target);
   }
+  validateCalibrationPolicy(policy.calibration);
+  validateQualificationPolicy(policy.qualification);
   validatePublicSupport(graph, targets, cellGroups);
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");

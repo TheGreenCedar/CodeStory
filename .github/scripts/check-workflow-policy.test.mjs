@@ -32,6 +32,7 @@ import {
   packagedPrSigningViolations,
   parseWorkflow,
   releaseEvidenceApprovalViolations,
+  releaseProofCpuSelectorViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
   retrievalFile,
@@ -367,6 +368,768 @@ test("release evidence policy pins the release-only Axios v2 task and corpus", a
       const workflows = loadWorkflows();
       mutate(workflows.get(file));
       assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+test("every release-proof workflow rejects CPU selectors at every structural level", async (t) => {
+  const graph = loadReleaseClaimGraph(root);
+  const releaseProofFiles = [
+    "auto-release.yml",
+    "packaged-platform-pr.yml",
+    ...new Set([
+      ...graph.evidence_types.flatMap(({ proof_lanes: lanes }) => lanes),
+      ...graph.workflow_policy.artifact_workflows,
+      ...graph.workflow_policy.protected_jobs.map(({ workflow }) => workflow),
+      graph.workflow_policy.calibration.coordinator_workflow,
+      ...graph.workflow_policy.calibration.required_cells.map(({ workflow }) => workflow),
+      ...graph.workflow_policy.calibration.optional_cells.map(({ workflow }) => workflow),
+      graph.workflow_policy.qualification.coordinator_workflow,
+      ...graph.workflow_policy.qualification.required_cells.map(({ workflow }) => workflow),
+      ...graph.workflow_policy.qualification.optional_cells.map(({ workflow }) => workflow),
+    ].map(file => path.basename(file))),
+  ];
+  assert.deepEqual(releaseProofCpuSelectorViolations(loadWorkflows(), graph), []);
+
+  const mutations = [
+    ["workflow environment", workflow => {
+      workflow.env = { ...workflow.env, CODESTORY_EMBED_ALLOW_CPU: "1" };
+    }],
+    ["job environment", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.env = { ...job.env, CODESTORY_EMBED_ALLOW_CPU: 1 };
+    }],
+    ["step environment", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [{ name: "Injected CPU selector", run: "true" }];
+      job.steps[0].env = {
+        ...job.steps[0].env,
+        CODESTORY_EMBED_ALLOW_CPU: "1",
+      };
+    }],
+    ["inline environment assignment", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: "CODESTORY_EMBED_ALLOW_CPU=1 true",
+      });
+    }],
+    ["inline arithmetic environment assignment", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: "CODESTORY_EMBED_ALLOW_CPU=$((1)) true",
+      });
+    }],
+    ["inline command-substitution environment assignment", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: "CODESTORY_EMBED_ALLOW_CPU=$(printf 1) true",
+      });
+    }],
+    ["equal-form engine policy", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: "codestory-proof --engine-policy=cpu_explicit",
+      });
+    }],
+    ["shell-concatenated engine policy", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: 'codestory-proof --engine-policy cpu_"explicit"',
+      });
+    }],
+    ["spaced backend flag", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: "codestory-proof --expected-backend CPU",
+      });
+    }],
+    ["shell-concatenated backend flag", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.steps ??= [];
+      job.steps.push({
+        name: "Injected CPU selector",
+        run: 'codestory-proof --expected-backend "c"pu',
+      });
+    }],
+    ["matrix semantic key", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.strategy = { matrix: { include: [{ engine_policy: "cpu_explicit" }] } };
+    }],
+    ["whitespace-wrapped matrix policy", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.strategy = { matrix: { include: [{ engine_policy: " CPU_EXPLICIT " }] } };
+    }],
+    ["whitespace-wrapped matrix backend", workflow => {
+      const job = Object.values(workflow.jobs)[0];
+      job.strategy = { matrix: { include: [{ backend: " CPU " }] } };
+    }],
+  ];
+
+  for (const file of releaseProofFiles) {
+    for (const [shape, mutate] of mutations) {
+      await t.test(`${file}: ${shape}`, () => {
+        const workflows = loadWorkflows();
+        mutate(workflows.get(file));
+        assert.match(
+          releaseProofCpuSelectorViolations(workflows, graph).join("\n"),
+          new RegExp(`\\[cpu_selector\\] ${file.replaceAll(".", "\\.")}`, "u"),
+        );
+      });
+    }
+  }
+
+  await t.test("non-release source workflow cannot enable the product CPU selector", () => {
+    const workflows = loadWorkflows();
+    workflows.get("rust-ci.yml").jobs["linux-draft"].env = {
+      CODESTORY_EMBED_ALLOW_CPU: "1",
+    };
+    assert.match(
+      releaseProofCpuSelectorViolations(workflows, graph).join("\n"),
+      /\[cpu_selector\] rust-ci\.yml/u,
+    );
+  });
+  await t.test("release proof cannot use the CPU test seam", () => {
+    const workflows = loadWorkflows();
+    workflows.get("macos-metal-proof.yml").jobs["packaged-metal"].env = {
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1",
+    };
+    assert.match(
+      releaseProofCpuSelectorViolations(workflows, graph).join("\n"),
+      /\[cpu_test_seam\] macos-metal-proof\.yml/u,
+    );
+  });
+  await t.test("unrelated source job cannot claim the CPU test seam", () => {
+    const workflows = loadWorkflows();
+    workflows.get("rust-ci.yml").jobs["linux-draft"].env = {
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1",
+    };
+    assert.match(
+      releaseProofCpuSelectorViolations(workflows, graph).join("\n"),
+      /\[cpu_test_seam\] rust-ci\.yml/u,
+    );
+  });
+  await t.test("allowlisted source test cannot move the seam to a step", () => {
+    const workflows = loadWorkflows();
+    const workflow = workflows.get("retrieval-engine-smoke.yml");
+    delete workflow.jobs["linux-contracts"].env.CODESTORY_TEST_EMBED_ALLOW_CPU;
+    workflow.jobs["linux-contracts"].steps[0].env = {
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1",
+    };
+    assert.match(
+      releaseProofCpuSelectorViolations(workflows, graph).join("\n"),
+      /\[cpu_test_seam\] retrieval-engine-smoke\.yml/u,
+    );
+  });
+
+  const supportSources = new Map([
+    [
+      "scripts/release-evidence/guest-runner.sh",
+      readFileSync(path.join(root, "scripts/release-evidence/guest-runner.sh"), "utf8"),
+    ],
+    [
+      ".github/scripts/check-linux-glibc-baseline.sh",
+      readFileSync(path.join(root, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
+    ],
+    [
+      "scripts/release-evidence/guest-verify.sh",
+      readFileSync(path.join(root, "scripts/release-evidence/guest-verify.sh"), "utf8"),
+    ],
+  ]);
+  await t.test("runner service re-enables CPU", () => {
+    const mutated = new Map(supportSources);
+    mutated.set(
+      "scripts/release-evidence/guest-runner.sh",
+      mutated.get("scripts/release-evidence/guest-runner.sh")
+        .replace("CODESTORY_EMBED_ALLOW_CPU=0", "CODESTORY_EMBED_ALLOW_CPU=1"),
+    );
+    assert.match(
+      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
+      /guest-runner\.sh contains a CPU proof selector/u,
+    );
+  });
+  for (const [shape, assignment] of [
+    ["arithmetic", "CODESTORY_EMBED_ALLOW_CPU=$((1))"],
+    ["command substitution", "CODESTORY_EMBED_ALLOW_CPU=$(printf 1)"],
+  ]) {
+    await t.test(`runner service re-enables CPU through ${shape}`, () => {
+      const mutated = new Map(supportSources);
+      mutated.set(
+        "scripts/release-evidence/guest-runner.sh",
+        mutated.get("scripts/release-evidence/guest-runner.sh")
+          .replace("CODESTORY_EMBED_ALLOW_CPU=0", assignment),
+      );
+      assert.match(
+        releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
+        /guest-runner\.sh contains a CPU proof selector/u,
+      );
+    });
+  }
+  await t.test("glibc smoke re-enables CPU", () => {
+    const mutated = new Map(supportSources);
+    mutated.set(
+      ".github/scripts/check-linux-glibc-baseline.sh",
+      mutated.get(".github/scripts/check-linux-glibc-baseline.sh")
+        .replace("CODESTORY_EMBED_ALLOW_CPU=0", "CODESTORY_EMBED_ALLOW_CPU=1"),
+    );
+    assert.match(
+      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
+      /check-linux-glibc-baseline\.sh contains a CPU proof selector/u,
+    );
+  });
+  await t.test("runner verification stops proving CPU disabled", () => {
+    const mutated = new Map(supportSources);
+    mutated.set(
+      "scripts/release-evidence/guest-verify.sh",
+      mutated.get("scripts/release-evidence/guest-verify.sh")
+        .replace('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"', "grep -qxF ignored"),
+    );
+    assert.match(
+      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
+      /guest-verify\.sh must prove CPU is disabled/u,
+    );
+  });
+});
+
+test("constant calibration structure rejects qualification, 3x3 sampling, repeated setup, and Linux gating", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const metalFile = "macos-metal-proof.yml";
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const collector = workflow => draftStep(
+    workflow.jobs["packaged-metal"],
+    "Collect three independent Metal constant calibration runs",
+  );
+  const nativeBuild = workflow => draftStep(
+    workflow.jobs["packaged-metal"],
+    "Build and package native CLI",
+  );
+  const metalTiming = workflow => draftStep(
+    workflow.jobs["packaged-metal"],
+    "Publish Metal constant calibration timing",
+  );
+  const linuxCollector = workflow => draftStep(
+    workflow.jobs["optional-constant-calibration"],
+    "Collect optional Linux Vulkan constant calibration",
+  );
+  const linuxNativeBuild = workflow => draftStep(
+    workflow.jobs["optional-constant-calibration"],
+    "Build and package native CLI and constant driver",
+  );
+  const assembly = workflow => workflow.jobs["calibration-assemble"];
+  const assemblyStep = workflow => draftStep(
+    assembly(workflow),
+    "Assemble frozen calibration candidate",
+  );
+
+  const mutations = [
+    ["qualification scenario enters calibration", metalFile, workflow => {
+      collector(workflow).run += "\n--qualification-scenario lifecycle";
+    }, /without full qualification or nested sampling/u],
+    ["fault evidence enters calibration", metalFile, workflow => {
+      collector(workflow).run += "\n--publication-fault-evidence target/fault.json";
+    }, /without full qualification or nested sampling/u],
+    ["quality evidence enters calibration", metalFile, workflow => {
+      collector(workflow).run += "\n--retrieval-quality-evidence target/quality.json";
+    }, /without full qualification or nested sampling/u],
+    ["full qualification producer enters calibration", metalFile, workflow => {
+      collector(workflow).run += "\n--produce-qualification-evidence";
+    }, /without full qualification or nested sampling/u],
+    ["shell-concatenated qualification producer enters calibration", metalFile, workflow => {
+      collector(workflow).run = collector(workflow).run.replace(
+        "--out-dir target/calibration-proof/macos",
+        '--produce-"qualification-evidence" \\\n  --out-dir target/calibration-proof/macos',
+      );
+    }, /without full qualification or nested sampling/u],
+    ["shell-concatenated qualification evidence enters calibration", metalFile, workflow => {
+      collector(workflow).run = collector(workflow).run.replace(
+        "--out-dir target/calibration-proof/macos",
+        '--qualification-"evidence" target/qualification.json \\\n  --out-dir target/calibration-proof/macos',
+      );
+    }, /without full qualification or nested sampling/u],
+    ["shell-concatenated fault evidence enters calibration", metalFile, workflow => {
+      collector(workflow).run = collector(workflow).run.replace(
+        "--out-dir target/calibration-proof/macos",
+        '--publication-"fault-evidence" target/fault.json \\\n  --out-dir target/calibration-proof/macos',
+      );
+    }, /without full qualification or nested sampling/u],
+    ["3x3 sampling is requested", metalFile, workflow => {
+      collector(workflow).run += "\n--samples-per-metric 3";
+    }, /without full qualification or nested sampling/u],
+    ["outer run loop returns", metalFile, workflow => {
+      collector(workflow).run = `for run_index in 1 2 3; do\n${collector(workflow).run}\ndone`;
+    }, /without full qualification or nested sampling/u],
+    ["renamed outer run loop returns", metalFile, workflow => {
+      collector(workflow).run = `for attempt in 1 2 3; do\n${collector(workflow).run}\ndone`;
+    }, /without full qualification or nested sampling/u],
+    ["brace-expanded outer run loop returns", metalFile, workflow => {
+      collector(workflow).run = `for attempt in {1..3}; do\n${collector(workflow).run}\ndone`;
+    }, /without full qualification or nested sampling/u],
+    ["collector is invoked twice", metalFile, workflow => {
+      collector(workflow).run += `\n${collector(workflow).run}`;
+    }, /without full qualification or nested sampling/u],
+    ["Metal collector accepts a checkout project", metalFile, workflow => {
+      collector(workflow).run += "\n--project \"$GITHUB_WORKSPACE\"";
+    }, /synthetic-project constant collector/u],
+    ["Metal collector accepts a plugin root", metalFile, workflow => {
+      collector(workflow).run += "\n--plugin-root plugins\/codestory";
+    }, /synthetic-project constant collector/u],
+    ["Metal collector accepts a plugin handoff", metalFile, workflow => {
+      collector(workflow).run += "\n--plugin-handoff";
+    }, /synthetic-project constant collector/u],
+    ["Metal proof output enters retained calibration root", metalFile, workflow => {
+      collector(workflow).run = collector(workflow).run.replace(
+        "--out-dir target/calibration-proof/macos",
+        "--out-dir target/calibration-runs/macos/proof",
+      );
+    }, /must run --out-dir target\/calibration-proof\/macos/u],
+    ["Cargo build repeats", metalFile, workflow => {
+      nativeBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
+    }, /one shared Cargo invocation and package once/u],
+    ["package repeats", metalFile, workflow => {
+      nativeBuild(workflow).run += "\npython3 .github/scripts/package-codestory-release.py --version 0.0.0";
+    }, /one shared Cargo invocation and package once/u],
+    ["model preparation repeats", metalFile, workflow => {
+      workflow.jobs["packaged-metal"].steps.push({
+        name: "Prepare model again",
+        run: "node scripts/prepare-embedded-model.mjs",
+      });
+    }, /one shared Cargo invocation and package once/u],
+    ["Cargo build repeats in a separate step", metalFile, workflow => {
+      workflow.jobs["packaged-metal"].steps.push({
+        name: "Build native CLI again",
+        shell: "bash",
+        run: "cargo build --release --locked -p codestory-cli",
+      });
+    }, /one shared Cargo invocation and package once/u],
+    ["packaging repeats in a separate step", metalFile, workflow => {
+      workflow.jobs["packaged-metal"].steps.push({
+        name: "Package native CLI again",
+        shell: "bash",
+        run: "python3 .github/scripts/package-codestory-release.py --version 0.16.3",
+      });
+    }, /one shared Cargo invocation and package once/u],
+    ["shell-concatenated model preparation repeats", metalFile, workflow => {
+      workflow.jobs["packaged-metal"].steps.push({
+        name: "Prepare model material again",
+        shell: "bash",
+        run: 'node scripts/prepare-"embedded-model".mjs',
+      });
+    }, /one shared Cargo invocation and package once/u],
+    ["complete packaged calibration harness repeats", metalFile, workflow => {
+      const repeated = collector(workflow).run
+        .replaceAll("target/calibration-runs/macos", "target/calibration-runs/macos-again")
+        .replaceAll("target/calibration-proof/macos", "target/calibration-proof/macos-again");
+      workflow.jobs["packaged-metal"].steps.push({
+        name: "Collect constant calibration again",
+        shell: "bash",
+        run: repeated,
+      });
+    }, /one shared Cargo invocation and package once/u],
+    ["shared build and package timing loses its output identity", metalFile, workflow => {
+      delete nativeBuild(workflow).id;
+    }, /one shared Cargo invocation and package once/u],
+    ["shared build and package timing is not measured once", metalFile, workflow => {
+      nativeBuild(workflow).run = nativeBuild(workflow).run.replace(
+        "build_package_finished_ns=\"$(python3 -c 'import time; print(time.monotonic_ns())')\"",
+        "build_package_finished_ns=\"$build_package_started_ns\"",
+      );
+    }, /one shared Cargo invocation and package once/u],
+    ["calibration total clock loses its output identity", metalFile, workflow => {
+      delete draftStep(
+        workflow.jobs["packaged-metal"],
+        "Start Metal constant calibration clock",
+      ).id;
+    }, /time model preparation and total wall time/u],
+    ["model preparation loses measured duration", metalFile, workflow => {
+      const model = draftStep(
+        workflow.jobs["packaged-metal"],
+        "Prepare checksum-pinned embedded model",
+      );
+      model.run = model.run.replace(
+        "model_prepare_finished_ns=\"$(python3 -c 'import time; print(time.monotonic_ns())')\"",
+        "model_prepare_finished_ns=\"$model_prepare_started_ns\"",
+      );
+    }, /time model preparation and total wall time/u],
+    ["timing summary loses shared build and package duration", metalFile, workflow => {
+      metalTiming(workflow).env.BUILD_PACKAGE_DURATION_MS = "0";
+    }, /shared build\/package and five-phase collector timing/u],
+    ["timing summary loses model preparation duration", metalFile, workflow => {
+      metalTiming(workflow).env.MODEL_PREPARATION_DURATION_MS = "0";
+    }, /shared build\/package and five-phase collector timing/u],
+    ["timing summary weakens the ten-minute target", metalFile, workflow => {
+      metalTiming(workflow).run = metalTiming(workflow).run.replace(
+        'test "$calibration_total_ms" -lt 600000',
+        'test "$calibration_total_ms" -lt 900000',
+      );
+    }, /shared build\/package and five-phase collector timing/u],
+    ["timing summary is not published", metalFile, workflow => {
+      metalTiming(workflow).run = metalTiming(workflow).run.replace(
+        "$GITHUB_STEP_SUMMARY",
+        "$IGNORED_SUMMARY",
+      );
+    }, /shared build\/package and five-phase collector timing/u],
+    ...[
+      "archive_authentication_unpack_ms",
+      "project_and_request_setup_ms",
+      "measurement_ms",
+      "retention_validation_ms",
+      "end_to_end_ms",
+    ].map(field => [
+      `timing summary drops ${field}`,
+      metalFile,
+      workflow => {
+        metalTiming(workflow).run = metalTiming(workflow).run.replaceAll(
+          field,
+          "omitted_timing_value",
+        );
+      },
+      /shared build\/package and five-phase collector timing/u,
+    ]),
+    ["Linux collector accepts a checkout project", "linux-vulkan-proof.yml", workflow => {
+      linuxCollector(workflow).run += "\n--project \"$GITHUB_WORKSPACE\"";
+    }, /synthetic project without qualification/u],
+    ["Linux collector accepts a plugin root", "linux-vulkan-proof.yml", workflow => {
+      linuxCollector(workflow).run += "\n--plugin-root plugins\/codestory";
+    }, /synthetic project without qualification/u],
+    ["Linux collector accepts a plugin handoff", "linux-vulkan-proof.yml", workflow => {
+      linuxCollector(workflow).run += "\n--plugin-handoff";
+    }, /synthetic project without qualification/u],
+    ["Linux proof output enters retained calibration root", "linux-vulkan-proof.yml", workflow => {
+      linuxCollector(workflow).run = linuxCollector(workflow).run.replace(
+        "--out-dir target/calibration-proof/linux-vulkan",
+        "--out-dir target/calibration-runs/linux-vulkan/proof",
+      );
+    }, /must run --out-dir target\/calibration-proof\/linux-vulkan/u],
+    ["Linux diagnostic upload drops disjoint proof output", "linux-vulkan-proof.yml", workflow => {
+      const upload = draftStep(
+        workflow.jobs["optional-constant-calibration"],
+        "Upload optional Linux Vulkan calibration evidence",
+      );
+      upload.with.path = upload.with.path.replace(
+        "target/calibration-proof/linux-vulkan",
+        "",
+      );
+    }, /must upload attempt-scoped non-selecting evidence/u],
+    ["Linux calibration requires an upstream package run", "linux-vulkan-proof.yml", workflow => {
+      workflow.on.workflow_dispatch.inputs.package_run_id.required = true;
+      delete workflow.on.workflow_dispatch.inputs.package_run_id.default;
+    }, /must not require an upstream package run/u],
+    ["Linux calibration downloads an independently built package", "linux-vulkan-proof.yml", workflow => {
+      workflow.jobs["optional-constant-calibration"].steps.splice(5, 0, {
+        name: "Download exact Linux package",
+        uses: "actions/download-artifact@v8.0.1",
+        with: {
+          name: "codestory-cli-linux-x64",
+          "run-id": "${{ inputs.package_run_id }}",
+        },
+      });
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["Linux calibration reads package_run_id", "linux-vulkan-proof.yml", workflow => {
+      linuxNativeBuild(workflow).env.PACKAGE_RUN_ID = "${{ inputs.package_run_id }}";
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["Linux calibration repeats Cargo build", "linux-vulkan-proof.yml", workflow => {
+      linuxNativeBuild(workflow).run += "\ncargo build --release --locked -p codestory-bench";
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["Linux calibration repeats packaging", "linux-vulkan-proof.yml", workflow => {
+      linuxNativeBuild(workflow).run += "\npython .github/scripts/package-codestory-release.py --version 0.0.0";
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["Linux calibration omits the runtime binary", "linux-vulkan-proof.yml", workflow => {
+      linuxNativeBuild(workflow).run = linuxNativeBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "",
+      );
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["Linux calibration repeats model preparation", "linux-vulkan-proof.yml", workflow => {
+      workflow.jobs["optional-constant-calibration"].steps.push({
+        name: "Prepare model again",
+        run: "node scripts/prepare-embedded-model.mjs",
+      });
+    }, /prepare once, build CLI and collector once, and package that exact CLI once/u],
+    ["assembly waits for Linux", coordinatorFile, workflow => {
+      assembly(workflow).needs.push("calibration-linux");
+    }, /wait only for required protected macOS Metal evidence/u],
+    ["assembly condition waits for Linux", coordinatorFile, workflow => {
+      assembly(workflow).if += " && needs.calibration-linux.result == 'success'";
+    }, /wait only for required protected macOS Metal evidence/u],
+    ["assembly condition waits on an optional Vulkan variable", coordinatorFile, workflow => {
+      assembly(workflow).if += " && vars.OPTIONAL_VULKAN_READY == 'true'";
+    }, /wait only for required protected macOS Metal evidence/u],
+    ["assembly downloads Linux evidence", coordinatorFile, workflow => {
+      assembly(workflow).steps.splice(1, 0, {
+        name: "Download optional Linux evidence",
+        uses: "actions/download-artifact@v8.0.1",
+        with: {
+          name: "optional-embedding-calibration-linux-vulkan",
+          path: "target/calibration-inputs/linux",
+        },
+      });
+    }, /must not select, discover, or gate on Linux evidence/u],
+    ["assembly requires wildcard optional evidence", coordinatorFile, workflow => {
+      assembly(workflow).steps.splice(2, 0, {
+        name: "Download auxiliary calibration evidence",
+        uses: "actions/download-artifact@v8.0.1",
+        with: {
+          pattern: "optional-embedding-calibration-*",
+          path: "target/auxiliary-calibration",
+        },
+      }, {
+        name: "Require auxiliary calibration evidence",
+        shell: "bash",
+        run: 'test "$(find target/auxiliary-calibration -type f | wc -l | tr -d " ")" -gt 0',
+      });
+    }, /exact protected macOS-only step boundary/u],
+    ["assembly can overwrite required runs with wildcard evidence", coordinatorFile, workflow => {
+      assembly(workflow).steps.splice(2, 0, {
+        name: "Download auxiliary calibration evidence",
+        uses: "actions/download-artifact@v8.0.1",
+        with: {
+          pattern: "optional-embedding-calibration-*",
+          path: "target/auxiliary-calibration",
+        },
+      }, {
+        name: "Select auxiliary calibration evidence",
+        shell: "bash",
+        run: [
+          'test "$(find target/auxiliary-calibration -name "run-*.json" | wc -l | tr -d " ")" = 3',
+          'find target/auxiliary-calibration -name "run-*.json" -exec cp {} target/calibration-inputs/macos/ \\;',
+        ].join("\n"),
+      });
+    }, /exact protected macOS-only step boundary/u],
+    ["assembly broadens artifact discovery", coordinatorFile, workflow => {
+      assemblyStep(workflow).run = assemblyStep(workflow).run
+        .replace("find target/calibration-inputs/macos", "find target/calibration-inputs");
+    }, /must not select, discover, or gate on Linux evidence/u],
+    ["assembly accepts six records", coordinatorFile, workflow => {
+      assemblyStep(workflow).run = assemblyStep(workflow).run
+        .replace('test "${#runs[@]}" = 3', 'test "${#runs[@]}" = 6');
+    }, /step Assemble frozen calibration candidate must run test "\$\{#runs\[@\]\}" = 3/u],
+    ["assembly accepts two matrix cells", coordinatorFile, workflow => {
+      assemblyStep(workflow).run = assemblyStep(workflow).run
+        .replace(".matrix_cell_count == 1", ".matrix_cell_count == 2");
+    }, /step Assemble frozen calibration candidate must run \.matrix_cell_count == 1/u],
+    ["an extra Linux hardware job can keep calibration from completing", coordinatorFile, workflow => {
+      workflow.jobs["hidden-linux-calibration-wait"] = {
+        needs: "route",
+        if: "needs.route.outputs.mode == 'calibration'",
+        "runs-on": ["self-hosted", "Linux", "X64", "codestory-vulkan"],
+        "timeout-minutes": 360,
+        steps: [{ name: "Wait on optional Linux", run: "true" }],
+      };
+    }, /must retain the reviewed exact job set so no hidden hardware job can block calibration/u],
+  ];
+  for (const [name, file, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+test("frozen-candidate qualification keeps the Metal quality handoff and optional Linux topology", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const metalFile = "macos-metal-proof.yml";
+  const windowsFile = "windows-vulkan-proof.yml";
+  const linuxFile = "linux-vulkan-proof.yml";
+
+  const mutations = [
+    ["qualification route accepts no calibration artifact", coordinatorFile, workflow => {
+      const resolver = draftStep(workflow.jobs.route, "Resolve trusted exact head");
+      resolver.run = resolver.run.replace(
+        'test -n "$INPUT_CALIBRATION_ARTIFACT"',
+        'true "$INPUT_CALIBRATION_ARTIFACT"',
+      );
+    }, /Resolve trusted exact head must run test -n "\$INPUT_CALIBRATION_ARTIFACT"|exact normalized trusted resolver/u],
+    ["Metal qualification becomes candidate-installed only", coordinatorFile, workflow => {
+      workflow.jobs["macos-metal-proof"].with.candidate_installed_proof = true;
+    }, /qualification must run full Metal proof rather than candidate-installed proof/u],
+    ["Metal qualification becomes server-behavior only", coordinatorFile, workflow => {
+      workflow.jobs["macos-metal-proof"].with.server_behavior_only = true;
+    }, /qualification must run full Metal quality and lifecycle proof/u],
+    ["Windows no longer waits for Metal", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].needs
+        = workflow.jobs["windows-vulkan-proof"].needs
+          .filter(name => name !== "macos-metal-proof");
+    }, /Windows qualification must wait for successful protected Metal quality/u],
+    ["Windows ignores failed Metal qualification", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].if
+        = workflow.jobs["windows-vulkan-proof"].if.replace(
+          "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success') &&",
+          "",
+        );
+    }, /qualification requires successful Metal/u],
+    ["Windows qualification loses exact quality artifact", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact = "";
+    }, /must consume the exact protected Metal quality artifact/u],
+    ["Windows qualification becomes candidate-installed only", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
+    }, /qualification must run full Windows proof rather than candidate-installed proof/u],
+    ["Windows qualification becomes server-behavior only", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
+    }, /qualification must run full Windows lifecycle and fault proof/u],
+    ["coordinator schedules Linux during qualification", coordinatorFile, workflow => {
+      workflow.jobs["linux-vulkan-proof"].if
+        = workflow.jobs["linux-vulkan-proof"].if.replace(
+          "needs.route.outputs.mode != 'qualification' &&",
+          "",
+        );
+    }, /qualification modes must skip coordinator Linux proof/u],
+    ["qualification closeout blocks on Linux", coordinatorFile, workflow => {
+      const closeout = draftStep(
+        workflow.jobs.closeout,
+        "Require one coherent accepted proof",
+      );
+      closeout.run = closeout.run.replace(
+        `if [ "$MODE" = qualification ]; then
+      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+    else`,
+        `if [ "$MODE" = qualification ]; then
+      require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+    else`,
+      );
+    }, /qualification closeout must accept skipped optional Linux proof without blocking/u],
+    ["qualification closeout hides the accepted Linux branch in dead code", coordinatorFile, workflow => {
+      const closeout = draftStep(
+        workflow.jobs.closeout,
+        "Require one coherent accepted proof",
+      );
+      const accepted = `if [ "$MODE" = qualification ]; then
+      require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof
+    else
+      require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof
+    fi`;
+      closeout.run = closeout.run.replace(
+        accepted,
+        accepted.replace(
+          'require_result "$LINUX_VULKAN_RESULT" skipped linux-vulkan-proof',
+          'require_result "$LINUX_VULKAN_RESULT" success linux-vulkan-proof',
+        ),
+      );
+      closeout.run += `\nif false; then\n${accepted}\nfi\n`;
+    }, /must match the reviewed coordinator closeout script exactly/u],
+    ["qualification closeout job is disabled", coordinatorFile, workflow => {
+      workflow.jobs.closeout.if = "${{ always() && false }}";
+    }, /closeout job must retain its reviewed unconditional result-checking activation/u],
+    ["qualification closeout proof step is disabled", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Require one coherent accepted proof",
+      ).if = "${{ false }}";
+    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    ["qualification closeout shell ignores the reviewed script", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Require one coherent accepted proof",
+      ).shell = "bash -c 'true' {0}";
+    }, /closeout must run one unconditional proof step under the reviewed Bash interpreter/u],
+    ["qualification closeout mode is rebound away from the route", coordinatorFile, workflow => {
+      draftStep(
+        workflow.jobs.closeout,
+        "Require one coherent accepted proof",
+      ).env.MODE = "qualification ";
+    }, /closeout proof must bind every route and platform result from the reviewed jobs exactly/u],
+    ["Metal quality producer runs during calibration", metalFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-metal"],
+        "Produce exact-head holdout quality on protected Metal",
+      ).if = "${{ !inputs.server_behavior_only }}";
+    }, /must generate one exact-head three-repeat holdout quality artifact/u],
+    ["Metal quality producer weakens repeat contract", metalFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs["packaged-metal"],
+        "Produce exact-head holdout quality on protected Metal",
+      );
+      producer.run = producer.run.replace("--repeats 3", "--repeats 1");
+    }, /must generate one exact-head three-repeat holdout quality artifact/u],
+    ["Metal quality upload loses exact-head name", metalFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-metal"],
+        "Upload exact-head protected Metal quality evidence",
+      ).with.name = "frozen-candidate-quality";
+    }, /must upload one exact-head stable handoff/u],
+    ["Metal quality upload loses safe overwrite", metalFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-metal"],
+        "Upload exact-head protected Metal quality evidence",
+      ).with.overwrite = false;
+    }, /must upload one exact-head stable handoff/u],
+    ["Windows downloads an unrelated quality artifact", windowsFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-vulkan"],
+        "Download exact-head publishable packet quality evidence",
+      ).with.name = "latest-quality";
+    }, /must download the exact protected Metal quality handoff/u],
+    ["Linux full qualification skips driver build", linuxFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-vulkan"],
+        "Build qualification driver",
+      ).if = "${{ inputs.server_behavior_only }}";
+    }, /must build its pinned full qualification driver exactly once/u],
+    ["Linux trusts quality from another workflow", linuxFile, workflow => {
+      const authenticate = draftStep(
+        workflow.jobs["packaged-vulkan"],
+        "Authenticate protected Metal quality producer",
+      );
+      authenticate.run = authenticate.run.replace(
+        ".github/workflows/packaged-platform-pr.yml",
+        ".github/workflows/release.yml",
+      );
+    }, /must authenticate exact-head protected Metal quality/u],
+    ["Linux quality download loses producer run identity", linuxFile, workflow => {
+      draftStep(
+        workflow.jobs["packaged-vulkan"],
+        "Download exact-head protected Metal quality evidence",
+      ).with["run-id"] = "${{ github.run_id }}";
+    }, /must consume the authenticated protected Metal quality artifact/u],
+    ["Linux standalone path removes lifecycle qualification", linuxFile, workflow => {
+      const proof = draftStep(
+        workflow.jobs["packaged-vulkan"],
+        "Prove offline Linux Vulkan retrieval",
+      );
+      proof.run = proof.run.replace("--produce-qualification-evidence", "--server-behavior-only");
+    }, /standalone qualification runs one full lifecycle and quality proof/u],
+  ];
+
+  for (const [name, file, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+
+  for (const [name, mutate] of [
+    ["required Windows qualification cell becomes optional", graph => {
+      graph.workflow_policy.qualification.required_cells
+        = graph.workflow_policy.qualification.required_cells.slice(0, 1);
+    }],
+    ["quality producer moves off protected Metal", graph => {
+      graph.workflow_policy.qualification.quality_contract.producer_cell
+        = "protected_windows_x64_vulkan";
+    }],
+    ["true-idle grace replaces the product timeout", graph => {
+      graph.workflow_policy.qualification.true_idle_timeout_ms = 2_500;
+    }],
+  ]) {
+    await t.test(`claim graph: ${name}`, () => {
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      mutate(graph);
+      assert.match(
+        validateWorkflows(loadWorkflows(), graph).join("\n"),
+        /must implement the release claim graph qualification contract/u,
+      );
     });
   }
 });
@@ -981,55 +1744,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
     }, /matrix must select structural JSON by scope/u],
-    ["package evaluation driver reaches the standard path", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Build qualification driver").if
-        = "matrix.asset_target == 'linux-x64'";
-    }, /packaged-platform-proof\.yml/u],
-    ["package evaluation reaches the standard path", packagedProofFile, workflow => {
-      const step = draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      step.if = "matrix.asset_target == 'linux-x64'";
-    }, /packaged-platform-proof\.yml/u],
-    ["frozen qualification stops enforcing the calibration freeze lineage", packagedProofFile, workflow => {
-      const step = draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      const removed = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
-      assert.notEqual(removed, step.run, "freeze lineage flag was already absent");
-      step.run = removed;
-    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
-    ["freeze lineage enforcement moves onto the unfrozen calibration invocation", packagedProofFile, workflow => {
-      const step = draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      const moved = step.run
-        .replace("  --enforce-calibration-freeze-lineage \\\n", "")
-        .replace(
-          "      --proof-tier calibration \\\n",
-          "      --proof-tier calibration \\\n      --enforce-calibration-freeze-lineage \\\n",
-        );
-      assert.match(moved, /--proof-tier calibration \\\n\s+--enforce-calibration-freeze-lineage/u);
-      step.run = moved;
-    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
     ["package build loses the history the freeze lineage probe reads", packagedProofFile, workflow => {
       draftStep(workflow.jobs.build, "Checkout").with["fetch-depth"] = 1;
     }, /package build must keep full history for the calibration freeze lineage probe/u],
-    // A flag pinned only by "appears after this anchor" is defeated by parking a
-    // copy on a later decoy line while the real invocation loses it. Both freeze
-    // lineage pins read the single backslash-continued command instead.
-    ["freeze lineage flag parked on a decoy after the frozen invocation", packagedProofFile, workflow => {
-      const step = draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      const stripped = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
-      assert.notEqual(stripped, step.run, "freeze lineage flag was already absent");
-      step.run = `${stripped}echo skipping python .github/scripts/check-packaged-agent-proof.py \\\n  --enforce-calibration-freeze-lineage \\\n  --out-dir target/decoy\n`;
-    }, /must pass --enforce-calibration-freeze-lineage so the calibration-to-package source lineage is proved, not assumed/u],
     ["reachable lineage proof stops enforcing the freeze lineage", packagedProofFile, workflow => {
       const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
       const removed = step.run.replace("  --enforce-calibration-freeze-lineage \\\n", "");
@@ -1076,32 +1793,6 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       draftStep(workflow.jobs.build, "Download frozen calibration bundle").if
         = "matrix.asset_target == 'linux-x64'";
     }, /packaged-platform-proof\.yml/u],
-    ["package evaluation artifact upload reaches the standard path", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Upload packaged agent proof artifacts").if
-        = "always() && matrix.asset_target == 'linux-x64'";
-    }, /packaged-platform-proof\.yml/u],
-    ["package calibration artifact escapes into quality evaluation", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Upload hosted Linux calibration runs").if
-        = "success() && matrix.asset_target == 'linux-x64'";
-    }, /hosted calibration artifact must remain calibration-only/u],
-    ["package calibration failure evidence removed", packagedProofFile, workflow => {
-      workflow.jobs.build.steps = workflow.jobs.build.steps
-        .filter(({ name }) => name !== "Upload hosted Linux calibration failure evidence");
-    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
-    ["package calibration failure evidence becomes success-gated", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence").if
-        = "success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode";
-    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
-    ["package calibration failure evidence fails closed", packagedProofFile, workflow => {
-      draftStep(workflow.jobs.build, "Upload hosted Linux calibration failure evidence")
-        .with["if-no-files-found"] = "error";
-    }, /hosted calibration failure evidence must stay a failure-only best-effort upload/u],
-    ["package evaluation becomes a standard server-behavior proof", packagedProofFile, workflow => {
-      draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      ).run += "\n--server-behavior-only";
-    }, /optional hosted CPU lane must remain evaluation-only/u],
     ["package workflow reclaims candidate-installed proof", packagedProofFile, workflow => {
       workflow.on.workflow_call.inputs.candidate_installed_proof = {
         required: false,
@@ -1109,26 +1800,16 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
         type: "boolean",
       };
     }, /package-only workflow must not define candidate_installed_proof/u],
-    ["package evaluation reads the calibration contract from an unpinned location", packagedProofFile, workflow => {
-      const step = draftStep(
-        workflow.jobs.build,
-        "Packaged per-user server calibration or qualification",
-      );
-      step.run = step.run.replaceAll(
-        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
-        "per-user-embedding-server-constant-set.json",
-      );
-    }, /must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
     ["Metal calibration reads the calibration contract from an unpinned location", metalProofFile, workflow => {
       const step = draftStep(
         workflow.jobs["packaged-metal"],
-        "Collect three independent Metal calibration runs",
+        "Collect three independent Metal constant calibration runs",
       );
       step.run = step.run.replaceAll(
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
         "per-user-embedding-server-constant-set.json",
       );
-    }, /Collect three independent Metal calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
+    }, /Collect three independent Metal constant calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
     ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
       delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
     }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],
@@ -1368,7 +2049,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
     ["packaged workload variants collide", packagedFile, workflow => {
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
-        .replace('--identity "qualification_driver=$qualification_driver"', "--workload ignored");
+        .replace("--identity qualification_driver=disabled", "--workload ignored");
     }, /packaged-platform-proof\.yml must compute one complete reusable compiler compatibility contract/u],
     ["source compiler cache waits for tests", sourceFile, workflow => {
       moveNamedStepAfter(
@@ -1450,14 +2131,23 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Windows proof", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].if = workflow.jobs["windows-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only mode must skip protected Windows proof/u],
+    }, /package-only mode must skip Windows while qualification requires successful Metal/u],
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only mode must skip protected Linux proof/u],
-    ["calibration mode enables frozen Linux qualification", coordinatorFile, workflow => {
-      workflow.jobs["calibration-linux"].with.hermetic_linux = true;
-    }, /hosted Linux calibration must call packaged proof in calibration mode/u],
+    }, /package-only and qualification modes must skip coordinator Linux proof/u],
+    ["calibration mode restores hosted Linux CPU calibration", coordinatorFile, workflow => {
+      workflow.jobs["calibration-linux"] = {
+        if: "needs.route.outputs.mode == 'calibration'",
+        needs: "route",
+        uses: "./.github/workflows/packaged-platform-proof.yml",
+        with: {
+          version: "${{ needs.route.outputs.version }}",
+          ref: "${{ needs.route.outputs.head_sha }}",
+          calibration_mode: true,
+        },
+      };
+    }, /calibration must not schedule hosted Linux CPU/u],
     ["coordinator adds a macOS source hard gate", coordinatorFile, workflow => {
       workflow.jobs["macos-source"] = {
         "runs-on": "macos-14",
@@ -1899,10 +2589,10 @@ test("Windows manifest-missing proof freezes routing, native topology, and exact
       windowsManifestJob(workflow)["timeout-minutes"] = 60;
     }],
     ["CPU permission removed", workflow => {
-      delete windowsManifestJob(workflow).env.CODESTORY_EMBED_ALLOW_CPU;
+      delete windowsManifestJob(workflow).env.CODESTORY_TEST_EMBED_ALLOW_CPU;
     }],
     ["CPU permission disabled", workflow => {
-      windowsManifestJob(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
+      windowsManifestJob(workflow).env.CODESTORY_TEST_EMBED_ALLOW_CPU = "0";
     }],
     ["native generator removed", workflow => {
       delete windowsManifestJob(workflow).env.CMAKE_GENERATOR;
@@ -2452,7 +3142,7 @@ test("package workflow keeps a packaging-only timeout", () => {
 
   assert.match(
     validateWorkflows(workflows).join("\n"),
-    /package build timeout must cover only calibration or signed macOS packaging/u,
+    /package build timeout must cover only signed macOS packaging/u,
   );
 });
 
@@ -2829,18 +3519,17 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       delete step.with.overwrite;
     }],
     ["overwriteable terminal evidence", workflows => {
-      const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
-        .find(({ name }) => name === "Upload packaged agent proof artifacts");
-      step.name = "Upload hosted Linux calibration runs";
-      step.with.name = "embedding-calibration-linux-${{ inputs.version }}";
-      step.with.path = "target/calibration-runs/linux";
+      const step = workflows.get("linux-vulkan-proof.yml")
+        .jobs["optional-constant-calibration"].steps
+        .find(({ name }) => name === "Upload optional Linux Vulkan calibration evidence");
+      step.with.name = "optional-embedding-calibration-linux-vulkan-${{ inputs.version }}";
       step.with.overwrite = true;
     }],
     ["attempt-qualified duplicate stable key", workflows => {
-      const steps = workflows.get("packaged-platform-proof.yml").jobs.build.steps;
-      const index = steps.findIndex(({ name }) => name === "Upload hosted Linux calibration runs");
+      const steps = workflows.get("macos-metal-proof.yml").jobs["packaged-metal"].steps;
+      const index = steps.findIndex(({ name }) => name === "Upload Metal calibration runs");
       steps.splice(index + 1, 0, {
-        name: "Upload hosted Linux calibration runs",
+        name: "Upload Metal calibration runs",
         uses: "actions/upload-artifact@v7.0.1",
         with: {
           name: "diagnostic-attempt-${{ github.run_attempt }}",

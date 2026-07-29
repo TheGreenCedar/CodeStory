@@ -40,7 +40,8 @@
     "maximum_payload_bytes": 16777216,
     "protocol_schema_version": 1,
     "pure_embedding_rpc_replay_limit": 1,
-    "query_queue_capacity": 64
+    "query_queue_capacity": 64,
+    "true_idle_observation_grace_ms": 2500
   },
   "freeze_record": null,
   "qualification_thresholds": {
@@ -54,7 +55,7 @@
     "retrieval_quality": 1.0,
     "spawn_convergence": 486,
     "total_codestory_process_memory": 3366597428,
-    "true_idle_exit": 71374,
+    "true_idle_exit": 62500,
     "warm_bulk_ipc": 29119,
     "warm_query_ipc": 577
   },

@@ -103,7 +103,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 8);
+  assert.equal(graph.graph_version, 9);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -157,6 +157,120 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+});
+
+test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => {
+  const calibration = graph.workflow_policy.calibration;
+  assert.deepEqual(calibration.required_cells.map(({ id }) => id), [
+    "protected_macos_arm64_metal",
+  ]);
+  assert.deepEqual(calibration.optional_cells.map(({ id }) => id), [
+    "protected_linux_x64_vulkan",
+  ]);
+  assert.equal(calibration.optional_cells[0].assembly_dependency, false);
+  assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
+  assert.equal(calibration.runs_per_required_cell, 3);
+  assert.equal(calibration.samples_per_metric_per_run, 1);
+  assert.deepEqual(calibration.forbidden_environment, [
+    "CODESTORY_EMBED_ALLOW_CPU=1",
+  ]);
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.calibration.required_cells[0].backend = "cpu";
+    }, /required cell must be protected macOS Metal/u],
+    [draft => {
+      draft.workflow_policy.calibration.required_cells[0].policy = "cpu_explicit";
+    }, /required cell must be protected macOS Metal/u],
+    [draft => {
+      draft.workflow_policy.calibration.optional_cells[0].assembly_dependency = true;
+    }, /optional cell must be standalone non-selecting Linux Vulkan evidence/u],
+    [draft => {
+      draft.workflow_policy.calibration.optional_cells[0].feeds_constant_selection = true;
+    }, /optional cell must be standalone non-selecting Linux Vulkan evidence/u],
+    [draft => {
+      draft.workflow_policy.calibration.runs_per_required_cell = 6;
+    }, /exactly three clean runs/u],
+    [draft => {
+      draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
+    }, /exactly one sample per metric per run/u],
+    [draft => {
+      draft.workflow_policy.calibration.forbidden_environment = [
+        "CODESTORY_EMBED_ALLOW_CPU=0",
+      ];
+    }, /must forbid CPU environment, policy, and backend selection/u],
+    [draft => {
+      draft.public_support.packages[0].broad_retrieval = "cpu_explicit";
+    }, /must require accelerated broad retrieval/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("claim graph freezes one GPU-only qualification run per available platform", () => {
+  const qualification = graph.workflow_policy.qualification;
+  assert.equal(qualification.runs_per_available_cell, 1);
+  assert.deepEqual(
+    qualification.required_cells.map(({ id }) => id),
+    [
+      "protected_macos_arm64_metal",
+      "protected_windows_x64_vulkan",
+    ],
+  );
+  assert.deepEqual(
+    qualification.optional_cells.map(({ id }) => id),
+    ["protected_linux_x64_vulkan"],
+  );
+  assert.equal(qualification.optional_cells[0].closeout_dependency, false);
+  assert.equal(qualification.optional_cells[0].blocking, false);
+  assert.deepEqual(qualification.quality_contract, {
+    producer_cell: "protected_macos_arm64_metal",
+    corpus_id: "codestory-release-corpus-v1",
+    evaluation_contract: "publishable-three-repeat-packet/v1",
+    task_count: 3,
+    repeats_per_task: 3,
+    row_count: 9,
+  });
+  assert.equal(
+    qualification.true_idle_timeout_ms
+      + qualification.true_idle_observation_grace_ms,
+    62_500,
+  );
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.qualification.runs_per_available_cell = 3;
+    }, /canonical one-run frozen-candidate coordinator/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_cells[0].backend = "cpu";
+    }, /protected Metal and Vulkan producers/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_cells[1].policy = "cpu_explicit";
+    }, /protected Metal and Vulkan producers/u],
+    [draft => {
+      draft.workflow_policy.qualification.optional_cells[0].blocking = true;
+    }, /standalone and nonblocking/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.row_count = 3;
+    }, /protected Metal 3x3 holdout matrix/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_scenarios.pop();
+    }, /each lifecycle and fault scenario once/u],
+    [draft => {
+      draft.workflow_policy.qualification.true_idle_observation_grace_ms = 11_374;
+    }, /product timeout plus explicit grace/u],
+    [draft => {
+      draft.workflow_policy.qualification.forbidden_environment = [];
+    }, /must forbid CPU environment, policy, and backend selection/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
 });
 
 test("benchmark leakage names only the one-process Node contract", () => {

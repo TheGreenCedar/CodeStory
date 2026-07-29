@@ -300,7 +300,7 @@ fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
 }
 
 fn allow_explicit_cpu_embeddings(command: &mut Command) {
-    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
+    command.env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
@@ -370,7 +370,7 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
         .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
         .spawn()

@@ -100,7 +100,7 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.args(args);
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
-    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
+    command.env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 

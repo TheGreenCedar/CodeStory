@@ -205,7 +205,7 @@ def _verify_host(contract: RetainedQualificationContract) -> None:
     )
     require(
         package.get("policy") == host.get("policy")
-        and host.get("policy") in {"accelerated", "cpu_explicit"},
+        and host.get("policy") == "accelerated",
         "retained qualification package and host policy identities disagree",
     )
     require(

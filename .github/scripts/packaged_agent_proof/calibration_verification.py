@@ -7,7 +7,6 @@ from pathlib import Path
 from .calibration_freeze import _calibration_freeze
 from .calibration_metrics import (
     _selected_calibration_constants,
-    _selected_calibration_thresholds,
     _verified_calibration_runs,
 )
 from .calibration_records import _calibration_bundle
@@ -36,15 +35,10 @@ def verify_calibration_bundle(
         accumulator.duration_values_ms,
         bundle.protocol["constant_selection"],
     )
-    thresholds = _selected_calibration_thresholds(
-        accumulator.metric_values,
-        bundle.protocol["metric_contracts"],
-    )
     freeze_digest, source_lineage = _calibration_freeze(
         bundle,
         accumulator,
         selected_constants,
-        thresholds,
         compare_frozen_constant_set=compare_frozen_constant_set,
         frozen_source=frozen_source,
         repository_root=repository_root,
@@ -59,7 +53,6 @@ def verify_calibration_bundle(
         "run_count": len(bundle.runs),
         "freeze_digest": freeze_digest,
         "calibration_required_values": selected_constants,
-        "qualification_thresholds": thresholds,
         "run_artifact_sha256s": sorted(accumulator.artifact_digests),
         "source_lineage": source_lineage,
     }

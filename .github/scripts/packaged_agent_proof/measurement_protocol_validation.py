@@ -118,14 +118,6 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
 
 def _verify_host_package_matrix(matrix: dict) -> None:
     expected_cells = {
-        "hosted_linux_x64_cpu": (
-            "linux-x64",
-            "hosted_package",
-            "github_hosted_linux_x64",
-            "cpu_explicit",
-            "cpu",
-            "none",
-        ),
         "protected_macos_arm64_metal": (
             "macos-arm64",
             "protected_hardware",
@@ -195,15 +187,15 @@ def _verify_host_package_matrix(matrix: dict) -> None:
         )
 
 
-def _verify_calibration_matrix(matrix: dict, calibration_matrix: object) -> None:
+def _verify_calibration_matrix(
+    matrix: dict,
+    calibration_matrix: object,
+    optional_evidence_matrix: object,
+) -> None:
     require(
         isinstance(calibration_matrix, dict)
-        and set(calibration_matrix)
-        == {
-            "hosted_linux_x64_cpu",
-            "protected_macos_arm64_metal",
-        },
-        "measurement calibration matrix must contain the Linux CPU and macOS Metal pre-publish lanes",
+        and set(calibration_matrix) == {"protected_macos_arm64_metal"},
+        "measurement calibration matrix must contain only protected macOS Metal",
     )
     for cell_id, cell in calibration_matrix.items():
         require(
@@ -240,6 +232,48 @@ def _verify_calibration_matrix(matrix: dict, calibration_matrix: object) -> None
             ),
             f"measurement calibration matrix cell {cell_id} does not use its exact qualification path",
         )
+    require(
+        isinstance(optional_evidence_matrix, dict)
+        and set(optional_evidence_matrix) == {"protected_linux_x64_vulkan"},
+        "optional calibration evidence must contain only protected Linux Vulkan",
+    )
+    for cell_id, cell in optional_evidence_matrix.items():
+        require(
+            isinstance(cell, dict)
+            and set(cell)
+            == {
+                "asset_target",
+                "proof_tier",
+                "host_class",
+                "policy",
+                "backend",
+                "cache_state",
+                "residency_state",
+                "accelerator_claim",
+                "feeds_constant_selection",
+            }
+            and cell["proof_tier"] == "calibration"
+            and cell["cache_state"] == "reused"
+            and cell["residency_state"] == "resident"
+            and cell["feeds_constant_selection"] is False,
+            f"optional calibration evidence cell {cell_id} is malformed",
+        )
+        qualification_cell = matrix[cell_id]
+        require(
+            all(
+                cell[field] == qualification_cell[field]
+                for field in (
+                    "asset_target",
+                    "host_class",
+                    "policy",
+                    "backend",
+                    "cache_state",
+                    "residency_state",
+                    "accelerator_claim",
+                )
+            ),
+            f"optional calibration evidence cell {cell_id} does not use its exact qualification path",
+        )
 
 
 def _verify_measurement_matrices(protocol: dict) -> None:
@@ -248,7 +282,74 @@ def _verify_measurement_matrices(protocol: dict) -> None:
         isinstance(matrix, dict), "measurement protocol omitted its host/package matrix"
     )
     _verify_host_package_matrix(matrix)
-    _verify_calibration_matrix(matrix, protocol.get("calibration_matrix"))
+    _verify_calibration_matrix(
+        matrix,
+        protocol.get("calibration_matrix"),
+        protocol.get("optional_calibration_evidence_matrix"),
+    )
+
+
+def _verify_calibration_sampling(
+    protocol: dict,
+    required_metrics: set[str],
+) -> None:
+    expected_metrics = {
+        "existing_owner_connect",
+        "spawn_convergence",
+        "cold_first_vector",
+        "first_product_ready",
+        "warm_query_ipc",
+        "warm_bulk_ipc",
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+        "busy_retry_usefulness",
+    }
+    calibration_metrics = protocol.get("calibration_required_metrics")
+    require(
+        isinstance(calibration_metrics, list)
+        and len(calibration_metrics) == len(set(calibration_metrics))
+        and set(calibration_metrics) == expected_metrics
+        and set(calibration_metrics).issubset(required_metrics),
+        "constant calibration must name exactly the nine runtime-constant source metrics",
+    )
+    sampling = protocol.get("calibration_metric_sampling")
+    require(
+        isinstance(sampling, dict) and set(sampling) == expected_metrics,
+        "constant-calibration sample policy does not match its required metrics",
+    )
+    for metric, policy in sampling.items():
+        require(
+            isinstance(policy, dict)
+            and policy == {"sample_count_per_run": 1},
+            f"constant-calibration metric {metric} must take one sample per clean run",
+        )
+    boundaries = protocol.get("calibration_phase_boundaries")
+    require(
+        isinstance(boundaries, dict) and set(boundaries) == expected_metrics,
+        "constant calibration must declare phase boundaries for exactly its nine metrics",
+    )
+    for metric, points in boundaries.items():
+        require(
+            isinstance(points, list)
+            and len(points) == 2
+            and all(isinstance(point, str) and point for point in points),
+            f"constant-calibration metric {metric} has malformed phase boundaries",
+        )
+        if metric != "cold_first_vector":
+            require(
+                points == protocol["phase_boundaries"][metric],
+                f"constant-calibration metric {metric} changed its shared phase boundary",
+            )
+    require(
+        boundaries["cold_first_vector"]
+        == [
+            "product_request_started_with_fresh_owner_model_absent",
+            "first_vector_and_engine_evidence_validated",
+        ]
+        and protocol.get("calibration_workload_state_overrides")
+        == {"cold_first_vector": "fresh_owner_model_absent"},
+        "constant calibration must measure cold-first-vector on the fresh owner before model materialization",
+    )
 
 
 def _verify_measurement_sampling(

@@ -742,7 +742,8 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     ["plugins/codestory/skills/codestory-grounding/SKILL.md", "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n", ["fetch-holdout-repos.mjs"]],
     [".cursor/rules/codestory.mdc", "Read benchmarks/tasks/eval-probes.json before answering.\n", ["benchmarks/tasks"]],
     [".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n        \".github/workflows/retrieval-engine-smoke.yml\",\nawait import(\".github/workflows/retrieval-engine-smoke.yml\");\n", ["retrieval-engine-smoke.yml"]],
-    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"engine-smoke.yml\";\n", ["githubworkflowsretrievalenginesmokeyml"]],
+    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"engine-smoke.yml\";\nconst duplicated = [\n  \"node scripts/codestory-agent-ab-benchmark.mjs\",\n  \"node scripts/codestory-agent-ab-benchmark.mjs\",\n];\n", ["githubworkflowsretrievalenginesmokeyml", "codestory-agent-ab-benchmark.mjs"]],
+    [".github/workflows/macos-metal-proof.yml", "run: |\n  node scripts/codestory-agent-ab-benchmark.mjs \\\n    --packet-runtime \\\n    --packet-runtime-mode cold-cli \\\n    --task-suite holdout-retrieval \\\n    --materialize-repos \\\n    --repeats 4 \\\n    --publishable \\\n    --max-source-reads-after-packet 0 \\\n    --codestory-cli \"$packaged_cli\" \\\n    --timeout-ms 180000 \\\n    --out-dir \"$quality_root/packet\"\n", ["codestory-agent-ab-benchmark.mjs"]],
   ];
   for (const [relativePath, contents] of rejectedNonRust) {
     write(nonRustRoot, `rejected/${relativePath}`, contents);
@@ -761,7 +762,8 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     ["punctuated-apostrophe.yml", "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n"],
     ["doubled-single-quote.yml", "value: 'scripts/fetch-''holdout-repos.mjs'\n"],
     [".github/scripts/route-ci-proof.mjs", "        \".github/workflows/retrieval-engine-smoke.yml\",\n"],
-    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\n"],
+    [".github/scripts/check-workflow-policy.mjs", "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst exactQualificationReferences = [\n  \"retrieval-engine-smoke.yml\",\n  \"node scripts/codestory-agent-ab-benchmark.mjs\",\n];\n"],
+    [".github/workflows/macos-metal-proof.yml", "run: |\n  node scripts/codestory-agent-ab-benchmark.mjs \\\n    --packet-runtime \\\n    --packet-runtime-mode cold-cli \\\n    --task-suite holdout-retrieval \\\n    --materialize-repos \\\n    --repeats 3 \\\n    --publishable \\\n    --max-source-reads-after-packet 0 \\\n    --codestory-cli \"$packaged_cli\" \\\n    --timeout-ms 180000 \\\n    --out-dir \"$quality_root/packet\"\n"],
   ];
   for (const [relativePath, contents] of allowedNonRust) {
     write(nonRustRoot, `allowed/${relativePath}`, contents);

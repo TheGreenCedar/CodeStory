@@ -8,6 +8,7 @@ from pathlib import Path
 from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
+    require_positive_int,
     require_sha256,
 )
 from .foundation import SERVER_LIFECYCLES, require
@@ -131,6 +132,31 @@ def verify_package_server_contracts(
     require(
         isinstance(thresholds, dict) and set(thresholds) == required_metrics,
         "embedding server qualification thresholds do not match the measurement metrics",
+    )
+    fixed = constant_set.get("fixed_contract_values")
+    threshold_contract = measurement.get("qualification_threshold_contract", {}).get(
+        "true_idle_exit"
+    )
+    require(
+        isinstance(fixed, dict)
+        and isinstance(threshold_contract, dict)
+        and require_positive_int(
+            fixed.get("idle_timeout_ms"),
+            "fixed per-user embedding idle timeout",
+        )
+        == threshold_contract["idle_timeout_ms"]
+        and require_positive_int(
+            fixed.get("true_idle_observation_grace_ms"),
+            "fixed true-idle observation grace",
+        )
+        == threshold_contract["observation_grace_ms"]
+        and thresholds.get("true_idle_exit")
+        == threshold_contract["required_threshold_ms"]
+        == (
+            threshold_contract["idle_timeout_ms"]
+            + threshold_contract["observation_grace_ms"]
+        ),
+        "true-idle qualification threshold must be the fixed product timeout plus observation grace",
     )
     if require_frozen:
         _verify_frozen_constant_set(measurement, constant_set)

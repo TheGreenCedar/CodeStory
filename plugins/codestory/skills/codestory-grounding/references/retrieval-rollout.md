@@ -10,7 +10,7 @@ benchmarks, packaging, or accelerator claims. Match the proof to the claim.
 | Runtime | Runtime library, generalization, and retrieval-eval lanes | Packet/search admission and result behavior |
 | CLI and plugin | Focused CLI protocol tests plus plugin static tests | Transport and user-facing capability state |
 | Performance | Same-build incumbent/candidate rows for cold initialization, warm search, bulk indexing, RSS, GPU memory, vector parity, quality, and multi-repository reuse | Promotion only when no repeatable regression exceeds the 5% noise allowance |
-| Hosted engine smoke | Managed CI with explicit CPU policy | Source and protocol behavior only; no Metal or Vulkan claim |
+| Hosted rejection contracts | Managed CI without protected GPU evidence | Source, protocol, and prohibited CPU-selector behavior only; no embedding-runtime claim |
 | Packaged hardware | Protected Metal or Vulkan workflow using the packaged executable offline | Only the exact backend and adapter exercised by that artifact |
 
 Normal plugin calls prepare retrieval automatically. They expose `ready`,
@@ -35,11 +35,11 @@ lifecycle. Maintainer JSON owns backend details.
    setup state. Private local IPC and the same executable's hidden server mode
    are the product path.
 
-Hosted CI sets `CODESTORY_EMBED_ALLOW_CPU=1` and must report `cpu_explicit`.
-Protected Apple Silicon proof must report Metal and verified accelerator
-execution. Windows and Linux hardware proof must report Vulkan. The Linux claim
-requires `.github/workflows/linux-vulkan-proof.yml`; hosted CPU proof is
-insufficient.
+CPU embeddings are unsupported. Protected Apple Silicon proof must report Metal
+and verified accelerator execution. Windows and Linux hardware proof must
+report Vulkan. The Linux claim requires
+`.github/workflows/linux-vulkan-proof.yml`; source-only CPU rejection tests are
+not runtime evidence.
 
 ## Quality and performance gate
 

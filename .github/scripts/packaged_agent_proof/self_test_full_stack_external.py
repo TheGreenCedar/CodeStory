@@ -529,6 +529,20 @@ def _quality_hostiles(
         pass
     else:
         raise ProofFailure("stale retrieval quality source tree was accepted")
+    hostile_quality = json.loads(json.dumps(quality_payload))
+    hostile_quality["release_evidence"]["rows"][0][
+        "codestory_cache_provenance"
+    ]["embedding_policy"] = "cpu_explicit"
+    write_json(quality_path, hostile_quality)
+    try:
+        verify_retrieval_quality_raw_evidence(
+            quality_path,
+            source=manifest["source"],
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("CPU-backed retrieval quality evidence was accepted")
     write_json(quality_path, quality_payload)
     try:
         verify_package_server_contracts(

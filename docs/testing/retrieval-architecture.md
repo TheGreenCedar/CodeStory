@@ -10,8 +10,8 @@ measurements live in
 | Tier | Required evidence | Supported claim |
 | --- | --- | --- |
 | Source | locked checks and focused crate tests | source compiles and contracts hold |
-| Hosted package | exact source/tree/archive/executable, inspected native imports, server/protocol/constant manifest, same-user IPC, explicit CPU policy, complete qualification record | package contract and CPU runtime are coherent; no acceleration claim |
-| Protected hardware | same manifest-bound package and qualification record, CPU disallowed, physical backend/adapter, backend-observed post-encode telemetry | Metal or Vulkan and the server contract work on that machine |
+| Hosted package | exact source/tree/archive/executable, inspected native imports, server/protocol/constant manifest, and rejection contracts | package structure is coherent; no embedding-runtime or acceleration claim |
+| Protected hardware | same manifest-bound package and qualification record, accelerated policy with CPU disabled, physical backend/adapter, backend-observed post-encode telemetry | Metal or Vulkan and the server contract work on that machine |
 | Product runtime | installed plugin launcher, full retrieval, packet/search, two independent hosts sharing one server/engine/load | installed agent path is coherent |
 | Restart | new process reuses verified materialized model content | content-addressed cache reuse works |
 | Performance/quality | same-run measurements and holdout gates | an engine change is promotion-eligible |
@@ -27,7 +27,7 @@ verifies:
 - endpoint authority, listener, server process, engine owner, native worker,
   load generation, and model-load identities;
 - exact model digest and ggml build identity;
-- backend, physical adapter, and `accelerated` or `cpu_explicit` policy;
+- backend, physical adapter, and `accelerated` policy with CPU disabled;
 - engine instance and model-load count;
 - initialization and live-smoke timing;
 - materialized path, digest, and reuse state;
@@ -38,8 +38,8 @@ verifies:
 Accelerated proof rejects software adapters and unknown or inferred execution
 evidence. Requested layer counts and process/GPU-memory deltas are observational
 unless the post-encode backend callback confirms execution and residency.
-Hosted proof requires explicit CPU permission; absent GPU hardware does not
-imply permission.
+CPU embeddings are unsupported. Absent eligible GPU hardware cannot produce
+runtime, calibration, qualification, or release evidence.
 
 ## Packaged product assertions
 
@@ -71,15 +71,15 @@ a separate protected-hardware result, and neither package nor execution proof
 is an answer-quality claim. The Windows and Linux release packages runtime-load
 their recorded backend modules; their base
 executables must not require a Vulkan loader, so help, status, local navigation,
-and explicit diagnostic CPU execution can start without one. Supported
-retrieval still requires Vulkan on both platforms.
+and diagnostics can start without one. Supported broad retrieval still requires
+physical Vulkan on both platforms.
 
 ## Workflow ownership
 
 | Workflow | Environment | Claim boundary |
 | --- | --- | --- |
-| `retrieval-engine-smoke.yml` | hosted Linux/Windows | explicit CPU source/protocol behavior |
-| `packaged-platform-proof.yml` | hosted package matrix | offline packaged behavior; CPU explicit where required |
+| `retrieval-engine-smoke.yml` | hosted Linux/Windows | source/protocol and prohibited-selector rejection behavior only |
+| `packaged-platform-proof.yml` | hosted package matrix | offline package identity and structure; no embedding-runtime claim |
 | `macos-metal-proof.yml` | protected Apple Silicon | packaged Metal, physical adapter, smoke, offload |
 | `windows-vulkan-proof.yml` | protected Windows GPU | packaged Vulkan, physical adapter, smoke, offload |
 | `linux-vulkan-proof.yml` | protected Linux GPU | packaged Vulkan, physical adapter, smoke, offload |
@@ -103,8 +103,8 @@ candidate-specific values.
 
 ## Focused failure boundaries
 
-Tests cover exact model/build identity, corrupt materialization, explicit CPU
-permission, prohibited fallback, software-adapter rejection, per-user reuse,
+Tests cover exact model/build identity, corrupt materialization, prohibited CPU
+selection and fallback, software-adapter rejection, per-user reuse,
 producer migration, generation-coherent reads, publication drift with one
 bounded retry, lease loss, malformed frames, queue pressure, cancellation,
 same-user endpoint authority, idle exit, frozen-owner non-takeover, and owned

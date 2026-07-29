@@ -858,7 +858,7 @@ fn run_cli_output_with_sidecar_cache_root(
         .arg(cache_dir)
         .env_remove("CODESTORY_STDIO_CACHE_ROOT")
         .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();

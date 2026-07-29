@@ -585,7 +585,7 @@ def native_release_manifest(
         "embedding": embedding_descriptor,
         "tokenizer_config": tokenizer,
         "accelerator": {
-            "cpu_fallback": "explicit_only",
+            "cpu_fallback": "unsupported",
             "package_claim": "compiled_capability_only",
             "runtime_execution": "not_proven_by_package",
             "expected_protected_backend": target_contract["expected_protected_backend"],

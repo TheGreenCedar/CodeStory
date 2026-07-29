@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 8,
+  "graph_version": 9,
   "graph_id": "codestory-release-claims",
   "standard_release_claims": [
     "source_behavior",
@@ -1058,6 +1058,133 @@
         "extension": "tar.gz"
       }
     ],
+    "calibration": {
+      "coordinator_workflow": "packaged-platform-pr.yml",
+      "mode": "calibration",
+      "assembly_job": "calibration-assemble",
+      "required_cells": [
+        {
+          "id": "protected_macos_arm64_metal",
+          "workflow": "macos-metal-proof.yml",
+          "job": "packaged-metal",
+          "policy": "accelerated",
+          "backend": "metal",
+          "feeds_constant_selection": true
+        }
+      ],
+      "optional_cells": [
+        {
+          "id": "protected_linux_x64_vulkan",
+          "workflow": "linux-vulkan-proof.yml",
+          "job": "optional-constant-calibration",
+          "trigger": "workflow_dispatch",
+          "policy": "accelerated",
+          "backend": "vulkan",
+          "assembly_dependency": false,
+          "feeds_constant_selection": false
+        }
+      ],
+      "runs_per_required_cell": 3,
+      "samples_per_metric_per_run": 1,
+      "constant_metrics": [
+        "existing_owner_connect",
+        "spawn_convergence",
+        "cold_first_vector",
+        "first_product_ready",
+        "warm_query_ipc",
+        "warm_bulk_ipc",
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+        "busy_retry_usefulness"
+      ],
+      "forbidden_evidence": [
+        "qualification_scenarios",
+        "true_idle_exit",
+        "total_codestory_process_memory",
+        "retrieval_quality",
+        "backend_observed_accelerator_residency"
+      ],
+      "forbidden_policies": [
+        "cpu_explicit"
+      ],
+      "forbidden_backends": [
+        "cpu"
+      ],
+      "forbidden_environment": [
+        "CODESTORY_EMBED_ALLOW_CPU=1"
+      ]
+    },
+    "qualification": {
+      "coordinator_workflow": "packaged-platform-pr.yml",
+      "mode": "qualification",
+      "runs_per_available_cell": 1,
+      "required_cells": [
+        {
+          "id": "protected_macos_arm64_metal",
+          "workflow": "macos-metal-proof.yml",
+          "job": "packaged-metal",
+          "policy": "accelerated",
+          "backend": "metal",
+          "produces_quality": true
+        },
+        {
+          "id": "protected_windows_x64_vulkan",
+          "workflow": "windows-vulkan-proof.yml",
+          "job": "packaged-vulkan",
+          "policy": "accelerated",
+          "backend": "vulkan",
+          "produces_quality": false
+        }
+      ],
+      "optional_cells": [
+        {
+          "id": "protected_linux_x64_vulkan",
+          "workflow": "linux-vulkan-proof.yml",
+          "job": "packaged-vulkan",
+          "trigger": "workflow_dispatch",
+          "policy": "accelerated",
+          "backend": "vulkan",
+          "closeout_dependency": false,
+          "blocking": false
+        }
+      ],
+      "quality_contract": {
+        "producer_cell": "protected_macos_arm64_metal",
+        "corpus_id": "codestory-release-corpus-v1",
+        "evaluation_contract": "publishable-three-repeat-packet/v1",
+        "task_count": 3,
+        "repeats_per_task": 3,
+        "row_count": 9
+      },
+      "required_evidence": [
+        "qualification_scenarios",
+        "true_idle_exit",
+        "total_codestory_process_memory",
+        "retrieval_quality",
+        "backend_observed_accelerator_residency"
+      ],
+      "required_scenarios": [
+        "client_death",
+        "cold_race",
+        "frozen_owner",
+        "incompatible_owner",
+        "mixed_queue",
+        "server_crash",
+        "true_idle_respawn",
+        "worker_stall"
+      ],
+      "true_idle_timeout_ms": 60000,
+      "true_idle_observation_grace_ms": 2500,
+      "forbidden_policies": [
+        "cpu_explicit"
+      ],
+      "forbidden_backends": [
+        "cpu"
+      ],
+      "forbidden_environment": [
+        "CODESTORY_EMBED_ALLOW_CPU=1"
+      ]
+    },
     "protected_jobs": [
       {
         "workflow": "macos-metal-proof.yml",

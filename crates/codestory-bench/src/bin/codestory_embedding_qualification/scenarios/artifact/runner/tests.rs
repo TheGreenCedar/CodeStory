@@ -47,6 +47,7 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
         "bulk",
         "measure_bulk_frame",
         "measure_spawn_hello",
+        "measure_constant_cold_query",
         "measure_product_query",
         "measure_resident_identity",
         "resident_identity",

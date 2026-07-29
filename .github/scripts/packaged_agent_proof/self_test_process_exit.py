@@ -61,7 +61,10 @@ def _exit_budget_tests() -> dict[str, int]:
         manifest,
         {
             "status": "frozen",
-            "qualification_thresholds": {"true_idle_exit": 72_285},
+            "fixed_contract_values": {
+                "idle_timeout_ms": 60_000,
+                "true_idle_observation_grace_ms": 2_500,
+            },
         },
     )
     require(
@@ -83,8 +86,21 @@ def _exit_budget_tests() -> dict[str, int]:
     )
     for hostile in (
         {"status": "frozen"},
-        {"status": "frozen", "qualification_thresholds": {"true_idle_exit": None}},
-        {"status": "frozen", "qualification_thresholds": {"true_idle_exit": 120_001}},
+        {"status": "frozen", "fixed_contract_values": {}},
+        {
+            "status": "frozen",
+            "fixed_contract_values": {
+                "idle_timeout_ms": 60_000,
+                "true_idle_observation_grace_ms": None,
+            },
+        },
+        {
+            "status": "frozen",
+            "fixed_contract_values": {
+                "idle_timeout_ms": 60_000,
+                "true_idle_observation_grace_ms": 60_001,
+            },
+        },
     ):
         try:
             native_server_exit_wait_budget(manifest, hostile)
