@@ -343,7 +343,10 @@ test("the full hostile matrix shares one policy load and never writes into the c
   timeout: 90_000,
 }, () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"));
-  const productionRepositoryRoot = path.join(fixtureRoot, "production-repository");
+  const productionRepositoryRoot = path.join(
+    fixtureRoot,
+    " in synthetic-repository",
+  );
   const rustRoot = path.join(
     productionRepositoryRoot,
     "crates",

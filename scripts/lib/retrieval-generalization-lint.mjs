@@ -108,7 +108,7 @@ function decodePromptStringLiteral(literal) {
 function structuredFinding(message) {
   const header = String(message).split("\n", 1)[0];
   const patterned = header.match(
-    /^(?<kind>Banned pattern|Banned literal pattern|Banned compact benchmark marker|Production dependency on eval\/query corpus|Constructed production dependency on eval\/query corpus|Banned eval\/query pattern|Constructed eval\/query dependency|Evaluation\/proof harness dependency|Constructed evaluation\/proof harness dependency) \/(?<pattern>.*)\/ in (?:protected non-Rust path )?(?<file>.+?)(?: \(|:|$)/u,
+    /^(?<kind>Banned pattern|Banned literal pattern|Banned compact benchmark marker|Production dependency on eval\/query corpus|Constructed production dependency on eval\/query corpus|Banned eval\/query pattern|Constructed eval\/query dependency|Evaluation\/proof harness dependency|Constructed evaluation\/proof harness dependency) \/(?<pattern>.*?)\/ in (?:protected non-Rust path )?(?<file>.+?)(?: \(|:|$)/u,
   );
   if (patterned?.groups != null) {
     return { ...patterned.groups, message: String(message) };
