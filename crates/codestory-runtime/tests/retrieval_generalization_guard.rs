@@ -13,6 +13,13 @@ static LINT_SCRIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const LINT_SCRIPT_LOCK_HELPER_PATH: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_PATH";
 const LINT_SCRIPT_LOCK_HELPER_READY: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_READY";
 const LINT_SCRIPT_LOCK_HELPER_RELEASE: &str = "CODESTORY_LINT_SCRIPT_LOCK_HELPER_RELEASE";
+const LINT_SCRIPT_CRASH_HELPER_ROOT: &str = "CODESTORY_LINT_SCRIPT_CRASH_HELPER_ROOT";
+const PLANTED_SOURCE_OWNERSHIP_MARKER: &str =
+    "// CODESTORY_TEST_OWNED: retrieval-generalization-guard\n";
+const PLANTED_SOURCE_PATHS: [&str; 2] = [
+    "crates/codestory-runtime/src/ranking_scope_probe_generated.rs",
+    "crates/codestory-runtime/src/ranking_probe/tests.rs",
+];
 
 struct LintScriptGuard {
     _thread_guard: MutexGuard<'static, ()>,
@@ -34,7 +41,14 @@ impl Drop for LintScriptGuard {
 /// therefore safe and keeps one real assertion failure from turning every later
 /// guard test into a `PoisonError` panic.
 fn lint_script_lock() -> LintScriptGuard {
-    lint_script_lock_at(&lint_script_lock_path(&workspace_root()))
+    let repo_root = workspace_root();
+    lint_script_lock_for(&repo_root, &lint_script_lock_path(&repo_root))
+}
+
+fn lint_script_lock_for(repo_root: &Path, lock_path: &Path) -> LintScriptGuard {
+    let guard = lint_script_lock_at(lock_path);
+    recover_stale_planted_sources(repo_root);
+    guard
 }
 
 fn lint_script_lock_at(lock_path: &Path) -> LintScriptGuard {
@@ -63,6 +77,29 @@ fn lint_script_lock_path(repo_root: &Path) -> PathBuf {
     repo_root
         .join("target")
         .join("retrieval-generalization-guard.lock")
+}
+
+fn recover_stale_planted_sources(repo_root: &Path) {
+    for relative_path in PLANTED_SOURCE_PATHS {
+        let path = repo_root.join(relative_path);
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!(
+                "read possible stale planted source {}: {error}",
+                path.display()
+            ),
+        };
+        if !contents.starts_with(PLANTED_SOURCE_OWNERSHIP_MARKER.as_bytes()) {
+            continue;
+        }
+        fs::remove_file(&path).unwrap_or_else(|error| {
+            panic!("remove stale planted source {}: {error}", path.display())
+        });
+        if relative_path == PLANTED_SOURCE_PATHS[1] {
+            let _ = fs::remove_dir(path.parent().expect("stale planted source parent"));
+        }
+    }
 }
 
 fn production_source(contents: &str) -> &str {
@@ -284,6 +321,32 @@ fn lint_script_lock_process_helper() {
 }
 
 #[test]
+#[ignore = "spawned by lint_script_lock_recovers_a_fixture_after_process_exit"]
+fn lint_script_crash_recovery_helper() {
+    let Some(repo_root) = std::env::var_os(LINT_SCRIPT_CRASH_HELPER_ROOT) else {
+        return;
+    };
+    let lock_path =
+        PathBuf::from(std::env::var_os(LINT_SCRIPT_LOCK_HELPER_PATH).expect("helper lock path"));
+    let repo_root = PathBuf::from(repo_root);
+    let _guard = lint_script_lock_for(&repo_root, &lock_path);
+    let _planted = PlantedSource::write(
+        repo_root.join(PLANTED_SOURCE_PATHS[1]),
+        concat!(
+            "pub fn ranking_probe_entry_points() -> [&'static str; 2] {\n",
+            "    [\"createApplication\", \"benchmarks/tasks\"]\n",
+            "}\n"
+        ),
+    );
+
+    // Model a killed nextest process: `process::exit` skips both the planted
+    // source destructor and the lock guard destructor. The operating system
+    // releases the file lock, while the next holder has to recover the
+    // proof-marked source before it scans the checkout.
+    std::process::exit(0);
+}
+
+#[test]
 fn lint_script_lock_serializes_independent_test_processes() {
     let fixture = TempDir::new().expect("create process lock fixture");
     let lock_path = fixture.path().join("lint-script.lock");
@@ -360,6 +423,68 @@ fn lint_script_lock_serializes_independent_test_processes() {
         acquired_after_release,
         "process lock contender did not acquire after the holder released it"
     );
+}
+
+#[test]
+fn lint_script_lock_recovers_a_fixture_after_process_exit() {
+    let fixture = TempDir::new().expect("create crash recovery fixture");
+    let lock_path = fixture.path().join("target/lint-script.lock");
+    let status = Command::new(std::env::current_exe().expect("current guard test executable"))
+        .arg("--exact")
+        .arg("lint_script_crash_recovery_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LINT_SCRIPT_CRASH_HELPER_ROOT, fixture.path())
+        .env(LINT_SCRIPT_LOCK_HELPER_PATH, &lock_path)
+        .status()
+        .expect("spawn lint script crash recovery helper");
+    assert!(status.success(), "crash recovery helper failed: {status}");
+
+    let stale_path = fixture.path().join(PLANTED_SOURCE_PATHS[1]);
+    let stale_contents = fs::read(&stale_path).expect("crashed helper should leave planted source");
+    assert!(
+        stale_contents.starts_with(PLANTED_SOURCE_OWNERSHIP_MARKER.as_bytes()),
+        "crashed helper should leave an explicitly owned source fixture"
+    );
+
+    {
+        let _guard = lint_script_lock_for(fixture.path(), &lock_path);
+        assert!(
+            !stale_path.exists(),
+            "the next lock holder should recover the crashed process fixture before scanning"
+        );
+    }
+}
+
+#[test]
+fn lint_script_lock_preserves_unowned_and_unknown_sources() {
+    let fixture = TempDir::new().expect("create recovery ownership fixture");
+    let lock_path = fixture.path().join("target/lint-script.lock");
+    let unowned_path = fixture.path().join(PLANTED_SOURCE_PATHS[0]);
+    let unknown_path = fixture
+        .path()
+        .join("crates/codestory-runtime/src/unknown_probe.rs");
+    let unowned_contents = b"pub fn user_owned_source() {}\n";
+    let unknown_contents =
+        format!("{PLANTED_SOURCE_OWNERSHIP_MARKER}pub fn unknown_test_source() {{}}\n");
+    fs::create_dir_all(unowned_path.parent().expect("unowned source parent"))
+        .expect("create unowned source parent");
+    fs::write(&unowned_path, unowned_contents).expect("write unowned source");
+    fs::write(&unknown_path, &unknown_contents).expect("write unknown marked source");
+
+    {
+        let _guard = lint_script_lock_for(fixture.path(), &lock_path);
+        assert_eq!(
+            fs::read(&unowned_path).expect("unowned source should remain"),
+            unowned_contents,
+            "a known path without the ownership marker must not be removed"
+        );
+        assert_eq!(
+            fs::read_to_string(&unknown_path).expect("unknown marked source should remain"),
+            unknown_contents,
+            "the ownership marker must not authorize cleanup outside the known path set"
+        );
+    }
 }
 
 #[test]
@@ -2514,7 +2639,9 @@ fn linter_excludes_only_module_bodies_their_parent_declares_cfg_test() {
 
 /// Writes `contents` at `relative_path` inside the repository, runs the lint
 /// with its real default scan roots before and after, and removes the planted
-/// file (and any directory created for it) again, including on panic.
+/// file (and any directory created for it) again. The source carries a test
+/// ownership marker so the next lock holder can recover it if this process
+/// exits before `Drop` runs.
 fn run_default_lint_with_planted_source(
     repo_root: &Path,
     relative_path: &Path,
@@ -2534,7 +2661,9 @@ fn run_default_lint_with_planted_source(
 
 /// A source file planted in the real tree for the duration of one assertion.
 /// `Drop` runs while a failing assertion unwinds, so a red test cannot leave a
-/// stray module behind for the next `cargo build` to trip over.
+/// stray module behind for the next `cargo build` to trip over. Forced process
+/// exit skips `Drop`; `lint_script_lock` removes only the known paths carrying
+/// `PLANTED_SOURCE_OWNERSHIP_MARKER` before the next scan.
 struct PlantedSource {
     path: PathBuf,
     created_directory: Option<PathBuf>,
@@ -2554,7 +2683,8 @@ impl PlantedSource {
             fs::create_dir_all(&parent).expect("create planted probe directory");
             Some(parent)
         };
-        fs::write(&path, contents).expect("plant probe source file");
+        let marked_contents = format!("{PLANTED_SOURCE_OWNERSHIP_MARKER}{contents}");
+        fs::write(&path, marked_contents).expect("plant probe source file");
         Self {
             path,
             created_directory,
