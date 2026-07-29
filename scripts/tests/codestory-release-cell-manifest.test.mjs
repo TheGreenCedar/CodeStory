@@ -25,6 +25,23 @@ const gitIdentity = {
 const version = "0.16.0";
 const observedAt = "2026-07-19T12:00:00.000Z";
 
+/// The CLI authenticates a requested producer against the ambient `GITHUB_*` context whenever
+/// `GITHUB_ACTIONS` is "true", so a spawned case must carry an environment that agrees with the
+/// arguments it passes. Inheriting the runner's own context instead makes the case pass locally
+/// (where the guard is inert) and fail in Actions (where `GITHUB_RUN_ID` is the real run) -- which
+/// is exactly how this reached the release lane, the only lane that runs this file.
+function producerEnv(overrides) {
+  return {
+    ...process.env,
+    GITHUB_ACTIONS: "true",
+    GITHUB_REPOSITORY: gitIdentity.repository,
+    GITHUB_SHA: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
+    GITHUB_RUN_ATTEMPT: String(nonClaimPolicy.maximum_run_attempts),
+    GITHUB_JOB: nonClaimPolicy.producer_job,
+    ...overrides,
+  };
+}
+
 function cell(id) {
   return deriveReleaseCells(graph, "post_publish").find(({ id: candidate }) => candidate === id);
 }
@@ -631,7 +648,7 @@ test("withhold writes one container per closeout phase, never a phase-mixed one"
     "--identity", identityPath,
     "--archive", archive,
     "--out-dir", outDir,
-  ], { encoding: "utf8" });
+  ], { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345" }) });
   assert.equal(result.status, 0, result.stderr);
 
   const expected = {

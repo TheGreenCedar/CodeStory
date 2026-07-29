@@ -270,6 +270,7 @@ function evaluate(
   trustedExceptionDocument = null,
   artifactBindings = null,
   verifyReuseBinding = null,
+  resolveCommitIdentity = null,
 ) {
   const bindings = artifactBindings ?? manifests.map((manifest) => {
     const producer = trustedProducers?.producers?.find(({ cell_id: cellId }) =>
@@ -294,6 +295,7 @@ function evaluate(
     trustedExceptionDocument,
     artifactBindings: bindings,
     verifyReuseBinding,
+    resolveCommitIdentity,
   });
 }
 
@@ -339,6 +341,72 @@ function reuseSourceBehavior(trustedProducers, manifests, reusedFrom = {}) {
   manifest.evidence.identity.producer_run_id = reusedRunId;
   manifest.evidence.identity.commit = reusedCommit;
   return row;
+}
+
+// ── Native-fingerprint reuse ────────────────────────────────────────────────────────────────
+
+// The whole point of the native_fingerprint binding: the reused commit's tree is *not* this
+// release's tree. Version-normalized native inputs are what is equal, so the accelerator the
+// evidence exercised is the accelerator this release ships.
+const reusedTree = "c".repeat(40);
+const nativeFingerprint = "f".repeat(64);
+
+function acceleratorCellIds() {
+  return deriveReleaseCells(graph, "pre_publish")
+    .filter(({ group_id: groupId }) => groupId === "accelerator_execution")
+    .map(({ id }) => id);
+}
+
+/// Stands in for the git fingerprint proof, and for the closeout reading the reused commit's own
+/// identity out of its checkout. Both are needed before a reused row may be read at this release's
+/// tree: one says the trees may be equated, the other says which tree is being equated away.
+function fingerprintReuse({
+  ancestors = [reusedCommit],
+  fingerprint = nativeFingerprint,
+  tree = reusedTree,
+} = {}) {
+  return {
+    verify: ({ binding, releaseCommit, reusedCommit: reused }) => {
+      assert.equal(releaseCommit, gitIdentity.commit);
+      if (binding !== "native_fingerprint") throw new Error(`unknown reuse binding ${binding}`);
+      if (!ancestors.includes(reused)) {
+        throw new Error(`reused commit ${reused} is not an ancestor of the release commit`);
+      }
+      return fingerprint;
+    },
+    resolve: (commit) => {
+      if (commit !== reusedCommit) throw new Error(`git cat-file -e ${commit} failed`);
+      return { repository: gitIdentity.repository, commit, source_tree: tree };
+    },
+  };
+}
+
+/// Re-anchor all three accelerator producer rows onto a prior run, exactly as the producer map
+/// does once an operator selects `--reuse accelerator_execution=<run>:<sha>` in preflight.
+function reuseAcceleratorExecution(trustedProducers, manifests, reusedFrom = {}) {
+  const rows = [];
+  for (const cellId of acceleratorCellIds()) {
+    const row = trustedProducers.producers.find(({ cell_id: candidate }) => candidate === cellId);
+    row.producer_run_id = reusedRunId;
+    row.reused_from = {
+      run_id: reusedRunId,
+      head_sha: reusedCommit,
+      binding: "native_fingerprint",
+      binding_value: nativeFingerprint,
+      ...reusedFrom,
+    };
+    row.artifact.workflow_run_id = reusedRunId;
+    row.artifact.head_sha = reusedCommit;
+    row.job.run_id = reusedRunId;
+    row.job.head_sha = reusedCommit;
+    const manifest = manifests.find(({ cell_id: candidate }) => candidate === cellId);
+    manifest.evidence.identity.producer_run_id = reusedRunId;
+    manifest.evidence.identity.commit = reusedCommit;
+    // The reused run ran at its own tree, which is not this release's.
+    manifest.evidence.identity.source_tree = reusedTree;
+    rows.push(row);
+  }
+  return rows;
 }
 
 test("cell inventory is derived only from the release claim graph", () => {
@@ -919,58 +987,209 @@ test("a reuse block naming the publishing run is not reuse", () => {
   assert.ok(rejected.summary.failed_cells.includes("source_behavior"));
 });
 
-test("native-fingerprint reuse is still refused, and refused for the tree it cannot equate", () => {
-  // release-claims.json declares a second reuse binding -- accelerator_execution under
-  // native_fingerprint -- and this closeout does not yet honour it. Fingerprint reuse exists
-  // precisely because the trees differ, and accelerator_execution requires source_tree, so the
-  // claim evaluator refuses the row after the closeout anchors it. #1552 is about source-proof
-  // reuse; widening the tree identity for accelerator evidence is a separate trust decision.
-  // Pinned here so that gap stays a documented refusal and can never widen unnoticed.
-  const reusedTree = "c".repeat(40);
-  const fingerprint = "f".repeat(64);
+/// Every message a rejected closeout produced, wherever it recorded it: input errors, cell
+/// validation failures, and the claim evaluator's own failures all refuse in different places.
+function refusals(result) {
+  const messages = [...result.summary.input_errors];
+  for (const { value } of result.evaluations.values()) {
+    for (const failure of value.failures ?? []) messages.push(String(failure));
+    for (const failure of value.release_claim_evaluation?.failures ?? []) {
+      messages.push(String(failure.message));
+    }
+  }
+  return messages;
+}
+
+test("native-fingerprint reuse is admitted for the tree that binding equates", () => {
+  // Replaces the test that pinned this as a permanent refusal (#1567). The refusal was not a
+  // trust decision, it was a missing declaration: the closeout read every reused row at the
+  // release commit and at nothing else, so accelerator_execution -- whose required_identity
+  // includes source_tree, and whose binding exists precisely because the trees differ -- could
+  // never pass. The claim graph now says per binding which identity keys the binding may equate,
+  // and native_fingerprint equates source_tree: an equal version-normalized fingerprint means
+  // every input that determines the native binary is identical, so execution evidence carries
+  // across a tree that differs only in code the accelerator never runs.
   const manifests = manifestsFor("pre_publish");
   const trusted = trustedProducersFor("pre_publish");
-  const acceleratorCells = deriveReleaseCells(graph, "pre_publish")
-    .filter(({ group_id: groupId }) => groupId === "accelerator_execution")
-    .map(({ id }) => id);
-  assert.equal(acceleratorCells.length, 3);
-  for (const cellId of acceleratorCells) {
-    const row = trusted.producers.find(({ cell_id: candidate }) => candidate === cellId);
-    row.producer_run_id = reusedRunId;
-    row.reused_from = {
-      run_id: reusedRunId,
-      head_sha: reusedCommit,
-      binding: "native_fingerprint",
-      binding_value: fingerprint,
-    };
-    row.artifact.workflow_run_id = reusedRunId;
-    row.artifact.head_sha = reusedCommit;
-    row.job.run_id = reusedRunId;
-    row.job.head_sha = reusedCommit;
-    const manifest = manifests.find(({ cell_id: candidate }) => candidate === cellId);
-    manifest.evidence.identity.producer_run_id = reusedRunId;
-    manifest.evidence.identity.commit = reusedCommit;
-    manifest.evidence.identity.source_tree = reusedTree;
-  }
-  const rejected = evaluate("pre_publish", manifests, null, trusted, null, null, ({ binding }) => {
-    if (binding !== "native_fingerprint") throw new Error(`unknown reuse binding ${binding}`);
-    return fingerprint;
+  const cellIds = acceleratorCellIds();
+  assert.equal(cellIds.length, 3);
+  reuseAcceleratorExecution(trusted, manifests);
+  const proof = fingerprintReuse();
+  const proved = [];
+  const resolved = [];
+  const accepted = evaluate("pre_publish", manifests, null, trusted, null, null, (request) => {
+    proved.push(request);
+    return proof.verify(request);
+  }, (commit) => {
+    resolved.push(commit);
+    return proof.resolve(commit);
   });
-  assert.equal(rejected.decision, "reject");
-  for (const cellId of acceleratorCells) {
-    assert.ok(rejected.summary.failed_cells.includes(cellId), cellId);
-    const failures = rejected.evaluations.get(cellId).value.release_claim_evaluation.failures;
-    assert.ok(
-      failures.some(({ class: failureClass, message }) =>
-        failureClass === "stale_sha" && message.includes("source tree does not match")),
-      `${cellId}: ${JSON.stringify(failures)}`,
+  assert.equal(accepted.decision, "accept");
+  assert.deepEqual(accepted.summary.input_errors, []);
+  assert.deepEqual(accepted.summary.failed_cells, []);
+  assert.equal(accepted.summary.counts.passed, 10);
+  // The closeout re-proves the binding for every reused cell, against its own checkout, and reads
+  // the reused commit's own tree rather than taking the row's word for what it is equating away.
+  assert.deepEqual(proved, cellIds.map(() => ({
+    binding: "native_fingerprint",
+    releaseCommit: gitIdentity.commit,
+    reusedCommit,
+  })));
+  assert.deepEqual(resolved, cellIds.map(() => reusedCommit));
+  // The ledger states what was actually inherited: the earlier run, its commit, and its tree.
+  for (const cellId of cellIds) {
+    const row = accepted.ledger.cells.find(({ id }) => id === cellId);
+    assert.equal(row.status, "pass", cellId);
+    assert.equal(row.identity.producer_run_id, reusedRunId, cellId);
+    assert.equal(row.identity.commit, reusedCommit, cellId);
+    assert.equal(row.identity.source_tree, reusedTree, cellId);
+  }
+  // Nothing else moved: cells that were not reused stay bound to the publishing run and tree.
+  const packaged = accepted.ledger.cells.find(({ id }) => id === "package_identity:windows-x64");
+  assert.equal(packaged.identity.commit, gitIdentity.commit);
+  assert.equal(packaged.identity.source_tree, gitIdentity.source_tree);
+});
+
+test("a native-fingerprint reuse row is refused wherever the equation stops holding", () => {
+  // The accept path above buys exactly one substitution, under one proof. Each row here breaks a
+  // different part of that and must still reject -- the equated key included, because equating an
+  // identity is not dropping it: the row still has to carry the reused commit's own value for it.
+  const rejections = [
+    ["the row names a binding the group did not declare", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests, { binding: "source_tree" });
+    }, "reuses evidence under an undeclared binding", fingerprintReuse()],
+    ["the reproved fingerprint is not the one the producer recorded", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests, { binding_value: "e".repeat(64) });
+    }, "recorded native_fingerprint value does not bind this release", fingerprintReuse()],
+    ["the two commits' native fingerprints differ", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests);
+    }, "native_fingerprint reuse is unverified", {
+      verify: () => {
+        throw new Error("native fingerprint of reused commit does not match the release commit");
+      },
+      resolve: fingerprintReuse().resolve,
+    }],
+    ["the reused commit is not an ancestor of the release commit", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests);
+    }, "is not an ancestor of the release commit", fingerprintReuse({ ancestors: [] })],
+    ["the reused artifact expired", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests)[0].artifact.expired = true;
+    }, "artifact is expired", fingerprintReuse()],
+    // The equated identity, checked at its source. A reused row may be read at this release's
+    // tree only because it carries the reused commit's tree; a row naming some third tree is not
+    // the evidence the fingerprint proved anything about.
+    ["the row declares a tree that is not the reused commit's", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests);
+      manifests.find(({ cell_id: cellId }) => cellId === acceleratorCellIds()[0])
+        .evidence.identity.source_tree = "e".repeat(40);
+    }, "manifest source_tree is not the reused commit's source_tree the binding equates",
+    fingerprintReuse()],
+    ["the row declares this release's tree, which the reused run could not have produced it at",
+      (trusted, manifests) => {
+        reuseAcceleratorExecution(trusted, manifests);
+        manifests.find(({ cell_id: cellId }) => cellId === acceleratorCellIds()[0])
+          .evidence.identity.source_tree = gitIdentity.source_tree;
+      }, "manifest source_tree is not the reused commit's source_tree the binding equates",
+      fingerprintReuse()],
+    // Keys the fingerprint does not determine are not equated, and are compared as written.
+    ["the row was produced in another repository", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests);
+      manifests.find(({ cell_id: cellId }) => cellId === acceleratorCellIds()[0])
+        .evidence.identity.repository = "TheGreenCedar/NotCodeStory";
+    }, "identity repository does not match the requested release", fingerprintReuse()],
+    ["the row was produced at another version, which the fingerprint normalizes away rather than proves",
+      (trusted, manifests) => {
+        reuseAcceleratorExecution(trusted, manifests);
+        manifests.find(({ cell_id: cellId }) => cellId === acceleratorCellIds()[0])
+          .evidence.identity.producer_version = "0.15.9";
+      }, "producer_version must equal closeout version", fingerprintReuse()],
+    ["the row exercised an archive this release does not ship", (trusted, manifests) => {
+      reuseAcceleratorExecution(trusted, manifests);
+      manifests.find(({ cell_id: cellId }) => cellId === acceleratorCellIds()[0])
+        .evidence.identity.artifact_sha256 = sha("some other release archive");
+    }, "identity artifact_sha256 does not match the requested release", fingerprintReuse()],
+  ];
+  for (const [label, mutate, expected, proof] of rejections) {
+    const manifests = manifestsFor("pre_publish");
+    const trusted = trustedProducersFor("pre_publish");
+    mutate(trusted, manifests);
+    const rejected = evaluate(
+      "pre_publish",
+      manifests,
+      null,
+      trusted,
+      null,
+      null,
+      proof.verify,
+      proof.resolve,
     );
-    // The commit the binding proof covered is admitted; only the tree it cannot equate refuses.
+    assert.equal(rejected.decision, "reject", label);
+    const messages = refusals(rejected);
     assert.ok(
-      !failures.some(({ message }) => message.includes("commit does not match")),
-      `${cellId}: ${JSON.stringify(failures)}`,
+      messages.some((message) => message.includes(expected)),
+      `${label}: ${JSON.stringify(messages)}`,
     );
   }
+});
+
+test("a closeout that cannot read the reused commit refuses to equate anything", () => {
+  // The binding proof alone does not say what is being equated away. Without this checkout's own
+  // reading of the reused commit, the release's tree would be standing in for whatever the row
+  // claimed -- so reuse is refused outright rather than granted on the producer map's word.
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseAcceleratorExecution(trusted, manifests);
+  const rejected = evaluate(
+    "pre_publish",
+    manifests,
+    null,
+    trusted,
+    null,
+    null,
+    fingerprintReuse().verify,
+  );
+  assert.equal(rejected.decision, "reject");
+  for (const cellId of acceleratorCellIds()) {
+    assert.ok(
+      rejected.summary.input_errors.some((message) =>
+        message.includes(`${cellId} equates source_tree this closeout cannot resolve`)),
+      `${cellId}: ${JSON.stringify(rejected.summary.input_errors)}`,
+    );
+  }
+});
+
+test("a reused accelerator container is still bound by its digest", () => {
+  const manifests = manifestsFor("pre_publish");
+  const trusted = trustedProducersFor("pre_publish");
+  reuseAcceleratorExecution(trusted, manifests);
+  const [cellId] = acceleratorCellIds();
+  const artifactBindings = manifests.map((manifest) => {
+    const producer = trusted.producers.find(({ cell_id: candidate }) => candidate === manifest.cell_id);
+    return {
+      cell_id: manifest.cell_id,
+      producer_artifact: producer.producer_artifact,
+      artifact_id: producer.artifact.id,
+      artifact_digest: producer.artifact.digest,
+      manifest_sha256: canonicalManifestSha(manifest),
+    };
+  });
+  artifactBindings.find(({ cell_id: candidate }) => candidate === cellId)
+    .artifact_digest = `sha256:${"f".repeat(64)}`;
+  const proof = fingerprintReuse();
+  const rejected = evaluate(
+    "pre_publish",
+    manifests,
+    null,
+    trusted,
+    null,
+    artifactBindings,
+    proof.verify,
+    proof.resolve,
+  );
+  assert.equal(rejected.decision, "reject");
+  assert.ok(rejected.summary.failed_cells.includes(cellId));
+  assert.ok(rejected.evaluations.get(cellId).value.failures.some((message) =>
+    message.includes("artifact_digest does not match Actions provenance")));
 });
 
 // ── Withheld accelerator claims ─────────────────────────────────────────────────────────────
