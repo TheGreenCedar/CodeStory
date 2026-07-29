@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -132,6 +139,74 @@ ${run}`;
   return spawnSync(executable, args, {
     encoding: "utf8",
   });
+}
+
+const calibrationReleaseChecker = path.join(
+  root,
+  ".github/scripts/check-calibration-release-lineage.py",
+);
+const calibrationConstantSet =
+  "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+const calibrationGitEnvironment = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "CodeStory Proof",
+  GIT_AUTHOR_EMAIL: "proof@codestory.invalid",
+  GIT_COMMITTER_NAME: "CodeStory Proof",
+  GIT_COMMITTER_EMAIL: "proof@codestory.invalid",
+  GIT_AUTHOR_DATE: "2026-01-01T00:00:00+00:00",
+  GIT_COMMITTER_DATE: "2026-01-01T00:00:00+00:00",
+  GIT_CONFIG_GLOBAL: os.devNull,
+  GIT_CONFIG_SYSTEM: os.devNull,
+};
+
+function calibrationGit(repository, ...gitArguments) {
+  const result = spawnSync(
+    "git",
+    ["-c", "commit.gpgsign=false", ...gitArguments],
+    {
+      cwd: repository,
+      encoding: "utf8",
+      env: calibrationGitEnvironment,
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    result.stderr || result.stdout || `git ${gitArguments.join(" ")} failed`,
+  );
+  return result.stdout.trim();
+}
+
+function writeCalibrationFixture(repository, relative, contents) {
+  const target = path.join(repository, relative);
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, contents);
+}
+
+function commitCalibrationFixture(repository, message) {
+  calibrationGit(repository, "add", "-A");
+  calibrationGit(repository, "commit", "--no-verify", "-q", "-m", message);
+  return {
+    commit: calibrationGit(repository, "rev-parse", "HEAD"),
+    tree: calibrationGit(repository, "rev-parse", "HEAD^{tree}"),
+  };
+}
+
+function runCalibrationReleaseCheck(repository, expectedSha) {
+  return spawnSync(
+    "python",
+    [
+      calibrationReleaseChecker,
+      "--repo",
+      repository,
+      "--expected-sha",
+      expectedSha,
+    ],
+    {
+      cwd: root,
+      encoding: "utf8",
+    },
+  );
 }
 
 const marketplaceGuardName = "Validate the dispatched release coordinates";
@@ -449,6 +524,189 @@ test("release authority accepts only exact live auto-main or manual-dev routes",
     assert.notEqual(result.status, 0);
     assert.match(result.stdout, /dev\/codestory-next moved from proved head/u);
   });
+});
+
+test("release-head calibration lineage rejects identities and source shapes around the freeze", async (t) => {
+  const fixtureRoot = mkdtempSync(
+    path.join(os.tmpdir(), "codestory-release-lineage-"),
+  );
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const repository = path.join(fixtureRoot, "repository");
+  mkdirSync(repository, { recursive: true });
+  calibrationGit(repository, "-c", "init.defaultBranch=main", "init", "-q");
+  writeCalibrationFixture(repository, "README.md", "release lineage fixture\n");
+  writeCalibrationFixture(
+    repository,
+    calibrationConstantSet,
+    `${JSON.stringify({ status: "unfrozen", freeze_record: null }, null, 2)}\n`,
+  );
+  const calibrated = commitCalibrationFixture(repository, "calibrate");
+  const frozenContract = {
+    status: "frozen",
+    freeze_record: {
+      selection_source_commit: calibrated.commit,
+      selection_source_tree: calibrated.tree,
+    },
+  };
+  writeCalibrationFixture(
+    repository,
+    calibrationConstantSet,
+    `${JSON.stringify(frozenContract, null, 2)}\n`,
+  );
+  const frozen = commitCalibrationFixture(repository, "freeze constants");
+
+  await t.test("the one-file freeze is accepted", () => {
+    const result = runCalibrationReleaseCheck(repository, frozen.commit);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const receipt = JSON.parse(result.stdout);
+    assert.equal(receipt.status, "passed");
+    assert.equal(receipt.selection_commit, calibrated.commit);
+    assert.equal(receipt.frozen_commit, frozen.commit);
+    assert.deepEqual(receipt.allowed_changed_paths, [calibrationConstantSet]);
+  });
+
+  await t.test("a caller-supplied SHA that is not the checkout is rejected", () => {
+    const result = runCalibrationReleaseCheck(repository, calibrated.commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /release checkout does not match the expected release source/u);
+  });
+
+  await t.test("a tree-preserving promotion commit stays bound", () => {
+    calibrationGit(
+      repository,
+      "commit",
+      "--allow-empty",
+      "--no-verify",
+      "-q",
+      "-m",
+      "promote frozen tree",
+    );
+    const promoted = calibrationGit(repository, "rev-parse", "HEAD");
+    const result = runCalibrationReleaseCheck(repository, promoted);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    calibrationGit(repository, "reset", "--hard", frozen.commit);
+  });
+
+  await t.test("a freeze record carrying the wrong calibration tree is rejected", () => {
+    writeCalibrationFixture(
+      repository,
+      calibrationConstantSet,
+      `${JSON.stringify({
+        ...frozenContract,
+        freeze_record: {
+          ...frozenContract.freeze_record,
+          selection_source_tree: "f".repeat(40),
+        },
+      }, null, 2)}\n`,
+    );
+    const wrongTree = commitCalibrationFixture(repository, "forge calibration tree");
+    const result = runCalibrationReleaseCheck(repository, wrongTree.commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /calibration commit does not resolve to the recorded calibration tree/u);
+    calibrationGit(repository, "reset", "--hard", frozen.commit);
+  });
+
+  await t.test("source drift after the freeze is rejected and named", () => {
+    writeCalibrationFixture(repository, "README.md", "post-freeze source drift\n");
+    const drifted = commitCalibrationFixture(repository, "change source after freeze");
+    const result = runCalibrationReleaseCheck(repository, drifted.commit);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /post-calibration source drift exceeded/u);
+    assert.match(result.stderr, /README\.md/u);
+  });
+});
+
+test("release policy keeps the release-head lineage check mandatory and exact", async (t) => {
+  const stepName = "Verify release-head calibration lineage";
+  const cases = [
+    ["missing step", workflows => {
+      const steps = workflows.get("release.yml").jobs.preflight.steps;
+      workflows.get("release.yml").jobs.preflight.steps = steps
+        .filter(step => step.name !== stepName);
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["conditional publishing-only step", workflows => {
+      draftStep(workflows.get("release.yml").jobs.preflight, stepName).if
+        = "inputs.publish_release";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["advisory continue-on-error step", workflows => {
+      draftStep(workflows.get("release.yml").jobs.preflight, stepName)["continue-on-error"]
+        = true;
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["advisory preflight job", workflows => {
+      workflows.get("release.yml").jobs.preflight["continue-on-error"] = true;
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["conditional preflight job", workflows => {
+      workflows.get("release.yml").jobs.preflight.if = "inputs.publish_release";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["job PATH shadows the lineage interpreter", workflows => {
+      workflows.get("release.yml").jobs.preflight.env = {
+        PATH: "${{ github.workspace }}/scripts/fake-bin:${{ env.PATH }}",
+      };
+    }, /preflight must retain the exact trusted job environment/u],
+    ["job BASH_ENV changes lineage execution", workflows => {
+      workflows.get("release.yml").jobs.preflight.env = {
+        BASH_ENV: "${{ github.workspace }}/scripts/fake-bin/bash-env",
+      };
+    }, /preflight must retain the exact trusted job environment/u],
+    ["job shell defaults change lineage execution", workflows => {
+      workflows.get("release.yml").jobs.preflight.defaults = {
+        run: { shell: "bash --noprofile --norc -e {0}" },
+      };
+    }, /preflight must retain the exact trusted job environment/u],
+    ["workflow PATH shadows the lineage interpreter", workflows => {
+      workflows.get("release.yml").env = {
+        PATH: "${{ github.workspace }}/scripts/fake-bin:${{ env.PATH }}",
+      };
+    }, /release workflow must not override the release-head calibration execution environment/u],
+    ["workflow BASH_ENV changes lineage execution", workflows => {
+      workflows.get("release.yml").env = {
+        BASH_ENV: "${{ github.workspace }}/scripts/fake-bin/bash-env",
+      };
+    }, /release workflow must not override the release-head calibration execution environment/u],
+    ["workflow shell defaults change lineage execution", workflows => {
+      workflows.get("release.yml").defaults = {
+        run: { shell: "bash --noprofile --norc -e {0}" },
+      };
+    }, /release workflow must not override the release-head calibration execution environment/u],
+    ["interpreter uses PATH lookup", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step.run = step.run.replace("/usr/bin/python3 -E -s", "python");
+    }, /must use the pinned interpreter on the exact release checkout/u],
+    ["lineage shell uses PATH lookup", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step.shell = "bash -e {0}";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["lineage step sources a hostile BASH_ENV", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step.env.BASH_ENV = "${{ github.workspace }}/scripts/fake-bin/bash-env";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["lineage step changes working directory", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step["working-directory"] = "${{ runner.temp }}";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["lineage step injects another environment variable", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step.env.PYTHONPATH = "${{ github.workspace }}/scripts/fake-python";
+    }, /release-head calibration lineage must be unconditional and fail closed/u],
+    ["step inserted before lineage", workflows => {
+      workflows.get("release.yml").jobs.preflight.steps.splice(1, 0, {
+        name: "Rewrite execution environment",
+        run: 'echo "$GITHUB_WORKSPACE/scripts/fake-bin" >> "$GITHUB_PATH"',
+      });
+    }, /must run immediately after checkout and before other release work/u],
+    ["wrong release SHA", workflows => {
+      const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
+      step.run = step.run.replace("$GITHUB_SHA", "$EXPECTED_HEAD_SHA");
+    }, /must use the pinned interpreter on the exact release checkout/u],
+  ];
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
 });
 
 test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before proof work", async (t) => {
@@ -1179,6 +1437,12 @@ test("standard release paths reject calibration plumbing", async (t) => {
     ["release forwards calibration to package proof", workflows => {
       workflows.get("release.yml").jobs["packaged-proof"].with.calibration_bundle_run_id
         = "${{ inputs.calibration_bundle_run_id }}";
+    }, /release\.yml standard release path must not reference calibration/u],
+    ["release hides calibration plumbing in a same-named decoy step", workflows => {
+      workflows.get("release.yml").jobs["workflow-policy"].steps.push({
+        name: "Verify release-head calibration lineage",
+        run: "echo calibration_bundle_artifact",
+      });
     }, /release\.yml standard release path must not reference calibration/u],
     ["post-publish proof receives calibration", workflows => {
       const step = draftStep(

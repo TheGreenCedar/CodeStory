@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
 
 from .contract_primitives import require_nonempty_string
-from .foundation import require
+from .foundation import ProofFailure, require
 
 # The single file a freeze commit is allowed to write between the tree that was
 # calibrated and the tree that is packaged.
@@ -26,6 +27,125 @@ REQUIRED_RELEASE_ORDERING = (
     "is the only file it may write). A calibrate-then-bump ordering fails here: "
     "move the bump ahead of calibration and recalibrate on the bumped tree"
 )
+
+
+def _git(repository_root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=repository_root,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    require(
+        completed.returncode == 0,
+        "calibration source-lineage probe failed: "
+        + require_nonempty_string(
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or f"git {' '.join(arguments)} exited {completed.returncode} "
+            "without output",
+            "Git lineage failure",
+        ),
+    )
+    return completed.stdout.strip()
+
+
+def _tracked_source_dirty(repository_root: Path) -> bool:
+    dirty = False
+    for arguments in (
+        ("diff", "--quiet", "--ignore-submodules", "--"),
+        ("diff", "--cached", "--quiet", "--ignore-submodules", "--"),
+    ):
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=repository_root,
+            capture_output=True,
+            timeout=30,
+        )
+        require(
+            completed.returncode in (0, 1),
+            "calibration source-lineage dirty-tree probe failed: "
+            + require_nonempty_string(
+                completed.stderr.decode(errors="replace").strip()
+                or completed.stdout.decode(errors="replace").strip()
+                or f"git {' '.join(arguments)} exited {completed.returncode} "
+                "without output",
+                "Git dirty-tree failure",
+            ),
+        )
+        dirty = dirty or completed.returncode == 1
+    return dirty
+
+
+def verify_release_head_calibration_lineage(
+    repository_root: Path,
+    expected_release_commit: str,
+) -> dict:
+    """Bind a release checkout to the calibration source in its freeze record.
+
+    Package qualification can authenticate the original calibration bundle,
+    but the publishing lane deliberately does not receive that optional
+    evidence. The checked-in freeze record is therefore the release lane's
+    durable source binding: the actual release head must descend from the
+    recorded calibration commit and differ from it only by the constant-set
+    freeze file.
+    """
+
+    require(
+        isinstance(expected_release_commit, str)
+        and re.fullmatch(r"[0-9a-f]{40}", expected_release_commit) is not None,
+        "expected release source is not an exact lowercase Git commit",
+    )
+    constant_set_path = repository_root / CONSTANT_SET_FREEZE_PATH
+    require(
+        constant_set_path.is_file() and not constant_set_path.is_symlink(),
+        f"release calibration freeze record is missing or unsafe: "
+        f"{constant_set_path}",
+    )
+    try:
+        constant_set = json.loads(constant_set_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(
+            f"release calibration constant set is not valid JSON: {exc}"
+        ) from exc
+    require(
+        isinstance(constant_set, dict) and constant_set.get("status") == "frozen",
+        "release calibration constant set is not frozen",
+    )
+    freeze_record = constant_set.get("freeze_record")
+    require(
+        isinstance(freeze_record, dict),
+        "release calibration constant set omits its freeze record",
+    )
+
+    release_commit = _git(repository_root, "rev-parse", "HEAD")
+    release_tree = _git(repository_root, "rev-parse", "HEAD^{tree}")
+    require(
+        release_commit == expected_release_commit,
+        "release checkout does not match the expected release source: "
+        f"expected {expected_release_commit}, got {release_commit}",
+    )
+    calibration_source = {
+        "commit": freeze_record.get("selection_source_commit"),
+        "tree": freeze_record.get("selection_source_tree"),
+        "tracked_dirty": False,
+    }
+    release_source = {
+        "commit": release_commit,
+        "tree": release_tree,
+        "tracked_dirty": _tracked_source_dirty(repository_root),
+    }
+    lineage = verify_calibration_source_lineage(
+        calibration_source,
+        release_source,
+        repository_root,
+    )
+    return {
+        **lineage,
+        "selection_tree": calibration_source["tree"],
+        "release_tree": release_tree,
+    }
 
 
 def verify_calibration_source_lineage(
@@ -53,40 +173,18 @@ def verify_calibration_source_lineage(
         "frozen package did not add the required constant-set freeze commit",
     )
 
-    def git(*arguments: str) -> str:
-        completed = subprocess.run(
-            ["git", *arguments],
-            cwd=repository_root,
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        # `require`'s message argument is evaluated before the call, so the
-        # detail must not itself be a contract that a *successful* probe can
-        # violate. `git diff --name-only` legitimately prints nothing when the
-        # two trees are identical, and demanding non-empty output here replaced
-        # the actionable drift message below with "Git lineage failure must be a
-        # non-empty string".
-        require(
-            completed.returncode == 0,
-            "calibration source-lineage probe failed: "
-            + require_nonempty_string(
-                completed.stderr.strip()
-                or completed.stdout.strip()
-                or f"git {' '.join(arguments)} exited {completed.returncode} "
-                "without output",
-                "Git lineage failure",
-            ),
-        )
-        return completed.stdout.strip()
-
     require(
-        git("rev-parse", "HEAD") == frozen_source["commit"]
-        and git("rev-parse", "HEAD^{tree}") == frozen_source["tree"],
+        _git(repository_root, "rev-parse", "HEAD") == frozen_source["commit"]
+        and _git(repository_root, "rev-parse", "HEAD^{tree}")
+        == frozen_source["tree"],
         "verification checkout does not match the frozen package source",
     )
     require(
-        git("rev-parse", f"{calibration_source['commit']}^{{tree}}")
+        _git(
+            repository_root,
+            "rev-parse",
+            f"{calibration_source['commit']}^{{tree}}",
+        )
         == calibration_source["tree"],
         "calibration commit does not resolve to the recorded calibration tree",
     )
@@ -112,7 +210,8 @@ def verify_calibration_source_lineage(
     )
     changed_paths = [
         path
-        for path in git(
+        for path in _git(
+            repository_root,
             "diff",
             "--name-only",
             calibration_source["commit"],
