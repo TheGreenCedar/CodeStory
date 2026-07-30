@@ -6,7 +6,7 @@ import copy
 from types import SimpleNamespace
 from unittest.mock import patch, sentinel
 
-from . import qualification_workflow
+from . import qualification_metrics, qualification_workflow
 from .foundation import ProofFailure, require
 from .qualification_metrics import (
     _qualification_cache_state_from_scenarios,
@@ -76,7 +76,7 @@ def _qualification_cache_state_self_tests() -> None:
     )
     measurement = {"unplanned_suspend": False}
     cache_state = _qualification_cache_state_from_scenarios(
-        runner.matrix_cell["cache_state"],
+        runner,
         reused_scenario,
     )
     host = _qualification_host(
@@ -113,13 +113,96 @@ def _qualification_cache_state_self_tests() -> None:
     ):
         try:
             _qualification_cache_state_from_scenarios(
-                runner.matrix_cell["cache_state"],
+                runner,
                 hostile,
             )
         except ProofFailure:
             pass
         else:
             raise ProofFailure(message)
+
+
+def _qualification_measurement_dataflow_self_test() -> None:
+    measurement_context = SimpleNamespace(
+        measurement_contract={
+            "constant_set": {"status": "frozen"},
+            "measurement_protocol": {"required_metrics": ["sentinel_metric"]},
+        },
+        contracts={"constant_set_sha256": "a" * 64},
+    )
+    runner = SimpleNamespace(matrix_cell={"cache_state": "reused"})
+    scenarios = QualificationScenarioEvidence(
+        shared_identity={},
+        scenarios={
+            "true_idle_respawn": {
+                "assertions": {"verified_materialization_reused": True}
+            }
+        },
+    )
+    retained_measurement = {"unplanned_suspend": False}
+    real_cache_state = qualification_metrics._qualification_cache_state_from_scenarios
+
+    def derive_cache_state(actual_runner, actual_scenarios):
+        require(
+            actual_runner is runner and actual_scenarios is scenarios,
+            "qualification measurement collection replaced validated runner or scenarios",
+        )
+        return real_cache_state(actual_runner, actual_scenarios)
+
+    def retain_metric(metric, *, context, measurement, memory):
+        require(
+            metric == "sentinel_metric"
+            and context is measurement_context
+            and measurement is retained_measurement
+            and memory is sentinel.memory,
+            "qualification measurement collection replaced metric phase evidence",
+        )
+        return sentinel.metric
+
+    def retain_host(actual_context, actual_runner, actual_measurement, *, cache_state):
+        require(
+            actual_context is measurement_context
+            and actual_runner is runner
+            and actual_measurement is retained_measurement
+            and cache_state == "reused",
+            "qualification host did not receive the proved cache state",
+        )
+        return sentinel.host
+
+    with (
+        patch.object(
+            qualification_metrics,
+            "_qualification_measurement_sources",
+            return_value=(retained_measurement, sentinel.memory),
+        ),
+        patch.object(
+            qualification_metrics,
+            "_qualification_cache_state_from_scenarios",
+            side_effect=derive_cache_state,
+        ),
+        patch.object(
+            qualification_metrics,
+            "_retained_qualification_metric",
+            side_effect=retain_metric,
+        ),
+        patch.object(
+            qualification_metrics,
+            "_qualification_host",
+            side_effect=retain_host,
+        ),
+    ):
+        retained = qualification_metrics.collect_qualification_measurements(
+            measurement_context,
+            runner,
+            scenarios,
+        )
+    require(
+        retained.measurement is retained_measurement
+        and retained.memory is sentinel.memory
+        and retained.host is sentinel.host
+        and retained.metrics == {"sentinel_metric": sentinel.metric},
+        "qualification measurement collection returned stale phase evidence",
+    )
 
 
 def _qualification_workflow_dataflow_self_test() -> None:
@@ -195,6 +278,7 @@ def _qualification_workflow_dataflow_self_test() -> None:
 
 def run_qualification_self_tests() -> None:
     _qualification_cache_state_self_tests()
+    _qualification_measurement_dataflow_self_test()
     _qualification_workflow_dataflow_self_test()
     retry = validate_retry_state(
         {

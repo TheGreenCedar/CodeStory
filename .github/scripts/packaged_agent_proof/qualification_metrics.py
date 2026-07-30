@@ -65,11 +65,11 @@ def _qualification_measurement_sources(
 
 
 def _qualification_cache_state_from_scenarios(
-    selected_cache_state: object,
+    runner: QualificationRunnerEvidence,
     scenarios: QualificationScenarioEvidence,
 ) -> str:
     cache_state = require_nonempty_string(
-        selected_cache_state,
+        runner.matrix_cell.get("cache_state"),
         "qualification matrix cache state",
     )
     if cache_state == "reused":
@@ -204,7 +204,7 @@ def collect_qualification_measurements(
 ) -> QualificationMeasurementEvidence:
     measurement, memory = _qualification_measurement_sources(context, runner)
     cache_state = _qualification_cache_state_from_scenarios(
-        runner.matrix_cell.get("cache_state"),
+        runner,
         scenarios,
     )
     timing = {
