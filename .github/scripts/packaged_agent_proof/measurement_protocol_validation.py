@@ -6,19 +6,46 @@ import json
 from pathlib import Path
 
 from .contract_primitives import (
+    canonical_sha256,
     require_exact_keys,
     require_nonempty_string,
     require_positive_int,
 )
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
-    MIN_RETRIEVAL_QUALITY_REPEATS,
     QUALIFICATION_SCHEMA_VERSION,
+    REQUIRED_QUALIFICATION_METRICS,
+    REQUIRED_SERVER_SCENARIO_ASSERTIONS,
     REQUIRED_SERVER_SCENARIOS,
-    RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
     ProofFailure,
     require,
 )
+
+QUALIFICATION_MEASUREMENT_SHAPE_FIELDS = (
+    "required_scenarios",
+    "scenario_contracts",
+    "required_metrics",
+    "phase_boundaries",
+    "workloads",
+    "metric_sampling",
+    "metric_contracts",
+    "calibration_required_metrics",
+    "calibration_phase_boundaries",
+    "calibration_metric_sampling",
+    "calibration_workload_state_overrides",
+)
+EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256 = (
+    "1c065562adc34d0d9978187857807e491c4e6d4aa233fdd94f5636931a7b730e"
+)
+
+
+def qualification_measurement_shape_sha256(protocol: dict) -> str:
+    return canonical_sha256(
+        {
+            field: protocol.get(field)
+            for field in QUALIFICATION_MEASUREMENT_SHAPE_FIELDS
+        }
+    )
 
 
 def _measurement_document(path: Path) -> dict:
@@ -36,6 +63,11 @@ def _measurement_document(path: Path) -> dict:
 
 
 def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dict]:
+    require(
+        qualification_measurement_shape_sha256(protocol)
+        == EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256,
+        "frozen-candidate qualification measurement shape changed",
+    )
     require(
         set(protocol.get("required_scenarios", [])) == REQUIRED_SERVER_SCENARIOS,
         "measurement protocol does not name the complete server scenario set",
@@ -59,11 +91,19 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
             ),
             f"measurement scenario {scenario} assertion contract is malformed",
         )
+        require(
+            set(contract["required"]) == REQUIRED_SERVER_SCENARIO_ASSERTIONS[scenario],
+            f"measurement scenario {scenario} assertion set changed",
+        )
     require(
         set(protocol.get("required_lower_tier_nonclaims", [])) == LOWER_TIER_NONCLAIMS,
         "measurement protocol does not name the complete lower-tier nonclaim set",
     )
     required_metrics = set(protocol.get("required_metrics", []))
+    require(
+        required_metrics == REQUIRED_QUALIFICATION_METRICS,
+        "frozen-candidate qualification metric set must remain lifecycle-only",
+    )
     phase_boundaries = protocol.get("phase_boundaries")
     require(
         isinstance(phase_boundaries, dict)
@@ -396,15 +436,7 @@ def _verify_measurement_sampling(
             policy.get("aggregation"),
             f"measurement sample policy {metric}.aggregation",
         )
-        if metric == "retrieval_quality":
-            require(
-                count == MIN_RETRIEVAL_QUALITY_REPEATS
-                and aggregation == "all_rows_pass_rate"
-                and policy.get("external_contract")
-                == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
-                "retrieval quality sample policy changed",
-            )
-        elif metric in {
+        if metric in {
             "true_idle_exit",
             "backend_observed_accelerator_residency",
         }:
@@ -419,8 +451,7 @@ def _verify_measurement_sampling(
             "greater_than_or_equal": "minimum",
             "equal": "exact",
         }[metric_contracts[metric]["comparison"]]
-        if metric != "retrieval_quality":
-            require(
-                aggregation == expected_aggregation,
-                f"measurement metric {metric} aggregation is not conservative",
-            )
+        require(
+            aggregation == expected_aggregation,
+            f"measurement metric {metric} aggregation is not conservative",
+        )

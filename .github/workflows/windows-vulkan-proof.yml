@@ -17,10 +17,6 @@ on:
         required: false
         default: false
         type: boolean
-      quality_evidence_artifact:
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         required: false
         default: ""
@@ -57,9 +53,6 @@ on:
         required: false
         type: string
       proof_key:
-        required: false
-        type: string
-      quality_evidence_artifact:
         required: false
         type: string
       calibration_bundle_artifact:
@@ -434,13 +427,6 @@ jobs:
           "path=$($result.driver)" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Download exact-head publishable packet quality evidence
-        if: inputs.quality_evidence_artifact != ''
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
-
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -499,7 +485,6 @@ jobs:
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
           $claimArgs = @()
           $calibrationArgs = @()
-          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
             $claimArgs = @("--server-behavior-only")
           } else {
@@ -508,9 +493,6 @@ jobs:
             )
             if ($calibrationBundles.Count -ne 1) {
               throw "expected exactly one frozen calibration-bundle.json"
-            }
-            if (-not (Test-Path $qualityPath)) {
-              throw "protected Windows proof requires exact-head quality evidence"
             }
             $qualificationDriver = "target/release/codestory_embedding_qualification.exe"
             if ($env:USE_PACKAGED_CLI_ARTIFACT -eq "true") {
@@ -525,8 +507,7 @@ jobs:
             $claimArgs = @(
               "--produce-qualification-evidence",
               "--qualification-driver", $qualificationDriver,
-              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
-              "--retrieval-quality-evidence", $qualityPath
+              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json"
             )
             $calibrationArgs = @(
               "--calibration-bundle", $calibrationBundles[0].FullName,

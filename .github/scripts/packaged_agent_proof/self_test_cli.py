@@ -24,7 +24,6 @@ def run_cli_self_tests() -> None:
             qualification_evidence=None,
             qualification_driver=None,
             publication_fault_evidence=None,
-            retrieval_quality_evidence=None,
             calibration_bundle=None,
             collect_constant_calibration=False,
             constant_calibration_output_dir=None,

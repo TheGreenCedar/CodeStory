@@ -15,6 +15,7 @@ from .calibration_verification import verify_calibration_bundle
 from .constant_calibration import _validate_driver_output
 from .contract_primitives import canonical_sha256, sha256, write_json
 from .foundation import TARGET_CONTRACTS, ProofFailure, require
+from .measurement_protocol import load_measurement_protocol
 from .measurement_samples import selected_qualification_matrix_cell
 from .package_contracts import verify_package_server_contracts
 from .qualification_measurements import (
@@ -32,6 +33,102 @@ def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
         self_measurement_protocol,
         require_frozen=False,
     )
+    for quality_metric in (
+        "answer_quality",
+        "packet_quality",
+        "publishable_packet_pass_rate",
+    ):
+        quality_reintroduced = json.loads(
+            json.dumps(measurement_contract["measurement_protocol"])
+        )
+        quality_reintroduced["required_metrics"].append(quality_metric)
+        quality_reintroduced["phase_boundaries"][quality_metric] = [
+            "publishable_packet_candidate_fixed",
+            "publishable_packet_pass_rate_scored",
+        ]
+        quality_reintroduced["workloads"][quality_metric] = {
+            "workload_id": "publishable_three_repeat_packet_v1",
+            "owner_state": "external_exact_head_artifact",
+            "operation": "packet_runtime",
+            "input_generator": "axios_js_ts_v2",
+        }
+        quality_reintroduced["metric_sampling"][quality_metric] = {
+            "sample_count": 3,
+            "aggregation": "minimum",
+        }
+        quality_reintroduced["metric_contracts"][quality_metric] = {
+            "comparison": "greater_than_or_equal",
+            "unit": "publishable_packet_pass_rate",
+        }
+        quality_protocol_path = (
+            fixture.root / f"{quality_metric}-reintroduced-protocol.json"
+        )
+        write_json(quality_protocol_path, quality_reintroduced)
+        try:
+            load_measurement_protocol(quality_protocol_path)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"shape-complete {quality_metric} re-entered frozen-candidate qualification"
+            )
+    for quality_assertion in (
+        "answer_quality_sufficient",
+        "packet_quality_pass",
+        "publishable_packet_pass_rate_is_one",
+    ):
+        quality_reintroduced = json.loads(
+            json.dumps(measurement_contract["measurement_protocol"])
+        )
+        quality_reintroduced["scenario_contracts"]["frozen_owner"][
+            "required"
+        ].append(quality_assertion)
+        quality_protocol_path = (
+            fixture.root / f"{quality_assertion}-scenario-protocol.json"
+        )
+        write_json(quality_protocol_path, quality_reintroduced)
+        try:
+            load_measurement_protocol(quality_protocol_path)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"{quality_assertion} re-entered lifecycle scenario qualification"
+            )
+    repurposed_metric = json.loads(
+        json.dumps(measurement_contract["measurement_protocol"])
+    )
+    repurposed_metric["phase_boundaries"]["warm_query_ipc"] = [
+        "publishable_packet_candidate_fixed",
+        "publishable_packet_pass_rate_scored",
+    ]
+    repurposed_metric["calibration_phase_boundaries"]["warm_query_ipc"] = list(
+        repurposed_metric["phase_boundaries"]["warm_query_ipc"]
+    )
+    repurposed_metric["workloads"]["warm_query_ipc"] = {
+        "workload_id": "publishable_three_repeat_packet_v1",
+        "owner_state": "external_exact_head_artifact",
+        "operation": "packet_runtime",
+        "input_generator": "axios_js_ts_v2",
+    }
+    repurposed_metric["metric_sampling"]["warm_query_ipc"] = {
+        "sample_count": 3,
+        "aggregation": "minimum",
+    }
+    repurposed_metric["metric_contracts"]["warm_query_ipc"] = {
+        "comparison": "greater_than_or_equal",
+        "unit": "publishable_packet_pass_rate",
+    }
+    repurposed_protocol_path = fixture.root / "repurposed-quality-metric.json"
+    write_json(repurposed_protocol_path, repurposed_metric)
+    try:
+        load_measurement_protocol(repurposed_protocol_path)
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure(
+            "warm query metric was repurposed as packet quality"
+        )
     windows_cell_id = "protected_windows_x64_vulkan"
     windows_cell = selected_qualification_matrix_cell(
         measurement_contract["measurement_protocol"],

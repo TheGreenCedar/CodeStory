@@ -288,7 +288,6 @@ def _lineage_probe_arguments(**overrides: object) -> argparse.Namespace:
         "ground_only": False,
         "produce_qualification_evidence": False,
         "qualification_evidence": None,
-        "retrieval_quality_evidence": None,
         "enforce_calibration_freeze_lineage": True,
         "calibration_bundle": Path("calibration-bundle.json"),
         "calibration_producer_run_id": "1234567890",

@@ -961,9 +961,10 @@ test("constant calibration structure rejects qualification, 3x3 sampling, repeat
   }
 });
 
-test("frozen-candidate qualification keeps the Metal quality handoff and optional Linux topology", async (t) => {
+test("frozen-candidate quality stays optional, exact, and archive-authenticated", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const coordinatorFile = "packaged-platform-pr.yml";
+  const qualityFile = "frozen-candidate-quality.yml";
   const metalFile = "macos-metal-proof.yml";
   const windowsFile = "windows-vulkan-proof.yml";
   const linuxFile = "linux-vulkan-proof.yml";
@@ -981,22 +982,14 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
     }, /qualification must run full Metal proof rather than candidate-installed proof/u],
     ["Metal qualification becomes server-behavior only", coordinatorFile, workflow => {
       workflow.jobs["macos-metal-proof"].with.server_behavior_only = true;
-    }, /qualification must run full Metal quality and lifecycle proof/u],
-    ["Windows no longer waits for Metal", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].needs
-        = workflow.jobs["windows-vulkan-proof"].needs
-          .filter(name => name !== "macos-metal-proof");
-    }, /Windows qualification must wait for successful protected Metal quality/u],
-    ["Windows ignores failed Metal qualification", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].if
-        = workflow.jobs["windows-vulkan-proof"].if.replace(
-          "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success') &&",
-          "",
-        );
-    }, /qualification requires successful Metal/u],
-    ["Windows qualification loses exact quality artifact", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact = "";
-    }, /must consume the exact protected Metal quality artifact/u],
+    }, /qualification must run one full Metal lifecycle proof without optional quality inputs/u],
+    ["Windows qualification waits for optional quality", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].needs.push("frozen-candidate-quality");
+    }, /Windows qualification must run independently of optional Metal quality|reviewed frozen-candidate coordinator structure/u],
+    ["Windows qualification consumes optional quality", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact =
+        "${{ needs.frozen-candidate-quality.outputs.artifact }}";
+    }, /Windows qualification must not consume optional quality evidence/u],
     ["Windows qualification becomes candidate-installed only", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
     }, /qualification must run full Windows proof rather than candidate-installed proof/u],
@@ -1064,66 +1057,178 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
         "Require one coherent accepted proof",
       ).env.MODE = "qualification ";
     }, /closeout proof must bind every route and platform result from the reviewed jobs exactly/u],
-    ["Metal quality producer runs during calibration", metalFile, workflow => {
-      draftStep(
-        workflow.jobs["packaged-metal"],
-        "Produce exact-head holdout quality on protected Metal",
-      ).if = "${{ !inputs.server_behavior_only }}";
-    }, /must generate one exact-head three-repeat holdout quality artifact/u],
-    ["Metal quality producer weakens repeat contract", metalFile, workflow => {
-      const producer = draftStep(
-        workflow.jobs["packaged-metal"],
-        "Produce exact-head holdout quality on protected Metal",
+    ["optional quality caller attempts unsupported advisory syntax", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"]["continue-on-error"] = true;
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality owner job becomes blocking", qualityFile, workflow => {
+      workflow.jobs.quality["continue-on-error"] = false;
+    }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional quality runs outside qualification", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"].if
+        = workflow.jobs["frozen-candidate-quality"].if.replace(
+          "needs.route.outputs.mode == 'qualification'",
+          "needs.route.outputs.mode == 'platform'",
+        );
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality no longer waits for Metal", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"].needs
+        = workflow.jobs["frozen-candidate-quality"].needs
+          .filter(name => name !== "macos-metal-proof");
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality moves off the protected Metal host", qualityFile, workflow => {
+      workflow.jobs.quality["runs-on"]
+        = ["self-hosted", "Linux", "X64", "codestory-vulkan"];
+    }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional quality stops authenticating the current run attempt", qualityFile, workflow => {
+      const authentication = draftStep(
+        workflow.jobs.quality,
+        "Authenticate exact candidate archive artifacts",
       );
-      producer.run = producer.run.replace("--repeats 3", "--repeats 1");
-    }, /must generate one exact-head three-repeat holdout quality artifact/u],
-    ["Metal quality upload loses exact-head name", metalFile, workflow => {
+      authentication.run = authentication.run.replace(
+        'test "$(jq -r \'.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
+        "true",
+      );
+    }, /authenticate one current-run exact-head candidate archive and record/u],
+    ["optional quality cache accepts another source SHA", qualityFile, workflow => {
+      const restore = draftStep(
+        workflow.jobs.quality,
+        "Restore exact candidate archive from protected host",
+      );
+      restore.run = restore.run.replace(".source.commit == $source_sha", "true");
+    }, /step Restore exact candidate archive from protected host must run \.source\.commit == \$source_sha/u],
+    ["optional quality archive transfer becomes unconditional", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Download, authenticate, and admit candidate archive on miss",
+      ).if;
+    }, /archive transfer must be cache-miss-only and outer-digest authenticated/u],
+    ["optional quality archive skips the outer digest", qualityFile, workflow => {
+      const miss = draftStep(
+        workflow.jobs.quality,
+        "Download, authenticate, and admit candidate archive on miss",
+      );
+      miss.run = miss.run.replace(
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
+        "true",
+      );
+    }, /step Download, authenticate, and admit candidate archive on miss must run test "\$actual_digest" = "\$EXPECTED_SHA256"/u],
+    ["optional quality restores the v1 corpus", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replaceAll(
+        "codestory-release-corpus-v0.16-axios-js-ts-v2",
+        "codestory-release-corpus-v1",
+      ).replace(
+        "v0.16-axios-js-ts-v2.json",
+        "holdout-retrieval-v1.json",
+      );
+    }, /reviewed isolated evaluation-owner structure/u],
+    ["optional quality selects the old Axios task", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "axios-request-dispatch-v2.task.json",
+        "axios-request-dispatch.task.json",
+      );
+    }, /reviewed isolated evaluation-owner structure/u],
+    ["optional quality appends a second task manifest", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "--materialize-repos",
+        "--task-manifest benchmarks/tasks/extra.task.json \\\n            --materialize-repos",
+      );
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality widens selection to a suite", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "--materialize-repos",
+        "--task-suite holdout-retrieval \\\n            --materialize-repos",
+      );
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality restores nested repeats", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace("--repeats 3", "--repeats 9");
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality permits CPU fallback", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-metal"],
-        "Upload exact-head protected Metal quality evidence",
-      ).with.name = "frozen-candidate-quality";
-    }, /must upload one exact-head stable handoff/u],
-    ["Metal quality upload loses safe overwrite", metalFile, workflow => {
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      ).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality measurement becomes blocking", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      )["continue-on-error"];
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality upload becomes blocking", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Upload optional Axios v2 quality evidence",
+      )["continue-on-error"];
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["optional quality outcome recorder is no longer unconditional", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-metal"],
-        "Upload exact-head protected Metal quality evidence",
-      ).with.overwrite = false;
-    }, /must upload one exact-head stable handoff/u],
-    ["Windows downloads an unrelated quality artifact", windowsFile, workflow => {
+        workflow.jobs.quality,
+        "Record optional quality outcome",
+      ).if = "steps.quality.outcome == 'success'";
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["optional quality outcome recorder uses a hardcoded sentinel", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Download exact-head publishable packet quality evidence",
-      ).with.name = "latest-quality";
-    }, /must download the exact protected Metal quality handoff/u],
+        workflow.jobs.quality,
+        "Record optional quality outcome",
+      ).env.QUALITY_OUTCOME = "success";
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["closeout adds optional quality as a dependency", coordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("frozen-candidate-quality");
+    }, /closeout must wait for every selected platform proof|normal closeout must not depend on optional release or quality evidence/u],
+    ["Metal lifecycle accepts quality evidence again", metalFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept optional quality evidence/u],
+    ["Windows lifecycle accepts quality evidence again", windowsFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept optional quality evidence/u],
+    ["Linux lifecycle accepts quality evidence again", linuxFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept quality_evidence_artifact/u],
     ["Linux full qualification skips retained-driver verification", linuxFile, workflow => {
       draftStep(
         workflow.jobs["packaged-vulkan"],
         "Verify packaged qualification driver",
       ).if = "${{ inputs.server_behavior_only }}";
     }, /packaged qualification must verify the archive-bound private driver/u],
-    ["Linux trusts quality from another workflow", linuxFile, workflow => {
-      const authenticate = draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Authenticate protected Metal quality producer",
-      );
-      authenticate.run = authenticate.run.replace(
-        ".github/workflows/packaged-platform-pr.yml",
-        ".github/workflows/release.yml",
-      );
-    }, /must authenticate exact-head protected Metal quality/u],
-    ["Linux quality download loses producer run identity", linuxFile, workflow => {
-      draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Download exact-head protected Metal quality evidence",
-      ).with["run-id"] = "${{ github.run_id }}";
-    }, /must consume the authenticated protected Metal quality artifact/u],
     ["Linux standalone path removes lifecycle qualification", linuxFile, workflow => {
       const proof = draftStep(
         workflow.jobs["packaged-vulkan"],
         "Prove offline Linux Vulkan retrieval",
       );
       proof.run = proof.run.replace("--produce-qualification-evidence", "--server-behavior-only");
-    }, /standalone qualification runs one full lifecycle and quality proof/u],
+    }, /standalone qualification runs one lifecycle proof without optional quality/u],
   ];
 
   for (const [name, file, mutate, expected] of mutations) {
@@ -1142,6 +1247,30 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
     ["quality producer moves off protected Metal", graph => {
       graph.workflow_policy.qualification.quality_contract.producer_cell
         = "protected_windows_x64_vulkan";
+    }],
+    ["quality becomes a release gate", graph => {
+      graph.workflow_policy.qualification.quality_contract.blocking = true;
+    }],
+    ["quality becomes a claimed result", graph => {
+      graph.workflow_policy.qualification.quality_contract.claimed = true;
+    }],
+    ["quality stops using the global exact-package cache contract", graph => {
+      graph.workflow_policy.qualification.quality_contract.archive_cache_contract
+        = "mutable_candidate_cache";
+    }],
+    ["quality owner moves back into a protected product boundary", graph => {
+      graph.workflow_policy.qualification.quality_contract.evaluation_owner
+        = "protected_product_path";
+    }],
+    ["quality owner digest no longer binds the reviewed evaluator", graph => {
+      graph.workflow_policy.qualification.quality_contract.evaluation_owner_sha256
+        = "0".repeat(64);
+    }],
+    ["quality re-enters required qualification evidence", graph => {
+      graph.workflow_policy.qualification.required_evidence.push("retrieval_quality");
+    }],
+    ["Metal lifecycle claims it produces quality again", graph => {
+      graph.workflow_policy.qualification.required_cells[0].produces_quality = true;
     }],
     ["true-idle grace replaces the product timeout", graph => {
       graph.workflow_policy.qualification.true_idle_timeout_ms = 2_500;
@@ -1335,7 +1464,7 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Windows executes an unverified driver", windowsFile, workflow => {
       draftStep(windowsJob(workflow), "Prove protected Windows Vulkan runtime")
         .env.VERIFIED_QUALIFICATION_DRIVER = "target/release/other.exe";
-    }, /server-behavior proof must omit calibration while qualification runs one full lifecycle/u],
+    }, /server-behavior proof must omit calibration while qualification runs one lifecycle proof without optional quality/u],
     ["Windows substitutes driver after verification", windowsFile, workflow => {
       const steps = windowsJob(workflow).steps;
       const verifyIndex = steps.findIndex(
@@ -1415,7 +1544,7 @@ test("qualification driver is built once, retained privately, authenticated, and
             '--qualification-driver "$qualification_driver"',
             "--qualification-driver target/release/other-driver",
           );
-    }, /standalone qualification runs one full lifecycle and quality proof/u],
+    }, /standalone qualification runs one lifecycle proof without optional quality/u],
     ["Linux substitutes driver after verification", linuxFile, workflow => {
       const steps = linuxJob(workflow).steps;
       const verifyIndex = steps.findIndex(
@@ -2508,7 +2637,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     }, /closeout must wait for every selected platform proof/u],
     ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
       workflow.jobs.closeout.needs.push("release-evidence");
-    }, /normal closeout must not depend on optional release evidence/u],
+    }, /normal closeout must not depend on optional release or quality evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
@@ -3044,7 +3173,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Windows proof", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].if = workflow.jobs["windows-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only mode must skip Windows while qualification requires successful Metal/u],
+    }, /package-only mode must skip Windows without serializing it behind Metal/u],
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");

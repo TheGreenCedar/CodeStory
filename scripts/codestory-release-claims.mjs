@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
-const GRAPH_VERSION = 10;
+const GRAPH_VERSION = 11;
 const KNOWN_PACKAGE_TARGETS = new Set([
   "linux-arm64",
   "linux-x64",
@@ -706,7 +706,6 @@ function validateQualificationPolicy(value) {
       job: "packaged-metal",
       policy: "accelerated",
       backend: "metal",
-      produces_quality: true,
     },
     {
       id: "protected_windows_x64_vulkan",
@@ -714,7 +713,6 @@ function validateQualificationPolicy(value) {
       job: "packaged-vulkan",
       policy: "accelerated",
       backend: "vulkan",
-      produces_quality: false,
     },
   ];
   if (JSON.stringify(requiredCells) !== JSON.stringify(expectedRequiredCells)) {
@@ -740,21 +738,38 @@ function validateQualificationPolicy(value) {
     qualification.quality_contract,
     "workflow_policy.qualification.quality_contract",
   );
+  const expectedQuality = {
+    producer_workflow: "packaged-platform-pr.yml",
+    producer_job: "frozen-candidate-quality",
+    producer_cell: "protected_macos_arm64_metal",
+    scheduled_once_per_frozen_candidate: true,
+    blocking: false,
+    closeout_dependency: false,
+    claimed: false,
+    archive_cache_key_fields: [
+      "source.commit",
+      "target",
+      "archive.sha256",
+    ],
+    archive_cache_contract: "candidate_archive_cache",
+    archive_transfer: "authenticated_miss_only",
+    evaluation_owner: "isolated_reusable_workflow",
+    evaluation_owner_sha256:
+      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+    evaluation_contract: "publishable-three-repeat-packet/v1",
+    task_count: 1,
+    repeats_per_task: 3,
+    row_count: 3,
+  };
   if (
-    quality.producer_cell !== "protected_macos_arm64_metal"
-    || quality.corpus_id !== "codestory-release-corpus-v1"
-    || quality.evaluation_contract !== "publishable-three-repeat-packet/v1"
-    || quality.task_count !== 3
-    || quality.repeats_per_task !== 3
-    || quality.row_count !== 9
+    JSON.stringify(quality) !== JSON.stringify(expectedQuality)
   ) {
-    fail("workflow_policy.qualification quality contract must bind the protected Metal 3x3 holdout matrix");
+    fail("workflow_policy.qualification quality contract must bind the optional isolated exact-package adjunct");
   }
   const expectedEvidence = [
     "qualification_scenarios",
     "true_idle_exit",
     "total_codestory_process_memory",
-    "retrieval_quality",
     "backend_observed_accelerator_residency",
   ];
   if (
@@ -764,7 +779,7 @@ function validateQualificationPolicy(value) {
       { nonEmpty: true },
     )) !== JSON.stringify(expectedEvidence)
   ) {
-    fail("workflow_policy.qualification must retain every frozen-candidate evidence class");
+    fail("workflow_policy.qualification must retain lifecycle evidence without optional retrieval quality");
   }
   const expectedScenarios = [
     "client_death",
