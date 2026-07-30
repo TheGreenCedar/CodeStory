@@ -42,7 +42,6 @@ def _claim_scope_tests() -> None:
         additional_query=[],
         produce_qualification_evidence=False,
         qualification_evidence=None,
-        retrieval_quality_evidence=None,
         publication_fault_evidence=None,
         proof_tier="installed_runtime",
     )
@@ -53,7 +52,6 @@ def _claim_scope_tests() -> None:
         ("server_behavior_only", True),
         ("produce_qualification_evidence", True),
         ("qualification_evidence", Path("qualification.json")),
-        ("retrieval_quality_evidence", Path("quality.json")),
         ("publication_fault_evidence", Path("fault.json")),
     ):
         hostile_scope = argparse.Namespace(**vars(valid_ground_scope))

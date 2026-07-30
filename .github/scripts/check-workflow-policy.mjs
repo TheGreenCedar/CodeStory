@@ -913,13 +913,15 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "8efd162e5e5c42e1cbeb0e40378f631ce358feb9404e90e27e02aa0b382d481e";
+  "464906e3cd7ec0e2f7e9195d60de035fdba76172c25d8b0861d0982f9d7dcc3e";
+const frozenCandidateQualityWorkflowDigest =
+  "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
-  "4f9630adb30d24a358ba8b423c4faadfa347efe678b7ec8d48a72cb059ffe94a";
+  "e1c4a59b412ba3f2041e89177e2af5a6533cf5ef0371dc2fa18c0309fba5b1ca";
 const windowsVulkanWorkflowDigest =
-  "c94a218f5599a727c608259206a68acd54726f38e50471148cb4cf12e1f859c0";
+  "f1123f11d430591380ed433d751c6fc110adfb13225106f50deecf232ee89f9b";
 const linuxVulkanWorkflowDigest =
-  "65449c5b8040d9338cdb12bb5d4271020ee94f1be30dd821f0b56c7bf5c797ea";
+  "935c5df20a2d57ed18824cca11dc9b8590d72a207e3d1677bc2ceea3048b3dff";
 // Linux owns its compiler server inside Docker, while macOS and Windows own one
 // in the host shell. Pin both executable programs so a swallowed stop or a
 // dead-code copy cannot satisfy the ownership fragments below.
@@ -1638,6 +1640,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
 }
 
 export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
+export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";
 
 export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
   const violations = [];
@@ -4796,6 +4799,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       "source-proof",
       "packaged-proof",
       "macos-metal-proof",
+      "frozen-candidate-quality",
       "windows-vulkan-proof",
       "linux-vulkan-proof",
       "closeout",
@@ -4832,7 +4836,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
             job: "packaged-metal",
             policy: "accelerated",
             backend: "metal",
-            produces_quality: true,
           },
           {
             id: "protected_windows_x64_vulkan",
@@ -4840,7 +4843,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
             job: "packaged-vulkan",
             policy: "accelerated",
             backend: "vulkan",
-            produces_quality: false,
           },
         ])
       && JSON.stringify(list(qualificationPolicy.optional_cells))
@@ -4858,18 +4860,31 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         ])
       && JSON.stringify(object(qualificationPolicy.quality_contract))
         === JSON.stringify({
+          producer_workflow: "packaged-platform-pr.yml",
+          producer_job: "frozen-candidate-quality",
           producer_cell: "protected_macos_arm64_metal",
-          corpus_id: "codestory-release-corpus-v1",
+          scheduled_once_per_frozen_candidate: true,
+          blocking: false,
+          closeout_dependency: false,
+          claimed: false,
+          archive_cache_key_fields: [
+            "source.commit",
+            "target",
+            "archive.sha256",
+          ],
+          archive_cache_contract: "candidate_archive_cache",
+          archive_transfer: "authenticated_miss_only",
+          evaluation_owner: "isolated_reusable_workflow",
+          evaluation_owner_sha256: frozenCandidateQualityWorkflowDigest,
           evaluation_contract: "publishable-three-repeat-packet/v1",
-          task_count: 3,
+          task_count: 1,
           repeats_per_task: 3,
-          row_count: 9,
+          row_count: 3,
         })
       && sameMembers(list(qualificationPolicy.required_evidence), [
         "qualification_scenarios",
         "true_idle_exit",
         "total_codestory_process_memory",
-        "retrieval_quality",
         "backend_observed_accelerator_residency",
       ])
       && sameMembers(list(qualificationPolicy.required_scenarios), [
@@ -5195,22 +5210,298 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     object(metal.with).server_behavior_only
         === "${{ needs.route.outputs.mode != 'qualification' }}"
-      && object(metal.with).quality_evidence_artifact === "",
-    `${file} qualification must run full Metal quality and lifecycle proof`,
+      && object(metal.with).quality_evidence_artifact === undefined,
+    `${file} qualification must run one full Metal lifecycle proof without optional quality inputs`,
+  );
+  const qualityCaller = requireJob(
+    violations,
+    file,
+    workflow,
+    "frozen-candidate-quality",
+  );
+  add(
+    violations,
+    sameMembers(needs(qualityCaller), [
+      "route",
+      "packaged-proof",
+      "macos-metal-proof",
+    ])
+      && qualityCaller.if
+        === "always() && needs.route.result == 'success' && needs.packaged-proof.result == 'success' && needs.macos-metal-proof.result == 'success' && needs.route.outputs.mode == 'qualification' && (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full')"
+      && qualityCaller.uses === frozenCandidateQualityWorkflowRef
+      && hasExactKeys(qualityCaller, ["name", "if", "needs", "uses", "with"])
+      && qualityCaller.secrets === undefined
+      && hasExactKeys(object(qualityCaller.with), ["ref", "version"])
+      && object(qualityCaller.with).ref === "${{ needs.route.outputs.head_sha }}"
+      && object(qualityCaller.with).version === "${{ needs.route.outputs.version }}",
+    `${file} optional quality must call its isolated owner once after protected Metal`,
+  );
+  const qualityFile = path.basename(frozenCandidateQualityWorkflowRef);
+  const qualityWorkflow = workflows.get(qualityFile);
+  if (!qualityWorkflow) {
+    violations.push(`${qualityFile} must exist`);
+    return;
+  }
+  add(
+    violations,
+    createHash("sha256").update(JSON.stringify(qualityWorkflow)).digest("hex")
+      === frozenCandidateQualityWorkflowDigest,
+    `${qualityFile} must match the reviewed isolated evaluation-owner structure`,
+  );
+  const qualityCall = object(trigger(qualityWorkflow, "workflow_call"));
+  const qualityInputs = object(qualityCall.inputs);
+  add(
+    violations,
+    trigger(qualityWorkflow, "workflow_dispatch") === undefined
+      && hasExactKeys(qualityInputs, ["ref", "version"])
+      && object(qualityInputs.ref).required === true
+      && object(qualityInputs.ref).type === "string"
+      && object(qualityInputs.version).required === true
+      && object(qualityInputs.version).type === "string"
+      && JSON.stringify(qualityWorkflow.permissions)
+        === JSON.stringify({ actions: "read", contents: "read" })
+      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality"]),
+    `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
+  );
+  const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
+  add(
+    violations,
+    JSON.stringify(quality["runs-on"])
+        === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"])
+      && quality.environment === "macos-metal-release"
+      && quality["continue-on-error"] === true
+      && quality["timeout-minutes"] === 60,
+    `${qualityFile} optional quality must stay nonblocking on protected Metal`,
+  );
+  const qualitySteps = list(quality.steps).map(object);
+  add(
+    violations,
+    qualitySteps.length === 9
+      && qualitySteps.filter(step => step.id === "quality").length === 1
+      && qualitySteps.filter(step => step.id === "quality-upload").length === 1,
+    `${qualityFile} must retain one authenticated measurement and upload boundary`,
+  );
+  const qualityCheckout = namedStep(quality, "Checkout exact frozen candidate");
+  add(
+    violations,
+    qualityCheckout?.uses === "actions/checkout@v5"
+      && hasExactKeys(object(qualityCheckout?.with), ["ref", "fetch-depth"])
+      && object(qualityCheckout?.with).ref === "${{ inputs.ref }}"
+      && object(qualityCheckout?.with)["fetch-depth"] === 0,
+    `${qualityFile} must check out the routed exact frozen candidate`,
+  );
+  const qualityAuthentication = namedStep(
+    quality,
+    "Authenticate exact candidate archive artifacts",
+  );
+  const qualityAuthenticationRun = shellLiteralNormalizedText(
+    stepRun(quality, "Authenticate exact candidate archive artifacts"),
+  );
+  add(
+    violations,
+    qualityAuthentication?.id === "candidate-artifacts"
+      && qualityAuthentication?.shell === "bash"
+      && qualityAuthentication?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityAuthentication?.env), ["GH_TOKEN", "HEAD_SHA"])
+      && object(qualityAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+      && object(qualityAuthentication?.env).HEAD_SHA === "${{ inputs.ref }}"
+      && qualityAuthenticationRun.includes("git rev-parse HEAD")
+      && qualityAuthenticationRun.includes(".head_repository.full_name")
+      && qualityAuthenticationRun.includes(
+        ".github/workflows/packaged-platform-pr.yml",
+      )
+      && qualityAuthenticationRun.includes(".head_sha")
+      && qualityAuthenticationRun.includes(".run_attempt")
+      && qualityAuthenticationRun.includes("select_artifact codestory-cli-macos-arm64")
+      && qualityAuthenticationRun.includes(
+        "select_artifact codestory-candidate-archive-record-macos-arm64",
+      )
+      && qualityAuthenticationRun.includes(".workflow_run.id == $run_id")
+      && qualityAuthenticationRun.includes(".workflow_run.head_sha == $sha")
+      && qualityAuthenticationRun.includes("package-id=$artifact_id")
+      && qualityAuthenticationRun.includes("package-bytes=$expected_size")
+      && qualityAuthenticationRun.includes(
+        "package-sha256=${expected_digest#sha256:}",
+      ),
+    `${qualityFile} must authenticate one current-run exact-head candidate archive and record`,
+  );
+  const qualityRecordDownload = namedStep(
+    quality,
+    "Download authenticated candidate record",
+  );
+  const qualityCacheRestore = namedStep(
+    quality,
+    "Restore exact candidate archive from protected host",
+  );
+  const qualityCacheMiss = namedStep(
+    quality,
+    "Download, authenticate, and admit candidate archive on miss",
+  );
+  add(
+    violations,
+    qualityRecordDownload?.uses === "actions/download-artifact@v8.0.1"
+      && hasExactKeys(object(qualityRecordDownload?.with), ["name", "path"])
+      && object(qualityRecordDownload?.with).name
+        === "codestory-candidate-archive-record-macos-arm64"
+      && object(qualityRecordDownload?.with).path
+        === "target/candidate-archive-record/macos-arm64"
+      && qualityCacheRestore?.id === "candidate-cache"
+      && qualityCacheRestore?.if === undefined
+      && qualityCacheRestore?.shell === "bash"
+      && qualityCacheRestore?.["continue-on-error"] === undefined,
+    `${qualityFile} cache lookup must consume only the exact small candidate record`,
+  );
+  requireStepRun(
+    violations,
+    qualityFile,
+    quality,
+    "Restore exact candidate archive from protected host",
+    [
+      "--arg repository \"$GITHUB_REPOSITORY\"",
+      "--arg source_sha \"$(git rev-parse HEAD)\"",
+      "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+      "--arg target macos-arm64",
+      ".source.commit == $source_sha",
+      ".source.tree == $source_tree",
+      ".target == $target",
+      "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+      "candidate-archive-store.mjs restore",
+      "--record \"$record\"",
+      "--output-dir target/release-dist",
+      "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
+    ],
+  );
+  add(
+    violations,
+    qualityCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
+      && qualityCacheMiss?.shell === "bash"
+      && qualityCacheMiss?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityCacheMiss?.env), [
+        "ARTIFACT_ID",
+        "EXPECTED_SHA256",
+        "EXPECTED_SIZE",
+        "GH_TOKEN",
+      ])
+      && object(qualityCacheMiss?.env).ARTIFACT_ID
+        === "${{ steps.candidate-artifacts.outputs.package-id }}"
+      && object(qualityCacheMiss?.env).EXPECTED_SIZE
+        === "${{ steps.candidate-artifacts.outputs.package-bytes }}"
+      && object(qualityCacheMiss?.env).EXPECTED_SHA256
+        === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
+      && object(qualityCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
+    `${qualityFile} archive transfer must be cache-miss-only and outer-digest authenticated`,
+  );
+  requireStepRun(
+    violations,
+    qualityFile,
+    quality,
+    "Download, authenticate, and admit candidate archive on miss",
+    [
+      "actions/artifacts/$ARTIFACT_ID/zip",
+      "--continue-at -",
+      "--max-time 120",
+      'test "$actual_size" = "$EXPECTED_SIZE"',
+      'test "$actual_digest" = "$EXPECTED_SHA256"',
+      "extract-candidate-actions-artifact.py",
+      "candidate-archive-store.mjs admit",
+      "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+      "--output-dir target/release-dist",
+    ],
+  );
+  const qualityProducer = qualitySteps.find(step => step.id === "quality");
+  const qualityProducerRun = shellLiteralNormalizedText(
+    String(qualityProducer?.run ?? ""),
+  );
+  add(
+    violations,
+    qualityProducer?.id === "quality"
+      && qualityProducer?.["continue-on-error"] === true
+      && qualityProducer?.shell === "bash"
+      && hasExactKeys(object(qualityProducer?.env), [
+        "VERSION",
+        "CODESTORY_EMBED_ALLOW_CPU",
+      ])
+      && object(qualityProducer?.env).VERSION === "${{ inputs.version }}"
+      && object(qualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && qualityProducerRun.includes(
+        "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
+      )
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=",
+      ) === 1
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=",
+      ) === 1
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CACHE_ID=",
+      ) === 1
+      && shellInvocationsContaining(qualityProducerRun, "--packet-runtime").length === 1
+      && qualityProducerRun.includes("--packet-runtime")
+      && qualityProducerRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(qualityProducerRun, "--task-manifest") === 1
+      && !qualityProducerRun.includes("--task-suite")
+      && !qualityProducerRun.includes("--task-ids")
+      && qualityProducerRun.includes("--materialize-repos")
+      && qualityProducerRun.includes("--repeats 3")
+      && qualityProducerRun.includes("--publishable")
+      && qualityProducerRun.includes("--max-source-reads-after-packet 0")
+      && qualityProducerRun.includes("--codestory-cli $packaged_cli")
+      && qualityProducerRun.includes("--timeout-ms 180000")
+      && qualityProducerRun.includes("--out-dir $quality_root/packet"),
+    `${qualityFile} must run exactly one pinned three-repeat publishable evaluator`,
+  );
+  const qualityUpload = qualitySteps.find(step => step.id === "quality-upload");
+  const qualityOutcome = namedStep(quality, "Record optional quality outcome");
+  add(
+    violations,
+    qualityUpload?.id === "quality-upload"
+      && qualityUpload?.if === "steps.quality.outcome == 'success'"
+      && qualityUpload?.["continue-on-error"] === true
+      && qualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(object(qualityUpload?.with), [
+        "name",
+        "path",
+        "if-no-files-found",
+        "retention-days",
+        "overwrite",
+      ])
+      && object(qualityUpload?.with).name
+        === "frozen-candidate-quality-${{ inputs.ref }}"
+      && object(qualityUpload?.with).path
+        === "target/frozen-candidate-quality/evidence"
+      && object(qualityUpload?.with)["if-no-files-found"] === "error"
+      && object(qualityUpload?.with)["retention-days"] === 30
+      && object(qualityUpload?.with).overwrite === true
+      && qualityOutcome?.if === "always()"
+      && qualityOutcome?.shell === "bash"
+      && qualityOutcome?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityOutcome?.env), [
+        "QUALITY_OUTCOME",
+        "UPLOAD_OUTCOME",
+      ])
+      && object(qualityOutcome?.env).QUALITY_OUTCOME
+        === "${{ steps.quality.outcome }}"
+      && object(qualityOutcome?.env).UPLOAD_OUTCOME
+        === "${{ steps.quality-upload.outcome }}"
+      && stepRun(quality, "Record optional quality outcome").includes(
+        'echo "- Release or qualification gate: \\`false\\`"',
+      ),
+    `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
   );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
-    sameMembers(needs(vulkan), ["route", "packaged-proof", "macos-metal-proof"]),
-    `${file} Windows qualification must wait for successful protected Metal quality`,
+    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
+    `${file} Windows qualification must run independently of optional Metal quality`,
   );
   add(
     violations,
     String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
-      && String(vulkan.if ?? "").includes(
-        "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success')",
-      ),
-    `${file} package-only mode must skip Windows while qualification requires successful Metal`,
+      && !String(vulkan.if ?? "").includes("needs.macos-metal-proof"),
+    `${file} package-only mode must skip Windows without serializing it behind Metal`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   add(
@@ -5221,9 +5512,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(vulkan.with).quality_evidence_artifact
-      === "${{ needs.route.outputs.mode == 'qualification' && format('frozen-candidate-quality-{0}', needs.route.outputs.head_sha) || '' }}",
-    `${file} Windows qualification must consume the exact protected Metal quality artifact`,
+    object(vulkan.with).quality_evidence_artifact === undefined,
+    `${file} Windows qualification must not consume optional quality evidence`,
   );
   add(
     violations,
@@ -5289,8 +5579,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(
     violations,
     !needs(closeout).includes("release-evidence")
-      && !scalarStrings(closeout).some(value => value.includes("EVIDENCE_RESULT")),
-    `${file} normal closeout must not depend on optional release evidence`,
+      && !needs(closeout).includes("frozen-candidate-quality")
+      && !scalarStrings(closeout).some(value =>
+        value.includes("EVIDENCE_RESULT")
+          || value.includes("QUALITY_RESULT")
+          || value.includes("frozen-candidate-quality")
+      ),
+    `${file} normal closeout must not depend on optional release or quality evidence`,
   );
   const closeoutProofName = "Require one coherent accepted proof";
   const closeoutProof = namedStep(closeout, closeoutProofName);
@@ -5469,6 +5764,11 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, metalFile, metal, event, key);
       }
+      add(
+        violations,
+        at(metal, "on", event, "inputs", "quality_evidence_artifact") === undefined,
+        `${metalFile} ${event} must not accept optional quality evidence`,
+      );
     }
     const candidateInput = object(at(
       metal,
@@ -5838,97 +6138,11 @@ function validateRemainingWorkflows(workflows, violations) {
         "Verify packaged qualification driver",
         "Prove protected Metal runtime",
         [
-          "Download exact-head publishable packet quality evidence",
-          "Produce exact-head holdout quality on protected Metal",
-          "Upload exact-head protected Metal quality evidence",
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
         ],
       ),
       `${metalFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head publishable packet quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(qualityDownload?.with, ["name", "path"])
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence",
-      `${metalFile} imported quality evidence must bind the caller-selected exact artifact`,
-    );
-    const qualityProducerName = "Produce exact-head holdout quality on protected Metal";
-    const qualityProducer = namedStep(job, qualityProducerName);
-    const qualityProducerRun = shellLiteralNormalizedText(
-      stepRun(job, qualityProducerName),
-    );
-    add(
-      violations,
-      qualityProducer?.if
-        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
-        && qualityProducer?.shell === "bash"
-        && hasExactKeys(qualityProducer?.env, ["VERSION", "CODESTORY_EMBED_ALLOW_CPU"])
-        && object(qualityProducer?.env).VERSION === "${{ inputs.version }}"
-        && object(qualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
-        && qualityProducerRun.includes(
-          "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
-        )
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cli.")
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cache.")
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-stdio.")
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_PROFILE=protected-macos-arm64-metal",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v1",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/holdout-retrieval-v1.json",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-holdout-v1",
-        )
-        && shellInvocationsContaining(
-          qualityProducerRun,
-          "node scripts/codestory-agent-ab-benchmark.mjs",
-        ).length === 1
-        && qualityProducerRun.includes("--packet-runtime")
-        && qualityProducerRun.includes("--packet-runtime-mode cold-cli")
-        && qualityProducerRun.includes("--task-suite holdout-retrieval")
-        && qualityProducerRun.includes("--materialize-repos")
-        && qualityProducerRun.includes("--repeats 3")
-        && qualityProducerRun.includes("--publishable")
-        && qualityProducerRun.includes("--max-source-reads-after-packet 0")
-        && qualityProducerRun.includes("--codestory-cli $packaged_cli")
-        && qualityProducerRun.includes("--timeout-ms 180000")
-        && qualityProducerRun.includes("--out-dir $quality_root/packet"),
-      `${metalFile} protected Metal must generate one exact-head three-repeat holdout quality artifact for qualification`,
-    );
-    const qualityUploadName = "Upload exact-head protected Metal quality evidence";
-    const qualityUpload = namedStep(job, qualityUploadName);
-    add(
-      violations,
-      qualityUpload?.if
-        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
-        && qualityUpload?.uses === "actions/upload-artifact@v7.0.1"
-        && hasExactKeys(
-          qualityUpload?.with,
-          ["name", "path", "if-no-files-found", "retention-days", "overwrite"],
-        )
-        && object(qualityUpload?.with).name
-          === "frozen-candidate-quality-${{ inputs.ref || github.sha }}"
-        && object(qualityUpload?.with).path === "target/release-quality-evidence"
-        && object(qualityUpload?.with)["if-no-files-found"] === "error"
-        && object(qualityUpload?.with)["retention-days"] === 30
-        && object(qualityUpload?.with).overwrite === true
-        && stepIndex(job, qualityUploadName) > stepIndex(job, qualityProducerName)
-        && stepIndex(job, "Prove protected Metal runtime")
-          > stepIndex(job, qualityUploadName),
-      `${metalFile} protected Metal quality must upload one exact-head stable handoff before qualification`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -6028,7 +6242,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--server-behavior-only",
-      'test -f "$quality_path"',
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(
@@ -6194,19 +6407,10 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, vulkanFile, vulkan, event, key);
       }
-      const qualityInput = object(at(
-        vulkan,
-        "on",
-        event,
-        "inputs",
-        "quality_evidence_artifact",
-      ));
       add(
         violations,
-        qualityInput.required === false
-          && qualityInput.type === "string"
-          && (qualityInput.default === "" || qualityInput.default === undefined),
-        `${vulkanFile} ${event} quality_evidence_artifact must be an optional empty string`,
+        at(vulkan, "on", event, "inputs", "quality_evidence_artifact") === undefined,
+        `${vulkanFile} ${event} must not accept optional quality evidence`,
       );
     }
     const candidateInput = object(at(
@@ -6613,26 +6817,11 @@ function validateRemainingWorkflows(workflows, violations) {
         "Verify packaged qualification driver",
         "Prove protected Windows Vulkan runtime",
         [
-          "Download exact-head publishable packet quality evidence",
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
         ],
       ),
       `${vulkanFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head publishable packet quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(qualityDownload?.with, ["name", "path"])
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence",
-      `${vulkanFile} qualification must download the exact protected Metal quality handoff`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -6650,7 +6839,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--server-behavior-only",
-      "Test-Path $qualityPath",
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(job, "Prove protected Windows Vulkan runtime");
@@ -6683,11 +6871,11 @@ function validateRemainingWorkflows(workflows, violations) {
         && engineRun.includes(
           '"--qualification-evidence", "target/windows-vulkan-proof/qualification.json"',
         )
-        && engineRun.includes('"--retrieval-quality-evidence", $qualityPath')
+        && !engineRun.includes("--retrieval-quality-evidence")
         && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
         && occurrenceCount(engineRun, "--calibration-bundle") === 1
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
-      `${vulkanFile} server-behavior proof must omit calibration while qualification runs one full lifecycle and quality proof`,
+      `${vulkanFile} server-behavior proof must omit calibration while qualification runs one lifecycle proof without optional quality`,
     );
     add(
       violations,
@@ -6853,13 +7041,10 @@ function validateRemainingWorkflows(workflows, violations) {
         requireOptionalStringInput(violations, linuxVulkanFile, linuxVulkan, event, key);
       }
       for (const key of ["quality_evidence_artifact", "quality_evidence_run_id"]) {
-        const input = object(at(linuxVulkan, "on", event, "inputs", key));
         add(
           violations,
-          input.required === false
-            && input.type === "string"
-            && (input.default === "" || input.default === undefined),
-          `${linuxVulkanFile} ${event} ${key} must be an optional empty string`,
+          at(linuxVulkan, "on", event, "inputs", key) === undefined,
+          `${linuxVulkanFile} ${event} must not accept ${key}`,
         );
       }
       add(
@@ -7250,78 +7435,9 @@ function validateRemainingWorkflows(workflows, violations) {
         [
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
-          "Authenticate protected Metal quality producer",
-          "Download exact-head protected Metal quality evidence",
         ],
       ),
       `${linuxVulkanFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityAuthentication = namedStep(
-      job,
-      "Authenticate protected Metal quality producer",
-    );
-    const qualityAuthenticationRun = stepRun(
-      job,
-      "Authenticate protected Metal quality producer",
-    );
-    add(
-      violations,
-      qualityAuthentication?.if === "${{ !inputs.server_behavior_only }}"
-        && qualityAuthentication?.shell === "bash"
-        && hasExactKeys(qualityAuthentication?.env, [
-          "GH_TOKEN",
-          "QUALITY_ARTIFACT",
-          "QUALITY_RUN_ID",
-        ])
-        && object(qualityAuthentication?.env).GH_TOKEN === "${{ github.token }}"
-        && object(qualityAuthentication?.env).QUALITY_ARTIFACT
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityAuthentication?.env).QUALITY_RUN_ID
-          === "${{ inputs.quality_evidence_run_id }}"
-        && qualityAuthenticationRun.includes('test -n "$QUALITY_ARTIFACT"')
-        && qualityAuthenticationRun.includes('test -n "$QUALITY_RUN_ID"')
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.head_repository.full_name\' <<<"$run")" = "$GITHUB_REPOSITORY"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.path\' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.event\' <<<"$run")" = workflow_dispatch',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.conclusion\' <<<"$run")" = success',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$producer_sha" = "$(git rev-parse HEAD)"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$QUALITY_ARTIFACT" = "frozen-candidate-quality-$producer_sha"',
-        )
-        && qualityAuthenticationRun.includes('test "$artifact_count" = 1'),
-      `${linuxVulkanFile} standalone qualification must authenticate exact-head protected Metal quality`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head protected Metal quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "${{ !inputs.server_behavior_only }}"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(
-          qualityDownload?.with,
-          ["name", "path", "run-id", "github-token"],
-        )
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence"
-        && object(qualityDownload?.with)["run-id"]
-          === "${{ inputs.quality_evidence_run_id }}"
-        && object(qualityDownload?.with)["github-token"] === "${{ github.token }}"
-        && stepIndex(job, "Download exact-head protected Metal quality evidence")
-          > stepIndex(job, "Authenticate protected Metal quality producer"),
-      `${linuxVulkanFile} standalone qualification must consume the authenticated protected Metal quality artifact`,
     );
     const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
     requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
@@ -7351,11 +7467,8 @@ function validateRemainingWorkflows(workflows, violations) {
       engineRun.includes("calibration_args=()")
         && engineRun.includes('"${calibration_args[@]}"')
         && engineRun.includes('claim_args=(--server-behavior-only)')
-        && engineRun.includes("quality_args=()")
         && engineRun.includes("qualification_args=()")
-        && normalizedEngineRun.includes(
-          "quality_args=(--retrieval-quality-evidence $quality_path)",
-        )
+        && !normalizedEngineRun.includes("--retrieval-quality-evidence")
         && normalizedEngineRun.includes("--produce-qualification-evidence")
         && object(engine?.env).VERIFIED_QUALIFICATION_DRIVER
           === "${{ steps.qualification-driver.outputs.path }}"
@@ -7374,7 +7487,7 @@ function validateRemainingWorkflows(workflows, violations) {
         && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
         && occurrenceCount(engineRun, "--calibration-bundle") === 1
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
-      `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one full lifecycle and quality proof`,
+      `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one lifecycle proof without optional quality`,
     );
     requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
       "--prepare-candidate-installed-proof",
@@ -8207,9 +8320,22 @@ export function absorbedFailureViolations(workflows) {
       // A job-level `continue-on-error` downgrades every step it contains at once, and the only
       // thing that can still require the failure is a downstream job reading `needs.<id>.result`.
       if (absorbs(job["continue-on-error"])) {
+        // The separately validated frozen-candidate adjunct is intentionally unclaimed and non-gating,
+        // including runner loss and timeout. It cannot appear in a downstream `needs` edge:
+        // doing so would turn optional evidence back into a closeout dependency. Its exact job
+        // structure, activation, protected host, cache boundary, evaluator, and outcome recorder
+        // are pinned by validatePackagedCoordinator and the whole-workflow digest.
+        const isOptionalFrozenCandidateQuality =
+          file === frozenCandidateQualityWorkflowRef.slice(
+            frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
+          )
+          && jobId === "quality";
         add(
           violations,
-          scalarStrings(workflow.jobs).some(text => text.includes(`needs.${jobId}.result`)),
+          isOptionalFrozenCandidateQuality
+            || scalarStrings(workflow.jobs).some(
+              text => text.includes(`needs.${jobId}.result`),
+            ),
           `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
         );
       }
@@ -8500,10 +8626,6 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
       name: "embedding-calibration-macos-${{ inputs.version }}",
       path: "target/calibration-runs/macos",
-    }],
-    ["macos-metal-proof.yml/packaged-metal/Upload exact-head protected Metal quality evidence", {
-      name: "frozen-candidate-quality-${{ inputs.ref || github.sha }}",
-      path: "target/release-quality-evidence",
     }],
     ["release.yml/pre-publish-closeout/Upload accepted pre-publish closeout", {
       name: "release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}",

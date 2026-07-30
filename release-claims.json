@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 10,
+  "graph_version": 11,
   "graph_id": "codestory-release-claims",
   "standard_release_claims": [
     "source_behavior",
@@ -1216,16 +1216,14 @@
           "workflow": "macos-metal-proof.yml",
           "job": "packaged-metal",
           "policy": "accelerated",
-          "backend": "metal",
-          "produces_quality": true
+          "backend": "metal"
         },
         {
           "id": "protected_windows_x64_vulkan",
           "workflow": "windows-vulkan-proof.yml",
           "job": "packaged-vulkan",
           "policy": "accelerated",
-          "backend": "vulkan",
-          "produces_quality": false
+          "backend": "vulkan"
         }
       ],
       "optional_cells": [
@@ -1241,18 +1239,31 @@
         }
       ],
       "quality_contract": {
+        "producer_workflow": "packaged-platform-pr.yml",
+        "producer_job": "frozen-candidate-quality",
         "producer_cell": "protected_macos_arm64_metal",
-        "corpus_id": "codestory-release-corpus-v1",
+        "scheduled_once_per_frozen_candidate": true,
+        "blocking": false,
+        "closeout_dependency": false,
+        "claimed": false,
+        "archive_cache_key_fields": [
+          "source.commit",
+          "target",
+          "archive.sha256"
+        ],
+        "archive_cache_contract": "candidate_archive_cache",
+        "archive_transfer": "authenticated_miss_only",
+        "evaluation_owner": "isolated_reusable_workflow",
+        "evaluation_owner_sha256": "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
         "evaluation_contract": "publishable-three-repeat-packet/v1",
-        "task_count": 3,
+        "task_count": 1,
         "repeats_per_task": 3,
-        "row_count": 9
+        "row_count": 3
       },
       "required_evidence": [
         "qualification_scenarios",
         "true_idle_exit",
         "total_codestory_process_memory",
-        "retrieval_quality",
         "backend_observed_accelerator_residency"
       ],
       "required_scenarios": [

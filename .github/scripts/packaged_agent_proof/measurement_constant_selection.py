@@ -226,7 +226,7 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
             ],
             "constant_set_comparison": "exact_recomputed_runtime_constants_and_freeze_record",
             "qualification_boundary": (
-                "lifecycle_fault_idle_memory_quality_accelerator_and_performance_are_frozen_candidate_qualification_only"
+                "lifecycle_fault_idle_memory_accelerator_and_performance_are_frozen_candidate_qualification_only"
             ),
         },
         "measurement calibration-bundle contract is incomplete or mutable",
@@ -239,6 +239,8 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
         and rules.get("missing_required_cell_fails") is True
         and rules.get("calibration_runs_full_qualification") is False
         and rules.get("qualification_runs_once_per_available_gpu_platform") is True
+        and rules.get("optional_quality_adjunct_is_nonblocking") is True
+        and rules.get("quality_is_not_a_qualification_metric") is True
         and rules.get("threshold_movement_after_results") is False,
         "calibration and qualification boundary is incomplete or mutable",
     )

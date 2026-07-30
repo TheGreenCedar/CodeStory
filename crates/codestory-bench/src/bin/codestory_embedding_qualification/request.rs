@@ -36,7 +36,6 @@ pub(super) const REQUIRED_METRICS: &[&str] = &[
     "cold_first_vector",
     "existing_owner_connect",
     "first_product_ready",
-    "retrieval_quality",
     "spawn_convergence",
     "total_codestory_process_memory",
     "true_idle_exit",

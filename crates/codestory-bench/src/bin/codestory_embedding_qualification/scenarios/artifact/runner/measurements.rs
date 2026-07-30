@@ -588,16 +588,13 @@ impl<'a> ScenarioRunner<'a> {
             BTreeMap::new(),
         )?;
 
-        if metrics.len() != REQUIRED_METRICS.len().saturating_sub(2) {
+        if metrics.len() != REQUIRED_METRICS.len().saturating_sub(1) {
             bail!("embedding_qualification_measurement_set_incomplete");
         }
         Ok(MeasurementArtifact {
             schema_version: 2,
             contracts: self.context.contracts.clone(),
-            external_metrics: vec![
-                "retrieval_quality".into(),
-                "total_codestory_process_memory".into(),
-            ],
+            external_metrics: vec!["total_codestory_process_memory".into()],
             metrics,
         })
     }

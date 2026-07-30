@@ -14,7 +14,6 @@ from .contract_primitives import (
 from .foundation import require
 from .qualification_measurements import qualification_measurement_artifact
 from .qualification_production_types import (
-    QualificationExternalEvidence,
     QualificationProducerContext,
     QualificationRunnerEvidence,
 )
@@ -108,16 +107,9 @@ def _qualification_host(
 def _qualification_metric_value(
     metric: str,
     *,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> float | int | None:
-    if metric == "retrieval_quality":
-        return (
-            external.retrieval_quality["publishable_packet_pass_rate"]
-            if external.retrieval_quality is not None
-            else None
-        )
     if metric == "total_codestory_process_memory":
         return memory["value"]
     return measurement["values"][metric]
@@ -126,16 +118,9 @@ def _qualification_metric_value(
 def _qualification_raw_metric_evidence(
     metric: str,
     *,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> dict:
-    if metric == "retrieval_quality":
-        require(
-            external.retrieval_quality is not None,
-            "qualification retrieval quality omitted publishable packet evidence",
-        )
-        return external.retrieval_quality
     if metric == "total_codestory_process_memory":
         return memory["artifact"]
     return measurement["artifact"]
@@ -145,7 +130,6 @@ def _retained_qualification_metric(
     metric: str,
     *,
     context: QualificationProducerContext,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> dict:
@@ -153,31 +137,15 @@ def _retained_qualification_metric(
     contract = protocol["metric_contracts"][metric]
     value = _qualification_metric_value(
         metric,
-        external=external,
         measurement=measurement,
         memory=memory,
     )
-    if metric == "retrieval_quality" and value is None:
-        require(
-            context.args.proof_tier == "calibration",
-            "qualification retrieval quality omitted publishable packet evidence",
-        )
-        return {
-            "status": "not_measured",
-            "unit": contract["unit"],
-            "value": None,
-            "reason": (
-                "calibration omitted the separately produced exact-head "
-                "publishable packet artifact"
-            ),
-        }
     require(
         isinstance(value, (int, float)) and not isinstance(value, bool),
         f"qualification metric {metric} is not numeric",
     )
     raw_evidence = _qualification_raw_metric_evidence(
         metric,
-        external=external,
         measurement=measurement,
         memory=memory,
     )
@@ -213,7 +181,6 @@ def _retained_qualification_metric(
 def collect_qualification_measurements(
     context: QualificationProducerContext,
     runner: QualificationRunnerEvidence,
-    external: QualificationExternalEvidence,
 ) -> QualificationMeasurementEvidence:
     measurement, memory = _qualification_measurement_sources(context, runner)
     timing = {
@@ -229,7 +196,6 @@ def collect_qualification_measurements(
         metric: _retained_qualification_metric(
             metric,
             context=context,
-            external=external,
             measurement=measurement,
             memory=memory,
         )

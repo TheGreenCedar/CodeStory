@@ -7,16 +7,18 @@ from pathlib import Path
 from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
-    require_positive_int,
     require_sha256,
 )
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
-    MIN_RETRIEVAL_QUALITY_REPEATS,
-    RELEASE_QUALITY_CORPUS_ID,
+    REQUIRED_QUALIFICATION_METRICS,
+    REQUIRED_SERVER_SCENARIO_ASSERTIONS,
     REQUIRED_SERVER_SCENARIOS,
-    RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
     require,
+)
+from .measurement_protocol_validation import (
+    EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256,
+    qualification_measurement_shape_sha256,
 )
 from .qualification_retained_types import (
     RetainedMeasurementBinding,
@@ -52,12 +54,25 @@ def _verified_scenario_artifact_names(scenario_id: str, artifacts: object) -> se
 
 def _verify_scenarios(contract: RetainedQualificationContract) -> None:
     scenarios = contract.evidence.scenarios
-    scenario_contracts = contract.measurement_contract["measurement_protocol"][
-        "scenario_contracts"
-    ]
+    protocol = contract.measurement_contract["measurement_protocol"]
+    scenario_contracts = protocol["scenario_contracts"]
+    require(
+        qualification_measurement_shape_sha256(protocol)
+        == EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256,
+        "retained qualification measurement shape changed",
+    )
     require(
         set(scenarios) == REQUIRED_SERVER_SCENARIOS,
         "retained qualification scenario set is incomplete",
+    )
+    require(
+        set(scenario_contracts) == REQUIRED_SERVER_SCENARIOS
+        and all(
+            set(scenario_contracts[scenario_id]["required"])
+            == REQUIRED_SERVER_SCENARIO_ASSERTIONS[scenario_id]
+            for scenario_id in REQUIRED_SERVER_SCENARIOS
+        ),
+        "retained qualification scenario assertion contracts changed",
     )
     for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
         scenario = scenarios.get(scenario_id)
@@ -115,6 +130,10 @@ def _normalized_retained_metrics(
     protocol = contract.measurement_contract["measurement_protocol"]
     required_metrics = set(protocol["required_metrics"])
     require(
+        required_metrics == REQUIRED_QUALIFICATION_METRICS,
+        "retained qualification metric contract must remain lifecycle-only",
+    )
+    require(
         set(metrics) == required_metrics,
         "retained qualification metric set is incomplete",
     )
@@ -153,90 +172,12 @@ def _normalized_retained_metrics(
         raw_evidence = result.get("raw_evidence")
         require(
             isinstance(raw_evidence, dict),
-            (
-                "retrieval quality metric omitted raw evidence"
-                if metric == "retrieval_quality"
-                else f"metric {metric} omitted its raw measurement artifact"
-            ),
+            f"metric {metric} omitted its raw measurement artifact",
         )
         normalized.append(
             RetainedMetric(metric, value, threshold, comparison, raw_evidence)
         )
     return tuple(normalized)
-
-
-def _verify_retrieval_quality_metric(
-    contract: RetainedQualificationContract,
-    metric: RetainedMetric,
-) -> None:
-    raw_evidence = metric.raw_evidence
-    require_exact_keys(
-        raw_evidence,
-        {
-            "artifact",
-            "evaluation_contract",
-            "source_commit",
-            "source_tree",
-            "corpus_id",
-            "holdout_manifest_set_sha256",
-            "repeats",
-            "row_count",
-            "passing_row_count",
-            "publishable_packet_pass_rate",
-        },
-        "retrieval quality retained raw evidence",
-    )
-    artifact = raw_evidence["artifact"]
-    require(isinstance(artifact, dict), "retrieval quality raw artifact is malformed")
-    require_exact_keys(artifact, {"name", "sha256"}, "retrieval quality raw artifact")
-    require(
-        artifact["name"] == "packet-runtime-summary.json",
-        "retrieval quality raw artifact name is invalid",
-    )
-    require_sha256(artifact["sha256"], "retrieval quality raw artifact sha256")
-    require(
-        raw_evidence["evaluation_contract"] == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
-        "retrieval quality retained evaluation contract changed",
-    )
-    require(
-        raw_evidence["source_commit"] == contract.evidence.source["commit"]
-        and raw_evidence["source_tree"] == contract.evidence.source["tree"],
-        "retrieval quality retained source identity is stale",
-    )
-    require(
-        require_positive_int(raw_evidence["repeats"], "retrieval quality repeats")
-        == MIN_RETRIEVAL_QUALITY_REPEATS,
-        "retrieval quality retained the wrong repeat count",
-    )
-    require(
-        raw_evidence["corpus_id"] == RELEASE_QUALITY_CORPUS_ID,
-        "retrieval quality retained the wrong holdout corpus",
-    )
-    require_sha256(
-        raw_evidence["holdout_manifest_set_sha256"],
-        "retrieval quality holdout manifest set sha256",
-    )
-    row_count = require_positive_int(
-        raw_evidence["row_count"],
-        "retrieval quality row count",
-    )
-    require(
-        require_positive_int(
-            raw_evidence["passing_row_count"],
-            "retrieval quality passing row count",
-        )
-        == row_count,
-        "retrieval quality retained a failing row",
-    )
-    pass_rate = raw_evidence["publishable_packet_pass_rate"]
-    require(
-        isinstance(pass_rate, (int, float)) and not isinstance(pass_rate, bool),
-        "retrieval quality pass rate is not numeric",
-    )
-    require(
-        pass_rate == metric.value,
-        "retrieval quality metric does not match its raw evidence",
-    )
 
 
 def _verify_measurement_metric(metric: RetainedMetric) -> None:
@@ -265,10 +206,7 @@ def _verify_metrics(
 ) -> tuple[RetainedMetric, ...]:
     metrics = _normalized_retained_metrics(contract)
     for metric in metrics:
-        if metric.name == "retrieval_quality":
-            _verify_retrieval_quality_metric(contract, metric)
-        else:
-            _verify_measurement_metric(metric)
+        _verify_measurement_metric(metric)
         passed = {
             "equal": metric.value == metric.threshold,
             "greater_than_or_equal": metric.value >= metric.threshold,

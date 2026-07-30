@@ -167,10 +167,6 @@
     "backend_observed_accelerator_residency": [
       "accelerator_measurement_started",
       "backend_residency_evidence_validated"
-    ],
-    "retrieval_quality": [
-      "publishable_packet_candidate_fixed",
-      "publishable_packet_pass_rate_scored"
     ]
   },
   "calibration_phase_boundaries": {
@@ -307,12 +303,6 @@
       "owner_state": "resident",
       "operation": "engine_identity",
       "input_generator": "none"
-    },
-    "retrieval_quality": {
-      "workload_id": "publishable_three_repeat_packet_v1",
-      "owner_state": "external_exact_head_artifact",
-      "operation": "packet_runtime",
-      "input_generator": "holdout_retrieval_suite"
     }
   },
   "required_scenarios": [
@@ -455,11 +445,6 @@
       "sample_count": 1,
       "aggregation": "exact",
       "single_sample_reason": "categorical backend identity and residency counters are validated rather than estimated"
-    },
-    "retrieval_quality": {
-      "sample_count": 3,
-      "aggregation": "all_rows_pass_rate",
-      "external_contract": "publishable-three-repeat-packet/v1"
     }
   },
   "calibration_required_metrics": [
@@ -674,16 +659,16 @@
       "calibration_required_values"
     ],
     "constant_set_comparison": "exact_recomputed_runtime_constants_and_freeze_record",
-    "qualification_boundary": "lifecycle_fault_idle_memory_quality_accelerator_and_performance_are_frozen_candidate_qualification_only"
+    "qualification_boundary": "lifecycle_fault_idle_memory_accelerator_and_performance_are_frozen_candidate_qualification_only"
   },
   "measurement_rules": {
     "calibration_and_qualification_are_distinct": true,
-    "quality_artifact_uses_exact_candidate_source_and_tree": true,
-    "quality_uses_publishable_three_repeat_packet_contract": true,
     "constants_frozen_before_qualification": true,
     "missing_required_cell_fails": true,
     "calibration_runs_full_qualification": false,
     "qualification_runs_once_per_available_gpu_platform": true,
+    "optional_quality_adjunct_is_nonblocking": true,
+    "quality_is_not_a_qualification_metric": true,
     "outlier_removal": "none",
     "performance_block_rejects_unplanned_suspend_or_power_transition": true,
     "threshold_movement_after_results": false
@@ -700,8 +685,7 @@
     "busy_retry_usefulness",
     "true_idle_exit",
     "total_codestory_process_memory",
-    "backend_observed_accelerator_residency",
-    "retrieval_quality"
+    "backend_observed_accelerator_residency"
   ],
   "metric_contracts": {
     "backend_observed_accelerator_residency": {
@@ -731,10 +715,6 @@
     "first_product_ready": {
       "comparison": "less_than_or_equal",
       "unit": "milliseconds"
-    },
-    "retrieval_quality": {
-      "comparison": "greater_than_or_equal",
-      "unit": "publishable_packet_pass_rate"
     },
     "spawn_convergence": {
       "comparison": "less_than_or_equal",

@@ -103,7 +103,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 10);
+  assert.equal(graph.graph_version, 11);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -360,13 +360,34 @@ test("claim graph freezes one GPU-only qualification run per available platform"
   assert.equal(qualification.optional_cells[0].closeout_dependency, false);
   assert.equal(qualification.optional_cells[0].blocking, false);
   assert.deepEqual(qualification.quality_contract, {
+    producer_workflow: "packaged-platform-pr.yml",
+    producer_job: "frozen-candidate-quality",
     producer_cell: "protected_macos_arm64_metal",
-    corpus_id: "codestory-release-corpus-v1",
+    scheduled_once_per_frozen_candidate: true,
+    blocking: false,
+    closeout_dependency: false,
+    claimed: false,
+    archive_cache_key_fields: [
+      "source.commit",
+      "target",
+      "archive.sha256",
+    ],
+    archive_cache_contract: "candidate_archive_cache",
+    archive_transfer: "authenticated_miss_only",
+    evaluation_owner: "isolated_reusable_workflow",
+    evaluation_owner_sha256:
+      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
     evaluation_contract: "publishable-three-repeat-packet/v1",
-    task_count: 3,
+    task_count: 1,
     repeats_per_task: 3,
-    row_count: 9,
+    row_count: 3,
   });
+  assert.deepEqual(qualification.required_evidence, [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "backend_observed_accelerator_residency",
+  ]);
   assert.equal(
     qualification.true_idle_timeout_ms
       + qualification.true_idle_observation_grace_ms,
@@ -409,8 +430,37 @@ test("claim graph freezes one GPU-only qualification run per available platform"
       draft.workflow_policy.qualification.optional_cells[0].blocking = true;
     }, /standalone and nonblocking/u],
     [draft => {
-      draft.workflow_policy.qualification.quality_contract.row_count = 3;
-    }, /protected Metal 3x3 holdout matrix/u],
+      draft.workflow_policy.qualification.quality_contract.row_count = 9;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.blocking = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.claimed = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_transfer = "unconditional_download";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_key_fields.shift();
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_contract = "mutable_candidate_cache";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner =
+        "protected_product_path";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner_sha256 =
+        "0".repeat(64);
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_evidence.push("retrieval_quality");
+    }, /without optional retrieval quality/u],
     [draft => {
       draft.workflow_policy.qualification.required_scenarios.pop();
     }, /each lifecycle and fault scenario once/u],

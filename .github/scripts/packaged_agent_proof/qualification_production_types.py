@@ -36,7 +36,6 @@ class QualificationProducerContext:
 class QualificationExternalEvidence:
     publication_fault: dict
     fault_recovery_consistency: dict | None
-    retrieval_quality: dict | None
 
 
 @dataclass(frozen=True)

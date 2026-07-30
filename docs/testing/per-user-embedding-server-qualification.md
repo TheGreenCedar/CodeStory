@@ -104,11 +104,8 @@ Each passing record contains:
 - shared endpoint, lifetime authority, listener, server, engine owner, native
   worker, load generation, and model-load identity;
 - every preregistered scenario assertion plus hashes of its raw artifacts;
-- every required metric, its unit, frozen threshold, comparison, and result.
-  Retrieval quality is the pass rate derived from the exact-head
-  `publishable-three-repeat-packet/v1` raw packet artifact; the verifier binds
-  its source commit and tree, requires every declared repeat and row, and
-  recomputes the 1.0 pass rate instead of trusting a declared quality result;
+- every required lifecycle, performance, memory, and accelerator metric, its
+  unit, frozen threshold, comparison, and result;
 - explicit lower-tier nonclaims; and
 - the highest tier actually exercised.
 
@@ -146,21 +143,23 @@ python .github/scripts/check-packaged-agent-proof.py \
 The proof harness authenticates and unpacks once, prepares its projects and
 model once, then records three fresh server generations with one sample per
 constant-source metric. It does not run qualification scenarios or collect
-true-idle, memory, retrieval-quality, or accelerator evidence. Those belong to
-frozen-candidate qualification. Optional Linux Vulkan calibration is
-manual-only and cannot feed or block the frozen bundle.
+true-idle, memory, retrieval-quality, or accelerator evidence. True-idle,
+memory, and accelerator evidence belong to frozen-candidate qualification;
+retrieval quality belongs to the separate optional adjunct. Optional Linux
+Vulkan calibration is manual-only and cannot feed or block the frozen bundle.
 The collector owns its private synthetic project. The retained calibration
 directory must start empty, and ordinary proof output must remain outside it.
 
-Frozen-candidate qualification passes `--retrieval-quality-evidence` the
-exact-head `packet-runtime-summary.json` produced on protected Metal from the
-packaged candidate. That artifact covers all three checked-in
-`holdout-retrieval` tasks for three cold-CLI repeats. Metal and Windows Vulkan
-each consume it while running the full qualification suite once. Linux Vulkan
-may consume the same artifact through a standalone protected-runner dispatch;
-its absence does not block the coordinator. v0.16 release closeout does not
-consume this optional evaluation artifact. Hosted and protected package tiers
-may bind the unpacked archive through the source plugin launcher.
+Frozen-candidate answer quality runs separately on protected Metal after its
+package proof. It uses the exact Axios JavaScript/TypeScript v2 task and
+checksum-bound project manifest for three cold-CLI repeats against the same
+authenticated candidate archive. The resulting `packet-runtime-summary.json`
+is optional evaluation evidence: lifecycle qualification does not accept it as
+an input, no platform or closeout job depends on it, and v0.16 makes no
+answer-quality claim. Release decisions consume the independent coordinator
+`closeout` result rather than waiting for optional quality or workflow-wide
+completion. Hosted and protected package tiers may bind the unpacked archive
+through the source plugin launcher.
 `installed_runtime` instead requires the managed installed plugin and managed
 executable it claims; it rejects
 `CODESTORY_CLI`, a repository-source plugin root, and a direct unpacked binary
@@ -176,8 +175,9 @@ The standard release path is narrower than qualification. On each protected
 host, `--server-behavior-only` initializes one plugin host, grounds one real
 project, waits for search readiness in that same project, and verifies the
 installed engine, server, package, and expected Metal or Vulkan backend
-identity. It rejects calibration and retrieval-quality inputs and makes no
-two-host sharing, answer-quality, performance, or broader lifecycle claim.
+identity. It rejects calibration inputs, has no retrieval-quality input, and
+makes no two-host sharing, answer-quality, performance, or broader lifecycle
+claim.
 
 The explicit `linux` coordinator scope runs that protected Linux x64 Vulkan
 package and candidate-installed proof without scheduling Mac or Windows
