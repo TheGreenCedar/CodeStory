@@ -1187,25 +1187,25 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
@@ -1239,13 +1239,11 @@ test("qualification driver is built once, retained privately, authenticated, and
         '--target-dir "${CARGO_TARGET_DIR:-target}"',
       );
     }, /retain one archive-bound private qualification driver beside each selected package/u],
-    ["package artifact drops private driver directory", packagedFile, workflow => {
+    ["public package artifact admits the private driver", packagedFile, workflow => {
       const upload = draftStep(packagedJob(workflow), "Upload release asset");
-      upload.with.path = upload.with.path.replace(
-        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n",
-        "",
-      );
-    }, /existing package artifact must retain the private driver directory/u],
+      upload.with.path +=
+        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
     ["public archive includes qualification driver", packagedFile, workflow => {
       draftStep(packagedJob(workflow), "Package release asset").run +=
         "\ntar -rf \"$archive\" target/release-dist/qualification-driver";
@@ -1326,13 +1324,13 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Windows trusts an arbitrary producer workflow", windowsFile, workflow => {
       const authenticate = draftStep(
         windowsJob(workflow),
-        "Authenticate exact Windows package producer",
+        "Authenticate exact Windows candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         '$env:CANDIDATE_PRODUCER_WORKFLOW_PATH -notin $allowedWorkflows',
         "$false",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate the exact candidate record, package, and private driver from an allowlisted producer/u],
     ["Windows executes an unverified driver", windowsFile, workflow => {
       draftStep(windowsJob(workflow), "Prove protected Windows Vulkan runtime")
         .env.VERIFIED_QUALIFICATION_DRIVER = "target/release/other.exe";
@@ -1358,17 +1356,17 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux trusts an arbitrary producer workflow", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'case "$CANDIDATE_PRODUCER_WORKFLOW_PATH" in',
         'case ".github/workflows/packaged-platform-pr.yml" in',
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux allowlist admits an untrusted producer through dead checks", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         ".github/workflows/packaged-platform-pr.yml)",
@@ -1382,7 +1380,7 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux producer path equality becomes advisory", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'test "$(jq -r \'.path\' <<<"$run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"',
@@ -1392,23 +1390,23 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux accepts an incomplete external package run", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'test "$(jq -r \'.conclusion\' <<<"$run")" = success',
         "true",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux accepts a package artifact from another head", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         "and .workflow_run.head_sha == $sha",
         "",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux executes a hardcoded driver", linuxFile, workflow => {
       draftStep(linuxJob(workflow), "Prove offline Linux Vulkan retrieval").run =
         draftStep(linuxJob(workflow), "Prove offline Linux Vulkan retrieval").run
@@ -1495,6 +1493,411 @@ test("qualification driver is built once, retained privately, authenticated, and
         validateWorkflows(loadWorkflows(), graph).join("\n"),
         /private archive-qualified driver contract exactly|release claim graph qualification contract/u,
       );
+    });
+  }
+});
+
+test("Windows packages one release graph into exact public and private artifacts", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "packaged-platform-proof.yml";
+  const job = workflow => workflow.jobs.build;
+  const step = (workflow, name) => draftStep(job(workflow), name);
+  const replaceRun = (workflow, name, from, to) => {
+    const selected = step(workflow, name);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${name}`);
+  };
+  const mutations = [
+    ["a second Windows Cargo build appears in another step", workflow => {
+      job(workflow).steps.push({
+        name: "Rebuild a Windows regression",
+        if: "runner.os == 'Windows'",
+        shell: "bash",
+        run: "cargo build --release --locked -p codestory-workspace --test windows_path_identity",
+      });
+    }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
+    ["the one package build invokes Cargo twice", workflow => {
+      step(workflow, "Build package and qualification driver").run +=
+        "\ncargo build --release --locked -p codestory-cli";
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    ["the package graph loses release mode", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        "cargo build --release --locked",
+        "cargo build --locked",
+      );
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    ["the path regression is replaced by a debug output", workflow => {
+      step(workflow, "Prove native workspace path identity").env.TEST_BINARY =
+        "target/debug/deps/windows_path_identity.exe";
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    ["the staging regression is replaced by a debug output", workflow => {
+      step(workflow, "Test immutable native staging on Windows").env.TEST_BINARY =
+        "target/debug/deps/native_staging.exe";
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    ["Windows packaging is fed a debug CLI", workflow => {
+      step(workflow, "Package release asset on Windows").env.WINDOWS_CLI =
+        "target/debug/codestory-cli.exe";
+    }, /Windows packaging must verify and package only the exact Cargo-selected release binary/u],
+    ["the public artifact uses a broad release glob", workflow => {
+      step(workflow, "Upload release asset").with.path = "target/release-dist/**";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the public artifact includes the private qualification driver", workflow => {
+      step(workflow, "Upload release asset").with.path +=
+        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the public artifact drops its candidate-local checksum manifest", workflow => {
+      const upload = step(workflow, "Upload release asset");
+      upload.with.path = upload.with.path.replace(
+        "target/release-dist/SHA256SUMS.txt\n",
+        "",
+      );
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the candidate record is not source-SHA bound", workflow => {
+      replaceRun(
+        workflow,
+        "Produce exact candidate archive record",
+        '--source-sha "$SOURCE_SHA"',
+        '--source-sha "$GITHUB_SHA"',
+      );
+    }, /Produce exact candidate archive record must run --source-sha/u],
+    ["the candidate-record artifact is missing", workflow => {
+      job(workflow).steps = job(workflow).steps.filter(
+        ({ name }) => name !== "Upload exact candidate archive record",
+      );
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact name drifts", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.name =
+        "codestory-candidate-record-${{ matrix.asset_target }}";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact path drifts", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.path =
+        "target/release-dist/candidate-archive-record.json";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact stops replacing its same-run stable name", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.overwrite = false;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact is missing", workflow => {
+      job(workflow).steps = job(workflow).steps.filter(
+        ({ name }) => name !== "Upload separate qualification driver",
+      );
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact name drifts", workflow => {
+      step(workflow, "Upload separate qualification driver").with.name =
+        "qualification-driver-${{ matrix.asset_target }}";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact path drifts", workflow => {
+      step(workflow, "Upload separate qualification driver").with.path =
+        "target/release-dist/qualification-driver";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact is uploaded unconditionally", workflow => {
+      delete step(workflow, "Upload separate qualification driver").if;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact stops replacing its same-run stable name", workflow => {
+      step(workflow, "Upload separate qualification driver").with.overwrite = false;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the public package stable artifact stops replacing its same-run name", workflow => {
+      step(workflow, "Upload release asset").with.overwrite = false;
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files|stable release artifact/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("protected candidate consumers key cache reuse by exact source and transfer only on miss", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const replaceRun = (workflow, jobName, stepName, from, to) => {
+    const selected = draftStep(workflow.jobs[jobName], stepName);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${stepName}`);
+  };
+  const cases = [
+    {
+      file: "macos-metal-proof.yml",
+      job: "packaged-metal",
+      authentication: "Authenticate exact candidate artifacts",
+      authenticationSha: ".workflow_run.head_sha == $sha",
+      authenticationExpected: /Authenticate exact candidate artifacts must run .workflow_run.head_sha == \$sha/u,
+      recordName: "codestory-candidate-archive-record-macos-arm64",
+      recordExpected: /protected cache lookup must consume only the exact small candidate record/u,
+      restoreSha: ".source.commit == $source_sha",
+      missIf: "inputs.use_packaged_cli_artifact",
+      missExpected: /large Actions artifact transfer must be a cache-miss-only authenticated boundary/u,
+      driverName: "codestory-qualification-driver-macos-arm64",
+      driverExpected: /private driver must remain a separate authenticated artifact after candidate cache resolution/u,
+      modelCache: '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+    },
+    {
+      file: "windows-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      authentication: "Authenticate exact Windows candidate artifacts",
+      authenticationSha: "$_.workflow_run.head_sha -eq $sourceSha",
+      authenticationExpected: /packaged proof must authenticate the exact candidate record, package, and private driver from an allowlisted producer/u,
+      recordName: "codestory-candidate-archive-record-windows-x64",
+      recordExpected: /protected cache lookup must consume only the exact small Windows candidate record/u,
+      restoreSha: "$record.source.commit -ne $sourceSha",
+      missIf: "inputs.use_packaged_cli_artifact",
+      missExpected: /large Windows Actions artifact transfer must be cache-miss-only and outer-digest authenticated/u,
+      driverName: "codestory-qualification-driver-windows-x64",
+      driverExpected: /private Windows qualification driver must stay separate from the cached public candidate/u,
+      modelCache: '--cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"',
+    },
+    {
+      file: "linux-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      authentication: "Authenticate exact Linux candidate artifacts",
+      authenticationSha: ".workflow_run.head_sha == $sha",
+      authenticationExpected: /must authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u,
+      recordName: "codestory-candidate-archive-record-linux-x64",
+      recordExpected: /protected cache lookup must consume only the exact small Linux candidate record/u,
+      restoreSha: ".source.commit == $source_sha",
+      missIf: "true",
+      missExpected: /large Linux Actions artifact transfer must be cache-miss-only and outer-digest authenticated/u,
+      driverName: "codestory-qualification-driver-linux-x64",
+      driverExpected: /private Linux qualification driver must stay separate from the cached public candidate/u,
+    },
+  ];
+
+  for (const platform of cases) {
+    await t.test(`${platform.file}: producer artifact SHA check removed`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      replaceRun(
+        workflow,
+        platform.job,
+        platform.authentication,
+        platform.authenticationSha,
+        "true",
+      );
+      assert.match(validateWorkflows(workflows).join("\n"), platform.authenticationExpected);
+    });
+
+    await t.test(`${platform.file}: record source SHA check removed from cache key`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      replaceRun(
+        workflow,
+        platform.job,
+        "Restore exact candidate archive from protected host",
+        platform.restoreSha,
+        "true",
+      );
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Restore exact candidate archive from protected host|reviewed protected .* workflow structure/u,
+      );
+    });
+
+    await t.test(`${platform.file}: large transfer made unconditional`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      draftStep(
+        workflow.jobs[platform.job],
+        "Download, authenticate, and admit candidate archive on miss",
+      ).if = platform.missIf;
+      assert.match(validateWorkflows(workflows).join("\n"), platform.missExpected);
+    });
+
+    await t.test(`${platform.file}: small candidate record name drifts`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      draftStep(
+        workflow.jobs[platform.job],
+        "Download authenticated candidate record",
+      ).with.name = platform.recordName.replace("candidate-archive-record", "package-record");
+      assert.match(validateWorkflows(workflows).join("\n"), platform.recordExpected);
+    });
+
+    await t.test(`${platform.file}: private driver is read from the public package`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      const download = draftStep(
+        workflow.jobs[platform.job],
+        "Download separate authenticated qualification driver",
+      );
+      download.with.name = platform.driverName.replace(
+        "codestory-qualification-driver",
+        "codestory-cli",
+      );
+      assert.match(validateWorkflows(workflows).join("\n"), platform.driverExpected);
+    });
+
+    if (platform.modelCache) {
+      await t.test(`${platform.file}: protected model material cache is omitted`, () => {
+        const workflows = loadWorkflows();
+        const workflow = workflows.get(platform.file);
+        replaceRun(
+          workflow,
+          platform.job,
+          "Prepare checksum-pinned embedded model",
+          platform.modelCache,
+          "--cache-root target/model-material",
+        );
+        assert.match(
+          validateWorkflows(workflows).join("\n"),
+          /Prepare checksum-pinned embedded model/u,
+        );
+      });
+    }
+  }
+
+  await t.test("optional Linux Vulkan calibration omits the protected model cache", () => {
+    const workflows = loadWorkflows();
+    const workflow = workflows.get("linux-vulkan-proof.yml");
+    replaceRun(
+      workflow,
+      "optional-constant-calibration",
+      "Prepare checksum-pinned embedded model",
+      '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+      "--cache-root target/model-material",
+    );
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /Prepare checksum-pinned embedded model/u,
+    );
+  });
+});
+
+test("post-publish candidate reuse authenticates release metadata and transfers large bytes once", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "post-publish-release-smoke.yml";
+  const job = workflow => workflow.jobs.smoke;
+  const step = (workflow, name) => draftStep(job(workflow), name);
+  const replaceRun = (workflow, name, from, to) => {
+    const selected = step(workflow, name);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${name}`);
+  };
+  const mutations = [
+    ["the release tag lookup is replaced by latest", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'releases/tags/$TAG',
+        "releases/latest",
+      );
+    }, /published candidate authentication must bind the release tag, commit, target, and exact asset metadata|Authenticate published candidate assets/u],
+    ["the returned release tag is not checked", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'test "$(jq -r .tag_name <<<"$release")" = "$TAG"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published asset size provenance is not validated", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        '[[ "$(jq -r .size <<<"$value")" =~ ^[0-9]+$ ]]',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published asset digest provenance is not validated", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        '[[ "$(jq -r .digest <<<"$value")" =~ ^sha256:[0-9a-f]{64}$ ]]',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published record source SHA is rebound to the workflow checkout", workflow => {
+      step(workflow, "Authenticate published candidate assets").env.PUBLISHED_COMMIT =
+        "${{ github.sha }}";
+    }, /published candidate authentication must bind the release tag, commit, target, and exact asset metadata/u],
+    ["published cache key no longer checks the source SHA", workflow => {
+      replaceRun(
+        workflow,
+        "Restore published candidate archive from protected host",
+        ".source.commit == $source_sha",
+        "true",
+      );
+    }, /Restore published candidate archive from protected host/u],
+    ["published cache lookup loses its exact source binding", workflow => {
+      delete step(workflow, "Restore published candidate archive from protected host")
+        .env.PUBLISHED_COMMIT;
+    }, /published candidate cache lookup must be unconditional and exact-source bound/u],
+    ["published large archive transfer is unconditional", workflow => {
+      delete step(workflow, "Download, verify, and admit published candidate on miss").if;
+    }, /published archive transfer must run only on an exact cache miss/u],
+    ["published large archive is downloaded a second time", workflow => {
+      step(workflow, "Download authenticated published checksum manifest").run +=
+        '\ncurl "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$id"';
+    }, /must resolve the protected cache before any large release-asset transfer and never use an unconditional bulk download/u],
+    ["bulk gh release download returns", workflow => {
+      step(workflow, "Download authenticated published checksum manifest").run +=
+        '\ngh release download "$TAG"';
+    }, /must resolve the protected cache before any large release-asset transfer and never use an unconditional bulk download/u],
+    ["published archive size output is dropped", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'echo "archive-bytes=$(jq -r .size <<<"$archive_asset")"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published archive digest output is dropped", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'echo "archive-sha256=$(jq -r .digest <<<"$archive_asset" | sed \'s/^sha256://\')"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("withheld accelerator cells consume only tiny exact candidate records", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release.yml";
+  const mutations = [
+    ["the non-claim lane downloads public package archives", workflow => {
+      draftStep(
+        workflow.jobs["accelerator-non-claim"],
+        "Download authenticated candidate records for withheld identity",
+      ).with.pattern = "codestory-cli-*";
+    }, /non-claim producer must download only tiny authenticated candidate records|must never transfer or read a large package archive/u],
+    ["the non-claim lane reads a large archive", workflow => {
+      const record = draftStep(
+        workflow.jobs["accelerator-non-claim"],
+        "Record populated accelerator non-claims",
+      );
+      record.run = record.run.replace(
+        '--candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json"',
+        '--archive "target/release-non-claim/candidate-records/codestory-cli-$target/archive"',
+      );
+    }, /non-claim producer must never transfer or read a large package archive|Record populated accelerator non-claims/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
     });
   }
 });
@@ -3539,7 +3942,7 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     }, /Configure short Windows Cargo target/u],
     ["packaged native staging regression made cross-platform", packagedFile, workflow => {
       packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
-    }, /immutable native staging regression must run on Windows/u],
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
     ["packaged native staging regression removed", packagedFile, workflow => {
       packagedNativeStaging(workflow).run = "cargo test --release --locked";
     }, /Test immutable native staging on Windows/u],
@@ -3690,23 +4093,23 @@ test("protected candidate installs prove accelerated server behavior without CPU
   }
 });
 
-test("protected macOS package download is resumable and container-verified", async (t) => {
+test("protected macOS candidate transfer is resumable, exact-head bound, and cache-miss only", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
   const file = "macos-metal-proof.yml";
   const mutations = [
     ["resume removed", step => {
       step.run = step.run.replace("--continue-at -", "--remote-name");
-    }, /Download packaged CLI artifact/u],
+    }, /Download, authenticate, and admit candidate archive on miss/u],
     ["container digest bypassed", step => {
       step.run = step.run.replace(
-        'test "$actual_digest" = "${expected_digest#sha256:}"',
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
         "true",
       );
-    }, /Download packaged CLI artifact/u],
-    ["producer SHA binding removed", step => {
-      step.run = step.run.replace(".workflow_run.head_sha == $sha", "true");
-    }, /Download packaged CLI artifact/u],
+    }, /Download, authenticate, and admit candidate archive on miss/u],
+    ["large transfer made unconditional", step => {
+      step.if = "inputs.use_packaged_cli_artifact";
+    }, /large Actions artifact transfer must be a cache-miss-only authenticated boundary/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3714,7 +4117,7 @@ test("protected macOS package download is resumable and container-verified", asy
       const workflows = loadWorkflows();
       const step = draftStep(
         workflows.get(file).jobs["packaged-metal"],
-        "Download packaged CLI artifact",
+        "Download, authenticate, and admit candidate archive on miss",
       );
       mutate(step);
       const violations = validateWorkflows(workflows);

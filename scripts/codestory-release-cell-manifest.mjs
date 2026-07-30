@@ -23,9 +23,13 @@ import {
   classifyJobFailure,
   countLostExecutions,
 } from "../.github/scripts/lost-runner-recovery.mjs";
+import {
+  readCandidateArchiveRecord,
+} from "../.github/scripts/candidate-archive-store.mjs";
 
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
 
 function fail(message) {
   throw new Error(message);
@@ -52,6 +56,39 @@ function fileAttestation(filePath) {
     name: path.basename(absolute),
     sha256: createHash("sha256").update(bytes).digest("hex"),
     bytes: bytes.length,
+  };
+}
+
+function archiveAttestation(value) {
+  if (
+    value === null
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort())
+      !== JSON.stringify(["bytes", "name", "sha256"])
+  ) {
+    fail("archive attestation keys changed");
+  }
+  const name = text(value.name, "archive attestation name");
+  if (
+    path.basename(name) !== name
+    || name === "."
+    || name === ".."
+    || name.includes("/")
+    || name.includes("\\")
+  ) {
+    fail("archive attestation name must be a simple filename");
+  }
+  if (!Number.isSafeInteger(value.bytes) || value.bytes <= 0) {
+    fail("archive attestation bytes must be a positive safe integer");
+  }
+  if (typeof value.sha256 !== "string" || !SHA256.test(value.sha256)) {
+    fail("archive attestation sha256 must be a lowercase SHA-256 digest");
+  }
+  return {
+    name,
+    sha256: value.sha256,
+    bytes: value.bytes,
   };
 }
 
@@ -141,6 +178,7 @@ export function produceReleaseCellManifest({
   observedAt,
   artifactPath = null,
   archivePath = null,
+  retainedArchive = null,
   prePublishLedger = null,
   evidence = null,
   nonClaim = null,
@@ -162,7 +200,16 @@ export function produceReleaseCellManifest({
   if (cell.required_identity.includes("producer_version")) identity.producer_version = version;
   if (cell.required_identity.includes("runtime_version")) identity.runtime_version = version;
 
-  const artifact = archivePath ? fileAttestation(archivePath) : artifactPath ? fileAttestation(artifactPath) : null;
+  if (archivePath && retainedArchive) {
+    fail("archivePath and retainedArchive are mutually exclusive");
+  }
+  const artifact = archivePath
+    ? fileAttestation(archivePath)
+    : retainedArchive
+      ? archiveAttestation(retainedArchive)
+      : artifactPath
+        ? fileAttestation(artifactPath)
+        : null;
   if (artifact && cell.required_identity.includes("artifact_sha256")) {
     identity.artifact_sha256 = artifact.sha256;
   }
@@ -186,10 +233,14 @@ export function produceReleaseCellManifest({
   };
   if (nonClaim) manifest.non_claim = nonClaim;
   if (cell.archive_role === "pre_publish") {
-    if (!artifact || !archivePath) fail(`${cell.id} requires --archive`);
+    if (!artifact || (!archivePath && !retainedArchive)) {
+      fail(`${cell.id} requires authenticated archive identity`);
+    }
     manifest.archive = { name: artifact.name, sha256: artifact.sha256, bytes: artifact.bytes };
   } else if (cell.archive_role === "post_publish_compare") {
-    if (!artifact || !archivePath) fail(`${cell.id} requires --archive`);
+    if (!artifact || (!archivePath && !retainedArchive)) {
+      fail(`${cell.id} requires authenticated archive identity`);
+    }
     const packageRow = retainedPackageRow(prePublishLedger, identity.target);
     identity.pre_publish_artifact_sha256 = packageRow.archive.sha256;
     manifest.comparison = {
@@ -260,9 +311,30 @@ function withholdHost(values) {
     fail(`a non-claim may be recorded only after ${policy.maximum_run_attempts} run attempts`);
   }
   const identity = values.identity ? JSON.parse(readFileSync(values.identity, "utf8")) : {};
+  const candidateRecord = readCandidateArchiveRecord(
+    text(values["candidate-record"], "--candidate-record"),
+  );
+  if (
+    candidateRecord.repository !== gitIdentity.repository
+    || candidateRecord.source.commit !== gitIdentity.commit
+    || candidateRecord.source.tree !== gitIdentity.source_tree
+  ) {
+    fail("candidate archive record does not match the exact withheld source");
+  }
+  const retainedArchive = {
+    name: candidateRecord.archive.name,
+    bytes: candidateRecord.archive.bytes,
+    sha256: candidateRecord.archive.sha256,
+  };
   const outDir = text(values["out-dir"], "--out-dir");
   for (const cellId of host.withheld_cells) {
     const cell = selectedCell(graph, cellId);
+    const cellTarget = resolveReleaseCellConstraints(cell, attempt).target;
+    if (cellTarget !== candidateRecord.target) {
+      fail(
+        `candidate archive record target ${candidateRecord.target} does not match ${cell.id}`,
+      );
+    }
     // Each closeout phase downloads and authorizes its own container, so the manifests are written
     // into one directory per phase and uploaded as one artifact per phase.
     const producer = authenticatedProducer({
@@ -280,7 +352,7 @@ function withholdHost(values) {
       identity,
       producer,
       observedAt: values["observed-at"],
-      archivePath: values.archive,
+      retainedArchive,
       nonClaim: {
         host: host.id,
         runtime_execution: policy.runtime_execution,

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +21,7 @@ import {
   resolveReleaseCellConstraints,
 } from "../codestory-release-closeout.mjs";
 import { loadReleaseClaimGraph } from "../codestory-release-claims.mjs";
+import { buildCandidateArchiveRecord } from "../../.github/scripts/candidate-archive-store.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const graph = loadReleaseClaimGraph(root);
@@ -627,17 +635,61 @@ test("withheld manifests carry the populated non-claim and refuse an unspent ret
 test("withhold writes one container per closeout phase, never a phase-mixed one", () => {
   // Each phase's trusted producer map authorizes only the manifests it selected, so a container
   // holding another phase's cell is rejected at download time and the release is lost anyway.
-  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-withhold-"));
-  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
-  writeFileSync(archive, "release archive bytes");
+  const directory = mkdtempSync(
+    path.join(realpathSync.native(os.tmpdir()), "codestory-release-withhold-"),
+  );
+  const archiveName = "codestory-cli-v0.16.0-linux-x64.tar.gz";
+  const archiveBytes = Buffer.from("release archive bytes");
+  const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
+  const checksumBytes = Buffer.from(`${archiveSha256}  ${archiveName}\n`);
+  const checksumSha256 = createHash("sha256").update(checksumBytes).digest("hex");
+  const candidateRecord = path.join(directory, "candidate-archive-record.json");
+  const head = execFileSync(
+    "git",
+    ["rev-parse", "HEAD"],
+    { cwd: root, encoding: "utf8" },
+  ).trim();
+  const sourceTree = execFileSync(
+    "git",
+    ["rev-parse", "HEAD^{tree}"],
+    { cwd: root, encoding: "utf8" },
+  ).trim();
+  writeFileSync(
+    candidateRecord,
+    `${JSON.stringify(buildCandidateArchiveRecord({
+      repository: gitIdentity.repository,
+      sourceSha: head,
+      sourceTree,
+      target: "linux-x64",
+      archive: {
+        name: archiveName,
+        relative_path: archiveName,
+        bytes: archiveBytes.length,
+        sha256: archiveSha256,
+      },
+      companions: [
+        {
+          role: "archive_checksum",
+          relative_path: `${archiveName}.sha256`,
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+        {
+          role: "checksum_manifest",
+          relative_path: "SHA256SUMS.txt",
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+      ],
+    }), null, 2)}\n`,
+  );
   const identityPath = path.join(directory, "identity.json");
   writeFileSync(identityPath, JSON.stringify({
     installer: "candidate_managed_plugin",
     native_engine: "coderank_q8_embedded",
   }));
   const outDir = path.join(directory, "cells");
-  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-  const result = spawnSync(process.execPath, [
+  const withholdArgs = [
     path.join(root, "scripts/codestory-release-cell-manifest.mjs"), "withhold",
     "--repo", root,
     "--expected-sha", head,
@@ -646,10 +698,32 @@ test("withhold writes one container per closeout phase, never a phase-mixed one"
     "--producer-run-id", "12345",
     "--producer-run-attempt", String(nonClaimPolicy.maximum_run_attempts),
     "--identity", identityPath,
-    "--archive", archive,
+    "--candidate-record", candidateRecord,
     "--out-dir", outDir,
-  ], { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345" }) });
+  ];
+  const result = spawnSync(process.execPath, withholdArgs, {
+    encoding: "utf8",
+    env: producerEnv({ GITHUB_RUN_ID: "12345" }),
+  });
   assert.equal(result.status, 0, result.stderr);
+
+  const staleRecord = path.join(directory, "stale-candidate-archive-record.json");
+  const stale = JSON.parse(readFileSync(candidateRecord, "utf8"));
+  stale.source.commit = "f".repeat(40);
+  writeFileSync(staleRecord, `${JSON.stringify(stale, null, 2)}\n`);
+  const staleResult = spawnSync(
+    process.execPath,
+    withholdArgs.map((value) => value === candidateRecord ? staleRecord : value),
+    {
+      encoding: "utf8",
+      env: producerEnv({ GITHUB_RUN_ID: "12345" }),
+    },
+  );
+  assert.notEqual(staleResult.status, 0);
+  assert.match(
+    staleResult.stderr,
+    /candidate archive record does not match the exact withheld source/u,
+  );
 
   const expected = {
     pre_publish: {
@@ -669,6 +743,7 @@ test("withhold writes one container per closeout phase, never a phase-mixed one"
     for (const manifest of written) {
       assert.equal(manifest.phase, phase);
       assert.equal(manifest.evidence.status, "withheld");
+      assert.equal(manifest.evidence.identity.artifact_sha256, archiveSha256);
       assert.equal(
         manifest.evidence.identity.producer_artifact,
         artifact.replaceAll("{attempt}", String(nonClaimPolicy.maximum_run_attempts)),

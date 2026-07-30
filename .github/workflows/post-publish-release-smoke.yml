@@ -163,8 +163,8 @@ jobs:
           name: ${{ inputs.pre_publish_closeout_artifact }}
           path: target/pre-publish-closeout
 
-      - name: Download published asset and checksum
-        id: asset
+      - name: Authenticate published candidate assets
+        id: published-assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -172,19 +172,259 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
           ASSET_TARGET: ${{ matrix.asset_target }}
           EXTENSION: ${{ matrix.extension }}
+          PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
         run: |
           set -euo pipefail
-          dir="target/post-publish-release-assets"
           asset="codestory-cli-v${VERSION}-${ASSET_TARGET}.${EXTENSION}"
+          checksum="$asset.sha256"
+          release="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          )"
+          test "$(jq -r .tag_name <<<"$release")" = "$TAG"
+          test "$(jq -r .draft <<<"$release")" = false
+          select_asset() {
+            local name="$1"
+            jq \
+              --arg name "$name" \
+              '[.assets[] | select(.name == $name)]
+                | if length == 1 then .[0] else error("expected one published release asset") end' \
+              <<<"$release"
+          }
+          archive_asset="$(select_asset "$asset")"
+          checksum_asset="$(select_asset "$checksum")"
+          manifest_asset="$(select_asset SHA256SUMS.txt)"
+          validate_asset() {
+            local value="$1"
+            [[ "$(jq -r .id <<<"$value")" =~ ^[0-9]+$ ]]
+            [[ "$(jq -r .size <<<"$value")" =~ ^[0-9]+$ ]]
+            [[ "$(jq -r .digest <<<"$value")" =~ ^sha256:[0-9a-f]{64}$ ]]
+          }
+          validate_asset "$archive_asset"
+          validate_asset "$checksum_asset"
+          validate_asset "$manifest_asset"
+          record_dir=target/candidate-archive-record/${ASSET_TARGET}
+          mkdir -p "$record_dir"
+          record="$record_dir/candidate-archive-record.json"
+          rm -f "$record"
+          node .github/scripts/candidate-archive-store.mjs record \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$PUBLISHED_COMMIT" \
+            --source-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --target "$ASSET_TARGET" \
+            --archive-name "$asset" \
+            --archive-bytes "$(jq -r .size <<<"$archive_asset")" \
+            --archive-sha256 "$(jq -r .digest <<<"$archive_asset" | sed 's/^sha256://')" \
+            --companion "archive_checksum|$checksum|$(jq -r .size <<<"$checksum_asset")|$(jq -r .digest <<<"$checksum_asset" | sed 's/^sha256://')" \
+            --companion "checksum_manifest|SHA256SUMS.txt|$(jq -r .size <<<"$checksum_asset")|$(jq -r .digest <<<"$checksum_asset" | sed 's/^sha256://')" \
+            --output "$record"
+          {
+            echo "archive-id=$(jq -r .id <<<"$archive_asset")"
+            echo "archive-bytes=$(jq -r .size <<<"$archive_asset")"
+            echo "archive-sha256=$(jq -r .digest <<<"$archive_asset" | sed 's/^sha256://')"
+            echo "checksum-id=$(jq -r .id <<<"$checksum_asset")"
+            echo "checksum-bytes=$(jq -r .size <<<"$checksum_asset")"
+            echo "checksum-sha256=$(jq -r .digest <<<"$checksum_asset" | sed 's/^sha256://')"
+            echo "manifest-id=$(jq -r .id <<<"$manifest_asset")"
+            echo "manifest-bytes=$(jq -r .size <<<"$manifest_asset")"
+            echo "manifest-sha256=$(jq -r .digest <<<"$manifest_asset" | sed 's/^sha256://')"
+            echo "archive-name=$asset"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore published candidate archive from protected host
+        id: candidate-cache
+        shell: bash
+        env:
+          ASSET_TARGET: ${{ matrix.asset_target }}
+          PUBLISHED_COMMIT: ${{ steps.published.outputs.commit }}
+        run: |
+          set -euo pipefail
+          started_ns="$(python -c 'import time; print(time.monotonic_ns())')"
+          record=target/candidate-archive-record/${ASSET_TARGET}/candidate-archive-record.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$PUBLISHED_COMMIT" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg target "$ASSET_TARGET" \
+            '.repository == $repository
+              and .source.commit == $source_sha
+              and .source.tree == $source_tree
+              and .target == $target' \
+            "$record" >/dev/null
+          store="$RUNNER_TOOL_CACHE/codestory/candidate-archives"
+          mkdir -p "$store" target
+          rm -rf target/post-publish-release-assets
+          restored="$(
+            node .github/scripts/candidate-archive-store.mjs restore \
+              --record "$record" \
+              --store-root "$store" \
+              --output-root target \
+              --output-dir target/post-publish-release-assets
+          )"
+          hit="$(jq -r .hit <<<"$restored")"
+          test "$hit" = true || test "$hit" = false
+          finished_ns="$(python -c 'import time; print(time.monotonic_ns())')"
+          elapsed_ms=$(((finished_ns - started_ns) / 1000000))
+          echo "hit=$hit" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published candidate archive transfer"
+            echo
+            echo "- Protected-host cache lookup and verification: ${elapsed_ms} ms"
+            echo "- Cache hit: \`$hit\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download, verify, and admit published candidate on miss
+        if: steps.candidate-cache.outputs.hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_TARGET: ${{ matrix.asset_target }}
+          ARCHIVE_NAME: ${{ steps.published-assets.outputs.archive-name }}
+          ARCHIVE_ID: ${{ steps.published-assets.outputs.archive-id }}
+          ARCHIVE_BYTES: ${{ steps.published-assets.outputs.archive-bytes }}
+          ARCHIVE_SHA256: ${{ steps.published-assets.outputs.archive-sha256 }}
+          CHECKSUM_ID: ${{ steps.published-assets.outputs.checksum-id }}
+          CHECKSUM_BYTES: ${{ steps.published-assets.outputs.checksum-bytes }}
+          CHECKSUM_SHA256: ${{ steps.published-assets.outputs.checksum-sha256 }}
+        run: |
+          set -euo pipefail
+          started_ns="$(python -c 'import time; print(time.monotonic_ns())')"
+          stage=target/candidate-archive-stage/${ASSET_TARGET}
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          download_asset() {
+            local id="$1"
+            local name="$2"
+            local expected_bytes="$3"
+            local expected_sha256="$4"
+            local destination="$stage/$name"
+            local partial="$destination.partial"
+            local url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$id"
+            rm -f "$destination" "$partial"
+            local complete=false
+            for attempt in $(seq 1 30); do
+              if curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                --connect-timeout 30 \
+                --max-time 120 \
+                --continue-at - \
+                --header "Accept: application/octet-stream" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --output "$partial" \
+                "$url"; then
+                complete=true
+                break
+              fi
+              current_size="$(python - "$partial" <<'PY'
+          import os
+          import sys
+          print(os.path.getsize(sys.argv[1]) if os.path.isfile(sys.argv[1]) else 0)
+          PY
+          )"
+              test "$current_size" -le "$expected_bytes"
+              if [ "$current_size" = "$expected_bytes" ]; then
+                complete=true
+                break
+              fi
+              echo "::warning title=Release asset transfer interrupted::Resuming $name at byte $current_size after attempt $attempt"
+              sleep 2
+            done
+            test "$complete" = true
+            actual="$(
+              python - "$partial" <<'PY'
+          import hashlib
+          import os
+          import sys
+          path = sys.argv[1]
+          with open(path, "rb") as source:
+              print(f"{os.path.getsize(path)} {hashlib.file_digest(source, 'sha256').hexdigest()}")
+          PY
+            )"
+            test "${actual%% *}" = "$expected_bytes"
+            test "${actual#* }" = "$expected_sha256"
+            mv "$partial" "$destination"
+          }
+          download_asset "$ARCHIVE_ID" "$ARCHIVE_NAME" \
+            "$ARCHIVE_BYTES" "$ARCHIVE_SHA256"
+          download_asset "$CHECKSUM_ID" "$ARCHIVE_NAME.sha256" \
+            "$CHECKSUM_BYTES" "$CHECKSUM_SHA256"
+          transfer_finished_ns="$(python -c 'import time; print(time.monotonic_ns())')"
+          # package-codestory-release.py defines the candidate-local manifest as
+          # the same single checksum line. The published global manifest is
+          # authenticated separately below and never mutates this cache record.
+          cp "$stage/$ARCHIVE_NAME.sha256" "$stage/SHA256SUMS.txt"
+          record=target/candidate-archive-record/${ASSET_TARGET}/candidate-archive-record.json
+          admitted="$(
+            node .github/scripts/candidate-archive-store.mjs admit \
+              --record "$record" \
+              --input-root "$stage" \
+              --store-root "$RUNNER_TOOL_CACHE/codestory/candidate-archives" \
+              --output-root target \
+              --output-dir target/post-publish-release-assets
+          )"
+          test "$(jq -r .hit <<<"$admitted")" = true || \
+            test "$(jq -r .admitted <<<"$admitted")" = true
+          admission_finished_ns="$(python -c 'import time; print(time.monotonic_ns())')"
+          transfer_ms=$(((transfer_finished_ns - started_ns) / 1000000))
+          verification_ms=$(((admission_finished_ns - transfer_finished_ns) / 1000000))
+          {
+            echo "- Published archive and checksum transfer: ${transfer_ms} ms"
+            echo "- Payload verification and atomic admission: ${verification_ms} ms"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download authenticated published checksum manifest
+        id: published-checksum
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_ID: ${{ steps.published-assets.outputs.manifest-id }}
+          MANIFEST_BYTES: ${{ steps.published-assets.outputs.manifest-bytes }}
+          MANIFEST_SHA256: ${{ steps.published-assets.outputs.manifest-sha256 }}
+        run: |
+          set -euo pipefail
+          dir=target/post-publish-release-checksums
           mkdir -p "$dir"
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "$asset" \
-            --pattern "SHA256SUMS.txt" \
-            --dir "$dir" \
-            --clobber
-          echo "archive=$dir/$asset" >> "$GITHUB_OUTPUT"
-          echo "checksum=$dir/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+          checksum="$dir/SHA256SUMS.txt"
+          rm -f "$checksum"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --header "Accept: application/octet-stream" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$checksum" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$MANIFEST_ID"
+          actual="$(
+            python - "$checksum" <<'PY'
+          import hashlib
+          import os
+          import sys
+          path = sys.argv[1]
+          with open(path, "rb") as source:
+              print(f"{os.path.getsize(path)} {hashlib.file_digest(source, 'sha256').hexdigest()}")
+          PY
+          )"
+          test "${actual%% *}" = "$MANIFEST_BYTES"
+          test "${actual#* }" = "$MANIFEST_SHA256"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Bind materialized published asset paths
+        id: asset
+        shell: bash
+        env:
+          ASSET_NAME: ${{ steps.published-assets.outputs.archive-name }}
+          PUBLISHED_CHECKSUM: ${{ steps.published-checksum.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          dir=target/post-publish-release-assets
+          test -f "$dir/$ASSET_NAME"
+          echo "archive=$dir/$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "checksum=$PUBLISHED_CHECKSUM" >> "$GITHUB_OUTPUT"
 
       - name: Prove packaged version, help, and stdio shape
         shell: bash
