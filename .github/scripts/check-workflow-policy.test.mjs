@@ -3078,7 +3078,56 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         name: "Unexpected broad source proof",
         run: "cargo test --workspace --locked",
       });
-    }, /closed cheap acceptance step contract/u],
+    }, /canonical acceptance job manifest/u],
+    ["acceptance hides an Ubuntu workspace test behind a variable", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.run += '\nbroad_scope=--workspace\ncargo test "$broad_scope" --locked\n';
+    }, /canonical acceptance job manifest/u],
+    ["acceptance hides a Windows workspace test behind a variable", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run += '\n$scope = "--workspace"\ncargo test --release $scope --locked\n';
+    }, /canonical acceptance job manifest/u],
+    ["acceptance hides a workspace test behind an alias", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.run += "\nalias broad='cargo test --workspace --locked'\nbroad\n";
+    }, /canonical acceptance job manifest/u],
+    ["acceptance hides a workspace test behind a shell function", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.run += "\nrun_broad() { cargo test --workspace --locked; }\nrun_broad\n";
+    }, /canonical acceptance job manifest/u],
+    ["acceptance delegates to an unreviewed script", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.run += "\nbash scripts/run-broad-source.sh\n";
+    }, /canonical acceptance job manifest/u],
+    ["acceptance chains a workspace test after an approved command", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.run += "\ntrue && cargo test --workspace --locked\n";
+    }, /canonical acceptance job manifest/u],
+    ["acceptance substitutes an alternate shell", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      );
+      step.shell = "python";
+    }, /canonical acceptance job manifest/u],
     ["source acceptance cannot publish status", workflows => {
       delete workflows.get("source-proof.yml").permissions.statuses;
     }, /acceptance must publish an exact-head commit status/u],
@@ -3407,6 +3456,62 @@ test("release freeze policy pins live PR base and support ancestry revalidation"
     assert.match(
       violations.join("\n"),
       /obsolete-run discovery must paginate every active Actions state/u,
+    );
+  });
+});
+
+test("release freeze policy authenticates the complete acceptance job manifest", async (t) => {
+  const barrierSource = readFileSync(
+    path.join(root, ".github", "scripts", "release-freeze-barrier.mjs"),
+    "utf8",
+  );
+  const manifestPath = path.join(
+    root,
+    ".github",
+    "scripts",
+    "release-freeze-acceptance-jobs.json",
+  );
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const cases = [
+    ["manifest substitutes an approved job body", value => {
+      value.jobs["freeze-hostile-mutations"] = "0".repeat(64);
+    }, /freeze-hostile-mutations must match the canonical acceptance job manifest/u],
+    ["manifest admits an extra executable job", value => {
+      value.jobs["acceptance-extra"] = "0".repeat(64);
+    }, /must pin exactly the executable acceptance jobs/u],
+  ];
+
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const changedManifest = structuredClone(manifest);
+      mutate(changedManifest);
+      const changedSource = `${JSON.stringify(changedManifest, null, 2)}\n`;
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      graph.workflow_policy.release_freeze_barrier.acceptance.job_manifest_sha256
+        = createHash("sha256").update(changedSource).digest("hex");
+      const violations = releaseFreezeBarrierWorkflowViolations(
+        loadWorkflows(),
+        graph,
+        barrierSource,
+        changedSource,
+      );
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+
+  await t.test("claim graph substitutes the manifest digest", () => {
+    const graph = structuredClone(loadReleaseClaimGraph(root));
+    graph.workflow_policy.release_freeze_barrier.acceptance.job_manifest_sha256
+      = "0".repeat(64);
+    const violations = releaseFreezeBarrierWorkflowViolations(
+      loadWorkflows(),
+      graph,
+      barrierSource,
+      readFileSync(manifestPath, "utf8"),
+    );
+    assert.match(
+      violations.join("\n"),
+      /release claim graph must pin the executable exact-head freeze contract/u,
     );
   });
 });

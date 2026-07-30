@@ -178,6 +178,9 @@ test("versioned claim graph has one deterministic digest and all declared contro
       publisher_job: "freeze-acceptance",
       publisher_step: "Publish executable release freeze",
       status_creator: "github-actions[bot]",
+      job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
+      job_manifest_sha256:
+        "e523d997b26828b8333014afe96835deb31dfa4f3c3bf476fffc43e2907a1cc6",
       phases: {
         calibration_source: {
           known_future_source_changes: [
@@ -714,6 +717,22 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     .acceptance.later_commit_revokes = false;
   assert.throws(
     () => validateReleaseClaimGraph(persistentFreezeStatus),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const unpinnedAcceptanceManifest = structuredClone(graph);
+  unpinnedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest_sha256 = "not-a-digest";
+  assert.throws(
+    () => validateReleaseClaimGraph(unpinnedAcceptanceManifest),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const substitutedAcceptanceManifest = structuredClone(graph);
+  substitutedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest = ".github/workflows/source-proof.yml";
+  assert.throws(
+    () => validateReleaseClaimGraph(substitutedAcceptanceManifest),
     /release_freeze_barrier\.acceptance/u,
   );
 

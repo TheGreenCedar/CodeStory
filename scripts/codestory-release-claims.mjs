@@ -1577,6 +1577,8 @@ export function validateReleaseClaimGraph(graph) {
     "publisher_job",
     "publisher_step",
     "status_creator",
+    "job_manifest",
+    "job_manifest_sha256",
   ]) {
     nonEmptyText(
       acceptance[field],
@@ -1614,6 +1616,9 @@ export function validateReleaseClaimGraph(graph) {
     || acceptance.event !== "workflow_dispatch"
     || acceptance.windows_probe_max_seconds !== 90
     || acceptance.status_creator !== "github-actions[bot]"
+    || acceptance.job_manifest
+      !== ".github/scripts/release-freeze-acceptance-jobs.json"
+    || !SHA256.test(acceptance.job_manifest_sha256)
   ) {
     fail(
       "workflow_policy.release_freeze_barrier.acceptance must bind the exact "

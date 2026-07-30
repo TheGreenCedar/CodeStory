@@ -1522,6 +1522,8 @@
         "publisher_job": "freeze-acceptance",
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
+        "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
+        "job_manifest_sha256": "e523d997b26828b8333014afe96835deb31dfa4f3c3bf476fffc43e2907a1cc6",
         "phases": {
           "calibration_source": {
             "known_future_source_changes": [

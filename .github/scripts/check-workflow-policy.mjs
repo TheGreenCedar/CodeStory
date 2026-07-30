@@ -336,6 +336,19 @@ function at(value, ...keys) {
   return current;
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function scalarStrings(value, found = []) {
   if (typeof value === "string") {
     found.push(value);
@@ -8158,6 +8171,15 @@ export function releaseFreezeBarrierWorkflowViolations(
     path.join(repositoryRoot, ".github", "scripts", "release-freeze-barrier.mjs"),
     "utf8",
   ),
+  acceptanceManifestSource = fs.readFileSync(
+    path.join(
+      repositoryRoot,
+      ".github",
+      "scripts",
+      "release-freeze-acceptance-jobs.json",
+    ),
+    "utf8",
+  ),
 ) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -8172,6 +8194,24 @@ export function releaseFreezeBarrierWorkflowViolations(
   const acceptancePhases = object(acceptance.phases);
   const calibrationSourcePhase = object(acceptancePhases.calibration_source);
   const frozenCandidatePhase = object(acceptancePhases.frozen_candidate);
+  let acceptanceManifest = {};
+  try {
+    acceptanceManifest = object(JSON.parse(acceptanceManifestSource));
+  } catch {
+    violations.push(
+      "[freeze_barrier] canonical acceptance job manifest must be valid JSON",
+    );
+  }
+  const acceptanceManifestJobs = object(acceptanceManifest.jobs);
+  const acceptanceJobNames = [
+    "resolve",
+    "freeze-hostile-mutations",
+    "freeze-windows-native-probe",
+    "freeze-acceptance",
+  ];
+  const acceptanceManifestDigest = createHash("sha256")
+    .update(acceptanceManifestSource)
+    .digest("hex");
   add(
     violations,
     freeze.schema === 3
@@ -8204,6 +8244,10 @@ export function releaseFreezeBarrierWorkflowViolations(
       && acceptance.publisher_job === "freeze-acceptance"
       && acceptance.publisher_step === "Publish executable release freeze"
       && acceptance.status_creator === "github-actions[bot]"
+      && acceptance.job_manifest
+        === ".github/scripts/release-freeze-acceptance-jobs.json"
+      && /^[0-9a-f]{64}$/u.test(String(acceptance.job_manifest_sha256 ?? ""))
+      && acceptance.job_manifest_sha256 === acceptanceManifestDigest
       && sameMembers(list(calibrationSourcePhase.known_future_source_changes), [
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
       ])
@@ -8227,6 +8271,16 @@ export function releaseFreezeBarrierWorkflowViolations(
       ])
       && frozenCandidatePhase.next_permitted_mutation === null,
     "[freeze_barrier] release claim graph must pin the executable exact-head freeze contract",
+  );
+  add(
+    violations,
+    acceptanceManifest.schema === "codestory.release-freeze-acceptance-jobs/v1"
+      && acceptanceManifest.workflow === ".github/workflows/source-proof.yml"
+      && sameMembers(Object.keys(acceptanceManifestJobs), acceptanceJobNames)
+      && acceptanceJobNames.every(jobName =>
+        /^[0-9a-f]{64}$/u.test(String(acceptanceManifestJobs[jobName] ?? ""))
+      ),
+    "[freeze_barrier] canonical acceptance job manifest must pin exactly the executable acceptance jobs",
   );
   add(
     violations,
@@ -8494,42 +8548,14 @@ export function releaseFreezeBarrierWorkflowViolations(
     sameMembers(Object.keys(object(sourceWorkflow.jobs)), sourceJobNames),
     "[freeze_barrier] source-proof.yml must use the closed source and acceptance job contract",
   );
-  const acceptanceStepContracts = new Map([
-    ["resolve", [
-      "Resolve trusted exact head",
-      "Checkout accepted source head",
-      "Cancel superseded proof runs",
-      "Record executable release freeze",
-      "Upload executable release freeze receipt",
-      "Reuse a completed gate for this exact head",
-      "Require executable release freeze",
-    ]],
-    ["freeze-hostile-mutations", [
-      "actions/checkout@v5",
-      "actions/setup-node@v5",
-      "Install workflow policy dependencies",
-      "Execute exact-head hostile mutation matrix",
-    ]],
-    ["freeze-windows-native-probe", [
-      "actions/checkout@v5",
-      "Run exact-head Windows native probe",
-    ]],
-    ["freeze-acceptance", [
-      "actions/checkout@v5",
-      "Download executable release freeze receipt",
-      "Publish executable release freeze",
-    ]],
-  ]);
-  for (const [jobName, expectedSteps] of acceptanceStepContracts) {
-    const job = object(at(sourceWorkflow, "jobs", jobName));
-    const stepNames = list(job.steps).map(step => step?.name ?? step?.uses);
+  for (const jobName of acceptanceJobNames) {
+    const actualDigest = createHash("sha256")
+      .update(canonicalJson(object(at(sourceWorkflow, "jobs", jobName))))
+      .digest("hex");
     add(
       violations,
-      sameMembers(stepNames, expectedSteps)
-        && !scalarStrings(job).some(value =>
-          /\bcargo\s+(?:test|nextest|build|clippy)\b[^\n]*--workspace\b/iu.test(value)
-        ),
-      `[freeze_barrier] source-proof.yml ${jobName} must use the closed cheap acceptance step contract`,
+      actualDigest === acceptanceManifestJobs[jobName],
+      `[freeze_barrier] source-proof.yml ${jobName} must match the canonical acceptance job manifest`,
     );
   }
   const sourceResolve = requireJob(
