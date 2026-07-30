@@ -37,8 +37,10 @@ import {
   releaseProofCpuSelectorViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
+  retrievalGeneralizationSuitePolicyViolations,
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
+  rustRetrievalWrapperSourcePresent,
   shellDependentBindingViolations,
   validateCargoTestFilters,
   validateWorkflows,
@@ -3580,6 +3582,130 @@ test("retrieval smoke keeps the one-process generalization lane blocking", async
       const workflows = loadWorkflows();
       workflows.set(retrievalFile, candidate);
       assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
+test("retrieval generalization fixture architecture rejects serialized regressions", async (t) => {
+  const suitePath = path.join(
+    root,
+    "scripts",
+    "tests",
+    "lint-retrieval-generalization.test.mjs",
+  );
+  const source = readFileSync(suitePath, "utf8");
+  assert.deepEqual(retrievalGeneralizationSuitePolicyViolations(source), []);
+  assert.equal(
+    rustRetrievalWrapperSourcePresent(`
+use std::process::Command;
+#[test]
+fn renamed_guard() {
+    Command::new("node").arg("-e").arg("import('./scripts/lib/retrieval-generalization-lint.mjs')").status().unwrap();
+}
+`),
+    true,
+    "a renamed Rust subprocess wrapper must remain detectable without the old filename or command",
+  );
+
+  const mutations = [
+    ["legacy Rust integration test returns", source, {
+      legacyWrapperPresent: true,
+    }, /must stay deleted so workspace nextest cannot rediscover/u],
+    ["per-fixture Node subprocess returns", `${source}
+import { spawnSync as runFixture } from "node:child_process";
+runFixture(process.execPath, ["scripts/lint-retrieval-generalization.mjs"]);
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["indirect builtin subprocess loading returns", `${source}
+process.getBuiltinModule("child" + "_process").spawnSync(
+  process.execPath,
+  ["scripts/lint-retrieval-generalization.mjs"],
+);
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["bracketed process binding returns", `${source}
+process["binding"]("spawn_sync");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["computed dynamic subprocess import returns", `${source}
+await import("node:" + "child" + "_process");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["worker-per-fixture execution returns", `${source}
+await import("node:worker_threads");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["matrix calls the lint twice", `${source}
+runRetrievalGeneralizationLint({});
+`, {}, /through one in-process lint invocation/u],
+    ["matrix aliases the lint for a second invocation", source.replace(
+      "    const result = runRetrievalGeneralizationLint({",
+      [
+        "    const invokeAgain = runRetrievalGeneralizationLint;",
+        "    invokeAgain({});",
+        "    const result = runRetrievalGeneralizationLint({",
+      ].join("\n"),
+    ), {}, /through one in-process lint invocation/u],
+    ["global file lock returns", `${source}
+fs.openSync(path.join(os.tmpdir(), "retrieval-generalization.lock"), "wx");
+`, {}, /must not restore a global or cross-process fixture lock/u],
+    ["exclusive sibling lock through the fixture filesystem returns", source.replace(
+      "  const productionRepositoryRoot = path.join(",
+      [
+        '  const globalSentinel = path.join(path.dirname(fixtureRoot), "serial-token");',
+        '  fs.writeFileSync(globalSentinel, "", { flag: ["w", "x"].join("") });',
+        "  fs.rmSync(globalSentinel, { force: true });",
+        "  const productionRepositoryRoot = path.join(",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["second global temporary root returns", `${source}
+const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shared-suite-"));
+fs.mkdirSync(path.join(sharedRoot, "sentinel"));
+`, {}, /under one temporary tree outside the checkout/u],
+    ["second sibling temporary root returns", `${source}
+const sharedRoot = fs.mkdtempSync(path.join(path.dirname(fixtureRoot), "shared-suite-"));
+fs.mkdirSync(path.join(sharedRoot, "sentinel"));
+`, {}, /under one temporary tree outside the checkout/u],
+    ["fixtures move into the checkout", source.replace(
+      'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
+      'fs.mkdtempSync(path.join(repositoryRoot, "codestory-generalization-"))',
+    ), {}, /under one temporary tree outside the checkout/u],
+    ["checkout read-only comparison is removed", source.replace(
+      "const checkoutBefore = treeDigest(repositoryRoot);",
+      "const checkoutBefore = null;",
+    ), {}, /prove the real checkout is byte-for-byte read-only/u],
+    ["checkout read-only comparison is inverted", source.replace(
+      "assert.equal(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+      "assert.notEqual(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+    ), {}, /prove the real checkout is byte-for-byte read-only/u],
+    ["checkout is changed and restored before the final digest", source.replace(
+      "  const checkoutBefore = treeDigest(repositoryRoot);",
+      [
+        "  const checkoutBefore = treeDigest(repositoryRoot);",
+        '  const transientCheckoutPath = path.join(repositoryRoot, ".policy-transient-fixture");',
+        '  fs.writeFileSync(transientCheckoutPath, "hostile");',
+        "  fs.rmSync(transientCheckoutPath, { force: true });",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["additive Rust root is unregistered", source.replace(
+      "structuralScanRoots: [rustRoot, extraRustRoot],",
+      "structuralScanRoots: [rustRoot],",
+    ), {}, /register every additive hostile fixture root/u],
+    ["a fifth fixture root is planted without registration", source.replace(
+      "  const productionRepositoryRoot = path.join(",
+      [
+        '  const unregisteredRoot = path.join(fixtureRoot, "unregistered");',
+        '  write(unregisteredRoot, "ignored.rs", `pub const LEAK: &str = "createApplication";\\n`);',
+        "  const productionRepositoryRoot = path.join(",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["fixture cleanup is removed", source.replace(
+      "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
+      "",
+    ), {}, /remove its isolated fixture tree/u],
+  ];
+
+  for (const [name, candidate, options, expectedReason] of mutations) {
+    await t.test(name, () => {
+      assert.match(
+        retrievalGeneralizationSuitePolicyViolations(candidate, options).join("\n"),
+        expectedReason,
+      );
     });
   }
 });

@@ -13,6 +13,22 @@ import {
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const retrievalGeneralizationSuiteFile = path.join(
+  "scripts",
+  "tests",
+  "lint-retrieval-generalization.test.mjs",
+);
+const legacyRetrievalGeneralizationWrapper = path.join(
+  "crates",
+  "codestory-runtime",
+  "tests",
+  "retrieval_generalization_guard.rs",
+);
+const runtimeIntegrationTestRoot = path.join(
+  "crates",
+  "codestory-runtime",
+  "tests",
+);
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
@@ -23,6 +39,232 @@ const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
 export { retrievalFile };
+
+export function rustRetrievalWrapperSourcePresent(source) {
+  return (
+    /lint-retrieval-generalization|retrieval[_-]generalization[_-](?:guard|lint)/u
+      .test(source)
+    || /\b(?:std|tokio|async_std)::process\b|\bprocess::Command\b|\bCommand\s*::\s*(?:new|from)\s*\(|\b(?:assert_cmd|duct|xshell)\b/u
+      .test(source)
+  );
+}
+
+function serializedRustRetrievalWrapperPresent() {
+  const root = path.join(repositoryRoot, runtimeIntegrationTestRoot);
+  if (!fs.existsSync(root)) return false;
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+      } else if (entry.name.endsWith(".rs")) {
+        const source = fs.readFileSync(entryPath, "utf8");
+        if (rustRetrievalWrapperSourcePresent(source)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+export function retrievalGeneralizationSuitePolicyViolations(
+  source,
+  {
+    legacyWrapperPresent = false,
+  } = {},
+) {
+  const violations = [];
+  const invocationCount = source.match(/\brunRetrievalGeneralizationLint\s*\(/gu)?.length ?? 0;
+  const lintReferenceCount =
+    source.match(/\brunRetrievalGeneralizationLint\b/gu)?.length ?? 0;
+  const checkoutDigestCount = source.match(/\btreeDigest\(repositoryRoot\)/gu)?.length ?? 0;
+  const repositoryRootReferenceCount = source.match(/\brepositoryRoot\b/gu)?.length ?? 0;
+  const fixtureRootReferenceCount = source.match(/\bfixtureRoot\b/gu)?.length ?? 0;
+  const productionRepositoryRootReferenceCount =
+    source.match(/\bproductionRepositoryRoot\b/gu)?.length ?? 0;
+  const temporaryRootCount = source.match(/\bos\.tmpdir\(\)/gu)?.length ?? 0;
+  const temporaryTreeCount = source.match(/\bfs\.mkdtempSync\s*\(/gu)?.length ?? 0;
+  const dynamicImportCount = source.match(/\bimport\s*\(/gu)?.length ?? 0;
+  const fsReferenceCount = source.match(/\bfs\b/gu)?.length ?? 0;
+  const filesystemMemberReferences = [...source.matchAll(
+    /\bfs\.([A-Za-z_$][\w$]*)\b/gu,
+  )].map((match) => match[1]);
+  const expectedFilesystemMemberCounts = {
+    existsSync: 1,
+    mkdirSync: 6,
+    mkdtempSync: 1,
+    readFileSync: 4,
+    readdirSync: 4,
+    readlinkSync: 1,
+    rmSync: 1,
+    writeFileSync: 1,
+  };
+  const filesystemMemberCounts = new Map();
+  for (const name of filesystemMemberReferences) {
+    filesystemMemberCounts.set(
+      name,
+      (filesystemMemberCounts.get(name) ?? 0) + 1,
+    );
+  }
+  const fixtureFilesystemShapeIsExact =
+    fsReferenceCount === 21
+    && filesystemMemberReferences.length === 19
+    && Object.entries(expectedFilesystemMemberCounts).every(
+      ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
+    )
+    && [
+      "const destination = path.join(root, relativePath);",
+      "fs.mkdirSync(path.dirname(destination), { recursive: true });",
+      "fs.writeFileSync(destination, contents);",
+      "fs.mkdirSync(rustRoot, { recursive: true });",
+      "fs.mkdirSync(retrievalRoot, { recursive: true });",
+      "fs.mkdirSync(extraRustRoot);",
+      "fs.mkdirSync(nonRustRoot);",
+      "fs.mkdirSync(taskRoot);",
+      "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
+    ].every((fragment) => source.includes(fragment));
+  const writeReferenceCount = source.match(/\bwrite\b/gu)?.length ?? 0;
+  const writeFirstArguments = [...source.matchAll(
+    /\bwrite\s*\(\s*([A-Za-z_$][\w$]*)/gu,
+  )].map((match) => match[1]);
+  const registeredWriteRoots = new Set([
+    "root",
+    "rustRoot",
+    "retrievalRoot",
+    "extraRustRoot",
+    "nonRustRoot",
+    "taskRoot",
+  ]);
+  const syntheticWritesStayInRegisteredRoots =
+    writeReferenceCount === 14
+    && writeFirstArguments.length === writeReferenceCount
+    && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
+  const fixturePathReferenceShapeIsExact =
+    repositoryRootReferenceCount === 12
+    && fixtureRootReferenceCount === 10
+    && productionRepositoryRootReferenceCount === 4;
+  const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
+  const retainedDynamicImportFixtures = [
+    "await import(harness);",
+    String.raw`await import(\"${protectedRetrievalWorkflow}\");`,
+    `await import("${protectedRetrievalWorkflow}");`,
+  ];
+  const importSpecifiers = [...source.matchAll(
+    /^\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["'];\s*$/gmu,
+  )].map((match) => match[1]);
+  const allowedImports = [
+    "node:assert/strict",
+    "node:crypto",
+    "node:fs",
+    "node:os",
+    "node:path",
+    "node:test",
+    "node:url",
+    "../lib/retrieval-generalization-lint.mjs",
+  ];
+  const forbiddenConcurrencySurface = [
+    /(?:node:)?child_process/u,
+    /(?:node:)?worker_threads/u,
+    /(?:node:)?cluster/u,
+    /\b(?:createRequire|getBuiltinModule)\b/u,
+    /\bprocess\s*\[/u,
+    /\bprocess\.(?:binding|_linkedBinding)\s*\(/u,
+    /\b(?:Function|eval)\s*\(/u,
+    /\bglobalThis\b/u,
+    /\bReflect\.(?:apply|construct|get)\b/u,
+    /\bmodule\s*\.\s*(?:constructor|createRequire)\b/u,
+    /\bWebAssembly\b/u,
+    /\brequire\s*\(/u,
+    /\bBun\.(?:spawn|spawnSync)\b/u,
+    /\bDeno\.Command\b/u,
+  ].some((pattern) => pattern.test(source));
+  const forbiddenLockSurface = [
+    /\b(?:flock|lock_exclusive|try_lock_exclusive|proper-lockfile)\b/iu,
+    /\bopenSync\s*\(/u,
+    /\bAtomics\.wait(?:Async)?\s*\(/u,
+    /\b(?:fs|os)\s*\[/u,
+    /retrieval-generalization(?:-guard)?\.lock/iu,
+    /process\.env\.(?:RUNNER_TEMP|TEMP|TMP|TMPDIR)\b/u,
+    /["']\/tmp(?:\/|["'])/u,
+  ].some((pattern) => pattern.test(source));
+
+  add(
+    violations,
+    !legacyWrapperPresent,
+    `${legacyRetrievalGeneralizationWrapper} must stay deleted so workspace nextest cannot rediscover the serialized Rust wrapper`,
+  );
+  add(
+    violations,
+    invocationCount === 1 && lintReferenceCount === 2,
+    `${retrievalGeneralizationSuiteFile} must execute the hostile fixture matrix through one in-process lint invocation`,
+  );
+  add(
+    violations,
+    !forbiddenConcurrencySurface
+      && dynamicImportCount === retainedDynamicImportFixtures.length
+      && retainedDynamicImportFixtures.every((fixture) => source.includes(fixture))
+      && importSpecifiers.length === allowedImports.length
+      && sameMembers(importSpecifiers, allowedImports),
+    `${retrievalGeneralizationSuiteFile} must not create subprocesses, workers, or clusters for hostile fixtures`,
+  );
+  add(
+    violations,
+    !forbiddenLockSurface,
+    `${retrievalGeneralizationSuiteFile} must not restore a global or cross-process fixture lock`,
+  );
+  add(
+    violations,
+    fixtureFilesystemShapeIsExact
+      && syntheticWritesStayInRegisteredRoots
+      && fixturePathReferenceShapeIsExact
+      && !/\bfs\.promises\b/u.test(source),
+    `${retrievalGeneralizationSuiteFile} must confine every filesystem mutation to registered roots in its one synthetic fixture tree`,
+  );
+  add(
+    violations,
+    source.includes(
+      'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
+    )
+      && temporaryRootCount === 1
+      && temporaryTreeCount === 1
+      && source.includes(
+        'assert.ok(\n    path.relative(repositoryRoot, fixtureRoot).startsWith(".."),',
+      )
+      && source.includes("const productionRepositoryRoot = path.join(\n    fixtureRoot,")
+      && source.includes("const extraRustRoot = path.join(fixtureRoot,")
+      && source.includes("const nonRustRoot = path.join(fixtureRoot,")
+      && source.includes("const taskRoot = path.join(fixtureRoot,"),
+    `${retrievalGeneralizationSuiteFile} must keep every mutable hostile fixture under one temporary tree outside the checkout`,
+  );
+  add(
+    violations,
+    checkoutDigestCount === 2
+      && source.includes("const checkoutBefore = treeDigest(repositoryRoot);")
+      && source.includes(
+        "assert.equal(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+      )
+      && source.includes(
+        '"lint changed the whole checkout tree, including tracked bytes or untracked paths"',
+      ),
+    `${retrievalGeneralizationSuiteFile} must prove the real checkout is byte-for-byte read-only`,
+  );
+  add(
+    violations,
+    source.includes("structuralScanRoots: [rustRoot, extraRustRoot],")
+      && source.includes("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS: extraRustRoot,")
+      && source.includes("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS: taskRoot,"),
+    `${retrievalGeneralizationSuiteFile} must register every additive hostile fixture root in the single lint invocation`,
+  );
+  add(
+    violations,
+    source.includes("fs.rmSync(fixtureRoot, { recursive: true, force: true });"),
+    `${retrievalGeneralizationSuiteFile} must remove its isolated fixture tree after the matrix`,
+  );
+  return violations;
+}
 
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -8803,6 +9045,17 @@ export function validateMarketplaceSync(workflows, violations) {
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...retrievalGeneralizationSuitePolicyViolations(
+    fs.readFileSync(
+      path.join(repositoryRoot, retrievalGeneralizationSuiteFile),
+      "utf8",
+    ),
+    {
+      legacyWrapperPresent:
+        fs.existsSync(path.join(repositoryRoot, legacyRetrievalGeneralizationWrapper))
+        || serializedRustRetrievalWrapperPresent(),
+    },
+  ));
   violations.push(...qualificationDriverArtifactViolations(
     fs.readFileSync(
       path.join(
