@@ -1,21 +1,21 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 40,
+      "retry_after_ms": 50,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 7,
+      "initial_backoff_ms": 9,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 102
+      "maximum_backoff_ms": 108
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
       "bulk_replay_success_budget_ms": 144537,
       "bulk_request_deadline_ms": 564239,
-      "query_request_deadline_ms": 10000
+      "query_request_deadline_ms": 10160
     },
     "spawn_convergence_timeout_ms": 15000,
     "watchdog_cadence_ms": 19271
@@ -43,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "2d02991184e58a28440ffee38f0df50840b57b6b13e57736ec1a273e614b3f97",
+    "calibration_freeze_digest": "9002c6b680c8b45e4ff8b076ec73cf0d314703a359ea27d60ed3392d9c1ddb01",
+    "input_constant_set_sha256": "ea58d298473ddf320469d15dc7c32176a1109d615a689c15ff76b67fb337e109",
+    "measurement_protocol_sha256": "d1bb9b2c7eb354fe98990aa32eedc0e165b0cf804212966e0a2ee362a2f5bf8e",
+    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
+    "run_artifact_sha256s": [
+      "65a4c4d5429ce9b83905505d6778c917c6a86d61fbd904c8950db1e0eac83ffc",
+      "cc5fe78225514333c8741564425c2c6f92db95e88d58df4e78ec03ac6985d6ca",
+      "e78409ef1925c467c178ed0b90b55f8d88269584a938e56393ead122ea835bb9"
+    ],
+    "selected_at": "github-actions-run:30531101324:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "74dd8b023481ccf5e7d6036aeb5a29cdc1ee4da6",
+    "selection_source_tree": "1eddbce0062d298868049a0c6f4603c419195100"
+  },
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -60,5 +75,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
