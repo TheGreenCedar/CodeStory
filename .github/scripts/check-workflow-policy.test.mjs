@@ -3212,6 +3212,22 @@ test("release freeze policy pins live PR base and support ancestry revalidation"
       );
     });
   }
+
+  await t.test("active workflow discovery becomes bounded", () => {
+    const bounded = source.replace(
+      '"api",\n      "--paginate",\n      "--slurp",',
+      '"run",\n      "list",\n      "--limit",',
+    );
+    const violations = releaseFreezeBarrierWorkflowViolations(
+      loadWorkflows(),
+      loadReleaseClaimGraph(root),
+      bounded,
+    );
+    assert.match(
+      violations.join("\n"),
+      /obsolete-run discovery must paginate every active Actions state/u,
+    );
+  });
 });
 
 test("Windows package proof retains the readable native sccache executable", () => {

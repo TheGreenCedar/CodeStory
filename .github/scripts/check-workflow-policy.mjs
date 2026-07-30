@@ -8049,6 +8049,16 @@ export function releaseFreezeBarrierWorkflowViolations(
       && barrierSource.includes("support PR #${number} is not merged"),
     "[freeze_barrier] Actions receipt authority must recheck the live release PR base and integrated support PR ancestry",
   );
+  add(
+    violations,
+    barrierSource.includes("for (const status of ACTIVE_RUN_STATES)")
+      && barrierSource.includes('"api",\n      "--paginate",\n      "--slurp",')
+      && barrierSource.includes(
+        "`repos/${repository}/actions/runs?status=${status}&per_page=100`",
+      )
+      && !barrierSource.includes('"run",\n    "list",'),
+    "[freeze_barrier] obsolete-run discovery must paginate every active Actions state",
+  );
 
   const invalidationFile = freeze.invalidation_workflow;
   const invalidation = workflows.get(invalidationFile);

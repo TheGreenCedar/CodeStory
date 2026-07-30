@@ -464,8 +464,15 @@ test("cancel-superseded rejects a cancellation request that leaves the run activ
   writeFileSync(
     fakeGh,
     `#!/bin/sh
-if [ "$1 $2" = "run list" ]; then
-  printf '%s\\n' '[{"databaseId":123,"workflowName":"Exact-head source proof","headSha":"${"9".repeat(40)}","headBranch":"old","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/123"}]'
+if [ "$1 $2 $3" = "api --paginate --slurp" ]; then
+  case "$4" in
+    *status=in_progress*)
+      printf '%s\\n' '[
+        {"workflow_runs":[{"id":123,"name":"Exact-head source proof","head_sha":"${"9".repeat(40)}","head_branch":"old","status":"in_progress","event":"workflow_dispatch","html_url":"https://example.invalid/123"}]}
+      ]'
+      ;;
+    *) printf '%s\\n' '[{"workflow_runs":[]}]' ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "run cancel" ]; then
@@ -502,14 +509,85 @@ exit 1
   assert.match(result.stderr, /remains queued or running after cancellation/u);
 });
 
+test("cancel-superseded finds an obsolete proof on a later active-run page", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-paginated-gh-"));
+  const fakeGh = path.join(root, "gh");
+  const cancelledMarker = path.join(root, "cancelled");
+  writeFileSync(
+    fakeGh,
+    `#!/bin/sh
+if [ "$1 $2 $3" = "api --paginate --slurp" ]; then
+  case "$4" in
+    *status=in_progress*)
+      if [ -f "${cancelledMarker}" ]; then
+        printf '%s\\n' '[{"workflow_runs":[]}]'
+      else
+        printf '%s\\n' '[
+          {"workflow_runs":[{"id":1,"name":"Draft source checks","head_sha":"${COMMIT}","head_branch":"candidate","status":"in_progress","event":"pull_request","html_url":"https://example.invalid/1"}]},
+          {"workflow_runs":[{"id":999,"name":"Exact-head source proof","head_sha":"${"9".repeat(40)}","head_branch":"obsolete","status":"in_progress","event":"workflow_dispatch","html_url":"https://example.invalid/999"}]}
+        ]'
+      fi
+      ;;
+    *) printf '%s\\n' '[{"workflow_runs":[]}]' ;;
+  esac
+  exit 0
+fi
+if [ "$1 $2 $3" = "run cancel 999" ]; then
+  : > "${cancelledMarker}"
+  exit 0
+fi
+exit 9
+`,
+  );
+  chmodSync(fakeGh, 0o755);
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "cancel-superseded",
+      "--repository",
+      REPOSITORY,
+      "--commit",
+      COMMIT,
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODESTORY_FREEZE_CANCEL_POLL_ATTEMPTS: "2",
+        CODESTORY_FREEZE_CANCEL_POLL_MS: "0",
+        PATH: `${root}${path.delimiter}${process.env.PATH}`,
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    cancelled: [{
+      database_id: 999,
+      head_sha: "9".repeat(40),
+      workflow: "Exact-head source proof",
+    }],
+  });
+});
+
 test("cancel-superseded rejects another active broad run on the unchanged head", () => {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-duplicate-gh-"));
   const fakeGh = path.join(root, "gh");
   writeFileSync(
     fakeGh,
     `#!/bin/sh
-if [ "$1 $2" = "run list" ]; then
-  printf '%s\\n' '[{"databaseId":456,"workflowName":"Exact-head source proof","headSha":"${COMMIT}","headBranch":"candidate","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/456"}]'
+if [ "$1 $2 $3" = "api --paginate --slurp" ]; then
+  case "$4" in
+    *status=in_progress*)
+      printf '%s\\n' '[
+        {"workflow_runs":[{"id":456,"name":"Exact-head source proof","head_sha":"${COMMIT}","head_branch":"candidate","status":"in_progress","event":"workflow_dispatch","html_url":"https://example.invalid/456"}]}
+      ]'
+      ;;
+    *) printf '%s\\n' '[{"workflow_runs":[]}]' ;;
+  esac
   exit 0
 fi
 exit 1
@@ -547,8 +625,15 @@ test("automatic invalidation preserves an active proof for the new exact head", 
   writeFileSync(
     fakeGh,
     `#!/bin/sh
-if [ "$1 $2" = "run list" ]; then
-  printf '%s\\n' '[{"databaseId":789,"workflowName":"Exact-head source proof","headSha":"${COMMIT}","headBranch":"candidate","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/789"}]'
+if [ "$1 $2 $3" = "api --paginate --slurp" ]; then
+  case "$4" in
+    *status=in_progress*)
+      printf '%s\\n' '[
+        {"workflow_runs":[{"id":789,"name":"Exact-head source proof","head_sha":"${COMMIT}","head_branch":"candidate","status":"in_progress","event":"workflow_dispatch","html_url":"https://example.invalid/789"}]}
+      ]'
+      ;;
+    *) printf '%s\\n' '[{"workflow_runs":[]}]' ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "run cancel" ]; then

@@ -303,18 +303,34 @@ export function validateReceipt(
 }
 
 function currentRuns(repository) {
-  const raw = gh([
-    "run",
-    "list",
-    "--repo",
-    repository,
-    "--limit",
-    "100",
-    "--json",
-    "databaseId,workflowName,headSha,headBranch,status,event,url",
-  ]);
-  const parsed = JSON.parse(raw || "[]");
-  return parsed.filter((entry) => ACTIVE_RUN_STATES.has(entry.status));
+  const runs = [];
+  for (const status of ACTIVE_RUN_STATES) {
+    const raw = gh([
+      "api",
+      "--paginate",
+      "--slurp",
+      `repos/${repository}/actions/runs?status=${status}&per_page=100`,
+    ]);
+    const pages = JSON.parse(raw || "[]");
+    if (!Array.isArray(pages)) {
+      fail(`active workflow query for ${status} did not return paginated pages`);
+    }
+    for (const page of pages) {
+      for (const entry of page?.workflow_runs ?? []) {
+        runs.push({
+          databaseId: entry.id,
+          workflowName: entry.name,
+          headSha: entry.head_sha,
+          headBranch: entry.head_branch,
+          status: entry.status,
+          event: entry.event,
+          url: entry.html_url,
+        });
+      }
+    }
+  }
+  const unique = new Map(runs.map(entry => [String(entry.databaseId), entry]));
+  return [...unique.values()].filter((entry) => ACTIVE_RUN_STATES.has(entry.status));
 }
 
 function cancelSupersededRuns({ repository, commit, workflows, runs }) {
