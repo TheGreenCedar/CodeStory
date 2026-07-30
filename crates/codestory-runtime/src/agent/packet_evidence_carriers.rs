@@ -596,11 +596,11 @@ pub(crate) fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool 
 /// The operations that move bytes across that buffer. Sibling of `buffer_storage`, so a citation
 /// that only names the container must not close it.
 ///
-/// The anchor must name the buffer itself as well as the operation. A bare `Source.read` or
-/// `Sink.write` names an IO operation, but not *this* buffer flow; accepting those generic peers
-/// let a real `Buffer` citation for storage combine with unrelated database and telemetry
-/// operations to close the whole flow. The positive surface remains the buffer's own methods
-/// (`Buffer.read`, `Buffer.write`, and their variants), which carry both factors in one citation.
+/// The anchor must name the buffer itself as well as the operation. A generic source or sink
+/// operation names IO, but not *this* buffer flow; accepting those peers let a real storage
+/// citation combine with unrelated database and telemetry operations to close the whole flow.
+/// The positive surface remains operations named on the storage object itself, which carry both
+/// factors in one citation.
 pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && names_io_operation(citation) && names_the_buffer_itself(citation)
 }
@@ -647,10 +647,9 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
 ///
 /// It must also name the logging subsystem itself. Structural adjectives such as `Abstract`,
 /// `Default`, `Processing`, `Interface`, and `Fallback` occur on handlers in every domain. Treating
-/// one as a record-pipeline subject let `DefaultHandler.process` in an HTTP subsystem combine with
-/// a real `Logger.addRecord` citation and close the whole logging flow. A proof-bearing handler
-/// anchor therefore says both whose handler it is (`LogHandler`, `LoggerHandler`,
-/// `LogRecordHandler`) and which processing step it owns.
+/// one as a record-pipeline subject let an HTTP handler combine with real record-creation evidence
+/// and close the whole logging flow. A proof-bearing handler anchor therefore says both whose
+/// handler it is and which processing step it owns.
 pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && belongs_to_logging(citation) && {
         let tokens = name_tokens(citation);
@@ -821,33 +820,42 @@ pub(crate) fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> boo
 // Runtime formatting
 // ---------------------------------------------------------------------------
 
+const RUNTIME_FORMATTING_WORDS: &[&str] = &[
+    "format",
+    "formats",
+    "formatted",
+    "formatter",
+    "formatters",
+    "formatting",
+    "fmt",
+    "vformat",
+    "printf",
+    "sprintf",
+    "fprintf",
+];
+
+const RUNTIME_FORMAT_ARGUMENT_WORDS: &[&str] = &[
+    "format",
+    "formats",
+    "formatted",
+    "formatter",
+    "formatters",
+    "formatting",
+];
+
 /// Anchors that belong to the runtime-formatting subsystem. The error carrier below asks only
 /// whether a symbol sounds like a failure path, which every subsystem in a repository has; scoping
 /// it to the formatting surface is what stops `CliParseError` in `src/cli/parse.cc` from standing
 /// in for the formatter's fallback.
 fn belongs_to_runtime_formatting(citation: &AgentCitationDto) -> bool {
-    names_token(
-        citation,
-        &[
-            "format",
-            "formats",
-            "formatter",
-            "formatters",
-            "formatting",
-            "fmt",
-            "vformat",
-            "printf",
-            "sprintf",
-            "fprintf",
-        ],
-    ) || names_token_prefix(citation, &["format"])
+    names_token(citation, RUNTIME_FORMATTING_WORDS)
 }
 
 /// The type-erased argument store a runtime formatter reads from.
 pub(crate) fn citation_owns_format_arguments(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && {
         let tokens = name_tokens(citation);
-        any_token_starts_with(&tokens, &["format"])
+        has_token(&tokens, RUNTIME_FORMAT_ARGUMENT_WORDS)
             && has_token(
                 &tokens,
                 &["arg", "args", "arguments", "store", "value", "values"],
@@ -1176,6 +1184,43 @@ mod tests {
         assert!(!citation_owns_formatter_fallback(&arguments));
         assert!(citation_owns_formatter_fallback(&errors));
         assert!(!citation_owns_format_arguments(&errors));
+    }
+
+    #[test]
+    fn runtime_formatting_rejects_words_that_only_neighbor_the_format_stem() {
+        let neighbor_suffixes = ["ion", "ions", "ive", "ively", "iveness"];
+        let argument_steps = ["Arg", "Args", "Arguments", "Store", "Value", "Values"];
+        let failure_steps = ["Error", "Throw", "Fail", "Assert", "Fallback", "Panic"];
+        let surfaces = [
+            "src/geometry/one.rs",
+            "src/geometry/one.vue",
+            "src/geometry/one.svelte",
+            "src/geometry/one.html",
+        ];
+
+        for suffix in neighbor_suffixes {
+            let neighbor = format!("format{suffix}");
+            for surface in surfaces {
+                for step in argument_steps {
+                    let arguments =
+                        citation(&format!("{neighbor}{step}"), surface, NodeKind::FUNCTION);
+                    assert!(
+                        !citation_owns_format_arguments(&arguments),
+                        "`{neighbor}` only shares a prefix with the formatting vocabulary: \
+                         {arguments:?}"
+                    );
+                }
+                for step in failure_steps {
+                    let fallback =
+                        citation(&format!("{neighbor}{step}"), surface, NodeKind::FUNCTION);
+                    assert!(
+                        !citation_owns_formatter_fallback(&fallback),
+                        "`{neighbor}` only shares a prefix with the formatting vocabulary: \
+                         {fallback:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -3383,10 +3383,8 @@ mod tests {
                     "formatter",
                     "formatters",
                     "formatting",
-                    // `belongs_to_runtime_formatting` reads "format" as a *prefix*, so every
-                    // vocabulary word that starts with it is a subject word. Leaving this one out
-                    // showed up below as both steps of the flow closing without a subject, which is
-                    // what this list being wrong is supposed to look like.
+                    // Every accepted inflection is declared explicitly. The near-prefix sweep
+                    // rejects neighboring words rather than treating this vocabulary as a stem.
                     "formatted",
                     "fmt",
                     "vformat",

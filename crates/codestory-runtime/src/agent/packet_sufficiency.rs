@@ -4079,15 +4079,16 @@ mod tests {
                 expected_missing: &["buffered_read_write"],
             },
             Case {
-                label: "format-looking failures without argument storage",
+                label: "near-prefix words from a different subsystem",
                 question: "Explain how formatting arguments become type-erased format args and reach the vformat error fallback path.",
                 citations: vec![
-                    anchor_at("ArgumentStore", "src/fmt/Args.vue"),
-                    anchor_at("NumberFormatError", "src/num/Parse.vue"),
-                    anchor_at("formatCurrencyError", "src/money/Format.svelte"),
-                    anchor_at("CliParseError", "src/cli/errors.html"),
+                    anchor_at("FormationArgs", "src/geometry/FormationArgs.vue"),
+                    anchor_at("FormativeValues", "src/geometry/FormativeValues.svelte"),
+                    anchor_at("FormationsStore", "src/geometry/FormationsStore.html"),
+                    anchor_at("FormationError", "src/geometry/FormationError.svelte"),
+                    anchor_at("FormativelyFallback", "src/geometry/Fallback.vue"),
                 ],
-                expected_missing: &["format_arguments"],
+                expected_missing: &["format_arguments", "format_errors"],
             },
         ];
 
