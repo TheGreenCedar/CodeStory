@@ -349,6 +349,16 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
+// A parsed job is not its complete execution contract. Workflow-level environment and run
+// defaults execute inside every job, while triggers, permissions, concurrency, and future
+// top-level fields can change when or with what authority it runs. Hash the entire parsed
+// workflow except `jobs`; the acceptance manifest hashes those bodies separately.
+function workflowExecutionContext(workflowValue) {
+  return Object.fromEntries(
+    Object.entries(object(workflowValue)).filter(([key]) => key !== "jobs"),
+  );
+}
+
 function scalarStrings(value, found = []) {
   if (typeof value === "string") {
     found.push(value);
@@ -8274,8 +8284,17 @@ export function releaseFreezeBarrierWorkflowViolations(
   );
   add(
     violations,
-    acceptanceManifest.schema === "codestory.release-freeze-acceptance-jobs/v1"
+    hasExactKeys(acceptanceManifest, [
+      "schema",
+      "workflow",
+      "workflow_context_sha256",
+      "jobs",
+    ])
+      && acceptanceManifest.schema === "codestory.release-freeze-acceptance-jobs/v2"
       && acceptanceManifest.workflow === ".github/workflows/source-proof.yml"
+      && /^[0-9a-f]{64}$/u.test(
+        String(acceptanceManifest.workflow_context_sha256 ?? ""),
+      )
       && sameMembers(Object.keys(acceptanceManifestJobs), acceptanceJobNames)
       && acceptanceJobNames.every(jobName =>
         /^[0-9a-f]{64}$/u.test(String(acceptanceManifestJobs[jobName] ?? ""))
@@ -8547,6 +8566,14 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     sameMembers(Object.keys(object(sourceWorkflow.jobs)), sourceJobNames),
     "[freeze_barrier] source-proof.yml must use the closed source and acceptance job contract",
+  );
+  const actualWorkflowContextDigest = createHash("sha256")
+    .update(canonicalJson(workflowExecutionContext(sourceWorkflow)))
+    .digest("hex");
+  add(
+    violations,
+    actualWorkflowContextDigest === acceptanceManifest.workflow_context_sha256,
+    "[freeze_barrier] source-proof.yml workflow execution context must match the canonical acceptance manifest",
   );
   for (const jobName of acceptanceJobNames) {
     const actualDigest = createHash("sha256")

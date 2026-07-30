@@ -3473,6 +3473,9 @@ test("release freeze policy authenticates the complete acceptance job manifest",
   );
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   const cases = [
+    ["manifest substitutes the workflow execution context", value => {
+      value.workflow_context_sha256 = "0".repeat(64);
+    }, /workflow execution context must match the canonical acceptance manifest/u],
     ["manifest substitutes an approved job body", value => {
       value.jobs["freeze-hostile-mutations"] = "0".repeat(64);
     }, /freeze-hostile-mutations must match the canonical acceptance job manifest/u],
@@ -3514,6 +3517,60 @@ test("release freeze policy authenticates the complete acceptance job manifest",
       /release claim graph must pin the executable exact-head freeze contract/u,
     );
   });
+
+  const workflowContextCases = [
+    ["repository BASH_ENV preload", workflow => {
+      workflow.env = {
+        ...workflow.env,
+        BASH_ENV: "${{ github.workspace }}/scripts/run-broad-source.sh",
+      };
+    }],
+    ["repository NODE_OPTIONS preload", workflow => {
+      workflow.env = {
+        ...workflow.env,
+        NODE_OPTIONS: "--require ${{ github.workspace }}/scripts/run-broad-source.js",
+      };
+    }],
+    ["repository shell wrapper", workflow => {
+      workflow.defaults = {
+        run: {
+          shell: "bash scripts/run-broad-source.sh {0}",
+        },
+      };
+    }],
+    ["workflow trigger context", workflow => {
+      workflow.on.workflow_dispatch.inputs.acceptance_only.default = true;
+    }],
+    ["workflow token permissions", workflow => {
+      workflow.permissions.contents = "write";
+    }],
+    ["workflow cancellation context", workflow => {
+      workflow.concurrency.group = "unscoped-acceptance";
+    }],
+    ["workflow display identity", workflow => {
+      workflow.name = "Unreviewed acceptance wrapper";
+    }],
+    ["new workflow-level field", workflow => {
+      workflow["run-name"] = "unreviewed-${{ github.run_id }}";
+    }],
+  ];
+
+  for (const [name, mutate] of workflowContextCases) {
+    await t.test(`workflow context rejects ${name}`, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get("source-proof.yml"));
+      const violations = releaseFreezeBarrierWorkflowViolations(
+        workflows,
+        loadReleaseClaimGraph(root),
+        barrierSource,
+        readFileSync(manifestPath, "utf8"),
+      );
+      assert.match(
+        violations.join("\n"),
+        /source-proof\.yml workflow execution context must match the canonical acceptance manifest/u,
+      );
+    });
+  }
 });
 
 test("calibration precedes the sole frozen-candidate source proof", async (t) => {
