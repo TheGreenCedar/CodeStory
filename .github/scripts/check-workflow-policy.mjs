@@ -993,7 +993,9 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "0c9e4752b50d25cc42406e943ca7fbe6198428095c9c98d8de3e14364e6a89ff";
+  "797fa9e2be359f83eacd45b78722829d1f277efd2e721de1c9bf8b590b73dc58";
+const releaseSourceProofSentinelDigest =
+  "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -2890,9 +2892,33 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
 
   const source = requireJob(violations, releaseFile, release, "source-proof");
-  add(violations, source.uses === "./.github/workflows/source-proof.yml", `${releaseFile} must call exact source proof`);
+  add(
+    violations,
+    createHash("sha256").update(JSON.stringify(source)).digest("hex")
+      === releaseSourceProofSentinelDigest,
+    `${releaseFile} source proof placeholder must match the reviewed fail-closed sentinel`,
+  );
+  add(
+    violations,
+    source.uses === undefined
+      && source["runs-on"] === "ubuntu-latest"
+      && source["timeout-minutes"] === 1
+      && permissionMapMatches(source.permissions, {})
+      && object(source.env).SOURCE_SHA === "${{ github.sha }}",
+    `${releaseFile} source proof placeholder must fail closed without calling the broad source workflow`,
+  );
   add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
-  add(violations, object(source.with).ref === "${{ github.sha }}", `${releaseFile} source proof must receive the exact release SHA`);
+  requireStepRun(
+    violations,
+    releaseFile,
+    source,
+    "Refuse a second source proof",
+    [
+      'test "$SOURCE_SHA" = "$GITHUB_SHA"',
+      "Preflight did not resolve reusable exact-head source proof",
+      "exit 1",
+    ],
+  );
   // Reuse is admissible only through the authenticated closeout binding, never by simply
   // dropping the gate: the job may be skipped, and only when preflight resolved reusable
   // evidence for this exact tree.
@@ -2935,10 +2961,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(source.with).version === "${{ needs.preflight.outputs.version }}"
-      && object(source.with).freeze_receipt_digest === ""
-      && object(source.with).emit_release_cells === undefined,
-    `${releaseFile} unreachable source fallback must fail closed without a post-calibration freeze`,
+    source.with === undefined
+      && source.uses === undefined
+      && list(source.steps).length === 1,
+    `${releaseFile} unreachable source fallback must remain a one-step fail-closed sentinel`,
   );
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
@@ -7951,6 +7977,60 @@ function permissionMapMatches(actualValue, expectedValue) {
     && Object.entries(expected).every(([key, value]) => actual[key] === value);
 }
 
+function reusableWorkflowPermissionViolations(workflows) {
+  const violations = [];
+  const permissionRank = value => (
+    value === "write" ? 2 : value === "read" ? 1 : 0
+  );
+  const permissionRequests = value => {
+    if (value === "write-all") return [["*", "write"]];
+    if (value === "read-all") return [["*", "read"]];
+    return Object.entries(object(value));
+  };
+  const permissionGrant = (value, scope) => {
+    if (value === "write-all") return { rank: 2, label: "write-all" };
+    if (value === "read-all") return { rank: 1, label: "read-all" };
+    const granted = object(value)[scope];
+    return { rank: permissionRank(granted), label: granted ?? "none" };
+  };
+  const localWorkflow = /^\.\/\.github\/workflows\/([^/]+\.ya?ml)$/u;
+
+  for (const [callerFile, callerWorkflow] of workflows) {
+    for (const [jobName, jobValue] of Object.entries(object(callerWorkflow.jobs))) {
+      const job = object(jobValue);
+      const match = String(job.uses ?? "").match(localWorkflow);
+      if (!match) continue;
+      const calleeFile = match[1];
+      const callee = workflows.get(calleeFile);
+      if (!callee) {
+        violations.push(
+          `[reusable_permissions] ${callerFile} job ${jobName} calls missing local workflow ${calleeFile}`,
+        );
+        continue;
+      }
+      const callerPermissions = job.permissions === undefined
+        ? callerWorkflow.permissions
+        : job.permissions;
+      for (const [calleeJobName, calleeJobValue] of Object.entries(object(callee.jobs))) {
+        const calleeJob = object(calleeJobValue);
+        const requestedPermissions = calleeJob.permissions === undefined
+          ? callee.permissions
+          : calleeJob.permissions;
+        for (const [scope, requested] of permissionRequests(requestedPermissions)) {
+          const granted = permissionGrant(callerPermissions, scope);
+          add(
+            violations,
+            granted.rank >= permissionRank(requested),
+            `[reusable_permissions] ${callerFile} job ${jobName} grants ${scope}: ${granted.label} but ${calleeFile} job ${calleeJobName} requests ${requested}`,
+          );
+        }
+      }
+    }
+  }
+
+  return violations;
+}
+
 function findNamedStep(workflow, name) {
   for (const job of Object.values(object(workflow.jobs))) {
     const found = namedStep(job, name);
@@ -8526,8 +8606,8 @@ export function releaseFreezeBarrierWorkflowViolations(
     } else {
       add(
         violations,
-        object(workflow.permissions).statuses === "write",
-        "[freeze_barrier] packaged-platform-pr.yml must forward status write required by reusable source proof",
+        object(workflow.permissions).statuses === "read",
+        "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status without broad workflow authority",
       );
     }
     add(
@@ -8911,6 +8991,22 @@ export function releaseFreezeBarrierWorkflowViolations(
       '.name == "full-source-gate" and .conclusion == "success"',
     ],
   );
+  const packagedSourceJob = requireJob(
+    violations,
+    "packaged-platform-pr.yml",
+    coordinator,
+    "source-proof",
+  );
+  add(
+    violations,
+    permissionMapMatches(packagedSourceJob.permissions, {
+      actions: "write",
+      contents: "read",
+      "pull-requests": "read",
+      statuses: "write",
+    }),
+    "[freeze_barrier] packaged source-proof call must grant exactly the reusable workflow permissions",
+  );
 
   const release = workflows.get("release.yml");
   const auto = workflows.get("auto-release.yml");
@@ -8959,7 +9055,9 @@ export function releaseFreezeBarrierWorkflowViolations(
     sourceJob.if === "needs.preflight.outputs.source_proof_reused != 'true'"
       && object(preflight.outputs).source_proof_reused
         === "${{ steps.reuse.outputs.source_proof_reused }}"
-      && object(sourceJob.with).freeze_receipt_digest === "",
+      && sourceJob.uses === undefined
+      && sourceJob.with === undefined
+      && namedStep(sourceJob, "Refuse a second source proof") !== undefined,
     "[freeze_barrier] release must make the post-calibration source-proof fallback unreachable",
   );
 
@@ -9055,9 +9153,13 @@ export function releaseWorkflowContractViolations(
 
   const release = workflows.get("release.yml");
   for (const jobName of policy.release_chain.exact_sha_jobs) {
+    const job = object(at(release, "jobs", jobName));
+    const exactSha = jobName === "source-proof" && job.uses === undefined
+      ? object(job.env).SOURCE_SHA
+      : object(job.with).ref;
     add(
       violations,
-      object(at(release, "jobs", jobName, "with")).ref === policy.promotion.exact_sha_expression,
+      exactSha === policy.promotion.exact_sha_expression,
       `[exact_sha] release.yml job ${jobName} must receive ${policy.promotion.exact_sha_expression}`,
     );
   }
@@ -10259,6 +10361,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
   }
+  violations.push(...reusableWorkflowPermissionViolations(workflows));
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations, graph);
   validateMarketplaceSync(workflows, violations);

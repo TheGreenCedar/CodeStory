@@ -44,7 +44,7 @@ permissions:
   actions: write
   contents: read
   pull-requests: read
-  statuses: write
+  statuses: read
 
 concurrency:
   group: proof-${{ github.sha }}-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || 'dev' }}
@@ -420,6 +420,11 @@ jobs:
   source-proof:
     if: needs.route.outputs.mode == 'integration'
     needs: route
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
     uses: ./.github/workflows/source-proof.yml
     with:
       ref: ${{ needs.route.outputs.head_sha }}

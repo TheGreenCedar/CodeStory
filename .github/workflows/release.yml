@@ -311,17 +311,22 @@ jobs:
 
   source-proof:
     needs: preflight
-    # Preflight fails unless the one frozen-candidate source proof is reusable. This job is a
-    # structural DAG placeholder for closeout compatibility and must remain unreachable.
+    # Preflight fails unless the one frozen-candidate source proof is reusable. Keep this
+    # structural DAG placeholder fail-closed without calling the broad source workflow again.
     if: needs.preflight.outputs.source_proof_reused != 'true'
-    uses: ./.github/workflows/source-proof.yml
-    with:
-      ref: ${{ github.sha }}
-      proof_key: release-${{ needs.preflight.outputs.version }}
-      version: ${{ needs.preflight.outputs.version }}
-      # This job is deliberately unreachable. An empty digest makes any policy
-      # regression that reaches it fail before starting a second broad proof.
-      freeze_receipt_digest: ""
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - name: Refuse a second source proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          echo "::error::Preflight did not resolve reusable exact-head source proof; refusing to start a second broad proof."
+          exit 1
 
   packaged-proof:
     needs: preflight

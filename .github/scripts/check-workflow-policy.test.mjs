@@ -2211,6 +2211,43 @@ jobs:
   );
 });
 
+test("local reusable workflow callers grant every permission requested by the callee", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const cases = [
+    ["packaged source caller downgrades status authority", workflows => {
+      workflows.get("packaged-platform-pr.yml").jobs["source-proof"]
+        .permissions.statuses = "read";
+    }, /packaged-platform-pr\.yml job source-proof grants statuses: read but source-proof\.yml job .+ requests write/u],
+    ["packaged source caller drops its job permission boundary", workflows => {
+      delete workflows.get("packaged-platform-pr.yml").jobs["source-proof"].permissions;
+    }, /packaged-platform-pr\.yml job source-proof grants statuses: read but source-proof\.yml job .+ requests write/u],
+    ["automatic release caller downgrades Actions authority", workflows => {
+      workflows.get("auto-release.yml").jobs.release.permissions.actions = "read";
+    }, /auto-release\.yml job release grants actions: read but release\.yml job .+ requests write/u],
+    ["plugin release caller cannot fund its publish job", workflows => {
+      workflows.get("auto-release.yml").jobs["plugin-release"].permissions.contents = "read";
+    }, /auto-release\.yml job plugin-release grants contents: read but plugin-release\.yml job publish requests write/u],
+    ["release restores the invalid broad source call", workflows => {
+      workflows.get("release.yml").jobs["source-proof"].uses
+        = "./.github/workflows/source-proof.yml";
+    }, /release\.yml job source-proof grants statuses: none but source-proof\.yml job .+ requests write/u],
+    ["caller scalar read-all cannot fund a write job", workflows => {
+      workflows.get("auto-release.yml").jobs["plugin-release"].permissions = "read-all";
+    }, /auto-release\.yml job plugin-release grants contents: read-all but plugin-release\.yml job publish requests write/u],
+    ["callee scalar write-all cannot hide from the caller check", workflows => {
+      workflows.get("plugin-release.yml").jobs.publish.permissions = "write-all";
+    }, /auto-release\.yml job plugin-release grants \*: none but plugin-release\.yml job publish requests write/u],
+  ];
+
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("cargo test filters must select at least one real test", () => {
   const identifiers = new Map([["demo-crate", "/unused"]]);
   const known = new Set(["tests", "demo_tests", "full_publication_survives_restart"]);
@@ -3338,8 +3375,9 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         .inputs.freeze_receipt_digest.default = "";
     }, /packaged proof must require an exact-head freeze digest/u],
     ["platform downgrades reusable source status authority", workflows => {
-      workflows.get("packaged-platform-pr.yml").permissions.statuses = "read";
-    }, /must forward status write required by reusable source proof/u],
+      workflows.get("packaged-platform-pr.yml").jobs["source-proof"]
+        .permissions.statuses = "read";
+    }, /packaged source-proof call must grant exactly the reusable workflow permissions/u],
     ["qualification bypasses its exact-head freeze status", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
@@ -3413,10 +3451,43 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run += "\nnode .github/scripts/release-freeze-barrier.mjs verify-status\n";
     }, /Resolve reusable prior evidence must not run release-freeze-barrier\.mjs verify-status/u],
-    ["release placeholder propagates a post-calibration receipt", workflows => {
-      workflows.get("release.yml").jobs["source-proof"].with.freeze_receipt_digest
-        = "${{ inputs.freeze_receipt_digest }}";
-    }, /unreachable source fallback must fail closed without a post-calibration freeze/u],
+    ["release placeholder calls the broad source workflow", workflows => {
+      const job = workflows.get("release.yml").jobs["source-proof"];
+      delete job["runs-on"];
+      delete job["timeout-minutes"];
+      delete job.permissions;
+      delete job.env;
+      delete job.steps;
+      job.uses = "./.github/workflows/source-proof.yml";
+      job.with = {
+        ref: "${{ github.sha }}",
+        proof_key: "release-${{ needs.preflight.outputs.version }}",
+        version: "${{ needs.preflight.outputs.version }}",
+        freeze_receipt_digest: "",
+      };
+    }, /source proof placeholder must fail closed without calling the broad source workflow/u],
+    ["release placeholder loses its hard failure", workflows => {
+      draftStep(
+        workflows.get("release.yml").jobs["source-proof"],
+        "Refuse a second source proof",
+      ).run = "exit 0";
+    }, /Refuse a second source proof/u],
+    ["release placeholder parks its failure behind a false step", workflows => {
+      draftStep(
+        workflows.get("release.yml").jobs["source-proof"],
+        "Refuse a second source proof",
+      ).if = "${{ false }}";
+    }, /source proof placeholder must match the reviewed fail-closed sentinel/u],
+    ["release placeholder exits successfully before its failure", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs["source-proof"],
+        "Refuse a second source proof",
+      );
+      step.run = `exit 0\n${step.run}`;
+    }, /source proof placeholder must match the reviewed fail-closed sentinel/u],
+    ["release placeholder makes job failure advisory", workflows => {
+      workflows.get("release.yml").jobs["source-proof"]["continue-on-error"] = true;
+    }, /source proof placeholder must match the reviewed fail-closed sentinel/u],
     ["release stops cancelling superseded work", workflows => {
       workflows.get("release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],

@@ -64,8 +64,8 @@
       "workflow": "release.yml",
       "job": "source-proof",
       "field": [
-        "with",
-        "ref"
+        "env",
+        "SOURCE_SHA"
       ],
       "value": "${{ github.ref }}"
     },
