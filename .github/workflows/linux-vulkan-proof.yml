@@ -45,47 +45,8 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        required: true
-        type: string
-      ref:
-        required: true
-        type: string
-      proof_key:
-        required: false
-        type: string
-      package_run_id:
-        description: Upstream packaged-platform run containing codestory-cli-linux-x64; omitted for standalone constant calibration.
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_artifact:
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        required: false
-        default: ""
-        type: string
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: true
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/packaged-platform-pr.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: true
-        type: boolean
       constant_calibration_mode:
-        description: Collect optional Linux Vulkan constant-calibration evidence without feeding the frozen bundle.
+        description: Collect optional Linux Vulkan calibration evidence without feeding assembly.
         required: false
         default: false
         type: boolean
@@ -662,7 +623,7 @@ jobs:
           retention-days: 30
 
   optional-constant-calibration:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.constant_calibration_mode }}
+    if: ${{ inputs.constant_calibration_mode }}
     needs: route
     name: Optional Linux Vulkan constant calibration
     runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
@@ -728,10 +689,11 @@ jobs:
         shell: bash
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
+          CONSTANT_CALIBRATION_MODE: ${{ inputs.constant_calibration_mode }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$CONSTANT_CALIBRATION_MODE" = true
           test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
           version="${INPUT_VERSION#v}"
           source_sha="$(git rev-parse HEAD)"

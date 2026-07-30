@@ -33,6 +33,38 @@ def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
         self_measurement_protocol,
         require_frozen=False,
     )
+    for label, field, value in (
+        (
+            "server idle epoch",
+            "phase",
+            [
+                "last_queued_active_or_leased_work_ended",
+                "engine_and_server_absent",
+            ],
+        ),
+        (
+            "pre-completion workload",
+            "workload",
+            "true_idle_60000_awake_ms_v1",
+        ),
+    ):
+        regressed_true_idle = json.loads(
+            json.dumps(measurement_contract["measurement_protocol"])
+        )
+        if field == "phase":
+            regressed_true_idle["phase_boundaries"]["true_idle_exit"] = value
+        else:
+            regressed_true_idle["workloads"]["true_idle_exit"]["workload_id"] = value
+        regressed_true_idle_path = (
+            fixture.root / f"true-idle-{field}-regression.json"
+        )
+        write_json(regressed_true_idle_path, regressed_true_idle)
+        try:
+            load_measurement_protocol(regressed_true_idle_path)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(f"true-idle qualification accepted {label}")
     for quality_metric in (
         "answer_quality",
         "packet_quality",

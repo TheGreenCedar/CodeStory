@@ -24,12 +24,21 @@ def main() -> int:
     )
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--expected-sha", required=True)
+    parser.add_argument(
+        "--allow-promotion-commit",
+        action="store_true",
+        help=(
+            "Permit one tree-preserving main promotion commit whose release "
+            "parent is the direct constant-freeze child."
+        ),
+    )
     arguments = parser.parse_args()
 
     repository_root = arguments.repo.resolve(strict=True)
     result = verify_release_head_calibration_lineage(
         repository_root,
         arguments.expected_sha,
+        allow_promotion_commit=arguments.allow_promotion_commit,
     )
     print(json.dumps({"status": "passed", **result}, sort_keys=True))
     return 0

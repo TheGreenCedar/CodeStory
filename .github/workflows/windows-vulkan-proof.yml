@@ -44,41 +44,6 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        required: true
-        type: string
-      ref:
-        required: false
-        type: string
-      proof_key:
-        required: false
-        type: string
-      calibration_bundle_artifact:
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        required: false
-        default: ""
-        type: string
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/windows-vulkan-proof.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   actions: read
   contents: read

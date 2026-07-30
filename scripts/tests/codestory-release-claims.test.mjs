@@ -152,11 +152,69 @@ test("versioned claim graph has one deterministic digest and all declared contro
     ],
   );
   assert.ok(graph.claims.every((claim) => claim.prerequisite_checks.every(({ command }) => command.length > 0)));
-  assert.deepEqual(graph.workflow_policy.promotion.required_events, ["labeled"]);
+  assert.deepEqual(graph.workflow_policy.promotion.required_events, []);
+  assert.deepEqual(graph.workflow_policy.promotion.label_routed_workflows, []);
   assert.equal(graph.workflow_policy.promotion.proof_run_sha_expression, "${{ github.sha }}");
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+  assert.deepEqual(
+    graph.workflow_policy.release_freeze_barrier.acceptance,
+    {
+      producer_workflow: "source-proof.yml",
+      receipt_authority: "github_actions",
+      receipt_artifact: "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+      receipt_file: "release-freeze-receipt.json",
+      receipt_producer_job: "resolve",
+      status_scope: "exact_candidate_head",
+      later_commit_revokes: true,
+      event: "workflow_dispatch",
+      hostile_job: "freeze-hostile-mutations",
+      hostile_step: "Execute exact-head hostile mutation matrix",
+      windows_job: "freeze-windows-native-probe",
+      windows_step: "Run exact-head Windows native probe",
+      windows_runner: ["self-hosted", "Windows", "X64", "codestory-vulkan"],
+      windows_probe_max_seconds: 90,
+      publisher_job: "freeze-acceptance",
+      publisher_step: "Publish executable release freeze",
+      status_creator: "github-actions[bot]",
+      job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
+      job_manifest_sha256:
+        "2df6fb76f1ac19acb98e530381ef456f38d517ded6356e61892b75b5fe6f3c79",
+      phases: {
+        calibration_source: {
+          known_future_source_changes: [
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+          ],
+          planned_actions: [
+            "calibration-source-acceptance",
+            "calibration",
+            "generated-constant-freeze",
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation:
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        },
+        frozen_candidate: {
+          known_future_source_changes: [],
+          planned_actions: [
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation: null,
+        },
+      },
+    },
+  );
+  assert.equal(
+    graph.workflow_policy.release_freeze_barrier.invalidation_workflow,
+    "release-freeze-invalidation.yml",
+  );
 });
 
 test("claim graph freezes one exact Windows release graph and protected content-addressed reuse", () => {
@@ -289,6 +347,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
+  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(
+    calibration.source_proof_stage,
+    "frozen_candidate_before_qualification",
+  );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
   ]);
@@ -312,6 +375,12 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
     [draft => {
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
+    [draft => {
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
+    }, /sole frozen-candidate source proof/u],
+    [draft => {
+      draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
+    }, /sole frozen-candidate source proof/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",
@@ -617,6 +686,87 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(aggregateCell),
     /identity undeclared_identity must declare a format/u,
+  );
+
+  const unprotectedFreezeProbe = structuredClone(graph);
+  unprotectedFreezeProbe.workflow_policy.release_freeze_barrier
+    .acceptance.windows_runner = ["windows-latest"];
+  assert.throws(
+    () => validateReleaseClaimGraph(unprotectedFreezeProbe),
+    /release_freeze_barrier\.acceptance\.windows_runner/u,
+  );
+
+  const callerAuthoredFreeze = structuredClone(graph);
+  callerAuthoredFreeze.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_authority = "caller";
+  assert.throws(
+    () => validateReleaseClaimGraph(callerAuthoredFreeze),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const mutableFreezeReceipt = structuredClone(graph);
+  mutableFreezeReceipt.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_artifact = "release-freeze-receipt";
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFreezeReceipt),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const persistentFreezeStatus = structuredClone(graph);
+  persistentFreezeStatus.workflow_policy.release_freeze_barrier
+    .acceptance.later_commit_revokes = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(persistentFreezeStatus),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const unpinnedAcceptanceManifest = structuredClone(graph);
+  unpinnedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest_sha256 = "not-a-digest";
+  assert.throws(
+    () => validateReleaseClaimGraph(unpinnedAcceptanceManifest),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const substitutedAcceptanceManifest = structuredClone(graph);
+  substitutedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest = ".github/workflows/source-proof.yml";
+  assert.throws(
+    () => validateReleaseClaimGraph(substitutedAcceptanceManifest),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const preCalibrationSourceProof = structuredClone(graph);
+  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
+    .acceptance.phases.calibration_source.planned_actions = [
+      "calibration-source-acceptance",
+      "source-proof",
+      "calibration",
+      "generated-constant-freeze",
+      "qualification",
+      "release",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(preCalibrationSourceProof),
+    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+  );
+
+  const mutableFrozenCandidate = structuredClone(graph);
+  mutableFrozenCandidate.workflow_policy.release_freeze_barrier
+    .acceptance.phases.frozen_candidate.known_future_source_changes = [
+      "AGENTS.md",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFrozenCandidate),
+    /frozen_candidate.*no future source mutation/u,
+  );
+
+  const missingInvalidation = structuredClone(graph);
+  delete missingInvalidation.workflow_policy.release_freeze_barrier
+    .invalidation_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(missingInvalidation),
+    /release_freeze_barrier\.invalidation_workflow/u,
   );
 
   // A non-claim that withholds less than the lost host actually produced would leave a live claim

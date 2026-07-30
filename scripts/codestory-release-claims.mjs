@@ -541,8 +541,10 @@ function validateCalibrationPolicy(value) {
     calibration.coordinator_workflow !== "packaged-platform-pr.yml"
     || calibration.mode !== "calibration"
     || calibration.assembly_job !== "calibration-assemble"
+    || calibration.pre_collection_source_proof_required !== false
+    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
   ) {
-    fail("workflow_policy.calibration must name the canonical calibration coordinator and assembly job");
+    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
   }
   if (calibration.runs_per_required_cell !== 3) {
     fail("workflow_policy.calibration must require exactly three clean runs per required cell");
@@ -1506,9 +1508,199 @@ export function validateReleaseClaimGraph(graph) {
   nonEmptyText(promotion.manual_pr_ref_hint, "workflow_policy.promotion.manual_pr_ref_hint");
   nonEmptyText(promotion.source_cache_namespace, "workflow_policy.promotion.source_cache_namespace");
   nonEmptyText(promotion.packaged_cache_namespace, "workflow_policy.promotion.packaged_cache_namespace");
-  stringArray(promotion.label_routed_workflows, "workflow_policy.promotion.label_routed_workflows", { nonEmpty: true });
-  stringArray(promotion.required_events, "workflow_policy.promotion.required_events", { nonEmpty: true });
+  const labelRouted = stringArray(
+    promotion.label_routed_workflows,
+    "workflow_policy.promotion.label_routed_workflows",
+  );
+  const requiredEvents = stringArray(
+    promotion.required_events,
+    "workflow_policy.promotion.required_events",
+  );
+  if (labelRouted.length !== 0 || requiredEvents.length !== 0) {
+    fail("workflow_policy.promotion must not admit label-routed proof workflows");
+  }
 
+  const freeze = object(
+    policy.release_freeze_barrier,
+    "workflow_policy.release_freeze_barrier",
+  );
+  if (freeze.schema !== 3) {
+    fail("workflow_policy.release_freeze_barrier.schema must be 3");
+  }
+  nonEmptyText(freeze.script, "workflow_policy.release_freeze_barrier.script");
+  nonEmptyText(
+    freeze.status_context_prefix,
+    "workflow_policy.release_freeze_barrier.status_context_prefix",
+  );
+  stringArray(
+    freeze.allowed_future_source_changes,
+    "workflow_policy.release_freeze_barrier.allowed_future_source_changes",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.required_hostile_mutations,
+    "workflow_policy.release_freeze_barrier.required_hostile_mutations",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.broad_entry_workflows,
+    "workflow_policy.release_freeze_barrier.broad_entry_workflows",
+    { nonEmpty: true },
+  );
+  if (freeze.invalidation_workflow !== "release-freeze-invalidation.yml") {
+    fail(
+      "workflow_policy.release_freeze_barrier.invalidation_workflow must name "
+      + "release-freeze-invalidation.yml",
+    );
+  }
+  stringArray(
+    freeze.coordinator_only_workflows,
+    "workflow_policy.release_freeze_barrier.coordinator_only_workflows",
+    { nonEmpty: true },
+  );
+  const acceptance = object(
+    freeze.acceptance,
+    "workflow_policy.release_freeze_barrier.acceptance",
+  );
+  for (const field of [
+    "producer_workflow",
+    "receipt_authority",
+    "receipt_artifact",
+    "receipt_file",
+    "receipt_producer_job",
+    "status_scope",
+    "event",
+    "hostile_job",
+    "hostile_step",
+    "windows_job",
+    "windows_step",
+    "publisher_job",
+    "publisher_step",
+    "status_creator",
+    "job_manifest",
+    "job_manifest_sha256",
+  ]) {
+    nonEmptyText(
+      acceptance[field],
+      `workflow_policy.release_freeze_barrier.acceptance.${field}`,
+    );
+  }
+  const windowsRunner = stringArray(
+    acceptance.windows_runner,
+    "workflow_policy.release_freeze_barrier.acceptance.windows_runner",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify([...windowsRunner].sort())
+      !== JSON.stringify([
+        "self-hosted",
+        "Windows",
+        "X64",
+        "codestory-vulkan",
+      ].sort())
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.windows_runner "
+      + "must name the protected Windows Vulkan runner",
+    );
+  }
+  if (
+    acceptance.producer_workflow !== "source-proof.yml"
+    || acceptance.receipt_authority !== "github_actions"
+    || acceptance.receipt_artifact
+      !== "release-freeze-receipt-attempt-${{ github.run_attempt }}"
+    || acceptance.receipt_file !== "release-freeze-receipt.json"
+    || acceptance.receipt_producer_job !== "resolve"
+    || acceptance.status_scope !== "exact_candidate_head"
+    || acceptance.later_commit_revokes !== true
+    || acceptance.event !== "workflow_dispatch"
+    || acceptance.windows_probe_max_seconds !== 90
+    || acceptance.status_creator !== "github-actions[bot]"
+    || acceptance.job_manifest
+      !== ".github/scripts/release-freeze-acceptance-jobs.json"
+    || !SHA256.test(acceptance.job_manifest_sha256)
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance must bind the exact "
+      + "Actions receipt authority, immutable artifact, producer, event, protected "
+      + "probe budget, status scope, revocation, and status creator",
+    );
+  }
+  const freezePhases = object(
+    acceptance.phases,
+    "workflow_policy.release_freeze_barrier.acceptance.phases",
+  );
+  if (
+    JSON.stringify(Object.keys(freezePhases).sort())
+      !== JSON.stringify(["calibration_source", "frozen_candidate"])
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases must define "
+      + "exactly calibration_source and frozen_candidate",
+    );
+  }
+  const constantSet =
+    "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+  const calibrationSource = object(
+    freezePhases.calibration_source,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source",
+  );
+  const calibrationFuture = stringArray(
+    calibrationSource.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.known_future_source_changes",
+    { nonEmpty: true },
+  );
+  const calibrationActions = stringArray(
+    calibrationSource.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify(calibrationFuture) !== JSON.stringify([constantSet])
+    || JSON.stringify(calibrationActions) !== JSON.stringify([
+      "calibration-source-acceptance",
+      "calibration",
+      "generated-constant-freeze",
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || calibrationSource.next_permitted_mutation !== constantSet
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source "
+      + "must permit only calibration then the generated constant-set freeze before source proof",
+    );
+  }
+  const frozenCandidate = object(
+    freezePhases.frozen_candidate,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate",
+  );
+  const frozenFuture = stringArray(
+    frozenCandidate.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.known_future_source_changes",
+  );
+  const frozenActions = stringArray(
+    frozenCandidate.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    frozenFuture.length !== 0
+    || JSON.stringify(frozenActions) !== JSON.stringify([
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || frozenCandidate.next_permitted_mutation !== null
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate "
+      + "must permit no future source mutation before its sole source proof",
+    );
+  }
   const actionlint = object(policy.actionlint, "workflow_policy.actionlint");
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");
   nonEmptyText(actionlint.config, "workflow_policy.actionlint.config");

@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: auto-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   detect-version:
@@ -61,7 +61,7 @@ jobs:
     needs: detect-version
     if: needs.detect-version.outputs.should_release == 'true' && needs.detect-version.outputs.release_lane == 'native'
     permissions:
-      actions: read
+      actions: write
       # This is the lane that actually publishes releases, so it is the lane whose token has to be
       # able to read the lost-runner annotation. A called workflow cannot widen the caller's grant.
       checks: read

@@ -1133,6 +1133,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
+      "pre_collection_source_proof_required": false,
+      "source_proof_stage": "frozen_candidate_before_qualification",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",
@@ -1466,13 +1468,90 @@
       "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
       "source_cache_namespace": "source-proof-v2",
       "packaged_cache_namespace": "codestory-cli-native-v4",
-      "label_routed_workflows": [
-        "source-proof.yml",
-        "packaged-platform-pr.yml"
+      "label_routed_workflows": [],
+      "required_events": []
+    },
+    "release_freeze_barrier": {
+      "schema": 3,
+      "script": ".github/scripts/release-freeze-barrier.mjs",
+      "status_context_prefix": "codestory/release-freeze",
+      "allowed_future_source_changes": [
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       ],
-      "required_events": [
-        "labeled"
-      ]
+      "required_hostile_mutations": [
+        "cpu_backend_rejected",
+        "calibration_qualification_rejected",
+        "calibration_three_by_three_rejected",
+        "calibration_repeated_setup_rejected",
+        "missing_linux_nonblocking",
+        "windows_duplicate_build_rejected",
+        "windows_debug_release_mix_rejected",
+        "windows_stale_archive_rejected"
+      ],
+      "broad_entry_workflows": [
+        "source-proof.yml",
+        "packaged-platform-pr.yml",
+        "release.yml"
+      ],
+      "invalidation_workflow": "release-freeze-invalidation.yml",
+      "coordinator_only_workflows": [
+        "macos-metal-proof.yml",
+        "windows-vulkan-proof.yml",
+        "linux-vulkan-proof.yml"
+      ],
+      "acceptance": {
+        "producer_workflow": "source-proof.yml",
+        "receipt_authority": "github_actions",
+        "receipt_artifact": "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+        "receipt_file": "release-freeze-receipt.json",
+        "receipt_producer_job": "resolve",
+        "status_scope": "exact_candidate_head",
+        "later_commit_revokes": true,
+        "event": "workflow_dispatch",
+        "hostile_job": "freeze-hostile-mutations",
+        "hostile_step": "Execute exact-head hostile mutation matrix",
+        "windows_job": "freeze-windows-native-probe",
+        "windows_step": "Run exact-head Windows native probe",
+        "windows_runner": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "windows_probe_max_seconds": 90,
+        "publisher_job": "freeze-acceptance",
+        "publisher_step": "Publish executable release freeze",
+        "status_creator": "github-actions[bot]",
+        "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
+        "job_manifest_sha256": "2df6fb76f1ac19acb98e530381ef456f38d517ded6356e61892b75b5fe6f3c79",
+        "phases": {
+          "calibration_source": {
+            "known_future_source_changes": [
+              "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+            ],
+            "planned_actions": [
+              "calibration-source-acceptance",
+              "calibration",
+              "generated-constant-freeze",
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+          },
+          "frozen_candidate": {
+            "known_future_source_changes": [],
+            "planned_actions": [
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": null
+          }
+        }
+      }
     },
     "actionlint": {
       "version": "1.7.12",

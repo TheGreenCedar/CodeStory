@@ -157,7 +157,7 @@
       "named_retry_condition_became_true"
     ],
     "true_idle_exit": [
-      "last_queued_active_or_leased_work_ended",
+      "final_product_request_completed",
       "engine_and_server_absent"
     ],
     "total_codestory_process_memory": [
@@ -279,7 +279,7 @@
       "measured_request_ordinal": 65
     },
     "true_idle_exit": {
-      "workload_id": "true_idle_60000_awake_ms_v1",
+      "workload_id": "true_idle_after_product_completion_60000_awake_ms_v2",
       "owner_state": "resident_then_absent",
       "operation": "observe",
       "input_generator": "none",

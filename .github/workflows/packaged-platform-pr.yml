@@ -1,8 +1,6 @@
 name: Platform and integration proof
 
 on:
-  pull_request:
-    types: [labeled]
   workflow_dispatch:
     inputs:
       mode:
@@ -37,19 +35,23 @@ on:
         description: Workflow run that produced the frozen calibration bundle artifact.
         required: false
         type: string
+      freeze_receipt_digest:
+        description: Active executable-freeze receipt digest for this exact proof head.
+        required: true
+        type: string
 
 permissions:
-  actions: read
+  actions: write
   contents: read
   pull-requests: read
+  statuses: read
 
 concurrency:
-  group: proof-${{ github.sha }}-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
+  group: proof-${{ github.sha }}-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || 'dev' }}
   cancel-in-progress: true
 
 jobs:
   route:
-    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -165,36 +167,28 @@ jobs:
             echo "proof_key=$mode-pr-$pr_number-$current_head"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Require successful exact-head source proof
-        if: steps.resolve.outputs.mode != 'integration'
+      - name: Checkout accepted candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Cancel superseded proof runs
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
-          set -euo pipefail
-          accepted=false
-          while IFS= read -r run_id; do
-            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
-              | grep -q .
-            then
-              accepted=true
-              echo "Accepted exact-head source proof run $run_id for $HEAD_SHA."
-              break
-            fi
-          done < <(
-            gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
-              | jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and (.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success") | .id'
-          )
-          test "$accepted" = true || {
-            echo "::error::No successful full-source-gate job exists for exact head $HEAD_SHA."
-            exit 1
-          }
+          node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"
 
       - name: Authenticate calibration bundle producer
+        id: calibration
         if: inputs.calibration_bundle_artifact != '' || inputs.calibration_bundle_run_id != ''
         shell: bash
         env:
@@ -218,10 +212,59 @@ jobs:
           )"
           test "$artifact_count" = 1
 
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.resolve.outputs.head_sha }}
-          fetch-depth: 0
+      - name: Require executable release freeze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          RESOLVED_MODE: ${{ steps.resolve.outputs.mode }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
+          if [ "$RESOLVED_MODE" = calibration ]; then
+            freeze_phase=calibration_source
+          else
+            freeze_phase=frozen_candidate
+          fi
+          tree="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
+          )"
+          node .github/scripts/release-freeze-barrier.mjs verify-status \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --tree "$tree" \
+            --phase "$freeze_phase" \
+            --receipt-digest "$FREEZE_RECEIPT_DIGEST"
+
+      - name: Require successful exact-head source proof
+        if: steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          accepted=false
+          while IFS= read -r run_id; do
+            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
+              | grep -q .
+            then
+              accepted=true
+              echo "Accepted exact-head source proof run $run_id for $HEAD_SHA."
+              break
+            fi
+          done < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
+              | jq -r --arg repo "$GITHUB_REPOSITORY" \
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
+          )
+          test "$accepted" = true || {
+            echo "::error::No successful full-source-gate job exists for exact head $HEAD_SHA."
+            exit 1
+          }
 
       - name: Select change-aware proof scope
         id: scope
@@ -381,6 +424,8 @@ jobs:
     with:
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
+      version: ${{ needs.route.outputs.version }}
+      freeze_receipt_digest: ${{ inputs.freeze_receipt_digest }}
 
   packaged-proof:
     if: >-

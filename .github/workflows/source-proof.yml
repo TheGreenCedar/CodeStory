@@ -1,8 +1,6 @@
 name: Exact-head source proof
 
 on:
-  pull_request:
-    types: [labeled]
   workflow_call:
     inputs:
       ref:
@@ -12,13 +10,12 @@ on:
         required: true
         type: string
       version:
-        required: false
-        default: ""
+        required: true
         type: string
-      emit_release_cells:
-        required: false
-        default: false
-        type: boolean
+      freeze_receipt_digest:
+        description: Digest of the exact-head release freeze status.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       pr_number:
@@ -29,14 +26,52 @@ on:
         description: Exact reviewed head SHA. The selected --ref, github.sha, and live PR head must match.
         required: true
         type: string
+      freeze_receipt_digest:
+        description: Existing successful freeze receipt digest. Leave empty when acceptance_only is true.
+        required: false
+        default: ""
+        type: string
+      version:
+        description: Release version whose source cell this accepted proof emits.
+        required: true
+        type: string
+      acceptance_only:
+        description: Execute only the hostile mutation and protected Windows native-probe freeze barrier.
+        required: false
+        default: false
+        type: boolean
+      acceptance_phase:
+        description: Candidate phase represented by an acceptance-only receipt.
+        required: false
+        default: frozen_candidate
+        type: choice
+        options:
+          - calibration_source
+          - frozen_candidate
+      support_prs_json:
+        description: JSON array of support PR numbers already merged into the release head.
+        required: false
+        default: "[]"
+        type: string
+      reusable_evidence_json:
+        description: JSON array naming evidence reusable by this exact head.
+        required: false
+        default: "[]"
+        type: string
+      invalidated_evidence_json:
+        description: JSON array naming evidence invalidated before this exact head.
+        required: false
+        default: "[]"
+        type: string
 
 permissions:
-  actions: read
+  actions: write
   contents: read
   pull-requests: read
+  statuses: write
 
 concurrency:
-  group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
+  group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -46,12 +81,13 @@ env:
 
 jobs:
   resolve:
-    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
       reuse: ${{ steps.reuse.outputs.reuse }}
+      freeze_digest: ${{ steps.receipt.outputs.digest }}
+      freeze_artifact_name: ${{ steps.receipt.outputs.artifact_name }}
     steps:
       - name: Resolve trusted exact head
         id: resolve
@@ -116,11 +152,85 @@ jobs:
             echo "ref=$CALLER_REF" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout accepted source head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Cancel superseded proof runs
+        id: cancel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          result="$(
+            node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"
+          )"
+          echo "cancelled=$(jq -c '.cancelled' <<<"$result")" >> "$GITHUB_OUTPUT"
+
+      - name: Record executable release freeze
+        id: receipt
+        if: ${{ inputs.acceptance_only }}
+        shell: bash
+        env:
+          CALLER_FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          ACCEPTANCE_PHASE: ${{ inputs.acceptance_phase }}
+          CANCELLED_RUNS_JSON: ${{ steps.cancel.outputs.cancelled }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+          INVALIDATED_EVIDENCE_JSON: ${{ inputs.invalidated_evidence_json }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REUSABLE_EVIDENCE_JSON: ${{ inputs.reusable_evidence_json }}
+          SUPPORT_PRS_JSON: ${{ inputs.support_prs_json }}
+        run: |
+          set -euo pipefail
+          test -z "$CALLER_FREEZE_RECEIPT_DIGEST" || {
+            echo "::error::acceptance_only mints its receipt digest; callers must leave freeze_receipt_digest empty."
+            exit 1
+          }
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          node .github/scripts/release-freeze-barrier.mjs record-actions-receipt \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo "$GITHUB_WORKSPACE" \
+            --branch "$GITHUB_REF_NAME" \
+            --commit "$HEAD_SHA" \
+            --tree "$tree" \
+            --release-pr "$PR_NUMBER" \
+            --support-prs-json "$SUPPORT_PRS_JSON" \
+            --reusable-evidence-json "$REUSABLE_EVIDENCE_JSON" \
+            --invalidated-evidence-json "$INVALIDATED_EVIDENCE_JSON" \
+            --cancelled-runs-json "$CANCELLED_RUNS_JSON" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --phase "$ACCEPTANCE_PHASE" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release" \
+            --output "$RUNNER_TEMP/release-freeze-receipt.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload executable release freeze receipt
+        if: ${{ inputs.acceptance_only }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ steps.receipt.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-freeze-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Reuse a completed gate for this exact head
         id: reuse
-        # Only the label and dispatch paths. workflow_call always supplies `ref`, and the release
-        # chain requires full-source-gate to actually run.
-        if: inputs.ref == ''
+        if: ${{ !inputs.acceptance_only }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,17 +244,211 @@ jobs:
               --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q .
             then
+              run_attempt="$(
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+              )"
+              artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
+              artifact_count="$(
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                  | jq --arg name "$artifact_name" \
+                    '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+              )"
+              test "$artifact_count" = 1 || continue
               reuse=true
-              echo "Reusing full-source-gate from run $run_id for exact head $HEAD_SHA."
+              echo "Reusing full-source-gate and $artifact_name from run $run_id for exact head $HEAD_SHA."
               break
             fi
           done < <(
             gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and (.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success") | .id'
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
           echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
+      - name: Require executable release freeze
+        if: ${{ !inputs.acceptance_only }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
+          tree="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
+          )"
+          node .github/scripts/release-freeze-barrier.mjs verify-status \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --tree "$tree" \
+            --phase frozen_candidate \
+            --receipt-digest "$FREEZE_RECEIPT_DIGEST"
+
+  freeze-hostile-mutations:
+    name: freeze-hostile-mutations
+    if: inputs.acceptance_only
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Execute exact-head hostile mutation matrix
+        run: >-
+          node --test
+          .github/scripts/check-workflow-policy.test.mjs
+          .github/scripts/release-freeze-barrier.test.mjs
+          .github/scripts/cargo-build-artifacts.test.mjs
+          .github/scripts/candidate-archive-store.test.mjs
+
+  freeze-windows-native-probe:
+    name: freeze-windows-native-probe
+    if: inputs.acceptance_only
+    needs: resolve
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Run exact-head Windows native probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probeRoot = Join-Path $env:RUNNER_TEMP (
+            "codestory-cargo-hardlink-probe-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          )
+          if (Test-Path -LiteralPath $probeRoot) {
+            throw "native probe root already exists: $probeRoot"
+          }
+          try {
+            cargo new --quiet --bin --name cargo-hardlink-probe $probeRoot
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo new failed"
+            }
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} (
+              "Microsoft Visual Studio/Installer/vswhere.exe"
+            )
+            $visualStudio = & $vswhere -latest -products "*" `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+            $vsDevCmd = Join-Path $visualStudio "Common7/Tools/VsDevCmd.bat"
+            $build = (
+              "`"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul " +
+              "&& cd /d `"$probeRoot`" && cargo build --release --quiet"
+            )
+            & cmd.exe /d /s /c $build
+            if ($LASTEXITCODE -ne 0) {
+              throw "tiny Cargo release probe failed"
+            }
+            node --test .github/scripts/cargo-build-artifacts.test.mjs
+            if ($LASTEXITCODE -ne 0) {
+              throw "exact-head Windows artifact selector mutations failed"
+            }
+            $rootExe = Join-Path $probeRoot "target/release/cargo-hardlink-probe.exe"
+            $depsExe = Join-Path $probeRoot "target/release/deps/cargo_hardlink_probe.exe"
+            $identityScript = @'
+          const fs = require("node:fs");
+          const [root, deps] = process.argv.slice(1);
+          const left = fs.statSync(root, { bigint: true });
+          const right = fs.statSync(deps, { bigint: true });
+          if (
+            left.dev !== right.dev
+            || left.ino !== right.ino
+            || left.nlink !== 2n
+            || right.nlink !== 2n
+          ) {
+            throw new Error("Cargo release root/deps outputs are not one native two-link file");
+          }
+          console.log(JSON.stringify({
+            device: String(left.dev),
+            inode: String(left.ino),
+            nlink: String(left.nlink),
+          }));
+          '@
+            node -e $identityScript $rootExe $depsExe
+            if ($LASTEXITCODE -ne 0) {
+              throw "Cargo native hardlink identity probe failed"
+            }
+            $clock.Stop()
+            if ($clock.Elapsed.TotalSeconds -ge 90) {
+              throw "native probe took $($clock.Elapsed.TotalSeconds) seconds"
+            }
+            "native_probe_seconds=$([Math]::Round($clock.Elapsed.TotalSeconds, 3))"
+          } finally {
+            Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+  freeze-acceptance:
+    name: freeze-acceptance
+    if: >-
+      always() &&
+      inputs.acceptance_only &&
+      needs.resolve.result == 'success' &&
+      needs.freeze-hostile-mutations.result == 'success' &&
+      needs.freeze-windows-native-probe.result == 'success'
+    needs:
+      - resolve
+      - freeze-hostile-mutations
+      - freeze-windows-native-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Download executable release freeze receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.resolve.outputs.freeze_artifact_name }}
+          path: ${{ runner.temp }}/release-freeze-receipt
+
+      - name: Publish executable release freeze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_RECEIPT_DIGEST: ${{ needs.resolve.outputs.freeze_digest }}
+          HEAD_SHA: ${{ needs.resolve.outputs.ref }}
+          ACCEPTANCE_PHASE: ${{ inputs.acceptance_phase }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          verified_digest="$(
+            node .github/scripts/release-freeze-barrier.mjs verify-file \
+              --receipt "$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json" \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$HEAD_SHA" \
+              --tree "$tree" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --phase "$ACCEPTANCE_PHASE"
+          )"
+          test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST" || {
+            echo "::error::Downloaded acceptance receipt digest differs from the Actions-generated resolve output."
+            exit 1
+          }
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f "context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST" \
+            -f "description=tree=$tree" \
+            -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
   full-source-gate:
     name: full-source-gate
@@ -153,7 +457,7 @@ jobs:
     # and cannot reach a different answer, which is what made re-labelling a PR expensive. Release
     # runs (workflow_call, which always supplies `ref`) never take this path: their chain requires
     # the job to execute.
-    if: needs.resolve.outputs.reuse != 'true'
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -399,7 +703,6 @@ jobs:
           cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
-        if: inputs.emit_release_cells
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -419,7 +722,7 @@ jobs:
             --out target/release-cells/source_behavior.json
 
       - name: Upload authenticated source release cell
-        if: success() && inputs.emit_release_cells
+        if: success()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-source-attempt-${{ github.run_attempt }}
@@ -430,7 +733,7 @@ jobs:
   retrieval-generalization:
     name: retrieval-generalization
     needs: resolve
-    if: needs.resolve.outputs.reuse != 'true'
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -452,7 +755,7 @@ jobs:
   windows-native-contracts:
     name: windows-native-contracts
     needs: resolve
-    if: needs.resolve.outputs.reuse != 'true'
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 15
     env:
