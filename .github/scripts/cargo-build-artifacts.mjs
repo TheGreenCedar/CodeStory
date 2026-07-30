@@ -6,9 +6,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const SCHEMA = "codestory.cargo-build-artifacts/v1";
+const SCHEMA = "codestory.cargo-build-artifacts/v2";
 const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const DECIMAL_BIGINT = /^(?:0|[1-9][0-9]*)$/u;
 const ALIAS = /^[a-z][a-z0-9_]*$/u;
 const WINDOWS_TARGET = "x86_64-pc-windows-msvc";
 const RELEASE_OPT_LEVELS = new Set(["1", "2", "3", "s", "z"]);
@@ -226,11 +227,150 @@ function hashFile(file) {
   return hash.digest("hex");
 }
 
+function nativeFileMetadata(file, label) {
+  const metadata = fs.lstatSync(file, { bigint: true });
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    fail(`${label} must be a regular, non-symlink file`);
+  }
+  if (
+    metadata.dev < 0n
+    || metadata.ino <= 0n
+    || metadata.nlink <= 0n
+    || metadata.size < 0n
+    || metadata.size > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    fail(`${label} has unusable native filesystem metadata`);
+  }
+  return metadata;
+}
+
+function nativeIdentity(metadata) {
+  return {
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+  };
+}
+
+function sameNativeIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameNativeSnapshot(left, right) {
+  return (
+    sameNativeIdentity(left, right)
+    && left.nlink === right.nlink
+    && left.size === right.size
+  );
+}
+
+function profileRelativePath(realProfileRoot, candidate, label) {
+  const realCandidate = fs.realpathSync(candidate);
+  if (!isWithin(realProfileRoot, realCandidate)) {
+    fail(`${label} escaped the exact target release directory`);
+  }
+  return path.relative(realProfileRoot, realCandidate)
+    .split(path.sep)
+    .join("/");
+}
+
+function inspectNativeLinks({
+  executable,
+  kind,
+  realProfileRoot,
+  targetName,
+}) {
+  const label = `Cargo artifact ${targetName}`;
+  const before = nativeFileMetadata(executable, label);
+  if (before.nlink > BigInt(Number.MAX_SAFE_INTEGER)) {
+    fail(`${label} has an unusable native hardlink count`);
+  }
+  const linkCount = Number(before.nlink);
+  const selectedRelative = profileRelativePath(
+    realProfileRoot,
+    executable,
+    label,
+  );
+  const paths = [selectedRelative];
+
+  if (kind === "test") {
+    if (linkCount !== 1) {
+      fail(`${label} test executable has native aliases outside its Cargo output path`);
+    }
+  } else if (linkCount === 2) {
+    const depsRoot = path.join(realProfileRoot, "deps");
+    const depsMetadata = fs.lstatSync(depsRoot);
+    if (!depsMetadata.isDirectory() || depsMetadata.isSymbolicLink()) {
+      fail(`${label} hardlink peer directory is missing`);
+    }
+    const peer = path.join(
+      depsRoot,
+      `${targetName.replaceAll("-", "_")}.exe`,
+    );
+    if (!fs.existsSync(peer)) {
+      fail(
+        `${label} hardlinks are not exactly the release-root executable and one release/deps peer`,
+      );
+    }
+    const peerMetadata = nativeFileMetadata(peer, `${label} hardlink peer`);
+    if (!sameNativeIdentity(before, peerMetadata)) {
+      fail(
+        `${label} hardlinks are not exactly the release-root executable and one release/deps peer`,
+      );
+    }
+    paths.push(profileRelativePath(realProfileRoot, peer, label));
+  } else if (linkCount !== 1) {
+    fail(`${label} has an unsupported native hardlink count ${linkCount}`);
+  }
+
+  paths.sort();
+  if (paths.length !== linkCount || new Set(paths).size !== paths.length) {
+    fail(`${label} native hardlink accounting is incomplete`);
+  }
+  const after = nativeFileMetadata(executable, label);
+  if (!sameNativeSnapshot(before, after)) {
+    fail(`${label} native identity changed while its hardlinks were inspected`);
+  }
+  return {
+    metadata: after,
+    nativeLinks: {
+      ...nativeIdentity(after),
+      count: linkCount,
+      paths,
+    },
+  };
+}
+
+function requireStableNativeInspection({
+  executable,
+  expectedMetadata,
+  expectedNativeLinks,
+  kind,
+  label,
+  realProfileRoot,
+  targetName,
+}) {
+  const current = inspectNativeLinks({
+    executable,
+    kind,
+    realProfileRoot,
+    targetName,
+  });
+  if (
+    !sameNativeSnapshot(expectedMetadata, current.metadata)
+    || JSON.stringify(expectedNativeLinks) !== JSON.stringify(current.nativeLinks)
+  ) {
+    fail(`${label} native identity changed while its contents were authenticated`);
+  }
+}
+
 function validatedExecutable(message, {
   kind,
   profileRoot,
   targetName,
 }) {
+  if (message.fresh !== false) {
+    fail(`Cargo artifact ${targetName} was not produced by the exact build invocation`);
+  }
   if (typeof message.executable !== "string" || message.executable === "") {
     fail(`Cargo artifact ${targetName} did not emit an executable`);
   }
@@ -243,38 +383,51 @@ function validatedExecutable(message, {
     fail(`Cargo artifact ${targetName} executable is not one of its emitted filenames`);
   }
   const executable = path.resolve(message.executable);
-  const metadata = fs.lstatSync(executable);
-  if (
-    !metadata.isFile()
-    || metadata.isSymbolicLink()
-    || metadata.nlink !== 1
-  ) {
-    fail(
-      `Cargo artifact ${targetName} must be a regular, non-symlink, singly linked file`,
-    );
-  }
   if (path.extname(executable).toLowerCase() !== ".exe") {
     fail(`Cargo artifact ${targetName} is not a Windows executable`);
   }
 
   const realProfileRoot = fs.realpathSync(profileRoot);
-  const realExecutable = fs.realpathSync(executable);
-  if (!isWithin(realProfileRoot, realExecutable)) {
-    fail(`Cargo artifact ${targetName} escaped the exact target release directory`);
-  }
-  const relative = path.relative(realProfileRoot, realExecutable);
-  if (kind === "test" && path.dirname(relative) !== "deps") {
+  const relative = profileRelativePath(
+    realProfileRoot,
+    executable,
+    `Cargo artifact ${targetName}`,
+  );
+  if (kind === "test" && path.posix.dirname(relative) !== "deps") {
     fail(`Cargo test artifact ${targetName} was not emitted under release/deps`);
   }
-  if (kind === "bin" && path.dirname(relative) !== ".") {
+  if (
+    kind === "bin"
+    && (
+      path.posix.dirname(relative) !== "."
+      || path.posix.basename(relative) !== `${targetName}.exe`
+    )
+  ) {
     fail(`Cargo binary artifact ${targetName} was not emitted at the release root`);
   }
+  const { metadata, nativeLinks } = inspectNativeLinks({
+    executable,
+    kind,
+    realProfileRoot,
+    targetName,
+  });
+  const sha256 = hashFile(executable);
+  requireStableNativeInspection({
+    executable,
+    expectedMetadata: metadata,
+    expectedNativeLinks: nativeLinks,
+    kind,
+    label: `Cargo artifact ${targetName}`,
+    realProfileRoot,
+    targetName,
+  });
 
   return {
     path: executable,
-    relative_path: relative.split(path.sep).join("/"),
-    bytes: metadata.size,
-    sha256: hashFile(executable),
+    relative_path: relative,
+    bytes: Number(metadata.size),
+    sha256,
+    native_links: nativeLinks,
   };
 }
 
@@ -422,6 +575,58 @@ function validateManifestShape(manifest) {
   }
 }
 
+function validateNativeLinksShape(nativeLinks, artifact, alias) {
+  exactKeys(
+    nativeLinks,
+    ["device", "inode", "count", "paths"],
+    `artifact manifest native links ${alias}`,
+  );
+  if (
+    typeof nativeLinks.device !== "string"
+    || !DECIMAL_BIGINT.test(nativeLinks.device)
+    || typeof nativeLinks.inode !== "string"
+    || !DECIMAL_BIGINT.test(nativeLinks.inode)
+    || BigInt(nativeLinks.inode) <= 0n
+    || !Number.isSafeInteger(nativeLinks.count)
+    || ![1, 2].includes(nativeLinks.count)
+    || !Array.isArray(nativeLinks.paths)
+    || nativeLinks.paths.length !== nativeLinks.count
+    || new Set(nativeLinks.paths).size !== nativeLinks.paths.length
+    || nativeLinks.paths.some(
+      (entry) =>
+        typeof entry !== "string"
+        || entry === ""
+        || entry.includes("\\")
+        || path.posix.isAbsolute(entry)
+        || entry === ".."
+        || entry.startsWith("../"),
+    )
+    || JSON.stringify(nativeLinks.paths) !== JSON.stringify([...nativeLinks.paths].sort())
+    || !nativeLinks.paths.includes(artifact.relative_path)
+  ) {
+    fail(`artifact manifest native links ${alias} values changed`);
+  }
+  const peerPaths = nativeLinks.paths.filter(
+    (entry) => entry !== artifact.relative_path,
+  );
+  if (
+    (artifact.kind === "test" && nativeLinks.count !== 1)
+    || (
+      artifact.kind === "bin"
+      && nativeLinks.count === 2
+      && (
+        peerPaths.length !== 1
+        || path.posix.dirname(peerPaths[0]) !== "deps"
+        || path.posix.basename(peerPaths[0])
+          !== `${artifact.target.replaceAll("-", "_")}.exe`
+      )
+    )
+    || (artifact.kind === "bin" && nativeLinks.count === 1 && peerPaths.length !== 0)
+  ) {
+    fail(`artifact manifest native link topology changed for ${alias}`);
+  }
+}
+
 export function verifyCargoArtifactManifest({
   exactSha,
   exactTree,
@@ -465,6 +670,7 @@ export function verifyCargoArtifactManifest({
         "relative_path",
         "bytes",
         "sha256",
+        "native_links",
       ],
       `artifact manifest entry ${alias}`,
     );
@@ -492,17 +698,8 @@ export function verifyCargoArtifactManifest({
       fail(`artifact manifest contract changed for ${alias}`);
     }
     releaseProfile({ profile: artifact.profile }, artifact.kind);
+    validateNativeLinksShape(artifact.native_links, artifact, alias);
     const executable = path.resolve(artifact.path);
-    const metadata = fs.lstatSync(executable);
-    if (
-      !metadata.isFile()
-      || metadata.isSymbolicLink()
-      || metadata.nlink !== 1
-    ) {
-      fail(
-        `artifact ${alias} is no longer a regular, non-symlink, singly linked file`,
-      );
-    }
     const realExecutable = fs.realpathSync(executable);
     if (!isWithin(realProfileRoot, realExecutable)) {
       fail(`artifact ${alias} escaped the exact target release directory`);
@@ -512,15 +709,42 @@ export function verifyCargoArtifactManifest({
       .join("/");
     if (
       (artifact.kind === "test" && path.posix.dirname(relative) !== "deps")
-      || (artifact.kind === "bin" && path.posix.dirname(relative) !== ".")
+      || (
+        artifact.kind === "bin"
+        && (
+          path.posix.dirname(relative) !== "."
+          || path.posix.basename(relative) !== `${artifact.target}.exe`
+        )
+      )
       || path.extname(executable).toLowerCase() !== ".exe"
     ) {
       fail(`artifact ${alias} no longer has its expected release-graph path`);
     }
+    const { metadata, nativeLinks } = inspectNativeLinks({
+      executable,
+      kind: artifact.kind,
+      realProfileRoot,
+      targetName: artifact.target,
+    });
+    if (
+      JSON.stringify(nativeLinks) !== JSON.stringify(artifact.native_links)
+    ) {
+      fail(`artifact ${alias} no longer matches its authenticated native links`);
+    }
+    const sha256 = hashFile(executable);
+    requireStableNativeInspection({
+      executable,
+      expectedMetadata: metadata,
+      expectedNativeLinks: nativeLinks,
+      kind: artifact.kind,
+      label: `artifact ${alias}`,
+      realProfileRoot,
+      targetName: artifact.target,
+    });
     if (
       relative !== artifact.relative_path
-      || metadata.size !== artifact.bytes
-      || hashFile(executable) !== artifact.sha256
+      || Number(metadata.size) !== artifact.bytes
+      || sha256 !== artifact.sha256
     ) {
       fail(`artifact ${alias} no longer matches its authenticated build output`);
     }
