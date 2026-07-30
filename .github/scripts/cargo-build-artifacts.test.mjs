@@ -164,10 +164,33 @@ function build(input = fixture()) {
   return { input, manifest };
 }
 
+function addCargoBinPeer(input, alias = "cli", peerName) {
+  const artifact = input.artifacts.find((entry) => entry.alias === alias);
+  assert.ok(artifact);
+  assert.equal(artifact.kind, "bin");
+  const peer = path.join(
+    input.releaseDir,
+    "deps",
+    peerName ?? `${artifact.targetName.replaceAll("-", "_")}.exe`,
+  );
+  fs.linkSync(artifact.executable, peer);
+  return peer;
+}
+
+function verify(input, manifest, exactSha = SOURCE_SHA) {
+  return verifyCargoArtifactManifest({
+    exactSha,
+    exactTree: SOURCE_TREE,
+    manifest,
+    rustTarget: RUST_TARGET,
+    workspaceRoot: input.root,
+  });
+}
+
 test("binds each requested executable to the exact Windows release graph", () => {
   const { input, manifest } = build();
 
-  assert.equal(manifest.schema, "codestory.cargo-build-artifacts/v1");
+  assert.equal(manifest.schema, "codestory.cargo-build-artifacts/v2");
   assert.deepEqual(manifest.source, {
     commit: SOURCE_SHA,
     tree: SOURCE_TREE,
@@ -180,16 +203,14 @@ test("binds each requested executable to the exact Windows release graph", () =>
     assert.equal(selected.bytes, Buffer.byteLength(artifact.contents));
     assert.equal(selected.sha256, sha256(artifact.contents));
     assert.equal(selected.profile.test, artifact.kind === "test");
+    assert.equal(selected.native_links.count, 1);
+    assert.deepEqual(selected.native_links.paths, [selected.relative_path]);
+    assert.match(selected.native_links.device, /^(?:0|[1-9][0-9]*)$/u);
+    assert.match(selected.native_links.inode, /^[1-9][0-9]*$/u);
   }
 
   assert.deepEqual(
-    verifyCargoArtifactManifest({
-      exactSha: SOURCE_SHA,
-      exactTree: SOURCE_TREE,
-      manifest,
-      rustTarget: RUST_TARGET,
-      workspaceRoot: input.root,
-    }),
+    verify(input, manifest),
     Object.fromEntries(
       input.artifacts.map((artifact) => [
         artifact.alias,
@@ -197,6 +218,38 @@ test("binds each requested executable to the exact Windows release graph", () =>
       ]),
     ),
   );
+});
+
+test("accepts and records Cargo's release-root hardlink to release/deps", () => {
+  const input = fixture();
+  const peer = addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  const selected = manifest.artifacts.cli;
+
+  assert.equal(selected.native_links.count, 2);
+  assert.deepEqual(selected.native_links.paths, [
+    "codestory-cli.exe",
+    "deps/codestory_cli.exe",
+  ]);
+  const rootIdentity = fs.lstatSync(input.artifacts[0].executable, { bigint: true });
+  const peerIdentity = fs.lstatSync(peer, { bigint: true });
+  assert.equal(rootIdentity.dev, peerIdentity.dev);
+  assert.equal(rootIdentity.ino, peerIdentity.ino);
+  assert.equal(rootIdentity.nlink, 2n);
+  assert.equal(selected.native_links.device, rootIdentity.dev.toString());
+  assert.equal(selected.native_links.inode, rootIdentity.ino.toString());
+
+  assert.equal(verify(input, manifest).cli, path.resolve(input.artifacts[0].executable));
+});
+
+test("accepts Cargo's copied release-root fallback when native hardlinking is unavailable", () => {
+  const { input, manifest } = build();
+
+  assert.equal(manifest.artifacts.cli.native_links.count, 1);
+  assert.deepEqual(manifest.artifacts.cli.native_links.paths, [
+    "codestory-cli.exe",
+  ]);
+  assert.doesNotThrow(() => verify(input, manifest));
 });
 
 test("accepts the release graph without the optional qualification driver", () => {
@@ -226,6 +279,17 @@ test("rejects duplicate compiler artifacts instead of choosing one by path order
   assert.throws(
     () => build(input),
     /expected exactly one Cargo artifact for cli, found 2/u,
+  );
+});
+
+test("rejects a fresh Cargo artifact from a prior build invocation", () => {
+  const input = fixture();
+  input.messages[1].fresh = true;
+  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+
+  assert.throws(
+    () => build(input),
+    /not produced by the exact build invocation/u,
   );
 });
 
@@ -294,7 +358,79 @@ test("rejects a release-path executable hardlinked to another build graph", () =
 
   assert.throws(
     () => build(input),
-    /regular, non-symlink, singly linked file/u,
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects a release-root executable hardlinked outside the release graph", () => {
+  const input = fixture();
+  const external = path.join(input.root, "foreign", "codestory-cli.exe");
+  fs.mkdirSync(path.dirname(external), { recursive: true });
+  fs.linkSync(input.artifacts[0].executable, external);
+
+  assert.throws(
+    () => build(input),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects a release-root executable hardlinked into another target graph", () => {
+  const input = fixture();
+  const otherTarget = path.join(
+    input.targetDir,
+    "aarch64-pc-windows-msvc",
+    "release",
+    "deps",
+    "codestory-cli.exe",
+  );
+  fs.mkdirSync(path.dirname(otherTarget), { recursive: true });
+  fs.linkSync(input.artifacts[0].executable, otherTarget);
+
+  assert.throws(
+    () => build(input),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects a non-executable hardlink posing as Cargo's release/deps peer", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli", "codestory-cli.pdb");
+
+  assert.throws(
+    () => build(input),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects an arbitrary executable name posing as Cargo's release/deps peer", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli", "evil.exe");
+
+  assert.throws(
+    () => build(input),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects the release-root spelling where Cargo uses a normalized deps peer", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli", "codestory-cli.exe");
+
+  assert.throws(
+    () => build(input),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects a hardlinked Cargo test executable", () => {
+  const input = fixture();
+  const native = input.artifacts.find((artifact) => artifact.alias === "native_staging");
+  const alias = path.join(input.releaseDir, "deps", "native_staging-copy.exe");
+  fs.linkSync(native.executable, alias);
+
+  assert.throws(
+    () => build(input),
+    /test executable has native aliases outside its Cargo output path/u,
   );
 });
 
@@ -336,14 +472,86 @@ test("rejects a hardlink added after Cargo artifact selection", () => {
 
   assert.throws(
     () =>
-      verifyCargoArtifactManifest({
-        exactSha: SOURCE_SHA,
-        exactTree: SOURCE_TREE,
-        manifest,
-        rustTarget: RUST_TARGET,
-        workspaceRoot: input.root,
-      }),
-    /regular, non-symlink, singly linked file/u,
+      verify(input, manifest),
+    /not exactly the release-root executable and one release\/deps peer/u,
+  );
+});
+
+test("rejects a third hardlink added after selecting Cargo's root and deps pair", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  fs.linkSync(
+    input.artifacts[0].executable,
+    path.join(input.root, "cross-graph-cli.exe"),
+  );
+
+  assert.throws(
+    () => verify(input, manifest),
+    /unsupported native hardlink count 3/u,
+  );
+});
+
+test("rejects an identical-byte replacement of Cargo's recorded deps peer", () => {
+  const input = fixture();
+  const peer = addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  fs.unlinkSync(peer);
+  fs.writeFileSync(peer, input.artifacts[0].contents);
+
+  assert.throws(
+    () => verify(input, manifest),
+    /no longer matches its authenticated native links/u,
+  );
+});
+
+test("rejects an identical-byte replacement of the selected release-root executable", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  fs.unlinkSync(input.artifacts[0].executable);
+  fs.writeFileSync(input.artifacts[0].executable, input.artifacts[0].contents);
+
+  assert.throws(
+    () => verify(input, manifest),
+    /no longer matches its authenticated native links/u,
+  );
+});
+
+test("rejects an identical-byte replacement of both recorded hardlink paths", () => {
+  const input = fixture();
+  const selected = input.artifacts[0].executable;
+  const peer = addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  const replacementRoot = path.join(input.releaseDir, "replacement.exe");
+  const replacementPeer = path.join(input.releaseDir, "deps", "replacement.exe");
+  fs.writeFileSync(replacementRoot, input.artifacts[0].contents);
+  fs.linkSync(replacementRoot, replacementPeer);
+  const replacementIdentity = fs.lstatSync(replacementRoot, { bigint: true });
+  assert.notEqual(
+    replacementIdentity.ino.toString(),
+    manifest.artifacts.cli.native_links.inode,
+  );
+  fs.unlinkSync(selected);
+  fs.unlinkSync(peer);
+  fs.renameSync(replacementRoot, selected);
+  fs.renameSync(replacementPeer, peer);
+
+  assert.throws(
+    () => verify(input, manifest),
+    /no longer matches its authenticated native links/u,
+  );
+});
+
+test("rejects manifest native-link topology changed from deps to another graph", () => {
+  const input = fixture();
+  addCargoBinPeer(input, "cli");
+  const { manifest } = build(input);
+  manifest.artifacts.cli.native_links.paths[1] = "../debug/codestory-cli.exe";
+
+  assert.throws(
+    () => verify(input, manifest),
+    /native links cli values changed/u,
   );
 });
 
