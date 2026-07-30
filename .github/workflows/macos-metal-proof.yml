@@ -162,7 +162,7 @@ jobs:
           test "$CALIBRATION_MODE" = false
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -193,6 +193,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           set -euo pipefail
           build_package_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
@@ -206,6 +207,11 @@ jobs:
             cargo_args+=(
               -p codestory-bench
               --bin codestory_embedding_constant_calibration
+            )
+          elif [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_qualification
             )
           fi
           cargo build --release --locked "${cargo_args[@]}"
@@ -224,8 +230,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_NAME: codestory-cli-macos-arm64
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           set -euo pipefail
+          case "$CANDIDATE_PRODUCER_WORKFLOW_PATH" in
+            .github/workflows/auto-release.yml | \
+            .github/workflows/release.yml | \
+            .github/workflows/packaged-platform-pr.yml)
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" = \
+              .github/workflows/packaged-platform-pr.yml
+          fi
+          producer_run="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          )"
+          test "$(jq -r '.head_repository.full_name' <<<"$producer_run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$producer_run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
+          test "$(jq -r '.head_sha' <<<"$producer_run")" = "$(git rev-parse HEAD)"
+          test "$(jq -r '.run_attempt' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"
           artifact="$(
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
               | jq \
@@ -297,10 +325,26 @@ jobs:
           mkdir -p target/release-dist
           ditto -x -k "$archive" target/release-dist
 
-      - name: Build qualification driver
-        if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
+      - name: Verify packaged qualification driver
+        id: qualification-driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.calibration_mode && !inputs.server_behavior_only }}
         shell: bash
-        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          verified="$(
+            node .github/scripts/qualification-driver-artifact.mjs verify \
+              --asset-target macos-arm64 \
+              --source-sha "$(git rev-parse HEAD)" \
+              --source-tree "$(git rev-parse 'HEAD^{tree}')" \
+              --version "$version" \
+              --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
+              --trusted-root "$GITHUB_WORKSPACE" \
+              --artifact-dir target/release-dist/qualification-driver/macos-arm64
+          )"
+          echo "path=$(jq -r .driver <<<"$verified")" >> "$GITHUB_OUTPUT"
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -406,6 +450,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
           SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          USE_PACKAGED_CLI_ARTIFACT: ${{ inputs.use_packaged_cli_artifact }}
+          VERIFIED_QUALIFICATION_DRIVER: ${{ steps.qualification-driver.outputs.path }}
           CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
           CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
@@ -426,10 +472,16 @@ jobs:
             calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
             test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
             test -f "$quality_path"
+            qualification_driver=target/release/codestory_embedding_qualification
+            if [ "$USE_PACKAGED_CLI_ARTIFACT" = true ]; then
+              qualification_driver="$VERIFIED_QUALIFICATION_DRIVER"
+              test -n "$qualification_driver"
+            fi
+            test -x "$qualification_driver"
             quality_args=(--retrieval-quality-evidence "$quality_path")
             qualification_args=(
               --produce-qualification-evidence
-              --qualification-driver target/release/codestory_embedding_qualification
+              --qualification-driver "$qualification_driver"
               --qualification-evidence target/macos-metal-proof/qualification.json
             )
             calibration_args=(

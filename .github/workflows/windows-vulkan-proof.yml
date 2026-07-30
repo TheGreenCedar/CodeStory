@@ -141,7 +141,7 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -160,14 +160,79 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           CMAKE_GENERATOR: Ninja
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           $version = $env:VERSION.TrimStart('v')
-          cargo build --release --locked -p codestory-cli
+          $cargoArgs = @(
+            "build",
+            "--release",
+            "--locked",
+            "-p", "codestory-cli",
+            "--bin", "codestory-cli",
+            "--bin", "codestory-cli-runtime"
+          )
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
+            $cargoArgs += @(
+              "-p", "codestory-bench",
+              "--bin", "codestory_embedding_qualification"
+            )
+          }
+          cargo @cargoArgs
           python .github/scripts/package-codestory-release.py `
             --version $version `
             --target windows-x64 `
             --binary target/release/codestory-cli.exe `
             --out-dir target/release-dist
+
+      - name: Authenticate exact Windows package producer
+        if: inputs.use_packaged_cli_artifact
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $allowedWorkflows = @(
+            ".github/workflows/auto-release.yml",
+            ".github/workflows/release.yml",
+            ".github/workflows/packaged-platform-pr.yml"
+          )
+          if ($env:CANDIDATE_PRODUCER_WORKFLOW_PATH -notin $allowedWorkflows) {
+            throw "candidate producer workflow is not trusted"
+          }
+          if (
+            $env:SERVER_BEHAVIOR_ONLY -ne "true" -and
+            $env:CANDIDATE_PRODUCER_WORKFLOW_PATH -ne
+              ".github/workflows/packaged-platform-pr.yml"
+          ) {
+            throw "full qualification requires the exact qualification coordinator"
+          }
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
+            ConvertFrom-Json
+          if (
+            $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+            $run.path -ne $env:CANDIDATE_PRODUCER_WORKFLOW_PATH -or
+            $run.head_sha -ne $sourceSha -or
+            [string]$run.run_attempt -ne $env:GITHUB_RUN_ATTEMPT
+          ) {
+            throw "Windows package producer is not the trusted exact-head run"
+          }
+          $artifacts = gh api `
+            "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=100" |
+            ConvertFrom-Json
+          $artifactCount = @(
+            $artifacts.artifacts | Where-Object {
+              $_.name -eq "codestory-cli-windows-x64" -and
+              $_.expired -eq $false -and
+              [string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID -and
+              $_.workflow_run.head_sha -eq $sourceSha
+            }
+          ).Count
+          if ($artifactCount -ne 1) {
+            throw "expected exactly one authenticated Windows package artifact"
+          }
 
       - name: Download packaged CLI artifact
         if: inputs.use_packaged_cli_artifact
@@ -176,10 +241,27 @@ jobs:
           name: codestory-cli-windows-x64
           path: target/release-dist
 
-      - name: Build qualification driver
-        if: ${{ !inputs.server_behavior_only }}
+      - name: Verify packaged qualification driver
+        id: qualification-driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $version = $env:INPUT_VERSION.TrimStart('v')
+          $verified = node .github/scripts/qualification-driver-artifact.mjs verify `
+            --asset-target windows-x64 `
+            --source-sha $sourceSha `
+            --source-tree $sourceTree `
+            --version $version `
+            --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
+            --trusted-root $env:GITHUB_WORKSPACE `
+            --artifact-dir target/release-dist/qualification-driver/windows-x64
+          $result = $verified | ConvertFrom-Json
+          "path=$($result.driver)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -235,6 +317,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
           SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          USE_PACKAGED_CLI_ARTIFACT: ${{ inputs.use_packaged_cli_artifact }}
+          VERIFIED_QUALIFICATION_DRIVER: ${{ steps.qualification-driver.outputs.path }}
           CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
           CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
@@ -257,9 +341,19 @@ jobs:
             if (-not (Test-Path $qualityPath)) {
               throw "protected Windows proof requires exact-head quality evidence"
             }
+            $qualificationDriver = "target/release/codestory_embedding_qualification.exe"
+            if ($env:USE_PACKAGED_CLI_ARTIFACT -eq "true") {
+              $qualificationDriver = $env:VERIFIED_QUALIFICATION_DRIVER
+              if ([String]::IsNullOrWhiteSpace($qualificationDriver)) {
+                throw "packaged qualification driver was not verified"
+              }
+            }
+            if (-not (Test-Path -LiteralPath $qualificationDriver -PathType Leaf)) {
+              throw "protected Windows proof requires the authenticated qualification driver"
+            }
             $claimArgs = @(
               "--produce-qualification-evidence",
-              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
+              "--qualification-driver", $qualificationDriver,
               "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
             )
