@@ -394,12 +394,12 @@ jobs:
             --input target/release-non-claim/plan-input.json \
             --out target/release-non-claim/plan.json
 
-      - name: Download release packages for withheld identity
+      - name: Download authenticated candidate records for withheld identity
         if: steps.non-claim.outputs.withheld_hosts != ''
         uses: actions/download-artifact@v8.0.1
         with:
-          pattern: codestory-cli-*
-          path: target/release-dist
+          pattern: codestory-candidate-archive-record-*
+          path: target/release-non-claim/candidate-records
           merge-multiple: false
 
       - name: Record populated accelerator non-claims
@@ -418,9 +418,9 @@ jobs:
             > target/release-non-claim/identity.json
           for host in $WITHHELD_HOSTS; do
             case "$host" in
-              macos-arm64-metal) target=macos-arm64; extension=tar.gz ;;
-              windows-x64-vulkan) target=windows-x64; extension=zip ;;
-              linux-x64-vulkan) target=linux-x64; extension=tar.gz ;;
+              macos-arm64-metal) target=macos-arm64 ;;
+              windows-x64-vulkan) target=windows-x64 ;;
+              linux-x64-vulkan) target=linux-x64 ;;
               *) echo "::error::unknown non-claim host $host"; exit 1 ;;
             esac
             node scripts/codestory-release-cell-manifest.mjs withhold \
@@ -431,7 +431,7 @@ jobs:
               --producer-run-id "$GITHUB_RUN_ID" \
               --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
               --identity target/release-non-claim/identity.json \
-              --archive "target/release-dist/codestory-cli-$target/codestory-cli-v$version-$target.$extension" \
+              --candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json" \
               --out-dir "target/release-non-claim/cells/$host"
           done
 

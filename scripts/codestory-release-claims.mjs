@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
-const GRAPH_VERSION = 9;
+const GRAPH_VERSION = 10;
 const KNOWN_PACKAGE_TARGETS = new Set([
   "linux-arm64",
   "linux-x64",
@@ -359,6 +359,11 @@ function validateWithholdPolicy(policy, hosts, cellGroups) {
       + `host proven (${hosts.size} hosts are declared)`,
     );
   }
+  if (withhold.archive_identity_source !== "candidate_archive_record") {
+    fail(
+      "non_claim_policy.withhold_policy.archive_identity_source must be candidate_archive_record",
+    );
+  }
   const required = stringArray(
     withhold.claims_requiring_proof,
     "non_claim_policy.withhold_policy.claims_requiring_proof",
@@ -678,8 +683,9 @@ function validateQualificationPolicy(value) {
     JSON.stringify(Object.keys(driver).sort()) !== JSON.stringify(expectedDriverKeys)
     || driver.producer_workflow !== "packaged-platform-proof.yml"
     || driver.producer_job !== "build"
-    || driver.artifact_name_template !== "codestory-cli-{asset_target}"
-    || driver.artifact_directory_template !== "qualification-driver/{asset_target}"
+    || driver.artifact_name_template
+      !== "codestory-qualification-driver-{asset_target}"
+    || driver.artifact_directory_template !== "."
     || driver.identity_file !== "qualification-driver-identity.json"
     || driver.identity_schema_version !== 1
     || JSON.stringify(driver.identity_fields) !== JSON.stringify(expectedIdentityFields)
@@ -793,6 +799,118 @@ function validateQualificationPolicy(value) {
   ) {
     fail("workflow_policy.qualification must forbid CPU environment, policy, and backend selection");
   }
+}
+
+function exactStringList(value, expected, label) {
+  const actual = stringArray(value, label, { nonEmpty: true });
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    fail(`${label} must be exactly ${expected.join(", ")}`);
+  }
+  return actual;
+}
+
+function validateWindowsPackageGraph(value) {
+  const graph = object(value, "workflow_policy.windows_package_graph");
+  if (
+    graph.asset_target !== "windows-x64"
+    || graph.cargo_profile !== "release"
+    || graph.cargo_build_invocations !== 1
+    || graph.cargo_test_invocations_after_build !== 0
+    || graph.package_artifact !== "codestory-cli"
+  ) {
+    fail("workflow_policy.windows_package_graph must build and package one exact Windows release graph");
+  }
+  exactStringList(
+    graph.artifacts,
+    [
+      "codestory-cli",
+      "codestory-cli-runtime",
+      "codestory_embedding_qualification",
+      "native_staging",
+      "windows_path_identity",
+    ],
+    "workflow_policy.windows_package_graph.artifacts",
+  );
+  exactStringList(
+    graph.direct_test_harnesses,
+    ["native_staging", "windows_path_identity"],
+    "workflow_policy.windows_package_graph.direct_test_harnesses",
+  );
+  exactStringList(
+    graph.timing_phases,
+    [
+      "cache_restore",
+      "native_setup",
+      "cargo_graph",
+      "msvc_link",
+      "regression_execution",
+      "packaging",
+      "artifact_transfer",
+    ],
+    "workflow_policy.windows_package_graph.timing_phases",
+  );
+}
+
+function validateCandidateArchiveCache(value) {
+  const cache = object(value, "workflow_policy.candidate_archive_cache");
+  if (
+    cache.record_schema !== "codestory-candidate-archive-store/v1"
+    || cache.protected_host_root !== "runner_tool_cache"
+    || cache.package_producer_workflow !== "packaged-platform-proof.yml"
+    || cache.package_artifact_name !== "codestory-cli-{asset_target}"
+    || cache.record_artifact_name
+      !== "codestory-candidate-archive-record-{asset_target}"
+    || cache.qualification_driver_artifact_name
+      !== "codestory-qualification-driver-{asset_target}"
+    || cache.miss_admission !== "same_filesystem_atomic_rename"
+    || cache.owned_corruption !== "quarantine_then_authenticated_miss"
+    || cache.unowned_corruption !== "fail_closed"
+    || cache.cross_source_reuse !== false
+    || cache.restore_prefixes !== false
+    || cache.public_asset_reauthentication !== true
+  ) {
+    fail("workflow_policy.candidate_archive_cache must retain exact-source atomic protected-host reuse");
+  }
+  exactStringList(
+    cache.key_fields,
+    ["source.commit", "target", "archive.sha256"],
+    "workflow_policy.candidate_archive_cache.key_fields",
+  );
+  exactStringList(
+    cache.hit_verification,
+    [
+      "repository",
+      "source.commit",
+      "source.tree",
+      "target",
+      "archive.file",
+      "archive.bytes",
+      "archive.sha256",
+    ],
+    "workflow_policy.candidate_archive_cache.hit_verification",
+  );
+}
+
+function validateModelMaterialCache(value) {
+  const cache = object(value, "workflow_policy.model_material_cache");
+  if (
+    cache.key_field !== "model.sha256"
+    || cache.source_sha_in_key !== false
+    || cache.toolchain_in_key !== false
+    || cache.miss_admission !== "same_filesystem_atomic_no_replace"
+  ) {
+    fail("workflow_policy.model_material_cache must key immutable model material only by model SHA");
+  }
+  exactStringList(
+    cache.hit_verification,
+    [
+      "model.real_ancestry",
+      "model.single_link",
+      "model.size_bytes",
+      "model.sha256",
+    ],
+    "workflow_policy.model_material_cache.hit_verification",
+  );
 }
 
 function validatePublicSupport(graph, packageTargets, cellGroups) {
@@ -1310,6 +1428,9 @@ export function validateReleaseClaimGraph(graph) {
     }
     targets.add(row.asset_target);
   }
+  validateWindowsPackageGraph(policy.windows_package_graph);
+  validateCandidateArchiveCache(policy.candidate_archive_cache);
+  validateModelMaterialCache(policy.model_material_cache);
   validateCalibrationPolicy(policy.calibration);
   validateQualificationPolicy(policy.qualification);
   validatePublicSupport(graph, targets, cellGroups);
