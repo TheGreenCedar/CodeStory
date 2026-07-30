@@ -841,15 +841,26 @@ function validateWindowsPackageGraph(value) {
       "codestory-cli",
       "codestory-cli-runtime",
       "codestory_embedding_qualification",
-      "native_staging",
-      "windows_path_identity",
     ],
     "workflow_policy.windows_package_graph.artifacts",
   );
+  if (
+    JSON.stringify(stringArray(
+      graph.direct_test_harnesses,
+      "workflow_policy.windows_package_graph.direct_test_harnesses",
+    )) !== JSON.stringify([])
+  ) {
+    fail("workflow_policy.windows_package_graph.direct_test_harnesses must be empty");
+  }
   exactStringList(
-    graph.direct_test_harnesses,
+    graph.source_test_harnesses,
     ["native_staging", "windows_path_identity"],
-    "workflow_policy.windows_package_graph.direct_test_harnesses",
+    "workflow_policy.windows_package_graph.source_test_harnesses",
+  );
+  exactStringList(
+    graph.production_feature_probes,
+    ["cargo_message_feature_contract", "runtime_observation_source"],
+    "workflow_policy.windows_package_graph.production_feature_probes",
   );
   exactStringList(
     graph.timing_phases,
@@ -858,7 +869,7 @@ function validateWindowsPackageGraph(value) {
       "native_setup",
       "cargo_graph",
       "msvc_link",
-      "regression_execution",
+      "feature_probe",
       "packaging",
       "artifact_transfer",
     ],

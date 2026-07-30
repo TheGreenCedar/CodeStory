@@ -1067,13 +1067,16 @@
       "artifacts": [
         "codestory-cli",
         "codestory-cli-runtime",
-        "codestory_embedding_qualification",
+        "codestory_embedding_qualification"
+      ],
+      "direct_test_harnesses": [],
+      "source_test_harnesses": [
         "native_staging",
         "windows_path_identity"
       ],
-      "direct_test_harnesses": [
-        "native_staging",
-        "windows_path_identity"
+      "production_feature_probes": [
+        "cargo_message_feature_contract",
+        "runtime_observation_source"
       ],
       "package_artifact": "codestory-cli",
       "timing_phases": [
@@ -1081,7 +1084,7 @@
         "native_setup",
         "cargo_graph",
         "msvc_link",
-        "regression_execution",
+        "feature_probe",
         "packaging",
         "artifact_transfer"
       ]

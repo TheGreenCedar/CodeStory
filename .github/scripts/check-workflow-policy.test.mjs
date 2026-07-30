@@ -22,6 +22,7 @@ import {
   absorbedFailureViolations,
   annotationScopeViolations,
   basicWorkflowViolations,
+  benchmarkDependencyIsolationViolations,
   dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
@@ -71,6 +72,33 @@ function retrievalSourceWorkflow() {
 function windowsManifestWorkflow() {
   return retrievalSourceWorkflow();
 }
+
+test("packaged qualification dependencies stay outside the benchmark graph", () => {
+  const source = readFileSync(
+    path.join(root, "crates", "codestory-bench", "Cargo.toml"),
+    "utf8",
+  );
+  assert.deepEqual(benchmarkDependencyIsolationViolations(source), []);
+
+  const runtimeDependency =
+    'codestory-runtime = { workspace = true, features = ["benchmark-support"] }\n';
+  const runtimeInProduct = source
+    .replace(runtimeDependency, "")
+    .replace("[dependencies]\n", `[dependencies]\n${runtimeDependency}`);
+  assert.match(
+    benchmarkDependencyIsolationViolations(runtimeInProduct).join("\n"),
+    /benchmark-only dependencies|must not enable benchmark-support/u,
+  );
+
+  const testSupportInProduct = source.replace(
+    "codestory-retrieval = { workspace = true }",
+    'codestory-retrieval = { workspace = true, features = ["test-support"] }',
+  );
+  assert.match(
+    benchmarkDependencyIsolationViolations(testSupportInProduct).join("\n"),
+    /must not enable benchmark-support or test-support/u,
+  );
+});
 
 function draftStep(job, name) {
   const matches = job.steps.filter(step => step.name === name);
@@ -1317,25 +1345,25 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
@@ -1650,7 +1678,7 @@ test("Windows packages one release graph into exact public and private artifacts
     ["the one package build invokes Cargo twice", workflow => {
       step(workflow, "Build package and qualification driver").run +=
         "\ncargo build --release --locked -p codestory-cli";
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["the package graph loses release mode", workflow => {
       replaceRun(
         workflow,
@@ -1658,15 +1686,28 @@ test("Windows packages one release graph into exact public and private artifacts
         "cargo build --release --locked",
         "cargo build --locked",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
-    ["the path regression is replaced by a debug output", workflow => {
-      step(workflow, "Prove native workspace path identity").env.TEST_BINARY =
-        "target/debug/deps/windows_path_identity.exe";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
-    ["the staging regression is replaced by a debug output", workflow => {
-      step(workflow, "Test immutable native staging on Windows").env.TEST_BINARY =
-        "target/debug/deps/native_staging.exe";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    ["a source-test target contaminates the package graph", workflow => {
+      step(workflow, "Build package and qualification driver").run =
+        step(workflow, "Build package and qualification driver").run.replace(
+          "timing_dir=\"target/windows-package-build-timing\"",
+          'cargo_args+=( -p codestory-workspace --test windows_path_identity )\n            timing_dir="target/windows-package-build-timing"',
+        );
+    }, /host package must build only the production bins/u],
+    ["the host feature contract is removed", workflow => {
+      step(workflow, "Build package and qualification driver").run =
+        step(workflow, "Build package and qualification driver").run.replace(
+          "node .github/scripts/cargo-build-artifacts.mjs features",
+          "true",
+        );
+    }, /host package must build only the production bins/u],
+    ["the Windows runtime probe accepts test support", workflow => {
+      step(workflow, "Prove production feature identity on Windows").run =
+        step(workflow, "Prove production feature identity on Windows").run.replace(
+          '"per_user_server"',
+          '"test_support"',
+        );
+    }, /Prove production feature identity on Windows|non-product embedding feature identity/u],
     ["Windows packaging is fed a debug CLI", workflow => {
       step(workflow, "Package release asset on Windows").env.WINDOWS_CLI =
         "target/debug/codestory-cli.exe";
@@ -2921,6 +2962,60 @@ ${captureRun}`],
   }
 });
 
+test("exact-head source proof owns Windows path and native-staging harnesses", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const mutations = [
+    ["job is removed", workflow => {
+      delete workflow.jobs["windows-native-contracts"];
+    }],
+    ["job becomes advisory", workflow => {
+      workflow.jobs["windows-native-contracts"]["continue-on-error"] = true;
+    }],
+    ["checkout stops using the resolved head", workflow => {
+      workflow.jobs["windows-native-contracts"].steps[0].with.ref = "dev/codestory-next";
+    }],
+    ["path identity is omitted", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run = step.run.replace(
+        "-p codestory-workspace --test windows_path_identity `\n",
+        "",
+      );
+    }],
+    ["native staging is omitted", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run = step.run.replace(
+        "-p codestory-llama-sys --test native_staging",
+        "-p codestory-llama-sys",
+      );
+    }],
+    ["source contracts compile twice", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run += "\ncargo test --release --locked -p codestory-workspace";
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Windows native source contracts|Prove Windows path and native-staging source contracts|Windows path and native-staging contracts/u,
+      );
+    });
+  }
+});
+
 test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
@@ -3100,13 +3195,13 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
         "Test the complete workspace once",
       );
     }, /source-proof\.yml compiler cache must save before test execution or release-cell failure/u],
-    ["packaged compiler cache waits for protected regression", packagedFile, workflow => {
+    ["packaged compiler cache waits for product feature proof", packagedFile, workflow => {
       moveNamedStepAfter(
         packagedJob(workflow),
         "Save compiler objects after compilation",
-        "Test immutable native staging on Windows",
+        "Prove production feature identity on Windows",
       );
-    }, /compiler cache must save before late Test immutable native staging on Windows failure/u],
+    }, /compiler cache must save before late Prove production feature identity on Windows failure/u],
     ["packaged compiler cache waits for signing", packagedFile, workflow => {
       moveNamedStepAfter(
         packagedJob(workflow),
@@ -4072,10 +4167,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     workflow.jobs.build,
     "Configure short Windows Cargo target",
   );
-  const packagedNativeStaging = workflow => draftStep(
-    workflow.jobs.build,
-    "Test immutable native staging on Windows",
-  );
   const protectedSourceTools = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Capture source build tool evidence",
@@ -4125,12 +4216,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("| Out-File -FilePath $env:GITHUB_ENV", "| Write-Output");
     }, /Configure short Windows Cargo target/u],
-    ["packaged native staging regression made cross-platform", packagedFile, workflow => {
-      packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
-    ["packaged native staging regression removed", packagedFile, workflow => {
-      packagedNativeStaging(workflow).run = "cargo test --release --locked";
-    }, /Test immutable native staging on Windows/u],
     ["packaged build overrides generator", packagedFile, workflow => {
       packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
     }, /native package build must not override the selected generator/u],
