@@ -673,6 +673,10 @@ test("constant calibration structure rejects qualification, 3x3 sampling, repeat
     workflow.jobs["packaged-metal"],
     "Collect three independent Metal constant calibration runs",
   );
+  const metalPreflight = workflow => draftStep(
+    workflow.jobs["packaged-metal"],
+    "Validate unfrozen Metal calibration source",
+  );
   const nativeBuild = workflow => draftStep(
     workflow.jobs["packaged-metal"],
     "Build and package native CLI",
@@ -696,6 +700,33 @@ test("constant calibration structure rejects qualification, 3x3 sampling, repeat
   );
 
   const mutations = [
+    ["frozen calibration source is checked after compilation", metalFile, workflow => {
+      const job = workflow.jobs["packaged-metal"];
+      const [preflight] = job.steps.splice(
+        job.steps.findIndex(step => step.name === "Validate unfrozen Metal calibration source"),
+        1,
+      );
+      job.steps.splice(
+        job.steps.findIndex(step => step.name === "Build and package native CLI") + 1,
+        0,
+        preflight,
+      );
+    }, /reject a frozen or stale calibration source immediately after checkout/u],
+    ["frozen calibration source preflight becomes advisory", metalFile, workflow => {
+      metalPreflight(workflow)["continue-on-error"] = true;
+    }, /reject a frozen or stale calibration source immediately after checkout/u],
+    ["frozen calibration source preflight checks a copy", metalFile, workflow => {
+      metalPreflight(workflow).run = metalPreflight(workflow).run.replace(
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        "target/per-user-embedding-server-constant-set.json",
+      );
+    }, /reject a frozen or stale calibration source immediately after checkout/u],
+    ["stale freeze record preflight is removed", metalFile, workflow => {
+      metalPreflight(workflow).run = metalPreflight(workflow).run
+        .split("\n")
+        .filter(line => !line.includes(".freeze_record"))
+        .join("\n");
+    }, /reject a frozen or stale calibration source immediately after checkout/u],
     ["qualification scenario enters calibration", metalFile, workflow => {
       collector(workflow).run += "\n--qualification-scenario lifecycle";
     }, /without full qualification or nested sampling/u],
@@ -2879,13 +2910,13 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["Metal calibration reads the calibration contract from an unpinned location", metalProofFile, workflow => {
       const step = draftStep(
         workflow.jobs["packaged-metal"],
-        "Collect three independent Metal constant calibration runs",
+        "Validate unfrozen Metal calibration source",
       );
       step.run = step.run.replaceAll(
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
         "per-user-embedding-server-constant-set.json",
       );
-    }, /Collect three independent Metal constant calibration runs must run test "\$\(jq -r \.status crates\/codestory-llama-sys\/per-user-embedding-server-constant-set\.json\)"/u],
+    }, /reject a frozen or stale calibration source immediately after checkout/u],
     ["Vulkan model preparation drops the bypass shell", windowsVulkanFile, workflow => {
       delete draftStep(workflow.jobs["packaged-vulkan"], "Prepare checksum-pinned embedded model").shell;
     }, /Prepare checksum-pinned embedded model must declare the bypass shell/u],

@@ -999,7 +999,7 @@ const releaseSourceProofSentinelDigest =
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
-  "05b69d48238284b47b40c13bf15eb1f31370dea55bb77169553d41b46fda1a7f";
+  "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627";
 const windowsVulkanWorkflowDigest =
   "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe";
 const linuxVulkanWorkflowDigest =
@@ -6440,9 +6440,24 @@ function validateRemainingWorkflows(workflows, violations) {
       job,
       "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
     );
+    const calibrationPreflightName = "Validate unfrozen Metal calibration source";
+    const calibrationPreflight = namedStep(job, calibrationPreflightName);
+    add(
+      violations,
+      calibrationPreflight?.if === "inputs.calibration_mode"
+        && calibrationPreflight?.shell === "bash"
+        && calibrationPreflight?.["continue-on-error"] === undefined
+        && stepRun(job, calibrationPreflightName).trim() === [
+          "set -euo pipefail",
+          'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
+          'test "$(jq -r .freeze_record crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = null',
+        ].join("\n")
+        && stepIndex(job, calibrationPreflightName)
+          === stepIndex(job, "Checkout") + 1,
+      `${metalFile} must reject a frozen or stale calibration source immediately after checkout and before setup or compilation`,
+    );
     const calibrationStepName = "Collect three independent Metal constant calibration runs";
     requireStepRun(violations, metalFile, job, calibrationStepName, [
-      'test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen',
       "--proof-tier calibration",
       "--engine-policy accelerated",
       "--expected-backend Metal",

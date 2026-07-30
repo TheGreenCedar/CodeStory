@@ -79,6 +79,14 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
+      - name: Validate unfrozen Metal calibration source
+        if: inputs.calibration_mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
+          test "$(jq -r .freeze_record crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = null
+
       - name: Capture host evidence
         shell: bash
         run: |
@@ -504,7 +512,6 @@ jobs:
           CODESTORY_EMBED_ALLOW_CPU: "0"
         run: |
           set -euo pipefail
-          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
           version="${VERSION#v}"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
