@@ -40,7 +40,7 @@ def produce_qualification_evidence(
     external = collect_qualification_external_evidence(context)
     runner = run_qualification_producer(context)
     scenarios = collect_qualification_scenarios(context, runner, external)
-    measurements = collect_qualification_measurements(context, runner)
+    measurements = collect_qualification_measurements(context, runner, scenarios)
     return write_qualification_outputs(
         context,
         runner,

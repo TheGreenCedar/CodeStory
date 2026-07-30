@@ -16,6 +16,7 @@ from .qualification_measurements import qualification_measurement_artifact
 from .qualification_production_types import (
     QualificationProducerContext,
     QualificationRunnerEvidence,
+    QualificationScenarioEvidence,
 )
 from .runtime_evidence_support import metric_passes
 from .runtime_memory import retain_five_process_memory_evidence
@@ -66,14 +67,24 @@ def _qualification_measurement_sources(
 def _qualification_host(
     context: QualificationProducerContext,
     runner: QualificationRunnerEvidence,
+    scenarios: QualificationScenarioEvidence,
     measurement: dict,
 ) -> dict:
     identity = context.runtime["identity"]
-    cache_state = (
-        "reused"
-        if context.runtime["materialization"]["reused_on_rejoin"] is True
-        else "materialized"
+    cache_state = require_nonempty_string(
+        runner.matrix_cell.get("cache_state"),
+        "qualification matrix cache state",
     )
+    if cache_state == "reused":
+        true_idle = scenarios.scenarios.get("true_idle_respawn")
+        assertions = (
+            true_idle.get("assertions") if isinstance(true_idle, dict) else None
+        )
+        require(
+            isinstance(assertions, dict)
+            and assertions.get("verified_materialization_reused") is True,
+            "qualification reused cache state lacks validated replacement reuse evidence",
+        )
     residency_state = require_nonempty_string(
         identity["embedding_engine_residency"],
         "runtime engine residency",
@@ -181,6 +192,7 @@ def _retained_qualification_metric(
 def collect_qualification_measurements(
     context: QualificationProducerContext,
     runner: QualificationRunnerEvidence,
+    scenarios: QualificationScenarioEvidence,
 ) -> QualificationMeasurementEvidence:
     measurement, memory = _qualification_measurement_sources(context, runner)
     timing = {
@@ -207,6 +219,6 @@ def collect_qualification_measurements(
         measurement,
         memory,
         timing,
-        _qualification_host(context, runner, measurement),
+        _qualification_host(context, runner, scenarios, measurement),
         metrics,
     )

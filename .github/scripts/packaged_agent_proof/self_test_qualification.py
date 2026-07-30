@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 from .foundation import ProofFailure, require
+from .qualification_metrics import _qualification_host
+from .qualification_production_types import (
+    QualificationRunnerEvidence,
+    QualificationScenarioEvidence,
+)
 from .qualification_scenario_evidence import validate_replay_attempts, validate_retry_state
 
 
@@ -28,7 +34,80 @@ def _replay_attempt(
     return attempt
 
 
+def _qualification_cache_state_self_tests() -> None:
+    context = SimpleNamespace(
+        args=SimpleNamespace(engine_policy="accelerated"),
+        runtime={
+            "identity": {
+                "embedding_backend": "metal",
+                "embedding_engine_residency": "resident",
+            },
+            "same_account": {"account_id": "uid:501"},
+            "materialization": {
+                "sha256": "a" * 64,
+                "reused_on_rejoin": False,
+            },
+        },
+        manifest={"asset_target": "macos-arm64"},
+        archive_sha256="b" * 64,
+    )
+    runner = QualificationRunnerEvidence(
+        output={},
+        expected_status="pass",
+        expected_backend="metal",
+        matrix_cell_id="protected_macos_arm64_metal",
+        matrix_cell={
+            "host_class": "protected_self_hosted_macos_arm64",
+            "accelerator_claim": "metal",
+            "cache_state": "reused",
+        },
+    )
+    reused_scenario = QualificationScenarioEvidence(
+        shared_identity={},
+        scenarios={
+            "true_idle_respawn": {
+                "assertions": {"verified_materialization_reused": True}
+            }
+        },
+    )
+    measurement = {"unplanned_suspend": False}
+    host = _qualification_host(context, runner, reused_scenario, measurement)
+    require(
+        context.runtime["materialization"]["reused_on_rejoin"] is False
+        and host["cache_state"] == "reused",
+        "cold bootstrap state overrode proved qualification replacement reuse",
+    )
+
+    for hostile, message in (
+        (
+            QualificationScenarioEvidence(
+                shared_identity={},
+                scenarios={
+                    "true_idle_respawn": {
+                        "assertions": {"verified_materialization_reused": False}
+                    }
+                },
+            ),
+            "false qualification replacement reuse was accepted",
+        ),
+        (
+            QualificationScenarioEvidence(
+                shared_identity={},
+                scenarios={"true_idle_respawn": {"assertions": {}}},
+            ),
+            "missing qualification replacement reuse proof was accepted",
+        ),
+    ):
+        try:
+            _qualification_host(context, runner, hostile, measurement)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(message)
+
+
 def run_qualification_self_tests() -> None:
+    _qualification_cache_state_self_tests()
     retry = validate_retry_state(
         {
             "code": "embedding_server_owner_unresponsive",
