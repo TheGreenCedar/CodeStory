@@ -970,7 +970,7 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "464906e3cd7ec0e2f7e9195d60de035fdba76172c25d8b0861d0982f9d7dcc3e";
+  "5017abab05e80355daf4618795d5ec7f09c07b4bc33cc1d52dca968a96b056bb";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -5145,6 +5145,16 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
   });
   requireExactResolverContract(violations, file, route, platformResolverContractDigest);
+  const sourceProofRequirement = namedStep(
+    route,
+    "Require successful exact-head source proof",
+  );
+  add(
+    violations,
+    sourceProofRequirement?.if
+      === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
+    `${file} calibration alone must skip pre-freeze source proof while every frozen-candidate mode requires it`,
+  );
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',

@@ -166,7 +166,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Require successful exact-head source proof
-        if: steps.resolve.outputs.mode != 'integration'
+        if: steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

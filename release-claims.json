@@ -1133,6 +1133,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
+      "pre_collection_source_proof_required": false,
+      "source_proof_stage": "frozen_candidate_before_qualification",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",

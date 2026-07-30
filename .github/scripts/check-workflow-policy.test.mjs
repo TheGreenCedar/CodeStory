@@ -2941,6 +2941,43 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
   }
 });
 
+test("calibration precedes the sole frozen-candidate source proof", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const mutations = [
+    ["calibration regains a pre-freeze source proof", workflow => {
+      draftStep(
+        workflow.jobs.route,
+        "Require successful exact-head source proof",
+      ).if = "steps.resolve.outputs.mode != 'integration'";
+    }],
+    ["qualification loses the frozen-head source proof", workflow => {
+      draftStep(
+        workflow.jobs.route,
+        "Require successful exact-head source proof",
+      ).if
+        = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
+    }],
+    ["every mode loses the exact-head source proof", workflow => {
+      draftStep(
+        workflow.jobs.route,
+        "Require successful exact-head source proof",
+      ).if = "false";
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(coordinatorFile));
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /calibration alone must skip pre-freeze source proof while every frozen-candidate mode requires it/u,
+      );
+    });
+  }
+});
+
 test("Windows package proof retains the readable native sccache executable", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-windows-sccache-"));
   try {

@@ -289,6 +289,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
+  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(
+    calibration.source_proof_stage,
+    "frozen_candidate_before_qualification",
+  );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
   ]);
@@ -312,6 +317,12 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
     [draft => {
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
+    [draft => {
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
+    }, /sole frozen-candidate source proof/u],
+    [draft => {
+      draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
+    }, /sole frozen-candidate source proof/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",

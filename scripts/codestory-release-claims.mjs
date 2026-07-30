@@ -541,8 +541,10 @@ function validateCalibrationPolicy(value) {
     calibration.coordinator_workflow !== "packaged-platform-pr.yml"
     || calibration.mode !== "calibration"
     || calibration.assembly_job !== "calibration-assemble"
+    || calibration.pre_collection_source_proof_required !== false
+    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
   ) {
-    fail("workflow_policy.calibration must name the canonical calibration coordinator and assembly job");
+    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
   }
   if (calibration.runs_per_required_cell !== 3) {
     fail("workflow_policy.calibration must require exactly three clean runs per required cell");
