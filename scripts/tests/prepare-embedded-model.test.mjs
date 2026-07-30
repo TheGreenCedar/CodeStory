@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -41,7 +51,9 @@ function contractDigest(domain, value) {
 }
 
 async function fixture(t, expected = Buffer.from("good"), sourceCount = 1) {
-  const directory = await mkdtemp(resolve(tmpdir(), "codestory-model-contract-"));
+  const directory = await realpath(
+    await mkdtemp(resolve(tmpdir(), "codestory-model-contract-")),
+  );
   t.after(() => rm(directory, { force: true, recursive: true }));
   const contract = resolve(directory, "contract.json");
   const modelSha256 = sha256(expected);
@@ -177,6 +189,144 @@ test("copies and verifies an explicit source while offline", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), output);
   assert.deepEqual(await readFile(output), expected);
+});
+
+test("persistent content root is keyed solely by the checked-in model SHA", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  const cacheRoot = resolve(directory, "persistent-model-cache");
+  await writeFile(source, expected);
+
+  const first = run(
+    ["--contract", contract, "--source", source, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+
+  assert.equal(first.status, 0, first.stderr);
+  const expectedPath = resolve(cacheRoot, "sha256", sha256(expected), "model.gguf");
+  assert.equal(first.stdout.trim(), expectedPath);
+  assert.deepEqual(await readFile(expectedPath), expected);
+
+  await writeFile(source, "baad");
+  const hit = run(
+    ["--contract", contract, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+  assert.equal(hit.status, 0, hit.stderr);
+  assert.equal(hit.stdout.trim(), expectedPath);
+  assert.deepEqual(await readFile(expectedPath), expected);
+});
+
+test("persistent content root revalidates bytes before reporting a hit", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  const cacheRoot = resolve(directory, "persistent-model-cache");
+  await writeFile(source, expected);
+
+  const first = run(
+    ["--contract", contract, "--source", source, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+  assert.equal(first.status, 0, first.stderr);
+  await writeFile(first.stdout.trim(), "baad");
+
+  const rejected = run(
+    ["--contract", contract, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /offline model preparation requires/u);
+});
+
+test("persistent content root rejects a hardlinked cache destination", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  const cacheRoot = resolve(directory, "persistent-model-cache");
+  await writeFile(source, expected);
+
+  const first = run(
+    ["--contract", contract, "--source", source, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+  assert.equal(first.status, 0, first.stderr);
+  await link(first.stdout.trim(), resolve(directory, "external-hardlink.gguf"));
+
+  const rejected = run(
+    ["--contract", contract, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /offline model preparation requires/u);
+});
+
+test("persistent content root rejects a symlinked or reparse cache root", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  const external = resolve(directory, "external-cache");
+  const cacheRoot = resolve(directory, "linked-cache");
+  await writeFile(source, expected);
+  await mkdir(external);
+  await symlink(
+    external,
+    cacheRoot,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  const rejected = run(
+    ["--contract", contract, "--source", source, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /must not traverse symbolic links, reparse points, or files/u);
+  assert.deepEqual(await readdir(external), []);
+});
+
+test("persistent content root rejects a symlinked or reparse digest ancestor", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  const external = resolve(directory, "external-sha256");
+  const cacheRoot = resolve(directory, "persistent-model-cache");
+  await writeFile(source, expected);
+  await mkdir(cacheRoot);
+  await mkdir(external);
+  await symlink(
+    external,
+    resolve(cacheRoot, "sha256"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  const rejected = run(
+    ["--contract", contract, "--source", source, "--cache-root", cacheRoot, "--offline"],
+    directory,
+  );
+
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /must not traverse symbolic links, reparse points, or files/u);
+  assert.deepEqual(await readdir(external), []);
+});
+
+test("explicit output cannot weaken the persistent content-addressed path", async (t) => {
+  const { contract, directory, expected } = await fixture(t);
+  const source = resolve(directory, "source.gguf");
+  await writeFile(source, expected);
+
+  const result = run(
+    [
+      "--contract",
+      contract,
+      "--source",
+      source,
+      "--cache-root",
+      resolve(directory, "persistent-model-cache"),
+      "--output",
+      resolve(directory, "arbitrary.gguf"),
+    ],
+    directory,
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /mutually exclusive/u);
 });
 
 test("rejects a missing explicit source", async (t) => {
