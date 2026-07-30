@@ -3207,6 +3207,13 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"]["runs-on"]
         = ["self-hosted", "Windows", "X64"];
     }, /protected blocking Windows native probe/u],
+    ["Windows probe restores unavailable PowerShell Core", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.shell = "pwsh";
+    }, /protected blocking Windows native probe/u],
     ["Windows probe restores a full build", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],

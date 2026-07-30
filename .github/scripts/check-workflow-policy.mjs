@@ -8735,13 +8735,16 @@ export function releaseFreezeBarrierWorkflowViolations(
     sourceWorkflow,
     acceptance.windows_job,
   );
+  const windowsProbePowerShell
+    = `powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"`;
   add(
     violations,
     windowsJob.if === "inputs.acceptance_only"
       && sameMembers(needs(windowsJob), ["resolve"])
       && sameMembers(list(windowsJob["runs-on"]), list(acceptance.windows_runner))
       && windowsJob["timeout-minutes"] === 5
-      && namedStep(windowsJob, acceptance.windows_step)?.shell === "pwsh"
+      && namedStep(windowsJob, acceptance.windows_step)?.shell
+        === windowsProbePowerShell
       && namedStep(windowsJob, acceptance.windows_step)?.["continue-on-error"] !== true,
     "[freeze_barrier] source acceptance must execute the protected blocking Windows native probe",
   );

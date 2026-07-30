@@ -325,7 +325,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.ref }}
 
       - name: Run exact-head Windows native probe
-        shell: pwsh
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = "Stop"
           $probeRoot = Join-Path $env:RUNNER_TEMP (
