@@ -36,8 +36,9 @@ on:
         required: false
         type: string
       freeze_receipt_digest:
-        description: Digest emitted by release-freeze-barrier.mjs for the accepted source head.
-        required: true
+        description: Active freeze digest required before pre-calibration proof; qualification reuses the source cell under constant-only lineage.
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -231,6 +232,7 @@ jobs:
           fi
 
       - name: Require executable release freeze
+        if: steps.resolve.outputs.mode != 'qualification'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

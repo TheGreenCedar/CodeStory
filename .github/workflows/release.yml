@@ -17,11 +17,6 @@ on:
         required: false
         type: boolean
         default: false
-      freeze_receipt_digest:
-        description: "Exact-head release freeze receipt digest; publishing may discover it from the calibrated source"
-        required: false
-        type: string
-        default: ""
   workflow_dispatch:
     inputs:
       version:
@@ -32,11 +27,6 @@ on:
         description: "Exact dev/codestory-next head to authenticate without publishing"
         required: true
         type: string
-      freeze_receipt_digest:
-        description: "Digest emitted by release-freeze-barrier.mjs for the accepted source head"
-        required: true
-        type: string
-
 permissions:
   actions: write
   # accelerator-non-claim reads the job annotation that identifies a lost runner, which the Actions
@@ -45,7 +35,6 @@ permissions:
   checks: read
   contents: read
   pull-requests: read
-  statuses: read
 
 concurrency:
   group: release-${{ inputs.version }}
@@ -97,7 +86,6 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       source_proof_reused: ${{ steps.reuse.outputs.source_proof_reused }}
-      freeze_receipt_digest: ${{ steps.reuse.outputs.freeze_receipt_digest }}
       tag: ${{ steps.version.outputs.tag }}
       marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
@@ -222,9 +210,7 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
           SOURCE_SHA: ${{ steps.lineage.outputs.selection_commit }}
-          SOURCE_TREE: ${{ steps.lineage.outputs.selection_tree }}
         shell: bash
         run: |
           set -euo pipefail
@@ -263,39 +249,9 @@ jobs:
             exit 1
           }
 
-          statuses="$(
-            gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/statuses?per_page=100"
-          )"
-          if [ -n "$INPUT_FREEZE_RECEIPT_DIGEST" ]; then
-            freeze_digest="$INPUT_FREEZE_RECEIPT_DIGEST"
-          else
-            freeze_digest="$(
-              jq -r \
-                --arg description "tree=$SOURCE_TREE" \
-                '[.[] | select(
-                  .state == "success"
-                  and (.context | startswith("codestory/release-freeze/"))
-                  and .description == $description
-                  and .creator.login == "github-actions[bot]"
-                  and .creator.type == "Bot"
-                  and (.target_url | test(
-                    "^https://github.com/TheGreenCedar/CodeStory/actions/runs/[1-9][0-9]*$"
-                  ))
-                ) | .context | sub("^codestory/release-freeze/"; "")] | unique | if length == 1 then .[0] else "" end' \
-                <<<"$statuses"
-            )"
-          fi
-          printf '%s' "$freeze_digest" | grep -Eq '^[0-9a-f]{64}$'
-          node .github/scripts/release-freeze-barrier.mjs verify-status \
-            --repository "$GITHUB_REPOSITORY" \
-            --commit "$SOURCE_SHA" \
-            --tree "$SOURCE_TREE" \
-            --receipt-digest "$freeze_digest"
-
           {
             echo "reuse=$reuse"
             echo "source_proof_reused=true"
-            echo "freeze_receipt_digest=$freeze_digest"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prove the public marketplace install path
@@ -359,7 +315,9 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       version: ${{ needs.preflight.outputs.version }}
-      freeze_receipt_digest: ${{ needs.preflight.outputs.freeze_receipt_digest }}
+      # This job is deliberately unreachable. An empty digest makes any policy
+      # regression that reaches it fail before starting a second broad proof.
+      freeze_receipt_digest: ""
 
   packaged-proof:
     needs: preflight

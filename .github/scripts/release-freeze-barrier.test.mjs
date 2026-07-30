@@ -1,23 +1,36 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  acceptedFreezeStatus,
   receiptDigest,
   validateAcceptanceProvenance,
   validateReceipt,
 } from "./release-freeze-barrier.mjs";
 
+const REPOSITORY = "TheGreenCedar/CodeStory";
 const COMMIT = "1".repeat(40);
 const TREE = "2".repeat(40);
-const DIGEST = "a".repeat(64);
+const RUN_ID = 77;
+const RUN_ATTEMPT = 2;
+const NEXT_PERMITTED_MUTATION =
+  "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+const PLANNED_PROOF_ACTIONS = [
+  "acceptance",
+  "source-proof",
+  "calibration",
+  "qualification",
+  "release",
+];
 
 function receipt(overrides = {}) {
   const candidate = {
-    schema: 1,
-    repository: "TheGreenCedar/CodeStory",
+    schema: 2,
+    authority: "github_actions",
+    repository: REPOSITORY,
     branch: "codex/release",
     commit: COMMIT,
     tree: TREE,
@@ -26,27 +39,75 @@ function receipt(overrides = {}) {
     release_pr: {
       number: 1597,
       base: "dev/codestory-next",
+      base_commit: "0".repeat(40),
       head: "codex/release",
       head_commit: COMMIT,
     },
     integrated_support_prs: [],
-    known_future_source_changes: [
-      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
-    ],
-    planned_proof_actions: ["source-proof", "calibration", "qualification"],
+    known_future_source_changes: [NEXT_PERMITTED_MUTATION],
+    planned_proof_actions: [...PLANNED_PROOF_ACTIONS],
+    proof_triggering_labels: [],
+    proof_triggering_actions: [...PLANNED_PROOF_ACTIONS],
     reusable_evidence: [],
     invalidated_evidence: [],
     running_workflows: [],
     cancelled_superseded_runs: [],
-    next_permitted_mutation: "generated constant set only",
+    next_permitted_mutation: NEXT_PERMITTED_MUTATION,
+    acceptance_run: {
+      id: RUN_ID,
+      attempt: RUN_ATTEMPT,
+      workflow: ".github/workflows/source-proof.yml",
+      event: "workflow_dispatch",
+    },
     ...overrides,
   };
   candidate.digest = receiptDigest(candidate);
   return candidate;
 }
 
-test("an exact clean pushed local declaration passes", () => {
-  validateReceipt(receipt(), { commit: COMMIT, tree: TREE });
+const RECEIPT_CONTEXT = {
+  repository: REPOSITORY,
+  commit: COMMIT,
+  tree: TREE,
+  runId: String(RUN_ID),
+  runAttempt: String(RUN_ATTEMPT),
+};
+
+test("an exact clean pushed Actions receipt passes", () => {
+  validateReceipt(receipt(), RECEIPT_CONTEXT);
+});
+
+test("a newer invalidation status revokes an older accepted freeze", () => {
+  const acceptedReceipt = receipt();
+  const context = `codestory/release-freeze/${acceptedReceipt.digest}`;
+  const accepted = {
+    id: "9007199254740993",
+    state: "success",
+    context,
+    description: `tree=${TREE}`,
+  };
+  assert.equal(
+    acceptedFreezeStatus([accepted], {
+      tree: TREE,
+      digest: acceptedReceipt.digest,
+    }),
+    accepted,
+  );
+  assert.equal(
+    acceptedFreezeStatus([
+      accepted,
+      {
+        id: "9007199254740994",
+        state: "error",
+        context,
+        description: `superseded-by=${"3".repeat(40)}`,
+      },
+    ], {
+      tree: TREE,
+      digest: acceptedReceipt.digest,
+    }),
+    undefined,
+  );
 });
 
 for (const [name, mutate, pattern] of [
@@ -57,13 +118,27 @@ for (const [name, mutate, pattern] of [
   ["moved release PR", (value) => {
     value.release_pr.head_commit = "5".repeat(40);
   }, /bind the open release PR/u],
+  ["unbound release base", (value) => {
+    value.release_pr.base_commit = "";
+  }, /bind the open release PR/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
-  }, /unsupported future source change/u],
+  }, /only the generated constant-set change/u],
+  ["caller-selected proof actions", (value) => {
+    value.planned_proof_actions = ["source-proof"];
+  }, /exact proof-triggering actions/u],
+  ["proof-triggering label", (value) => {
+    value.proof_triggering_labels = ["source-proof"];
+  }, /exact proof-triggering actions/u],
+  ["cross-attempt receipt", (value) => {
+    value.acceptance_run.attempt = RUN_ATTEMPT + 1;
+  }, /exact Actions run and attempt/u],
   ["missing handoff field", (value) => { delete value.running_workflows; }, /running_workflows/u],
-  ["missing next mutation", (value) => { value.next_permitted_mutation = ""; }, /next permitted mutation/u],
+  ["missing next mutation", (value) => {
+    value.next_permitted_mutation = "";
+  }, /generated constant set as the next mutation/u],
   ["tampered receipt", (value) => {
-    value.planned_proof_actions.push("second-source-proof");
+    value.reusable_evidence.push("unauthenticated evidence");
   }, /digest/u],
 ]) {
   test(`freeze barrier rejects ${name}`, () => {
@@ -73,15 +148,15 @@ for (const [name, mutate, pattern] of [
       candidate.digest = receiptDigest(candidate);
     }
     assert.throws(
-      () => validateReceipt(candidate, { commit: COMMIT, tree: TREE }),
+      () => validateReceipt(candidate, RECEIPT_CONTEXT),
       pattern,
     );
   });
 }
 
 function acceptanceProvenance() {
-  const runId = 77;
-  const runAttempt = 2;
+  const acceptedReceipt = receipt();
+  const digest = acceptedReceipt.digest;
   const startedAt = "2026-07-30T12:00:00Z";
   const completedAt = "2026-07-30T12:00:06Z";
   const job = (name, stepName, labels = ["ubuntu-latest"]) => ({
@@ -89,8 +164,8 @@ function acceptanceProvenance() {
     status: "completed",
     conclusion: "success",
     head_sha: COMMIT,
-    run_id: runId,
-    run_attempt: runAttempt,
+    run_id: RUN_ID,
+    run_attempt: RUN_ATTEMPT,
     labels,
     steps: [{
       name: stepName,
@@ -103,20 +178,20 @@ function acceptanceProvenance() {
   return {
     status: {
       state: "success",
-      context: `codestory/release-freeze/${DIGEST}`,
+      context: `codestory/release-freeze/${digest}`,
       description: `tree=${TREE}`,
-      target_url: `https://github.com/TheGreenCedar/CodeStory/actions/runs/${runId}`,
+      target_url: `https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}`,
       creator: { login: "github-actions[bot]", type: "Bot" },
     },
     run: {
-      id: runId,
-      run_attempt: runAttempt,
+      id: RUN_ID,
+      run_attempt: RUN_ATTEMPT,
       head_sha: COMMIT,
       path: ".github/workflows/source-proof.yml",
       event: "workflow_dispatch",
       status: "completed",
       conclusion: "success",
-      head_repository: { full_name: "TheGreenCedar/CodeStory" },
+      head_repository: { full_name: REPOSITORY },
     },
     jobs: [
       job("freeze-hostile-mutations", "Execute exact-head hostile mutation matrix"),
@@ -127,10 +202,16 @@ function acceptanceProvenance() {
       ),
       job("freeze-acceptance", "Publish executable release freeze"),
     ],
-    repository: "TheGreenCedar/CodeStory",
+    artifact: {
+      name: `release-freeze-receipt-attempt-${RUN_ATTEMPT}`,
+      expired: false,
+      workflow_run: { id: RUN_ID },
+    },
+    receipt: acceptedReceipt,
+    repository: REPOSITORY,
     commit: COMMIT,
     tree: TREE,
-    digest: DIGEST,
+    digest,
   };
 }
 
@@ -160,6 +241,21 @@ for (const [name, mutate, pattern] of [
   ["fabricated native step", (value) => {
     value.jobs[1].steps[0].conclusion = "failure";
   }, /did not execute successfully/u],
+  ["wrong receipt artifact", (value) => {
+    value.artifact.name = "release-freeze-receipt-attempt-999";
+  }, /receipt artifact provenance changed/u],
+  ["expired receipt artifact", (value) => {
+    value.artifact.expired = true;
+  }, /receipt artifact provenance changed/u],
+  ["cross-run receipt artifact", (value) => {
+    value.artifact.workflow_run.id = RUN_ID + 1;
+  }, /receipt artifact provenance changed/u],
+  ["cross-attempt receipt artifact", (value) => {
+    value.artifact.name = `release-freeze-receipt-attempt-${RUN_ATTEMPT + 1}`;
+  }, /receipt artifact provenance changed/u],
+  ["tampered receipt artifact", (value) => {
+    value.receipt.running_workflows.push({ id: 123 });
+  }, /digest/u],
 ]) {
   test(`acceptance rejects ${name}`, () => {
     const value = acceptanceProvenance();
@@ -180,10 +276,16 @@ test("verify-file is executable and rejects a later commit", () => {
       "verify-file",
       "--receipt",
       receiptPath,
+      "--repository",
+      REPOSITORY,
       "--commit",
       COMMIT,
       "--tree",
       TREE,
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
     ],
     { encoding: "utf8" },
   );
@@ -197,10 +299,16 @@ test("verify-file is executable and rejects a later commit", () => {
       "verify-file",
       "--receipt",
       receiptPath,
+      "--repository",
+      REPOSITORY,
       "--commit",
       "8".repeat(40),
       "--tree",
       TREE,
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
     ],
     { encoding: "utf8" },
   );
@@ -208,42 +316,51 @@ test("verify-file is executable and rejects a later commit", () => {
   assert.match(rejected.stderr, /exact commit and tree/u);
 });
 
-test("declare rejects a dirty worktree before publishing a status", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-repo-"));
-  execFileSync("git", ["init", "-q", root]);
-  execFileSync("git", ["-C", root, "config", "user.email", "test@example.com"]);
-  execFileSync("git", ["-C", root, "config", "user.name", "Test"]);
-  writeFileSync(path.join(root, "tracked.txt"), "one\n");
-  execFileSync("git", ["-C", root, "add", "tracked.txt"]);
-  execFileSync("git", ["-C", root, "commit", "-qm", "initial"]);
-  writeFileSync(path.join(root, "untracked.txt"), "dirty\n");
-
+test("record-actions-receipt refuses to mint authority outside GitHub Actions", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-outside-actions-"));
   const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
   const result = spawnSync(
     process.execPath,
     [
       script.pathname,
-      "declare",
+      "record-actions-receipt",
       "--repo",
       root,
       "--repository",
-      "TheGreenCedar/CodeStory",
+      REPOSITORY,
+      "--branch",
+      "codex/release",
+      "--commit",
+      COMMIT,
+      "--tree",
+      TREE,
       "--release-pr",
       "1",
       "--output",
       path.join(root, "receipt.json"),
-      "--next-permitted-mutation",
-      "none",
-      "--planned-proof-action",
-      "source-proof",
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
+      "--support-prs-json",
+      "[]",
       "--broad-workflow",
       "Exact-head source proof",
-      "--no-publish-status",
     ],
-    { encoding: "utf8" },
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "",
+        GITHUB_EVENT_NAME: "",
+      },
+    },
   );
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /clean worktree, including untracked files/u);
+  assert.match(
+    result.stderr,
+    /canonical release freeze receipt may be produced only by workflow_dispatch/u,
+  );
 });
 
 test("cancel-superseded rejects a cancellation request that leaves the run active", () => {

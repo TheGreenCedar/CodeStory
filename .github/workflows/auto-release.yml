@@ -67,7 +67,6 @@ jobs:
       checks: read
       contents: write
       pull-requests: read
-      statuses: read
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.detect-version.outputs.version }}

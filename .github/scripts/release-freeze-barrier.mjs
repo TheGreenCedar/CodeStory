@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import process from "node:process";
 
 const ACTIVE_RUN_STATES = new Set([
@@ -15,6 +24,17 @@ const ACTIVE_RUN_STATES = new Set([
 const ALLOWED_FUTURE_CHANGES = new Set([
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
 ]);
+const NEXT_PERMITTED_MUTATION =
+  "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+const PLANNED_PROOF_ACTIONS = [
+  "acceptance",
+  "source-proof",
+  "calibration",
+  "qualification",
+  "release",
+];
+const RECEIPT_ARTIFACT_PREFIX = "release-freeze-receipt-attempt-";
+const RECEIPT_FILE = "release-freeze-receipt.json";
 const STATUS_PREFIX = "codestory/release-freeze";
 const CANCEL_POLL_ATTEMPTS = Number.parseInt(
   process.env.CODESTORY_FREEZE_CANCEL_POLL_ATTEMPTS ?? "10",
@@ -76,10 +96,6 @@ function required(args, name) {
   return result;
 }
 
-function has(args, name) {
-  return args.includes(name);
-}
-
 function parseJsonFile(path, label) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -123,6 +139,8 @@ export function validateAcceptanceProvenance({
   status,
   run,
   jobs,
+  artifact,
+  receipt,
   repository,
   commit,
   tree,
@@ -154,6 +172,22 @@ export function validateAcceptanceProvenance({
   ) {
     fail("release freeze acceptance run provenance changed");
   }
+  const artifactName = `${RECEIPT_ARTIFACT_PREFIX}${run.run_attempt}`;
+  if (
+    artifact?.name !== artifactName
+    || artifact?.expired !== false
+    || String(artifact?.workflow_run?.id) !== String(run.id)
+    || receipt?.digest !== digest
+  ) {
+    fail("release freeze receipt artifact provenance changed");
+  }
+  validateReceipt(receipt, {
+    repository,
+    commit,
+    tree,
+    runId: String(run.id),
+    runAttempt: String(run.run_attempt),
+  });
   if (!Array.isArray(jobs)) {
     fail("release freeze acceptance jobs are missing");
   }
@@ -192,44 +226,76 @@ export function validateAcceptanceProvenance({
   return Number(target[1]);
 }
 
-export function validateReceipt(receipt, { commit, tree }) {
-  if (receipt?.schema !== 1) {
-    fail("freeze receipt schema must be 1");
+export function validateReceipt(
+  receipt,
+  { repository, commit, tree, runId, runAttempt },
+) {
+  if (receipt?.schema !== 2 || receipt?.authority !== "github_actions") {
+    fail("freeze receipt must use the GitHub Actions authority schema");
   }
-  if (receipt.commit !== commit || receipt.tree !== tree) {
+  if (
+    receipt.repository !== repository
+    || receipt.commit !== commit
+    || receipt.tree !== tree
+  ) {
     fail("freeze receipt does not match the exact commit and tree");
   }
   if (receipt.worktree_clean !== true || receipt.remote_head !== commit) {
     fail("freeze receipt must prove a clean worktree pushed at the exact commit");
   }
   if (
-    receipt?.release_pr?.head_commit !== commit
+    !Number.isInteger(receipt?.release_pr?.number)
+    || receipt.release_pr.number <= 0
+    || receipt?.release_pr?.head_commit !== commit
     || receipt?.release_pr?.head !== receipt.branch
     || receipt?.release_pr?.base !== "dev/codestory-next"
+    || !/^[0-9a-f]{40}$/u.test(String(receipt?.release_pr?.base_commit ?? ""))
   ) {
     fail("freeze receipt must bind the open release PR at this exact head");
   }
-  if (!Array.isArray(receipt.known_future_source_changes)) {
-    fail("freeze receipt must declare known future source changes");
+  if (
+    !Array.isArray(receipt.integrated_support_prs)
+    || new Set(receipt.integrated_support_prs.map(entry => entry?.number)).size
+      !== receipt.integrated_support_prs.length
+  ) {
+    fail("freeze receipt must contain unique integrated support PRs");
   }
-  for (const path of receipt.known_future_source_changes) {
-    if (!ALLOWED_FUTURE_CHANGES.has(path)) {
-      fail(`freeze receipt admits an unsupported future source change: ${path}`);
-    }
+  if (
+    !Array.isArray(receipt.known_future_source_changes)
+    || receipt.known_future_source_changes.length !== 1
+    || !ALLOWED_FUTURE_CHANGES.has(receipt.known_future_source_changes[0])
+  ) {
+    fail("freeze receipt must declare only the generated constant-set change");
+  }
+  if (
+    JSON.stringify(receipt.planned_proof_actions) !== JSON.stringify(PLANNED_PROOF_ACTIONS)
+    || JSON.stringify(receipt.proof_triggering_labels) !== "[]"
+    || JSON.stringify(receipt.proof_triggering_actions) !== JSON.stringify(
+      PLANNED_PROOF_ACTIONS,
+    )
+  ) {
+    fail("freeze receipt must record the exact proof-triggering actions and no labels");
   }
   for (const field of [
-    "planned_proof_actions",
     "reusable_evidence",
     "invalidated_evidence",
     "running_workflows",
+    "cancelled_superseded_runs",
   ]) {
     if (!Array.isArray(receipt[field])) {
       fail(`freeze receipt must contain ${field}`);
     }
   }
-  if (typeof receipt.next_permitted_mutation !== "string"
-      || receipt.next_permitted_mutation.length === 0) {
-    fail("freeze receipt must name the next permitted mutation");
+  if (receipt.next_permitted_mutation !== NEXT_PERMITTED_MUTATION) {
+    fail("freeze receipt must name the generated constant set as the next mutation");
+  }
+  if (
+    String(receipt?.acceptance_run?.id) !== String(runId)
+    || String(receipt?.acceptance_run?.attempt) !== String(runAttempt)
+    || receipt?.acceptance_run?.workflow !== ".github/workflows/source-proof.yml"
+    || receipt?.acceptance_run?.event !== "workflow_dispatch"
+  ) {
+    fail("freeze receipt must bind its exact Actions run and attempt");
   }
   if (receipt.digest !== receiptDigest(receipt)) {
     fail("freeze receipt digest does not match its contents");
@@ -364,69 +430,110 @@ function supportPr(repository, number, commit, repo) {
 }
 
 function releasePr(repository, number, { branch, commit }) {
-  const pr = JSON.parse(gh([
-    "pr",
-    "view",
-    String(number),
-    "--repo",
-    repository,
-    "--json",
-    "number,state,baseRefName,headRefName,headRefOid,headRepository",
-  ]));
+  const pr = JSON.parse(gh(["api", `repos/${repository}/pulls/${number}`]));
   if (
-    pr.state !== "OPEN"
-    || pr.baseRefName !== "dev/codestory-next"
-    || pr.headRefName !== branch
-    || pr.headRefOid !== commit
-    || pr?.headRepository?.nameWithOwner !== repository
+    pr.state !== "open"
+    || pr?.base?.ref !== "dev/codestory-next"
+    || pr?.head?.ref !== branch
+    || pr?.head?.sha !== commit
+    || pr?.head?.repo?.full_name !== repository
+    || !/^[0-9a-f]{40}$/u.test(String(pr?.base?.sha ?? ""))
   ) {
     fail(
       `release PR #${number} must be an open same-repository ${branch} -> `
       + `dev/codestory-next PR at exact head ${commit}`,
     );
   }
+  const comparison = JSON.parse(gh([
+    "api",
+    `repos/${repository}/compare/${pr.base.sha}...${commit}`,
+  ]));
+  if (!["ahead", "identical"].includes(comparison?.status)) {
+    fail(
+      `release PR #${number} head ${commit} does not contain current dev base ${pr.base.sha}`,
+    );
+  }
   return {
     number: pr.number,
-    base: pr.baseRefName,
-    head: pr.headRefName,
-    head_commit: pr.headRefOid,
+    base: pr.base.ref,
+    base_commit: pr.base.sha,
+    head: pr.head.ref,
+    head_commit: pr.head.sha,
   };
 }
 
-function declare(args) {
+function jsonArray(args, name, label) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value(args, name, "[]"));
+  } catch (error) {
+    fail(`${label} must be valid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    fail(`${label} must be a JSON array`);
+  }
+  return parsed;
+}
+
+function stringArray(args, name, label) {
+  const parsed = jsonArray(args, name, label);
+  if (!parsed.every(entry => typeof entry === "string" && entry.length > 0)) {
+    fail(`${label} must contain only non-empty strings`);
+  }
+  return parsed;
+}
+
+function recordActionsReceipt(args) {
   const repo = value(args, "--repo", process.cwd());
   const repository = required(args, "--repository");
-  const branch = value(args, "--branch", git(["branch", "--show-current"], repo));
+  const branch = required(args, "--branch");
+  const commit = required(args, "--commit");
+  const tree = required(args, "--tree");
   const output = required(args, "--output");
   const releasePrNumber = required(args, "--release-pr");
-  const supportPrNumbers = values(args, "--support-pr");
-  const knownFutureChanges = values(args, "--known-future-change");
-  const plannedProofActions = values(args, "--planned-proof-action");
-  const reusableEvidence = values(args, "--reusable-evidence");
-  const invalidatedEvidence = values(args, "--invalidated-evidence");
-  const nextMutation = required(args, "--next-permitted-mutation");
-  const broadWorkflows = values(args, "--broad-workflow");
+  const runId = required(args, "--run-id");
+  const runAttempt = required(args, "--run-attempt");
+  const supportPrNumbers = jsonArray(args, "--support-prs-json", "support PRs");
   if (
-    plannedProofActions.length === 0
-    || broadWorkflows.length === 0
+    !supportPrNumbers.every(number => Number.isInteger(number) && number > 0)
+    || new Set(supportPrNumbers).size !== supportPrNumbers.length
   ) {
-    fail("release freeze requires planned proof actions and broad workflow names");
+    fail("support PRs must contain unique positive integers");
+  }
+  const reusableEvidence = stringArray(
+    args,
+    "--reusable-evidence-json",
+    "reusable evidence",
+  );
+  const invalidatedEvidence = stringArray(
+    args,
+    "--invalidated-evidence-json",
+    "invalidated evidence",
+  );
+  const cancelledRuns = jsonArray(
+    args,
+    "--cancelled-runs-json",
+    "cancelled superseded runs",
+  );
+  const broadWorkflows = values(args, "--broad-workflow");
+  if (broadWorkflows.length === 0) {
+    fail("release freeze requires broad workflow names");
+  }
+  if (
+    process.env.GITHUB_ACTIONS !== "true"
+    || process.env.GITHUB_EVENT_NAME !== "workflow_dispatch"
+  ) {
+    fail("the canonical release freeze receipt may be produced only by workflow_dispatch");
   }
 
   if (git(["status", "--porcelain=v1", "--untracked-files=all"], repo) !== "") {
     fail("release freeze requires a clean worktree, including untracked files");
   }
-  const commit = git(["rev-parse", "HEAD"], repo);
-  const tree = git(["rev-parse", "HEAD^{tree}"], repo);
-  const remoteLine = git(["ls-remote", "--exit-code", "origin", `refs/heads/${branch}`], repo);
-  const remoteHead = remoteLine.split(/\s+/u)[0];
-  if (remoteHead !== commit) {
-    fail(`origin/${branch} is ${remoteHead}, not local HEAD ${commit}`);
-  }
-  for (const path of knownFutureChanges) {
-    if (!ALLOWED_FUTURE_CHANGES.has(path)) {
-      fail(`unsupported future source change: ${path}`);
-    }
+  if (
+    git(["rev-parse", "HEAD"], repo) !== commit
+    || git(["rev-parse", "HEAD^{tree}"], repo) !== tree
+  ) {
+    fail("checked-out Actions source does not match the declared commit and tree");
   }
 
   const acceptedReleasePr = releasePr(repository, releasePrNumber, {
@@ -437,29 +544,9 @@ function declare(args) {
     (number) => supportPr(repository, number, commit, repo),
   );
 
-  const runs = currentRuns(repository);
-  const duplicate = runs.find((entry) =>
-    broadWorkflows.includes(entry.workflowName) && entry.headSha === commit
+  const remainingRuns = currentRuns(repository).filter(
+    entry => String(entry.databaseId) !== String(runId),
   );
-  if (duplicate) {
-    fail(
-      `unchanged head ${commit} already has active ${duplicate.workflowName} run ${duplicate.databaseId}`,
-    );
-  }
-  const cancelledRuns = cancelSupersededRuns({
-    repository,
-    commit,
-    workflows: broadWorkflows,
-    runs,
-  });
-  if (cancelledRuns.length > 0) {
-    waitForSupersededRunsToStop({
-      repository,
-      commit,
-      workflows: broadWorkflows,
-    });
-  }
-  const remainingRuns = currentRuns(repository);
   const remainingBroadRun = remainingRuns.find((entry) =>
     broadWorkflows.includes(entry.workflowName)
   );
@@ -470,76 +557,140 @@ function declare(args) {
   }
 
   const receipt = {
-    schema: 1,
+    schema: 2,
+    authority: "github_actions",
     repository,
     branch,
     commit,
     tree,
     worktree_clean: true,
-    remote_head: remoteHead,
+    remote_head: commit,
     release_pr: acceptedReleasePr,
     integrated_support_prs: integratedSupportPrs,
-    known_future_source_changes: knownFutureChanges,
-    planned_proof_actions: plannedProofActions,
+    known_future_source_changes: [NEXT_PERMITTED_MUTATION],
+    planned_proof_actions: PLANNED_PROOF_ACTIONS,
+    proof_triggering_labels: [],
+    proof_triggering_actions: PLANNED_PROOF_ACTIONS,
     reusable_evidence: reusableEvidence,
     invalidated_evidence: invalidatedEvidence,
     running_workflows: remainingRuns,
     cancelled_superseded_runs: cancelledRuns,
-    next_permitted_mutation: nextMutation,
+    next_permitted_mutation: NEXT_PERMITTED_MUTATION,
+    acceptance_run: {
+      id: Number(runId),
+      attempt: Number(runAttempt),
+      workflow: ".github/workflows/source-proof.yml",
+      event: "workflow_dispatch",
+    },
   };
   receipt.digest = receiptDigest(receipt);
-  validateReceipt(receipt, { commit, tree });
+  validateReceipt(receipt, {
+    repository,
+    commit,
+    tree,
+    runId,
+    runAttempt,
+  });
   writeFileSync(output, `${JSON.stringify(receipt, null, 2)}\n`);
-
-  if (!has(args, "--no-publish-status")) {
-    gh([
-      "api",
-      "--method",
-      "POST",
-      `repos/${repository}/statuses/${commit}`,
-      "-f",
-      "state=pending",
-      "-f",
-      `context=${STATUS_PREFIX}/${receipt.digest}`,
-      "-f",
-      `description=tree=${tree}`,
-    ]);
+  const githubOutput = value(args, "--github-output");
+  if (githubOutput) {
+    writeFileSync(
+      githubOutput,
+      `digest=${receipt.digest}\nartifact_name=${RECEIPT_ARTIFACT_PREFIX}${runAttempt}\n`,
+      { flag: "a" },
+    );
   }
   process.stdout.write(`${receipt.digest}\n`);
 }
 
 function verifyFile(args) {
   const receipt = parseJsonFile(required(args, "--receipt"), "freeze receipt");
+  const repository = required(args, "--repository");
   const commit = required(args, "--commit");
   const tree = required(args, "--tree");
   validateReceipt(receipt, {
+    repository,
     commit,
     tree,
+    runId: required(args, "--run-id"),
+    runAttempt: required(args, "--run-attempt"),
   });
   process.stdout.write(`${receipt.digest}\n`);
 }
 
-function matchingStatus({ repository, commit, tree, digest, state }) {
+export function acceptedFreezeStatus(statuses, { tree, digest }) {
+  if (!Array.isArray(statuses)) {
+    fail("release freeze statuses are missing");
+  }
+  const context = `${STATUS_PREFIX}/${digest}`;
+  const newest = statuses
+    .filter(status => status?.context === context)
+    .reduce((latest, status) => {
+      if (!latest) {
+        return status;
+      }
+      const latestId = BigInt(String(latest.id ?? "0"));
+      const statusId = BigInt(String(status.id ?? "0"));
+      return statusId > latestId ? status : latest;
+    }, undefined);
+  if (newest?.state !== "success" || newest?.description !== `tree=${tree}`) {
+    return undefined;
+  }
+  return newest;
+}
+
+function matchingStatus({ repository, commit, tree, digest }) {
   const statuses = JSON.parse(gh([
     "api",
     `repos/${repository}/commits/${commit}/statuses?per_page=100`,
   ]));
-  return statuses.find((status) =>
-    status?.state === state
-    && status?.context === `${STATUS_PREFIX}/${digest}`
-    && status?.description === `tree=${tree}`
-  );
+  return acceptedFreezeStatus(statuses, { tree, digest });
 }
 
-function verifyPending(args) {
-  const repository = required(args, "--repository");
-  const commit = required(args, "--commit");
-  const tree = required(args, "--tree");
-  const digest = required(args, "--receipt-digest");
-  if (!matchingStatus({ repository, commit, tree, digest, state: "pending" })) {
-    fail("no pending local release freeze declaration matches this exact commit and tree");
+function downloadAuthenticatedReceipt({ repository, run }) {
+  const artifactName = `${RECEIPT_ARTIFACT_PREFIX}${run.run_attempt}`;
+  const payload = JSON.parse(gh([
+    "api",
+    `repos/${repository}/actions/runs/${run.id}/artifacts?per_page=100`,
+  ]));
+  const matches = (payload.artifacts ?? []).filter(
+    artifact => artifact?.name === artifactName && artifact?.expired === false,
+  );
+  if (matches.length !== 1) {
+    fail(`acceptance run must retain exactly one unexpired ${artifactName}`);
   }
-  process.stdout.write(`${digest}\n`);
+  const directory = mkdtempSync(path.join(tmpdir(), "codestory-freeze-receipt-"));
+  try {
+    gh([
+      "run",
+      "download",
+      String(run.id),
+      "--repo",
+      repository,
+      "--name",
+      artifactName,
+      "--dir",
+      directory,
+    ]);
+    const entries = readdirSync(directory);
+    if (
+      entries.length !== 1
+      || entries[0] !== RECEIPT_FILE
+      || !lstatSync(path.join(directory, RECEIPT_FILE)).isFile()
+      || lstatSync(path.join(directory, RECEIPT_FILE)).nlink !== 1
+    ) {
+      fail("release freeze artifact must contain one singly linked canonical receipt");
+    }
+    return {
+      artifact: matches[0],
+      receipt: parseJsonFile(
+        path.join(directory, RECEIPT_FILE),
+        "authenticated freeze receipt",
+      ),
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function verifyStatus(args) {
@@ -552,7 +703,6 @@ function verifyStatus(args) {
     commit,
     tree,
     digest,
-    state: "success",
   });
   if (!status) {
     fail("no successful exact-head release freeze status matches this receipt digest and tree");
@@ -565,6 +715,17 @@ function verifyStatus(args) {
     "api",
     `repos/${repository}/actions/runs/${target[1]}`,
   ]));
+  const { artifact, receipt } = downloadAuthenticatedReceipt({
+    repository,
+    run,
+  });
+  const currentReleasePr = releasePr(repository, receipt?.release_pr?.number, {
+    branch: receipt?.branch,
+    commit,
+  });
+  if (currentReleasePr.base_commit !== receipt?.release_pr?.base_commit) {
+    fail("release PR base advanced after freeze acceptance");
+  }
   const jobsPayload = JSON.parse(gh([
     "api",
     `repos/${repository}/actions/runs/${target[1]}/jobs?per_page=100`,
@@ -573,6 +734,8 @@ function verifyStatus(args) {
     status,
     run,
     jobs: jobsPayload.jobs,
+    artifact,
+    receipt,
     repository,
     commit,
     tree,
@@ -583,12 +746,10 @@ function verifyStatus(args) {
 
 function main() {
   const [command, ...args] = process.argv.slice(2);
-  if (command === "declare") {
-    declare(args);
+  if (command === "record-actions-receipt") {
+    recordActionsReceipt(args);
   } else if (command === "verify-file") {
     verifyFile(args);
-  } else if (command === "verify-pending") {
-    verifyPending(args);
   } else if (command === "verify-status") {
     verifyStatus(args);
   } else if (command === "cancel-superseded") {
@@ -598,7 +759,7 @@ function main() {
   } else {
     fail(
       "usage: release-freeze-barrier.mjs "
-      + "<declare|verify-file|verify-pending|verify-status|cancel-superseded"
+      + "<record-actions-receipt|verify-file|verify-status|cancel-superseded"
       + "|invalidate-superseded> ...",
     );
   }

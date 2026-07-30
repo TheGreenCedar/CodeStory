@@ -36,6 +36,7 @@ import {
   releaseEvidenceApprovalViolations,
   releaseProofCpuSelectorViolations,
   releaseEvidenceWorkflowRef,
+  releaseFreezeBarrierWorkflowViolations,
   releaseWorkflowContractViolations,
   retrievalGeneralizationSuitePolicyViolations,
   retrievalFile,
@@ -2866,6 +2867,43 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         '--broad-workflow "Auto Release"',
         "",
       );
+    }, /every dev push must cancel obsolete proof/u],
+    ["dev push no longer cancels before status lookup", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      step.run = step.run.replace(
+        "release-freeze-barrier.mjs invalidate-superseded",
+        "release-freeze-barrier.mjs cancelled-too-late",
+      );
+    }, /every dev push must cancel obsolete proof/u],
+    ["invalidation loses event identity", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      delete step.env.EVENT_NAME;
+    }, /must bind EVENT_NAME/u],
+    ["invalidation accepts a pending freeze", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      step.run = step.run.replace(
+        '.state == "success"',
+        '(.state == "pending" or .state == "success")',
+      );
+    }, /Invalidate a superseded release freeze/u],
+    ["invalidation cannot revoke the old status", workflows => {
+      workflows.get("release-freeze-invalidation.yml").permissions.statuses = "read";
+    }, /must run automatically when a candidate head is superseded/u],
+    ["invalidation stops publishing the revocation", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      step.run = step.run.replace("-f state=error", "-f state=success");
     }, /Invalidate a superseded release freeze/u],
     ["platform label trigger", workflows => {
       workflows.get("packaged-platform-pr.yml").on.pull_request = { types: ["labeled"] };
@@ -2881,10 +2919,10 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       },
       /callable only through an accepted coordinator/u,
     ]),
-    ["source dispatch omits receipt", workflows => {
+    ["source acceptance requires a caller receipt", workflows => {
       workflows.get("source-proof.yml").on.workflow_dispatch
-        .inputs.freeze_receipt_digest.required = false;
-    }, /dispatch must require an exact-head freeze receipt digest/u],
+        .inputs.freeze_receipt_digest.required = true;
+    }, /acceptance must mint its own receipt digest/u],
     ["source acceptance becomes the default", workflows => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.acceptance_only.default = true;
@@ -2892,6 +2930,44 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["source acceptance cannot publish status", workflows => {
       delete workflows.get("source-proof.yml").permissions.statuses;
     }, /acceptance must publish an exact-head commit status/u],
+    ["Actions receipt generation is removed", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      job.steps = job.steps.filter(({ name }) =>
+        name !== "Record executable release freeze");
+    }, /Record executable release freeze/u],
+    ["Actions receipt generation loses live release PR authentication", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Record executable release freeze",
+      );
+      step.run = step.run.replace('--release-pr "$PR_NUMBER"', "");
+    }, /Record executable release freeze.*--release-pr/u],
+    ["Actions receipt generation loses merged support PR authentication", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Record executable release freeze",
+      );
+      step.run = step.run.replace('--support-prs-json "$SUPPORT_PRS_JSON"', "");
+    }, /Record executable release freeze.*--support-prs-json/u],
+    ["Actions receipt generation loses support PR history", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Checkout accepted source head",
+      );
+      delete step.with["fetch-depth"];
+    }, /complete history for support PR ancestry/u],
+    ["Actions receipt artifact is removed", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      job.steps = job.steps.filter(({ name }) =>
+        name !== "Upload executable release freeze receipt");
+    }, /immutable attempt-qualified Actions receipt/u],
+    ["Actions receipt artifact is substituted", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Upload executable release freeze receipt",
+      );
+      step.with.name = "release-freeze-receipt";
+    }, /immutable attempt-qualified Actions receipt/u],
     ["source restores conditional cell emission", workflows => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.emit_release_cells = {
@@ -2944,6 +3020,35 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").jobs["freeze-acceptance"].needs
         = ["resolve", "freeze-hostile-mutations"];
     }, /publisher must depend on both exact successful mutation jobs/u],
+    ["acceptance publisher stops downloading the Actions receipt", workflows => {
+      const job = workflows.get("source-proof.yml").jobs["freeze-acceptance"];
+      job.steps = job.steps.filter(({ name }) =>
+        name !== "Download executable release freeze receipt");
+    }, /download the exact Actions receipt before publication/u],
+    ["acceptance publisher trusts the caller digest", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-acceptance"],
+        "Publish executable release freeze",
+      );
+      step.env.FREEZE_RECEIPT_DIGEST = "${{ inputs.freeze_receipt_digest }}";
+    }, /FREEZE_RECEIPT_DIGEST/u],
+    ["acceptance publisher skips receipt verification", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-acceptance"],
+        "Publish executable release freeze",
+      );
+      step.run = step.run.replace(
+        "release-freeze-barrier.mjs verify-file",
+        "printf '%s' \"$FREEZE_RECEIPT_DIGEST\"",
+      );
+    }, /Publish executable release freeze.*verify-file/u],
+    ["source acceptance restores pending status trust", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Require executable release freeze",
+      );
+      step.run = step.run.replace("verify-status", "verify-pending");
+    }, /caller-authored pending status/u],
     ["acceptance publisher loses Actions provenance", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-acceptance"],
@@ -2954,10 +3059,10 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "pull/$GITHUB_RUN_ID",
       );
     }, /Publish executable release freeze/u],
-    ["platform dispatch omits receipt", workflows => {
+    ["qualification requires an active receipt", workflows => {
       workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
-        .inputs.freeze_receipt_digest.required = false;
-    }, /dispatch must require an exact-head freeze receipt digest/u],
+        .inputs.freeze_receipt_digest.required = true;
+    }, /qualification must reuse source-cell lineage without an active freeze digest/u],
     ["platform cannot read freeze status", workflows => {
       delete workflows.get("packaged-platform-pr.yml").permissions.statuses;
     }, /must authenticate the exact-head freeze status/u],
@@ -2971,6 +3076,12 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         'echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"',
       );
     }, /Resolve accepted source proof head.*sha=\$CALIBRATION_SOURCE_SHA/u],
+    ["qualification requires an active freeze status", workflows => {
+      draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require executable release freeze",
+      ).if = "always()";
+    }, /qualification must reuse source-cell lineage after the constant-only commit/u],
     ["release searches the frozen descendant", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
@@ -3015,22 +3126,26 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "gh api repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/status",
       );
     }, /Require executable release freeze.*verify-status/u],
-    ["release trusts a bare success status", workflows => {
+    ["release restores active freeze status authentication", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
-      step.run = step.run.replace(
-        "release-freeze-barrier.mjs verify-status",
-        "gh api repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/status",
-      );
-    }, /Resolve reusable prior evidence.*verify-status/u],
+      step.run += "\nnode .github/scripts/release-freeze-barrier.mjs verify-status\n";
+    }, /Resolve reusable prior evidence must not run release-freeze-barrier\.mjs verify-status/u],
+    ["release placeholder propagates a post-calibration receipt", workflows => {
+      workflows.get("release.yml").jobs["source-proof"].with.freeze_receipt_digest
+        = "${{ inputs.freeze_receipt_digest }}";
+    }, /unreachable source fallback must fail closed without a post-calibration freeze/u],
     ["release stops cancelling superseded work", workflows => {
       workflows.get("release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],
-    ["automatic release cannot read freeze status", workflows => {
-      delete workflows.get("auto-release.yml").jobs.release.permissions.statuses;
-    }, /must authenticate freeze status provenance/u],
+    ["automatic release restores freeze status authority", workflows => {
+      workflows.get("auto-release.yml").jobs.release.permissions.statuses = "read";
+    }, /post-calibration release must not rely on an active freeze status/u],
+    ["manual release restores freeze status authority", workflows => {
+      workflows.get("release.yml").permissions.statuses = "read";
+    }, /post-calibration release must not rely on an active freeze status/u],
     ["auto-release stops cancelling superseded work", workflows => {
       workflows.get("auto-release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],
@@ -3048,6 +3163,48 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       const workflows = loadWorkflows();
       mutate(workflows);
       assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
+test("release freeze policy pins live PR base and support ancestry revalidation", async (t) => {
+  const source = readFileSync(
+    path.join(root, ".github", "scripts", "release-freeze-barrier.mjs"),
+    "utf8",
+  );
+  const cases = [
+    ["release PR lookup stops using live REST state", value =>
+      value.replace(
+        'gh(["api", `repos/${repository}/pulls/${number}`])',
+        "JSON.parse('{}')",
+      )],
+    ["release PR head stops proving it contains the current dev base", value =>
+      value.replace(
+        "`repos/${repository}/compare/${pr.base.sha}...${commit}`",
+        "`repos/${repository}/commits/${commit}`",
+      )],
+    ["verification stops detecting a base advance", value =>
+      value.replace(
+        "currentReleasePr.base_commit !== receipt?.release_pr?.base_commit",
+        "false",
+      )],
+    ["support PR ancestry becomes advisory", value =>
+      value.replace(
+        'git(["merge-base", "--is-ancestor", mergeCommit, commit]',
+        'git(["rev-parse", commit]',
+      )],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const violations = releaseFreezeBarrierWorkflowViolations(
+        loadWorkflows(),
+        loadReleaseClaimGraph(root),
+        mutate(source),
+      );
+      assert.match(
+        violations.join("\n"),
+        /recheck the live release PR base and integrated support PR ancestry/u,
+      );
     });
   }
 });

@@ -1566,8 +1566,8 @@ export function validateReleaseClaimGraph(graph) {
     policy.release_freeze_barrier,
     "workflow_policy.release_freeze_barrier",
   );
-  if (freeze.schema !== 1) {
-    fail("workflow_policy.release_freeze_barrier.schema must be 1");
+  if (freeze.schema !== 2) {
+    fail("workflow_policy.release_freeze_barrier.schema must be 2");
   }
   nonEmptyText(freeze.script, "workflow_policy.release_freeze_barrier.script");
   nonEmptyText(
@@ -1606,6 +1606,11 @@ export function validateReleaseClaimGraph(graph) {
   );
   for (const field of [
     "producer_workflow",
+    "receipt_authority",
+    "receipt_artifact",
+    "receipt_file",
+    "receipt_producer_job",
+    "status_scope",
     "event",
     "hostile_job",
     "hostile_step",
@@ -1641,13 +1646,21 @@ export function validateReleaseClaimGraph(graph) {
   }
   if (
     acceptance.producer_workflow !== "source-proof.yml"
+    || acceptance.receipt_authority !== "github_actions"
+    || acceptance.receipt_artifact
+      !== "release-freeze-receipt-attempt-${{ github.run_attempt }}"
+    || acceptance.receipt_file !== "release-freeze-receipt.json"
+    || acceptance.receipt_producer_job !== "resolve"
+    || acceptance.status_scope !== "pre_calibration_source_head"
+    || acceptance.later_commit_revokes !== true
     || acceptance.event !== "workflow_dispatch"
     || acceptance.windows_probe_max_seconds !== 90
     || acceptance.status_creator !== "github-actions[bot]"
   ) {
     fail(
       "workflow_policy.release_freeze_barrier.acceptance must bind the exact "
-      + "Actions producer, event, protected probe budget, and status creator",
+      + "Actions receipt authority, immutable artifact, producer, event, protected "
+      + "probe budget, status scope, revocation, and status creator",
     );
   }
   const singleSource = object(
@@ -1676,6 +1689,13 @@ export function validateReleaseClaimGraph(graph) {
     fail(
       "workflow_policy.release_freeze_barrier.single_source_proof "
       + "must emit its source cell unconditionally after successful proof",
+    );
+  }
+  if (singleSource.post_calibration_status_required !== false) {
+    fail(
+      "workflow_policy.release_freeze_barrier.single_source_proof "
+      + "must reuse the source cell and constant-only lineage after calibration, "
+      + "not an active freeze status",
     );
   }
   stringArray(

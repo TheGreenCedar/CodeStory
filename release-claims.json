@@ -1472,7 +1472,7 @@
       "required_events": []
     },
     "release_freeze_barrier": {
-      "schema": 1,
+      "schema": 2,
       "script": ".github/scripts/release-freeze-barrier.mjs",
       "status_context_prefix": "codestory/release-freeze",
       "allowed_future_source_changes": [
@@ -1501,6 +1501,12 @@
       ],
       "acceptance": {
         "producer_workflow": "source-proof.yml",
+        "receipt_authority": "github_actions",
+        "receipt_artifact": "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+        "receipt_file": "release-freeze-receipt.json",
+        "receipt_producer_job": "resolve",
+        "status_scope": "pre_calibration_source_head",
+        "later_commit_revokes": true,
         "event": "workflow_dispatch",
         "hostile_job": "freeze-hostile-mutations",
         "hostile_step": "Execute exact-head hostile mutation matrix",
@@ -1523,6 +1529,7 @@
         "artifact": "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
         "artifact_required_unexpired": true,
         "cell_emission": "unconditional_on_success",
+        "post_calibration_status_required": false,
         "accepted_source": "freeze_receipt.commit",
         "frozen_descendant": "constant_set.freeze_record.selection_source_commit",
         "reuse_validation": [

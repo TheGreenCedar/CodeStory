@@ -913,7 +913,7 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "26e3e2a92d959a46f8ef6173d0531b331cbd824344400629aa2e5b13c6286d33";
+  "24916c12c5242695460cddf8999518b053ae80a2286fb6706f6cf4c71e49a3e1";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -2141,7 +2141,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     requireStepRun(violations, sourceFile, resolve, "Require executable release freeze", [
       "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
       "release-freeze-barrier.mjs",
-      "verify-pending",
       "verify-status",
       '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
     ]);
@@ -2740,9 +2739,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
     ".expired == false",
     'test "$artifact_count" = 1 || continue',
-    "release-freeze-barrier.mjs verify-status",
-    '--receipt-digest "$freeze_digest"',
   ]);
+  forbidStepRun(
+    violations,
+    releaseFile,
+    requireJob(violations, releaseFile, release, "preflight"),
+    "Resolve reusable prior evidence",
+    [
+      "release-freeze-barrier.mjs verify-status",
+      "freeze_receipt_digest",
+    ],
+  );
   const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
     '--reuse "$REUSE_SELECTION"',
@@ -2756,10 +2763,9 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     object(source.with).version === "${{ needs.preflight.outputs.version }}"
-      && object(source.with).freeze_receipt_digest
-        === "${{ needs.preflight.outputs.freeze_receipt_digest }}"
+      && object(source.with).freeze_receipt_digest === ""
       && object(source.with).emit_release_cells === undefined,
-    `${releaseFile} unreachable source fallback must retain the accepted freeze identity`,
+    `${releaseFile} unreachable source fallback must fail closed without a post-calibration freeze`,
   );
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
@@ -5009,6 +5015,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
   });
   requireExactResolverContract(violations, file, route, platformResolverContractDigest);
+  add(
+    violations,
+    namedStep(route, "Require executable release freeze")?.if
+      === "steps.resolve.outputs.mode != 'qualification'",
+    `${file} active freeze status must gate only pre-calibration proof modes`,
+  );
   requireStepRun(violations, file, route, "Require executable release freeze", [
     "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA",
     "release-freeze-barrier.mjs verify-status",
@@ -7962,14 +7974,25 @@ export function releaseProofCpuSelectorViolations(
 export function releaseFreezeBarrierWorkflowViolations(
   workflows,
   graph = loadReleaseClaimGraph(repositoryRoot),
+  barrierSource = fs.readFileSync(
+    path.join(repositoryRoot, ".github", "scripts", "release-freeze-barrier.mjs"),
+    "utf8",
+  ),
 ) {
   const violations = [];
+  for (const [file, workflow] of workflows) {
+    add(
+      violations,
+      !scalarStrings(workflow).some(value => value.includes("verify-pending")),
+      `[freeze_barrier] ${file} must never trust a caller-authored pending freeze`,
+    );
+  }
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
   const acceptance = object(freeze.acceptance);
   const singleSource = object(freeze.single_source_proof);
   add(
     violations,
-    freeze.schema === 1
+    freeze.schema === 2
       && freeze.script === ".github/scripts/release-freeze-barrier.mjs"
       && freeze.status_context_prefix === "codestory/release-freeze"
       && sameMembers(list(freeze.allowed_future_source_changes), [
@@ -7977,6 +8000,13 @@ export function releaseFreezeBarrierWorkflowViolations(
       ])
       && freeze.invalidation_workflow === "release-freeze-invalidation.yml"
       && acceptance.producer_workflow === "source-proof.yml"
+      && acceptance.receipt_authority === "github_actions"
+      && acceptance.receipt_artifact
+        === "release-freeze-receipt-attempt-${{ github.run_attempt }}"
+      && acceptance.receipt_file === "release-freeze-receipt.json"
+      && acceptance.receipt_producer_job === "resolve"
+      && acceptance.status_scope === "pre_calibration_source_head"
+      && acceptance.later_commit_revokes === true
       && acceptance.event === "workflow_dispatch"
       && acceptance.hostile_job === "freeze-hostile-mutations"
       && acceptance.hostile_step === "Execute exact-head hostile mutation matrix"
@@ -7996,8 +8026,23 @@ export function releaseFreezeBarrierWorkflowViolations(
         === "release-cell-prepublish-source-attempt-${{ github.run_attempt }}"
       && singleSource.artifact_required_unexpired === true
       && singleSource.cell_emission === "unconditional_on_success"
+      && singleSource.post_calibration_status_required === false
       && singleSource.post_calibration_fallback_allowed === false,
     "[freeze_barrier] release claim graph must pin the executable single-proof freeze contract",
+  );
+  add(
+    violations,
+    barrierSource.includes('gh(["api", `repos/${repository}/pulls/${number}`])')
+      && barrierSource.includes("`repos/${repository}/compare/${pr.base.sha}...${commit}`")
+      && barrierSource.includes("base_commit: pr.base.sha")
+      && barrierSource.includes("const currentReleasePr = releasePr(")
+      && barrierSource.includes(
+        "currentReleasePr.base_commit !== receipt?.release_pr?.base_commit",
+      )
+      && barrierSource.includes("release PR base advanced after freeze acceptance")
+      && barrierSource.includes("git([\"merge-base\", \"--is-ancestor\", mergeCommit, commit]")
+      && barrierSource.includes("support PR #${number} is not merged"),
+    "[freeze_barrier] Actions receipt authority must recheck the live release PR base and integrated support PR ancestry",
   );
 
   const invalidationFile = freeze.invalidation_workflow;
@@ -8015,7 +8060,7 @@ export function releaseFreezeBarrierWorkflowViolations(
       ])
       && object(invalidation.permissions).actions === "write"
       && object(invalidation.permissions).contents === "read"
-      && object(invalidation.permissions).statuses === "read"
+      && object(invalidation.permissions).statuses === "write"
       && at(invalidation, "concurrency", "cancel-in-progress") === true,
     "[freeze_barrier] release freeze invalidation must run automatically when a candidate head is superseded",
   );
@@ -8046,15 +8091,29 @@ export function releaseFreezeBarrierWorkflowViolations(
     [
       'test "$BEFORE_SHA" != "$AFTER_SHA"',
       "commits/$BEFORE_SHA/statuses?per_page=100",
-      '.state == "pending" or .state == "success"',
+      '.state == "success"',
       'startswith("codestory/release-freeze/")',
-      'if [ "$has_freeze" = 0 ]; then',
+      'if [ -z "$freeze_contexts" ]; then',
+      '"repos/$GITHUB_REPOSITORY/statuses/$BEFORE_SHA"',
+      "-f state=error",
+      '-f "context=$context"',
+      '-f "description=superseded-by=$AFTER_SHA"',
       "release-freeze-barrier.mjs invalidate-superseded",
       '--commit "$AFTER_SHA"',
       '--broad-workflow "Exact-head source proof"',
       '--broad-workflow "Platform and integration proof"',
       '--broad-workflow "Release"',
       '--broad-workflow "Auto Release"',
+    ],
+  );
+  forbidStepRun(
+    violations,
+    invalidationFile,
+    invalidationJob,
+    "Invalidate a superseded release freeze",
+    [
+      '.state == "pending"',
+      ".state == 'pending'",
     ],
   );
   requireStepEnv(
@@ -8065,7 +8124,23 @@ export function releaseFreezeBarrierWorkflowViolations(
     {
       AFTER_SHA: "${{ github.event.after || github.sha }}",
       BEFORE_SHA: "${{ github.event.before }}",
+      EVENT_NAME: "${{ github.event_name }}",
     },
+  );
+  const invalidationRun = executableRunText(stepRun(
+    invalidationJob,
+    "Invalidate a superseded release freeze",
+  ));
+  add(
+    violations,
+    occurrenceCount(invalidationRun, "release-freeze-barrier.mjs invalidate-superseded")
+      === 2
+      && occurrenceCount(invalidationRun, '--broad-workflow "Auto Release"') === 2
+      && invalidationRun.indexOf('if [ "$EVENT_NAME" = push ]; then')
+        < invalidationRun.indexOf("commits/$BEFORE_SHA/statuses?per_page=100")
+      && invalidationRun.indexOf("release-freeze-barrier.mjs invalidate-superseded")
+        < invalidationRun.indexOf("commits/$BEFORE_SHA/statuses?per_page=100"),
+    "[freeze_barrier] every dev push must cancel obsolete proof before PR-status revocation logic",
   );
 
   for (const file of ["source-proof.yml", "packaged-platform-pr.yml"]) {
@@ -8089,8 +8164,12 @@ export function releaseFreezeBarrierWorkflowViolations(
     ));
     add(
       violations,
-      freezeInput.required === true && freezeInput.type === "string",
-      `[freeze_barrier] ${file} dispatch must require an exact-head freeze receipt digest`,
+      freezeInput.required === false
+        && freezeInput.default === ""
+        && freezeInput.type === "string",
+      file === "source-proof.yml"
+        ? "[freeze_barrier] source acceptance must mint its own receipt digest"
+        : "[freeze_barrier] qualification must reuse source-cell lineage without an active freeze digest",
     );
     if (file === "source-proof.yml") {
       const dispatchVersionInput = object(at(
@@ -8114,12 +8193,21 @@ export function releaseFreezeBarrierWorkflowViolations(
         "inputs",
         "acceptance_only",
       ));
+      const callFreezeInput = object(at(
+        workflow,
+        "on",
+        "workflow_call",
+        "inputs",
+        "freeze_receipt_digest",
+      ));
       add(
         violations,
         dispatchVersionInput.required === true
           && dispatchVersionInput.type === "string"
           && callVersionInput.required === true
           && callVersionInput.type === "string"
+          && callFreezeInput.required === true
+          && callFreezeInput.type === "string"
           && acceptanceInput.required === false
           && acceptanceInput.type === "boolean"
           && acceptanceInput.default === false
@@ -8164,6 +8252,118 @@ export function releaseFreezeBarrierWorkflowViolations(
   }
 
   const sourceWorkflow = workflows.get("source-proof.yml");
+  const sourceResolve = requireJob(
+    violations,
+    "source-proof.yml",
+    sourceWorkflow,
+    acceptance.receipt_producer_job,
+  );
+  const acceptedCheckout = namedStep(sourceResolve, "Checkout accepted source head");
+  add(
+    violations,
+    acceptedCheckout?.uses === "actions/checkout@v5"
+      && object(acceptedCheckout.with).ref === "${{ steps.resolve.outputs.ref }}"
+      && object(acceptedCheckout.with)["fetch-depth"] === 0,
+    "[freeze_barrier] Actions receipt generation must have complete history for support PR ancestry",
+  );
+  const recordReceipt = namedStep(sourceResolve, "Record executable release freeze");
+  add(
+    violations,
+    recordReceipt?.if === "${{ inputs.acceptance_only }}",
+    "[freeze_barrier] Actions may generate a release freeze receipt only in acceptance mode",
+  );
+  requireStepRun(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Record executable release freeze",
+    [
+      'test -z "$CALLER_FREEZE_RECEIPT_DIGEST"',
+      "release-freeze-barrier.mjs record-actions-receipt",
+      '--repository "$GITHUB_REPOSITORY"',
+      '--repo "$GITHUB_WORKSPACE"',
+      '--branch "$GITHUB_REF_NAME"',
+      '--commit "$HEAD_SHA"',
+      '--tree "$tree"',
+      '--release-pr "$PR_NUMBER"',
+      '--support-prs-json "$SUPPORT_PRS_JSON"',
+      '--reusable-evidence-json "$REUSABLE_EVIDENCE_JSON"',
+      '--invalidated-evidence-json "$INVALIDATED_EVIDENCE_JSON"',
+      '--cancelled-runs-json "$CANCELLED_RUNS_JSON"',
+      '--run-id "$GITHUB_RUN_ID"',
+      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
+      '--output "$RUNNER_TEMP/release-freeze-receipt.json"',
+      '--github-output "$GITHUB_OUTPUT"',
+    ],
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Record executable release freeze",
+    {
+      CALLER_FREEZE_RECEIPT_DIGEST: "${{ inputs.freeze_receipt_digest }}",
+      CANCELLED_RUNS_JSON: "${{ steps.cancel.outputs.cancelled }}",
+      HEAD_SHA: "${{ steps.resolve.outputs.ref }}",
+      INVALIDATED_EVIDENCE_JSON: "${{ inputs.invalidated_evidence_json }}",
+      PR_NUMBER: "${{ inputs.pr_number }}",
+      REUSABLE_EVIDENCE_JSON: "${{ inputs.reusable_evidence_json }}",
+      SUPPORT_PRS_JSON: "${{ inputs.support_prs_json }}",
+    },
+  );
+  const receiptUpload = namedStep(
+    sourceResolve,
+    "Upload executable release freeze receipt",
+  );
+  add(
+    violations,
+    receiptUpload?.if === "${{ inputs.acceptance_only }}"
+      && receiptUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && object(receiptUpload.with).name
+        === "${{ steps.receipt.outputs.artifact_name }}"
+      && object(receiptUpload.with).path
+        === "${{ runner.temp }}/release-freeze-receipt.json"
+      && object(receiptUpload.with)["if-no-files-found"] === "error"
+      && object(receiptUpload.with)["retention-days"] === 30
+      && object(sourceResolve.outputs).freeze_digest
+        === "${{ steps.receipt.outputs.digest }}"
+      && object(sourceResolve.outputs).freeze_artifact_name
+        === "${{ steps.receipt.outputs.artifact_name }}",
+    "[freeze_barrier] source acceptance must retain one immutable attempt-qualified Actions receipt",
+  );
+  const broadFreeze = namedStep(sourceResolve, "Require executable release freeze");
+  add(
+    violations,
+    broadFreeze?.if === "${{ !inputs.acceptance_only }}",
+    "[freeze_barrier] broad source proof must authenticate the accepted freeze",
+  );
+  requireStepRun(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Require executable release freeze",
+    [
+      "release-freeze-barrier.mjs verify-status",
+      '--commit "$HEAD_SHA"',
+      '--tree "$tree"',
+      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
+    ],
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    sourceResolve,
+    "Require executable release freeze",
+    {
+      FREEZE_RECEIPT_DIGEST: "${{ inputs.freeze_receipt_digest }}",
+      HEAD_SHA: "${{ steps.resolve.outputs.ref }}",
+    },
+  );
+  add(
+    violations,
+    !scalarStrings(sourceWorkflow).some(value => value.includes("verify-pending")),
+    "[freeze_barrier] source proof must never accept a caller-authored pending status",
+  );
   const hostileJob = requireJob(
     violations,
     "source-proof.yml",
@@ -8250,18 +8450,51 @@ export function releaseFreezeBarrierWorkflowViolations(
         ].every(fragment => String(publisherJob.if ?? "").includes(fragment)),
     "[freeze_barrier] acceptance publisher must depend on both exact successful mutation jobs",
   );
+  const receiptDownload = namedStep(
+    publisherJob,
+    "Download executable release freeze receipt",
+  );
+  add(
+    violations,
+    receiptDownload?.uses === "actions/download-artifact@v8.0.1"
+      && object(receiptDownload.with).name
+        === "${{ needs.resolve.outputs.freeze_artifact_name }}"
+      && object(receiptDownload.with).path
+        === "${{ runner.temp }}/release-freeze-receipt"
+      && stepIndex(publisherJob, "Download executable release freeze receipt")
+        < stepIndex(publisherJob, acceptance.publisher_step),
+    "[freeze_barrier] acceptance publisher must download the exact Actions receipt before publication",
+  );
   requireStepRun(
     violations,
     "source-proof.yml",
     publisherJob,
     acceptance.publisher_step,
     [
+      "release-freeze-barrier.mjs verify-file",
+      '--receipt "$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json"',
+      '--repository "$GITHUB_REPOSITORY"',
+      '--commit "$HEAD_SHA"',
+      '--tree "$tree"',
+      '--run-id "$GITHUB_RUN_ID"',
+      '--run-attempt "$GITHUB_RUN_ATTEMPT"',
+      'test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST"',
       "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA",
       "-f state=success",
       "-f \"context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST\"",
       "-f \"description=tree=$tree\"",
       "actions/runs/$GITHUB_RUN_ID",
     ],
+  );
+  requireStepEnv(
+    violations,
+    "source-proof.yml",
+    publisherJob,
+    acceptance.publisher_step,
+    {
+      FREEZE_RECEIPT_DIGEST: "${{ needs.resolve.outputs.freeze_digest }}",
+      HEAD_SHA: "${{ needs.resolve.outputs.ref }}",
+    },
   );
 
   for (const file of list(freeze.coordinator_only_workflows)) {
@@ -8287,6 +8520,12 @@ export function releaseFreezeBarrierWorkflowViolations(
       "sha=$CALIBRATION_SOURCE_SHA",
       "sha=$HEAD_SHA",
     ],
+  );
+  add(
+    violations,
+    namedStep(route, "Require executable release freeze")?.if
+      === "steps.resolve.outputs.mode != 'qualification'",
+    "[freeze_barrier] qualification must reuse source-cell lineage after the constant-only commit",
   );
   requireStepRun(
     violations,
@@ -8324,9 +8563,9 @@ export function releaseFreezeBarrierWorkflowViolations(
   );
   add(
     violations,
-    object(release.permissions).statuses === "read"
-      && object(at(auto, "jobs", "release", "permissions")).statuses === "read",
-    "[freeze_barrier] manual and automatic release must authenticate freeze status provenance",
+    object(release.permissions).statuses === undefined
+      && object(at(auto, "jobs", "release", "permissions")).statuses === undefined,
+    "[freeze_barrier] post-calibration release must not rely on an active freeze status",
   );
   const preflight = requireJob(violations, "release.yml", release, "preflight");
   requireStepRun(
@@ -8339,9 +8578,18 @@ export function releaseFreezeBarrierWorkflowViolations(
       'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
       ".expired == false",
       'test "$artifact_count" = 1 || continue',
-      "release-freeze-barrier.mjs verify-status",
       "The release workflow will not start a second proof after calibration",
       "source_proof_reused=true",
+    ],
+  );
+  forbidStepRun(
+    violations,
+    "release.yml",
+    preflight,
+    "Resolve reusable prior evidence",
+    [
+      "release-freeze-barrier.mjs verify-status",
+      "freeze_receipt_digest",
     ],
   );
   requireStepEnv(
@@ -8351,7 +8599,6 @@ export function releaseFreezeBarrierWorkflowViolations(
     "Resolve reusable prior evidence",
     {
       SOURCE_SHA: "${{ steps.lineage.outputs.selection_commit }}",
-      SOURCE_TREE: "${{ steps.lineage.outputs.selection_tree }}",
     },
   );
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
@@ -8359,7 +8606,8 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     sourceJob.if === "needs.preflight.outputs.source_proof_reused != 'true'"
       && object(preflight.outputs).source_proof_reused
-        === "${{ steps.reuse.outputs.source_proof_reused }}",
+        === "${{ steps.reuse.outputs.source_proof_reused }}"
+      && object(sourceJob.with).freeze_receipt_digest === "",
     "[freeze_barrier] release must make the post-calibration source-proof fallback unreachable",
   );
 
@@ -9097,7 +9345,11 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
         const upload = object(step.with);
         const artifactName = String(upload.name ?? "");
         const uploadKey = `${file}/${jobId}/${step.name ?? ""}`;
-        const attemptQualified = artifactName.includes("${{ github.run_attempt }}");
+        const attemptQualified = artifactName.includes("${{ github.run_attempt }}")
+          || (
+            uploadKey === "source-proof.yml/resolve/Upload executable release freeze receipt"
+            && artifactName === "${{ steps.receipt.outputs.artifact_name }}"
+          );
         const expectedStable = replaceableStableIntermediates.get(uploadKey);
         const stableIntermediateMatches = expectedStable !== undefined
           && !observedStableIntermediates.has(uploadKey)

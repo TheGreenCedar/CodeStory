@@ -167,6 +167,12 @@ test("versioned claim graph has one deterministic digest and all declared contro
     graph.workflow_policy.release_freeze_barrier.acceptance,
     {
       producer_workflow: "source-proof.yml",
+      receipt_authority: "github_actions",
+      receipt_artifact: "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+      receipt_file: "release-freeze-receipt.json",
+      receipt_producer_job: "resolve",
+      status_scope: "pre_calibration_source_head",
+      later_commit_revokes: true,
       event: "workflow_dispatch",
       hostile_job: "freeze-hostile-mutations",
       hostile_step: "Execute exact-head hostile mutation matrix",
@@ -190,11 +196,14 @@ test("versioned claim graph has one deterministic digest and all declared contro
         .single_source_proof.artifact_required_unexpired,
       cell_emission: graph.workflow_policy.release_freeze_barrier
         .single_source_proof.cell_emission,
+      post_calibration_status_required: graph.workflow_policy.release_freeze_barrier
+        .single_source_proof.post_calibration_status_required,
     },
     {
       artifact: "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
       artifact_required_unexpired: true,
       cell_emission: "unconditional_on_success",
+      post_calibration_status_required: false,
     },
   );
 });
@@ -656,6 +665,38 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(unprotectedFreezeProbe),
     /release_freeze_barrier\.acceptance\.windows_runner/u,
+  );
+
+  const callerAuthoredFreeze = structuredClone(graph);
+  callerAuthoredFreeze.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_authority = "caller";
+  assert.throws(
+    () => validateReleaseClaimGraph(callerAuthoredFreeze),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const mutableFreezeReceipt = structuredClone(graph);
+  mutableFreezeReceipt.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_artifact = "release-freeze-receipt";
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFreezeReceipt),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const persistentFreezeStatus = structuredClone(graph);
+  persistentFreezeStatus.workflow_policy.release_freeze_barrier
+    .acceptance.later_commit_revokes = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(persistentFreezeStatus),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const postCalibrationStatus = structuredClone(graph);
+  postCalibrationStatus.workflow_policy.release_freeze_barrier
+    .single_source_proof.post_calibration_status_required = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(postCalibrationStatus),
+    /source cell and constant-only lineage after calibration/u,
   );
 
   const missingInvalidation = structuredClone(graph);

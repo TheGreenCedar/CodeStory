@@ -27,8 +27,9 @@ on:
         required: true
         type: string
       freeze_receipt_digest:
-        description: Digest emitted by release-freeze-barrier.mjs for this exact head.
-        required: true
+        description: Existing successful freeze receipt digest. Leave empty when acceptance_only is true.
+        required: false
+        default: ""
         type: string
       version:
         description: Release version whose source cell this accepted proof emits.
@@ -39,6 +40,21 @@ on:
         required: false
         default: false
         type: boolean
+      support_prs_json:
+        description: JSON array of support PR numbers already merged into the release head.
+        required: false
+        default: "[]"
+        type: string
+      reusable_evidence_json:
+        description: JSON array naming evidence reusable by this exact head.
+        required: false
+        default: "[]"
+        type: string
+      invalidated_evidence_json:
+        description: JSON array naming evidence invalidated before this exact head.
+        required: false
+        default: "[]"
+        type: string
 
 permissions:
   actions: write
@@ -62,6 +78,8 @@ jobs:
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
       reuse: ${{ steps.reuse.outputs.reuse }}
+      freeze_digest: ${{ steps.receipt.outputs.digest }}
+      freeze_artifact_name: ${{ steps.receipt.outputs.artifact_name }}
     steps:
       - name: Resolve trusted exact head
         id: resolve
@@ -130,20 +148,75 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.resolve.outputs.ref }}
+          fetch-depth: 0
 
       - name: Cancel superseded proof runs
+        id: cancel
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.resolve.outputs.ref }}
         run: |
-          node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+          set -euo pipefail
+          result="$(
+            node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
             --repository "$GITHUB_REPOSITORY" \
             --commit "$HEAD_SHA" \
             --broad-workflow "Exact-head source proof" \
             --broad-workflow "Platform and integration proof" \
             --broad-workflow "Release" \
             --broad-workflow "Auto Release"
+          )"
+          echo "cancelled=$(jq -c '.cancelled' <<<"$result")" >> "$GITHUB_OUTPUT"
+
+      - name: Record executable release freeze
+        id: receipt
+        if: ${{ inputs.acceptance_only }}
+        shell: bash
+        env:
+          CALLER_FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          CANCELLED_RUNS_JSON: ${{ steps.cancel.outputs.cancelled }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+          INVALIDATED_EVIDENCE_JSON: ${{ inputs.invalidated_evidence_json }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REUSABLE_EVIDENCE_JSON: ${{ inputs.reusable_evidence_json }}
+          SUPPORT_PRS_JSON: ${{ inputs.support_prs_json }}
+        run: |
+          set -euo pipefail
+          test -z "$CALLER_FREEZE_RECEIPT_DIGEST" || {
+            echo "::error::acceptance_only mints its receipt digest; callers must leave freeze_receipt_digest empty."
+            exit 1
+          }
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          node .github/scripts/release-freeze-barrier.mjs record-actions-receipt \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo "$GITHUB_WORKSPACE" \
+            --branch "$GITHUB_REF_NAME" \
+            --commit "$HEAD_SHA" \
+            --tree "$tree" \
+            --release-pr "$PR_NUMBER" \
+            --support-prs-json "$SUPPORT_PRS_JSON" \
+            --reusable-evidence-json "$REUSABLE_EVIDENCE_JSON" \
+            --invalidated-evidence-json "$INVALIDATED_EVIDENCE_JSON" \
+            --cancelled-runs-json "$CANCELLED_RUNS_JSON" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release" \
+            --output "$RUNNER_TEMP/release-freeze-receipt.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload executable release freeze receipt
+        if: ${{ inputs.acceptance_only }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ steps.receipt.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-freeze-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Reuse a completed gate for this exact head
         id: reuse
@@ -184,10 +257,10 @@ jobs:
           echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
 
       - name: Require executable release freeze
+        if: ${{ !inputs.acceptance_only }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ACCEPTANCE_ONLY: ${{ inputs.acceptance_only }}
           FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
           HEAD_SHA: ${{ steps.resolve.outputs.ref }}
         run: |
@@ -196,11 +269,7 @@ jobs:
           tree="$(
             gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
           )"
-          command=verify-status
-          if [ "$ACCEPTANCE_ONLY" = true ]; then
-            command=verify-pending
-          fi
-          node .github/scripts/release-freeze-barrier.mjs "$command" \
+          node .github/scripts/release-freeze-barrier.mjs verify-status \
             --repository "$GITHUB_REPOSITORY" \
             --commit "$HEAD_SHA" \
             --tree "$tree" \
@@ -328,17 +397,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Download executable release freeze receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.resolve.outputs.freeze_artifact_name }}
+          path: ${{ runner.temp }}/release-freeze-receipt
+
       - name: Publish executable release freeze
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          FREEZE_RECEIPT_DIGEST: ${{ needs.resolve.outputs.freeze_digest }}
           HEAD_SHA: ${{ needs.resolve.outputs.ref }}
         run: |
           set -euo pipefail
-          tree="$(
-            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          verified_digest="$(
+            node .github/scripts/release-freeze-barrier.mjs verify-file \
+              --receipt "$RUNNER_TEMP/release-freeze-receipt/release-freeze-receipt.json" \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$HEAD_SHA" \
+              --tree "$tree" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT"
           )"
+          test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST" || {
+            echo "::error::Downloaded acceptance receipt digest differs from the Actions-generated resolve output."
+            exit 1
+          }
           gh api \
             --method POST \
             "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
