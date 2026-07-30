@@ -369,12 +369,7 @@ fn recorded_phases_and_workloads_are_exactly_the_protocol_declarations() {
     let driver_metrics = REQUIRED_METRICS
         .iter()
         .copied()
-        .filter(|metric| {
-            !matches!(
-                *metric,
-                "retrieval_quality" | "total_codestory_process_memory"
-            )
-        })
+        .filter(|metric| *metric != "total_codestory_process_memory")
         .collect::<Vec<_>>();
     assert_eq!(driver_metrics.len(), 11);
     for metric in driver_metrics {
@@ -403,12 +398,14 @@ fn recorded_phases_and_workloads_are_exactly_the_protocol_declarations() {
             "driver workload table diverged from the protocol for {metric}"
         );
     }
-    for unknown in ["retrieval_quality", "total_codestory_process_memory"] {
-        assert!(
-            declared_phase_boundaries(unknown).is_err(),
-            "externally owned metric {unknown} must not be recordable by the driver"
-        );
-    }
+    assert!(
+        declared_phase_boundaries("total_codestory_process_memory").is_err(),
+        "externally owned memory metric must not be recordable by the driver"
+    );
+    assert!(
+        !REQUIRED_METRICS.contains(&"retrieval_quality"),
+        "optional packet quality must not re-enter lifecycle qualification"
+    );
 }
 
 fn span_test_output() -> (WorkerOutput, EmbeddingQualificationWorkerMeasurementSpan) {

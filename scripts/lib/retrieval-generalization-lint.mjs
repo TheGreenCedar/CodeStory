@@ -236,6 +236,7 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "score-drill-ledger.mjs"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
   path.join(repoRoot, ".github", "scripts", "check-workflow-policy.test.mjs"),
+  path.join(repoRoot, ".github", "workflows", "frozen-candidate-quality.yml"),
   path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
   path.join(repoRoot, ".github", "workflows", "retrieval-engine-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
@@ -285,6 +286,16 @@ const allowedHarnessReferences = [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/release-candidate-evidence.yml",
     'export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";',
+  ],
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    ".github/workflows/frozen-candidate-quality.yml",
+    'export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";',
+  ],
+  [
+    path.join(".github", "workflows", "packaged-platform-pr.yml"),
+    ".github/workflows/frozen-candidate-quality.yml",
+    "uses: ./.github/workflows/frozen-candidate-quality.yml",
   ],
   [
     path.join(".github", "workflows", "packaged-platform-pr.yml"),

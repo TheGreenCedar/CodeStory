@@ -17,10 +17,6 @@ on:
         required: false
         default: false
         type: boolean
-      quality_evidence_artifact:
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         required: false
         default: ""
@@ -57,9 +53,6 @@ on:
         required: false
         type: string
       proof_key:
-        required: false
-        type: string
-      quality_evidence_artifact:
         required: false
         type: string
       calibration_bundle_artifact:
@@ -152,7 +145,9 @@ jobs:
         # The self-hosted runner service account has the default Restricted execution
         # policy, so every run step must carry the bypass shell or die before running.
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: node scripts/prepare-embedded-model.mjs
+        run: >-
+          node scripts/prepare-embedded-model.mjs
+          --cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"
 
       - name: Build and package native CLI
         if: ${{ !inputs.use_packaged_cli_artifact }}
@@ -184,7 +179,8 @@ jobs:
             --binary target/release/codestory-cli.exe `
             --out-dir target/release-dist
 
-      - name: Authenticate exact Windows package producer
+      - name: Authenticate exact Windows candidate artifacts
+        id: candidate-artifacts
         if: inputs.use_packaged_cli_artifact
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
@@ -222,24 +218,192 @@ jobs:
           $artifacts = gh api `
             "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=100" |
             ConvertFrom-Json
-          $artifactCount = @(
-            $artifacts.artifacts | Where-Object {
-              $_.name -eq "codestory-cli-windows-x64" -and
-              $_.expired -eq $false -and
-              [string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID -and
-              $_.workflow_run.head_sha -eq $sourceSha
+          function Select-ExactArtifact([string] $name) {
+            $selected = @(
+              $artifacts.artifacts | Where-Object {
+                $_.name -eq $name -and
+                $_.expired -eq $false -and
+                [string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID -and
+                $_.workflow_run.head_sha -eq $sourceSha
+              }
+            )
+            if ($selected.Count -ne 1) {
+              throw "expected exactly one authenticated $name artifact"
             }
-          ).Count
-          if ($artifactCount -ne 1) {
-            throw "expected exactly one authenticated Windows package artifact"
+            return $selected[0]
           }
+          $package = Select-ExactArtifact "codestory-cli-windows-x64"
+          $record = Select-ExactArtifact `
+            "codestory-candidate-archive-record-windows-x64"
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
+            $null = Select-ExactArtifact `
+              "codestory-qualification-driver-windows-x64"
+          }
+          if (
+            [string]$package.id -notmatch '^[0-9]+$' -or
+            [string]$package.size_in_bytes -notmatch '^[0-9]+$' -or
+            [string]$package.digest -notmatch '^sha256:[0-9a-f]{64}$' -or
+            [string]$record.id -notmatch '^[0-9]+$' -or
+            [string]$record.size_in_bytes -notmatch '^[0-9]+$' -or
+            [string]$record.digest -notmatch '^sha256:[0-9a-f]{64}$'
+          ) {
+            throw "candidate artifact metadata is incomplete"
+          }
+          @(
+            "package-id=$($package.id)",
+            "package-bytes=$($package.size_in_bytes)",
+            "package-sha256=$($package.digest.Substring(7))"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Download packaged CLI artifact
+      - name: Download authenticated candidate record
         if: inputs.use_packaged_cli_artifact
         uses: actions/download-artifact@v8.0.1
         with:
-          name: codestory-cli-windows-x64
-          path: target/release-dist
+          name: codestory-candidate-archive-record-windows-x64
+          path: target/candidate-archive-record/windows-x64
+
+      - name: Restore exact candidate archive from protected host
+        id: candidate-cache
+        if: inputs.use_packaged_cli_artifact
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $recordPath = "target/candidate-archive-record/windows-x64/candidate-archive-record.json"
+          $record = Get-Content -Raw -LiteralPath $recordPath | ConvertFrom-Json
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          if (
+            $record.repository -ne $env:GITHUB_REPOSITORY -or
+            $record.source.commit -ne $sourceSha -or
+            $record.source.tree -ne $sourceTree -or
+            $record.target -ne "windows-x64"
+          ) {
+            throw "candidate record provenance does not match the protected proof"
+          }
+          $store = Join-Path $env:RUNNER_TOOL_CACHE `
+            "codestory/candidate-archives"
+          New-Item -ItemType Directory -Force $store | Out-Null
+          New-Item -ItemType Directory -Force target | Out-Null
+          Remove-Item -Recurse -Force target/release-dist -ErrorAction SilentlyContinue
+          $restored = node .github/scripts/candidate-archive-store.mjs restore `
+            --record $recordPath `
+            --store-root $store `
+            --output-root target `
+            --output-dir target/release-dist | ConvertFrom-Json
+          $hit = "$($restored.hit)".ToLowerInvariant()
+          if ($hit -notin @("true", "false")) {
+            throw "candidate cache returned an invalid hit state"
+          }
+          "hit=$hit" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started
+          @(
+            "### Candidate archive transfer",
+            "",
+            "- Protected-host cache lookup and verification: $elapsed ms",
+            "- Cache hit: ``$hit``"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Download, authenticate, and admit candidate archive on miss
+        if: inputs.use_packaged_cli_artifact && steps.candidate-cache.outputs.hit != 'true'
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.candidate-artifacts.outputs.package-id }}
+          EXPECTED_SIZE: ${{ steps.candidate-artifacts.outputs.package-bytes }}
+          EXPECTED_SHA256: ${{ steps.candidate-artifacts.outputs.package-sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $archive = Join-Path $env:RUNNER_TEMP `
+            "codestory-cli-windows-x64-$env:ARTIFACT_ID.zip"
+          $partial = "$archive.partial"
+          Remove-Item -Force $archive, $partial -ErrorAction SilentlyContinue
+          $url = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID/zip"
+          $complete = $false
+          foreach ($attempt in 1..30) {
+            & curl.exe `
+              --fail `
+              --location `
+              --silent `
+              --show-error `
+              --connect-timeout 30 `
+              --max-time 120 `
+              --continue-at - `
+              --header "Accept: application/vnd.github+json" `
+              --header "Authorization: Bearer $env:GH_TOKEN" `
+              --header "X-GitHub-Api-Version: 2022-11-28" `
+              --output $partial `
+              $url
+            if ($LASTEXITCODE -eq 0) {
+              $complete = $true
+              break
+            }
+            $currentSize = if (Test-Path -LiteralPath $partial -PathType Leaf) {
+              (Get-Item -LiteralPath $partial).Length
+            } else {
+              0
+            }
+            if ($currentSize -gt [long]$env:EXPECTED_SIZE) {
+              throw "candidate artifact exceeded its authenticated size"
+            }
+            if ($currentSize -eq [long]$env:EXPECTED_SIZE) {
+              $complete = $true
+              break
+            }
+            Write-Warning `
+              "resuming exact candidate at byte $currentSize after attempt $attempt"
+            Start-Sleep -Seconds 2
+          }
+          if (-not $complete) {
+            throw "exact candidate artifact transfer did not complete"
+          }
+          $actualSize = (Get-Item -LiteralPath $partial).Length
+          $actualDigest = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $partial
+          ).Hash.ToLowerInvariant()
+          if (
+            $actualSize -ne [long]$env:EXPECTED_SIZE -or
+            $actualDigest -ne $env:EXPECTED_SHA256
+          ) {
+            throw "candidate artifact container identity changed"
+          }
+          Move-Item -LiteralPath $partial -Destination $archive
+          $transferEnded = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $recordPath = "target/candidate-archive-record/windows-x64/candidate-archive-record.json"
+          $stage = "target/candidate-archive-stage/windows-x64"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          python .github/scripts/extract-candidate-actions-artifact.py `
+            --artifact $archive `
+            --record $recordPath `
+            --out $stage
+          if ($LASTEXITCODE -ne 0) {
+            throw "candidate artifact extraction failed"
+          }
+          $store = Join-Path $env:RUNNER_TOOL_CACHE `
+            "codestory/candidate-archives"
+          $admitted = node .github/scripts/candidate-archive-store.mjs admit `
+            --record $recordPath `
+            --input-root $stage `
+            --store-root $store `
+            --output-root target `
+            --output-dir target/release-dist | ConvertFrom-Json
+          if (-not $admitted.hit -and -not $admitted.admitted) {
+            throw "candidate archive was not admitted or restored"
+          }
+          $admissionEnded = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          @(
+            "- Authenticated Actions transfer: $($transferEnded - $started) ms",
+            "- Payload verification and atomic admission: $($admissionEnded - $transferEnded) ms"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Download separate authenticated qualification driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-qualification-driver-windows-x64
+          path: target/qualification-driver-artifact/windows-x64
 
       - name: Verify packaged qualification driver
         id: qualification-driver
@@ -258,17 +422,10 @@ jobs:
             --version $version `
             --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
             --trusted-root $env:GITHUB_WORKSPACE `
-            --artifact-dir target/release-dist/qualification-driver/windows-x64
+            --artifact-dir target/qualification-driver-artifact/windows-x64
           $result = $verified | ConvertFrom-Json
           "path=$($result.driver)" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Download exact-head publishable packet quality evidence
-        if: inputs.quality_evidence_artifact != ''
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.server_behavior_only }}
@@ -328,7 +485,6 @@ jobs:
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
           $claimArgs = @()
           $calibrationArgs = @()
-          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
             $claimArgs = @("--server-behavior-only")
           } else {
@@ -337,9 +493,6 @@ jobs:
             )
             if ($calibrationBundles.Count -ne 1) {
               throw "expected exactly one frozen calibration-bundle.json"
-            }
-            if (-not (Test-Path $qualityPath)) {
-              throw "protected Windows proof requires exact-head quality evidence"
             }
             $qualificationDriver = "target/release/codestory_embedding_qualification.exe"
             if ($env:USE_PACKAGED_CLI_ARTIFACT -eq "true") {
@@ -354,8 +507,7 @@ jobs:
             $claimArgs = @(
               "--produce-qualification-evidence",
               "--qualification-driver", $qualificationDriver,
-              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
-              "--retrieval-quality-evidence", $qualityPath
+              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json"
             )
             $calibrationArgs = @(
               "--calibration-bundle", $calibrationBundles[0].FullName,

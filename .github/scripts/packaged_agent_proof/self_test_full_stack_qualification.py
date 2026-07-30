@@ -145,17 +145,15 @@ def _build_retained_evidence(
     retained["scenarios"]["worker_stall"]["artifacts"].append(
         external.publication["artifact"]
     )
-    retained["metrics"]["retrieval_quality"]["raw_evidence"] = external.quality
     for metric, result in retained["metrics"].items():
-        if metric != "retrieval_quality":
-            result["raw_evidence"] = {
-                "name": (
-                    "total-codestory-process-memory.raw.json"
-                    if metric == "total_codestory_process_memory"
-                    else "measurements.raw.json"
-                ),
-                "sha256": "d" * 64,
-            }
+        result["raw_evidence"] = {
+            "name": (
+                "total-codestory-process-memory.raw.json"
+                if metric == "total_codestory_process_memory"
+                else "measurements.raw.json"
+            ),
+            "sha256": "d" * 64,
+        }
     return retained, qualification_contract
 
 
@@ -210,11 +208,27 @@ def _retained_hostile_tests(
     stale_shared["shared_identity"]["server_instance_id"] = "stale-server"
     wrong_cell = json.loads(json.dumps(retained))
     wrong_cell["package"]["matrix_cell_id"] = "hosted_linux_x64_cpu"
+    extra_quality_metric = json.loads(json.dumps(retained))
+    extra_quality_metric["metrics"]["packet_quality"] = {
+        "status": "pass",
+        "unit": "ratio",
+        "value": 1,
+        "threshold": 1,
+        "comparison": "greater_than_or_equal",
+        "raw_evidence": {
+            "name": "measurements.raw.json",
+            "sha256": "d" * 64,
+        },
+    }
     for candidate, message in (
         (missing_scenario, "incomplete scenario evidence was accepted"),
         (wrong_tier, "different-tier retained qualification was accepted"),
         (stale_shared, "stale retained shared server identity was accepted"),
         (wrong_cell, "wrong qualification matrix cell was accepted"),
+        (
+            extra_quality_metric,
+            "optional retrieval quality re-entered frozen-candidate qualification",
+        ),
     ):
         _expect_retained_rejected(
             candidate,
@@ -223,6 +237,82 @@ def _retained_hostile_tests(
             qualification_contract,
             message,
         )
+    quality_contract_reintroduced = json.loads(json.dumps(qualification_contract))
+    quality_contract_reintroduced["measurement_protocol"]["required_metrics"].append(
+        "publishable_packet_pass_rate"
+    )
+    quality_contract_reintroduced["measurement_protocol"]["metric_contracts"][
+        "publishable_packet_pass_rate"
+    ] = {
+        "comparison": "greater_than_or_equal",
+        "unit": "ratio",
+    }
+    quality_contract_reintroduced["constant_set"]["qualification_thresholds"][
+        "publishable_packet_pass_rate"
+    ] = 1
+    coherent_quality_metric = json.loads(json.dumps(retained))
+    coherent_quality_metric["metrics"]["publishable_packet_pass_rate"] = (
+        extra_quality_metric["metrics"]["packet_quality"]
+    )
+    _expect_retained_rejected(
+        coherent_quality_metric,
+        fixture,
+        server,
+        quality_contract_reintroduced,
+        "shape-complete retrieval quality re-entered retained qualification",
+    )
+    quality_assertion_contract = json.loads(json.dumps(qualification_contract))
+    quality_assertion_contract["measurement_protocol"]["scenario_contracts"][
+        "frozen_owner"
+    ]["required"].append("packet_quality_pass")
+    quality_assertion_evidence = json.loads(json.dumps(retained))
+    quality_assertion_evidence["scenarios"]["frozen_owner"]["assertions"][
+        "packet_quality_pass"
+    ] = True
+    _expect_retained_rejected(
+        quality_assertion_evidence,
+        fixture,
+        server,
+        quality_assertion_contract,
+        "packet quality re-entered retained lifecycle assertions",
+    )
+    repurposed_metric_contract = json.loads(json.dumps(qualification_contract))
+    repurposed_protocol = repurposed_metric_contract["measurement_protocol"]
+    repurposed_protocol["phase_boundaries"]["warm_query_ipc"] = [
+        "publishable_packet_candidate_fixed",
+        "publishable_packet_pass_rate_scored",
+    ]
+    repurposed_protocol["calibration_phase_boundaries"]["warm_query_ipc"] = list(
+        repurposed_protocol["phase_boundaries"]["warm_query_ipc"]
+    )
+    repurposed_protocol["workloads"]["warm_query_ipc"] = {
+        "workload_id": "publishable_three_repeat_packet_v1",
+        "owner_state": "external_exact_head_artifact",
+        "operation": "packet_runtime",
+        "input_generator": "axios_js_ts_v2",
+    }
+    repurposed_protocol["metric_sampling"]["warm_query_ipc"] = {
+        "sample_count": 3,
+        "aggregation": "minimum",
+    }
+    repurposed_protocol["metric_contracts"]["warm_query_ipc"] = {
+        "comparison": "greater_than_or_equal",
+        "unit": "publishable_packet_pass_rate",
+    }
+    repurposed_metric_evidence = json.loads(json.dumps(retained))
+    repurposed_metric_evidence["metrics"]["warm_query_ipc"].update(
+        {
+            "unit": "publishable_packet_pass_rate",
+            "comparison": "greater_than_or_equal",
+        }
+    )
+    _expect_retained_rejected(
+        repurposed_metric_evidence,
+        fixture,
+        server,
+        repurposed_metric_contract,
+        "warm query retained metric was repurposed as packet quality",
+    )
 
 
 def _engine_identity_hostiles(server: ServerIdentityFixture) -> None:
@@ -289,6 +379,27 @@ def run_retained_qualification_self_tests(
     external: ExternalEvidenceFixture,
     measurement_contract: dict,
 ) -> None:
+    protocol = measurement_contract["measurement_protocol"]
+    thresholds = measurement_contract["constant_set"]["qualification_thresholds"]
+    require(
+        set(protocol["required_metrics"])
+        == {
+            "backend_observed_accelerator_residency",
+            "bulk_documents_per_second",
+            "bulk_tokens_per_second",
+            "busy_retry_usefulness",
+            "cold_first_vector",
+            "existing_owner_connect",
+            "first_product_ready",
+            "spawn_convergence",
+            "total_codestory_process_memory",
+            "true_idle_exit",
+            "warm_bulk_ipc",
+            "warm_query_ipc",
+        }
+        and set(thresholds) == set(protocol["required_metrics"]),
+        "frozen-candidate qualification metric set changed",
+    )
     retained, qualification_contract = _build_retained_evidence(
         fixture,
         server,

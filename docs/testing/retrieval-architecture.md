@@ -14,7 +14,7 @@ measurements live in
 | Protected hardware | same manifest-bound package and qualification record, accelerated policy with CPU disabled, physical backend/adapter, backend-observed post-encode telemetry | Metal or Vulkan and the server contract work on that machine |
 | Product runtime | installed plugin launcher, full retrieval, packet/search, two independent hosts sharing one server/engine/load | installed agent path is coherent |
 | Restart | new process reuses verified materialized model content | content-addressed cache reuse works |
-| Performance/quality | same-run measurements and holdout gates | an engine change is promotion-eligible |
+| Performance/quality | same-run performance measurements plus optional exact-candidate quality evidence | performance is promotion-eligible; quality is reported separately and unclaimed |
 
 A lower tier cannot support a higher-tier claim.
 
@@ -84,19 +84,21 @@ physical Vulkan on both platforms.
 | `windows-vulkan-proof.yml` | protected Windows GPU | packaged Vulkan, physical adapter, smoke, offload |
 | `linux-vulkan-proof.yml` | protected Linux GPU | packaged Vulkan, physical adapter, smoke, offload |
 
-## Performance and quality acceptance
+## Performance acceptance and optional quality
 
 Measure existing-owner connect, spawn convergence, first residency and product
 ready, warm query/bulk IPC, bulk documents/tokens per second, useful busy retry,
 true-idle exit, total CodeStory process memory, GPU memory, vector parity,
 retrieval quality, multi-process reuse, and restart reuse separately. Native
 model/backend candidates use the same-build private comparison described by
-the embedding benchmark contract. The per-user server cutover instead imports
-the exact-head `publishable-three-repeat-packet/v1` artifact, verifies its
-source commit and tree plus complete row/repeat coverage, and derives a required
-1.0 packet pass rate. Pre-fault and post-replacement searches are retained only
-as crash-recovery consistency evidence. Freeze thresholds before the
-qualification run. No retrieval-quality loss is accepted; a repeatable
+the embedding benchmark contract. The per-user server cutover measures answer
+quality in a separate optional frozen-candidate adjunct. That adjunct uses the
+`publishable-three-repeat-packet/v1` evaluation contract, binds the exact Axios
+JavaScript/TypeScript v2 task and project manifest, verifies source identity and
+complete row/repeat coverage, and derives the pass rate. It is not a lifecycle
+qualification metric or a standard-release claim. Pre-fault and
+post-replacement searches are retained only as crash-recovery consistency
+evidence. Freeze thresholds before the qualification run. A repeatable
 throughput, latency, or memory regression blocks promotion. The checked-in
 constant set and qualification protocol, not prose on this page, own the
 candidate-specific values.

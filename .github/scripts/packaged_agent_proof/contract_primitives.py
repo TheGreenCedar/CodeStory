@@ -229,9 +229,8 @@ def validate_runtime_claim_scope(args: argparse.Namespace) -> None:
         require(
             not args.produce_qualification_evidence
             and args.qualification_evidence is None
-            and args.retrieval_quality_evidence is None
             and args.publication_fault_evidence is None,
-            "server-behavior-only proof rejects qualification and retrieval-quality inputs",
+            "server-behavior-only proof rejects qualification inputs",
         )
     if args.ground_only:
         require(
@@ -242,7 +241,6 @@ def validate_runtime_claim_scope(args: argparse.Namespace) -> None:
             not args.server_behavior_only
             and not args.produce_qualification_evidence
             and args.qualification_evidence is None
-            and args.retrieval_quality_evidence is None
             and args.publication_fault_evidence is None,
-            "ground-only proof rejects server, qualification, and retrieval-quality inputs",
+            "ground-only proof rejects server and qualification inputs",
         )

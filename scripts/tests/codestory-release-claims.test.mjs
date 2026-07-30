@@ -103,7 +103,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 9);
+  assert.equal(graph.graph_version, 11);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -157,6 +157,115 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+});
+
+test("claim graph freezes one exact Windows release graph and protected content-addressed reuse", () => {
+  assert.deepEqual(graph.workflow_policy.windows_package_graph, {
+    asset_target: "windows-x64",
+    cargo_profile: "release",
+    cargo_build_invocations: 1,
+    cargo_test_invocations_after_build: 0,
+    artifacts: [
+      "codestory-cli",
+      "codestory-cli-runtime",
+      "codestory_embedding_qualification",
+      "native_staging",
+      "windows_path_identity",
+    ],
+    direct_test_harnesses: ["native_staging", "windows_path_identity"],
+    package_artifact: "codestory-cli",
+    timing_phases: [
+      "cache_restore",
+      "native_setup",
+      "cargo_graph",
+      "msvc_link",
+      "regression_execution",
+      "packaging",
+      "artifact_transfer",
+    ],
+  });
+  assert.deepEqual(graph.workflow_policy.candidate_archive_cache.key_fields, [
+    "source.commit",
+    "target",
+    "archive.sha256",
+  ]);
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.qualification_driver_artifact_name,
+    "codestory-qualification-driver-{asset_target}",
+  );
+  assert.equal(graph.workflow_policy.candidate_archive_cache.cross_source_reuse, false);
+  assert.equal(graph.workflow_policy.candidate_archive_cache.restore_prefixes, false);
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.owned_corruption,
+    "quarantine_then_authenticated_miss",
+  );
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.unowned_corruption,
+    "fail_closed",
+  );
+  assert.deepEqual(graph.workflow_policy.model_material_cache, {
+    key_field: "model.sha256",
+    source_sha_in_key: false,
+    toolchain_in_key: false,
+    hit_verification: [
+      "model.real_ancestry",
+      "model.single_link",
+      "model.size_bytes",
+      "model.sha256",
+    ],
+    miss_admission: "same_filesystem_atomic_no_replace",
+  });
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_build_invocations = 2;
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_profile = "debug";
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_test_invocations_after_build = 1;
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.direct_test_harnesses.pop();
+    }, /direct_test_harnesses must be exactly/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.key_fields.shift();
+    }, /key_fields must be exactly/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.cross_source_reuse = true;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.restore_prefixes = true;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.public_asset_reauthentication = false;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.owned_corruption = "fail_closed";
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.unowned_corruption =
+        "quarantine_then_authenticated_miss";
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.key_field = "source.commit";
+    }, /only by model SHA/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.source_sha_in_key = true;
+    }, /only by model SHA/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.hit_verification = [
+        "model.size_bytes",
+        "model.sha256",
+      ];
+    }, /hit_verification must be exactly/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
 });
 
 test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => {
@@ -215,8 +324,8 @@ test("claim graph freezes one GPU-only qualification run per available platform"
   assert.deepEqual(qualification.driver_contract, {
     producer_workflow: "packaged-platform-proof.yml",
     producer_job: "build",
-    artifact_name_template: "codestory-cli-{asset_target}",
-    artifact_directory_template: "qualification-driver/{asset_target}",
+    artifact_name_template: "codestory-qualification-driver-{asset_target}",
+    artifact_directory_template: ".",
     identity_file: "qualification-driver-identity.json",
     identity_schema_version: 1,
     identity_fields: [
@@ -251,13 +360,34 @@ test("claim graph freezes one GPU-only qualification run per available platform"
   assert.equal(qualification.optional_cells[0].closeout_dependency, false);
   assert.equal(qualification.optional_cells[0].blocking, false);
   assert.deepEqual(qualification.quality_contract, {
+    producer_workflow: "packaged-platform-pr.yml",
+    producer_job: "frozen-candidate-quality",
     producer_cell: "protected_macos_arm64_metal",
-    corpus_id: "codestory-release-corpus-v1",
+    scheduled_once_per_frozen_candidate: true,
+    blocking: false,
+    closeout_dependency: false,
+    claimed: false,
+    archive_cache_key_fields: [
+      "source.commit",
+      "target",
+      "archive.sha256",
+    ],
+    archive_cache_contract: "candidate_archive_cache",
+    archive_transfer: "authenticated_miss_only",
+    evaluation_owner: "isolated_reusable_workflow",
+    evaluation_owner_sha256:
+      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
     evaluation_contract: "publishable-three-repeat-packet/v1",
-    task_count: 3,
+    task_count: 1,
     repeats_per_task: 3,
-    row_count: 9,
+    row_count: 3,
   });
+  assert.deepEqual(qualification.required_evidence, [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "backend_observed_accelerator_residency",
+  ]);
   assert.equal(
     qualification.true_idle_timeout_ms
       + qualification.true_idle_observation_grace_ms,
@@ -300,8 +430,37 @@ test("claim graph freezes one GPU-only qualification run per available platform"
       draft.workflow_policy.qualification.optional_cells[0].blocking = true;
     }, /standalone and nonblocking/u],
     [draft => {
-      draft.workflow_policy.qualification.quality_contract.row_count = 3;
-    }, /protected Metal 3x3 holdout matrix/u],
+      draft.workflow_policy.qualification.quality_contract.row_count = 9;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.blocking = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.claimed = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_transfer = "unconditional_download";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_key_fields.shift();
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_contract = "mutable_candidate_cache";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner =
+        "protected_product_path";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner_sha256 =
+        "0".repeat(64);
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_evidence.push("retrieval_quality");
+    }, /without optional retrieval quality/u],
     [draft => {
       draft.workflow_policy.qualification.required_scenarios.pop();
     }, /each lifecycle and fault scenario once/u],
@@ -495,6 +654,14 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(zeroCap),
     /maximum_withheld_hosts must be a positive integer/u,
+  );
+
+  const packageDownloadWithholding = structuredClone(graph);
+  packageDownloadWithholding.non_claim_policy.withhold_policy.archive_identity_source =
+    "downloaded_archive";
+  assert.throws(
+    () => validateReleaseClaimGraph(packageDownloadWithholding),
+    /archive_identity_source must be candidate_archive_record/u,
   );
 
   // Dropping a claim a lost host can erase would make the cap silent about exactly that claim.

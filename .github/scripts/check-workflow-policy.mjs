@@ -13,6 +13,22 @@ import {
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const retrievalGeneralizationSuiteFile = path.join(
+  "scripts",
+  "tests",
+  "lint-retrieval-generalization.test.mjs",
+);
+const legacyRetrievalGeneralizationWrapper = path.join(
+  "crates",
+  "codestory-runtime",
+  "tests",
+  "retrieval_generalization_guard.rs",
+);
+const runtimeIntegrationTestRoot = path.join(
+  "crates",
+  "codestory-runtime",
+  "tests",
+);
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
 const sccacheAction = "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696";
@@ -23,6 +39,232 @@ const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
 export { retrievalFile };
+
+export function rustRetrievalWrapperSourcePresent(source) {
+  return (
+    /lint-retrieval-generalization|retrieval[_-]generalization[_-](?:guard|lint)/u
+      .test(source)
+    || /\b(?:std|tokio|async_std)::process\b|\bprocess::Command\b|\bCommand\s*::\s*(?:new|from)\s*\(|\b(?:assert_cmd|duct|xshell)\b/u
+      .test(source)
+  );
+}
+
+function serializedRustRetrievalWrapperPresent() {
+  const root = path.join(repositoryRoot, runtimeIntegrationTestRoot);
+  if (!fs.existsSync(root)) return false;
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+      } else if (entry.name.endsWith(".rs")) {
+        const source = fs.readFileSync(entryPath, "utf8");
+        if (rustRetrievalWrapperSourcePresent(source)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+export function retrievalGeneralizationSuitePolicyViolations(
+  source,
+  {
+    legacyWrapperPresent = false,
+  } = {},
+) {
+  const violations = [];
+  const invocationCount = source.match(/\brunRetrievalGeneralizationLint\s*\(/gu)?.length ?? 0;
+  const lintReferenceCount =
+    source.match(/\brunRetrievalGeneralizationLint\b/gu)?.length ?? 0;
+  const checkoutDigestCount = source.match(/\btreeDigest\(repositoryRoot\)/gu)?.length ?? 0;
+  const repositoryRootReferenceCount = source.match(/\brepositoryRoot\b/gu)?.length ?? 0;
+  const fixtureRootReferenceCount = source.match(/\bfixtureRoot\b/gu)?.length ?? 0;
+  const productionRepositoryRootReferenceCount =
+    source.match(/\bproductionRepositoryRoot\b/gu)?.length ?? 0;
+  const temporaryRootCount = source.match(/\bos\.tmpdir\(\)/gu)?.length ?? 0;
+  const temporaryTreeCount = source.match(/\bfs\.mkdtempSync\s*\(/gu)?.length ?? 0;
+  const dynamicImportCount = source.match(/\bimport\s*\(/gu)?.length ?? 0;
+  const fsReferenceCount = source.match(/\bfs\b/gu)?.length ?? 0;
+  const filesystemMemberReferences = [...source.matchAll(
+    /\bfs\.([A-Za-z_$][\w$]*)\b/gu,
+  )].map((match) => match[1]);
+  const expectedFilesystemMemberCounts = {
+    existsSync: 1,
+    mkdirSync: 6,
+    mkdtempSync: 1,
+    readFileSync: 4,
+    readdirSync: 4,
+    readlinkSync: 1,
+    rmSync: 1,
+    writeFileSync: 1,
+  };
+  const filesystemMemberCounts = new Map();
+  for (const name of filesystemMemberReferences) {
+    filesystemMemberCounts.set(
+      name,
+      (filesystemMemberCounts.get(name) ?? 0) + 1,
+    );
+  }
+  const fixtureFilesystemShapeIsExact =
+    fsReferenceCount === 21
+    && filesystemMemberReferences.length === 19
+    && Object.entries(expectedFilesystemMemberCounts).every(
+      ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
+    )
+    && [
+      "const destination = path.join(root, relativePath);",
+      "fs.mkdirSync(path.dirname(destination), { recursive: true });",
+      "fs.writeFileSync(destination, contents);",
+      "fs.mkdirSync(rustRoot, { recursive: true });",
+      "fs.mkdirSync(retrievalRoot, { recursive: true });",
+      "fs.mkdirSync(extraRustRoot);",
+      "fs.mkdirSync(nonRustRoot);",
+      "fs.mkdirSync(taskRoot);",
+      "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
+    ].every((fragment) => source.includes(fragment));
+  const writeReferenceCount = source.match(/\bwrite\b/gu)?.length ?? 0;
+  const writeFirstArguments = [...source.matchAll(
+    /\bwrite\s*\(\s*([A-Za-z_$][\w$]*)/gu,
+  )].map((match) => match[1]);
+  const registeredWriteRoots = new Set([
+    "root",
+    "rustRoot",
+    "retrievalRoot",
+    "extraRustRoot",
+    "nonRustRoot",
+    "taskRoot",
+  ]);
+  const syntheticWritesStayInRegisteredRoots =
+    writeReferenceCount === 14
+    && writeFirstArguments.length === writeReferenceCount
+    && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
+  const fixturePathReferenceShapeIsExact =
+    repositoryRootReferenceCount === 12
+    && fixtureRootReferenceCount === 10
+    && productionRepositoryRootReferenceCount === 4;
+  const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
+  const retainedDynamicImportFixtures = [
+    "await import(harness);",
+    String.raw`await import(\"${protectedRetrievalWorkflow}\");`,
+    `await import("${protectedRetrievalWorkflow}");`,
+  ];
+  const importSpecifiers = [...source.matchAll(
+    /^\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["'];\s*$/gmu,
+  )].map((match) => match[1]);
+  const allowedImports = [
+    "node:assert/strict",
+    "node:crypto",
+    "node:fs",
+    "node:os",
+    "node:path",
+    "node:test",
+    "node:url",
+    "../lib/retrieval-generalization-lint.mjs",
+  ];
+  const forbiddenConcurrencySurface = [
+    /(?:node:)?child_process/u,
+    /(?:node:)?worker_threads/u,
+    /(?:node:)?cluster/u,
+    /\b(?:createRequire|getBuiltinModule)\b/u,
+    /\bprocess\s*\[/u,
+    /\bprocess\.(?:binding|_linkedBinding)\s*\(/u,
+    /\b(?:Function|eval)\s*\(/u,
+    /\bglobalThis\b/u,
+    /\bReflect\.(?:apply|construct|get)\b/u,
+    /\bmodule\s*\.\s*(?:constructor|createRequire)\b/u,
+    /\bWebAssembly\b/u,
+    /\brequire\s*\(/u,
+    /\bBun\.(?:spawn|spawnSync)\b/u,
+    /\bDeno\.Command\b/u,
+  ].some((pattern) => pattern.test(source));
+  const forbiddenLockSurface = [
+    /\b(?:flock|lock_exclusive|try_lock_exclusive|proper-lockfile)\b/iu,
+    /\bopenSync\s*\(/u,
+    /\bAtomics\.wait(?:Async)?\s*\(/u,
+    /\b(?:fs|os)\s*\[/u,
+    /retrieval-generalization(?:-guard)?\.lock/iu,
+    /process\.env\.(?:RUNNER_TEMP|TEMP|TMP|TMPDIR)\b/u,
+    /["']\/tmp(?:\/|["'])/u,
+  ].some((pattern) => pattern.test(source));
+
+  add(
+    violations,
+    !legacyWrapperPresent,
+    `${legacyRetrievalGeneralizationWrapper} must stay deleted so workspace nextest cannot rediscover the serialized Rust wrapper`,
+  );
+  add(
+    violations,
+    invocationCount === 1 && lintReferenceCount === 2,
+    `${retrievalGeneralizationSuiteFile} must execute the hostile fixture matrix through one in-process lint invocation`,
+  );
+  add(
+    violations,
+    !forbiddenConcurrencySurface
+      && dynamicImportCount === retainedDynamicImportFixtures.length
+      && retainedDynamicImportFixtures.every((fixture) => source.includes(fixture))
+      && importSpecifiers.length === allowedImports.length
+      && sameMembers(importSpecifiers, allowedImports),
+    `${retrievalGeneralizationSuiteFile} must not create subprocesses, workers, or clusters for hostile fixtures`,
+  );
+  add(
+    violations,
+    !forbiddenLockSurface,
+    `${retrievalGeneralizationSuiteFile} must not restore a global or cross-process fixture lock`,
+  );
+  add(
+    violations,
+    fixtureFilesystemShapeIsExact
+      && syntheticWritesStayInRegisteredRoots
+      && fixturePathReferenceShapeIsExact
+      && !/\bfs\.promises\b/u.test(source),
+    `${retrievalGeneralizationSuiteFile} must confine every filesystem mutation to registered roots in its one synthetic fixture tree`,
+  );
+  add(
+    violations,
+    source.includes(
+      'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
+    )
+      && temporaryRootCount === 1
+      && temporaryTreeCount === 1
+      && source.includes(
+        'assert.ok(\n    path.relative(repositoryRoot, fixtureRoot).startsWith(".."),',
+      )
+      && source.includes("const productionRepositoryRoot = path.join(\n    fixtureRoot,")
+      && source.includes("const extraRustRoot = path.join(fixtureRoot,")
+      && source.includes("const nonRustRoot = path.join(fixtureRoot,")
+      && source.includes("const taskRoot = path.join(fixtureRoot,"),
+    `${retrievalGeneralizationSuiteFile} must keep every mutable hostile fixture under one temporary tree outside the checkout`,
+  );
+  add(
+    violations,
+    checkoutDigestCount === 2
+      && source.includes("const checkoutBefore = treeDigest(repositoryRoot);")
+      && source.includes(
+        "assert.equal(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+      )
+      && source.includes(
+        '"lint changed the whole checkout tree, including tracked bytes or untracked paths"',
+      ),
+    `${retrievalGeneralizationSuiteFile} must prove the real checkout is byte-for-byte read-only`,
+  );
+  add(
+    violations,
+    source.includes("structuralScanRoots: [rustRoot, extraRustRoot],")
+      && source.includes("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS: extraRustRoot,")
+      && source.includes("CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_TASK_ROOTS: taskRoot,"),
+    `${retrievalGeneralizationSuiteFile} must register every additive hostile fixture root in the single lint invocation`,
+  );
+  add(
+    violations,
+    source.includes("fs.rmSync(fixtureRoot, { recursive: true, force: true });"),
+    `${retrievalGeneralizationSuiteFile} must remove its isolated fixture tree after the matrix`,
+  );
+  return violations;
+}
 
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -559,8 +801,8 @@ function expectedQualificationDriverContract() {
   return {
     producer_workflow: "packaged-platform-proof.yml",
     producer_job: "build",
-    artifact_name_template: "codestory-cli-{asset_target}",
-    artifact_directory_template: "qualification-driver/{asset_target}",
+    artifact_name_template: "codestory-qualification-driver-{asset_target}",
+    artifact_directory_template: ".",
     identity_file: "qualification-driver-identity.json",
     identity_schema_version: 1,
     identity_fields: qualificationDriverIdentityFields,
@@ -669,20 +911,22 @@ const packagedPlatformCloseoutDigest =
 // parsed executable structure so an unreviewed earlier step cannot replace an
 // owner binary while leaving the locally digested finalizer unchanged.
 const packagedPlatformWorkflowDigest =
-  "d96f36e08888ba2806103829ddf737829d66efee0374138ae9634ed6d71bd355";
+  "ae53e5a2ab7cc72bfba4eec4264a682dabb75b45913e3e0b5341d2ca5c08c776";
 // The frozen-candidate coordinator and protected GPU workflows are small
 // release-control programs, not loose collections of independently safe
 // fragments. Pin their complete parsed structure so a required check cannot be
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "8efd162e5e5c42e1cbeb0e40378f631ce358feb9404e90e27e02aa0b382d481e";
+  "464906e3cd7ec0e2f7e9195d60de035fdba76172c25d8b0861d0982f9d7dcc3e";
+const frozenCandidateQualityWorkflowDigest =
+  "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
-  "7ff48fa410330a96f3c6da5f3efbb6131d4304fee837bd69c97c8e88e553ea0c";
+  "e1c4a59b412ba3f2041e89177e2af5a6533cf5ef0371dc2fa18c0309fba5b1ca";
 const windowsVulkanWorkflowDigest =
-  "f4f6031cb9595a3d1623567ff5b7fcdca5ae34de0a392fbb801138ddb750aa14";
+  "f1123f11d430591380ed433d751c6fc110adfb13225106f50deecf232ee89f9b";
 const linuxVulkanWorkflowDigest =
-  "cd3b2b719dafea2645079503ff4b58da66c085f3522e3921f77a76360554de9b";
+  "935c5df20a2d57ed18824cca11dc9b8590d72a207e3d1677bc2ceea3048b3dff";
 // Linux owns its compiler server inside Docker, while macOS and Windows own one
 // in the host shell. Pin both executable programs so a swallowed stop or a
 // dead-code copy cannot satisfy the ownership fragments below.
@@ -1402,6 +1646,7 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
 }
 
 export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
+export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";
 
 export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
   const violations = [];
@@ -3221,14 +3466,12 @@ function validatePackagedProof(workflows, violations, graph) {
     "--save-result",
     "--path \"$SCCACHE_DIR\"",
   ]);
-  requireStepRun(violations, file, job, "Compile immutable native staging regression on Windows", [
-    "cargo test --release --locked",
-    "--test native_staging",
-    "--no-run",
-  ]);
-  requireStepRun(violations, file, job, "Compile native workspace path regression on Windows", [
-    "cargo test --locked -p codestory-workspace repository_identity --no-run",
-  ]);
+  add(
+    violations,
+    namedStep(job, "Compile immutable native staging regression on Windows") === undefined
+      && namedStep(job, "Compile native workspace path regression on Windows") === undefined,
+    `${file} Windows package proof must not compile either regression in a second Cargo invocation`,
+  );
   const packageBuild = namedStep(job, "Build package and qualification driver");
   const linuxBuild = namedStep(job, "Build Linux x64 at the glibc 2.31 baseline");
   const expectedSccacheIdentityEnv = {
@@ -3361,23 +3604,69 @@ function validatePackagedProof(workflows, violations, graph) {
       && hasExactKeys(object(packageBuild?.env), [
         "INCLUDE_QUALIFICATION_DRIVER",
         "RELEASE_RUST_TARGET",
+        "SOURCE_SHA",
+        "SOURCE_TREE",
       ])
       && object(packageBuild?.env).INCLUDE_QUALIFICATION_DRIVER
         === "${{ inputs.include_qualification_driver }}"
       && object(packageBuild?.env).RELEASE_RUST_TARGET
-        === "${{ matrix.rust_target }}",
+        === "${{ matrix.rust_target }}"
+      && object(packageBuild?.env).SOURCE_SHA
+        === "${{ steps.source-identity.outputs.sha }}"
+      && object(packageBuild?.env).SOURCE_TREE
+        === "${{ steps.source-identity.outputs.tree }}",
     `${file} native package build must not override the selected generator and must bind the reviewed target and qualification workload`,
   );
   requireStepRun(violations, file, job, "Smoke codestory-cli on Windows", [
-    "$env:CARGO_TARGET_DIR",
-    "${{ matrix.rust_target }}/release/codestory-cli",
+    '$bin = "$env:WINDOWS_CLI"',
+    "throw \"Windows CLI version smoke failed",
+    "throw \"Windows CLI help smoke failed",
   ]);
+  const windowsCliSmoke = namedStep(job, "Smoke codestory-cli on Windows");
+  add(
+    violations,
+    windowsCliSmoke?.if === "runner.os == 'Windows'"
+      && windowsCliSmoke?.shell === "pwsh"
+      && hasExactKeys(object(windowsCliSmoke?.env), ["WINDOWS_CLI"])
+      && object(windowsCliSmoke?.env).WINDOWS_CLI
+        === "${{ steps.package-build.outputs.cli }}"
+      && windowsCliSmoke?.["continue-on-error"] === undefined,
+    `${file} Windows CLI smoke must execute only the exact release binary selected from Cargo output`,
+  );
   requireStepRun(violations, file, job, "Package release asset on Windows", [
-    "$env:CARGO_TARGET_DIR",
-    "${{ matrix.rust_target }}/release/codestory-cli",
+    "cargo-build-artifacts.mjs verify",
+    '--manifest "$env:ARTIFACT_MANIFEST"',
+    '--source-sha "$env:SOURCE_SHA"',
+    '--source-tree "$env:SOURCE_TREE"',
+    '--rust-target "$env:RELEASE_RUST_TARGET"',
+    '$bin = "$env:WINDOWS_CLI"',
     "package-codestory-release.py",
     "--binary $bin",
   ]);
+  const windowsPackage = namedStep(job, "Package release asset on Windows");
+  add(
+    violations,
+    windowsPackage?.if === "runner.os == 'Windows'"
+      && windowsPackage?.shell === "pwsh"
+      && hasExactKeys(object(windowsPackage?.env), [
+        "ARTIFACT_MANIFEST",
+        "INPUT_VERSION",
+        "RELEASE_RUST_TARGET",
+        "SOURCE_SHA",
+        "SOURCE_TREE",
+        "WINDOWS_CLI",
+      ])
+      && object(windowsPackage?.env).ARTIFACT_MANIFEST
+        === "${{ steps.package-build.outputs.manifest }}"
+      && object(windowsPackage?.env).WINDOWS_CLI
+        === "${{ steps.package-build.outputs.cli }}"
+      && object(windowsPackage?.env).SOURCE_SHA
+        === "${{ steps.source-identity.outputs.sha }}"
+      && object(windowsPackage?.env).SOURCE_TREE
+        === "${{ steps.source-identity.outputs.tree }}"
+      && windowsPackage?.["continue-on-error"] === undefined,
+    `${file} Windows packaging must verify and package only the exact Cargo-selected release binary`,
+  );
   requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
     "node scripts/prepare-embedded-model.mjs",
   ]);
@@ -3385,17 +3674,28 @@ function validatePackagedProof(workflows, violations, graph) {
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
   ]);
   const windowsNativeStagingTest = namedStep(job, "Test immutable native staging on Windows");
+  const windowsPathIdentityTest = namedStep(job, "Prove native workspace path identity");
   add(
     violations,
-    windowsNativeStagingTest?.if === "runner.os == 'Windows'",
-    `${file} immutable native staging regression must run on Windows`,
+    windowsNativeStagingTest?.if === "runner.os == 'Windows'"
+      && windowsNativeStagingTest?.shell === "pwsh"
+      && object(windowsNativeStagingTest?.env).TEST_BINARY
+        === "${{ steps.package-build.outputs.native_staging }}"
+      && windowsNativeStagingTest?.["continue-on-error"] === undefined
+      && windowsPathIdentityTest?.if === "runner.os == 'Windows'"
+      && windowsPathIdentityTest?.shell === "pwsh"
+      && object(windowsPathIdentityTest?.env).TEST_BINARY
+        === "${{ steps.package-build.outputs.windows_path_identity }}"
+      && windowsPathIdentityTest?.["continue-on-error"] === undefined,
+    `${file} Windows regressions must execute the exact release test binaries emitted by the one Cargo graph`,
   );
   requireStepRun(violations, file, job, "Test immutable native staging on Windows", [
-    "cargo test --release --locked",
-    "-p codestory-llama-sys",
-    "--test native_staging",
-    '--target "${{ matrix.rust_target }}"',
-    "stages_complete_immutable_native_seeds",
+    '& "$env:TEST_BINARY" --nocapture',
+    "immutable native-staging release harness failed",
+  ]);
+  requireStepRun(violations, file, job, "Prove native workspace path identity", [
+    '& "$env:TEST_BINARY" --nocapture',
+    "Windows path-identity release harness failed",
   ]);
   requireStepRun(violations, file, job, "Build pinned Linux toolchain image", [
     ".github/docker/linux-glibc-build.Dockerfile",
@@ -3410,9 +3710,19 @@ function validatePackagedProof(workflows, violations, graph) {
     job,
     "Build Linux x64 at the glibc 2.31 baseline",
   ));
+  const cargoBuildStepNames = list(job?.steps)
+    .map(object)
+    .filter(step =>
+      shellInvocationsContaining(
+        shellLiteralNormalizedText(step.run),
+        "cargo build",
+      ).length > 0)
+    .map(step => step.name)
+    .sort();
   add(
     violations,
     shellInvocationsContaining(packageBuildRun, "cargo build").length === 1
+      && packageBuildRun.includes("cargo build --release --locked")
       && packageBuildRun.includes("-p codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli")
       && packageBuildRun.includes("--bin codestory-cli-runtime")
@@ -3420,9 +3730,33 @@ function validatePackagedProof(workflows, violations, graph) {
       && packageBuildRun.includes("-p codestory-bench")
       && packageBuildRun.includes("--bin codestory_embedding_qualification")
       && packageBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && packageBuildRun.includes("if [ $RUNNER_OS = Windows ]")
+      && packageBuildRun.includes("-p codestory-llama-sys")
+      && packageBuildRun.includes("--test native_staging")
+      && packageBuildRun.includes("-p codestory-workspace")
+      && packageBuildRun.includes("--test windows_path_identity")
+      && packageBuildRun.includes("--message-format=json-render-diagnostics")
+      && packageBuildRun.includes("--timings")
+      && packageBuildRun.includes("cargo-build-artifacts.mjs select")
+      && packageBuildRun.includes("--source-sha $SOURCE_SHA")
+      && packageBuildRun.includes("--source-tree $SOURCE_TREE")
+      && occurrenceCount(packageBuildRun, "build_package_graph") === 3
       && !packageBuildRun.includes("codestory_embedding_constant_calibration")
+      && !packageBuildRun.includes("target/debug")
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
-    `${file} host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
+    `${file} host package must build the complete Windows release graph in one exact Cargo invocation`,
+  );
+  add(
+    violations,
+    JSON.stringify(cargoBuildStepNames) === JSON.stringify([
+      "Build Linux x64 at the glibc 2.31 baseline",
+      "Build package and qualification driver",
+    ])
+      && jobShellInvocationsContaining(job, "cargo test").length === 0
+      && jobShellInvocationsContaining(job, "cargo check").length === 0
+      && jobShellInvocationsContaining(job, "rustc ").length === 1
+      && jobShellInvocationsContaining(job, "rustc ")[0].includes("rustc -Vv"),
+    `${file} package proof must not compile outside the two mutually exclusive reviewed Cargo build steps`,
   );
   add(
     violations,
@@ -3715,22 +4049,78 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   requireStepUses(violations, file, job, "Upload release asset", "actions/upload-artifact@v7.0.1");
   const releaseAssetUpload = namedStep(job, "Upload release asset");
+  const candidateRecordStep = namedStep(job, "Produce exact candidate archive record");
+  const candidateRecordUpload = namedStep(job, "Upload exact candidate archive record");
+  const qualificationDriverUpload = namedStep(job, "Upload separate qualification driver");
+  requireStepRun(violations, file, job, "Produce exact candidate archive record", [
+    "candidate-archive-store.mjs record",
+    "--output \"$record_dir/candidate-archive-record.json\"",
+    "--repository \"$GITHUB_REPOSITORY\"",
+    "--source-sha \"$SOURCE_SHA\"",
+    "--source-tree \"$SOURCE_TREE\"",
+    "--target \"${{ matrix.asset_target }}\"",
+    "--archive-name \"$archive_name\"",
+    "--archive-bytes",
+    "--archive-sha256",
+    "--companion \"archive_checksum|",
+    "--companion \"checksum_manifest|SHA256SUMS.txt|",
+  ]);
+  add(
+    violations,
+    candidateRecordStep?.shell === "bash"
+      && candidateRecordStep?.["continue-on-error"] === undefined
+      && hasExactKeys(object(candidateRecordStep?.env), [
+        "INPUT_VERSION",
+        "SOURCE_SHA",
+        "SOURCE_TREE",
+      ])
+      && object(candidateRecordStep?.env).INPUT_VERSION === "${{ inputs.version }}"
+      && object(candidateRecordStep?.env).SOURCE_SHA
+        === "${{ steps.source-identity.outputs.sha }}"
+      && object(candidateRecordStep?.env).SOURCE_TREE
+        === "${{ steps.source-identity.outputs.tree }}"
+      && stepIndex(job, "Produce exact candidate archive record")
+        > stepIndex(job, "Report fresh package identity")
+      && stepIndex(job, "Produce exact candidate archive record")
+        < stepIndex(job, "Upload release asset"),
+    `${file} package producer must derive one exact public candidate record from the authenticated package bytes`,
+  );
+  const expectedPublicPackagePath = [
+    "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}",
+    "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}.sha256",
+    "target/release-dist/SHA256SUMS.txt",
+    "",
+  ].join("\n");
   add(
     violations,
     object(releaseAssetUpload?.with).name
         === "codestory-cli-${{ matrix.asset_target }}"
-      && String(object(releaseAssetUpload?.with).path ?? "")
-        === [
-          "target/release-dist/*.tar.gz",
-          "target/release-dist/*.zip",
-          "target/release-dist/*.sha256",
-          "target/release-dist/SHA256SUMS.txt",
-          "target/release-dist/qualification-driver/${{ matrix.asset_target }}",
-          "",
-        ].join("\n")
+      && String(object(releaseAssetUpload?.with).path ?? "") === expectedPublicPackagePath
       && object(releaseAssetUpload?.with)["if-no-files-found"] === "error"
+      && object(releaseAssetUpload?.with)["retention-days"] === 30
       && object(releaseAssetUpload?.with).overwrite === true,
-    `${file} existing package artifact must retain the private driver directory without changing its public archive`,
+    `${file} public package artifact must contain exactly the archive and its two candidate-local checksum files`,
+  );
+  add(
+    violations,
+    candidateRecordUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && object(candidateRecordUpload?.with).name
+        === "codestory-candidate-archive-record-${{ matrix.asset_target }}"
+      && object(candidateRecordUpload?.with).path
+        === "target/candidate-archive-record/${{ matrix.asset_target }}/candidate-archive-record.json"
+      && object(candidateRecordUpload?.with)["if-no-files-found"] === "error"
+      && object(candidateRecordUpload?.with)["retention-days"] === 30
+      && object(candidateRecordUpload?.with).overwrite === true
+      && qualificationDriverUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && qualificationDriverUpload?.if === "inputs.include_qualification_driver"
+      && object(qualificationDriverUpload?.with).name
+        === "codestory-qualification-driver-${{ matrix.asset_target }}"
+      && object(qualificationDriverUpload?.with).path
+        === "target/release-dist/qualification-driver/${{ matrix.asset_target }}"
+      && object(qualificationDriverUpload?.with)["if-no-files-found"] === "error"
+      && object(qualificationDriverUpload?.with)["retention-days"] === 30
+      && object(qualificationDriverUpload?.with).overwrite === true,
+    `${file} candidate record and private qualification driver must be separate exact stable artifacts`,
   );
   requireStepUses(violations, file, job, "Upload macOS notarization proof", "actions/upload-artifact@v7.0.1");
   requireStepRun(violations, file, job, "Emit authenticated package release cell", [
@@ -3940,6 +4330,247 @@ function validatePostPublish(workflows, violations, graph) {
     violations,
     object(workflow.env).CODEX_CLI_VERSION === "0.144.5",
     `${file} must pin the Codex CLI used for marketplace installation`,
+  );
+  const publishedAuthentication = namedStep(
+    job,
+    "Authenticate published candidate assets",
+  );
+  add(
+    violations,
+    publishedAuthentication?.id === "published-assets"
+      && publishedAuthentication?.shell === "bash"
+      && publishedAuthentication?.if === undefined
+      && publishedAuthentication?.["continue-on-error"] === undefined
+      && hasExactKeys(object(publishedAuthentication?.env), [
+        "ASSET_TARGET",
+        "EXTENSION",
+        "GH_TOKEN",
+        "PUBLISHED_COMMIT",
+        "TAG",
+        "VERSION",
+      ])
+      && object(publishedAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+      && object(publishedAuthentication?.env).TAG === "${{ steps.release.outputs.tag }}"
+      && object(publishedAuthentication?.env).VERSION
+        === "${{ steps.release.outputs.version }}"
+      && object(publishedAuthentication?.env).ASSET_TARGET
+        === "${{ matrix.asset_target }}"
+      && object(publishedAuthentication?.env).EXTENSION
+        === "${{ matrix.extension }}"
+      && object(publishedAuthentication?.env).PUBLISHED_COMMIT
+        === "${{ steps.published.outputs.commit }}",
+    `${file} published candidate authentication must bind the release tag, commit, target, and exact asset metadata`,
+  );
+  requireStepRun(violations, file, job, "Authenticate published candidate assets", [
+    'gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"',
+    'test "$(jq -r .tag_name <<<"$release")" = "$TAG"',
+    'test "$(jq -r .draft <<<"$release")" = false',
+    "expected one published release asset",
+    'archive_asset="$(select_asset "$asset")"',
+    'checksum_asset="$(select_asset "$checksum")"',
+    "manifest_asset=\"$(select_asset SHA256SUMS.txt)\"",
+    '[[ "$(jq -r .id <<<"$value")" =~ ^[0-9]+$ ]]',
+    '[[ "$(jq -r .size <<<"$value")" =~ ^[0-9]+$ ]]',
+    '[[ "$(jq -r .digest <<<"$value")" =~ ^sha256:[0-9a-f]{64}$ ]]',
+    'validate_asset "$archive_asset"',
+    'validate_asset "$checksum_asset"',
+    'validate_asset "$manifest_asset"',
+    "candidate-archive-store.mjs record",
+    '--source-sha "$PUBLISHED_COMMIT"',
+    "--source-tree \"$(git rev-parse 'HEAD^{tree}')\"",
+    '--target "$ASSET_TARGET"',
+    "--archive-bytes",
+    "--archive-sha256",
+    '--companion "archive_checksum|',
+    '--companion "checksum_manifest|SHA256SUMS.txt|',
+    "archive-id=",
+    "archive-bytes=",
+    "archive-sha256=",
+    "checksum-id=",
+    "checksum-bytes=",
+    "checksum-sha256=",
+    "manifest-id=",
+    "manifest-bytes=",
+    "manifest-sha256=",
+  ]);
+  const publishedRestore = namedStep(
+    job,
+    "Restore published candidate archive from protected host",
+  );
+  add(
+    violations,
+    publishedRestore?.id === "candidate-cache"
+      && publishedRestore?.shell === "bash"
+      && publishedRestore?.if === undefined
+      && publishedRestore?.["continue-on-error"] === undefined
+      && hasExactKeys(object(publishedRestore?.env), [
+        "ASSET_TARGET",
+        "PUBLISHED_COMMIT",
+      ])
+      && object(publishedRestore?.env).ASSET_TARGET
+        === "${{ matrix.asset_target }}"
+      && object(publishedRestore?.env).PUBLISHED_COMMIT
+        === "${{ steps.published.outputs.commit }}",
+    `${file} published candidate cache lookup must be unconditional and exact-source bound`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Restore published candidate archive from protected host",
+    [
+      "--arg repository \"$GITHUB_REPOSITORY\"",
+      '--arg source_sha "$PUBLISHED_COMMIT"',
+      "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+      '--arg target "$ASSET_TARGET"',
+      ".repository == $repository",
+      ".source.commit == $source_sha",
+      ".source.tree == $source_tree",
+      ".target == $target",
+      "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+      "candidate-archive-store.mjs restore",
+      "--record \"$record\"",
+      "--output-dir target/post-publish-release-assets",
+      'echo "hit=$hit" >> "$GITHUB_OUTPUT"',
+    ],
+  );
+  const publishedMiss = namedStep(
+    job,
+    "Download, verify, and admit published candidate on miss",
+  );
+  add(
+    violations,
+    publishedMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
+      && publishedMiss?.shell === "bash"
+      && publishedMiss?.["continue-on-error"] === undefined
+      && hasExactKeys(object(publishedMiss?.env), [
+        "ARCHIVE_BYTES",
+        "ARCHIVE_ID",
+        "ARCHIVE_NAME",
+        "ARCHIVE_SHA256",
+        "ASSET_TARGET",
+        "CHECKSUM_BYTES",
+        "CHECKSUM_ID",
+        "CHECKSUM_SHA256",
+        "GH_TOKEN",
+      ])
+      && object(publishedMiss?.env).GH_TOKEN === "${{ github.token }}"
+      && object(publishedMiss?.env).ASSET_TARGET === "${{ matrix.asset_target }}"
+      && object(publishedMiss?.env).ARCHIVE_NAME
+        === "${{ steps.published-assets.outputs.archive-name }}"
+      && object(publishedMiss?.env).ARCHIVE_ID
+        === "${{ steps.published-assets.outputs.archive-id }}"
+      && object(publishedMiss?.env).ARCHIVE_BYTES
+        === "${{ steps.published-assets.outputs.archive-bytes }}"
+      && object(publishedMiss?.env).ARCHIVE_SHA256
+        === "${{ steps.published-assets.outputs.archive-sha256 }}"
+      && object(publishedMiss?.env).CHECKSUM_ID
+        === "${{ steps.published-assets.outputs.checksum-id }}"
+      && object(publishedMiss?.env).CHECKSUM_BYTES
+        === "${{ steps.published-assets.outputs.checksum-bytes }}"
+      && object(publishedMiss?.env).CHECKSUM_SHA256
+        === "${{ steps.published-assets.outputs.checksum-sha256 }}",
+    `${file} published archive transfer must run only on an exact cache miss`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Download, verify, and admit published candidate on miss",
+    [
+      "releases/assets/$id",
+      "--continue-at -",
+      "--max-time 120",
+      'test "${actual%% *}" = "$expected_bytes"',
+      'test "${actual#* }" = "$expected_sha256"',
+      'download_asset "$ARCHIVE_ID" "$ARCHIVE_NAME"',
+      'download_asset "$CHECKSUM_ID" "$ARCHIVE_NAME.sha256"',
+      'cp "$stage/$ARCHIVE_NAME.sha256" "$stage/SHA256SUMS.txt"',
+      "candidate-archive-store.mjs admit",
+      "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+      "--output-dir target/post-publish-release-assets",
+    ],
+  );
+  const publishedManifest = namedStep(
+    job,
+    "Download authenticated published checksum manifest",
+  );
+  const publishedBinding = namedStep(
+    job,
+    "Bind materialized published asset paths",
+  );
+  add(
+    violations,
+    publishedManifest?.id === "published-checksum"
+      && publishedManifest?.if === undefined
+      && publishedManifest?.shell === "bash"
+      && publishedManifest?.["continue-on-error"] === undefined
+      && hasExactKeys(object(publishedManifest?.env), [
+        "GH_TOKEN",
+        "MANIFEST_BYTES",
+        "MANIFEST_ID",
+        "MANIFEST_SHA256",
+      ])
+      && object(publishedManifest?.env).GH_TOKEN === "${{ github.token }}"
+      && object(publishedManifest?.env).MANIFEST_ID
+        === "${{ steps.published-assets.outputs.manifest-id }}"
+      && object(publishedManifest?.env).MANIFEST_BYTES
+        === "${{ steps.published-assets.outputs.manifest-bytes }}"
+      && object(publishedManifest?.env).MANIFEST_SHA256
+        === "${{ steps.published-assets.outputs.manifest-sha256 }}"
+      && publishedBinding?.id === "asset"
+      && publishedBinding?.if === undefined
+      && publishedBinding?.shell === "bash"
+      && hasExactKeys(object(publishedBinding?.env), [
+        "ASSET_NAME",
+        "PUBLISHED_CHECKSUM",
+      ])
+      && object(publishedBinding?.env).ASSET_NAME
+        === "${{ steps.published-assets.outputs.archive-name }}"
+      && object(publishedBinding?.env).PUBLISHED_CHECKSUM
+        === "${{ steps.published-checksum.outputs.checksum }}",
+    `${file} global published checksum must stay independently authenticated and bind the materialized candidate`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Download authenticated published checksum manifest",
+    [
+      "releases/assets/$MANIFEST_ID",
+      'test "${actual%% *}" = "$MANIFEST_BYTES"',
+      'test "${actual#* }" = "$MANIFEST_SHA256"',
+      'echo "checksum=$checksum" >> "$GITHUB_OUTPUT"',
+    ],
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Bind materialized published asset paths",
+    [
+      'test -f "$dir/$ASSET_NAME"',
+      'echo "archive=$dir/$ASSET_NAME" >> "$GITHUB_OUTPUT"',
+      'echo "checksum=$PUBLISHED_CHECKSUM" >> "$GITHUB_OUTPUT"',
+    ],
+  );
+  add(
+    violations,
+    stepIndex(job, "Authenticate published candidate assets")
+      < stepIndex(job, "Restore published candidate archive from protected host")
+      && stepIndex(job, "Restore published candidate archive from protected host")
+        < stepIndex(job, "Download, verify, and admit published candidate on miss")
+      && stepIndex(job, "Download, verify, and admit published candidate on miss")
+        < stepIndex(job, "Download authenticated published checksum manifest")
+      && stepIndex(job, "Download authenticated published checksum manifest")
+        < stepIndex(job, "Bind materialized published asset paths")
+      && jobShellInvocationsContaining(job, "releases/assets/$id").length === 1
+      && jobShellInvocationsContaining(
+        job,
+        "releases/assets/$MANIFEST_ID",
+      ).length === 1
+      && !scalarStrings(workflow).some(value => value.includes("gh release download")),
+    `${file} must resolve the protected cache before any large release-asset transfer and never use an unconditional bulk download`,
   );
   const catalogDelivery = graph.workflow_policy.catalog_delivery;
   const resolveStepName = "Resolve the published plugin through the marketplace catalog";
@@ -4174,6 +4805,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       "source-proof",
       "packaged-proof",
       "macos-metal-proof",
+      "frozen-candidate-quality",
       "windows-vulkan-proof",
       "linux-vulkan-proof",
       "closeout",
@@ -4210,7 +4842,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
             job: "packaged-metal",
             policy: "accelerated",
             backend: "metal",
-            produces_quality: true,
           },
           {
             id: "protected_windows_x64_vulkan",
@@ -4218,7 +4849,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
             job: "packaged-vulkan",
             policy: "accelerated",
             backend: "vulkan",
-            produces_quality: false,
           },
         ])
       && JSON.stringify(list(qualificationPolicy.optional_cells))
@@ -4236,18 +4866,31 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         ])
       && JSON.stringify(object(qualificationPolicy.quality_contract))
         === JSON.stringify({
+          producer_workflow: "packaged-platform-pr.yml",
+          producer_job: "frozen-candidate-quality",
           producer_cell: "protected_macos_arm64_metal",
-          corpus_id: "codestory-release-corpus-v1",
+          scheduled_once_per_frozen_candidate: true,
+          blocking: false,
+          closeout_dependency: false,
+          claimed: false,
+          archive_cache_key_fields: [
+            "source.commit",
+            "target",
+            "archive.sha256",
+          ],
+          archive_cache_contract: "candidate_archive_cache",
+          archive_transfer: "authenticated_miss_only",
+          evaluation_owner: "isolated_reusable_workflow",
+          evaluation_owner_sha256: frozenCandidateQualityWorkflowDigest,
           evaluation_contract: "publishable-three-repeat-packet/v1",
-          task_count: 3,
+          task_count: 1,
           repeats_per_task: 3,
-          row_count: 9,
+          row_count: 3,
         })
       && sameMembers(list(qualificationPolicy.required_evidence), [
         "qualification_scenarios",
         "true_idle_exit",
         "total_codestory_process_memory",
-        "retrieval_quality",
         "backend_observed_accelerator_residency",
       ])
       && sameMembers(list(qualificationPolicy.required_scenarios), [
@@ -4573,22 +5216,298 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     object(metal.with).server_behavior_only
         === "${{ needs.route.outputs.mode != 'qualification' }}"
-      && object(metal.with).quality_evidence_artifact === "",
-    `${file} qualification must run full Metal quality and lifecycle proof`,
+      && object(metal.with).quality_evidence_artifact === undefined,
+    `${file} qualification must run one full Metal lifecycle proof without optional quality inputs`,
+  );
+  const qualityCaller = requireJob(
+    violations,
+    file,
+    workflow,
+    "frozen-candidate-quality",
+  );
+  add(
+    violations,
+    sameMembers(needs(qualityCaller), [
+      "route",
+      "packaged-proof",
+      "macos-metal-proof",
+    ])
+      && qualityCaller.if
+        === "always() && needs.route.result == 'success' && needs.packaged-proof.result == 'success' && needs.macos-metal-proof.result == 'success' && needs.route.outputs.mode == 'qualification' && (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full')"
+      && qualityCaller.uses === frozenCandidateQualityWorkflowRef
+      && hasExactKeys(qualityCaller, ["name", "if", "needs", "uses", "with"])
+      && qualityCaller.secrets === undefined
+      && hasExactKeys(object(qualityCaller.with), ["ref", "version"])
+      && object(qualityCaller.with).ref === "${{ needs.route.outputs.head_sha }}"
+      && object(qualityCaller.with).version === "${{ needs.route.outputs.version }}",
+    `${file} optional quality must call its isolated owner once after protected Metal`,
+  );
+  const qualityFile = path.basename(frozenCandidateQualityWorkflowRef);
+  const qualityWorkflow = workflows.get(qualityFile);
+  if (!qualityWorkflow) {
+    violations.push(`${qualityFile} must exist`);
+    return;
+  }
+  add(
+    violations,
+    createHash("sha256").update(JSON.stringify(qualityWorkflow)).digest("hex")
+      === frozenCandidateQualityWorkflowDigest,
+    `${qualityFile} must match the reviewed isolated evaluation-owner structure`,
+  );
+  const qualityCall = object(trigger(qualityWorkflow, "workflow_call"));
+  const qualityInputs = object(qualityCall.inputs);
+  add(
+    violations,
+    trigger(qualityWorkflow, "workflow_dispatch") === undefined
+      && hasExactKeys(qualityInputs, ["ref", "version"])
+      && object(qualityInputs.ref).required === true
+      && object(qualityInputs.ref).type === "string"
+      && object(qualityInputs.version).required === true
+      && object(qualityInputs.version).type === "string"
+      && JSON.stringify(qualityWorkflow.permissions)
+        === JSON.stringify({ actions: "read", contents: "read" })
+      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality"]),
+    `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
+  );
+  const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
+  add(
+    violations,
+    JSON.stringify(quality["runs-on"])
+        === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"])
+      && quality.environment === "macos-metal-release"
+      && quality["continue-on-error"] === true
+      && quality["timeout-minutes"] === 60,
+    `${qualityFile} optional quality must stay nonblocking on protected Metal`,
+  );
+  const qualitySteps = list(quality.steps).map(object);
+  add(
+    violations,
+    qualitySteps.length === 9
+      && qualitySteps.filter(step => step.id === "quality").length === 1
+      && qualitySteps.filter(step => step.id === "quality-upload").length === 1,
+    `${qualityFile} must retain one authenticated measurement and upload boundary`,
+  );
+  const qualityCheckout = namedStep(quality, "Checkout exact frozen candidate");
+  add(
+    violations,
+    qualityCheckout?.uses === "actions/checkout@v5"
+      && hasExactKeys(object(qualityCheckout?.with), ["ref", "fetch-depth"])
+      && object(qualityCheckout?.with).ref === "${{ inputs.ref }}"
+      && object(qualityCheckout?.with)["fetch-depth"] === 0,
+    `${qualityFile} must check out the routed exact frozen candidate`,
+  );
+  const qualityAuthentication = namedStep(
+    quality,
+    "Authenticate exact candidate archive artifacts",
+  );
+  const qualityAuthenticationRun = shellLiteralNormalizedText(
+    stepRun(quality, "Authenticate exact candidate archive artifacts"),
+  );
+  add(
+    violations,
+    qualityAuthentication?.id === "candidate-artifacts"
+      && qualityAuthentication?.shell === "bash"
+      && qualityAuthentication?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityAuthentication?.env), ["GH_TOKEN", "HEAD_SHA"])
+      && object(qualityAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+      && object(qualityAuthentication?.env).HEAD_SHA === "${{ inputs.ref }}"
+      && qualityAuthenticationRun.includes("git rev-parse HEAD")
+      && qualityAuthenticationRun.includes(".head_repository.full_name")
+      && qualityAuthenticationRun.includes(
+        ".github/workflows/packaged-platform-pr.yml",
+      )
+      && qualityAuthenticationRun.includes(".head_sha")
+      && qualityAuthenticationRun.includes(".run_attempt")
+      && qualityAuthenticationRun.includes("select_artifact codestory-cli-macos-arm64")
+      && qualityAuthenticationRun.includes(
+        "select_artifact codestory-candidate-archive-record-macos-arm64",
+      )
+      && qualityAuthenticationRun.includes(".workflow_run.id == $run_id")
+      && qualityAuthenticationRun.includes(".workflow_run.head_sha == $sha")
+      && qualityAuthenticationRun.includes("package-id=$artifact_id")
+      && qualityAuthenticationRun.includes("package-bytes=$expected_size")
+      && qualityAuthenticationRun.includes(
+        "package-sha256=${expected_digest#sha256:}",
+      ),
+    `${qualityFile} must authenticate one current-run exact-head candidate archive and record`,
+  );
+  const qualityRecordDownload = namedStep(
+    quality,
+    "Download authenticated candidate record",
+  );
+  const qualityCacheRestore = namedStep(
+    quality,
+    "Restore exact candidate archive from protected host",
+  );
+  const qualityCacheMiss = namedStep(
+    quality,
+    "Download, authenticate, and admit candidate archive on miss",
+  );
+  add(
+    violations,
+    qualityRecordDownload?.uses === "actions/download-artifact@v8.0.1"
+      && hasExactKeys(object(qualityRecordDownload?.with), ["name", "path"])
+      && object(qualityRecordDownload?.with).name
+        === "codestory-candidate-archive-record-macos-arm64"
+      && object(qualityRecordDownload?.with).path
+        === "target/candidate-archive-record/macos-arm64"
+      && qualityCacheRestore?.id === "candidate-cache"
+      && qualityCacheRestore?.if === undefined
+      && qualityCacheRestore?.shell === "bash"
+      && qualityCacheRestore?.["continue-on-error"] === undefined,
+    `${qualityFile} cache lookup must consume only the exact small candidate record`,
+  );
+  requireStepRun(
+    violations,
+    qualityFile,
+    quality,
+    "Restore exact candidate archive from protected host",
+    [
+      "--arg repository \"$GITHUB_REPOSITORY\"",
+      "--arg source_sha \"$(git rev-parse HEAD)\"",
+      "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+      "--arg target macos-arm64",
+      ".source.commit == $source_sha",
+      ".source.tree == $source_tree",
+      ".target == $target",
+      "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+      "candidate-archive-store.mjs restore",
+      "--record \"$record\"",
+      "--output-dir target/release-dist",
+      "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
+    ],
+  );
+  add(
+    violations,
+    qualityCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
+      && qualityCacheMiss?.shell === "bash"
+      && qualityCacheMiss?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityCacheMiss?.env), [
+        "ARTIFACT_ID",
+        "EXPECTED_SHA256",
+        "EXPECTED_SIZE",
+        "GH_TOKEN",
+      ])
+      && object(qualityCacheMiss?.env).ARTIFACT_ID
+        === "${{ steps.candidate-artifacts.outputs.package-id }}"
+      && object(qualityCacheMiss?.env).EXPECTED_SIZE
+        === "${{ steps.candidate-artifacts.outputs.package-bytes }}"
+      && object(qualityCacheMiss?.env).EXPECTED_SHA256
+        === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
+      && object(qualityCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
+    `${qualityFile} archive transfer must be cache-miss-only and outer-digest authenticated`,
+  );
+  requireStepRun(
+    violations,
+    qualityFile,
+    quality,
+    "Download, authenticate, and admit candidate archive on miss",
+    [
+      "actions/artifacts/$ARTIFACT_ID/zip",
+      "--continue-at -",
+      "--max-time 120",
+      'test "$actual_size" = "$EXPECTED_SIZE"',
+      'test "$actual_digest" = "$EXPECTED_SHA256"',
+      "extract-candidate-actions-artifact.py",
+      "candidate-archive-store.mjs admit",
+      "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+      "--output-dir target/release-dist",
+    ],
+  );
+  const qualityProducer = qualitySteps.find(step => step.id === "quality");
+  const qualityProducerRun = shellLiteralNormalizedText(
+    String(qualityProducer?.run ?? ""),
+  );
+  add(
+    violations,
+    qualityProducer?.id === "quality"
+      && qualityProducer?.["continue-on-error"] === true
+      && qualityProducer?.shell === "bash"
+      && hasExactKeys(object(qualityProducer?.env), [
+        "VERSION",
+        "CODESTORY_EMBED_ALLOW_CPU",
+      ])
+      && object(qualityProducer?.env).VERSION === "${{ inputs.version }}"
+      && object(qualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && qualityProducerRun.includes(
+        "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
+      )
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=",
+      ) === 1
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=",
+      ) === 1
+      && occurrenceCount(
+        qualityProducerRun,
+        "CODESTORY_RELEASE_EVIDENCE_CACHE_ID=",
+      ) === 1
+      && shellInvocationsContaining(qualityProducerRun, "--packet-runtime").length === 1
+      && qualityProducerRun.includes("--packet-runtime")
+      && qualityProducerRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(qualityProducerRun, "--task-manifest") === 1
+      && !qualityProducerRun.includes("--task-suite")
+      && !qualityProducerRun.includes("--task-ids")
+      && qualityProducerRun.includes("--materialize-repos")
+      && qualityProducerRun.includes("--repeats 3")
+      && qualityProducerRun.includes("--publishable")
+      && qualityProducerRun.includes("--max-source-reads-after-packet 0")
+      && qualityProducerRun.includes("--codestory-cli $packaged_cli")
+      && qualityProducerRun.includes("--timeout-ms 180000")
+      && qualityProducerRun.includes("--out-dir $quality_root/packet"),
+    `${qualityFile} must run exactly one pinned three-repeat publishable evaluator`,
+  );
+  const qualityUpload = qualitySteps.find(step => step.id === "quality-upload");
+  const qualityOutcome = namedStep(quality, "Record optional quality outcome");
+  add(
+    violations,
+    qualityUpload?.id === "quality-upload"
+      && qualityUpload?.if === "steps.quality.outcome == 'success'"
+      && qualityUpload?.["continue-on-error"] === true
+      && qualityUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && hasExactKeys(object(qualityUpload?.with), [
+        "name",
+        "path",
+        "if-no-files-found",
+        "retention-days",
+        "overwrite",
+      ])
+      && object(qualityUpload?.with).name
+        === "frozen-candidate-quality-${{ inputs.ref }}"
+      && object(qualityUpload?.with).path
+        === "target/frozen-candidate-quality/evidence"
+      && object(qualityUpload?.with)["if-no-files-found"] === "error"
+      && object(qualityUpload?.with)["retention-days"] === 30
+      && object(qualityUpload?.with).overwrite === true
+      && qualityOutcome?.if === "always()"
+      && qualityOutcome?.shell === "bash"
+      && qualityOutcome?.["continue-on-error"] === undefined
+      && hasExactKeys(object(qualityOutcome?.env), [
+        "QUALITY_OUTCOME",
+        "UPLOAD_OUTCOME",
+      ])
+      && object(qualityOutcome?.env).QUALITY_OUTCOME
+        === "${{ steps.quality.outcome }}"
+      && object(qualityOutcome?.env).UPLOAD_OUTCOME
+        === "${{ steps.quality-upload.outcome }}"
+      && stepRun(quality, "Record optional quality outcome").includes(
+        'echo "- Release or qualification gate: \\`false\\`"',
+      ),
+    `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
   );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
-    sameMembers(needs(vulkan), ["route", "packaged-proof", "macos-metal-proof"]),
-    `${file} Windows qualification must wait for successful protected Metal quality`,
+    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
+    `${file} Windows qualification must run independently of optional Metal quality`,
   );
   add(
     violations,
     String(vulkan.if ?? "").includes("needs.route.outputs.mode != 'package'")
-      && String(vulkan.if ?? "").includes(
-        "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success')",
-      ),
-    `${file} package-only mode must skip Windows while qualification requires successful Metal`,
+      && !String(vulkan.if ?? "").includes("needs.macos-metal-proof"),
+    `${file} package-only mode must skip Windows without serializing it behind Metal`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   add(
@@ -4599,9 +5518,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(vulkan.with).quality_evidence_artifact
-      === "${{ needs.route.outputs.mode == 'qualification' && format('frozen-candidate-quality-{0}', needs.route.outputs.head_sha) || '' }}",
-    `${file} Windows qualification must consume the exact protected Metal quality artifact`,
+    object(vulkan.with).quality_evidence_artifact === undefined,
+    `${file} Windows qualification must not consume optional quality evidence`,
   );
   add(
     violations,
@@ -4667,8 +5585,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(
     violations,
     !needs(closeout).includes("release-evidence")
-      && !scalarStrings(closeout).some(value => value.includes("EVIDENCE_RESULT")),
-    `${file} normal closeout must not depend on optional release evidence`,
+      && !needs(closeout).includes("frozen-candidate-quality")
+      && !scalarStrings(closeout).some(value =>
+        value.includes("EVIDENCE_RESULT")
+          || value.includes("QUALITY_RESULT")
+          || value.includes("frozen-candidate-quality")
+      ),
+    `${file} normal closeout must not depend on optional release or quality evidence`,
   );
   const closeoutProofName = "Require one coherent accepted proof";
   const closeoutProof = namedStep(closeout, closeoutProofName);
@@ -4847,6 +5770,11 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, metalFile, metal, event, key);
       }
+      add(
+        violations,
+        at(metal, "on", event, "inputs", "quality_evidence_artifact") === undefined,
+        `${metalFile} ${event} must not accept optional quality evidence`,
+      );
     }
     const candidateInput = object(at(
       metal,
@@ -4915,7 +5843,10 @@ function validateRemainingWorkflows(workflows, violations) {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
       CALIBRATION_MODE: "${{ inputs.calibration_mode }}",
     });
-    requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
+    requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", [
+      "node scripts/prepare-embedded-model.mjs",
+      '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+    ]);
     requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
     const calibrationClock = namedStep(
       job,
@@ -5013,20 +5944,54 @@ function validateRemainingWorkflows(workflows, violations) {
         && normalizedNativeBuildRun.includes(">> $GITHUB_OUTPUT"),
       `${metalFile} calibration must build CLI and constant collector once through one shared Cargo invocation and package once`,
     );
-    const packagedArtifactDownload = namedStep(job, "Download packaged CLI artifact");
+    const candidateAuthentication = namedStep(
+      job,
+      "Authenticate exact candidate artifacts",
+    );
+    const recordDownload = namedStep(
+      job,
+      "Download authenticated candidate record",
+    );
+    const cacheRestore = namedStep(
+      job,
+      "Restore exact candidate archive from protected host",
+    );
+    const cacheMiss = namedStep(
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+    );
+    const driverDownload = namedStep(
+      job,
+      "Download separate authenticated qualification driver",
+    );
     add(
       violations,
-      packagedArtifactDownload?.if === "inputs.use_packaged_cli_artifact"
-        && packagedArtifactDownload?.shell === "bash"
-        && object(packagedArtifactDownload?.env).GH_TOKEN === "${{ github.token }}"
-        && object(packagedArtifactDownload?.env).ARTIFACT_NAME === "codestory-cli-macos-arm64"
-        && object(packagedArtifactDownload?.env).CANDIDATE_PRODUCER_WORKFLOW_PATH
+      candidateAuthentication?.id === "candidate-artifacts"
+        && candidateAuthentication?.if === "inputs.use_packaged_cli_artifact"
+        && candidateAuthentication?.shell === "bash"
+        && candidateAuthentication?.["continue-on-error"] === undefined
+        && hasExactKeys(object(candidateAuthentication?.env), [
+          "ARTIFACT_NAME",
+          "CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "CANDIDATE_RECORD_ARTIFACT",
+          "GH_TOKEN",
+          "QUALIFICATION_ARTIFACT",
+          "SERVER_BEHAVIOR_ONLY",
+        ])
+        && object(candidateAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+        && object(candidateAuthentication?.env).ARTIFACT_NAME
+          === "codestory-cli-macos-arm64"
+        && object(candidateAuthentication?.env).CANDIDATE_RECORD_ARTIFACT
+          === "codestory-candidate-archive-record-macos-arm64"
+        && object(candidateAuthentication?.env).QUALIFICATION_ARTIFACT
+          === "codestory-qualification-driver-macos-arm64"
+        && object(candidateAuthentication?.env).CANDIDATE_PRODUCER_WORKFLOW_PATH
           === "${{ inputs.candidate_producer_workflow_path }}"
-        && object(packagedArtifactDownload?.env).SERVER_BEHAVIOR_ONLY
+        && object(candidateAuthentication?.env).SERVER_BEHAVIOR_ONLY
           === "${{ inputs.server_behavior_only }}",
-      `${metalFile} packaged CLI download must be an authenticated exact-artifact Bash boundary`,
+      `${metalFile} packaged candidate authentication must bind all exact artifacts before cache lookup`,
     );
-    requireStepRun(violations, metalFile, job, "Download packaged CLI artifact", [
+    requireStepRun(violations, metalFile, job, "Authenticate exact candidate artifacts", [
       "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
       ".github/workflows/auto-release.yml",
       ".github/workflows/release.yml",
@@ -5039,14 +6004,104 @@ function validateRemainingWorkflows(workflows, violations) {
       '.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
       ".workflow_run.id == $run_id",
       ".workflow_run.head_sha == $sha",
-      ".digest",
-      ".size_in_bytes",
+      "expected one exact candidate artifact",
+      'artifact="$(select_artifact "$ARTIFACT_NAME")"',
+      'record_artifact="$(select_artifact "$CANDIDATE_RECORD_ARTIFACT")"',
+      'select_artifact "$QUALIFICATION_ARTIFACT"',
+      "package-id=$artifact_id",
+      "package-bytes=$expected_size",
+      "package-sha256=${expected_digest#sha256:}",
+    ]);
+    add(
+      violations,
+      recordDownload?.if === "inputs.use_packaged_cli_artifact"
+        && recordDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(object(recordDownload?.with), ["name", "path"])
+        && object(recordDownload?.with).name
+          === "codestory-candidate-archive-record-macos-arm64"
+        && object(recordDownload?.with).path
+          === "target/candidate-archive-record/macos-arm64"
+        && cacheRestore?.id === "candidate-cache"
+        && cacheRestore?.if === "inputs.use_packaged_cli_artifact"
+        && cacheRestore?.shell === "bash"
+        && cacheRestore?.["continue-on-error"] === undefined,
+      `${metalFile} protected cache lookup must consume only the exact small candidate record`,
+    );
+    requireStepRun(
+      violations,
+      metalFile,
+      job,
+      "Restore exact candidate archive from protected host",
+      [
+        "--arg repository \"$GITHUB_REPOSITORY\"",
+        "--arg source_sha \"$(git rev-parse HEAD)\"",
+        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+        "--arg target macos-arm64",
+        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+        "candidate-archive-store.mjs restore",
+        "--record \"$record\"",
+        "--output-dir target/release-dist",
+        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
+      ],
+    );
+    add(
+      violations,
+      cacheMiss?.if
+        === "inputs.use_packaged_cli_artifact && steps.candidate-cache.outputs.hit != 'true'"
+        && cacheMiss?.shell === "bash"
+        && cacheMiss?.["continue-on-error"] === undefined
+        && hasExactKeys(object(cacheMiss?.env), [
+          "ARTIFACT_ID",
+          "EXPECTED_SHA256",
+          "EXPECTED_SIZE",
+          "GH_TOKEN",
+        ])
+        && object(cacheMiss?.env).ARTIFACT_ID
+          === "${{ steps.candidate-artifacts.outputs.package-id }}"
+        && object(cacheMiss?.env).EXPECTED_SIZE
+          === "${{ steps.candidate-artifacts.outputs.package-bytes }}"
+        && object(cacheMiss?.env).EXPECTED_SHA256
+          === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
+        && object(cacheMiss?.env).GH_TOKEN === "${{ github.token }}",
+      `${metalFile} large Actions artifact transfer must be a cache-miss-only authenticated boundary`,
+    );
+    requireStepRun(
+      violations,
+      metalFile,
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+      [
+        "actions/artifacts/$ARTIFACT_ID/zip",
       "--continue-at -",
       "--max-time 120",
-      "test \"$actual_size\" = \"$expected_size\"",
-      "test \"$actual_digest\" = \"${expected_digest#sha256:}\"",
-      "ditto -x -k",
-    ]);
+        'test "$actual_size" = "$EXPECTED_SIZE"',
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
+        "extract-candidate-actions-artifact.py",
+        "candidate-archive-store.mjs admit",
+        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+        "--output-dir target/release-dist",
+      ],
+    );
+    add(
+      violations,
+      driverDownload?.if
+        === "${{ inputs.use_packaged_cli_artifact && !inputs.calibration_mode && !inputs.server_behavior_only }}"
+        && driverDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(object(driverDownload?.with), ["name", "path"])
+        && object(driverDownload?.with).name
+          === "codestory-qualification-driver-macos-arm64"
+        && object(driverDownload?.with).path
+          === "target/qualification-driver-artifact/macos-arm64"
+        && stepIndex(job, "Authenticate exact candidate artifacts")
+          < stepIndex(job, "Download authenticated candidate record")
+        && stepIndex(job, "Download authenticated candidate record")
+          < stepIndex(job, "Restore exact candidate archive from protected host")
+        && stepIndex(job, "Restore exact candidate archive from protected host")
+          < stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+        && stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+          < stepIndex(job, "Download separate authenticated qualification driver"),
+      `${metalFile} private driver must remain a separate authenticated artifact after candidate cache resolution`,
+    );
     const metalDriverVerify = namedStep(job, "Verify packaged qualification driver");
     const metalDriverVerifyRun = shellLiteralNormalizedText(
       stepRun(job, "Verify packaged qualification driver"),
@@ -5073,13 +6128,13 @@ function validateRemainingWorkflows(workflows, violations) {
         )
         && metalDriverVerifyRun.includes("--trusted-root $GITHUB_WORKSPACE")
         && metalDriverVerifyRun.includes(
-          "--artifact-dir target/release-dist/qualification-driver/macos-arm64",
+          "--artifact-dir target/qualification-driver-artifact/macos-arm64",
         )
         && metalDriverVerifyRun.includes(
           "echo path=$(jq -r .driver <<<$verified) >> $GITHUB_OUTPUT",
         )
         && stepIndex(job, "Verify packaged qualification driver")
-          > stepIndex(job, "Download packaged CLI artifact"),
+          === stepIndex(job, "Download separate authenticated qualification driver") + 1,
       `${metalFile} packaged qualification must verify the archive-bound private driver`,
     );
     add(
@@ -5089,97 +6144,11 @@ function validateRemainingWorkflows(workflows, violations) {
         "Verify packaged qualification driver",
         "Prove protected Metal runtime",
         [
-          "Download exact-head publishable packet quality evidence",
-          "Produce exact-head holdout quality on protected Metal",
-          "Upload exact-head protected Metal quality evidence",
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
         ],
       ),
       `${metalFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head publishable packet quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(qualityDownload?.with, ["name", "path"])
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence",
-      `${metalFile} imported quality evidence must bind the caller-selected exact artifact`,
-    );
-    const qualityProducerName = "Produce exact-head holdout quality on protected Metal";
-    const qualityProducer = namedStep(job, qualityProducerName);
-    const qualityProducerRun = shellLiteralNormalizedText(
-      stepRun(job, qualityProducerName),
-    );
-    add(
-      violations,
-      qualityProducer?.if
-        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
-        && qualityProducer?.shell === "bash"
-        && hasExactKeys(qualityProducer?.env, ["VERSION", "CODESTORY_EMBED_ALLOW_CPU"])
-        && object(qualityProducer?.env).VERSION === "${{ inputs.version }}"
-        && object(qualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
-        && qualityProducerRun.includes(
-          "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
-        )
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cli.")
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-cache.")
-        && qualityProducerRun.includes("mktemp -d $RUNNER_TEMP/codestory-quality-stdio.")
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_PROFILE=protected-macos-arm64-metal",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v1",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/holdout-retrieval-v1.json",
-        )
-        && qualityProducerRun.includes(
-          "CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-holdout-v1",
-        )
-        && shellInvocationsContaining(
-          qualityProducerRun,
-          "node scripts/codestory-agent-ab-benchmark.mjs",
-        ).length === 1
-        && qualityProducerRun.includes("--packet-runtime")
-        && qualityProducerRun.includes("--packet-runtime-mode cold-cli")
-        && qualityProducerRun.includes("--task-suite holdout-retrieval")
-        && qualityProducerRun.includes("--materialize-repos")
-        && qualityProducerRun.includes("--repeats 3")
-        && qualityProducerRun.includes("--publishable")
-        && qualityProducerRun.includes("--max-source-reads-after-packet 0")
-        && qualityProducerRun.includes("--codestory-cli $packaged_cli")
-        && qualityProducerRun.includes("--timeout-ms 180000")
-        && qualityProducerRun.includes("--out-dir $quality_root/packet"),
-      `${metalFile} protected Metal must generate one exact-head three-repeat holdout quality artifact for qualification`,
-    );
-    const qualityUploadName = "Upload exact-head protected Metal quality evidence";
-    const qualityUpload = namedStep(job, qualityUploadName);
-    add(
-      violations,
-      qualityUpload?.if
-        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only && inputs.quality_evidence_artifact == '' }}"
-        && qualityUpload?.uses === "actions/upload-artifact@v7.0.1"
-        && hasExactKeys(
-          qualityUpload?.with,
-          ["name", "path", "if-no-files-found", "retention-days", "overwrite"],
-        )
-        && object(qualityUpload?.with).name
-          === "frozen-candidate-quality-${{ inputs.ref || github.sha }}"
-        && object(qualityUpload?.with).path === "target/release-quality-evidence"
-        && object(qualityUpload?.with)["if-no-files-found"] === "error"
-        && object(qualityUpload?.with)["retention-days"] === 30
-        && object(qualityUpload?.with).overwrite === true
-        && stepIndex(job, qualityUploadName) > stepIndex(job, qualityProducerName)
-        && stepIndex(job, "Prove protected Metal runtime")
-          > stepIndex(job, qualityUploadName),
-      `${metalFile} protected Metal quality must upload one exact-head stable handoff before qualification`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -5279,7 +6248,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--server-behavior-only",
-      'test -f "$quality_path"',
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(
@@ -5445,19 +6413,10 @@ function validateRemainingWorkflows(workflows, violations) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
         requireOptionalStringInput(violations, vulkanFile, vulkan, event, key);
       }
-      const qualityInput = object(at(
-        vulkan,
-        "on",
-        event,
-        "inputs",
-        "quality_evidence_artifact",
-      ));
       add(
         violations,
-        qualityInput.required === false
-          && qualityInput.type === "string"
-          && (qualityInput.default === "" || qualityInput.default === undefined),
-        `${vulkanFile} ${event} quality_evidence_artifact must be an optional empty string`,
+        at(vulkan, "on", event, "inputs", "quality_evidence_artifact") === undefined,
+        `${vulkanFile} ${event} must not accept optional quality evidence`,
       );
     }
     const candidateInput = object(at(
@@ -5541,7 +6500,9 @@ function validateRemainingWorkflows(workflows, violations) {
       "Capture source build tool evidence",
       "Install pinned Rust",
       "Build and package native CLI",
-      "Authenticate exact Windows package producer",
+      "Authenticate exact Windows candidate artifacts",
+      "Restore exact candidate archive from protected host",
+      "Download, authenticate, and admit candidate archive on miss",
       "Verify packaged qualification driver",
       "Authenticate calibration bundle producer",
       "Prove protected Windows Vulkan runtime",
@@ -5580,7 +6541,10 @@ function validateRemainingWorkflows(workflows, violations) {
       "cmake --version",
       "ninja --version",
     ]);
-    requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
+    requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", [
+      "node scripts/prepare-embedded-model.mjs",
+      '--cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"',
+    ]);
     const nativeBuild = namedStep(job, "Build and package native CLI");
     const nativeBuildRun = shellLiteralNormalizedText(String(nativeBuild?.run ?? ""));
     add(
@@ -5630,14 +6594,15 @@ function validateRemainingWorkflows(workflows, violations) {
     );
     const windowsPackageAuthentication = namedStep(
       job,
-      "Authenticate exact Windows package producer",
+      "Authenticate exact Windows candidate artifacts",
     );
     const windowsPackageAuthenticationRun = shellLiteralNormalizedText(
-      stepRun(job, "Authenticate exact Windows package producer"),
+      stepRun(job, "Authenticate exact Windows candidate artifacts"),
     );
     add(
       violations,
-      windowsPackageAuthentication?.if === "inputs.use_packaged_cli_artifact"
+      windowsPackageAuthentication?.id === "candidate-artifacts"
+        && windowsPackageAuthentication?.if === "inputs.use_packaged_cli_artifact"
         && windowsPackageAuthentication?.shell === windowsPowerShellShell
         && windowsPackageAuthentication?.["continue-on-error"] === undefined
         && hasExactKeys(object(windowsPackageAuthentication?.env), [
@@ -5679,7 +6644,7 @@ function validateRemainingWorkflows(workflows, violations) {
           "[string]$run.run_attempt -ne $env:GITHUB_RUN_ATTEMPT",
         )
         && windowsPackageAuthenticationRun.includes(
-          "$_.name -eq codestory-cli-windows-x64",
+          "$_.name -eq $name",
         )
         && windowsPackageAuthenticationRun.includes(
           "[string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID",
@@ -5688,22 +6653,133 @@ function validateRemainingWorkflows(workflows, violations) {
           "$_.workflow_run.head_sha -eq $sourceSha",
         )
         && windowsPackageAuthenticationRun.includes(
-          "if ($artifactCount -ne 1)",
+          "expected exactly one authenticated $name artifact",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "codestory-cli-windows-x64",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "codestory-candidate-archive-record-windows-x64",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "codestory-qualification-driver-windows-x64",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "package-id=$($package.id)",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "package-bytes=$($package.size_in_bytes)",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "package-sha256=$($package.digest.Substring(7))",
         ),
-      `${vulkanFile} packaged proof must authenticate one exact-head package from an allowlisted producer`,
+      `${vulkanFile} packaged proof must authenticate the exact candidate record, package, and private driver from an allowlisted producer`,
     );
-    const windowsPackageDownload = namedStep(job, "Download packaged CLI artifact");
+    const windowsRecordDownload = namedStep(
+      job,
+      "Download authenticated candidate record",
+    );
+    const windowsCacheRestore = namedStep(
+      job,
+      "Restore exact candidate archive from protected host",
+    );
+    const windowsCacheMiss = namedStep(
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+    );
+    const windowsDriverDownload = namedStep(
+      job,
+      "Download separate authenticated qualification driver",
+    );
     add(
       violations,
-      windowsPackageDownload?.if === "inputs.use_packaged_cli_artifact"
-        && windowsPackageDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(windowsPackageDownload?.with, ["name", "path"])
-        && object(windowsPackageDownload?.with).name
-          === "codestory-cli-windows-x64"
-        && object(windowsPackageDownload?.with).path === "target/release-dist"
-        && stepIndex(job, "Download packaged CLI artifact")
-          === stepIndex(job, "Authenticate exact Windows package producer") + 1,
-      `${vulkanFile} must download only the authenticated Windows package`,
+      windowsRecordDownload?.if === "inputs.use_packaged_cli_artifact"
+        && windowsRecordDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(object(windowsRecordDownload?.with), ["name", "path"])
+        && object(windowsRecordDownload?.with).name
+          === "codestory-candidate-archive-record-windows-x64"
+        && object(windowsRecordDownload?.with).path
+          === "target/candidate-archive-record/windows-x64"
+        && windowsCacheRestore?.id === "candidate-cache"
+        && windowsCacheRestore?.if === "inputs.use_packaged_cli_artifact"
+        && windowsCacheRestore?.shell === windowsPowerShellShell
+        && windowsCacheRestore?.["continue-on-error"] === undefined,
+      `${vulkanFile} protected cache lookup must consume only the exact small Windows candidate record`,
+    );
+    requireStepRun(
+      violations,
+      vulkanFile,
+      job,
+      "Restore exact candidate archive from protected host",
+      [
+        "$record.source.commit -ne $sourceSha",
+        "$record.source.tree -ne $sourceTree",
+        "$record.target -ne \"windows-x64\"",
+        "codestory/candidate-archives",
+        "candidate-archive-store.mjs restore",
+        "--record $recordPath",
+        "--output-dir target/release-dist",
+        "\"hit=$hit\"",
+        "$env:GITHUB_OUTPUT",
+      ],
+    );
+    add(
+      violations,
+      windowsCacheMiss?.if
+        === "inputs.use_packaged_cli_artifact && steps.candidate-cache.outputs.hit != 'true'"
+        && windowsCacheMiss?.shell === windowsPowerShellShell
+        && windowsCacheMiss?.["continue-on-error"] === undefined
+        && hasExactKeys(object(windowsCacheMiss?.env), [
+          "ARTIFACT_ID",
+          "EXPECTED_SHA256",
+          "EXPECTED_SIZE",
+          "GH_TOKEN",
+        ])
+        && object(windowsCacheMiss?.env).ARTIFACT_ID
+          === "${{ steps.candidate-artifacts.outputs.package-id }}"
+        && object(windowsCacheMiss?.env).EXPECTED_SIZE
+          === "${{ steps.candidate-artifacts.outputs.package-bytes }}"
+        && object(windowsCacheMiss?.env).EXPECTED_SHA256
+          === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
+        && object(windowsCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
+      `${vulkanFile} large Windows Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
+    );
+    requireStepRun(
+      violations,
+      vulkanFile,
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+      [
+        "actions/artifacts/$env:ARTIFACT_ID/zip",
+        "--continue-at -",
+        "--max-time 120",
+        "$actualSize -ne [long]$env:EXPECTED_SIZE",
+        "$actualDigest -ne $env:EXPECTED_SHA256",
+        "extract-candidate-actions-artifact.py",
+        "candidate-archive-store.mjs admit",
+        "--store-root $store",
+        "--output-dir target/release-dist",
+      ],
+    );
+    add(
+      violations,
+      windowsDriverDownload?.if
+        === "${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}"
+        && windowsDriverDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(object(windowsDriverDownload?.with), ["name", "path"])
+        && object(windowsDriverDownload?.with).name
+          === "codestory-qualification-driver-windows-x64"
+        && object(windowsDriverDownload?.with).path
+          === "target/qualification-driver-artifact/windows-x64"
+        && stepIndex(job, "Authenticate exact Windows candidate artifacts")
+          < stepIndex(job, "Download authenticated candidate record")
+        && stepIndex(job, "Download authenticated candidate record")
+          < stepIndex(job, "Restore exact candidate archive from protected host")
+        && stepIndex(job, "Restore exact candidate archive from protected host")
+          < stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+        && stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+          < stepIndex(job, "Download separate authenticated qualification driver"),
+      `${vulkanFile} private Windows qualification driver must stay separate from the cached public candidate`,
     );
     const windowsDriverVerify = namedStep(job, "Verify packaged qualification driver");
     const windowsDriverVerifyRun = shellLiteralNormalizedText(
@@ -5732,12 +6808,12 @@ function validateRemainingWorkflows(workflows, violations) {
         )
         && windowsDriverVerifyRun.includes("--trusted-root $env:GITHUB_WORKSPACE")
         && windowsDriverVerifyRun.includes(
-          "--artifact-dir target/release-dist/qualification-driver/windows-x64",
+          "--artifact-dir target/qualification-driver-artifact/windows-x64",
         )
         && windowsDriverVerifyRun.includes("$result.driver")
         && windowsDriverVerifyRun.includes("$env:GITHUB_OUTPUT")
         && stepIndex(job, "Verify packaged qualification driver")
-          === stepIndex(job, "Download packaged CLI artifact") + 1,
+          === stepIndex(job, "Download separate authenticated qualification driver") + 1,
       `${vulkanFile} packaged qualification must verify the archive-bound private driver`,
     );
     add(
@@ -5747,26 +6823,11 @@ function validateRemainingWorkflows(workflows, violations) {
         "Verify packaged qualification driver",
         "Prove protected Windows Vulkan runtime",
         [
-          "Download exact-head publishable packet quality evidence",
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
         ],
       ),
       `${vulkanFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head publishable packet quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "inputs.quality_evidence_artifact != ''"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(qualityDownload?.with, ["name", "path"])
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence",
-      `${vulkanFile} qualification must download the exact protected Metal quality handoff`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -5784,7 +6845,6 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--server-behavior-only",
-      "Test-Path $qualityPath",
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
     const engineRun = stepRun(job, "Prove protected Windows Vulkan runtime");
@@ -5817,11 +6877,11 @@ function validateRemainingWorkflows(workflows, violations) {
         && engineRun.includes(
           '"--qualification-evidence", "target/windows-vulkan-proof/qualification.json"',
         )
-        && engineRun.includes('"--retrieval-quality-evidence", $qualityPath')
+        && !engineRun.includes("--retrieval-quality-evidence")
         && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
         && occurrenceCount(engineRun, "--calibration-bundle") === 1
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
-      `${vulkanFile} server-behavior proof must omit calibration while qualification runs one full lifecycle and quality proof`,
+      `${vulkanFile} server-behavior proof must omit calibration while qualification runs one lifecycle proof without optional quality`,
     );
     add(
       violations,
@@ -5987,13 +7047,10 @@ function validateRemainingWorkflows(workflows, violations) {
         requireOptionalStringInput(violations, linuxVulkanFile, linuxVulkan, event, key);
       }
       for (const key of ["quality_evidence_artifact", "quality_evidence_run_id"]) {
-        const input = object(at(linuxVulkan, "on", event, "inputs", key));
         add(
           violations,
-          input.required === false
-            && input.type === "string"
-            && (input.default === "" || input.default === undefined),
-          `${linuxVulkanFile} ${event} ${key} must be an optional empty string`,
+          at(linuxVulkan, "on", event, "inputs", key) === undefined,
+          `${linuxVulkanFile} ${event} must not accept ${key}`,
         );
       }
       add(
@@ -6120,14 +7177,15 @@ function validateRemainingWorkflows(workflows, violations) {
     });
     const packageAuthentication = namedStep(
       job,
-      "Authenticate exact Linux package producer",
+      "Authenticate exact Linux candidate artifacts",
     );
     const packageAuthenticationRun = shellLiteralNormalizedText(
-      stepRun(job, "Authenticate exact Linux package producer"),
+      stepRun(job, "Authenticate exact Linux candidate artifacts"),
     );
     add(
       violations,
-      packageAuthentication?.shell === "bash"
+      packageAuthentication?.id === "candidate-artifacts"
+        && packageAuthentication?.shell === "bash"
         && packageAuthentication?.if === undefined
         && packageAuthentication?.["continue-on-error"] === undefined
         && hasExactKeys(object(packageAuthentication?.env), [
@@ -6183,18 +7241,42 @@ function validateRemainingWorkflows(workflows, violations) {
           "test $(jq -r .conclusion <<<$run) = success",
         )
         && packageAuthenticationRun.includes(
-          ".name == codestory-cli-linux-x64",
+          "expected one exact candidate artifact",
         )
         && packageAuthenticationRun.includes(
-          ".workflow_run.id == $run_id",
+          "select_artifact codestory-cli-linux-x64",
         )
         && packageAuthenticationRun.includes(
-          ".workflow_run.head_sha == $sha",
+          "select_artifact codestory-candidate-archive-record-linux-x64",
         )
-        && packageAuthenticationRun.includes("test $artifact_count = 1"),
-      `${linuxVulkanFile} must authenticate one exact-head package from an allowlisted producer`,
+        && packageAuthenticationRun.includes(
+          "select_artifact codestory-qualification-driver-linux-x64",
+        )
+        && packageAuthenticationRun.includes(".workflow_run.id == $run_id")
+        && packageAuthenticationRun.includes(".workflow_run.head_sha == $sha")
+        && packageAuthenticationRun.includes("package-id=$artifact_id")
+        && packageAuthenticationRun.includes("package-bytes=$expected_size")
+        && packageAuthenticationRun.includes(
+          "package-sha256=${expected_digest#sha256:}",
+        ),
+      `${linuxVulkanFile} must authenticate one exact-head candidate record, package, and private driver from an allowlisted producer`,
     );
-    const packageDownload = namedStep(job, "Download exact Linux package");
+    const packageDownload = namedStep(
+      job,
+      "Download authenticated candidate record",
+    );
+    const linuxCacheRestore = namedStep(
+      job,
+      "Restore exact candidate archive from protected host",
+    );
+    const linuxCacheMiss = namedStep(
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+    );
+    const linuxDriverDownload = namedStep(
+      job,
+      "Download separate authenticated qualification driver",
+    );
     add(
       violations,
       packageDownload?.uses === "actions/download-artifact@v8.0.1"
@@ -6202,14 +7284,98 @@ function validateRemainingWorkflows(workflows, violations) {
           packageDownload?.with,
           ["name", "path", "run-id", "github-token"],
         )
-        && object(packageDownload.with).name === "codestory-cli-linux-x64"
-        && object(packageDownload.with).path === "target/release-dist"
+        && object(packageDownload.with).name
+          === "codestory-candidate-archive-record-linux-x64"
+        && object(packageDownload.with).path
+          === "target/candidate-archive-record/linux-x64"
         && object(packageDownload.with)["run-id"]
           === "${{ inputs.package_run_id || github.run_id }}"
         && object(packageDownload.with)["github-token"] === "${{ github.token }}"
-        && stepIndex(job, "Download exact Linux package")
-          === stepIndex(job, "Authenticate exact Linux package producer") + 1,
-      `${linuxVulkanFile} must consume only the authenticated Linux x64 package`,
+        && linuxCacheRestore?.id === "candidate-cache"
+        && linuxCacheRestore?.if === undefined
+        && linuxCacheRestore?.shell === "bash"
+        && linuxCacheRestore?.["continue-on-error"] === undefined,
+      `${linuxVulkanFile} protected cache lookup must consume only the exact small Linux candidate record`,
+    );
+    requireStepRun(
+      violations,
+      linuxVulkanFile,
+      job,
+      "Restore exact candidate archive from protected host",
+      [
+        "--arg repository \"$GITHUB_REPOSITORY\"",
+        "--arg source_sha \"$(git rev-parse HEAD)\"",
+        "--arg source_tree \"$(git rev-parse 'HEAD^{tree}')\"",
+        "--arg target linux-x64",
+        "$RUNNER_TOOL_CACHE/codestory/candidate-archives",
+        "candidate-archive-store.mjs restore",
+        "--record \"$record\"",
+        "--output-dir target/release-dist",
+        "echo \"hit=$hit\" >> \"$GITHUB_OUTPUT\"",
+      ],
+    );
+    add(
+      violations,
+      linuxCacheMiss?.if === "steps.candidate-cache.outputs.hit != 'true'"
+        && linuxCacheMiss?.shell === "bash"
+        && linuxCacheMiss?.["continue-on-error"] === undefined
+        && hasExactKeys(object(linuxCacheMiss?.env), [
+          "ARTIFACT_ID",
+          "EXPECTED_SHA256",
+          "EXPECTED_SIZE",
+          "GH_TOKEN",
+        ])
+        && object(linuxCacheMiss?.env).ARTIFACT_ID
+          === "${{ steps.candidate-artifacts.outputs.package-id }}"
+        && object(linuxCacheMiss?.env).EXPECTED_SIZE
+          === "${{ steps.candidate-artifacts.outputs.package-bytes }}"
+        && object(linuxCacheMiss?.env).EXPECTED_SHA256
+          === "${{ steps.candidate-artifacts.outputs.package-sha256 }}"
+        && object(linuxCacheMiss?.env).GH_TOKEN === "${{ github.token }}",
+      `${linuxVulkanFile} large Linux Actions artifact transfer must be cache-miss-only and outer-digest authenticated`,
+    );
+    requireStepRun(
+      violations,
+      linuxVulkanFile,
+      job,
+      "Download, authenticate, and admit candidate archive on miss",
+      [
+        "actions/artifacts/$ARTIFACT_ID/zip",
+        "--continue-at -",
+        "--max-time 120",
+        'test "$actual_size" = "$EXPECTED_SIZE"',
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
+        "extract-candidate-actions-artifact.py",
+        "candidate-archive-store.mjs admit",
+        "--store-root \"$RUNNER_TOOL_CACHE/codestory/candidate-archives\"",
+        "--output-dir target/release-dist",
+      ],
+    );
+    add(
+      violations,
+      linuxDriverDownload?.if === "${{ !inputs.server_behavior_only }}"
+        && linuxDriverDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(
+          object(linuxDriverDownload?.with),
+          ["name", "path", "run-id", "github-token"],
+        )
+        && object(linuxDriverDownload?.with).name
+          === "codestory-qualification-driver-linux-x64"
+        && object(linuxDriverDownload?.with).path
+          === "target/qualification-driver-artifact/linux-x64"
+        && object(linuxDriverDownload?.with)["run-id"]
+          === "${{ inputs.package_run_id || github.run_id }}"
+        && object(linuxDriverDownload?.with)["github-token"]
+          === "${{ github.token }}"
+        && stepIndex(job, "Authenticate exact Linux candidate artifacts")
+          < stepIndex(job, "Download authenticated candidate record")
+        && stepIndex(job, "Download authenticated candidate record")
+          < stepIndex(job, "Restore exact candidate archive from protected host")
+        && stepIndex(job, "Restore exact candidate archive from protected host")
+          < stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+        && stepIndex(job, "Download, authenticate, and admit candidate archive on miss")
+          < stepIndex(job, "Download separate authenticated qualification driver"),
+      `${linuxVulkanFile} private Linux qualification driver must stay separate from the cached public candidate`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -6257,13 +7423,13 @@ function validateRemainingWorkflows(workflows, violations) {
         )
         && linuxDriverVerifyRun.includes("--trusted-root $GITHUB_WORKSPACE")
         && linuxDriverVerifyRun.includes(
-          "--artifact-dir target/release-dist/qualification-driver/linux-x64",
+          "--artifact-dir target/qualification-driver-artifact/linux-x64",
         )
         && linuxDriverVerifyRun.includes(
           "echo path=$(jq -r .driver <<<$verified) >> $GITHUB_OUTPUT",
         )
         && stepIndex(job, "Verify packaged qualification driver")
-          === stepIndex(job, "Download exact Linux package") + 1,
+          === stepIndex(job, "Download separate authenticated qualification driver") + 1,
       `${linuxVulkanFile} packaged qualification must verify the archive-bound private driver`,
     );
     add(
@@ -6275,78 +7441,9 @@ function validateRemainingWorkflows(workflows, violations) {
         [
           "Authenticate calibration bundle producer",
           "Download frozen calibration bundle",
-          "Authenticate protected Metal quality producer",
-          "Download exact-head protected Metal quality evidence",
         ],
       ),
       `${linuxVulkanFile} must not replace the verified qualification driver before execution`,
-    );
-    const qualityAuthentication = namedStep(
-      job,
-      "Authenticate protected Metal quality producer",
-    );
-    const qualityAuthenticationRun = stepRun(
-      job,
-      "Authenticate protected Metal quality producer",
-    );
-    add(
-      violations,
-      qualityAuthentication?.if === "${{ !inputs.server_behavior_only }}"
-        && qualityAuthentication?.shell === "bash"
-        && hasExactKeys(qualityAuthentication?.env, [
-          "GH_TOKEN",
-          "QUALITY_ARTIFACT",
-          "QUALITY_RUN_ID",
-        ])
-        && object(qualityAuthentication?.env).GH_TOKEN === "${{ github.token }}"
-        && object(qualityAuthentication?.env).QUALITY_ARTIFACT
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityAuthentication?.env).QUALITY_RUN_ID
-          === "${{ inputs.quality_evidence_run_id }}"
-        && qualityAuthenticationRun.includes('test -n "$QUALITY_ARTIFACT"')
-        && qualityAuthenticationRun.includes('test -n "$QUALITY_RUN_ID"')
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.head_repository.full_name\' <<<"$run")" = "$GITHUB_REPOSITORY"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.path\' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.event\' <<<"$run")" = workflow_dispatch',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$(jq -r \'.conclusion\' <<<"$run")" = success',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$producer_sha" = "$(git rev-parse HEAD)"',
-        )
-        && qualityAuthenticationRun.includes(
-          'test "$QUALITY_ARTIFACT" = "frozen-candidate-quality-$producer_sha"',
-        )
-        && qualityAuthenticationRun.includes('test "$artifact_count" = 1'),
-      `${linuxVulkanFile} standalone qualification must authenticate exact-head protected Metal quality`,
-    );
-    const qualityDownload = namedStep(
-      job,
-      "Download exact-head protected Metal quality evidence",
-    );
-    add(
-      violations,
-      qualityDownload?.if === "${{ !inputs.server_behavior_only }}"
-        && qualityDownload?.uses === "actions/download-artifact@v8.0.1"
-        && hasExactKeys(
-          qualityDownload?.with,
-          ["name", "path", "run-id", "github-token"],
-        )
-        && object(qualityDownload?.with).name
-          === "${{ inputs.quality_evidence_artifact }}"
-        && object(qualityDownload?.with).path === "target/release-quality-evidence"
-        && object(qualityDownload?.with)["run-id"]
-          === "${{ inputs.quality_evidence_run_id }}"
-        && object(qualityDownload?.with)["github-token"] === "${{ github.token }}"
-        && stepIndex(job, "Download exact-head protected Metal quality evidence")
-          > stepIndex(job, "Authenticate protected Metal quality producer"),
-      `${linuxVulkanFile} standalone qualification must consume the authenticated protected Metal quality artifact`,
     );
     const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
     requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
@@ -6376,11 +7473,8 @@ function validateRemainingWorkflows(workflows, violations) {
       engineRun.includes("calibration_args=()")
         && engineRun.includes('"${calibration_args[@]}"')
         && engineRun.includes('claim_args=(--server-behavior-only)')
-        && engineRun.includes("quality_args=()")
         && engineRun.includes("qualification_args=()")
-        && normalizedEngineRun.includes(
-          "quality_args=(--retrieval-quality-evidence $quality_path)",
-        )
+        && !normalizedEngineRun.includes("--retrieval-quality-evidence")
         && normalizedEngineRun.includes("--produce-qualification-evidence")
         && object(engine?.env).VERIFIED_QUALIFICATION_DRIVER
           === "${{ steps.qualification-driver.outputs.path }}"
@@ -6399,7 +7493,7 @@ function validateRemainingWorkflows(workflows, violations) {
         && occurrenceCount(engineRun, "--produce-qualification-evidence") === 1
         && occurrenceCount(engineRun, "--calibration-bundle") === 1
         && occurrenceCount(engineRun, "check-packaged-agent-proof.py") === 1,
-      `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one full lifecycle and quality proof`,
+      `${linuxVulkanFile} server-behavior proof must omit calibration while standalone qualification runs one lifecycle proof without optional quality`,
     );
     requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
       "--prepare-candidate-installed-proof",
@@ -6474,6 +7568,16 @@ function validateRemainingWorkflows(workflows, violations) {
           === JSON.stringify(["self-hosted", "Linux", "X64", "codestory-linux-vulkan"])
         && optionalCalibration.environment === "linux-vulkan-proof",
       `${linuxVulkanFile} optional calibration must be a standalone protected manual Vulkan job`,
+    );
+    requireStepRun(
+      violations,
+      linuxVulkanFile,
+      optionalCalibration,
+      "Prepare checksum-pinned embedded model",
+      [
+        "node scripts/prepare-embedded-model.mjs",
+        '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+      ],
     );
     const optionalCollectorName = "Collect optional Linux Vulkan constant calibration";
     requireStepRun(violations, linuxVulkanFile, optionalCalibration, optionalCollectorName, [
@@ -7222,9 +8326,22 @@ export function absorbedFailureViolations(workflows) {
       // A job-level `continue-on-error` downgrades every step it contains at once, and the only
       // thing that can still require the failure is a downstream job reading `needs.<id>.result`.
       if (absorbs(job["continue-on-error"])) {
+        // The separately validated frozen-candidate adjunct is intentionally unclaimed and non-gating,
+        // including runner loss and timeout. It cannot appear in a downstream `needs` edge:
+        // doing so would turn optional evidence back into a closeout dependency. Its exact job
+        // structure, activation, protected host, cache boundary, evaluator, and outcome recorder
+        // are pinned by validatePackagedCoordinator and the whole-workflow digest.
+        const isOptionalFrozenCandidateQuality =
+          file === frozenCandidateQualityWorkflowRef.slice(
+            frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
+          )
+          && jobId === "quality";
         add(
           violations,
-          scalarStrings(workflow.jobs).some(text => text.includes(`needs.${jobId}.result`)),
+          isOptionalFrozenCandidateQuality
+            || scalarStrings(workflow.jobs).some(
+              text => text.includes(`needs.${jobId}.result`),
+            ),
           `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
         );
       }
@@ -7414,6 +8531,26 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
   requireStepRun(violations, releaseFile, job, "Decide withheld accelerator hosts", [
     "node .github/scripts/lost-runner-recovery.mjs plan-non-claim",
   ]);
+  const recordDownload = namedStep(
+    job,
+    "Download authenticated candidate records for withheld identity",
+  );
+  add(
+    violations,
+    recordDownload?.if === "steps.non-claim.outputs.withheld_hosts != ''"
+      && recordDownload?.uses === "actions/download-artifact@v8.0.1"
+      && hasExactKeys(object(recordDownload?.with), [
+        "merge-multiple",
+        "path",
+        "pattern",
+      ])
+      && object(recordDownload?.with).pattern
+        === "codestory-candidate-archive-record-*"
+      && object(recordDownload?.with).path
+        === "target/release-non-claim/candidate-records"
+      && object(recordDownload?.with)["merge-multiple"] === false,
+    `${releaseFile} non-claim producer must download only tiny authenticated candidate records`,
+  );
   const record = namedStep(job, "Record populated accelerator non-claims");
   add(
     violations,
@@ -7423,7 +8560,18 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
   requireStepRun(violations, releaseFile, job, "Record populated accelerator non-claims", [
     "scripts/codestory-release-cell-manifest.mjs withhold",
     '--producer-run-attempt "$GITHUB_RUN_ATTEMPT"',
+    '--candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json"',
   ]);
+  add(
+    violations,
+    !shellLiteralNormalizedText(stepRun(
+      job,
+      "Record populated accelerator non-claims",
+    )).includes("--archive ")
+      && !scalarStrings(recordDownload).some(value =>
+        value.includes("codestory-cli-")),
+    `${releaseFile} non-claim producer must never transfer or read a large package archive`,
+  );
   // A non-claim producer that emitted evidence for a host that reported would overwrite a real
   // proof, so every upload is bound to the classifier's own withheld list. Each closeout phase gets
   // its own container: a phase authorizes every manifest inside the container it downloads, so a
@@ -7471,15 +8619,19 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     }],
     ["packaged-platform-proof.yml/build/Upload release asset", {
       name: "codestory-cli-${{ matrix.asset_target }}",
-      path: "target/release-dist/*.tar.gz\ntarget/release-dist/*.zip\ntarget/release-dist/*.sha256\ntarget/release-dist/SHA256SUMS.txt\ntarget/release-dist/qualification-driver/${{ matrix.asset_target }}\n",
+      path: "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}\ntarget/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}.sha256\ntarget/release-dist/SHA256SUMS.txt\n",
+    }],
+    ["packaged-platform-proof.yml/build/Upload exact candidate archive record", {
+      name: "codestory-candidate-archive-record-${{ matrix.asset_target }}",
+      path: "target/candidate-archive-record/${{ matrix.asset_target }}/candidate-archive-record.json",
+    }],
+    ["packaged-platform-proof.yml/build/Upload separate qualification driver", {
+      name: "codestory-qualification-driver-${{ matrix.asset_target }}",
+      path: "target/release-dist/qualification-driver/${{ matrix.asset_target }}",
     }],
     ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
       name: "embedding-calibration-macos-${{ inputs.version }}",
       path: "target/calibration-runs/macos",
-    }],
-    ["macos-metal-proof.yml/packaged-metal/Upload exact-head protected Metal quality evidence", {
-      name: "frozen-candidate-quality-${{ inputs.ref || github.sha }}",
-      path: "target/release-quality-evidence",
     }],
     ["release.yml/pre-publish-closeout/Upload accepted pre-publish closeout", {
       name: "release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}",
@@ -8021,6 +9173,17 @@ export function validateMarketplaceSync(workflows, violations) {
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...retrievalGeneralizationSuitePolicyViolations(
+    fs.readFileSync(
+      path.join(repositoryRoot, retrievalGeneralizationSuiteFile),
+      "utf8",
+    ),
+    {
+      legacyWrapperPresent:
+        fs.existsSync(path.join(repositoryRoot, legacyRetrievalGeneralizationWrapper))
+        || serializedRustRetrievalWrapperPresent(),
+    },
+  ));
   violations.push(...qualificationDriverArtifactViolations(
     fs.readFileSync(
       path.join(

@@ -14,7 +14,7 @@ Criterion targets.
 | --- | --- | --- |
 | Rust formatting or local logic | `cargo fmt --all -- --check`; owning crate tests | Workspace check/test/clippy |
 | Store/publication | Store tests plus named fault/concurrency cases | Workspace source gate |
-| Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run quality/performance gate and required hardware proof |
+| Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run performance gate, optional exact-candidate quality report, and required hardware proof |
 | CLI/stdio | Named CLI contract suites | Workspace source gate and packaged proof when package behavior changed |
 | Plugin launcher or CodeStoryDev staging | Installer tests plus `plugin-static` | Packaged plugin handoff |
 | Worktree setup | Node suite plus one platform adapter smoke | Mac/Windows platform cell when adapter changed |
@@ -195,13 +195,19 @@ dispatched Linux Vulkan calibration may emit optional diagnostic evidence, but
 it does not feed or block the frozen calibration bundle.
 
 Frozen-candidate qualification is a separate one-run-per-platform lane.
-Protected Metal produces the exact three-task, three-repeat holdout quality
-artifact from the packaged candidate, then Metal and Windows Vulkan each run
-the full lifecycle, fault, true-idle, memory, quality, and accelerator suite
-once. Protected Linux Vulkan may consume those exact package, calibration, and
-quality artifacts through a standalone dispatch when its GPU runner is online;
-it is not a coordinator closeout dependency and cannot block qualification
-when that runner is absent.
+Metal and Windows Vulkan each run the full lifecycle, fault, true-idle, memory,
+and accelerator suite once. Protected Linux Vulkan may run that same
+qualification through a standalone dispatch when its GPU runner is online; it
+is not a coordinator closeout dependency and cannot block qualification when
+that runner is absent.
+
+Answer quality is a separate, optional frozen-candidate adjunct. After the
+protected Metal package proof, it runs the checksum-bound Axios JavaScript and
+TypeScript v2 task for three cold-CLI repeats against the same authenticated
+macOS archive. Its failure or absence cannot block Metal, Windows, Linux, or
+closeout, and the standard release makes no answer-quality claim. Promotion and
+release decisions consume the coordinator's `closeout` job result directly;
+they do not wait for this optional job or for workflow-wide completion.
 
 ### Packaged proof
 
@@ -287,20 +293,24 @@ Before replacing a model or native embedding implementation, compare incumbent
 and candidate in the same release build on the same machine. Keep that
 measurement selector private and delete it before merge. A server-ownership
 cutover does not relabel pre-fault and post-fault searches as two
-implementations: it consumes the existing exact-head
-`publishable-three-repeat-packet/v1` artifact and derives the pass rate from
-every row and repeat. Freeze every production timing value and qualification
-threshold before running the unchanged qualification candidate; a result
-cannot define its own pass threshold.
+implementations. The separate frozen-candidate quality adjunct consumes the
+existing `publishable-three-repeat-packet/v1` evaluation contract and derives
+the pass rate from every scoped Axios v2 row and repeat. Freeze every
+production timing value and qualification threshold before running the
+unchanged qualification candidate; a result cannot define its own pass
+threshold.
 
 Measure existing-owner connect, listener spawn, first residency, first product
 ready, warm query/bulk IPC, bulk documents and tokens per second, useful retry
 latency, true-idle exit, total CodeStory process memory, accelerator residency,
-retrieval quality, multi-process reuse, and restart reuse separately. Use
+retrieval quality, multi-process reuse, and restart reuse separately. Retrieval
+quality remains evaluation evidence, not a required lifecycle-qualification
+metric. Use
 awake-time monotonic clocks within each process; never subtract timestamps from
-different process origins. Quality cannot regress. A repeatable throughput,
-warm-latency, or memory regression blocks the cutover; 5% is measurement noise,
-not an accepted sustained loss.
+different process origins. Report quality separately as unclaimed optional
+evidence; its absence or result does not gate qualification or release. A
+repeatable throughput, warm-latency, or memory regression blocks the cutover;
+5% is measurement noise, not an accepted sustained loss.
 
 Historical reference: 368-372 documents/sec, 84.7 ms cross-repository search
 p95, MRR@10 0.9824, Hit@10 1.0, Hit@1 0.973, and 829-1,020 MB peak working set.

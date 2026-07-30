@@ -1399,6 +1399,7 @@ test("a release that withholds every accelerator host is refused, not published"
     JSON.stringify(result.summary.input_errors),
   );
   assert.deepEqual(result.ledger.withhold_policy, {
+    archive_identity_source: withholdPolicy.archive_identity_source,
     claims_requiring_proof: [...withholdPolicy.claims_requiring_proof],
     maximum_withheld_hosts: withholdPolicy.maximum_withheld_hosts,
   });

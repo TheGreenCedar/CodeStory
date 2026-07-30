@@ -54,7 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-behavior-only", action="store_true")
     parser.add_argument("--ground-only", action="store_true")
     parser.add_argument("--publication-fault-evidence", type=Path)
-    parser.add_argument("--retrieval-quality-evidence", type=Path)
     parser.add_argument("--calibration-bundle", type=Path)
     parser.add_argument("--enforce-calibration-freeze-lineage", action="store_true")
     parser.add_argument("--collect-constant-calibration", action="store_true")
@@ -98,7 +97,6 @@ def _resolve_optional_paths(args: argparse.Namespace) -> None:
         "qualification_evidence",
         "qualification_driver",
         "publication_fault_evidence",
-        "retrieval_quality_evidence",
         "calibration_bundle",
         "installed_plugin_attestation",
         "installed_plugin_data",
@@ -129,7 +127,6 @@ def _validate_calibration_mode(args: argparse.Namespace) -> None:
             and not args.produce_qualification_evidence
             and args.qualification_evidence is None
             and args.publication_fault_evidence is None
-            and args.retrieval_quality_evidence is None
             and args.calibration_bundle is None,
             "constant calibration requires its isolated GPU-only collector and rejects project, plugin, or qualification inputs",
         )

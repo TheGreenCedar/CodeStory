@@ -39,8 +39,10 @@ import {
   releaseProofCpuSelectorViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
+  retrievalGeneralizationSuitePolicyViolations,
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
+  rustRetrievalWrapperSourcePresent,
   shellDependentBindingViolations,
   validateCargoTestFilters,
   validateWorkflows,
@@ -965,9 +967,10 @@ test("constant calibration structure rejects qualification, 3x3 sampling, repeat
   }
 });
 
-test("frozen-candidate qualification keeps the Metal quality handoff and optional Linux topology", async (t) => {
+test("frozen-candidate quality stays optional, exact, and archive-authenticated", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const coordinatorFile = "packaged-platform-pr.yml";
+  const qualityFile = "frozen-candidate-quality.yml";
   const metalFile = "macos-metal-proof.yml";
   const windowsFile = "windows-vulkan-proof.yml";
   const linuxFile = "linux-vulkan-proof.yml";
@@ -985,22 +988,14 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
     }, /qualification must run full Metal proof rather than candidate-installed proof/u],
     ["Metal qualification becomes server-behavior only", coordinatorFile, workflow => {
       workflow.jobs["macos-metal-proof"].with.server_behavior_only = true;
-    }, /qualification must run full Metal quality and lifecycle proof/u],
-    ["Windows no longer waits for Metal", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].needs
-        = workflow.jobs["windows-vulkan-proof"].needs
-          .filter(name => name !== "macos-metal-proof");
-    }, /Windows qualification must wait for successful protected Metal quality/u],
-    ["Windows ignores failed Metal qualification", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].if
-        = workflow.jobs["windows-vulkan-proof"].if.replace(
-          "(needs.route.outputs.mode != 'qualification' || needs.macos-metal-proof.result == 'success') &&",
-          "",
-        );
-    }, /qualification requires successful Metal/u],
-    ["Windows qualification loses exact quality artifact", coordinatorFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact = "";
-    }, /must consume the exact protected Metal quality artifact/u],
+    }, /qualification must run one full Metal lifecycle proof without optional quality inputs/u],
+    ["Windows qualification waits for optional quality", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].needs.push("frozen-candidate-quality");
+    }, /Windows qualification must run independently of optional Metal quality|reviewed frozen-candidate coordinator structure/u],
+    ["Windows qualification consumes optional quality", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact =
+        "${{ needs.frozen-candidate-quality.outputs.artifact }}";
+    }, /Windows qualification must not consume optional quality evidence/u],
     ["Windows qualification becomes candidate-installed only", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
     }, /qualification must run full Windows proof rather than candidate-installed proof/u],
@@ -1068,66 +1063,178 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
         "Require one coherent accepted proof",
       ).env.MODE = "qualification ";
     }, /closeout proof must bind every route and platform result from the reviewed jobs exactly/u],
-    ["Metal quality producer runs during calibration", metalFile, workflow => {
-      draftStep(
-        workflow.jobs["packaged-metal"],
-        "Produce exact-head holdout quality on protected Metal",
-      ).if = "${{ !inputs.server_behavior_only }}";
-    }, /must generate one exact-head three-repeat holdout quality artifact/u],
-    ["Metal quality producer weakens repeat contract", metalFile, workflow => {
-      const producer = draftStep(
-        workflow.jobs["packaged-metal"],
-        "Produce exact-head holdout quality on protected Metal",
+    ["optional quality caller attempts unsupported advisory syntax", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"]["continue-on-error"] = true;
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality owner job becomes blocking", qualityFile, workflow => {
+      workflow.jobs.quality["continue-on-error"] = false;
+    }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional quality runs outside qualification", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"].if
+        = workflow.jobs["frozen-candidate-quality"].if.replace(
+          "needs.route.outputs.mode == 'qualification'",
+          "needs.route.outputs.mode == 'platform'",
+        );
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality no longer waits for Metal", coordinatorFile, workflow => {
+      workflow.jobs["frozen-candidate-quality"].needs
+        = workflow.jobs["frozen-candidate-quality"].needs
+          .filter(name => name !== "macos-metal-proof");
+    }, /optional quality must call its isolated owner once after protected Metal/u],
+    ["optional quality moves off the protected Metal host", qualityFile, workflow => {
+      workflow.jobs.quality["runs-on"]
+        = ["self-hosted", "Linux", "X64", "codestory-vulkan"];
+    }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional quality stops authenticating the current run attempt", qualityFile, workflow => {
+      const authentication = draftStep(
+        workflow.jobs.quality,
+        "Authenticate exact candidate archive artifacts",
       );
-      producer.run = producer.run.replace("--repeats 3", "--repeats 1");
-    }, /must generate one exact-head three-repeat holdout quality artifact/u],
-    ["Metal quality upload loses exact-head name", metalFile, workflow => {
+      authentication.run = authentication.run.replace(
+        'test "$(jq -r \'.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
+        "true",
+      );
+    }, /authenticate one current-run exact-head candidate archive and record/u],
+    ["optional quality cache accepts another source SHA", qualityFile, workflow => {
+      const restore = draftStep(
+        workflow.jobs.quality,
+        "Restore exact candidate archive from protected host",
+      );
+      restore.run = restore.run.replace(".source.commit == $source_sha", "true");
+    }, /step Restore exact candidate archive from protected host must run \.source\.commit == \$source_sha/u],
+    ["optional quality archive transfer becomes unconditional", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Download, authenticate, and admit candidate archive on miss",
+      ).if;
+    }, /archive transfer must be cache-miss-only and outer-digest authenticated/u],
+    ["optional quality archive skips the outer digest", qualityFile, workflow => {
+      const miss = draftStep(
+        workflow.jobs.quality,
+        "Download, authenticate, and admit candidate archive on miss",
+      );
+      miss.run = miss.run.replace(
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
+        "true",
+      );
+    }, /step Download, authenticate, and admit candidate archive on miss must run test "\$actual_digest" = "\$EXPECTED_SHA256"/u],
+    ["optional quality restores the v1 corpus", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replaceAll(
+        "codestory-release-corpus-v0.16-axios-js-ts-v2",
+        "codestory-release-corpus-v1",
+      ).replace(
+        "v0.16-axios-js-ts-v2.json",
+        "holdout-retrieval-v1.json",
+      );
+    }, /reviewed isolated evaluation-owner structure/u],
+    ["optional quality selects the old Axios task", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "axios-request-dispatch-v2.task.json",
+        "axios-request-dispatch.task.json",
+      );
+    }, /reviewed isolated evaluation-owner structure/u],
+    ["optional quality appends a second task manifest", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "--materialize-repos",
+        "--task-manifest benchmarks/tasks/extra.task.json \\\n            --materialize-repos",
+      );
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality widens selection to a suite", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace(
+        "--materialize-repos",
+        "--task-suite holdout-retrieval \\\n            --materialize-repos",
+      );
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality restores nested repeats", qualityFile, workflow => {
+      const producer = draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      );
+      producer.run = producer.run.replace("--repeats 3", "--repeats 9");
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality permits CPU fallback", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-metal"],
-        "Upload exact-head protected Metal quality evidence",
-      ).with.name = "frozen-candidate-quality";
-    }, /must upload one exact-head stable handoff/u],
-    ["Metal quality upload loses safe overwrite", metalFile, workflow => {
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      ).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality measurement becomes blocking", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Produce optional Axios v2 quality evidence",
+      )["continue-on-error"];
+    }, /run exactly one pinned three-repeat publishable evaluator/u],
+    ["optional quality upload becomes blocking", qualityFile, workflow => {
+      delete draftStep(
+        workflow.jobs.quality,
+        "Upload optional Axios v2 quality evidence",
+      )["continue-on-error"];
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["optional quality outcome recorder is no longer unconditional", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-metal"],
-        "Upload exact-head protected Metal quality evidence",
-      ).with.overwrite = false;
-    }, /must upload one exact-head stable handoff/u],
-    ["Windows downloads an unrelated quality artifact", windowsFile, workflow => {
+        workflow.jobs.quality,
+        "Record optional quality outcome",
+      ).if = "steps.quality.outcome == 'success'";
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["optional quality outcome recorder uses a hardcoded sentinel", qualityFile, workflow => {
       draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Download exact-head publishable packet quality evidence",
-      ).with.name = "latest-quality";
-    }, /must download the exact protected Metal quality handoff/u],
+        workflow.jobs.quality,
+        "Record optional quality outcome",
+      ).env.QUALITY_OUTCOME = "success";
+    }, /report both outcomes without becoming a qualification or release gate/u],
+    ["closeout adds optional quality as a dependency", coordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("frozen-candidate-quality");
+    }, /closeout must wait for every selected platform proof|normal closeout must not depend on optional release or quality evidence/u],
+    ["Metal lifecycle accepts quality evidence again", metalFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept optional quality evidence/u],
+    ["Windows lifecycle accepts quality evidence again", windowsFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept optional quality evidence/u],
+    ["Linux lifecycle accepts quality evidence again", linuxFile, workflow => {
+      workflow.on.workflow_call.inputs.quality_evidence_artifact = {
+        required: false,
+        type: "string",
+        default: "",
+      };
+    }, /workflow_call must not accept quality_evidence_artifact/u],
     ["Linux full qualification skips retained-driver verification", linuxFile, workflow => {
       draftStep(
         workflow.jobs["packaged-vulkan"],
         "Verify packaged qualification driver",
       ).if = "${{ inputs.server_behavior_only }}";
     }, /packaged qualification must verify the archive-bound private driver/u],
-    ["Linux trusts quality from another workflow", linuxFile, workflow => {
-      const authenticate = draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Authenticate protected Metal quality producer",
-      );
-      authenticate.run = authenticate.run.replace(
-        ".github/workflows/packaged-platform-pr.yml",
-        ".github/workflows/release.yml",
-      );
-    }, /must authenticate exact-head protected Metal quality/u],
-    ["Linux quality download loses producer run identity", linuxFile, workflow => {
-      draftStep(
-        workflow.jobs["packaged-vulkan"],
-        "Download exact-head protected Metal quality evidence",
-      ).with["run-id"] = "${{ github.run_id }}";
-    }, /must consume the authenticated protected Metal quality artifact/u],
     ["Linux standalone path removes lifecycle qualification", linuxFile, workflow => {
       const proof = draftStep(
         workflow.jobs["packaged-vulkan"],
         "Prove offline Linux Vulkan retrieval",
       );
       proof.run = proof.run.replace("--produce-qualification-evidence", "--server-behavior-only");
-    }, /standalone qualification runs one full lifecycle and quality proof/u],
+    }, /standalone qualification runs one lifecycle proof without optional quality/u],
   ];
 
   for (const [name, file, mutate, expected] of mutations) {
@@ -1146,6 +1253,30 @@ test("frozen-candidate qualification keeps the Metal quality handoff and optiona
     ["quality producer moves off protected Metal", graph => {
       graph.workflow_policy.qualification.quality_contract.producer_cell
         = "protected_windows_x64_vulkan";
+    }],
+    ["quality becomes a release gate", graph => {
+      graph.workflow_policy.qualification.quality_contract.blocking = true;
+    }],
+    ["quality becomes a claimed result", graph => {
+      graph.workflow_policy.qualification.quality_contract.claimed = true;
+    }],
+    ["quality stops using the global exact-package cache contract", graph => {
+      graph.workflow_policy.qualification.quality_contract.archive_cache_contract
+        = "mutable_candidate_cache";
+    }],
+    ["quality owner moves back into a protected product boundary", graph => {
+      graph.workflow_policy.qualification.quality_contract.evaluation_owner
+        = "protected_product_path";
+    }],
+    ["quality owner digest no longer binds the reviewed evaluator", graph => {
+      graph.workflow_policy.qualification.quality_contract.evaluation_owner_sha256
+        = "0".repeat(64);
+    }],
+    ["quality re-enters required qualification evidence", graph => {
+      graph.workflow_policy.qualification.required_evidence.push("retrieval_quality");
+    }],
+    ["Metal lifecycle claims it produces quality again", graph => {
+      graph.workflow_policy.qualification.required_cells[0].produces_quality = true;
     }],
     ["true-idle grace replaces the product timeout", graph => {
       graph.workflow_policy.qualification.true_idle_timeout_ms = 2_500;
@@ -1192,25 +1323,25 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
@@ -1244,13 +1375,11 @@ test("qualification driver is built once, retained privately, authenticated, and
         '--target-dir "${CARGO_TARGET_DIR:-target}"',
       );
     }, /retain one archive-bound private qualification driver beside each selected package/u],
-    ["package artifact drops private driver directory", packagedFile, workflow => {
+    ["public package artifact admits the private driver", packagedFile, workflow => {
       const upload = draftStep(packagedJob(workflow), "Upload release asset");
-      upload.with.path = upload.with.path.replace(
-        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n",
-        "",
-      );
-    }, /existing package artifact must retain the private driver directory/u],
+      upload.with.path +=
+        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
     ["public archive includes qualification driver", packagedFile, workflow => {
       draftStep(packagedJob(workflow), "Package release asset").run +=
         "\ntar -rf \"$archive\" target/release-dist/qualification-driver";
@@ -1331,17 +1460,17 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Windows trusts an arbitrary producer workflow", windowsFile, workflow => {
       const authenticate = draftStep(
         windowsJob(workflow),
-        "Authenticate exact Windows package producer",
+        "Authenticate exact Windows candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         '$env:CANDIDATE_PRODUCER_WORKFLOW_PATH -notin $allowedWorkflows',
         "$false",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate the exact candidate record, package, and private driver from an allowlisted producer/u],
     ["Windows executes an unverified driver", windowsFile, workflow => {
       draftStep(windowsJob(workflow), "Prove protected Windows Vulkan runtime")
         .env.VERIFIED_QUALIFICATION_DRIVER = "target/release/other.exe";
-    }, /server-behavior proof must omit calibration while qualification runs one full lifecycle/u],
+    }, /server-behavior proof must omit calibration while qualification runs one lifecycle proof without optional quality/u],
     ["Windows substitutes driver after verification", windowsFile, workflow => {
       const steps = windowsJob(workflow).steps;
       const verifyIndex = steps.findIndex(
@@ -1363,17 +1492,17 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux trusts an arbitrary producer workflow", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'case "$CANDIDATE_PRODUCER_WORKFLOW_PATH" in',
         'case ".github/workflows/packaged-platform-pr.yml" in',
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux allowlist admits an untrusted producer through dead checks", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         ".github/workflows/packaged-platform-pr.yml)",
@@ -1387,7 +1516,7 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux producer path equality becomes advisory", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'test "$(jq -r \'.path\' <<<"$run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"',
@@ -1397,23 +1526,23 @@ test("qualification driver is built once, retained privately, authenticated, and
     ["Linux accepts an incomplete external package run", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         'test "$(jq -r \'.conclusion\' <<<"$run")" = success',
         "true",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux accepts a package artifact from another head", linuxFile, workflow => {
       const authenticate = draftStep(
         linuxJob(workflow),
-        "Authenticate exact Linux package producer",
+        "Authenticate exact Linux candidate artifacts",
       );
       authenticate.run = authenticate.run.replace(
         "and .workflow_run.head_sha == $sha",
         "",
       );
-    }, /authenticate one exact-head package from an allowlisted producer/u],
+    }, /authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u],
     ["Linux executes a hardcoded driver", linuxFile, workflow => {
       draftStep(linuxJob(workflow), "Prove offline Linux Vulkan retrieval").run =
         draftStep(linuxJob(workflow), "Prove offline Linux Vulkan retrieval").run
@@ -1421,7 +1550,7 @@ test("qualification driver is built once, retained privately, authenticated, and
             '--qualification-driver "$qualification_driver"',
             "--qualification-driver target/release/other-driver",
           );
-    }, /standalone qualification runs one full lifecycle and quality proof/u],
+    }, /standalone qualification runs one lifecycle proof without optional quality/u],
     ["Linux substitutes driver after verification", linuxFile, workflow => {
       const steps = linuxJob(workflow).steps;
       const verifyIndex = steps.findIndex(
@@ -1577,6 +1706,411 @@ test("qualification driver retention breaks a Cargo source hardlink and rejects 
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows packages one release graph into exact public and private artifacts", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "packaged-platform-proof.yml";
+  const job = workflow => workflow.jobs.build;
+  const step = (workflow, name) => draftStep(job(workflow), name);
+  const replaceRun = (workflow, name, from, to) => {
+    const selected = step(workflow, name);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${name}`);
+  };
+  const mutations = [
+    ["a second Windows Cargo build appears in another step", workflow => {
+      job(workflow).steps.push({
+        name: "Rebuild a Windows regression",
+        if: "runner.os == 'Windows'",
+        shell: "bash",
+        run: "cargo build --release --locked -p codestory-workspace --test windows_path_identity",
+      });
+    }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
+    ["the one package build invokes Cargo twice", workflow => {
+      step(workflow, "Build package and qualification driver").run +=
+        "\ncargo build --release --locked -p codestory-cli";
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    ["the package graph loses release mode", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        "cargo build --release --locked",
+        "cargo build --locked",
+      );
+    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    ["the path regression is replaced by a debug output", workflow => {
+      step(workflow, "Prove native workspace path identity").env.TEST_BINARY =
+        "target/debug/deps/windows_path_identity.exe";
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    ["the staging regression is replaced by a debug output", workflow => {
+      step(workflow, "Test immutable native staging on Windows").env.TEST_BINARY =
+        "target/debug/deps/native_staging.exe";
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    ["Windows packaging is fed a debug CLI", workflow => {
+      step(workflow, "Package release asset on Windows").env.WINDOWS_CLI =
+        "target/debug/codestory-cli.exe";
+    }, /Windows packaging must verify and package only the exact Cargo-selected release binary/u],
+    ["the public artifact uses a broad release glob", workflow => {
+      step(workflow, "Upload release asset").with.path = "target/release-dist/**";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the public artifact includes the private qualification driver", workflow => {
+      step(workflow, "Upload release asset").with.path +=
+        "target/release-dist/qualification-driver/${{ matrix.asset_target }}\n";
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the public artifact drops its candidate-local checksum manifest", workflow => {
+      const upload = step(workflow, "Upload release asset");
+      upload.with.path = upload.with.path.replace(
+        "target/release-dist/SHA256SUMS.txt\n",
+        "",
+      );
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files/u],
+    ["the candidate record is not source-SHA bound", workflow => {
+      replaceRun(
+        workflow,
+        "Produce exact candidate archive record",
+        '--source-sha "$SOURCE_SHA"',
+        '--source-sha "$GITHUB_SHA"',
+      );
+    }, /Produce exact candidate archive record must run --source-sha/u],
+    ["the candidate-record artifact is missing", workflow => {
+      job(workflow).steps = job(workflow).steps.filter(
+        ({ name }) => name !== "Upload exact candidate archive record",
+      );
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact name drifts", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.name =
+        "codestory-candidate-record-${{ matrix.asset_target }}";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact path drifts", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.path =
+        "target/release-dist/candidate-archive-record.json";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the candidate-record artifact stops replacing its same-run stable name", workflow => {
+      step(workflow, "Upload exact candidate archive record").with.overwrite = false;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact is missing", workflow => {
+      job(workflow).steps = job(workflow).steps.filter(
+        ({ name }) => name !== "Upload separate qualification driver",
+      );
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact name drifts", workflow => {
+      step(workflow, "Upload separate qualification driver").with.name =
+        "qualification-driver-${{ matrix.asset_target }}";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact path drifts", workflow => {
+      step(workflow, "Upload separate qualification driver").with.path =
+        "target/release-dist/qualification-driver";
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact is uploaded unconditionally", workflow => {
+      delete step(workflow, "Upload separate qualification driver").if;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the separate qualification-driver artifact stops replacing its same-run stable name", workflow => {
+      step(workflow, "Upload separate qualification driver").with.overwrite = false;
+    }, /candidate record and private qualification driver must be separate exact stable artifacts/u],
+    ["the public package stable artifact stops replacing its same-run name", workflow => {
+      step(workflow, "Upload release asset").with.overwrite = false;
+    }, /public package artifact must contain exactly the archive and its two candidate-local checksum files|stable release artifact/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("protected candidate consumers key cache reuse by exact source and transfer only on miss", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const replaceRun = (workflow, jobName, stepName, from, to) => {
+    const selected = draftStep(workflow.jobs[jobName], stepName);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${stepName}`);
+  };
+  const cases = [
+    {
+      file: "macos-metal-proof.yml",
+      job: "packaged-metal",
+      authentication: "Authenticate exact candidate artifacts",
+      authenticationSha: ".workflow_run.head_sha == $sha",
+      authenticationExpected: /Authenticate exact candidate artifacts must run .workflow_run.head_sha == \$sha/u,
+      recordName: "codestory-candidate-archive-record-macos-arm64",
+      recordExpected: /protected cache lookup must consume only the exact small candidate record/u,
+      restoreSha: ".source.commit == $source_sha",
+      missIf: "inputs.use_packaged_cli_artifact",
+      missExpected: /large Actions artifact transfer must be a cache-miss-only authenticated boundary/u,
+      driverName: "codestory-qualification-driver-macos-arm64",
+      driverExpected: /private driver must remain a separate authenticated artifact after candidate cache resolution/u,
+      modelCache: '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+    },
+    {
+      file: "windows-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      authentication: "Authenticate exact Windows candidate artifacts",
+      authenticationSha: "$_.workflow_run.head_sha -eq $sourceSha",
+      authenticationExpected: /packaged proof must authenticate the exact candidate record, package, and private driver from an allowlisted producer/u,
+      recordName: "codestory-candidate-archive-record-windows-x64",
+      recordExpected: /protected cache lookup must consume only the exact small Windows candidate record/u,
+      restoreSha: "$record.source.commit -ne $sourceSha",
+      missIf: "inputs.use_packaged_cli_artifact",
+      missExpected: /large Windows Actions artifact transfer must be cache-miss-only and outer-digest authenticated/u,
+      driverName: "codestory-qualification-driver-windows-x64",
+      driverExpected: /private Windows qualification driver must stay separate from the cached public candidate/u,
+      modelCache: '--cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"',
+    },
+    {
+      file: "linux-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      authentication: "Authenticate exact Linux candidate artifacts",
+      authenticationSha: ".workflow_run.head_sha == $sha",
+      authenticationExpected: /must authenticate one exact-head candidate record, package, and private driver from an allowlisted producer/u,
+      recordName: "codestory-candidate-archive-record-linux-x64",
+      recordExpected: /protected cache lookup must consume only the exact small Linux candidate record/u,
+      restoreSha: ".source.commit == $source_sha",
+      missIf: "true",
+      missExpected: /large Linux Actions artifact transfer must be cache-miss-only and outer-digest authenticated/u,
+      driverName: "codestory-qualification-driver-linux-x64",
+      driverExpected: /private Linux qualification driver must stay separate from the cached public candidate/u,
+    },
+  ];
+
+  for (const platform of cases) {
+    await t.test(`${platform.file}: producer artifact SHA check removed`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      replaceRun(
+        workflow,
+        platform.job,
+        platform.authentication,
+        platform.authenticationSha,
+        "true",
+      );
+      assert.match(validateWorkflows(workflows).join("\n"), platform.authenticationExpected);
+    });
+
+    await t.test(`${platform.file}: record source SHA check removed from cache key`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      replaceRun(
+        workflow,
+        platform.job,
+        "Restore exact candidate archive from protected host",
+        platform.restoreSha,
+        "true",
+      );
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Restore exact candidate archive from protected host|reviewed protected .* workflow structure/u,
+      );
+    });
+
+    await t.test(`${platform.file}: large transfer made unconditional`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      draftStep(
+        workflow.jobs[platform.job],
+        "Download, authenticate, and admit candidate archive on miss",
+      ).if = platform.missIf;
+      assert.match(validateWorkflows(workflows).join("\n"), platform.missExpected);
+    });
+
+    await t.test(`${platform.file}: small candidate record name drifts`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      draftStep(
+        workflow.jobs[platform.job],
+        "Download authenticated candidate record",
+      ).with.name = platform.recordName.replace("candidate-archive-record", "package-record");
+      assert.match(validateWorkflows(workflows).join("\n"), platform.recordExpected);
+    });
+
+    await t.test(`${platform.file}: private driver is read from the public package`, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(platform.file);
+      const download = draftStep(
+        workflow.jobs[platform.job],
+        "Download separate authenticated qualification driver",
+      );
+      download.with.name = platform.driverName.replace(
+        "codestory-qualification-driver",
+        "codestory-cli",
+      );
+      assert.match(validateWorkflows(workflows).join("\n"), platform.driverExpected);
+    });
+
+    if (platform.modelCache) {
+      await t.test(`${platform.file}: protected model material cache is omitted`, () => {
+        const workflows = loadWorkflows();
+        const workflow = workflows.get(platform.file);
+        replaceRun(
+          workflow,
+          platform.job,
+          "Prepare checksum-pinned embedded model",
+          platform.modelCache,
+          "--cache-root target/model-material",
+        );
+        assert.match(
+          validateWorkflows(workflows).join("\n"),
+          /Prepare checksum-pinned embedded model/u,
+        );
+      });
+    }
+  }
+
+  await t.test("optional Linux Vulkan calibration omits the protected model cache", () => {
+    const workflows = loadWorkflows();
+    const workflow = workflows.get("linux-vulkan-proof.yml");
+    replaceRun(
+      workflow,
+      "optional-constant-calibration",
+      "Prepare checksum-pinned embedded model",
+      '--cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"',
+      "--cache-root target/model-material",
+    );
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /Prepare checksum-pinned embedded model/u,
+    );
+  });
+});
+
+test("post-publish candidate reuse authenticates release metadata and transfers large bytes once", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "post-publish-release-smoke.yml";
+  const job = workflow => workflow.jobs.smoke;
+  const step = (workflow, name) => draftStep(job(workflow), name);
+  const replaceRun = (workflow, name, from, to) => {
+    const selected = step(workflow, name);
+    const before = selected.run;
+    selected.run = before.replace(from, to);
+    assert.notEqual(selected.run, before, `mutation did not change ${name}`);
+  };
+  const mutations = [
+    ["the release tag lookup is replaced by latest", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'releases/tags/$TAG',
+        "releases/latest",
+      );
+    }, /published candidate authentication must bind the release tag, commit, target, and exact asset metadata|Authenticate published candidate assets/u],
+    ["the returned release tag is not checked", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'test "$(jq -r .tag_name <<<"$release")" = "$TAG"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published asset size provenance is not validated", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        '[[ "$(jq -r .size <<<"$value")" =~ ^[0-9]+$ ]]',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published asset digest provenance is not validated", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        '[[ "$(jq -r .digest <<<"$value")" =~ ^sha256:[0-9a-f]{64}$ ]]',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published record source SHA is rebound to the workflow checkout", workflow => {
+      step(workflow, "Authenticate published candidate assets").env.PUBLISHED_COMMIT =
+        "${{ github.sha }}";
+    }, /published candidate authentication must bind the release tag, commit, target, and exact asset metadata/u],
+    ["published cache key no longer checks the source SHA", workflow => {
+      replaceRun(
+        workflow,
+        "Restore published candidate archive from protected host",
+        ".source.commit == $source_sha",
+        "true",
+      );
+    }, /Restore published candidate archive from protected host/u],
+    ["published cache lookup loses its exact source binding", workflow => {
+      delete step(workflow, "Restore published candidate archive from protected host")
+        .env.PUBLISHED_COMMIT;
+    }, /published candidate cache lookup must be unconditional and exact-source bound/u],
+    ["published large archive transfer is unconditional", workflow => {
+      delete step(workflow, "Download, verify, and admit published candidate on miss").if;
+    }, /published archive transfer must run only on an exact cache miss/u],
+    ["published large archive is downloaded a second time", workflow => {
+      step(workflow, "Download authenticated published checksum manifest").run +=
+        '\ncurl "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$id"';
+    }, /must resolve the protected cache before any large release-asset transfer and never use an unconditional bulk download/u],
+    ["bulk gh release download returns", workflow => {
+      step(workflow, "Download authenticated published checksum manifest").run +=
+        '\ngh release download "$TAG"';
+    }, /must resolve the protected cache before any large release-asset transfer and never use an unconditional bulk download/u],
+    ["published archive size output is dropped", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'echo "archive-bytes=$(jq -r .size <<<"$archive_asset")"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+    ["published archive digest output is dropped", workflow => {
+      replaceRun(
+        workflow,
+        "Authenticate published candidate assets",
+        'echo "archive-sha256=$(jq -r .digest <<<"$archive_asset" | sed \'s/^sha256://\')"',
+        "true",
+      );
+    }, /Authenticate published candidate assets/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("withheld accelerator cells consume only tiny exact candidate records", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release.yml";
+  const mutations = [
+    ["the non-claim lane downloads public package archives", workflow => {
+      draftStep(
+        workflow.jobs["accelerator-non-claim"],
+        "Download authenticated candidate records for withheld identity",
+      ).with.pattern = "codestory-cli-*";
+    }, /non-claim producer must download only tiny authenticated candidate records|must never transfer or read a large package archive/u],
+    ["the non-claim lane reads a large archive", workflow => {
+      const record = draftStep(
+        workflow.jobs["accelerator-non-claim"],
+        "Record populated accelerator non-claims",
+      );
+      record.run = record.run.replace(
+        '--candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json"',
+        '--archive "target/release-non-claim/candidate-records/codestory-cli-$target/archive"',
+      );
+    }, /non-claim producer must never transfer or read a large package archive|Record populated accelerator non-claims/u],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expected);
+    });
   }
 });
 
@@ -2185,7 +2719,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     }, /closeout must wait for every selected platform proof/u],
     ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
       workflow.jobs.closeout.needs.push("release-evidence");
-    }, /normal closeout must not depend on optional release evidence/u],
+    }, /normal closeout must not depend on optional release or quality evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
@@ -2721,7 +3255,7 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
     ["package mode enables protected Windows proof", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].if = workflow.jobs["windows-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
-    }, /package-only mode must skip Windows while qualification requires successful Metal/u],
+    }, /package-only mode must skip Windows without serializing it behind Metal/u],
     ["package mode enables protected Linux proof", coordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].if = workflow.jobs["linux-vulkan-proof"].if
         .replace("needs.route.outputs.mode != 'package' &&", "");
@@ -3263,6 +3797,130 @@ test("retrieval smoke keeps the one-process generalization lane blocking", async
   }
 });
 
+test("retrieval generalization fixture architecture rejects serialized regressions", async (t) => {
+  const suitePath = path.join(
+    root,
+    "scripts",
+    "tests",
+    "lint-retrieval-generalization.test.mjs",
+  );
+  const source = readFileSync(suitePath, "utf8");
+  assert.deepEqual(retrievalGeneralizationSuitePolicyViolations(source), []);
+  assert.equal(
+    rustRetrievalWrapperSourcePresent(`
+use std::process::Command;
+#[test]
+fn renamed_guard() {
+    Command::new("node").arg("-e").arg("import('./scripts/lib/retrieval-generalization-lint.mjs')").status().unwrap();
+}
+`),
+    true,
+    "a renamed Rust subprocess wrapper must remain detectable without the old filename or command",
+  );
+
+  const mutations = [
+    ["legacy Rust integration test returns", source, {
+      legacyWrapperPresent: true,
+    }, /must stay deleted so workspace nextest cannot rediscover/u],
+    ["per-fixture Node subprocess returns", `${source}
+import { spawnSync as runFixture } from "node:child_process";
+runFixture(process.execPath, ["scripts/lint-retrieval-generalization.mjs"]);
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["indirect builtin subprocess loading returns", `${source}
+process.getBuiltinModule("child" + "_process").spawnSync(
+  process.execPath,
+  ["scripts/lint-retrieval-generalization.mjs"],
+);
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["bracketed process binding returns", `${source}
+process["binding"]("spawn_sync");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["computed dynamic subprocess import returns", `${source}
+await import("node:" + "child" + "_process");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["worker-per-fixture execution returns", `${source}
+await import("node:worker_threads");
+`, {}, /must not create subprocesses, workers, or clusters/u],
+    ["matrix calls the lint twice", `${source}
+runRetrievalGeneralizationLint({});
+`, {}, /through one in-process lint invocation/u],
+    ["matrix aliases the lint for a second invocation", source.replace(
+      "    const result = runRetrievalGeneralizationLint({",
+      [
+        "    const invokeAgain = runRetrievalGeneralizationLint;",
+        "    invokeAgain({});",
+        "    const result = runRetrievalGeneralizationLint({",
+      ].join("\n"),
+    ), {}, /through one in-process lint invocation/u],
+    ["global file lock returns", `${source}
+fs.openSync(path.join(os.tmpdir(), "retrieval-generalization.lock"), "wx");
+`, {}, /must not restore a global or cross-process fixture lock/u],
+    ["exclusive sibling lock through the fixture filesystem returns", source.replace(
+      "  const productionRepositoryRoot = path.join(",
+      [
+        '  const globalSentinel = path.join(path.dirname(fixtureRoot), "serial-token");',
+        '  fs.writeFileSync(globalSentinel, "", { flag: ["w", "x"].join("") });',
+        "  fs.rmSync(globalSentinel, { force: true });",
+        "  const productionRepositoryRoot = path.join(",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["second global temporary root returns", `${source}
+const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "shared-suite-"));
+fs.mkdirSync(path.join(sharedRoot, "sentinel"));
+`, {}, /under one temporary tree outside the checkout/u],
+    ["second sibling temporary root returns", `${source}
+const sharedRoot = fs.mkdtempSync(path.join(path.dirname(fixtureRoot), "shared-suite-"));
+fs.mkdirSync(path.join(sharedRoot, "sentinel"));
+`, {}, /under one temporary tree outside the checkout/u],
+    ["fixtures move into the checkout", source.replace(
+      'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
+      'fs.mkdtempSync(path.join(repositoryRoot, "codestory-generalization-"))',
+    ), {}, /under one temporary tree outside the checkout/u],
+    ["checkout read-only comparison is removed", source.replace(
+      "const checkoutBefore = treeDigest(repositoryRoot);",
+      "const checkoutBefore = null;",
+    ), {}, /prove the real checkout is byte-for-byte read-only/u],
+    ["checkout read-only comparison is inverted", source.replace(
+      "assert.equal(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+      "assert.notEqual(\n      treeDigest(repositoryRoot),\n      checkoutBefore,",
+    ), {}, /prove the real checkout is byte-for-byte read-only/u],
+    ["checkout is changed and restored before the final digest", source.replace(
+      "  const checkoutBefore = treeDigest(repositoryRoot);",
+      [
+        "  const checkoutBefore = treeDigest(repositoryRoot);",
+        '  const transientCheckoutPath = path.join(repositoryRoot, ".policy-transient-fixture");',
+        '  fs.writeFileSync(transientCheckoutPath, "hostile");',
+        "  fs.rmSync(transientCheckoutPath, { force: true });",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["additive Rust root is unregistered", source.replace(
+      "structuralScanRoots: [rustRoot, extraRustRoot],",
+      "structuralScanRoots: [rustRoot],",
+    ), {}, /register every additive hostile fixture root/u],
+    ["a fifth fixture root is planted without registration", source.replace(
+      "  const productionRepositoryRoot = path.join(",
+      [
+        '  const unregisteredRoot = path.join(fixtureRoot, "unregistered");',
+        '  write(unregisteredRoot, "ignored.rs", `pub const LEAK: &str = "createApplication";\\n`);',
+        "  const productionRepositoryRoot = path.join(",
+      ].join("\n"),
+    ), {}, /confine every filesystem mutation/u],
+    ["fixture cleanup is removed", source.replace(
+      "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
+      "",
+    ), {}, /remove its isolated fixture tree/u],
+  ];
+
+  for (const [name, candidate, options, expectedReason] of mutations) {
+    await t.test(name, () => {
+      assert.match(
+        retrievalGeneralizationSuitePolicyViolations(candidate, options).join("\n"),
+        expectedReason,
+      );
+    });
+  }
+});
+
 test("Windows manifest-missing proof freezes routing, native topology, and exact cache identity", async (t) => {
   assert.deepEqual(windowsManifestProofPolicyViolations(windowsManifestWorkflow()), []);
 
@@ -3551,7 +4209,7 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     }, /Configure short Windows Cargo target/u],
     ["packaged native staging regression made cross-platform", packagedFile, workflow => {
       packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
-    }, /immutable native staging regression must run on Windows/u],
+    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
     ["packaged native staging regression removed", packagedFile, workflow => {
       packagedNativeStaging(workflow).run = "cargo test --release --locked";
     }, /Test immutable native staging on Windows/u],
@@ -3702,23 +4360,23 @@ test("protected candidate installs prove accelerated server behavior without CPU
   }
 });
 
-test("protected macOS package download is resumable and container-verified", async (t) => {
+test("protected macOS candidate transfer is resumable, exact-head bound, and cache-miss only", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 
   const file = "macos-metal-proof.yml";
   const mutations = [
     ["resume removed", step => {
       step.run = step.run.replace("--continue-at -", "--remote-name");
-    }, /Download packaged CLI artifact/u],
+    }, /Download, authenticate, and admit candidate archive on miss/u],
     ["container digest bypassed", step => {
       step.run = step.run.replace(
-        'test "$actual_digest" = "${expected_digest#sha256:}"',
+        'test "$actual_digest" = "$EXPECTED_SHA256"',
         "true",
       );
-    }, /Download packaged CLI artifact/u],
-    ["producer SHA binding removed", step => {
-      step.run = step.run.replace(".workflow_run.head_sha == $sha", "true");
-    }, /Download packaged CLI artifact/u],
+    }, /Download, authenticate, and admit candidate archive on miss/u],
+    ["large transfer made unconditional", step => {
+      step.if = "inputs.use_packaged_cli_artifact";
+    }, /large Actions artifact transfer must be a cache-miss-only authenticated boundary/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -3726,7 +4384,7 @@ test("protected macOS package download is resumable and container-verified", asy
       const workflows = loadWorkflows();
       const step = draftStep(
         workflows.get(file).jobs["packaged-metal"],
-        "Download packaged CLI artifact",
+        "Download, authenticate, and admit candidate archive on miss",
       );
       mutate(step);
       const violations = validateWorkflows(workflows);

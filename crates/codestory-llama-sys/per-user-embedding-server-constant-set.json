@@ -1,7 +1,7 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 45,
+      "retry_after_ms": 40,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
@@ -9,7 +9,7 @@
     "election_backoff_policy": {
       "initial_backoff_ms": 7,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 104
+      "maximum_backoff_ms": 102
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -43,22 +43,7 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": {
-    "calibration_bundle_sha256": "e0861864455fd60dc6d51f5b627f615e1d8a16825a91d029ea5940029dd0c5ea",
-    "calibration_freeze_digest": "0ae241b2f151c7c2232677e84097f0b4f79766115204d8410d3d5ec15fd10a15",
-    "input_constant_set_sha256": "c67187b461e07bc09352cbb2b3eaaf1760780e32b284e6d127de9d49adb3c51b",
-    "measurement_protocol_sha256": "ce4bc4911c13d3e52438638e3abb5383e23cd9b400893805f589cdf6350e16e1",
-    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
-    "run_artifact_sha256s": [
-      "739c711ca14cd9110da279fdbb735ee6adf18629fe3fa33d4f693fb7bd4d5dea",
-      "c6e468a1570fc5fb4f2620df046914b0b39d54123b3ef18f5254425dc58649e1",
-      "dc9dc2a857e2400d3662ea9f7a111c31776296439b83da696c9aa1f982a2395f"
-    ],
-    "selected_at": "github-actions-run:30511516861:1",
-    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "f1fb7af2458ef16129c1bca71b122f0cc9b3ef05",
-    "selection_source_tree": "b084dcda7507969035353a3fc1a9ee906ce2e73d"
-  },
+  "freeze_record": null,
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -67,7 +52,6 @@
     "cold_first_vector": 1566,
     "existing_owner_connect": 16,
     "first_product_ready": 723,
-    "retrieval_quality": 1.0,
     "spawn_convergence": 486,
     "total_codestory_process_memory": 3366597428,
     "true_idle_exit": 62500,
@@ -76,5 +60,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "frozen"
+  "status": "unfrozen"
 }
