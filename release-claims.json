@@ -117,8 +117,13 @@
       "equation": "Reuse anchors a row to the earlier run and commit it was produced by, so the commit identity is read at the release commit for every binding. Any further identity a reused row would otherwise be held to is checked as written unless the binding declares it below. A binding may declare an identity key only when the binding's own construction determines that key for the evidence being inherited, and an equated key is never dropped: the reused row must still carry the reused commit's own value for it, which the binding is what makes admissible in place of this release's.",
       "bindings": {
         "source_tree": {
-          "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
-          "equates": []
+          "admits": "Source evidence from the accepted calibration commit is admissible on the frozen candidate only when the checked-in freeze record names that exact commit and tree, the sole changed path is the generated constant set, and the frozen candidate is its direct child or has one explicit tree-preserving promotion commit.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The source proof ran on the accepted pre-calibration tree. Deterministic constant selection, direct constant-only lineage, and frozen-candidate qualification prove the only later source transition, so closeout may read that measured source row at the frozen candidate tree without running the workspace a second time."
+            }
+          ]
         },
         "native_fingerprint": {
           "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
@@ -1463,13 +1468,48 @@
       "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
       "source_cache_namespace": "source-proof-v2",
       "packaged_cache_namespace": "codestory-cli-native-v4",
-      "label_routed_workflows": [
-        "source-proof.yml",
-        "packaged-platform-pr.yml"
+      "label_routed_workflows": [],
+      "required_events": []
+    },
+    "release_freeze_barrier": {
+      "schema": 1,
+      "script": ".github/scripts/release-freeze-barrier.mjs",
+      "status_context_prefix": "codestory/release-freeze",
+      "allowed_future_source_changes": [
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       ],
-      "required_events": [
-        "labeled"
-      ]
+      "required_hostile_mutations": [
+        "cpu_backend_rejected",
+        "calibration_qualification_rejected",
+        "calibration_three_by_three_rejected",
+        "calibration_repeated_setup_rejected",
+        "missing_linux_nonblocking",
+        "windows_duplicate_build_rejected",
+        "windows_debug_release_mix_rejected",
+        "windows_stale_archive_rejected"
+      ],
+      "broad_entry_workflows": [
+        "source-proof.yml",
+        "packaged-platform-pr.yml",
+        "release.yml"
+      ],
+      "coordinator_only_workflows": [
+        "macos-metal-proof.yml",
+        "windows-vulkan-proof.yml",
+        "linux-vulkan-proof.yml"
+      ],
+      "single_source_proof": {
+        "producer_workflow": "source-proof.yml",
+        "producer_job": "full-source-gate",
+        "accepted_source": "freeze_receipt.commit",
+        "frozen_descendant": "constant_set.freeze_record.selection_source_commit",
+        "reuse_validation": [
+          "deterministic_constant_selection",
+          "direct_constant_only_lineage",
+          "frozen_candidate_qualification"
+        ],
+        "post_calibration_fallback_allowed": false
+      }
     },
     "actionlint": {
       "version": "1.7.12",

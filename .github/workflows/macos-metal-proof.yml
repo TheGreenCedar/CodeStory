@@ -56,51 +56,6 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        description: CodeStory version to prove.
-        required: true
-        type: string
-      ref:
-        description: Git ref to check out. Defaults to the current SHA.
-        required: false
-        type: string
-      proof_key:
-        description: Stable proof identity for cancellation.
-        required: false
-        type: string
-      calibration_bundle_artifact:
-        description: Frozen calibration bundle artifact name.
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        description: Workflow run that produced the frozen calibration bundle artifact.
-        required: false
-        default: ""
-        type: string
-      calibration_mode:
-        description: Collect three independent pre-freeze Metal calibration runs.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/macos-metal-proof.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   actions: read
   contents: read

@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: false
+      freeze_receipt_digest:
+        description: "Exact-head release freeze receipt digest; publishing may discover it from the calibrated source"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       version:
@@ -27,9 +32,13 @@ on:
         description: "Exact dev/codestory-next head to authenticate without publishing"
         required: true
         type: string
+      freeze_receipt_digest:
+        description: "Digest emitted by release-freeze-barrier.mjs for the accepted source head"
+        required: true
+        type: string
 
 permissions:
-  actions: read
+  actions: write
   # accelerator-non-claim reads the job annotation that identifies a lost runner, which the Actions
   # annotations endpoint gates on `checks: read`. Without it the collector fails closed and this
   # workflow stops rather than mistaking an unreadable signature for an ordinary failure.
@@ -39,7 +48,7 @@ permissions:
 
 concurrency:
   group: release-${{ inputs.version }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   workflow-policy:
@@ -87,6 +96,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       source_proof_reused: ${{ steps.reuse.outputs.source_proof_reused }}
+      freeze_receipt_digest: ${{ steps.reuse.outputs.freeze_receipt_digest }}
       tag: ${{ steps.version.outputs.tag }}
       marketplace_revision: ${{ steps.marketplace.outputs.marketplace_revision }}
     steps:
@@ -95,16 +105,47 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cancel superseded proof runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"
+
       - name: Verify release-head calibration lineage
+        id: lineage
         env:
           BASH_ENV: /dev/null
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         shell: /bin/bash --noprofile --norc -e -o pipefail {0}
         working-directory: ${{ github.workspace }}
-        run: >-
-          /usr/bin/python3 -E -s
-          "$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py"
-          --repo "$GITHUB_WORKSPACE"
-          --expected-sha "$GITHUB_SHA"
+        run: |
+          promotion_args=()
+          if [ "$PUBLISH_RELEASE" = true ]; then
+            promotion_args+=(--allow-promotion-commit)
+          fi
+          result="$(
+            /usr/bin/python3 -E -s \
+              "$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py" \
+              --repo "$GITHUB_WORKSPACE" \
+              --expected-sha "$GITHUB_SHA" \
+              "${promotion_args[@]}"
+          )"
+          jq -e '.status == "passed"' <<<"$result" >/dev/null
+          selection_commit="$(jq -r '.selection_commit' <<<"$result")"
+          selection_tree="$(jq -r '.selection_tree' <<<"$result")"
+          printf '%s' "$selection_commit" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$selection_tree" | grep -Eq '^[0-9a-f]{40}$'
+          {
+            echo "selection_commit=$selection_commit"
+            echo "selection_tree=$selection_tree"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate release authority
         env:
@@ -180,39 +221,68 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          SOURCE_SHA: ${{ steps.lineage.outputs.selection_commit }}
+          SOURCE_TREE: ${{ steps.lineage.outputs.selection_tree }}
         shell: bash
         run: |
           set -euo pipefail
           entries=()
 
-          # The source gate proves a tree. When dev was already gated and promoted without
-          # changing the tree, re-running it for an hour cannot reach a different answer.
-          release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          # The sole generated constant-set commit is validated by deterministic selection,
+          # exact lineage, and frozen-candidate qualification. Re-running the workspace on
+          # the descendant would be a second source proof for the same candidate.
           while IFS= read -r run_id; do
-            head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
-            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
-            test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
-            git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name | endswith("full-source-gate")) | select(.conclusion == "success") | .id' \
+              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q . || continue
-            entries+=("source_behavior=$run_id:$head_sha")
-            echo "Reusing source proof from run $run_id (tree $release_tree)."
+            entries+=("source_behavior=$run_id:$SOURCE_SHA")
+            echo "Reusing the one source proof from run $run_id at calibration source $SOURCE_SHA."
             break
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .conclusion == "success") | .id'
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
 
           reuse="$(IFS=,; echo "${entries[*]:-}")"
-          echo "reuse=${reuse:--}" >> "$GITHUB_OUTPUT"
-          if [ -n "$reuse" ]; then
-            echo "source_proof_reused=true" >> "$GITHUB_OUTPUT"
+          test -n "$reuse" || {
+            echo "::error::The accepted calibration source $SOURCE_SHA has no successful full-source-gate. The release workflow will not start a second proof after calibration."
+            exit 1
+          }
+
+          statuses="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/statuses?per_page=100"
+          )"
+          if [ -n "$INPUT_FREEZE_RECEIPT_DIGEST" ]; then
+            freeze_digest="$INPUT_FREEZE_RECEIPT_DIGEST"
           else
-            echo "source_proof_reused=false" >> "$GITHUB_OUTPUT"
+            freeze_digest="$(
+              jq -r \
+                --arg description "tree=$SOURCE_TREE" \
+                '[.[] | select(
+                  .state == "success"
+                  and (.context | startswith("codestory/release-freeze/"))
+                  and .description == $description
+                ) | .context | sub("^codestory/release-freeze/"; "")] | unique | if length == 1 then .[0] else "" end' \
+                <<<"$statuses"
+            )"
           fi
+          printf '%s' "$freeze_digest" | grep -Eq '^[0-9a-f]{64}$'
+          jq -e \
+            --arg context "codestory/release-freeze/$freeze_digest" \
+            --arg description "tree=$SOURCE_TREE" \
+            'any(.[]; .state == "success"
+              and .context == $context
+              and .description == $description)' \
+            <<<"$statuses" >/dev/null
+
+          {
+            echo "reuse=$reuse"
+            echo "source_proof_reused=true"
+            echo "freeze_receipt_digest=$freeze_digest"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prove the public marketplace install path
         if: inputs.publish_release
@@ -267,8 +337,8 @@ jobs:
 
   source-proof:
     needs: preflight
-    # A completed gate for this exact tree is already authenticated evidence; the closeout
-    # consumes it through the reuse binding instead of re-running an hour of compilation.
+    # Preflight fails unless the one pre-calibration source proof is reusable. This job is a
+    # structural DAG placeholder for closeout compatibility and must remain unreachable.
     if: needs.preflight.outputs.source_proof_reused != 'true'
     uses: ./.github/workflows/source-proof.yml
     with:
@@ -276,6 +346,7 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       version: ${{ needs.preflight.outputs.version }}
       emit_release_cells: true
+      freeze_receipt_digest: ${{ needs.preflight.outputs.freeze_receipt_digest }}
 
   packaged-proof:
     needs: preflight

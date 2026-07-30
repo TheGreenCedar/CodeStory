@@ -81,6 +81,8 @@ def _tracked_source_dirty(repository_root: Path) -> bool:
 def verify_release_head_calibration_lineage(
     repository_root: Path,
     expected_release_commit: str,
+    *,
+    allow_promotion_commit: bool = False,
 ) -> dict:
     """Bind a release checkout to the calibration source in its freeze record.
 
@@ -140,6 +142,7 @@ def verify_release_head_calibration_lineage(
         calibration_source,
         release_source,
         repository_root,
+        allow_promotion_commit=allow_promotion_commit,
     )
     return {
         **lineage,
@@ -152,6 +155,8 @@ def verify_calibration_source_lineage(
     calibration_source: dict,
     frozen_source: dict,
     repository_root: Path,
+    *,
+    allow_promotion_commit: bool = False,
 ) -> dict:
     require(
         frozen_source.get("tracked_dirty") is False,
@@ -238,8 +243,47 @@ def verify_calibration_source_lineage(
         )
         + f". The {REQUIRED_RELEASE_ORDERING}.",
     )
+    frozen_parents = _git(
+        repository_root,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        frozen_source["commit"],
+    ).split()[1:]
+    direct_freeze = frozen_parents == [calibration_source["commit"]]
+    promotion_parent = None
+    if allow_promotion_commit and not direct_freeze:
+        candidates = []
+        for parent in frozen_parents:
+            parent_parents = _git(
+                repository_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                parent,
+            ).split()[1:]
+            parent_tree = _git(repository_root, "rev-parse", f"{parent}^{{tree}}")
+            if (
+                parent_parents == [calibration_source["commit"]]
+                and parent_tree == frozen_source["tree"]
+            ):
+                candidates.append(parent)
+        if len(candidates) == 1:
+            promotion_parent = candidates[0]
+    require(
+        direct_freeze or promotion_parent is not None,
+        "the frozen candidate must be the direct single-parent child of the "
+        "accepted calibration source. Any later commit revokes acceptance; "
+        "publication may add only one explicit tree-preserving promotion commit",
+    )
     return {
         "selection_commit": calibration_source["commit"],
         "frozen_commit": frozen_source["commit"],
+        "freeze_commit": promotion_parent or frozen_source["commit"],
+        "promotion_commit": (
+            frozen_source["commit"] if promotion_parent is not None else None
+        ),
         "allowed_changed_paths": changed_paths,
     }

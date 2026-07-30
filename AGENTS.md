@@ -120,8 +120,8 @@ adapter to compensate for incorrect upstream state.
   lanes.
 - Do not use `cargo test --workspace --all-targets` as the routine broad gate;
   it expands Criterion targets. Draft work uses focused checks. The full
-  workspace test and all-target/all-feature clippy gate run once on an
-  independently accepted exact head.
+  workspace test and all-target/all-feature clippy gate run once on the source
+  head accepted by the executable release freeze barrier.
 - CLI integration tests must launch through
   `tests/test_support::cli_command` or its supplied-binary variant, use
   isolated cache/install/plugin state roots.
@@ -160,6 +160,9 @@ adapter to compensate for incorrect upstream state.
   saga label) must close a PR-sized issue with `Closes`, `Fixes`, or `Resolves`.
   Use `Refs` for broader parents. A partial slice closes only its child issue;
   keep the parent open until its acceptance criteria are met.
+- Before creating an issue, branch, worktree, or PR, search open and closed
+  issues, merged PRs, and integration history for the requested outcome, then
+  prove that outcome is absent from the current integration head.
 - For PRs targeting `dev/codestory-next`, add both the issue and PR to the
   Project; computed linked-PR fields may not populate before default-branch
   promotion.
@@ -170,6 +173,9 @@ adapter to compensate for incorrect upstream state.
 - PRs should explain context, what changed, how to review, verification, risk,
   and follow-up. Include exact SHAs and distinguish completed proof from
   non-claims.
+- Release handoffs must name the final intended source head, known future
+  source changes, proof-triggering labels or actions, reusable and invalidated
+  evidence, currently running workflows, and the next permitted mutation.
 - Public GitHub status comments must use
   `node scripts/github-status-comment.mjs --issue <n> --body-file <file>` or
   stdin; the helper rejects literal `\\n` text.
@@ -185,6 +191,42 @@ adapter to compensate for incorrect upstream state.
 - Commit messages are short, lowercase, and imperative.
 
 ## Release Rules
+
+### Candidate freeze and proof budget
+
+- Before any gate expected to exceed five minutes, record the exact commit and
+  tree, confirm the worktree is clean and pushed, and confirm that every
+  planned source or workflow change is already merged. Independent acceptance
+  must execute the required hostile mutations on that exact head; diff review
+  and existing green tests do not qualify. Any later commit revokes
+  acceptance.
+- Support PRs use focused checks only. Do not add a proof-triggering label or
+  dispatch a broad source, package, calibration, or hardware gate until all
+  support PRs are integrated into the release lane. Broad proof belongs to the
+  final integration head, not every independently mergeable PR.
+- Release order is: merge all blockers, run focused checks, run actual-host
+  microprobes, execute hostile mutation acceptance, push and declare the source
+  head frozen, run one broad source proof, calibrate, apply the sole generated
+  constant-set change, then qualify. If another source or workflow change
+  becomes necessary, immediately invalidate the candidate and cancel every
+  queued or running proof for it.
+- Run the full workspace source proof exactly once per release candidate. For
+  a sole generated constant-set freeze, use deterministic selection
+  validation, lineage verification, and frozen-candidate qualification; do not
+  rerun the full workspace. If policy cannot reuse the pre-calibration proof,
+  move the one broad proof to the frozen head instead. Never run both.
+- Cancel a run whose head is no longer the intended release candidate. Never
+  let an expensive obsolete run finish for information. Before dispatching,
+  inspect both in-flight runs and whether any known source change will
+  invalidate the result.
+- After a platform-specific packaging or filesystem failure, do not run a full
+  rebuild until a sub-90-second native probe reproduces the relevant path,
+  link, staging, cache, or identity behavior on that operating system. Test the
+  selector against the probe or captured artifact first.
+- Use one implementer and one adversarial verifier. Give the verifier the exact
+  mutation matrix and only the context needed to execute it. Its output is
+  limited to counterexamples or acceptance evidence. After two failed
+  revisions of the same shape, stop patching examples and redesign the seam.
 
 - Freeze the selected release claim before qualification. For the standard
   v0.16 release described in `CHANGELOG.md`, build one candidate; install its

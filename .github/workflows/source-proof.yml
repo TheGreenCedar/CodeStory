@@ -1,8 +1,6 @@
 name: Exact-head source proof
 
 on:
-  pull_request:
-    types: [labeled]
   workflow_call:
     inputs:
       ref:
@@ -19,6 +17,10 @@ on:
         required: false
         default: false
         type: boolean
+      freeze_receipt_digest:
+        description: Digest of the exact-head release freeze status.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       pr_number:
@@ -29,14 +31,27 @@ on:
         description: Exact reviewed head SHA. The selected --ref, github.sha, and live PR head must match.
         required: true
         type: string
+      freeze_receipt_digest:
+        description: Digest emitted by release-freeze-barrier.mjs for this exact head.
+        required: true
+        type: string
+      version:
+        description: Release version whose source cell this accepted proof emits.
+        required: true
+        type: string
+      emit_release_cells:
+        description: Emit the source cell that qualification and publication reuse.
+        required: false
+        default: true
+        type: boolean
 
 permissions:
-  actions: read
+  actions: write
   contents: read
   pull-requests: read
 
 concurrency:
-  group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
+  group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -46,7 +61,6 @@ env:
 
 jobs:
   resolve:
-    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -116,11 +130,27 @@ jobs:
             echo "ref=$CALLER_REF" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout accepted source head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+
+      - name: Cancel superseded proof runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"
+
       - name: Reuse a completed gate for this exact head
         id: reuse
-        # Only the label and dispatch paths. workflow_call always supplies `ref`, and the release
-        # chain requires full-source-gate to actually run.
-        if: inputs.ref == ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -142,9 +172,32 @@ jobs:
             gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and (.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success") | .id'
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
           echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
+      - name: Require executable release freeze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          HEAD_SHA: ${{ steps.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
+          tree="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
+          )"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" \
+            | jq -e \
+              --arg context "codestory/release-freeze/$FREEZE_RECEIPT_DIGEST" \
+              --arg description "tree=$tree" \
+              'any(.[]; .state == "success"
+                and .context == $context
+                and .description == $description)' >/dev/null || {
+              echo "::error::No executable release freeze accepts exact head $HEAD_SHA and tree $tree."
+              exit 1
+            }
 
   full-source-gate:
     name: full-source-gate

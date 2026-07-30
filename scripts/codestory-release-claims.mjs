@@ -183,16 +183,17 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
 /// and why; this map is the ceiling, stated next to the proofs that establish it, so a graph edit
 /// alone can never grant an equation no binding proves.
 ///
-///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
-///     substituting: every tree-derived identity a reused row declares is still checkable directly
-///     against this release, and equating one would replace a live check with nothing. Hence [].
+///   * `source_tree` proves either an identical tree or the one exact constant-set transition from
+///     the accepted calibration source. In the latter case it determines both trees and the direct
+///     lineage, so the reused source row may retain its measured source_tree while closeout reads it
+///     at the frozen candidate's tree.
 ///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
 ///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
 ///     determines the built accelerator, so accelerator execution evidence transfers across the
 ///     source_tree difference the binding exists to tolerate. It determines nothing about the
 ///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
 const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
-  source_tree: Object.freeze([]),
+  source_tree: Object.freeze(["source_tree"]),
   native_fingerprint: Object.freeze(["source_tree"]),
 });
 
@@ -218,8 +219,62 @@ export function verifyReuseBinding({ binding, repository, releaseCommit, reusedC
   if (binding === "source_tree") {
     const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
     const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
-    if (releaseTree !== reusedTree) {
-      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
+    if (releaseTree === reusedTree) {
+      return releaseTree;
+    }
+    const constantPath =
+      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+    let constantSet;
+    try {
+      constantSet = JSON.parse(git(
+        ["show", `${releaseCommit}:${constantPath}`],
+        repository,
+      ));
+    } catch {
+      fail(
+        `reused commit ${reusedCommit} tree ${reusedTree} does not match release tree `
+        + `${releaseTree}, and the release has no readable calibration freeze`,
+      );
+    }
+    const freeze = constantSet?.freeze_record;
+    if (
+      constantSet?.status !== "frozen"
+      || freeze?.selection_source_commit !== reusedCommit
+      || freeze?.selection_source_tree !== reusedTree
+    ) {
+      fail(
+        `reused commit ${reusedCommit} tree ${reusedTree} does not match release tree `
+        + `${releaseTree} or the release calibration source`,
+      );
+    }
+    const changed = git(
+      ["diff", "--name-only", reusedCommit, releaseCommit],
+      repository,
+    ).split("\n").filter(Boolean);
+    if (JSON.stringify(changed) !== JSON.stringify([constantPath])) {
+      fail(
+        "source proof reuse crosses changes outside the sole generated constant set: "
+        + changed.join(", "),
+      );
+    }
+    const parents = (commit) => git(
+      ["rev-list", "--parents", "-n", "1", commit],
+      repository,
+    ).split(/\s+/u).slice(1);
+    const releaseParents = parents(releaseCommit);
+    const direct = releaseParents.length === 1 && releaseParents[0] === reusedCommit;
+    const promotionParents = direct
+      ? []
+      : releaseParents.filter((parent) =>
+        parents(parent).length === 1
+        && parents(parent)[0] === reusedCommit
+        && git(["rev-parse", `${parent}^{tree}`], repository) === releaseTree
+      );
+    if (!direct && promotionParents.length !== 1) {
+      fail(
+        "source proof reuse requires the direct generated constant-set child "
+        + "or one explicit tree-preserving promotion commit",
+      );
     }
     return releaseTree;
   }
@@ -1495,8 +1550,73 @@ export function validateReleaseClaimGraph(graph) {
   nonEmptyText(promotion.manual_pr_ref_hint, "workflow_policy.promotion.manual_pr_ref_hint");
   nonEmptyText(promotion.source_cache_namespace, "workflow_policy.promotion.source_cache_namespace");
   nonEmptyText(promotion.packaged_cache_namespace, "workflow_policy.promotion.packaged_cache_namespace");
-  stringArray(promotion.label_routed_workflows, "workflow_policy.promotion.label_routed_workflows", { nonEmpty: true });
-  stringArray(promotion.required_events, "workflow_policy.promotion.required_events", { nonEmpty: true });
+  const labelRouted = stringArray(
+    promotion.label_routed_workflows,
+    "workflow_policy.promotion.label_routed_workflows",
+  );
+  const requiredEvents = stringArray(
+    promotion.required_events,
+    "workflow_policy.promotion.required_events",
+  );
+  if (labelRouted.length !== 0 || requiredEvents.length !== 0) {
+    fail("workflow_policy.promotion must not admit label-routed proof workflows");
+  }
+
+  const freeze = object(
+    policy.release_freeze_barrier,
+    "workflow_policy.release_freeze_barrier",
+  );
+  if (freeze.schema !== 1) {
+    fail("workflow_policy.release_freeze_barrier.schema must be 1");
+  }
+  nonEmptyText(freeze.script, "workflow_policy.release_freeze_barrier.script");
+  nonEmptyText(
+    freeze.status_context_prefix,
+    "workflow_policy.release_freeze_barrier.status_context_prefix",
+  );
+  stringArray(
+    freeze.allowed_future_source_changes,
+    "workflow_policy.release_freeze_barrier.allowed_future_source_changes",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.required_hostile_mutations,
+    "workflow_policy.release_freeze_barrier.required_hostile_mutations",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.broad_entry_workflows,
+    "workflow_policy.release_freeze_barrier.broad_entry_workflows",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.coordinator_only_workflows,
+    "workflow_policy.release_freeze_barrier.coordinator_only_workflows",
+    { nonEmpty: true },
+  );
+  const singleSource = object(
+    freeze.single_source_proof,
+    "workflow_policy.release_freeze_barrier.single_source_proof",
+  );
+  nonEmptyText(
+    singleSource.producer_workflow,
+    "workflow_policy.release_freeze_barrier.single_source_proof.producer_workflow",
+  );
+  nonEmptyText(
+    singleSource.producer_job,
+    "workflow_policy.release_freeze_barrier.single_source_proof.producer_job",
+  );
+  stringArray(
+    singleSource.reuse_validation,
+    "workflow_policy.release_freeze_barrier.single_source_proof.reuse_validation",
+    { nonEmpty: true },
+  );
+  if (singleSource.post_calibration_fallback_allowed !== false) {
+    fail(
+      "workflow_policy.release_freeze_barrier.single_source_proof "
+      + "must prohibit a post-calibration fallback",
+    );
+  }
 
   const actionlint = object(policy.actionlint, "workflow_policy.actionlint");
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");

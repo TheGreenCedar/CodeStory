@@ -125,11 +125,40 @@ def _accepts_the_single_freeze_commit(root: Path, calibration: dict) -> dict:
         == {
             "selection_commit": calibration["commit"],
             "frozen_commit": frozen["commit"],
+            "freeze_commit": frozen["commit"],
+            "promotion_commit": None,
             "allowed_changed_paths": [CONSTANT_SET_FREEZE_PATH],
         },
         "the one allowed constant-set freeze commit was not accepted intact",
     )
     return frozen
+
+
+def _rejects_commit_after_freeze(
+    root: Path,
+    calibration: dict,
+    frozen: dict,
+) -> None:
+    later = _commit(root, "later empty commit", allow_empty=True)
+    _reject(
+        "a later tree-preserving commit",
+        ["direct single-parent child", "later commit revokes acceptance"],
+        calibration,
+        later,
+        root,
+    )
+    accepted_promotion = verify_calibration_source_lineage(
+        calibration,
+        later,
+        root,
+        allow_promotion_commit=True,
+    )
+    require(
+        accepted_promotion["freeze_commit"] == frozen["commit"]
+        and accepted_promotion["promotion_commit"] == later["commit"],
+        "the explicit tree-preserving promotion exception lost its exact commits",
+    )
+    _git(root, "reset", "-q", "--hard", frozen["commit"])
 
 
 def _rejects_identity_and_checkout_drift(
@@ -396,6 +425,7 @@ def run_calibration_lineage_self_tests() -> None:
         root.mkdir(parents=True)
         calibration = _build_calibration_history(root)
         frozen = _accepts_the_single_freeze_commit(root, calibration)
+        _rejects_commit_after_freeze(root, calibration, frozen)
         _rejects_identity_and_checkout_drift(root, calibration, frozen)
         _rejects_calibrate_then_bump(root, calibration)
         _rejects_missing_freeze_and_unrelated_history(root, frozen)

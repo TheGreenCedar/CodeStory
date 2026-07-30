@@ -197,16 +197,24 @@ function commitCalibrationFixture(repository, message) {
   };
 }
 
-function runCalibrationReleaseCheck(repository, expectedSha) {
+function runCalibrationReleaseCheck(
+  repository,
+  expectedSha,
+  { allowPromotionCommit = false } = {},
+) {
+  const argumentsList = [
+    calibrationReleaseChecker,
+    "--repo",
+    repository,
+    "--expected-sha",
+    expectedSha,
+  ];
+  if (allowPromotionCommit) {
+    argumentsList.push("--allow-promotion-commit");
+  }
   return spawnSync(
     "python",
-    [
-      calibrationReleaseChecker,
-      "--repo",
-      repository,
-      "--expected-sha",
-      expectedSha,
-    ],
+    argumentsList,
     {
       cwd: root,
       encoding: "utf8",
@@ -845,10 +853,9 @@ test("constant calibration structure rejects qualification, 3x3 sampling, repeat
         "",
       );
     }, /must upload attempt-scoped non-selecting evidence/u],
-    ["Linux calibration requires an upstream package run", "linux-vulkan-proof.yml", workflow => {
-      workflow.on.workflow_dispatch.inputs.package_run_id.required = true;
-      delete workflow.on.workflow_dispatch.inputs.package_run_id.default;
-    }, /must not require an upstream package run/u],
+    ["Linux calibration restores a direct dispatch", "linux-vulkan-proof.yml", workflow => {
+      workflow.on.workflow_dispatch = { inputs: {} };
+    }, /coordinator-only and not directly dispatchable/u],
     ["Linux calibration downloads an independently built package", "linux-vulkan-proof.yml", workflow => {
       workflow.jobs["optional-constant-calibration"].steps.splice(5, 0, {
         name: "Download exact Linux package",
@@ -2232,7 +2239,7 @@ test("release-head calibration lineage rejects identities and source shapes arou
     assert.match(result.stderr, /release checkout does not match the expected release source/u);
   });
 
-  await t.test("a tree-preserving promotion commit stays bound", () => {
+  await t.test("a later commit revokes candidate acceptance unless it is the explicit promotion", () => {
     calibrationGit(
       repository,
       "commit",
@@ -2243,8 +2250,19 @@ test("release-head calibration lineage rejects identities and source shapes arou
       "promote frozen tree",
     );
     const promoted = calibrationGit(repository, "rev-parse", "HEAD");
-    const result = runCalibrationReleaseCheck(repository, promoted);
-    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const rejected = runCalibrationReleaseCheck(repository, promoted);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /later commit revokes acceptance/u);
+    const promotedResult = runCalibrationReleaseCheck(
+      repository,
+      promoted,
+      { allowPromotionCommit: true },
+    );
+    assert.equal(
+      promotedResult.status,
+      0,
+      promotedResult.stderr || promotedResult.stdout,
+    );
     calibrationGit(repository, "reset", "--hard", frozen.commit);
   });
 
@@ -2332,7 +2350,7 @@ test("release policy keeps the release-head lineage check mandatory and exact", 
     ["interpreter uses PATH lookup", workflows => {
       const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
       step.run = step.run.replace("/usr/bin/python3 -E -s", "python");
-    }, /must use the pinned interpreter on the exact release checkout/u],
+    }, /step Verify release-head calibration lineage must run \/usr\/bin\/python3 -E -s/u],
     ["lineage shell uses PATH lookup", workflows => {
       const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
       step.shell = "bash -e {0}";
@@ -2358,7 +2376,7 @@ test("release policy keeps the release-head lineage check mandatory and exact", 
     ["wrong release SHA", workflows => {
       const step = draftStep(workflows.get("release.yml").jobs.preflight, stepName);
       step.run = step.run.replace("$GITHUB_SHA", "$EXPECTED_HEAD_SHA");
-    }, /must use the pinned interpreter on the exact release checkout/u],
+    }, /step Verify release-head calibration lineage must run --expected-sha/u],
   ];
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   for (const [name, mutate, expected] of cases) {
@@ -2518,12 +2536,12 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
   const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
 
   const mutations = [
-    ["source synchronize trigger", sourceFile, workflow => {
-      workflow.on.pull_request.types.push("synchronize");
-    }, /trigger must be label-only/u],
-    ["platform synchronize trigger", packagedCoordinatorFile, workflow => {
-      workflow.on.pull_request.types.push("synchronize");
-    }, /trigger must be label-only/u],
+    ["source PR label trigger returns", sourceFile, workflow => {
+      workflow.on.pull_request = { types: ["labeled"] };
+    }, /support PR labels must not trigger broad source proof/u],
+    ["platform PR label trigger returns", packagedCoordinatorFile, workflow => {
+      workflow.on.pull_request = { types: ["labeled"] };
+    }, /support PR labels must not trigger package or hardware proof/u],
     ["source PR-number-only concurrency", sourceFile, workflow => {
       workflow.concurrency.group = "source-proof-${{ inputs.pr_number || github.event.pull_request.number }}";
     }, /concurrency must bind the Actions SHA/u],
@@ -2559,10 +2577,10 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace("set -euo pipefail\n", "set -euo pipefail\n\n");
     }, /exact normalized trusted resolver script contract/u],
-    ["source labeled job disabled", sourceFile, workflow => {
+    ["source resolve becomes conditional", sourceFile, workflow => {
       workflow.jobs.resolve.if
         = "false && (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')";
-    }, /only review-accepted labeled PR runs/u],
+    }, /execute only explicit dispatch and reusable calls/u],
     ["source manual ref equality", sourceFile, workflow => {
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace('test "$GITHUB_REF" = "refs\/heads\/$head_ref"', 'test -n "$GITHUB_REF"');
@@ -2599,10 +2617,10 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
           'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n\n    ||',
         );
     }, /exact normalized trusted resolver script contract/u],
-    ["platform labeled job disabled", packagedCoordinatorFile, workflow => {
+    ["platform route becomes conditional", packagedCoordinatorFile, workflow => {
       workflow.jobs.route.if
         = "false && (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')";
-    }, /only platform-proof labeled PR runs/u],
+    }, /execute only explicit dispatches/u],
     ["integration live dev SHA equality", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
@@ -2627,10 +2645,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["protected Linux candidate proof disabled", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].with.candidate_installed_proof = false;
     }, /Linux proof must close Vulkan and candidate-installed claims/u],
-    ["manual Linux candidate trusts a non-producer", linuxVulkanFile, workflow => {
-      workflow.on.workflow_dispatch.inputs.candidate_producer_workflow_path.default
-        = ".github/workflows/release.yml";
-    }, /manual candidate proof must trust the package-producing workflow/u],
+    ["Linux direct dispatch returns", linuxVulkanFile, workflow => {
+      workflow.on.workflow_dispatch = { inputs: {} };
+    }, /coordinator-only and not directly dispatchable/u],
     ["closeout skips protected Linux", packagedCoordinatorFile, workflow => {
       workflow.jobs.closeout.needs = workflow.jobs.closeout.needs
         .filter(name => name !== "linux-vulkan-proof");
@@ -2783,8 +2800,8 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
         "Reuse a completed gate for this exact head",
       );
       step.run = step.run.replace(
-        '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
-        '(.event == "pull_request" or .event == "workflow_dispatch")',
+        '.event == "workflow_dispatch" and .conclusion == "success"',
+        '.event == "workflow_dispatch"',
       );
     }, /source-proof\.yml step Reuse a completed gate.*workflow_dispatch.*conclusion/u],
     ["release preflight reuse", workflows => {
@@ -2793,20 +2810,20 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
         "Resolve reusable prior evidence",
       );
       step.run = step.run.replace(
-        ".head_repository.full_name == $repo and .conclusion == \"success\"",
-        ".head_repository.full_name == $repo",
+        '.event == "workflow_dispatch" and .conclusion == "success"',
+        '.event == "workflow_dispatch"',
       );
     }, /release\.yml step Resolve reusable prior evidence.*conclusion/u],
     ["packaged prior proof lookup", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful exact-head source proof",
+        "Require successful accepted-head source proof",
       );
       step.run = step.run.replace(
-        '(.event == "pull_request" or .event == "workflow_dispatch") and .conclusion == "success"',
-        '(.event == "pull_request" or .event == "workflow_dispatch")',
+        '.event == "workflow_dispatch" and .conclusion == "success"',
+        '.event == "workflow_dispatch"',
       );
-    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
+    }, /packaged-platform-pr\.yml step Require successful accepted-head source proof.*conclusion/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -2814,6 +2831,85 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
       const workflows = loadWorkflows();
       mutate(workflows);
       assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
+});
+
+test("release freeze barrier rejects every broad-proof bypass", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const cases = [
+    ["source label trigger", workflows => {
+      workflows.get("source-proof.yml").on.pull_request = { types: ["labeled"] };
+    }, /support PR event/u],
+    ["platform label trigger", workflows => {
+      workflows.get("packaged-platform-pr.yml").on.pull_request = { types: ["labeled"] };
+    }, /support PR event/u],
+    ...[
+      "macos-metal-proof.yml",
+      "windows-vulkan-proof.yml",
+      "linux-vulkan-proof.yml",
+    ].map(file => [
+      `${file} direct dispatch`,
+      workflows => {
+        workflows.get(file).on.workflow_dispatch = { inputs: {} };
+      },
+      /callable only through an accepted coordinator/u,
+    ]),
+    ["source dispatch omits receipt", workflows => {
+      workflows.get("source-proof.yml").on.workflow_dispatch
+        .inputs.freeze_receipt_digest.required = false;
+    }, /dispatch must require an exact-head freeze receipt digest/u],
+    ["source dispatch stops emitting a reusable cell", workflows => {
+      workflows.get("source-proof.yml").on.workflow_dispatch
+        .inputs.emit_release_cells.default = false;
+    }, /dispatch must emit one reusable versioned source cell/u],
+    ["platform dispatch omits receipt", workflows => {
+      workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
+        .inputs.freeze_receipt_digest.required = false;
+    }, /dispatch must require an exact-head freeze receipt digest/u],
+    ["qualification proves the frozen descendant again", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Resolve accepted source proof head",
+      );
+      step.run = step.run.replace(
+        'echo "sha=$CALIBRATION_SOURCE_SHA" >> "$GITHUB_OUTPUT"',
+        'echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"',
+      );
+    }, /Resolve accepted source proof head.*sha=\$CALIBRATION_SOURCE_SHA/u],
+    ["release searches the frozen descendant", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        "actions/runs?head_sha=$SOURCE_SHA",
+        "actions/runs?head_sha=$GITHUB_SHA",
+      );
+    }, /Resolve reusable prior evidence.*head_sha=\$SOURCE_SHA/u],
+    ["release restores post-calibration fallback", workflows => {
+      workflows.get("release.yml").jobs["source-proof"].if = "always()";
+    }, /post-calibration source-proof fallback unreachable/u],
+    ["release stops cancelling superseded work", workflows => {
+      workflows.get("release.yml").concurrency["cancel-in-progress"] = false;
+    }, /release and auto-release must cancel superseded work/u],
+    ["auto-release stops cancelling superseded work", workflows => {
+      workflows.get("auto-release.yml").concurrency["cancel-in-progress"] = false;
+    }, /release and auto-release must cancel superseded work/u],
+    ["source stale-run sweep is removed", workflows => {
+      const job = workflows.get("source-proof.yml").jobs.resolve;
+      job.steps = job.steps.filter(({ name }) => name !== "Cancel superseded proof runs");
+    }, /Cancel superseded proof runs/u],
+    ["platform stale-run sweep is removed", workflows => {
+      const job = workflows.get("packaged-platform-pr.yml").jobs.route;
+      job.steps = job.steps.filter(({ name }) => name !== "Cancel superseded proof runs");
+    }, /Cancel superseded proof runs/u],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
     });
   }
 });
@@ -3402,17 +3498,14 @@ test("standard release paths reject calibration plumbing", async (t) => {
         required: true,
         type: "string",
       };
-    }, /release\.yml standard release path must not reference calibration/u],
+    }, /release\.yml must not accept calibration bundle inputs/u],
     ["release forwards calibration to package proof", workflows => {
       workflows.get("release.yml").jobs["packaged-proof"].with.calibration_bundle_run_id
         = "${{ inputs.calibration_bundle_run_id }}";
-    }, /release\.yml standard release path must not reference calibration/u],
-    ["release hides calibration plumbing in a same-named decoy step", workflows => {
-      workflows.get("release.yml").jobs["workflow-policy"].steps.push({
-        name: "Verify release-head calibration lineage",
-        run: "echo calibration_bundle_artifact",
-      });
-    }, /release\.yml standard release path must not reference calibration/u],
+    }, /release\.yml packaged proof must not receive calibration_bundle_run_id/u],
+    ["release restores a second source proof fallback", workflows => {
+      workflows.get("release.yml").jobs["source-proof"].if = "always()";
+    }, /source proof may be skipped only when preflight resolved reusable evidence/u],
     ["post-publish proof receives calibration", workflows => {
       const step = draftStep(
         workflows.get("post-publish-release-smoke.yml").jobs.smoke,

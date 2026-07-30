@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -152,11 +152,17 @@ test("versioned claim graph has one deterministic digest and all declared contro
     ],
   );
   assert.ok(graph.claims.every((claim) => claim.prerequisite_checks.every(({ command }) => command.length > 0)));
-  assert.deepEqual(graph.workflow_policy.promotion.required_events, ["labeled"]);
+  assert.deepEqual(graph.workflow_policy.promotion.required_events, []);
+  assert.deepEqual(graph.workflow_policy.promotion.label_routed_workflows, []);
   assert.equal(graph.workflow_policy.promotion.proof_run_sha_expression, "${{ github.sha }}");
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+  assert.equal(
+    graph.workflow_policy.release_freeze_barrier
+      .single_source_proof.post_calibration_fallback_allowed,
+    false,
+  );
 });
 
 test("claim graph freezes one exact Windows release graph and protected content-addressed reuse", () => {
@@ -1162,6 +1168,83 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     }),
     /is not an ancestor of the release commit/u,
   );
+
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "codestory-source-reuse-"));
+  const fixtureGit = (...args) => {
+    const result = spawnSync("git", args, {
+      cwd: fixture,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "CodeStory Proof",
+        GIT_AUTHOR_EMAIL: "proof@codestory.invalid",
+        GIT_COMMITTER_NAME: "CodeStory Proof",
+        GIT_COMMITTER_EMAIL: "proof@codestory.invalid",
+        GIT_CONFIG_GLOBAL: os.devNull,
+        GIT_CONFIG_SYSTEM: os.devNull,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return result.stdout.trim();
+  };
+  fixtureGit("init", "-q");
+  const constantPath =
+    "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+  mkdirSync(path.dirname(path.join(fixture, constantPath)), { recursive: true });
+  writeFileSync(path.join(fixture, "README.md"), "source reuse fixture\n");
+  writeFileSync(
+    path.join(fixture, constantPath),
+    `${JSON.stringify({ status: "unfrozen", freeze_record: null }, null, 2)}\n`,
+  );
+  fixtureGit("add", "-A");
+  fixtureGit("commit", "-qm", "accepted source");
+  const acceptedSource = fixtureGit("rev-parse", "HEAD");
+  const acceptedTree = fixtureGit("rev-parse", "HEAD^{tree}");
+  writeFileSync(
+    path.join(fixture, constantPath),
+    `${JSON.stringify({
+      status: "frozen",
+      freeze_record: {
+        selection_source_commit: acceptedSource,
+        selection_source_tree: acceptedTree,
+      },
+    }, null, 2)}\n`,
+  );
+  fixtureGit("add", constantPath);
+  fixtureGit("commit", "-qm", "freeze constants");
+  const frozenSource = fixtureGit("rev-parse", "HEAD");
+  const frozenTree = fixtureGit("rev-parse", "HEAD^{tree}");
+  assert.equal(
+    verifyReuseBinding({
+      binding: "source_tree",
+      repository: fixture,
+      releaseCommit: frozenSource,
+      reusedCommit: acceptedSource,
+    }),
+    frozenTree,
+  );
+  fixtureGit("commit", "--allow-empty", "-qm", "promote frozen tree");
+  const promotedSource = fixtureGit("rev-parse", "HEAD");
+  assert.equal(
+    verifyReuseBinding({
+      binding: "source_tree",
+      repository: fixture,
+      releaseCommit: promotedSource,
+      reusedCommit: acceptedSource,
+    }),
+    frozenTree,
+  );
+  fixtureGit("commit", "--allow-empty", "-qm", "later source commit");
+  const laterSource = fixtureGit("rev-parse", "HEAD");
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_tree",
+      repository: fixture,
+      releaseCommit: laterSource,
+      reusedCommit: acceptedSource,
+    }),
+    /direct generated constant-set child|tree-preserving promotion/u,
+  );
 });
 
 test("a reuse binding may equate only identities its own construction determines", () => {
@@ -1170,7 +1253,10 @@ test("a reuse binding may equate only identities its own construction determines
   // required_identity, which would drop the check for fresh evidence too (#1567).
   const declared = graph.evidence_policy.reuse.bindings;
   assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
-  assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(
+    declared.source_tree.equates.map(({ identity }) => identity),
+    ["source_tree"],
+  );
   assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
   assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
 
@@ -1185,15 +1271,15 @@ test("a reuse binding may equate only identities its own construction determines
     /native_fingerprint may not equate identity repository, which its construction does not determine/u,
   );
 
-  // The tree binding proves the reused commit resolves to this release's own tree, so there is
-  // nothing to substitute: equating the tree there would replace a live check with nothing.
-  const vacuousEquation = structuredClone(graph);
-  vacuousEquation.evidence_policy.reuse.bindings.source_tree.equates = [
-    { identity: "source_tree", justification: "the trees are equal anyway" },
+  // Constant-only lineage lets the tree binding determine the source-tree transition. It still
+  // says nothing about which repository produced either commit, so it cannot equate repository.
+  const sourceTreeOverreach = structuredClone(graph);
+  sourceTreeOverreach.evidence_policy.reuse.bindings.source_tree.equates = [
+    { identity: "repository", justification: "the commits were nearby" },
   ];
   assert.throws(
-    () => validateReleaseClaimGraph(vacuousEquation),
-    /source_tree may not equate identity source_tree, which its construction does not determine/u,
+    () => validateReleaseClaimGraph(sourceTreeOverreach),
+    /source_tree may not equate identity repository, which its construction does not determine/u,
   );
 
   // An identity outside the release identity binding has no authoritative release-side value the
