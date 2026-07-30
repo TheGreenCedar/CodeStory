@@ -1,47 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   receiptDigest,
-  validateMutationReceipt,
-  validatePlatformEvidence,
+  validateAcceptanceProvenance,
   validateReceipt,
 } from "./release-freeze-barrier.mjs";
 
 const COMMIT = "1".repeat(40);
 const TREE = "2".repeat(40);
-const REQUIRED = ["cpu-reentry", "duplicate-source-proof"];
-
-function mutationReceipt(overrides = {}) {
-  return {
-    commit: COMMIT,
-    tree: TREE,
-    cases: REQUIRED.map((id) => ({ id, status: "passed" })),
-    ...overrides,
-  };
-}
-
-function platformEvidence(overrides = {}) {
-  return {
-    failures: [{
-      run_id: 77,
-      platform: "windows",
-    }],
-    probes: [{
-      failure_run_id: 77,
-      platform: "windows",
-      commit: COMMIT,
-      tree: TREE,
-      status: "passed",
-      duration_seconds: 5,
-      mutation: "junction replacement",
-    }],
-    ...overrides,
-  };
-}
+const DIGEST = "a".repeat(64);
 
 function receipt(overrides = {}) {
   const candidate = {
@@ -63,8 +34,6 @@ function receipt(overrides = {}) {
       "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
     ],
     planned_proof_actions: ["source-proof", "calibration", "qualification"],
-    hostile_mutations: mutationReceipt(),
-    platform_evidence: platformEvidence(),
     reusable_evidence: [],
     invalidated_evidence: [],
     running_workflows: [],
@@ -76,12 +45,8 @@ function receipt(overrides = {}) {
   return candidate;
 }
 
-test("an exact clean pushed receipt with hostile and native evidence passes", () => {
-  validateReceipt(receipt(), {
-    commit: COMMIT,
-    tree: TREE,
-    requiredMutationIds: REQUIRED,
-  });
+test("an exact clean pushed local declaration passes", () => {
+  validateReceipt(receipt(), { commit: COMMIT, tree: TREE });
 });
 
 for (const [name, mutate, pattern] of [
@@ -97,18 +62,6 @@ for (const [name, mutate, pattern] of [
   }, /unsupported future source change/u],
   ["missing handoff field", (value) => { delete value.running_workflows; }, /running_workflows/u],
   ["missing next mutation", (value) => { value.next_permitted_mutation = ""; }, /next permitted mutation/u],
-  ["mutation from another head", (value) => {
-    value.hostile_mutations.commit = "6".repeat(40);
-  }, /exact frozen commit and tree/u],
-  ["named mutation not run", (value) => {
-    value.hostile_mutations.cases[0].status = "skipped";
-  }, /did not pass/u],
-  ["native probe from another head", (value) => {
-    value.platform_evidence.probes[0].commit = "7".repeat(40);
-  }, /native probe under 90 seconds/u],
-  ["native probe at 90 seconds", (value) => {
-    value.platform_evidence.probes[0].duration_seconds = 90;
-  }, /native probe under 90 seconds/u],
   ["tampered receipt", (value) => {
     value.planned_proof_actions.push("second-source-proof");
   }, /digest/u],
@@ -120,33 +73,100 @@ for (const [name, mutate, pattern] of [
       candidate.digest = receiptDigest(candidate);
     }
     assert.throws(
-      () => validateReceipt(candidate, {
-        commit: COMMIT,
-        tree: TREE,
-        requiredMutationIds: REQUIRED,
-      }),
+      () => validateReceipt(candidate, { commit: COMMIT, tree: TREE }),
       pattern,
     );
   });
 }
 
-test("mutation and native evidence validators reject malformed arrays", () => {
-  assert.throws(
-    () => validateMutationReceipt({ commit: COMMIT, tree: TREE }, {
-      commit: COMMIT,
-      tree: TREE,
-      requiredIds: REQUIRED,
-    }),
-    /contain cases/u,
-  );
-  assert.throws(
-    () => validatePlatformEvidence({ failures: {}, probes: [] }, {
-      commit: COMMIT,
-      tree: TREE,
-    }),
-    /failure and probe arrays/u,
-  );
+function acceptanceProvenance() {
+  const runId = 77;
+  const runAttempt = 2;
+  const startedAt = "2026-07-30T12:00:00Z";
+  const completedAt = "2026-07-30T12:00:06Z";
+  const job = (name, stepName, labels = ["ubuntu-latest"]) => ({
+    name,
+    status: "completed",
+    conclusion: "success",
+    head_sha: COMMIT,
+    run_id: runId,
+    run_attempt: runAttempt,
+    labels,
+    steps: [{
+      name: stepName,
+      status: "completed",
+      conclusion: "success",
+      started_at: startedAt,
+      completed_at: completedAt,
+    }],
+  });
+  return {
+    status: {
+      state: "success",
+      context: `codestory/release-freeze/${DIGEST}`,
+      description: `tree=${TREE}`,
+      target_url: `https://github.com/TheGreenCedar/CodeStory/actions/runs/${runId}`,
+      creator: { login: "github-actions[bot]", type: "Bot" },
+    },
+    run: {
+      id: runId,
+      run_attempt: runAttempt,
+      head_sha: COMMIT,
+      path: ".github/workflows/source-proof.yml",
+      event: "workflow_dispatch",
+      status: "completed",
+      conclusion: "success",
+      head_repository: { full_name: "TheGreenCedar/CodeStory" },
+    },
+    jobs: [
+      job("freeze-hostile-mutations", "Execute exact-head hostile mutation matrix"),
+      job(
+        "freeze-windows-native-probe",
+        "Run exact-head Windows native probe",
+        ["self-hosted", "Windows", "X64", "codestory-vulkan"],
+      ),
+      job("freeze-acceptance", "Publish executable release freeze"),
+    ],
+    repository: "TheGreenCedar/CodeStory",
+    commit: COMMIT,
+    tree: TREE,
+    digest: DIGEST,
+  };
+}
+
+test("acceptance trusts exact Actions run, job, step, host, and duration provenance", () => {
+  assert.equal(validateAcceptanceProvenance(acceptanceProvenance()), 77);
 });
+
+for (const [name, mutate, pattern] of [
+  ["caller-authored success", (value) => {
+    value.status.creator = { login: "TheGreenCedar", type: "User" };
+  }, /not authenticated Actions acceptance/u],
+  ["cross-head run", (value) => {
+    value.run.head_sha = "3".repeat(40);
+  }, /run provenance changed/u],
+  ["wrong workflow", (value) => {
+    value.run.path = ".github/workflows/release.yml";
+  }, /run provenance changed/u],
+  ["skipped hostile mutations", (value) => {
+    value.jobs[0].conclusion = "skipped";
+  }, /not a successful exact-run job/u],
+  ["unprotected Windows runner", (value) => {
+    value.jobs[1].labels = ["self-hosted", "Windows", "X64"];
+  }, /protected label codestory-vulkan/u],
+  ["90-second Windows probe", (value) => {
+    value.jobs[1].steps[0].completed_at = "2026-07-30T12:01:30Z";
+  }, /under 90 seconds/u],
+  ["fabricated native step", (value) => {
+    value.jobs[1].steps[0].conclusion = "failure";
+  }, /did not execute successfully/u],
+]) {
+  test(`acceptance rejects ${name}`, () => {
+    const value = acceptanceProvenance();
+    mutate(value);
+    assert.throws(() => validateAcceptanceProvenance(value), pattern);
+  });
+}
 
 test("verify-file is executable and rejects a later commit", () => {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-"));
@@ -164,10 +184,6 @@ test("verify-file is executable and rejects a later commit", () => {
       COMMIT,
       "--tree",
       TREE,
-      "--required-mutation",
-      REQUIRED[0],
-      "--required-mutation",
-      REQUIRED[1],
     ],
     { encoding: "utf8" },
   );
@@ -216,14 +232,8 @@ test("declare rejects a dirty worktree before publishing a status", () => {
       "1",
       "--output",
       path.join(root, "receipt.json"),
-      "--mutation-receipt",
-      path.join(root, "missing-mutations.json"),
-      "--platform-evidence",
-      path.join(root, "missing-platform.json"),
       "--next-permitted-mutation",
       "none",
-      "--required-mutation",
-      "cpu-reentry",
       "--planned-proof-action",
       "source-proof",
       "--broad-workflow",
@@ -234,4 +244,131 @@ test("declare rejects a dirty worktree before publishing a status", () => {
   );
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /clean worktree, including untracked files/u);
+});
+
+test("cancel-superseded rejects a cancellation request that leaves the run active", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-gh-"));
+  const fakeGh = path.join(root, "gh");
+  writeFileSync(
+    fakeGh,
+    `#!/bin/sh
+if [ "$1 $2" = "run list" ]; then
+  printf '%s\\n' '[{"databaseId":123,"workflowName":"Exact-head source proof","headSha":"${"9".repeat(40)}","headBranch":"old","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/123"}]'
+  exit 0
+fi
+if [ "$1 $2" = "run cancel" ]; then
+  exit 0
+fi
+exit 1
+`,
+  );
+  chmodSync(fakeGh, 0o755);
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "cancel-superseded",
+      "--repository",
+      "TheGreenCedar/CodeStory",
+      "--commit",
+      COMMIT,
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODESTORY_FREEZE_CANCEL_POLL_ATTEMPTS: "2",
+        CODESTORY_FREEZE_CANCEL_POLL_MS: "0",
+        PATH: `${root}${path.delimiter}${process.env.PATH}`,
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /remains queued or running after cancellation/u);
+});
+
+test("cancel-superseded rejects another active broad run on the unchanged head", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-duplicate-gh-"));
+  const fakeGh = path.join(root, "gh");
+  writeFileSync(
+    fakeGh,
+    `#!/bin/sh
+if [ "$1 $2" = "run list" ]; then
+  printf '%s\\n' '[{"databaseId":456,"workflowName":"Exact-head source proof","headSha":"${COMMIT}","headBranch":"candidate","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/456"}]'
+  exit 0
+fi
+exit 1
+`,
+  );
+  chmodSync(fakeGh, 0o755);
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "cancel-superseded",
+      "--repository",
+      "TheGreenCedar/CodeStory",
+      "--commit",
+      COMMIT,
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${root}${path.delimiter}${process.env.PATH}`,
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unchanged head.*already has active/u);
+});
+
+test("automatic invalidation preserves an active proof for the new exact head", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-current-gh-"));
+  const fakeGh = path.join(root, "gh");
+  writeFileSync(
+    fakeGh,
+    `#!/bin/sh
+if [ "$1 $2" = "run list" ]; then
+  printf '%s\\n' '[{"databaseId":789,"workflowName":"Exact-head source proof","headSha":"${COMMIT}","headBranch":"candidate","status":"in_progress","event":"workflow_dispatch","url":"https://example.invalid/789"}]'
+  exit 0
+fi
+if [ "$1 $2" = "run cancel" ]; then
+  exit 9
+fi
+exit 1
+`,
+  );
+  chmodSync(fakeGh, 0o755);
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "invalidate-superseded",
+      "--repository",
+      "TheGreenCedar/CodeStory",
+      "--commit",
+      COMMIT,
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODESTORY_FREEZE_CANCEL_POLL_ATTEMPTS: "2",
+        CODESTORY_FREEZE_CANCEL_POLL_MS: "0",
+        PATH: `${root}${path.delimiter}${process.env.PATH}`,
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { cancelled: [] });
 });

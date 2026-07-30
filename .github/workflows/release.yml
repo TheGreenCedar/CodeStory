@@ -45,6 +45,7 @@ permissions:
   checks: read
   contents: read
   pull-requests: read
+  statuses: read
 
 concurrency:
   group: release-${{ inputs.version }}
@@ -236,8 +237,18 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
               --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q . || continue
+            run_attempt="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+            )"
+            artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
+            artifact_count="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                | jq --arg name "$artifact_name" \
+                  '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+            )"
+            test "$artifact_count" = 1 || continue
             entries+=("source_behavior=$run_id:$SOURCE_SHA")
-            echo "Reusing the one source proof from run $run_id at calibration source $SOURCE_SHA."
+            echo "Reusing the one source proof and $artifact_name from run $run_id at calibration source $SOURCE_SHA."
             break
           done < <(
             gh api --paginate \
@@ -265,18 +276,21 @@ jobs:
                   .state == "success"
                   and (.context | startswith("codestory/release-freeze/"))
                   and .description == $description
+                  and .creator.login == "github-actions[bot]"
+                  and .creator.type == "Bot"
+                  and (.target_url | test(
+                    "^https://github.com/TheGreenCedar/CodeStory/actions/runs/[1-9][0-9]*$"
+                  ))
                 ) | .context | sub("^codestory/release-freeze/"; "")] | unique | if length == 1 then .[0] else "" end' \
                 <<<"$statuses"
             )"
           fi
           printf '%s' "$freeze_digest" | grep -Eq '^[0-9a-f]{64}$'
-          jq -e \
-            --arg context "codestory/release-freeze/$freeze_digest" \
-            --arg description "tree=$SOURCE_TREE" \
-            'any(.[]; .state == "success"
-              and .context == $context
-              and .description == $description)' \
-            <<<"$statuses" >/dev/null
+          node .github/scripts/release-freeze-barrier.mjs verify-status \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$SOURCE_SHA" \
+            --tree "$SOURCE_TREE" \
+            --receipt-digest "$freeze_digest"
 
           {
             echo "reuse=$reuse"
@@ -345,7 +359,6 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       version: ${{ needs.preflight.outputs.version }}
-      emit_release_cells: true
       freeze_receipt_digest: ${{ needs.preflight.outputs.freeze_receipt_digest }}
 
   packaged-proof:

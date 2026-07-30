@@ -10,13 +10,8 @@ on:
         required: true
         type: string
       version:
-        required: false
-        default: ""
+        required: true
         type: string
-      emit_release_cells:
-        required: false
-        default: false
-        type: boolean
       freeze_receipt_digest:
         description: Digest of the exact-head release freeze status.
         required: true
@@ -39,16 +34,17 @@ on:
         description: Release version whose source cell this accepted proof emits.
         required: true
         type: string
-      emit_release_cells:
-        description: Emit the source cell that qualification and publication reuse.
+      acceptance_only:
+        description: Execute only the hostile mutation and protected Windows native-probe freeze barrier.
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
   actions: write
   contents: read
   pull-requests: read
+  statuses: write
 
 concurrency:
   group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.ref }}
@@ -151,6 +147,7 @@ jobs:
 
       - name: Reuse a completed gate for this exact head
         id: reuse
+        if: ${{ !inputs.acceptance_only }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -164,8 +161,18 @@ jobs:
               --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q .
             then
+              run_attempt="$(
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+              )"
+              artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
+              artifact_count="$(
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                  | jq --arg name "$artifact_name" \
+                    '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+              )"
+              test "$artifact_count" = 1 || continue
               reuse=true
-              echo "Reusing full-source-gate from run $run_id for exact head $HEAD_SHA."
+              echo "Reusing full-source-gate and $artifact_name from run $run_id for exact head $HEAD_SHA."
               break
             fi
           done < <(
@@ -180,6 +187,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_ONLY: ${{ inputs.acceptance_only }}
           FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
           HEAD_SHA: ${{ steps.resolve.outputs.ref }}
         run: |
@@ -188,16 +196,156 @@ jobs:
           tree="$(
             gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
           )"
-          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" \
-            | jq -e \
-              --arg context "codestory/release-freeze/$FREEZE_RECEIPT_DIGEST" \
-              --arg description "tree=$tree" \
-              'any(.[]; .state == "success"
-                and .context == $context
-                and .description == $description)' >/dev/null || {
-              echo "::error::No executable release freeze accepts exact head $HEAD_SHA and tree $tree."
-              exit 1
+          command=verify-status
+          if [ "$ACCEPTANCE_ONLY" = true ]; then
+            command=verify-pending
+          fi
+          node .github/scripts/release-freeze-barrier.mjs "$command" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$HEAD_SHA" \
+            --tree "$tree" \
+            --receipt-digest "$FREEZE_RECEIPT_DIGEST"
+
+  freeze-hostile-mutations:
+    name: freeze-hostile-mutations
+    if: inputs.acceptance_only
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Execute exact-head hostile mutation matrix
+        run: >-
+          node --test
+          .github/scripts/check-workflow-policy.test.mjs
+          .github/scripts/release-freeze-barrier.test.mjs
+          .github/scripts/cargo-build-artifacts.test.mjs
+          .github/scripts/candidate-archive-store.test.mjs
+
+  freeze-windows-native-probe:
+    name: freeze-windows-native-probe
+    if: inputs.acceptance_only
+    needs: resolve
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Run exact-head Windows native probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probeRoot = Join-Path $env:RUNNER_TEMP (
+            "codestory-cargo-hardlink-probe-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          )
+          if (Test-Path -LiteralPath $probeRoot) {
+            throw "native probe root already exists: $probeRoot"
+          }
+          try {
+            cargo new --quiet --bin --name cargo-hardlink-probe $probeRoot
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo new failed"
             }
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} (
+              "Microsoft Visual Studio/Installer/vswhere.exe"
+            )
+            $visualStudio = & $vswhere -latest -products "*" `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+            $vsDevCmd = Join-Path $visualStudio "Common7/Tools/VsDevCmd.bat"
+            $build = (
+              "`"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul " +
+              "&& cd /d `"$probeRoot`" && cargo build --release --quiet"
+            )
+            & cmd.exe /d /s /c $build
+            if ($LASTEXITCODE -ne 0) {
+              throw "tiny Cargo release probe failed"
+            }
+            node --test .github/scripts/cargo-build-artifacts.test.mjs
+            if ($LASTEXITCODE -ne 0) {
+              throw "exact-head Windows artifact selector mutations failed"
+            }
+            $rootExe = Join-Path $probeRoot "target/release/cargo-hardlink-probe.exe"
+            $depsExe = Join-Path $probeRoot "target/release/deps/cargo_hardlink_probe.exe"
+            $identityScript = @'
+          const fs = require("node:fs");
+          const [root, deps] = process.argv.slice(1);
+          const left = fs.statSync(root, { bigint: true });
+          const right = fs.statSync(deps, { bigint: true });
+          if (
+            left.dev !== right.dev
+            || left.ino !== right.ino
+            || left.nlink !== 2n
+            || right.nlink !== 2n
+          ) {
+            throw new Error("Cargo release root/deps outputs are not one native two-link file");
+          }
+          console.log(JSON.stringify({
+            device: String(left.dev),
+            inode: String(left.ino),
+            nlink: String(left.nlink),
+          }));
+          '@
+            node -e $identityScript $rootExe $depsExe
+            if ($LASTEXITCODE -ne 0) {
+              throw "Cargo native hardlink identity probe failed"
+            }
+            $clock.Stop()
+            if ($clock.Elapsed.TotalSeconds -ge 90) {
+              throw "native probe took $($clock.Elapsed.TotalSeconds) seconds"
+            }
+            "native_probe_seconds=$([Math]::Round($clock.Elapsed.TotalSeconds, 3))"
+          } finally {
+            Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+  freeze-acceptance:
+    name: freeze-acceptance
+    if: >-
+      always() &&
+      inputs.acceptance_only &&
+      needs.resolve.result == 'success' &&
+      needs.freeze-hostile-mutations.result == 'success' &&
+      needs.freeze-windows-native-probe.result == 'success'
+    needs:
+      - resolve
+      - freeze-hostile-mutations
+      - freeze-windows-native-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish executable release freeze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          HEAD_SHA: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          tree="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
+          )"
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f "context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST" \
+            -f "description=tree=$tree" \
+            -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
   full-source-gate:
     name: full-source-gate
@@ -206,7 +354,7 @@ jobs:
     # and cannot reach a different answer, which is what made re-labelling a PR expensive. Release
     # runs (workflow_call, which always supplies `ref`) never take this path: their chain requires
     # the job to execute.
-    if: needs.resolve.outputs.reuse != 'true'
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -452,7 +600,6 @@ jobs:
           cargo test --workspace --doc --locked
 
       - name: Emit authenticated source release cell
-        if: inputs.emit_release_cells
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -472,7 +619,7 @@ jobs:
             --out target/release-cells/source_behavior.json
 
       - name: Upload authenticated source release cell
-        if: success() && inputs.emit_release_cells
+        if: success()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-source-attempt-${{ github.run_attempt }}
@@ -483,7 +630,7 @@ jobs:
   retrieval-generalization:
     name: retrieval-generalization
     needs: resolve
-    if: needs.resolve.outputs.reuse != 'true'
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

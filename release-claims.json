@@ -1493,14 +1493,36 @@
         "packaged-platform-pr.yml",
         "release.yml"
       ],
+      "invalidation_workflow": "release-freeze-invalidation.yml",
       "coordinator_only_workflows": [
         "macos-metal-proof.yml",
         "windows-vulkan-proof.yml",
         "linux-vulkan-proof.yml"
       ],
+      "acceptance": {
+        "producer_workflow": "source-proof.yml",
+        "event": "workflow_dispatch",
+        "hostile_job": "freeze-hostile-mutations",
+        "hostile_step": "Execute exact-head hostile mutation matrix",
+        "windows_job": "freeze-windows-native-probe",
+        "windows_step": "Run exact-head Windows native probe",
+        "windows_runner": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "windows_probe_max_seconds": 90,
+        "publisher_job": "freeze-acceptance",
+        "publisher_step": "Publish executable release freeze",
+        "status_creator": "github-actions[bot]"
+      },
       "single_source_proof": {
         "producer_workflow": "source-proof.yml",
         "producer_job": "full-source-gate",
+        "artifact": "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
+        "artifact_required_unexpired": true,
+        "cell_emission": "unconditional_on_success",
         "accepted_source": "freeze_receipt.commit",
         "frozen_descendant": "constant_set.freeze_record.selection_source_commit",
         "reuse_validation": [

@@ -913,7 +913,7 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "83ff8876fbf87a2e35eebe0e16d8f025a1b2377ceb0a31d8c9bcacea856f9bde";
+  "26e3e2a92d959a46f8ef6173d0531b331cbd824344400629aa2e5b13c6286d33";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -2134,18 +2134,22 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       '.path == ".github/workflows/source-proof.yml"',
       '.event == "workflow_dispatch" and .conclusion == "success"',
       '.name == "full-source-gate" and .conclusion == "success"',
+      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
+      ".expired == false",
+      'test "$artifact_count" = 1 || continue',
     ]);
     requireStepRun(violations, sourceFile, resolve, "Require executable release freeze", [
-      "codestory/release-freeze/$FREEZE_RECEIPT_DIGEST",
       "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
-      ".state == \"success\"",
-      ".description == $description",
+      "release-freeze-barrier.mjs",
+      "verify-pending",
+      "verify-status",
+      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
     ]);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
     add(
       violations,
-      full.if === "needs.resolve.outputs.reuse != 'true'",
+      full.if === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}",
       `${sourceFile} full source gate may skip only a completed exact-head proof`,
     );
     const generalization = requireJob(
@@ -2170,7 +2174,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       violations,
       generalization.name === "retrieval-generalization"
         && sameMembers(needs(generalization), ["resolve"])
-        && generalization.if === "needs.resolve.outputs.reuse != 'true'"
+        && generalization.if
+          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
         && generalization["runs-on"] === "ubuntu-latest"
         && generalization["timeout-minutes"] === 5
         && generalization["continue-on-error"] === undefined,
@@ -2406,9 +2411,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     add(
       violations,
       sourceCellUpload?.uses === "actions/upload-artifact@v7.0.1"
-        && String(sourceCellUpload?.if ?? "").includes("success()")
-        && String(sourceCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
-      `${sourceFile} source release cell must be a success-only retained artifact`,
+        && sourceCellUpload?.if === "success()"
+        && !scalarStrings(source).some(value => value.includes("emit_release_cells")),
+      `${sourceFile} source release cell must be an unconditional success-only retained artifact`,
     );
   }
 }
@@ -2732,7 +2737,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     '.path == ".github/workflows/source-proof.yml"',
     '.event == "workflow_dispatch" and .conclusion == "success"',
     "The release workflow will not start a second proof after calibration",
-    "codestory/release-freeze/$freeze_digest",
+    'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
+    ".expired == false",
+    'test "$artifact_count" = 1 || continue',
+    "release-freeze-barrier.mjs verify-status",
+    '--receipt-digest "$freeze_digest"',
   ]);
   const closeout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   requireStepRun(violations, releaseFile, closeout, "Authenticate pre-publish Actions provenance", [
@@ -2747,9 +2756,9 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     object(source.with).version === "${{ needs.preflight.outputs.version }}"
-      && object(source.with).emit_release_cells === true
       && object(source.with).freeze_receipt_digest
-        === "${{ needs.preflight.outputs.freeze_receipt_digest }}",
+        === "${{ needs.preflight.outputs.freeze_receipt_digest }}"
+      && object(source.with).emit_release_cells === undefined,
     `${releaseFile} unreachable source fallback must retain the accepted freeze identity`,
   );
 
@@ -5001,16 +5010,19 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   });
   requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   requireStepRun(violations, file, route, "Require executable release freeze", [
-    "codestory/release-freeze/$FREEZE_RECEIPT_DIGEST",
     "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA",
-    ".state == \"success\"",
-    ".description == $description",
+    "release-freeze-barrier.mjs verify-status",
+    '--commit "$SOURCE_SHA"',
+    '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
   ]);
   requireStepRun(violations, file, route, "Require successful accepted-head source proof", [
     "actions/runs?head_sha=$SOURCE_SHA",
     '.path == ".github/workflows/source-proof.yml"',
     '.event == "workflow_dispatch" and .conclusion == "success"',
     '.name == "full-source-gate" and .conclusion == "success"',
+    'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
+    ".expired == false",
+    'test "$artifact_count" = 1 || continue',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
     'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
@@ -7953,6 +7965,8 @@ export function releaseFreezeBarrierWorkflowViolations(
 ) {
   const violations = [];
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
+  const acceptance = object(freeze.acceptance);
+  const singleSource = object(freeze.single_source_proof);
   add(
     violations,
     freeze.schema === 1
@@ -7961,8 +7975,97 @@ export function releaseFreezeBarrierWorkflowViolations(
       && sameMembers(list(freeze.allowed_future_source_changes), [
         "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
       ])
-      && object(freeze.single_source_proof).post_calibration_fallback_allowed === false,
+      && freeze.invalidation_workflow === "release-freeze-invalidation.yml"
+      && acceptance.producer_workflow === "source-proof.yml"
+      && acceptance.event === "workflow_dispatch"
+      && acceptance.hostile_job === "freeze-hostile-mutations"
+      && acceptance.hostile_step === "Execute exact-head hostile mutation matrix"
+      && acceptance.windows_job === "freeze-windows-native-probe"
+      && acceptance.windows_step === "Run exact-head Windows native probe"
+      && sameMembers(list(acceptance.windows_runner), [
+        "self-hosted",
+        "Windows",
+        "X64",
+        "codestory-vulkan",
+      ])
+      && acceptance.windows_probe_max_seconds === 90
+      && acceptance.publisher_job === "freeze-acceptance"
+      && acceptance.publisher_step === "Publish executable release freeze"
+      && acceptance.status_creator === "github-actions[bot]"
+      && singleSource.artifact
+        === "release-cell-prepublish-source-attempt-${{ github.run_attempt }}"
+      && singleSource.artifact_required_unexpired === true
+      && singleSource.cell_emission === "unconditional_on_success"
+      && singleSource.post_calibration_fallback_allowed === false,
     "[freeze_barrier] release claim graph must pin the executable single-proof freeze contract",
+  );
+
+  const invalidationFile = freeze.invalidation_workflow;
+  const invalidation = workflows.get(invalidationFile);
+  add(
+    violations,
+    sameMembers(at(invalidation, "on", "pull_request", "branches"), [
+      "dev/codestory-next",
+    ])
+      && sameMembers(at(invalidation, "on", "pull_request", "types"), [
+        "synchronize",
+      ])
+      && sameMembers(at(invalidation, "on", "push", "branches"), [
+        "dev/codestory-next",
+      ])
+      && object(invalidation.permissions).actions === "write"
+      && object(invalidation.permissions).contents === "read"
+      && object(invalidation.permissions).statuses === "read"
+      && at(invalidation, "concurrency", "cancel-in-progress") === true,
+    "[freeze_barrier] release freeze invalidation must run automatically when a candidate head is superseded",
+  );
+  const invalidationJob = requireJob(
+    violations,
+    invalidationFile,
+    invalidation,
+    "invalidate",
+  );
+  add(
+    violations,
+    invalidationJob["runs-on"] === "ubuntu-latest"
+      && invalidationJob["timeout-minutes"] === 5
+      && sameMembers(
+        list(invalidationJob.steps).map(step => step?.name ?? step?.uses),
+        [
+          "actions/checkout@v5",
+          "Invalidate a superseded release freeze",
+        ],
+      ),
+    "[freeze_barrier] release freeze invalidation must remain one bounded cancellation job",
+  );
+  requireStepRun(
+    violations,
+    invalidationFile,
+    invalidationJob,
+    "Invalidate a superseded release freeze",
+    [
+      'test "$BEFORE_SHA" != "$AFTER_SHA"',
+      "commits/$BEFORE_SHA/statuses?per_page=100",
+      '.state == "pending" or .state == "success"',
+      'startswith("codestory/release-freeze/")',
+      'if [ "$has_freeze" = 0 ]; then',
+      "release-freeze-barrier.mjs invalidate-superseded",
+      '--commit "$AFTER_SHA"',
+      '--broad-workflow "Exact-head source proof"',
+      '--broad-workflow "Platform and integration proof"',
+      '--broad-workflow "Release"',
+      '--broad-workflow "Auto Release"',
+    ],
+  );
+  requireStepEnv(
+    violations,
+    invalidationFile,
+    invalidationJob,
+    "Invalidate a superseded release freeze",
+    {
+      AFTER_SHA: "${{ github.event.after || github.sha }}",
+      BEFORE_SHA: "${{ github.event.before }}",
+    },
   );
 
   for (const file of ["source-proof.yml", "packaged-platform-pr.yml"]) {
@@ -7990,28 +8093,52 @@ export function releaseFreezeBarrierWorkflowViolations(
       `[freeze_barrier] ${file} dispatch must require an exact-head freeze receipt digest`,
     );
     if (file === "source-proof.yml") {
-      const versionInput = object(at(
+      const dispatchVersionInput = object(at(
         workflow,
         "on",
         "workflow_dispatch",
         "inputs",
         "version",
       ));
-      const emitInput = object(at(
+      const callVersionInput = object(at(
+        workflow,
+        "on",
+        "workflow_call",
+        "inputs",
+        "version",
+      ));
+      const acceptanceInput = object(at(
         workflow,
         "on",
         "workflow_dispatch",
         "inputs",
-        "emit_release_cells",
+        "acceptance_only",
       ));
       add(
         violations,
-        versionInput.required === true
-          && versionInput.type === "string"
-          && emitInput.required === false
-          && emitInput.type === "boolean"
-          && emitInput.default === true,
-        "[freeze_barrier] source-proof.yml dispatch must emit one reusable versioned source cell",
+        dispatchVersionInput.required === true
+          && dispatchVersionInput.type === "string"
+          && callVersionInput.required === true
+          && callVersionInput.type === "string"
+          && acceptanceInput.required === false
+          && acceptanceInput.type === "boolean"
+          && acceptanceInput.default === false
+          && at(workflow, "on", "workflow_dispatch", "inputs", "emit_release_cells")
+            === undefined
+          && at(workflow, "on", "workflow_call", "inputs", "emit_release_cells")
+            === undefined,
+        "[freeze_barrier] source-proof.yml must separate acceptance and emit one reusable source cell after every successful proof",
+      );
+      add(
+        violations,
+        object(workflow.permissions).statuses === "write",
+        "[freeze_barrier] source-proof.yml acceptance must publish an exact-head commit status",
+      );
+    } else {
+      add(
+        violations,
+        object(workflow.permissions).statuses === "read",
+        "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status",
       );
     }
     add(
@@ -8035,6 +8162,107 @@ export function releaseFreezeBarrierWorkflowViolations(
       ],
     );
   }
+
+  const sourceWorkflow = workflows.get("source-proof.yml");
+  const hostileJob = requireJob(
+    violations,
+    "source-proof.yml",
+    sourceWorkflow,
+    acceptance.hostile_job,
+  );
+  add(
+    violations,
+    hostileJob.if === "inputs.acceptance_only"
+      && sameMembers(needs(hostileJob), ["resolve"])
+      && hostileJob["runs-on"] === "ubuntu-latest"
+      && hostileJob["timeout-minutes"] === 5
+      && namedStep(hostileJob, acceptance.hostile_step)?.["continue-on-error"] !== true,
+    "[freeze_barrier] source acceptance must execute the exact blocking hostile mutation job",
+  );
+  requireStepRun(
+    violations,
+    "source-proof.yml",
+    hostileJob,
+    acceptance.hostile_step,
+    [
+      "node --test",
+      ".github/scripts/check-workflow-policy.test.mjs",
+      ".github/scripts/release-freeze-barrier.test.mjs",
+      ".github/scripts/cargo-build-artifacts.test.mjs",
+      ".github/scripts/candidate-archive-store.test.mjs",
+    ],
+  );
+
+  const windowsJob = requireJob(
+    violations,
+    "source-proof.yml",
+    sourceWorkflow,
+    acceptance.windows_job,
+  );
+  add(
+    violations,
+    windowsJob.if === "inputs.acceptance_only"
+      && sameMembers(needs(windowsJob), ["resolve"])
+      && sameMembers(list(windowsJob["runs-on"]), list(acceptance.windows_runner))
+      && windowsJob["timeout-minutes"] === 5
+      && namedStep(windowsJob, acceptance.windows_step)?.shell === "pwsh"
+      && namedStep(windowsJob, acceptance.windows_step)?.["continue-on-error"] !== true,
+    "[freeze_barrier] source acceptance must execute the protected blocking Windows native probe",
+  );
+  requireStepRun(
+    violations,
+    "source-proof.yml",
+    windowsJob,
+    acceptance.windows_step,
+    [
+      "cargo new --quiet --bin",
+      "cargo build --release --quiet",
+      "node --test .github/scripts/cargo-build-artifacts.test.mjs",
+      "left.dev !== right.dev",
+      "left.ino !== right.ino",
+      "left.nlink !== 2n",
+      "right.nlink !== 2n",
+      "Elapsed.TotalSeconds -ge 90",
+      "Remove-Item -LiteralPath $probeRoot -Recurse -Force",
+    ],
+  );
+
+  const publisherJob = requireJob(
+    violations,
+    "source-proof.yml",
+    sourceWorkflow,
+    acceptance.publisher_job,
+  );
+  add(
+    violations,
+    sameMembers(needs(publisherJob), [
+      "resolve",
+      acceptance.hostile_job,
+      acceptance.windows_job,
+    ])
+      && publisherJob["runs-on"] === "ubuntu-latest"
+      && publisherJob["timeout-minutes"] === 5
+      && [
+          "always()",
+          "inputs.acceptance_only",
+          `needs.${acceptance.hostile_job}.result == 'success'`,
+          `needs.${acceptance.windows_job}.result == 'success'`,
+        ].every(fragment => String(publisherJob.if ?? "").includes(fragment)),
+    "[freeze_barrier] acceptance publisher must depend on both exact successful mutation jobs",
+  );
+  requireStepRun(
+    violations,
+    "source-proof.yml",
+    publisherJob,
+    acceptance.publisher_step,
+    [
+      "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA",
+      "-f state=success",
+      "-f \"context=codestory/release-freeze/$FREEZE_RECEIPT_DIGEST\"",
+      "-f \"description=tree=$tree\"",
+      "actions/runs/$GITHUB_RUN_ID",
+    ],
+  );
 
   for (const file of list(freeze.coordinator_only_workflows)) {
     const workflow = workflows.get(file);
@@ -8064,11 +8292,25 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     "packaged-platform-pr.yml",
     route,
+    "Require executable release freeze",
+    [
+      "release-freeze-barrier.mjs verify-status",
+      '--commit "$SOURCE_SHA"',
+      '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
+    ],
+  );
+  requireStepRun(
+    violations,
+    "packaged-platform-pr.yml",
+    route,
     "Require successful accepted-head source proof",
     [
       "actions/runs?head_sha=$SOURCE_SHA",
       '.event == "workflow_dispatch" and .conclusion == "success"',
       '.name == "full-source-gate" and .conclusion == "success"',
+      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
+      ".expired == false",
+      'test "$artifact_count" = 1 || continue',
     ],
   );
 
@@ -8080,6 +8322,12 @@ export function releaseFreezeBarrierWorkflowViolations(
       && at(auto, "concurrency", "cancel-in-progress") === true,
     "[freeze_barrier] release and auto-release must cancel superseded work",
   );
+  add(
+    violations,
+    object(release.permissions).statuses === "read"
+      && object(at(auto, "jobs", "release", "permissions")).statuses === "read",
+    "[freeze_barrier] manual and automatic release must authenticate freeze status provenance",
+  );
   const preflight = requireJob(violations, "release.yml", release, "preflight");
   requireStepRun(
     violations,
@@ -8088,6 +8336,10 @@ export function releaseFreezeBarrierWorkflowViolations(
     "Resolve reusable prior evidence",
     [
       "actions/runs?head_sha=$SOURCE_SHA",
+      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
+      ".expired == false",
+      'test "$artifact_count" = 1 || continue',
+      "release-freeze-barrier.mjs verify-status",
       "The release workflow will not start a second proof after calibration",
       "source_proof_reused=true",
     ],

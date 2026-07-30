@@ -16,6 +16,14 @@ const ALLOWED_FUTURE_CHANGES = new Set([
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
 ]);
 const STATUS_PREFIX = "codestory/release-freeze";
+const CANCEL_POLL_ATTEMPTS = Number.parseInt(
+  process.env.CODESTORY_FREEZE_CANCEL_POLL_ATTEMPTS ?? "10",
+  10,
+);
+const CANCEL_POLL_MS = Number.parseInt(
+  process.env.CODESTORY_FREEZE_CANCEL_POLL_MS ?? "1000",
+  10,
+);
 
 function fail(message) {
   throw new Error(message);
@@ -102,49 +110,89 @@ export function receiptDigest(receipt) {
     .digest("hex");
 }
 
-export function validateMutationReceipt(receipt, { commit, tree, requiredIds }) {
-  if (receipt?.commit !== commit || receipt?.tree !== tree) {
-    fail("hostile mutation evidence must name the exact frozen commit and tree");
+function elapsedSeconds(step) {
+  const started = Date.parse(String(step?.started_at ?? ""));
+  const completed = Date.parse(String(step?.completed_at ?? ""));
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started) {
+    fail(`acceptance step ${step?.name ?? "<unknown>"} has invalid Actions timing`);
   }
-  if (!Array.isArray(receipt.cases)) {
-    fail("hostile mutation evidence must contain cases");
-  }
-  const cases = new Map(receipt.cases.map((entry) => [entry?.id, entry]));
-  for (const id of requiredIds) {
-    const entry = cases.get(id);
-    if (!entry || entry.status !== "passed") {
-      fail(`hostile mutation ${id} did not pass on the exact frozen head`);
-    }
-  }
+  return (completed - started) / 1000;
 }
 
-export function validatePlatformEvidence(evidence, { commit, tree }) {
-  const failures = evidence?.failures ?? [];
-  const probes = evidence?.probes ?? [];
-  if (!Array.isArray(failures) || !Array.isArray(probes)) {
-    fail("platform evidence must contain failure and probe arrays");
+export function validateAcceptanceProvenance({
+  status,
+  run,
+  jobs,
+  repository,
+  commit,
+  tree,
+  digest,
+}) {
+  const escapedRepository = repository.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const target = new RegExp(
+    `^https://github\\.com/${escapedRepository}/actions/runs/([1-9][0-9]*)$`,
+    "u",
+  ).exec(String(status?.target_url ?? ""));
+  if (
+    status?.state !== "success"
+    || status?.context !== `${STATUS_PREFIX}/${digest}`
+    || status?.description !== `tree=${tree}`
+    || status?.creator?.login !== "github-actions[bot]"
+    || status?.creator?.type !== "Bot"
+    || !target
+  ) {
+    fail("release freeze status is not authenticated Actions acceptance");
   }
-  for (const failure of failures) {
-    const probe = probes.find((candidate) =>
-      candidate?.failure_run_id === failure?.run_id
-      && candidate?.platform === failure?.platform
-      && candidate?.commit === commit
-      && candidate?.tree === tree
-      && candidate?.status === "passed"
-      && Number.isFinite(candidate?.duration_seconds)
-      && candidate.duration_seconds < 90
-      && typeof candidate?.mutation === "string"
-      && candidate.mutation.length > 0
-    );
-    if (!probe) {
-      fail(
-        `platform failure ${failure?.run_id ?? "<unknown>"} lacks an exact-head native probe under 90 seconds`,
-      );
+  if (
+    String(run?.id) !== target[1]
+    || run?.head_sha !== commit
+    || run?.path !== ".github/workflows/source-proof.yml"
+    || run?.event !== "workflow_dispatch"
+    || run?.status !== "completed"
+    || run?.conclusion !== "success"
+    || run?.head_repository?.full_name !== repository
+  ) {
+    fail("release freeze acceptance run provenance changed");
+  }
+  if (!Array.isArray(jobs)) {
+    fail("release freeze acceptance jobs are missing");
+  }
+  const requiredJobs = new Map([
+    ["freeze-hostile-mutations", "Execute exact-head hostile mutation matrix"],
+    ["freeze-windows-native-probe", "Run exact-head Windows native probe"],
+    ["freeze-acceptance", "Publish executable release freeze"],
+  ]);
+  for (const [jobName, stepName] of requiredJobs) {
+    const job = jobs.find((candidate) => candidate?.name === jobName);
+    if (
+      job?.status !== "completed"
+      || job?.conclusion !== "success"
+      || job?.head_sha !== commit
+      || String(job?.run_id) !== String(run.id)
+      || String(job?.run_attempt) !== String(run.run_attempt)
+    ) {
+      fail(`release freeze acceptance job ${jobName} is not a successful exact-run job`);
+    }
+    const step = job.steps?.find((candidate) => candidate?.name === stepName);
+    if (step?.status !== "completed" || step?.conclusion !== "success") {
+      fail(`release freeze acceptance step ${stepName} did not execute successfully`);
+    }
+    if (jobName === "freeze-windows-native-probe") {
+      const labels = new Set(job.labels ?? []);
+      for (const label of ["self-hosted", "Windows", "X64", "codestory-vulkan"]) {
+        if (!labels.has(label)) {
+          fail(`Windows native probe did not run on protected label ${label}`);
+        }
+      }
+      if (elapsedSeconds(step) >= 90) {
+        fail("Windows native probe must complete in under 90 seconds");
+      }
     }
   }
+  return Number(target[1]);
 }
 
-export function validateReceipt(receipt, { commit, tree, requiredMutationIds = [] }) {
+export function validateReceipt(receipt, { commit, tree }) {
   if (receipt?.schema !== 1) {
     fail("freeze receipt schema must be 1");
   }
@@ -183,12 +231,6 @@ export function validateReceipt(receipt, { commit, tree, requiredMutationIds = [
       || receipt.next_permitted_mutation.length === 0) {
     fail("freeze receipt must name the next permitted mutation");
   }
-  validateMutationReceipt(receipt.hostile_mutations, {
-    commit,
-    tree,
-    requiredIds: requiredMutationIds,
-  });
-  validatePlatformEvidence(receipt.platform_evidence, { commit, tree });
   if (receipt.digest !== receiptDigest(receipt)) {
     fail("freeze receipt digest does not match its contents");
   }
@@ -226,6 +268,29 @@ function cancelSupersededRuns({ repository, commit, workflows, runs }) {
   return cancelled;
 }
 
+function waitForSupersededRunsToStop({ repository, commit, workflows }) {
+  if (
+    !Number.isInteger(CANCEL_POLL_ATTEMPTS)
+    || CANCEL_POLL_ATTEMPTS < 1
+    || !Number.isInteger(CANCEL_POLL_MS)
+    || CANCEL_POLL_MS < 0
+  ) {
+    fail("cancellation polling configuration is invalid");
+  }
+  for (let attempt = 0; attempt < CANCEL_POLL_ATTEMPTS; attempt += 1) {
+    const remaining = currentRuns(repository).filter((entry) =>
+      workflows.includes(entry.workflowName) && entry.headSha !== commit
+    );
+    if (remaining.length === 0) {
+      return;
+    }
+    if (attempt + 1 < CANCEL_POLL_ATTEMPTS) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, CANCEL_POLL_MS);
+    }
+  }
+  fail("superseded broad proof remains queued or running after cancellation");
+}
+
 function cancelSuperseded(args) {
   const repository = required(args, "--repository");
   const commit = required(args, "--commit");
@@ -250,15 +315,24 @@ function cancelSuperseded(args) {
     workflows,
     runs: before,
   });
-  const cancelledIds = new Set(cancelled.map((entry) => String(entry.database_id)));
-  const remaining = currentRuns(repository).filter((entry) =>
-    workflows.includes(entry.workflowName)
-      && entry.headSha !== commit
-      && !cancelledIds.has(String(entry.databaseId))
-  );
-  if (remaining.length > 0) {
-    fail("superseded broad proof remains queued or running after cancellation");
+  waitForSupersededRunsToStop({ repository, commit, workflows });
+  process.stdout.write(`${JSON.stringify({ cancelled })}\n`);
+}
+
+function invalidateSuperseded(args) {
+  const repository = required(args, "--repository");
+  const commit = required(args, "--commit");
+  const workflows = values(args, "--broad-workflow");
+  if (workflows.length === 0) {
+    fail("--broad-workflow is required");
   }
+  const cancelled = cancelSupersededRuns({
+    repository,
+    commit,
+    workflows,
+    runs: currentRuns(repository),
+  });
+  waitForSupersededRunsToStop({ repository, commit, workflows });
   process.stdout.write(`${JSON.stringify({ cancelled })}\n`);
 }
 
@@ -325,9 +399,6 @@ function declare(args) {
   const branch = value(args, "--branch", git(["branch", "--show-current"], repo));
   const output = required(args, "--output");
   const releasePrNumber = required(args, "--release-pr");
-  const mutationPath = required(args, "--mutation-receipt");
-  const platformPath = required(args, "--platform-evidence");
-  const requiredMutationIds = values(args, "--required-mutation");
   const supportPrNumbers = values(args, "--support-pr");
   const knownFutureChanges = values(args, "--known-future-change");
   const plannedProofActions = values(args, "--planned-proof-action");
@@ -336,13 +407,10 @@ function declare(args) {
   const nextMutation = required(args, "--next-permitted-mutation");
   const broadWorkflows = values(args, "--broad-workflow");
   if (
-    requiredMutationIds.length === 0
-    || plannedProofActions.length === 0
+    plannedProofActions.length === 0
     || broadWorkflows.length === 0
   ) {
-    fail(
-      "release freeze requires hostile mutations, planned proof actions, and broad workflow names",
-    );
+    fail("release freeze requires planned proof actions and broad workflow names");
   }
 
   if (git(["status", "--porcelain=v1", "--untracked-files=all"], repo) !== "") {
@@ -361,14 +429,6 @@ function declare(args) {
     }
   }
 
-  const mutationReceipt = parseJsonFile(mutationPath, "mutation receipt");
-  validateMutationReceipt(mutationReceipt, {
-    commit,
-    tree,
-    requiredIds: requiredMutationIds,
-  });
-  const platformEvidence = parseJsonFile(platformPath, "platform evidence");
-  validatePlatformEvidence(platformEvidence, { commit, tree });
   const acceptedReleasePr = releasePr(repository, releasePrNumber, {
     branch,
     commit,
@@ -378,26 +438,35 @@ function declare(args) {
   );
 
   const runs = currentRuns(repository);
-  const cancelledRuns = has(args, "--cancel-superseded")
-    ? cancelSupersededRuns({
+  const duplicate = runs.find((entry) =>
+    broadWorkflows.includes(entry.workflowName) && entry.headSha === commit
+  );
+  if (duplicate) {
+    fail(
+      `unchanged head ${commit} already has active ${duplicate.workflowName} run ${duplicate.databaseId}`,
+    );
+  }
+  const cancelledRuns = cancelSupersededRuns({
+    repository,
+    commit,
+    workflows: broadWorkflows,
+    runs,
+  });
+  if (cancelledRuns.length > 0) {
+    waitForSupersededRunsToStop({
       repository,
       commit,
       workflows: broadWorkflows,
-      runs,
-    })
-    : [];
-  const cancelledIds = new Set(
-    cancelledRuns.map((entry) => String(entry.database_id)),
-  );
+    });
+  }
   const remainingRuns = currentRuns(repository);
-  const superseded = remainingRuns.filter(
-    (entry) =>
-      broadWorkflows.includes(entry.workflowName)
-      && entry.headSha !== commit
-      && !cancelledIds.has(String(entry.databaseId)),
+  const remainingBroadRun = remainingRuns.find((entry) =>
+    broadWorkflows.includes(entry.workflowName)
   );
-  if (superseded.length > 0) {
-    fail("superseded broad proof remains queued or running");
+  if (remainingBroadRun) {
+    fail(
+      `broad proof ${remainingBroadRun.databaseId} remains active before freeze declaration`,
+    );
   }
 
   const receipt = {
@@ -412,8 +481,6 @@ function declare(args) {
     integrated_support_prs: integratedSupportPrs,
     known_future_source_changes: knownFutureChanges,
     planned_proof_actions: plannedProofActions,
-    hostile_mutations: mutationReceipt,
-    platform_evidence: platformEvidence,
     reusable_evidence: reusableEvidence,
     invalidated_evidence: invalidatedEvidence,
     running_workflows: remainingRuns,
@@ -421,7 +488,7 @@ function declare(args) {
     next_permitted_mutation: nextMutation,
   };
   receipt.digest = receiptDigest(receipt);
-  validateReceipt(receipt, { commit, tree, requiredMutationIds });
+  validateReceipt(receipt, { commit, tree });
   writeFileSync(output, `${JSON.stringify(receipt, null, 2)}\n`);
 
   if (!has(args, "--no-publish-status")) {
@@ -431,7 +498,7 @@ function declare(args) {
       "POST",
       `repos/${repository}/statuses/${commit}`,
       "-f",
-      "state=success",
+      "state=pending",
       "-f",
       `context=${STATUS_PREFIX}/${receipt.digest}`,
       "-f",
@@ -448,9 +515,31 @@ function verifyFile(args) {
   validateReceipt(receipt, {
     commit,
     tree,
-    requiredMutationIds: values(args, "--required-mutation"),
   });
   process.stdout.write(`${receipt.digest}\n`);
+}
+
+function matchingStatus({ repository, commit, tree, digest, state }) {
+  const statuses = JSON.parse(gh([
+    "api",
+    `repos/${repository}/commits/${commit}/statuses?per_page=100`,
+  ]));
+  return statuses.find((status) =>
+    status?.state === state
+    && status?.context === `${STATUS_PREFIX}/${digest}`
+    && status?.description === `tree=${tree}`
+  );
+}
+
+function verifyPending(args) {
+  const repository = required(args, "--repository");
+  const commit = required(args, "--commit");
+  const tree = required(args, "--tree");
+  const digest = required(args, "--receipt-digest");
+  if (!matchingStatus({ repository, commit, tree, digest, state: "pending" })) {
+    fail("no pending local release freeze declaration matches this exact commit and tree");
+  }
+  process.stdout.write(`${digest}\n`);
 }
 
 function verifyStatus(args) {
@@ -458,18 +547,37 @@ function verifyStatus(args) {
   const commit = required(args, "--commit");
   const tree = required(args, "--tree");
   const digest = required(args, "--receipt-digest");
-  const statuses = JSON.parse(gh([
-    "api",
-    `repos/${repository}/commits/${commit}/statuses?per_page=100`,
-  ]));
-  const accepted = statuses.some((status) =>
-    status?.state === "success"
-    && status?.context === `${STATUS_PREFIX}/${digest}`
-    && status?.description === `tree=${tree}`
-  );
-  if (!accepted) {
+  const status = matchingStatus({
+    repository,
+    commit,
+    tree,
+    digest,
+    state: "success",
+  });
+  if (!status) {
     fail("no successful exact-head release freeze status matches this receipt digest and tree");
   }
+  const target = /\/actions\/runs\/([1-9][0-9]*)$/u.exec(String(status.target_url ?? ""));
+  if (!target) {
+    fail("release freeze success status has no authenticated Actions run");
+  }
+  const run = JSON.parse(gh([
+    "api",
+    `repos/${repository}/actions/runs/${target[1]}`,
+  ]));
+  const jobsPayload = JSON.parse(gh([
+    "api",
+    `repos/${repository}/actions/runs/${target[1]}/jobs?per_page=100`,
+  ]));
+  validateAcceptanceProvenance({
+    status,
+    run,
+    jobs: jobsPayload.jobs,
+    repository,
+    commit,
+    tree,
+    digest,
+  });
   process.stdout.write(`${digest}\n`);
 }
 
@@ -479,14 +587,19 @@ function main() {
     declare(args);
   } else if (command === "verify-file") {
     verifyFile(args);
+  } else if (command === "verify-pending") {
+    verifyPending(args);
   } else if (command === "verify-status") {
     verifyStatus(args);
   } else if (command === "cancel-superseded") {
     cancelSuperseded(args);
+  } else if (command === "invalidate-superseded") {
+    invalidateSuperseded(args);
   } else {
     fail(
       "usage: release-freeze-barrier.mjs "
-      + "<declare|verify-file|verify-status|cancel-superseded> ...",
+      + "<declare|verify-file|verify-pending|verify-status|cancel-superseded"
+      + "|invalidate-superseded> ...",
     );
   }
 }

@@ -2841,6 +2841,32 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["source label trigger", workflows => {
       workflows.get("source-proof.yml").on.pull_request = { types: ["labeled"] };
     }, /support PR event/u],
+    ["superseded PR heads stop invalidating proof", workflows => {
+      workflows.get("release-freeze-invalidation.yml").on.pull_request.types = ["opened"];
+    }, /must run automatically when a candidate head is superseded/u],
+    ["dev head changes stop invalidating proof", workflows => {
+      delete workflows.get("release-freeze-invalidation.yml").on.push;
+    }, /must run automatically when a candidate head is superseded/u],
+    ["invalidation stops checking the prior freeze", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      step.run = step.run.replace(
+        "commits/$BEFORE_SHA/statuses?per_page=100",
+        "commits/$AFTER_SHA/statuses?per_page=100",
+      );
+    }, /Invalidate a superseded release freeze/u],
+    ["invalidation stops cancelling auto-release", workflows => {
+      const step = draftStep(
+        workflows.get("release-freeze-invalidation.yml").jobs.invalidate,
+        "Invalidate a superseded release freeze",
+      );
+      step.run = step.run.replace(
+        '--broad-workflow "Auto Release"',
+        "",
+      );
+    }, /Invalidate a superseded release freeze/u],
     ["platform label trigger", workflows => {
       workflows.get("packaged-platform-pr.yml").on.pull_request = { types: ["labeled"] };
     }, /support PR event/u],
@@ -2859,14 +2885,82 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.freeze_receipt_digest.required = false;
     }, /dispatch must require an exact-head freeze receipt digest/u],
-    ["source dispatch stops emitting a reusable cell", workflows => {
+    ["source acceptance becomes the default", workflows => {
       workflows.get("source-proof.yml").on.workflow_dispatch
-        .inputs.emit_release_cells.default = false;
-    }, /dispatch must emit one reusable versioned source cell/u],
+        .inputs.acceptance_only.default = true;
+    }, /separate acceptance and emit one reusable source cell/u],
+    ["source acceptance cannot publish status", workflows => {
+      delete workflows.get("source-proof.yml").permissions.statuses;
+    }, /acceptance must publish an exact-head commit status/u],
+    ["source restores conditional cell emission", workflows => {
+      workflows.get("source-proof.yml").on.workflow_dispatch
+        .inputs.emit_release_cells = {
+          required: false,
+          default: false,
+          type: "boolean",
+        };
+      draftStep(
+        workflows.get("source-proof.yml").jobs["full-source-gate"],
+        "Upload authenticated source release cell",
+      ).if = "success() && inputs.emit_release_cells";
+    }, /separate acceptance and emit one reusable source cell/u],
+    ["hostile mutation job is removed", workflows => {
+      delete workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"];
+    }, /freeze-hostile-mutations/u],
+    ["hostile mutation matrix is weakened", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      ).run = "node --test .github/scripts/release-freeze-barrier.test.mjs";
+    }, /Execute exact-head hostile mutation matrix/u],
+    ["hostile mutations become advisory", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"],
+        "Execute exact-head hostile mutation matrix",
+      )["continue-on-error"] = true;
+    }, /exact blocking hostile mutation job/u],
+    ["Windows probe leaves the protected runner", workflows => {
+      workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"]["runs-on"]
+        = ["self-hosted", "Windows", "X64"];
+    }, /protected blocking Windows native probe/u],
+    ["Windows probe restores a full build", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(
+        "cargo build --release --quiet",
+        "cargo build --workspace --release",
+      );
+    }, /Run exact-head Windows native probe/u],
+    ["Windows probe allows 90 seconds", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace("Elapsed.TotalSeconds -ge 90", "Elapsed.TotalSeconds -gt 90");
+    }, /Run exact-head Windows native probe/u],
+    ["acceptance publisher stops waiting for Windows", workflows => {
+      workflows.get("source-proof.yml").jobs["freeze-acceptance"].needs
+        = ["resolve", "freeze-hostile-mutations"];
+    }, /publisher must depend on both exact successful mutation jobs/u],
+    ["acceptance publisher loses Actions provenance", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-acceptance"],
+        "Publish executable release freeze",
+      );
+      step.run = step.run.replace(
+        "actions/runs/$GITHUB_RUN_ID",
+        "pull/$GITHUB_RUN_ID",
+      );
+    }, /Publish executable release freeze/u],
     ["platform dispatch omits receipt", workflows => {
       workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
         .inputs.freeze_receipt_digest.required = false;
     }, /dispatch must require an exact-head freeze receipt digest/u],
+    ["platform cannot read freeze status", workflows => {
+      delete workflows.get("packaged-platform-pr.yml").permissions.statuses;
+    }, /must authenticate the exact-head freeze status/u],
     ["qualification proves the frozen descendant again", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
@@ -2890,9 +2984,53 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["release restores post-calibration fallback", workflows => {
       workflows.get("release.yml").jobs["source-proof"].if = "always()";
     }, /post-calibration source-proof fallback unreachable/u],
+    ["source reuse accepts an expired cell", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs.resolve,
+        "Reuse a completed gate for this exact head",
+      );
+      step.run = step.run.replace(".expired == false", "true");
+    }, /Reuse a completed gate.*expired/u],
+    ["qualification accepts an expired source cell", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require successful accepted-head source proof",
+      );
+      step.run = step.run.replace(".expired == false", "true");
+    }, /Require successful accepted-head source proof.*expired/u],
+    ["release accepts an expired source cell", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(".expired == false", "true");
+    }, /Resolve reusable prior evidence.*expired/u],
+    ["qualification trusts a bare success status", workflows => {
+      const step = draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require executable release freeze",
+      );
+      step.run = step.run.replace(
+        "release-freeze-barrier.mjs verify-status",
+        "gh api repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/status",
+      );
+    }, /Require executable release freeze.*verify-status/u],
+    ["release trusts a bare success status", workflows => {
+      const step = draftStep(
+        workflows.get("release.yml").jobs.preflight,
+        "Resolve reusable prior evidence",
+      );
+      step.run = step.run.replace(
+        "release-freeze-barrier.mjs verify-status",
+        "gh api repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/status",
+      );
+    }, /Resolve reusable prior evidence.*verify-status/u],
     ["release stops cancelling superseded work", workflows => {
       workflows.get("release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],
+    ["automatic release cannot read freeze status", workflows => {
+      delete workflows.get("auto-release.yml").jobs.release.permissions.statuses;
+    }, /must authenticate freeze status provenance/u],
     ["auto-release stops cancelling superseded work", workflows => {
       workflows.get("auto-release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],
@@ -4860,7 +4998,12 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
         uses: "./.github/workflows/release.yml",
       };
     }],
-    ["source emission", workflows => { delete workflows.get("release.yml").jobs["source-proof"].with.emit_release_cells; }],
+    ["source emission", workflows => {
+      draftStep(
+        workflows.get("source-proof.yml").jobs["full-source-gate"],
+        "Upload authenticated source release cell",
+      ).if = "success() && inputs.emit_release_cells";
+    }],
     ["full rerun preflight guard", workflows => {
       workflows.get("release.yml").jobs.preflight.steps = workflows
         .get("release.yml").jobs.preflight.steps

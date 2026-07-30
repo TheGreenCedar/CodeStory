@@ -1589,11 +1589,67 @@ export function validateReleaseClaimGraph(graph) {
     "workflow_policy.release_freeze_barrier.broad_entry_workflows",
     { nonEmpty: true },
   );
+  if (freeze.invalidation_workflow !== "release-freeze-invalidation.yml") {
+    fail(
+      "workflow_policy.release_freeze_barrier.invalidation_workflow must name "
+      + "release-freeze-invalidation.yml",
+    );
+  }
   stringArray(
     freeze.coordinator_only_workflows,
     "workflow_policy.release_freeze_barrier.coordinator_only_workflows",
     { nonEmpty: true },
   );
+  const acceptance = object(
+    freeze.acceptance,
+    "workflow_policy.release_freeze_barrier.acceptance",
+  );
+  for (const field of [
+    "producer_workflow",
+    "event",
+    "hostile_job",
+    "hostile_step",
+    "windows_job",
+    "windows_step",
+    "publisher_job",
+    "publisher_step",
+    "status_creator",
+  ]) {
+    nonEmptyText(
+      acceptance[field],
+      `workflow_policy.release_freeze_barrier.acceptance.${field}`,
+    );
+  }
+  const windowsRunner = stringArray(
+    acceptance.windows_runner,
+    "workflow_policy.release_freeze_barrier.acceptance.windows_runner",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify([...windowsRunner].sort())
+      !== JSON.stringify([
+        "self-hosted",
+        "Windows",
+        "X64",
+        "codestory-vulkan",
+      ].sort())
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.windows_runner "
+      + "must name the protected Windows Vulkan runner",
+    );
+  }
+  if (
+    acceptance.producer_workflow !== "source-proof.yml"
+    || acceptance.event !== "workflow_dispatch"
+    || acceptance.windows_probe_max_seconds !== 90
+    || acceptance.status_creator !== "github-actions[bot]"
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance must bind the exact "
+      + "Actions producer, event, protected probe budget, and status creator",
+    );
+  }
   const singleSource = object(
     freeze.single_source_proof,
     "workflow_policy.release_freeze_barrier.single_source_proof",
@@ -1606,6 +1662,22 @@ export function validateReleaseClaimGraph(graph) {
     singleSource.producer_job,
     "workflow_policy.release_freeze_barrier.single_source_proof.producer_job",
   );
+  nonEmptyText(
+    singleSource.artifact,
+    "workflow_policy.release_freeze_barrier.single_source_proof.artifact",
+  );
+  if (singleSource.artifact_required_unexpired !== true) {
+    fail(
+      "workflow_policy.release_freeze_barrier.single_source_proof "
+      + "must require an unexpired source-cell artifact",
+    );
+  }
+  if (singleSource.cell_emission !== "unconditional_on_success") {
+    fail(
+      "workflow_policy.release_freeze_barrier.single_source_proof "
+      + "must emit its source cell unconditionally after successful proof",
+    );
+  }
   stringArray(
     singleSource.reuse_validation,
     "workflow_policy.release_freeze_barrier.single_source_proof.reuse_validation",

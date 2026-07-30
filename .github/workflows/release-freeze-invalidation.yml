@@ -1,0 +1,58 @@
+name: Release freeze invalidation
+
+on:
+  pull_request:
+    branches:
+      - dev/codestory-next
+    types: [synchronize]
+  push:
+    branches:
+      - dev/codestory-next
+
+permissions:
+  actions: write
+  contents: read
+  statuses: read
+
+concurrency:
+  group: release-freeze-invalidation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  invalidate:
+    name: Cancel proof for a superseded frozen head
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Invalidate a superseded release freeze
+        shell: bash
+        env:
+          AFTER_SHA: ${{ github.event.after || github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$BEFORE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$AFTER_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$BEFORE_SHA" != "$AFTER_SHA"
+          has_freeze="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$BEFORE_SHA/statuses?per_page=100" \
+              | jq \
+                '[.[] | select(
+                  (.state == "pending" or .state == "success")
+                  and (.context | startswith("codestory/release-freeze/"))
+                )] | length'
+          )"
+          if [ "$has_freeze" = 0 ]; then
+            echo "Previous head $BEFORE_SHA was not a declared release candidate."
+            exit 0
+          fi
+          node .github/scripts/release-freeze-barrier.mjs invalidate-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$AFTER_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"

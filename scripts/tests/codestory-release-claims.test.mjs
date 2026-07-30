@@ -163,6 +163,40 @@ test("versioned claim graph has one deterministic digest and all declared contro
       .single_source_proof.post_calibration_fallback_allowed,
     false,
   );
+  assert.deepEqual(
+    graph.workflow_policy.release_freeze_barrier.acceptance,
+    {
+      producer_workflow: "source-proof.yml",
+      event: "workflow_dispatch",
+      hostile_job: "freeze-hostile-mutations",
+      hostile_step: "Execute exact-head hostile mutation matrix",
+      windows_job: "freeze-windows-native-probe",
+      windows_step: "Run exact-head Windows native probe",
+      windows_runner: ["self-hosted", "Windows", "X64", "codestory-vulkan"],
+      windows_probe_max_seconds: 90,
+      publisher_job: "freeze-acceptance",
+      publisher_step: "Publish executable release freeze",
+      status_creator: "github-actions[bot]",
+    },
+  );
+  assert.equal(
+    graph.workflow_policy.release_freeze_barrier.invalidation_workflow,
+    "release-freeze-invalidation.yml",
+  );
+  assert.deepEqual(
+    {
+      artifact: graph.workflow_policy.release_freeze_barrier.single_source_proof.artifact,
+      artifact_required_unexpired: graph.workflow_policy.release_freeze_barrier
+        .single_source_proof.artifact_required_unexpired,
+      cell_emission: graph.workflow_policy.release_freeze_barrier
+        .single_source_proof.cell_emission,
+    },
+    {
+      artifact: "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
+      artifact_required_unexpired: true,
+      cell_emission: "unconditional_on_success",
+    },
+  );
 });
 
 test("claim graph freezes one exact Windows release graph and protected content-addressed reuse", () => {
@@ -614,6 +648,30 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(aggregateCell),
     /identity undeclared_identity must declare a format/u,
+  );
+
+  const unprotectedFreezeProbe = structuredClone(graph);
+  unprotectedFreezeProbe.workflow_policy.release_freeze_barrier
+    .acceptance.windows_runner = ["windows-latest"];
+  assert.throws(
+    () => validateReleaseClaimGraph(unprotectedFreezeProbe),
+    /release_freeze_barrier\.acceptance\.windows_runner/u,
+  );
+
+  const missingInvalidation = structuredClone(graph);
+  delete missingInvalidation.workflow_policy.release_freeze_barrier
+    .invalidation_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(missingInvalidation),
+    /release_freeze_barrier\.invalidation_workflow/u,
+  );
+
+  const conditionalSourceCell = structuredClone(graph);
+  conditionalSourceCell.workflow_policy.release_freeze_barrier
+    .single_source_proof.cell_emission = "caller_opt_in";
+  assert.throws(
+    () => validateReleaseClaimGraph(conditionalSourceCell),
+    /must emit its source cell unconditionally/u,
   );
 
   // A non-claim that withholds less than the lost host actually produced would leave a live claim
