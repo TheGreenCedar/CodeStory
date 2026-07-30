@@ -1,13 +1,13 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 57,
+      "retry_after_ms": 40,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 8,
+      "initial_backoff_ms": 7,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
       "maximum_backoff_ms": 102
     },
@@ -43,22 +43,7 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": {
-    "calibration_bundle_sha256": "650c558b108c6473f0f244aaeb8680938f45cb51ad30cba3cc42ccaf330de004",
-    "calibration_freeze_digest": "14f02f80a8bf0f68d02e820b5d16d8b171839cf60ecbf643ddc6191c9f9bb40e",
-    "input_constant_set_sha256": "c67187b461e07bc09352cbb2b3eaaf1760780e32b284e6d127de9d49adb3c51b",
-    "measurement_protocol_sha256": "ce4bc4911c13d3e52438638e3abb5383e23cd9b400893805f589cdf6350e16e1",
-    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
-    "run_artifact_sha256s": [
-      "65789b6090a68a45ab770513fc2d20ed3a228a371f1dbdd76aec6ce568dfd8e8",
-      "b74a95d375f6e3e37b182d91a120b2d05071f2016bf7d49dc3355bb8a2b42dec",
-      "bdd9340b0020be257fa2af59cb7231eed5270ee2bf3509b04bdc30cc4861da11"
-    ],
-    "selected_at": "github-actions-run:30498515242:1",
-    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
-    "selection_source_commit": "08451fa2cfc6665821248bebc60bd8b5636c1258",
-    "selection_source_tree": "2215e54a1ef49f1b1bb8f0b2dab5bcdaaec19706"
-  },
+  "freeze_record": null,
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
     "bulk_documents_per_second": 2,
@@ -76,5 +61,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "frozen"
+  "status": "unfrozen"
 }
