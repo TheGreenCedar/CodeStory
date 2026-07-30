@@ -22,6 +22,7 @@ import {
   absorbedFailureViolations,
   annotationScopeViolations,
   basicWorkflowViolations,
+  benchmarkDependencyIsolationViolations,
   dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
@@ -72,6 +73,33 @@ function retrievalSourceWorkflow() {
 function windowsManifestWorkflow() {
   return retrievalSourceWorkflow();
 }
+
+test("packaged qualification dependencies stay outside the benchmark graph", () => {
+  const source = readFileSync(
+    path.join(root, "crates", "codestory-bench", "Cargo.toml"),
+    "utf8",
+  );
+  assert.deepEqual(benchmarkDependencyIsolationViolations(source), []);
+
+  const runtimeDependency =
+    'codestory-runtime = { workspace = true, features = ["benchmark-support"] }\n';
+  const runtimeInProduct = source
+    .replace(runtimeDependency, "")
+    .replace("[dependencies]\n", `[dependencies]\n${runtimeDependency}`);
+  assert.match(
+    benchmarkDependencyIsolationViolations(runtimeInProduct).join("\n"),
+    /benchmark-only dependencies|must not enable benchmark-support/u,
+  );
+
+  const testSupportInProduct = source.replace(
+    "codestory-retrieval = { workspace = true }",
+    'codestory-retrieval = { workspace = true, features = ["test-support"] }',
+  );
+  assert.match(
+    benchmarkDependencyIsolationViolations(testSupportInProduct).join("\n"),
+    /must not enable benchmark-support or test-support/u,
+  );
+});
 
 function draftStep(job, name) {
   const matches = job.steps.filter(step => step.name === name);
@@ -1325,25 +1353,25 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
@@ -1658,7 +1686,7 @@ test("Windows packages one release graph into exact public and private artifacts
     ["the one package build invokes Cargo twice", workflow => {
       step(workflow, "Build package and qualification driver").run +=
         "\ncargo build --release --locked -p codestory-cli";
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
     ["the package graph loses release mode", workflow => {
       replaceRun(
         workflow,
@@ -1666,15 +1694,28 @@ test("Windows packages one release graph into exact public and private artifacts
         "cargo build --release --locked",
         "cargo build --locked",
       );
-    }, /host package must build the complete Windows release graph in one exact Cargo invocation/u],
-    ["the path regression is replaced by a debug output", workflow => {
-      step(workflow, "Prove native workspace path identity").env.TEST_BINARY =
-        "target/debug/deps/windows_path_identity.exe";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
-    ["the staging regression is replaced by a debug output", workflow => {
-      step(workflow, "Test immutable native staging on Windows").env.TEST_BINARY =
-        "target/debug/deps/native_staging.exe";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
+    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    ["a source-test target contaminates the package graph", workflow => {
+      step(workflow, "Build package and qualification driver").run =
+        step(workflow, "Build package and qualification driver").run.replace(
+          "timing_dir=\"target/windows-package-build-timing\"",
+          'cargo_args+=( -p codestory-workspace --test windows_path_identity )\n            timing_dir="target/windows-package-build-timing"',
+        );
+    }, /host package must build only the production bins/u],
+    ["the host feature contract is removed", workflow => {
+      step(workflow, "Build package and qualification driver").run =
+        step(workflow, "Build package and qualification driver").run.replace(
+          "node .github/scripts/cargo-build-artifacts.mjs features",
+          "true",
+        );
+    }, /host package must build only the production bins/u],
+    ["the Windows runtime probe accepts test support", workflow => {
+      step(workflow, "Prove production feature identity on Windows").run =
+        step(workflow, "Prove production feature identity on Windows").run.replace(
+          '"per_user_server"',
+          '"test_support"',
+        );
+    }, /Prove production feature identity on Windows|non-product embedding feature identity/u],
     ["Windows packaging is fed a debug CLI", workflow => {
       step(workflow, "Package release asset on Windows").env.WINDOWS_CLI =
         "target/debug/codestory-cli.exe";
@@ -2818,13 +2859,13 @@ test("source proof reuse accepts only whole successful workflow runs", async (t)
     ["packaged prior proof lookup", workflows => {
       const step = draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful accepted-head source proof",
+        "Require successful exact-head source proof",
       );
       step.run = step.run.replace(
         '.event == "workflow_dispatch" and .conclusion == "success"',
         '.event == "workflow_dispatch"',
       );
-    }, /packaged-platform-pr\.yml step Require successful accepted-head source proof.*conclusion/u],
+    }, /packaged-platform-pr\.yml step Require successful exact-head source proof.*conclusion/u],
   ];
 
   for (const [name, mutate, expectedReason] of mutations) {
@@ -2926,7 +2967,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     ["source acceptance becomes the default", workflows => {
       workflows.get("source-proof.yml").on.workflow_dispatch
         .inputs.acceptance_only.default = true;
-    }, /separate acceptance and emit one reusable source cell/u],
+    }, /separate acceptance from broad proof/u],
     ["source acceptance cannot publish status", workflows => {
       delete workflows.get("source-proof.yml").permissions.statuses;
     }, /acceptance must publish an exact-head commit status/u],
@@ -2979,7 +3020,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         workflows.get("source-proof.yml").jobs["full-source-gate"],
         "Upload authenticated source release cell",
       ).if = "success() && inputs.emit_release_cells";
-    }, /separate acceptance and emit one reusable source cell/u],
+    }, /source release cell must be an unconditional success-only retained artifact/u],
     ["hostile mutation job is removed", workflows => {
       delete workflows.get("source-proof.yml").jobs["freeze-hostile-mutations"];
     }, /freeze-hostile-mutations/u],
@@ -3059,39 +3100,44 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
         "pull/$GITHUB_RUN_ID",
       );
     }, /Publish executable release freeze/u],
-    ["qualification requires an active receipt", workflows => {
+    ["packaged proof makes the exact-head receipt optional", workflows => {
       workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
-        .inputs.freeze_receipt_digest.required = true;
-    }, /qualification must reuse source-cell lineage without an active freeze digest/u],
+        .inputs.freeze_receipt_digest.required = false;
+      workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
+        .inputs.freeze_receipt_digest.default = "";
+    }, /packaged proof must require an exact-head freeze digest/u],
     ["platform cannot read freeze status", workflows => {
       delete workflows.get("packaged-platform-pr.yml").permissions.statuses;
     }, /must authenticate the exact-head freeze status/u],
-    ["qualification proves the frozen descendant again", workflows => {
-      const step = draftStep(
-        workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Resolve accepted source proof head",
-      );
-      step.run = step.run.replace(
-        'echo "sha=$CALIBRATION_SOURCE_SHA" >> "$GITHUB_OUTPUT"',
-        'echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"',
-      );
-    }, /Resolve accepted source proof head.*sha=\$CALIBRATION_SOURCE_SHA/u],
-    ["qualification requires an active freeze status", workflows => {
+    ["qualification bypasses its exact-head freeze status", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
         "Require executable release freeze",
-      ).if = "always()";
-    }, /qualification must reuse source-cell lineage after the constant-only commit/u],
-    ["release searches the frozen descendant", workflows => {
+      ).if = "steps.resolve.outputs.mode != 'qualification'";
+    }, /every packaged proof mode must authenticate the exact candidate head/u],
+    ["calibration regains a pre-freeze source proof", workflows => {
+      draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require successful exact-head source proof",
+      ).if = "steps.resolve.outputs.mode != 'integration'";
+    }, /calibration must precede the sole frozen-candidate source proof/u],
+    ["qualification loses the frozen-head source proof", workflows => {
+      draftStep(
+        workflows.get("packaged-platform-pr.yml").jobs.route,
+        "Require successful exact-head source proof",
+      ).if
+        = "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration' && steps.resolve.outputs.mode != 'qualification'";
+    }, /calibration must precede the sole frozen-candidate source proof/u],
+    ["release searches the calibration source instead of the frozen tree", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
         "Resolve reusable prior evidence",
       );
       step.run = step.run.replace(
-        "actions/runs?head_sha=$SOURCE_SHA",
-        "actions/runs?head_sha=$GITHUB_SHA",
+        'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
+        'release_tree="$(git rev-parse "$SOURCE_SHA^{tree}")"',
       );
-    }, /Resolve reusable prior evidence.*head_sha=\$SOURCE_SHA/u],
+    }, /Resolve reusable prior evidence.*release_tree/u],
     ["release restores post-calibration fallback", workflows => {
       workflows.get("release.yml").jobs["source-proof"].if = "always()";
     }, /post-calibration source-proof fallback unreachable/u],
@@ -3102,13 +3148,6 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replace(".expired == false", "true");
     }, /Reuse a completed gate.*expired/u],
-    ["qualification accepts an expired source cell", workflows => {
-      const step = draftStep(
-        workflows.get("packaged-platform-pr.yml").jobs.route,
-        "Require successful accepted-head source proof",
-      );
-      step.run = step.run.replace(".expired == false", "true");
-    }, /Require successful accepted-head source proof.*expired/u],
     ["release accepts an expired source cell", workflows => {
       const step = draftStep(
         workflows.get("release.yml").jobs.preflight,
@@ -3123,7 +3162,7 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.run = step.run.replace(
         "release-freeze-barrier.mjs verify-status",
-        "gh api repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/status",
+        "gh api repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status",
       );
     }, /Require executable release freeze.*verify-status/u],
     ["release restores active freeze status authentication", workflows => {
@@ -3142,10 +3181,10 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
     }, /release and auto-release must cancel superseded work/u],
     ["automatic release restores freeze status authority", workflows => {
       workflows.get("auto-release.yml").jobs.release.permissions.statuses = "read";
-    }, /post-calibration release must not rely on an active freeze status/u],
+    }, /publication must reuse accepted frozen-candidate proof without an active status/u],
     ["manual release restores freeze status authority", workflows => {
       workflows.get("release.yml").permissions.statuses = "read";
-    }, /post-calibration release must not rely on an active freeze status/u],
+    }, /publication must reuse accepted frozen-candidate proof without an active status/u],
     ["auto-release stops cancelling superseded work", workflows => {
       workflows.get("auto-release.yml").concurrency["cancel-in-progress"] = false;
     }, /release and auto-release must cancel superseded work/u],
@@ -3157,6 +3196,10 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       const job = workflows.get("packaged-platform-pr.yml").jobs.route;
       job.steps = job.steps.filter(({ name }) => name !== "Cancel superseded proof runs");
     }, /Cancel superseded proof runs/u],
+    ["acceptance-only mode restores the full Windows source lane", workflows => {
+      workflows.get("source-proof.yml").jobs["windows-native-contracts"].if
+        = "needs.resolve.outputs.reuse != 'true'";
+    }, /Windows native source contracts must run in parallel on the resolved exact head/u],
   ];
   for (const [name, mutate, expected] of cases) {
     await t.test(name, () => {
@@ -3330,6 +3373,60 @@ ${captureRun}`],
     assert.equal(readFileSync(decoyCalls, "utf8"), "");
   } finally {
     rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("exact-head source proof owns Windows path and native-staging harnesses", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const mutations = [
+    ["job is removed", workflow => {
+      delete workflow.jobs["windows-native-contracts"];
+    }],
+    ["job becomes advisory", workflow => {
+      workflow.jobs["windows-native-contracts"]["continue-on-error"] = true;
+    }],
+    ["checkout stops using the resolved head", workflow => {
+      workflow.jobs["windows-native-contracts"].steps[0].with.ref = "dev/codestory-next";
+    }],
+    ["path identity is omitted", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run = step.run.replace(
+        "-p codestory-workspace --test windows_path_identity `\n",
+        "",
+      );
+    }],
+    ["native staging is omitted", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run = step.run.replace(
+        "-p codestory-llama-sys --test native_staging",
+        "-p codestory-llama-sys",
+      );
+    }],
+    ["source contracts compile twice", workflow => {
+      const step = draftStep(
+        workflow.jobs["windows-native-contracts"],
+        "Prove Windows path and native-staging source contracts",
+      );
+      step.run += "\ncargo test --release --locked -p codestory-workspace";
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Windows native source contracts|Prove Windows path and native-staging source contracts|Windows path and native-staging contracts/u,
+      );
+    });
   }
 });
 
@@ -3512,13 +3609,13 @@ test("reusable compiler caches and proof modes reject hostile downgrades", async
         "Test the complete workspace once",
       );
     }, /source-proof\.yml compiler cache must save before test execution or release-cell failure/u],
-    ["packaged compiler cache waits for protected regression", packagedFile, workflow => {
+    ["packaged compiler cache waits for product feature proof", packagedFile, workflow => {
       moveNamedStepAfter(
         packagedJob(workflow),
         "Save compiler objects after compilation",
-        "Test immutable native staging on Windows",
+        "Prove production feature identity on Windows",
       );
-    }, /compiler cache must save before late Test immutable native staging on Windows failure/u],
+    }, /compiler cache must save before late Prove production feature identity on Windows failure/u],
     ["packaged compiler cache waits for signing", packagedFile, workflow => {
       moveNamedStepAfter(
         packagedJob(workflow),
@@ -4481,10 +4578,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     workflow.jobs.build,
     "Configure short Windows Cargo target",
   );
-  const packagedNativeStaging = workflow => draftStep(
-    workflow.jobs.build,
-    "Test immutable native staging on Windows",
-  );
   const protectedSourceTools = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Capture source build tool evidence",
@@ -4534,12 +4627,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("| Out-File -FilePath $env:GITHUB_ENV", "| Write-Output");
     }, /Configure short Windows Cargo target/u],
-    ["packaged native staging regression made cross-platform", packagedFile, workflow => {
-      packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
-    }, /Windows regressions must execute the exact release test binaries emitted by the one Cargo graph/u],
-    ["packaged native staging regression removed", packagedFile, workflow => {
-      packagedNativeStaging(workflow).run = "cargo test --release --locked";
-    }, /Test immutable native staging on Windows/u],
     ["packaged build overrides generator", packagedFile, workflow => {
       packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
     }, /native package build must not override the selected generator/u],

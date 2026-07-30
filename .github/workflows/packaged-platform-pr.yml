@@ -36,9 +36,8 @@ on:
         required: false
         type: string
       freeze_receipt_digest:
-        description: Active freeze digest required before pre-calibration proof; qualification reuses the source cell under constant-only lineage.
-        required: false
-        default: ""
+        description: Active executable-freeze receipt digest for this exact proof head.
+        required: true
         type: string
 
 permissions:
@@ -60,7 +59,6 @@ jobs:
       base_sha: ${{ steps.resolve.outputs.base_sha }}
       mode: ${{ steps.resolve.outputs.mode }}
       proof_key: ${{ steps.resolve.outputs.proof_key }}
-      source_proof_sha: ${{ steps.source-head.outputs.sha }}
       scope: ${{ steps.scope.outputs.scope }}
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -207,7 +205,6 @@ jobs:
           test "$(jq -r '.event' <<<"$run")" = workflow_dispatch
           test "$(jq -r '.conclusion' <<<"$run")" = success
           test "$CALIBRATION_ARTIFACT" = "embedding-calibration-bundle-$producer_sha"
-          echo "source_sha=$producer_sha" >> "$GITHUB_OUTPUT"
           artifact_count="$(
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID/artifacts?per_page=100" \
               | jq --arg name "$CALIBRATION_ARTIFACT" \
@@ -215,47 +212,30 @@ jobs:
           )"
           test "$artifact_count" = 1
 
-      - name: Resolve accepted source proof head
-        id: source-head
-        shell: bash
-        env:
-          CALIBRATION_SOURCE_SHA: ${{ steps.calibration.outputs.source_sha }}
-          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
-          MODE: ${{ steps.resolve.outputs.mode }}
-        run: |
-          set -euo pipefail
-          if [ "$MODE" = qualification ]; then
-            test -n "$CALIBRATION_SOURCE_SHA"
-            echo "sha=$CALIBRATION_SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          else
-            echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Require executable release freeze
-        if: steps.resolve.outputs.mode != 'qualification'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
-          SOURCE_SHA: ${{ steps.source-head.outputs.sha }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
           printf '%s' "$FREEZE_RECEIPT_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
           tree="$(
-            gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA" --jq '.tree.sha'
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha'
           )"
           node .github/scripts/release-freeze-barrier.mjs verify-status \
             --repository "$GITHUB_REPOSITORY" \
-            --commit "$SOURCE_SHA" \
+            --commit "$HEAD_SHA" \
             --tree "$tree" \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
-      - name: Require successful accepted-head source proof
-        if: steps.resolve.outputs.mode != 'integration'
+      - name: Require successful exact-head source proof
+        if: steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ steps.source-head.outputs.sha }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
           accepted=false
@@ -264,28 +244,18 @@ jobs:
               --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q .
             then
-              run_attempt="$(
-                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
-              )"
-              artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
-              artifact_count="$(
-                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
-                  | jq --arg name "$artifact_name" \
-                    '[.artifacts[] | select(.name == $name and .expired == false)] | length'
-              )"
-              test "$artifact_count" = 1 || continue
               accepted=true
-              echo "Accepted source proof run $run_id and $artifact_name for frozen source head $SOURCE_SHA."
+              echo "Accepted exact-head source proof run $run_id for $HEAD_SHA."
               break
             fi
           done < <(
             gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_SHA&status=completed&per_page=100" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
                 '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
           test "$accepted" = true || {
-            echo "::error::No successful full-source-gate job exists for accepted source head $SOURCE_SHA."
+            echo "::error::No successful full-source-gate job exists for exact head $HEAD_SHA."
             exit 1
           }
 

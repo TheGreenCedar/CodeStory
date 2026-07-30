@@ -40,6 +40,58 @@ const windowsSccacheCacheSize = "2G";
 
 export { retrievalFile };
 
+function tomlSection(source, section) {
+  const header = `[${section}]`;
+  const start = source.indexOf(`${header}\n`);
+  if (start < 0) return null;
+  const bodyStart = start + header.length + 1;
+  const next = source.slice(bodyStart).search(/^\[[^\]]+\]\s*$/mu);
+  return next < 0
+    ? source.slice(bodyStart)
+    : source.slice(bodyStart, bodyStart + next);
+}
+
+export function benchmarkDependencyIsolationViolations(source) {
+  const violations = [];
+  const dependencies = tomlSection(source, "dependencies");
+  const devDependencies = tomlSection(source, "dev-dependencies");
+  if (dependencies === null || devDependencies === null) {
+    return ["codestory-bench must separate product-driver and benchmark dependencies"];
+  }
+  const benchmarkOnly = [
+    "codestory-cli",
+    "codestory-contracts",
+    "codestory-indexer",
+    "codestory-runtime",
+    "codestory-store",
+    "criterion",
+    "uuid",
+  ];
+  const dependencyNames = new Set(
+    [...dependencies.matchAll(/^([A-Za-z0-9_-]+)\s*=/gmu)]
+      .map((match) => match[1]),
+  );
+  const devDependencyNames = new Set(
+    [...devDependencies.matchAll(/^([A-Za-z0-9_-]+)\s*=/gmu)]
+      .map((match) => match[1]),
+  );
+  add(
+    violations,
+    benchmarkOnly.every(
+      (name) => !dependencyNames.has(name) && devDependencyNames.has(name),
+    ),
+    "codestory-bench benchmark-only dependencies must not enter packaged qualification binaries",
+  );
+  add(
+    violations,
+    /^codestory-runtime\s*=\s*\{\s*workspace\s*=\s*true,\s*features\s*=\s*\["benchmark-support"\]\s*\}\s*$/mu
+      .test(devDependencies)
+      && !/\b(?:benchmark-support|test-support)\b/u.test(dependencies),
+    "codestory-bench product dependencies must not enable benchmark-support or test-support",
+  );
+  return violations;
+}
+
 export function rustRetrievalWrapperSourcePresent(source) {
   return (
     /lint-retrieval-generalization|retrieval[_-]generalization[_-](?:guard|lint)/u
@@ -906,14 +958,14 @@ const packagedPlatformCloseoutDigest =
 // parsed executable structure so an unreviewed earlier step cannot replace an
 // owner binary while leaving the locally digested finalizer unchanged.
 const packagedPlatformWorkflowDigest =
-  "ae53e5a2ab7cc72bfba4eec4264a682dabb75b45913e3e0b5341d2ca5c08c776";
+  "3767898b5225ab53ffc7a0ebbfa7096c3fd833e33edacfe1d425fc00c2e53995";
 // The frozen-candidate coordinator and protected GPU workflows are small
 // release-control programs, not loose collections of independently safe
 // fragments. Pin their complete parsed structure so a required check cannot be
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "24916c12c5242695460cddf8999518b053ae80a2286fb6706f6cf4c71e49a3e1";
+  "458e29b26d5a51dd6d57853ca2cd2867294440150669d942627f5eaa976fdc8c";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -928,7 +980,7 @@ const linuxVulkanWorkflowDigest =
 const packagedSccacheIdentityDigest =
   "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342";
 const packagedLinuxBuildDigest =
-  "968f2ab585eb1870eea20f521d576bfaad2900fc14e6438074f62246a0c8652b";
+  "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f";
 const packagedCompileClockStopDigest =
   "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5";
 const packagedHostCompilerFinalizerDigest =
@@ -2221,6 +2273,96 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         `${sourceFile} retrieval generalization ${name} must run its exact blocking Node command`,
       );
     }
+    const windowsNative = requireJob(
+      violations,
+      sourceFile,
+      source,
+      "windows-native-contracts",
+    );
+    add(
+      violations,
+      hasExactKeys(windowsNative, [
+        "name",
+        "needs",
+        "if",
+        "runs-on",
+        "timeout-minutes",
+        "env",
+        "steps",
+      ])
+        && windowsNative.name === "windows-native-contracts"
+        && sameMembers(needs(windowsNative), ["resolve"])
+        && windowsNative.if
+          === "${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}"
+        && windowsNative["runs-on"] === "windows-latest"
+        && windowsNative["timeout-minutes"] === 15
+        && object(windowsNative.env).CMAKE_GENERATOR === "Ninja"
+        && windowsNative["continue-on-error"] === undefined,
+      `${sourceFile} Windows native source contracts must run in parallel on the resolved exact head`,
+    );
+    const windowsNativeSteps = list(windowsNative.steps).map(object);
+    add(
+      violations,
+      windowsNativeSteps.length === 6
+        && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
+        && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
+        && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
+      `${sourceFile} Windows native source contracts must keep the exact blocking six-step shape`,
+    );
+    requireStepRun(violations, sourceFile, windowsNative, "Install Rust stable", [
+      "rustup toolchain install stable --profile minimal",
+      "rustup default stable",
+    ]);
+    requireStepRun(
+      violations,
+      sourceFile,
+      windowsNative,
+      "Configure short Windows Cargo target",
+      [
+        '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
+        '$shortTarget = Join-Path $runnerRoot "t"',
+        "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
+        '"CARGO_TARGET_DIR=$shortTarget"',
+      ],
+    );
+    requireStepRun(
+      violations,
+      sourceFile,
+      windowsNative,
+      "Prepare checksum-pinned embedded model",
+      ["node scripts/prepare-embedded-model.mjs"],
+    );
+    requireStepRun(
+      violations,
+      sourceFile,
+      windowsNative,
+      "Install checksum-pinned Windows Vulkan SDK",
+      [".github/scripts/install-windows-vulkan-sdk.ps1"],
+    );
+    requireStepRun(
+      violations,
+      sourceFile,
+      windowsNative,
+      "Prove Windows path and native-staging source contracts",
+      [
+        "cargo test --release --locked",
+        "-p codestory-workspace --test windows_path_identity",
+        "-p codestory-llama-sys --test native_staging",
+        "Windows native source contracts failed",
+        "Windows path and native-staging source contracts:",
+      ],
+    );
+    const windowsNativeRun = shellLiteralNormalizedText(stepRun(
+      windowsNative,
+      "Prove Windows path and native-staging source contracts",
+    ));
+    add(
+      violations,
+      shellInvocationsContaining(windowsNativeRun, "cargo test").length === 1
+        && jobShellInvocationsContaining(windowsNative, "cargo build").length === 0
+        && jobShellInvocationsContaining(windowsNative, "cargo check").length === 0,
+      `${sourceFile} Windows path and native-staging contracts must share one source-only Cargo invocation`,
+    );
     add(
       violations,
       object(source.env).SCCACHE_VERSION === sccacheVersion
@@ -2731,11 +2873,13 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} source proof may be skipped only when preflight resolved reusable evidence`,
   );
   requireStepRun(violations, releaseFile, requireJob(violations, releaseFile, release, "preflight"), "Resolve reusable prior evidence", [
-    "actions/runs?head_sha=$SOURCE_SHA",
+    'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
+    'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
+    'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
     "full-source-gate",
     '.path == ".github/workflows/source-proof.yml"',
     '.event == "workflow_dispatch" and .conclusion == "success"',
-    "The release workflow will not start a second proof after calibration",
+    "The release workflow will not start a broad proof",
     'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
     ".expired == false",
     'test "$artifact_count" = 1 || continue',
@@ -3464,8 +3608,8 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   const compilerSaveIndex = stepIndex(job, "Save compiler objects after compilation");
   for (const lateStep of [
-    "Prove native workspace path identity",
-    "Test immutable native staging on Windows",
+    "Prove production feature identity",
+    "Prove production feature identity on Windows",
     "Sign and notarize macOS CLI",
     "Package release asset",
     "Package release asset on Windows",
@@ -3701,30 +3845,48 @@ function validatePackagedProof(workflows, violations, graph) {
   requireStepRun(violations, file, job, "Install Linux Vulkan build dependencies", [
     "bash .github/scripts/install-linux-vulkan-build-deps.sh",
   ]);
-  const windowsNativeStagingTest = namedStep(job, "Test immutable native staging on Windows");
-  const windowsPathIdentityTest = namedStep(job, "Prove native workspace path identity");
+  const productFeatureProbe = namedStep(job, "Prove production feature identity");
   add(
     violations,
-    windowsNativeStagingTest?.if === "runner.os == 'Windows'"
-      && windowsNativeStagingTest?.shell === "pwsh"
-      && object(windowsNativeStagingTest?.env).TEST_BINARY
-        === "${{ steps.package-build.outputs.native_staging }}"
-      && windowsNativeStagingTest?.["continue-on-error"] === undefined
-      && windowsPathIdentityTest?.if === "runner.os == 'Windows'"
-      && windowsPathIdentityTest?.shell === "pwsh"
-      && object(windowsPathIdentityTest?.env).TEST_BINARY
-        === "${{ steps.package-build.outputs.windows_path_identity }}"
-      && windowsPathIdentityTest?.["continue-on-error"] === undefined,
-    `${file} Windows regressions must execute the exact release test binaries emitted by the one Cargo graph`,
+    productFeatureProbe?.if === "runner.os != 'Windows'"
+      && productFeatureProbe?.shell === "bash"
+      && object(productFeatureProbe?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && productFeatureProbe?.["continue-on-error"] === undefined,
+    `${file} Unix packages must fail closed on a non-product embedding feature identity`,
   );
-  requireStepRun(violations, file, job, "Test immutable native staging on Windows", [
-    '& "$env:TEST_BINARY" --nocapture',
-    "immutable native-staging release harness failed",
+  requireStepRun(violations, file, job, "Prove production feature identity", [
+    "retrieval status",
+    '--cache-dir "$cache"',
+    '.embedding_device_observation_source == "per_user_server"',
+    "Production feature identity probe:",
   ]);
-  requireStepRun(violations, file, job, "Prove native workspace path identity", [
-    '& "$env:TEST_BINARY" --nocapture',
-    "Windows path-identity release harness failed",
-  ]);
+  const windowsProductFeatureProbe = namedStep(
+    job,
+    "Prove production feature identity on Windows",
+  );
+  add(
+    violations,
+    windowsProductFeatureProbe?.if === "runner.os == 'Windows'"
+      && windowsProductFeatureProbe?.shell === "pwsh"
+      && object(windowsProductFeatureProbe?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && object(windowsProductFeatureProbe?.env).WINDOWS_CLI
+        === "${{ steps.package-build.outputs.cli }}"
+      && windowsProductFeatureProbe?.["continue-on-error"] === undefined,
+    `${file} Windows package must execute the exact selected CLI for its product feature probe`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Prove production feature identity on Windows",
+    [
+      'retrieval status',
+      '--cache-dir "$cache"',
+      '$status.embedding_device_observation_source -ne "per_user_server"',
+      "non-product embedding observation source",
+      "Production feature identity probe:",
+    ],
+  );
   requireStepRun(violations, file, job, "Build pinned Linux toolchain image", [
     ".github/docker/linux-glibc-build.Dockerfile",
     "LINUX_GLIBC_BUILD_IMAGE",
@@ -3759,20 +3921,19 @@ function validatePackagedProof(workflows, violations, graph) {
       && packageBuildRun.includes("--bin codestory_embedding_qualification")
       && packageBuildRun.includes("--target $RELEASE_RUST_TARGET")
       && packageBuildRun.includes("if [ $RUNNER_OS = Windows ]")
-      && packageBuildRun.includes("-p codestory-llama-sys")
-      && packageBuildRun.includes("--test native_staging")
-      && packageBuildRun.includes("-p codestory-workspace")
-      && packageBuildRun.includes("--test windows_path_identity")
       && packageBuildRun.includes("--message-format=json-render-diagnostics")
       && packageBuildRun.includes("--timings")
       && packageBuildRun.includes("cargo-build-artifacts.mjs select")
+      && packageBuildRun.includes("cargo-build-artifacts.mjs features")
+      && occurrenceCount(packageBuildRun, "--workspace-root $GITHUB_WORKSPACE") === 2
       && packageBuildRun.includes("--source-sha $SOURCE_SHA")
       && packageBuildRun.includes("--source-tree $SOURCE_TREE")
       && occurrenceCount(packageBuildRun, "build_package_graph") === 3
       && !packageBuildRun.includes("codestory_embedding_constant_calibration")
       && !packageBuildRun.includes("target/debug")
+      && !/(?:^|\s)--test(?:s)?(?:\s|$)/u.test(packageBuildRun)
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
-    `${file} host package must build the complete Windows release graph in one exact Cargo invocation`,
+    `${file} host package must build only the production bins and optional qualification driver in one exact Cargo invocation`,
   );
   add(
     violations,
@@ -3800,6 +3961,9 @@ function validatePackagedProof(workflows, violations, graph) {
       && linuxBuildRun.includes("-p codestory-bench")
       && linuxBuildRun.includes("--bin codestory_embedding_qualification")
       && linuxBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && linuxBuildRun.includes("--message-format=json-render-diagnostics")
+      && linuxBuildRun.includes("cargo-build-artifacts.mjs features")
+      && linuxBuildRun.includes("--workspace-root $GITHUB_WORKSPACE")
       && !linuxBuildRun.includes("codestory_embedding_constant_calibration")
       && !/(?:^|\s)--bins(?:\s|$)/u.test(linuxBuildRun),
     `${file} Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
@@ -5017,24 +5181,27 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   add(
     violations,
-    namedStep(route, "Require executable release freeze")?.if
-      === "steps.resolve.outputs.mode != 'qualification'",
-    `${file} active freeze status must gate only pre-calibration proof modes`,
+    namedStep(route, "Require executable release freeze")?.if === undefined,
+    `${file} every broad proof mode must authenticate its exact candidate head`,
   );
   requireStepRun(violations, file, route, "Require executable release freeze", [
-    "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA",
+    "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA",
     "release-freeze-barrier.mjs verify-status",
-    '--commit "$SOURCE_SHA"',
+    '--commit "$HEAD_SHA"',
     '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
   ]);
-  requireStepRun(violations, file, route, "Require successful accepted-head source proof", [
-    "actions/runs?head_sha=$SOURCE_SHA",
+  const exactHeadSourceProof = namedStep(route, "Require successful exact-head source proof");
+  add(
+    violations,
+    exactHeadSourceProof?.if
+      === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
+    `${file} calibration must precede the sole frozen-candidate source proof`,
+  );
+  requireStepRun(violations, file, route, "Require successful exact-head source proof", [
+    "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',
     '.event == "workflow_dispatch" and .conclusion == "success"',
     '.name == "full-source-gate" and .conclusion == "success"',
-    'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-    ".expired == false",
-    'test "$artifact_count" = 1 || continue',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
     'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
@@ -7989,7 +8156,6 @@ export function releaseFreezeBarrierWorkflowViolations(
   }
   const freeze = object(graph.workflow_policy.release_freeze_barrier);
   const acceptance = object(freeze.acceptance);
-  const singleSource = object(freeze.single_source_proof);
   add(
     violations,
     freeze.schema === 2
@@ -8005,7 +8171,7 @@ export function releaseFreezeBarrierWorkflowViolations(
         === "release-freeze-receipt-attempt-${{ github.run_attempt }}"
       && acceptance.receipt_file === "release-freeze-receipt.json"
       && acceptance.receipt_producer_job === "resolve"
-      && acceptance.status_scope === "pre_calibration_source_head"
+      && acceptance.status_scope === "exact_candidate_head"
       && acceptance.later_commit_revokes === true
       && acceptance.event === "workflow_dispatch"
       && acceptance.hostile_job === "freeze-hostile-mutations"
@@ -8021,14 +8187,8 @@ export function releaseFreezeBarrierWorkflowViolations(
       && acceptance.windows_probe_max_seconds === 90
       && acceptance.publisher_job === "freeze-acceptance"
       && acceptance.publisher_step === "Publish executable release freeze"
-      && acceptance.status_creator === "github-actions[bot]"
-      && singleSource.artifact
-        === "release-cell-prepublish-source-attempt-${{ github.run_attempt }}"
-      && singleSource.artifact_required_unexpired === true
-      && singleSource.cell_emission === "unconditional_on_success"
-      && singleSource.post_calibration_status_required === false
-      && singleSource.post_calibration_fallback_allowed === false,
-    "[freeze_barrier] release claim graph must pin the executable single-proof freeze contract",
+      && acceptance.status_creator === "github-actions[bot]",
+    "[freeze_barrier] release claim graph must pin the executable exact-head freeze contract",
   );
   add(
     violations,
@@ -8179,12 +8339,15 @@ export function releaseFreezeBarrierWorkflowViolations(
     ));
     add(
       violations,
-      freezeInput.required === false
-        && freezeInput.default === ""
+      (
+        file === "source-proof.yml"
+          ? freezeInput.required === false && freezeInput.default === ""
+          : freezeInput.required === true && freezeInput.default === undefined
+      )
         && freezeInput.type === "string",
       file === "source-proof.yml"
         ? "[freeze_barrier] source acceptance must mint its own receipt digest"
-        : "[freeze_barrier] qualification must reuse source-cell lineage without an active freeze digest",
+        : "[freeze_barrier] packaged proof must require an exact-head freeze digest",
     );
     if (file === "source-proof.yml") {
       const dispatchVersionInput = object(at(
@@ -8230,7 +8393,7 @@ export function releaseFreezeBarrierWorkflowViolations(
             === undefined
           && at(workflow, "on", "workflow_call", "inputs", "emit_release_cells")
             === undefined,
-        "[freeze_barrier] source-proof.yml must separate acceptance and emit one reusable source cell after every successful proof",
+        "[freeze_barrier] source-proof.yml must separate acceptance from broad proof",
       );
       add(
         violations,
@@ -8524,23 +8687,10 @@ export function releaseFreezeBarrierWorkflowViolations(
 
   const coordinator = workflows.get("packaged-platform-pr.yml");
   const route = requireJob(violations, "packaged-platform-pr.yml", coordinator, "route");
-  requireStepRun(
-    violations,
-    "packaged-platform-pr.yml",
-    route,
-    "Resolve accepted source proof head",
-    [
-      'if [ "$MODE" = qualification ]; then',
-      'test -n "$CALIBRATION_SOURCE_SHA"',
-      "sha=$CALIBRATION_SOURCE_SHA",
-      "sha=$HEAD_SHA",
-    ],
-  );
   add(
     violations,
-    namedStep(route, "Require executable release freeze")?.if
-      === "steps.resolve.outputs.mode != 'qualification'",
-    "[freeze_barrier] qualification must reuse source-cell lineage after the constant-only commit",
+    namedStep(route, "Require executable release freeze")?.if === undefined,
+    "[freeze_barrier] every packaged proof mode must authenticate the exact candidate head",
   );
   requireStepRun(
     violations,
@@ -8549,22 +8699,26 @@ export function releaseFreezeBarrierWorkflowViolations(
     "Require executable release freeze",
     [
       "release-freeze-barrier.mjs verify-status",
-      '--commit "$SOURCE_SHA"',
+      '--commit "$HEAD_SHA"',
       '--receipt-digest "$FREEZE_RECEIPT_DIGEST"',
     ],
+  );
+  const packagedSourceProof = namedStep(route, "Require successful exact-head source proof");
+  add(
+    violations,
+    packagedSourceProof?.if
+      === "steps.resolve.outputs.mode != 'integration' && steps.resolve.outputs.mode != 'calibration'",
+    "[freeze_barrier] calibration must precede the sole frozen-candidate source proof",
   );
   requireStepRun(
     violations,
     "packaged-platform-pr.yml",
     route,
-    "Require successful accepted-head source proof",
+    "Require successful exact-head source proof",
     [
-      "actions/runs?head_sha=$SOURCE_SHA",
+      "actions/runs?head_sha=$HEAD_SHA",
       '.event == "workflow_dispatch" and .conclusion == "success"',
       '.name == "full-source-gate" and .conclusion == "success"',
-      'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
-      ".expired == false",
-      'test "$artifact_count" = 1 || continue',
     ],
   );
 
@@ -8580,7 +8734,7 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     object(release.permissions).statuses === undefined
       && object(at(auto, "jobs", "release", "permissions")).statuses === undefined,
-    "[freeze_barrier] post-calibration release must not rely on an active freeze status",
+    "[freeze_barrier] publication must reuse accepted frozen-candidate proof without an active status",
   );
   const preflight = requireJob(violations, "release.yml", release, "preflight");
   requireStepRun(
@@ -8589,11 +8743,13 @@ export function releaseFreezeBarrierWorkflowViolations(
     preflight,
     "Resolve reusable prior evidence",
     [
-      "actions/runs?head_sha=$SOURCE_SHA",
+      'release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"',
+      'test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree"',
+      'git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA"',
       'artifact_name="release-cell-prepublish-source-attempt-$run_attempt"',
       ".expired == false",
       'test "$artifact_count" = 1 || continue',
-      "The release workflow will not start a second proof after calibration",
+      "The release workflow will not start a broad proof",
       "source_proof_reused=true",
     ],
   );
@@ -8606,15 +8762,6 @@ export function releaseFreezeBarrierWorkflowViolations(
       "release-freeze-barrier.mjs verify-status",
       "freeze_receipt_digest",
     ],
-  );
-  requireStepEnv(
-    violations,
-    "release.yml",
-    preflight,
-    "Resolve reusable prior evidence",
-    {
-      SOURCE_SHA: "${{ steps.lineage.outputs.selection_commit }}",
-    },
   );
   const sourceJob = requireJob(violations, "release.yml", release, "source-proof");
   add(
@@ -9890,6 +10037,12 @@ export function validateMarketplaceSync(workflows, violations) {
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...benchmarkDependencyIsolationViolations(
+    fs.readFileSync(
+      path.join(repositoryRoot, "crates", "codestory-bench", "Cargo.toml"),
+      "utf8",
+    ),
+  ));
   violations.push(...retrievalGeneralizationSuitePolicyViolations(
     fs.readFileSync(
       path.join(repositoryRoot, retrievalGeneralizationSuiteFile),

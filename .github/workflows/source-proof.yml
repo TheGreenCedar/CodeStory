@@ -738,3 +738,64 @@ jobs:
 
       - name: Generalization lint hostile matrix
         run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
+
+  windows-native-contracts:
+    name: windows-native-contracts
+    needs: resolve
+    if: ${{ !inputs.acceptance_only && needs.resolve.outputs.reuse != 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Install Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Configure short Windows Cargo target
+        shell: pwsh
+        run: |
+          $workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"
+          $runnerRoot = [System.IO.Path]::GetPathRoot($workspaceTarget)
+          if ([string]::IsNullOrWhiteSpace($runnerRoot)) {
+            throw "workspace target has no volume root: $workspaceTarget"
+          }
+          $shortTarget = Join-Path $runnerRoot "t"
+          New-Item -ItemType Directory -Force -Path $workspaceTarget | Out-Null
+          if (Test-Path -LiteralPath $shortTarget) {
+            throw "short Cargo target already exists: $shortTarget"
+          }
+          New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget | Out-Null
+          "CARGO_TARGET_DIR=$shortTarget" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Prepare checksum-pinned embedded model
+        run: node scripts/prepare-embedded-model.mjs
+
+      - name: Install checksum-pinned Windows Vulkan SDK
+        shell: pwsh
+        run: .github/scripts/install-windows-vulkan-sdk.ps1
+
+      - name: Prove Windows path and native-staging source contracts
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          cargo test --release --locked `
+            -p codestory-workspace --test windows_path_identity `
+            -p codestory-llama-sys --test native_staging
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows native source contracts failed with exit code $LASTEXITCODE"
+          }
+          $ended = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $elapsed = $ended - $started
+          if ($elapsed -lt 0) {
+            throw "Windows native source-contract timing was negative"
+          }
+          "- Windows path and native-staging source contracts: ${elapsed} ms" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

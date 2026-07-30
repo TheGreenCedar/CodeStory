@@ -183,17 +183,16 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
 /// and why; this map is the ceiling, stated next to the proofs that establish it, so a graph edit
 /// alone can never grant an equation no binding proves.
 ///
-///   * `source_tree` proves either an identical tree or the one exact constant-set transition from
-///     the accepted calibration source. In the latter case it determines both trees and the direct
-///     lineage, so the reused source row may retain its measured source_tree while closeout reads it
-///     at the frozen candidate's tree.
+///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
+///     substituting: every tree-derived identity a reused row declares is still checkable directly
+///     against this release, and equating one would replace a live check with nothing. Hence [].
 ///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
 ///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
 ///     determines the built accelerator, so accelerator execution evidence transfers across the
 ///     source_tree difference the binding exists to tolerate. It determines nothing about the
 ///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
 const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
-  source_tree: Object.freeze(["source_tree"]),
+  source_tree: Object.freeze([]),
   native_fingerprint: Object.freeze(["source_tree"]),
 });
 
@@ -219,62 +218,8 @@ export function verifyReuseBinding({ binding, repository, releaseCommit, reusedC
   if (binding === "source_tree") {
     const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
     const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
-    if (releaseTree === reusedTree) {
-      return releaseTree;
-    }
-    const constantPath =
-      "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-    let constantSet;
-    try {
-      constantSet = JSON.parse(git(
-        ["show", `${releaseCommit}:${constantPath}`],
-        repository,
-      ));
-    } catch {
-      fail(
-        `reused commit ${reusedCommit} tree ${reusedTree} does not match release tree `
-        + `${releaseTree}, and the release has no readable calibration freeze`,
-      );
-    }
-    const freeze = constantSet?.freeze_record;
-    if (
-      constantSet?.status !== "frozen"
-      || freeze?.selection_source_commit !== reusedCommit
-      || freeze?.selection_source_tree !== reusedTree
-    ) {
-      fail(
-        `reused commit ${reusedCommit} tree ${reusedTree} does not match release tree `
-        + `${releaseTree} or the release calibration source`,
-      );
-    }
-    const changed = git(
-      ["diff", "--name-only", reusedCommit, releaseCommit],
-      repository,
-    ).split("\n").filter(Boolean);
-    if (JSON.stringify(changed) !== JSON.stringify([constantPath])) {
-      fail(
-        "source proof reuse crosses changes outside the sole generated constant set: "
-        + changed.join(", "),
-      );
-    }
-    const parents = (commit) => git(
-      ["rev-list", "--parents", "-n", "1", commit],
-      repository,
-    ).split(/\s+/u).slice(1);
-    const releaseParents = parents(releaseCommit);
-    const direct = releaseParents.length === 1 && releaseParents[0] === reusedCommit;
-    const promotionParents = direct
-      ? []
-      : releaseParents.filter((parent) =>
-        parents(parent).length === 1
-        && parents(parent)[0] === reusedCommit
-        && git(["rev-parse", `${parent}^{tree}`], repository) === releaseTree
-      );
-    if (!direct && promotionParents.length !== 1) {
-      fail(
-        "source proof reuse requires the direct generated constant-set child "
-        + "or one explicit tree-preserving promotion commit",
-      );
+    if (releaseTree !== reusedTree) {
+      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
     }
     return releaseTree;
   }
@@ -896,15 +841,26 @@ function validateWindowsPackageGraph(value) {
       "codestory-cli",
       "codestory-cli-runtime",
       "codestory_embedding_qualification",
-      "native_staging",
-      "windows_path_identity",
     ],
     "workflow_policy.windows_package_graph.artifacts",
   );
+  if (
+    JSON.stringify(stringArray(
+      graph.direct_test_harnesses,
+      "workflow_policy.windows_package_graph.direct_test_harnesses",
+    )) !== JSON.stringify([])
+  ) {
+    fail("workflow_policy.windows_package_graph.direct_test_harnesses must be empty");
+  }
   exactStringList(
-    graph.direct_test_harnesses,
+    graph.source_test_harnesses,
     ["native_staging", "windows_path_identity"],
-    "workflow_policy.windows_package_graph.direct_test_harnesses",
+    "workflow_policy.windows_package_graph.source_test_harnesses",
+  );
+  exactStringList(
+    graph.production_feature_probes,
+    ["cargo_message_feature_contract", "runtime_observation_source"],
+    "workflow_policy.windows_package_graph.production_feature_probes",
   );
   exactStringList(
     graph.timing_phases,
@@ -913,7 +869,7 @@ function validateWindowsPackageGraph(value) {
       "native_setup",
       "cargo_graph",
       "msvc_link",
-      "regression_execution",
+      "feature_probe",
       "packaging",
       "artifact_transfer",
     ],
@@ -1651,7 +1607,7 @@ export function validateReleaseClaimGraph(graph) {
       !== "release-freeze-receipt-attempt-${{ github.run_attempt }}"
     || acceptance.receipt_file !== "release-freeze-receipt.json"
     || acceptance.receipt_producer_job !== "resolve"
-    || acceptance.status_scope !== "pre_calibration_source_head"
+    || acceptance.status_scope !== "exact_candidate_head"
     || acceptance.later_commit_revokes !== true
     || acceptance.event !== "workflow_dispatch"
     || acceptance.windows_probe_max_seconds !== 90
@@ -1663,53 +1619,6 @@ export function validateReleaseClaimGraph(graph) {
       + "probe budget, status scope, revocation, and status creator",
     );
   }
-  const singleSource = object(
-    freeze.single_source_proof,
-    "workflow_policy.release_freeze_barrier.single_source_proof",
-  );
-  nonEmptyText(
-    singleSource.producer_workflow,
-    "workflow_policy.release_freeze_barrier.single_source_proof.producer_workflow",
-  );
-  nonEmptyText(
-    singleSource.producer_job,
-    "workflow_policy.release_freeze_barrier.single_source_proof.producer_job",
-  );
-  nonEmptyText(
-    singleSource.artifact,
-    "workflow_policy.release_freeze_barrier.single_source_proof.artifact",
-  );
-  if (singleSource.artifact_required_unexpired !== true) {
-    fail(
-      "workflow_policy.release_freeze_barrier.single_source_proof "
-      + "must require an unexpired source-cell artifact",
-    );
-  }
-  if (singleSource.cell_emission !== "unconditional_on_success") {
-    fail(
-      "workflow_policy.release_freeze_barrier.single_source_proof "
-      + "must emit its source cell unconditionally after successful proof",
-    );
-  }
-  if (singleSource.post_calibration_status_required !== false) {
-    fail(
-      "workflow_policy.release_freeze_barrier.single_source_proof "
-      + "must reuse the source cell and constant-only lineage after calibration, "
-      + "not an active freeze status",
-    );
-  }
-  stringArray(
-    singleSource.reuse_validation,
-    "workflow_policy.release_freeze_barrier.single_source_proof.reuse_validation",
-    { nonEmpty: true },
-  );
-  if (singleSource.post_calibration_fallback_allowed !== false) {
-    fail(
-      "workflow_policy.release_freeze_barrier.single_source_proof "
-      + "must prohibit a post-calibration fallback",
-    );
-  }
-
   const actionlint = object(policy.actionlint, "workflow_policy.actionlint");
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");
   nonEmptyText(actionlint.config, "workflow_policy.actionlint.config");

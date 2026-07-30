@@ -117,13 +117,8 @@
       "equation": "Reuse anchors a row to the earlier run and commit it was produced by, so the commit identity is read at the release commit for every binding. Any further identity a reused row would otherwise be held to is checked as written unless the binding declares it below. A binding may declare an identity key only when the binding's own construction determines that key for the evidence being inherited, and an equated key is never dropped: the reused row must still carry the reused commit's own value for it, which the binding is what makes admissible in place of this release's.",
       "bindings": {
         "source_tree": {
-          "admits": "Source evidence from the accepted calibration commit is admissible on the frozen candidate only when the checked-in freeze record names that exact commit and tree, the sole changed path is the generated constant set, and the frozen candidate is its direct child or has one explicit tree-preserving promotion commit.",
-          "equates": [
-            {
-              "identity": "source_tree",
-              "justification": "The source proof ran on the accepted pre-calibration tree. Deterministic constant selection, direct constant-only lineage, and frozen-candidate qualification prove the only later source transition, so closeout may read that measured source row at the frozen candidate tree without running the workspace a second time."
-            }
-          ]
+          "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
+          "equates": []
         },
         "native_fingerprint": {
           "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
@@ -1072,13 +1067,16 @@
       "artifacts": [
         "codestory-cli",
         "codestory-cli-runtime",
-        "codestory_embedding_qualification",
+        "codestory_embedding_qualification"
+      ],
+      "direct_test_harnesses": [],
+      "source_test_harnesses": [
         "native_staging",
         "windows_path_identity"
       ],
-      "direct_test_harnesses": [
-        "native_staging",
-        "windows_path_identity"
+      "production_feature_probes": [
+        "cargo_message_feature_contract",
+        "runtime_observation_source"
       ],
       "package_artifact": "codestory-cli",
       "timing_phases": [
@@ -1086,7 +1084,7 @@
         "native_setup",
         "cargo_graph",
         "msvc_link",
-        "regression_execution",
+        "feature_probe",
         "packaging",
         "artifact_transfer"
       ]
@@ -1505,7 +1503,7 @@
         "receipt_artifact": "release-freeze-receipt-attempt-${{ github.run_attempt }}",
         "receipt_file": "release-freeze-receipt.json",
         "receipt_producer_job": "resolve",
-        "status_scope": "pre_calibration_source_head",
+        "status_scope": "exact_candidate_head",
         "later_commit_revokes": true,
         "event": "workflow_dispatch",
         "hostile_job": "freeze-hostile-mutations",
@@ -1522,22 +1520,6 @@
         "publisher_job": "freeze-acceptance",
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]"
-      },
-      "single_source_proof": {
-        "producer_workflow": "source-proof.yml",
-        "producer_job": "full-source-gate",
-        "artifact": "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
-        "artifact_required_unexpired": true,
-        "cell_emission": "unconditional_on_success",
-        "post_calibration_status_required": false,
-        "accepted_source": "freeze_receipt.commit",
-        "frozen_descendant": "constant_set.freeze_record.selection_source_commit",
-        "reuse_validation": [
-          "deterministic_constant_selection",
-          "direct_constant_only_lineage",
-          "frozen_candidate_qualification"
-        ],
-        "post_calibration_fallback_allowed": false
       }
     },
     "actionlint": {
