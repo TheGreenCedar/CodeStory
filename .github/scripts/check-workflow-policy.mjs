@@ -40,6 +40,15 @@ const windowsSccacheCacheSize = "2G";
 
 export { retrievalFile };
 
+export function rustRetrievalWrapperSourcePresent(source) {
+  return (
+    /lint-retrieval-generalization|retrieval[_-]generalization[_-](?:guard|lint)/u
+      .test(source)
+    || /\b(?:std|tokio|async_std)::process\b|\bprocess::Command\b|\bCommand\s*::\s*(?:new|from)\s*\(|\b(?:assert_cmd|duct|xshell)\b/u
+      .test(source)
+  );
+}
+
 function serializedRustRetrievalWrapperPresent() {
   const root = path.join(repositoryRoot, runtimeIntegrationTestRoot);
   if (!fs.existsSync(root)) return false;
@@ -50,12 +59,11 @@ function serializedRustRetrievalWrapperPresent() {
       const entryPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         pending.push(entryPath);
-      } else if (
-        entry.name.endsWith(".rs")
-        && /lint-retrieval-generalization|retrieval[_-]generalization[_-](?:guard|lint)/u
-          .test(fs.readFileSync(entryPath, "utf8"))
-      ) {
-        return true;
+      } else if (entry.name.endsWith(".rs")) {
+        const source = fs.readFileSync(entryPath, "utf8");
+        if (rustRetrievalWrapperSourcePresent(source)) {
+          return true;
+        }
       }
     }
   }
@@ -70,8 +78,80 @@ export function retrievalGeneralizationSuitePolicyViolations(
 ) {
   const violations = [];
   const invocationCount = source.match(/\brunRetrievalGeneralizationLint\s*\(/gu)?.length ?? 0;
+  const lintReferenceCount =
+    source.match(/\brunRetrievalGeneralizationLint\b/gu)?.length ?? 0;
   const checkoutDigestCount = source.match(/\btreeDigest\(repositoryRoot\)/gu)?.length ?? 0;
+  const repositoryRootReferenceCount = source.match(/\brepositoryRoot\b/gu)?.length ?? 0;
+  const fixtureRootReferenceCount = source.match(/\bfixtureRoot\b/gu)?.length ?? 0;
+  const productionRepositoryRootReferenceCount =
+    source.match(/\bproductionRepositoryRoot\b/gu)?.length ?? 0;
   const temporaryRootCount = source.match(/\bos\.tmpdir\(\)/gu)?.length ?? 0;
+  const temporaryTreeCount = source.match(/\bfs\.mkdtempSync\s*\(/gu)?.length ?? 0;
+  const dynamicImportCount = source.match(/\bimport\s*\(/gu)?.length ?? 0;
+  const fsReferenceCount = source.match(/\bfs\b/gu)?.length ?? 0;
+  const filesystemMemberReferences = [...source.matchAll(
+    /\bfs\.([A-Za-z_$][\w$]*)\b/gu,
+  )].map((match) => match[1]);
+  const expectedFilesystemMemberCounts = {
+    existsSync: 1,
+    mkdirSync: 6,
+    mkdtempSync: 1,
+    readFileSync: 4,
+    readdirSync: 4,
+    readlinkSync: 1,
+    rmSync: 1,
+    writeFileSync: 1,
+  };
+  const filesystemMemberCounts = new Map();
+  for (const name of filesystemMemberReferences) {
+    filesystemMemberCounts.set(
+      name,
+      (filesystemMemberCounts.get(name) ?? 0) + 1,
+    );
+  }
+  const fixtureFilesystemShapeIsExact =
+    fsReferenceCount === 21
+    && filesystemMemberReferences.length === 19
+    && Object.entries(expectedFilesystemMemberCounts).every(
+      ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
+    )
+    && [
+      "const destination = path.join(root, relativePath);",
+      "fs.mkdirSync(path.dirname(destination), { recursive: true });",
+      "fs.writeFileSync(destination, contents);",
+      "fs.mkdirSync(rustRoot, { recursive: true });",
+      "fs.mkdirSync(retrievalRoot, { recursive: true });",
+      "fs.mkdirSync(extraRustRoot);",
+      "fs.mkdirSync(nonRustRoot);",
+      "fs.mkdirSync(taskRoot);",
+      "fs.rmSync(fixtureRoot, { recursive: true, force: true });",
+    ].every((fragment) => source.includes(fragment));
+  const writeReferenceCount = source.match(/\bwrite\b/gu)?.length ?? 0;
+  const writeFirstArguments = [...source.matchAll(
+    /\bwrite\s*\(\s*([A-Za-z_$][\w$]*)/gu,
+  )].map((match) => match[1]);
+  const registeredWriteRoots = new Set([
+    "root",
+    "rustRoot",
+    "retrievalRoot",
+    "extraRustRoot",
+    "nonRustRoot",
+    "taskRoot",
+  ]);
+  const syntheticWritesStayInRegisteredRoots =
+    writeReferenceCount === 14
+    && writeFirstArguments.length === writeReferenceCount
+    && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
+  const fixturePathReferenceShapeIsExact =
+    repositoryRootReferenceCount === 12
+    && fixtureRootReferenceCount === 10
+    && productionRepositoryRootReferenceCount === 4;
+  const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
+  const retainedDynamicImportFixtures = [
+    "await import(harness);",
+    String.raw`await import(\"${protectedRetrievalWorkflow}\");`,
+    `await import("${protectedRetrievalWorkflow}");`,
+  ];
   const importSpecifiers = [...source.matchAll(
     /^\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["'];\s*$/gmu,
   )].map((match) => match[1]);
@@ -90,7 +170,13 @@ export function retrievalGeneralizationSuitePolicyViolations(
     /(?:node:)?worker_threads/u,
     /(?:node:)?cluster/u,
     /\b(?:createRequire|getBuiltinModule)\b/u,
-    /\bprocess\.binding\s*\(/u,
+    /\bprocess\s*\[/u,
+    /\bprocess\.(?:binding|_linkedBinding)\s*\(/u,
+    /\b(?:Function|eval)\s*\(/u,
+    /\bglobalThis\b/u,
+    /\bReflect\.(?:apply|construct|get)\b/u,
+    /\bmodule\s*\.\s*(?:constructor|createRequire)\b/u,
+    /\bWebAssembly\b/u,
     /\brequire\s*\(/u,
     /\bBun\.(?:spawn|spawnSync)\b/u,
     /\bDeno\.Command\b/u,
@@ -98,7 +184,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
   const forbiddenLockSurface = [
     /\b(?:flock|lock_exclusive|try_lock_exclusive|proper-lockfile)\b/iu,
     /\bopenSync\s*\(/u,
-    /\bAtomics\.wait\s*\(/u,
+    /\bAtomics\.wait(?:Async)?\s*\(/u,
+    /\b(?:fs|os)\s*\[/u,
     /retrieval-generalization(?:-guard)?\.lock/iu,
     /process\.env\.(?:RUNNER_TEMP|TEMP|TMP|TMPDIR)\b/u,
     /["']\/tmp(?:\/|["'])/u,
@@ -111,12 +198,14 @@ export function retrievalGeneralizationSuitePolicyViolations(
   );
   add(
     violations,
-    invocationCount === 1,
+    invocationCount === 1 && lintReferenceCount === 2,
     `${retrievalGeneralizationSuiteFile} must execute the hostile fixture matrix through one in-process lint invocation`,
   );
   add(
     violations,
     !forbiddenConcurrencySurface
+      && dynamicImportCount === retainedDynamicImportFixtures.length
+      && retainedDynamicImportFixtures.every((fixture) => source.includes(fixture))
       && importSpecifiers.length === allowedImports.length
       && sameMembers(importSpecifiers, allowedImports),
     `${retrievalGeneralizationSuiteFile} must not create subprocesses, workers, or clusters for hostile fixtures`,
@@ -128,10 +217,19 @@ export function retrievalGeneralizationSuitePolicyViolations(
   );
   add(
     violations,
+    fixtureFilesystemShapeIsExact
+      && syntheticWritesStayInRegisteredRoots
+      && fixturePathReferenceShapeIsExact
+      && !/\bfs\.promises\b/u.test(source),
+    `${retrievalGeneralizationSuiteFile} must confine every filesystem mutation to registered roots in its one synthetic fixture tree`,
+  );
+  add(
+    violations,
     source.includes(
       'fs.mkdtempSync(path.join(os.tmpdir(), "codestory-generalization-"))',
     )
       && temporaryRootCount === 1
+      && temporaryTreeCount === 1
       && source.includes(
         'assert.ok(\n    path.relative(repositoryRoot, fixtureRoot).startsWith(".."),',
       )
