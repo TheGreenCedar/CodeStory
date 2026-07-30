@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import patch, sentinel
 
+from . import qualification_workflow
 from .foundation import ProofFailure, require
-from .qualification_metrics import _qualification_host
+from .qualification_metrics import (
+    _qualification_cache_state_from_scenarios,
+    _qualification_host,
+)
 from .qualification_production_types import (
     QualificationRunnerEvidence,
     QualificationScenarioEvidence,
@@ -49,7 +54,6 @@ def _qualification_cache_state_self_tests() -> None:
             },
         },
         manifest={"asset_target": "macos-arm64"},
-        archive_sha256="b" * 64,
     )
     runner = QualificationRunnerEvidence(
         output={},
@@ -71,7 +75,16 @@ def _qualification_cache_state_self_tests() -> None:
         },
     )
     measurement = {"unplanned_suspend": False}
-    host = _qualification_host(context, runner, reused_scenario, measurement)
+    cache_state = _qualification_cache_state_from_scenarios(
+        runner.matrix_cell["cache_state"],
+        reused_scenario,
+    )
+    host = _qualification_host(
+        context,
+        runner,
+        measurement,
+        cache_state=cache_state,
+    )
     require(
         context.runtime["materialization"]["reused_on_rejoin"] is False
         and host["cache_state"] == "reused",
@@ -99,15 +112,90 @@ def _qualification_cache_state_self_tests() -> None:
         ),
     ):
         try:
-            _qualification_host(context, runner, hostile, measurement)
+            _qualification_cache_state_from_scenarios(
+                runner.matrix_cell["cache_state"],
+                hostile,
+            )
         except ProofFailure:
             pass
         else:
             raise ProofFailure(message)
 
 
+def _qualification_workflow_dataflow_self_test() -> None:
+    validated_scenarios = QualificationScenarioEvidence(
+        shared_identity={"server_instance_id": "validated"},
+        scenarios={"true_idle_respawn": {"assertions": {}}},
+    )
+
+    def retain_measurements(context, runner, scenarios):
+        require(
+            context is sentinel.context
+            and runner is sentinel.runner
+            and scenarios is validated_scenarios,
+            "qualification workflow replaced validated scenarios before measurement retention",
+        )
+        return sentinel.measurements
+
+    def retain_outputs(context, runner, scenarios, measurements):
+        require(
+            context is sentinel.context
+            and runner is sentinel.runner
+            and scenarios is validated_scenarios
+            and measurements is sentinel.measurements,
+            "qualification workflow replaced validated producer phase evidence",
+        )
+        return sentinel.output
+
+    with (
+        patch.object(
+            qualification_workflow,
+            "prepare_qualification_producer",
+            return_value=sentinel.context,
+        ),
+        patch.object(
+            qualification_workflow,
+            "collect_qualification_external_evidence",
+            return_value=sentinel.external,
+        ),
+        patch.object(
+            qualification_workflow,
+            "run_qualification_producer",
+            return_value=sentinel.runner,
+        ),
+        patch.object(
+            qualification_workflow,
+            "collect_qualification_scenarios",
+            return_value=validated_scenarios,
+        ),
+        patch.object(
+            qualification_workflow,
+            "collect_qualification_measurements",
+            side_effect=retain_measurements,
+        ),
+        patch.object(
+            qualification_workflow,
+            "write_qualification_outputs",
+            side_effect=retain_outputs,
+        ),
+    ):
+        result = qualification_workflow.produce_qualification_evidence(
+            sentinel.args,
+            sentinel.qualification_cli,
+            sentinel.env,
+            sentinel.root,
+            sentinel.runtime,
+            sentinel.manifest,
+            sentinel.archive_sha256,
+            sentinel.measurement_contract,
+            sentinel.server_cleanup_control,
+        )
+    require(result is sentinel.output, "qualification workflow returned stale evidence")
+
+
 def run_qualification_self_tests() -> None:
     _qualification_cache_state_self_tests()
+    _qualification_workflow_dataflow_self_test()
     retry = validate_retry_state(
         {
             "code": "embedding_server_owner_unresponsive",

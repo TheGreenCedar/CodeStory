@@ -64,15 +64,12 @@ def _qualification_measurement_sources(
     return measurement, memory
 
 
-def _qualification_host(
-    context: QualificationProducerContext,
-    runner: QualificationRunnerEvidence,
+def _qualification_cache_state_from_scenarios(
+    selected_cache_state: object,
     scenarios: QualificationScenarioEvidence,
-    measurement: dict,
-) -> dict:
-    identity = context.runtime["identity"]
+) -> str:
     cache_state = require_nonempty_string(
-        runner.matrix_cell.get("cache_state"),
+        selected_cache_state,
         "qualification matrix cache state",
     )
     if cache_state == "reused":
@@ -85,6 +82,17 @@ def _qualification_host(
             and assertions.get("verified_materialization_reused") is True,
             "qualification reused cache state lacks validated replacement reuse evidence",
         )
+    return cache_state
+
+
+def _qualification_host(
+    context: QualificationProducerContext,
+    runner: QualificationRunnerEvidence,
+    measurement: dict,
+    *,
+    cache_state: str,
+) -> dict:
+    identity = context.runtime["identity"]
     residency_state = require_nonempty_string(
         identity["embedding_engine_residency"],
         "runtime engine residency",
@@ -195,6 +203,10 @@ def collect_qualification_measurements(
     scenarios: QualificationScenarioEvidence,
 ) -> QualificationMeasurementEvidence:
     measurement, memory = _qualification_measurement_sources(context, runner)
+    cache_state = _qualification_cache_state_from_scenarios(
+        runner.matrix_cell.get("cache_state"),
+        scenarios,
+    )
     timing = {
         "clock_domain": "awake_monotonic",
         "cross_process_timestamp_subtraction": False,
@@ -219,6 +231,11 @@ def collect_qualification_measurements(
         measurement,
         memory,
         timing,
-        _qualification_host(context, runner, scenarios, measurement),
+        _qualification_host(
+            context,
+            runner,
+            measurement,
+            cache_state=cache_state,
+        ),
         metrics,
     )
