@@ -993,7 +993,7 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "29fdda15a93e6cf4526588bad2c746ef8e13afb58e74a7b2b44d9b1a656eb549";
+  "0c9e4752b50d25cc42406e943ca7fbe6198428095c9c98d8de3e14364e6a89ff";
 const frozenCandidateQualityWorkflowDigest =
   "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
 const macosMetalWorkflowDigest =
@@ -8526,8 +8526,8 @@ export function releaseFreezeBarrierWorkflowViolations(
     } else {
       add(
         violations,
-        object(workflow.permissions).statuses === "read",
-        "[freeze_barrier] packaged-platform-pr.yml must authenticate the exact-head freeze status",
+        object(workflow.permissions).statuses === "write",
+        "[freeze_barrier] packaged-platform-pr.yml must forward status write required by reusable source proof",
       );
     }
     add(

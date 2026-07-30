@@ -3337,9 +3337,9 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       workflows.get("packaged-platform-pr.yml").on.workflow_dispatch
         .inputs.freeze_receipt_digest.default = "";
     }, /packaged proof must require an exact-head freeze digest/u],
-    ["platform cannot read freeze status", workflows => {
-      delete workflows.get("packaged-platform-pr.yml").permissions.statuses;
-    }, /must authenticate the exact-head freeze status/u],
+    ["platform downgrades reusable source status authority", workflows => {
+      workflows.get("packaged-platform-pr.yml").permissions.statuses = "read";
+    }, /must forward status write required by reusable source proof/u],
     ["qualification bypasses its exact-head freeze status", workflows => {
       draftStep(
         workflows.get("packaged-platform-pr.yml").jobs.route,
