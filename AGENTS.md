@@ -206,15 +206,17 @@ adapter to compensate for incorrect upstream state.
   final integration head, not every independently mergeable PR.
 - Release order is: merge all blockers, run focused checks, run actual-host
   microprobes, execute hostile mutation acceptance, push and declare the source
-  head frozen, run one broad source proof, calibrate, apply the sole generated
-  constant-set change, then qualify. If another source or workflow change
-  becomes necessary, immediately invalidate the candidate and cancel every
-  queued or running proof for it.
-- Run the full workspace source proof exactly once per release candidate. For
-  a sole generated constant-set freeze, use deterministic selection
-  validation, lineage verification, and frozen-candidate qualification; do not
-  rerun the full workspace. If policy cannot reuse the pre-calibration proof,
-  move the one broad proof to the frozen head instead. Never run both.
+  head frozen for calibration, calibrate, apply the sole generated constant-set
+  change, accept and freeze that generated head, run one broad source proof on
+  it, then qualify. If another source or workflow change becomes necessary,
+  immediately invalidate the candidate and cancel every queued or running
+  proof for it.
+- Run the full workspace source proof exactly once per release candidate, on
+  the generated constant-only frozen head after calibration. The calibration
+  source receives focused hostile-mutation and native-probe acceptance, not a
+  broad source proof. Use deterministic selection validation, direct
+  constant-only lineage verification, and frozen-candidate qualification;
+  never run both a pre-calibration and post-calibration workspace proof.
 - Cancel a run whose head is no longer the intended release candidate. Never
   let an expensive obsolete run finish for information. Before dispatching,
   inspect both in-flight runs and whether any known source change will

@@ -21,18 +21,33 @@ const ACTIVE_RUN_STATES = new Set([
   "pending",
   "in_progress",
 ]);
-const ALLOWED_FUTURE_CHANGES = new Set([
-  "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
-]);
-const NEXT_PERMITTED_MUTATION =
+const CONSTANT_SET_PATH =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-const PLANNED_PROOF_ACTIONS = [
-  "acceptance",
-  "source-proof",
-  "calibration",
-  "qualification",
-  "release",
-];
+const PHASE_CONTRACTS = Object.freeze({
+  calibration_source: Object.freeze({
+    knownFutureSourceChanges: Object.freeze([CONSTANT_SET_PATH]),
+    plannedProofActions: Object.freeze([
+      "calibration-source-acceptance",
+      "calibration",
+      "generated-constant-freeze",
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ]),
+    nextPermittedMutation: CONSTANT_SET_PATH,
+  }),
+  frozen_candidate: Object.freeze({
+    knownFutureSourceChanges: Object.freeze([]),
+    plannedProofActions: Object.freeze([
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ]),
+    nextPermittedMutation: null,
+  }),
+});
 const RECEIPT_ARTIFACT_PREFIX = "release-freeze-receipt-attempt-";
 const RECEIPT_FILE = "release-freeze-receipt.json";
 const STATUS_PREFIX = "codestory/release-freeze";
@@ -47,6 +62,14 @@ const CANCEL_POLL_MS = Number.parseInt(
 
 function fail(message) {
   throw new Error(message);
+}
+
+function phaseContract(phase) {
+  const contract = PHASE_CONTRACTS[phase];
+  if (!contract) {
+    fail("freeze phase must be calibration_source or frozen_candidate");
+  }
+  return contract;
 }
 
 function run(command, args, options = {}) {
@@ -145,6 +168,7 @@ export function validateAcceptanceProvenance({
   commit,
   tree,
   digest,
+  phase,
 }) {
   const escapedRepository = repository.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const target = new RegExp(
@@ -187,6 +211,7 @@ export function validateAcceptanceProvenance({
     tree,
     runId: String(run.id),
     runAttempt: String(run.run_attempt),
+    phase,
   });
   if (!Array.isArray(jobs)) {
     fail("release freeze acceptance jobs are missing");
@@ -228,9 +253,14 @@ export function validateAcceptanceProvenance({
 
 export function validateReceipt(
   receipt,
-  { repository, commit, tree, runId, runAttempt },
+  { repository, commit, tree, runId, runAttempt, phase },
 ) {
-  if (receipt?.schema !== 2 || receipt?.authority !== "github_actions") {
+  const expectedContract = phaseContract(phase);
+  if (
+    receipt?.schema !== 3
+    || receipt?.authority !== "github_actions"
+    || receipt?.phase !== phase
+  ) {
     fail("freeze receipt must use the GitHub Actions authority schema");
   }
   if (
@@ -262,19 +292,20 @@ export function validateReceipt(
   }
   if (
     !Array.isArray(receipt.known_future_source_changes)
-    || receipt.known_future_source_changes.length !== 1
-    || !ALLOWED_FUTURE_CHANGES.has(receipt.known_future_source_changes[0])
+    || JSON.stringify(receipt.known_future_source_changes)
+      !== JSON.stringify(expectedContract.knownFutureSourceChanges)
   ) {
-    fail("freeze receipt must declare only the generated constant-set change");
+    fail(`freeze receipt future changes do not match ${phase}`);
   }
   if (
-    JSON.stringify(receipt.planned_proof_actions) !== JSON.stringify(PLANNED_PROOF_ACTIONS)
+    JSON.stringify(receipt.planned_proof_actions)
+      !== JSON.stringify(expectedContract.plannedProofActions)
     || JSON.stringify(receipt.proof_triggering_labels) !== "[]"
     || JSON.stringify(receipt.proof_triggering_actions) !== JSON.stringify(
-      PLANNED_PROOF_ACTIONS,
+      expectedContract.plannedProofActions,
     )
   ) {
-    fail("freeze receipt must record the exact proof-triggering actions and no labels");
+    fail(`freeze receipt must record the exact ${phase} actions and no labels`);
   }
   for (const field of [
     "reusable_evidence",
@@ -286,8 +317,8 @@ export function validateReceipt(
       fail(`freeze receipt must contain ${field}`);
     }
   }
-  if (receipt.next_permitted_mutation !== NEXT_PERMITTED_MUTATION) {
-    fail("freeze receipt must name the generated constant set as the next mutation");
+  if (receipt.next_permitted_mutation !== expectedContract.nextPermittedMutation) {
+    fail(`freeze receipt next mutation does not match ${phase}`);
   }
   if (
     String(receipt?.acceptance_run?.id) !== String(runId)
@@ -514,6 +545,8 @@ function recordActionsReceipt(args) {
   const releasePrNumber = required(args, "--release-pr");
   const runId = required(args, "--run-id");
   const runAttempt = required(args, "--run-attempt");
+  const phase = required(args, "--phase");
+  const contract = phaseContract(phase);
   const supportPrNumbers = jsonArray(args, "--support-prs-json", "support PRs");
   if (
     !supportPrNumbers.every(number => Number.isInteger(number) && number > 0)
@@ -578,8 +611,9 @@ function recordActionsReceipt(args) {
   }
 
   const receipt = {
-    schema: 2,
+    schema: 3,
     authority: "github_actions",
+    phase,
     repository,
     branch,
     commit,
@@ -588,15 +622,15 @@ function recordActionsReceipt(args) {
     remote_head: commit,
     release_pr: acceptedReleasePr,
     integrated_support_prs: integratedSupportPrs,
-    known_future_source_changes: [NEXT_PERMITTED_MUTATION],
-    planned_proof_actions: PLANNED_PROOF_ACTIONS,
+    known_future_source_changes: [...contract.knownFutureSourceChanges],
+    planned_proof_actions: [...contract.plannedProofActions],
     proof_triggering_labels: [],
-    proof_triggering_actions: PLANNED_PROOF_ACTIONS,
+    proof_triggering_actions: [...contract.plannedProofActions],
     reusable_evidence: reusableEvidence,
     invalidated_evidence: invalidatedEvidence,
     running_workflows: remainingRuns,
     cancelled_superseded_runs: cancelledRuns,
-    next_permitted_mutation: NEXT_PERMITTED_MUTATION,
+    next_permitted_mutation: contract.nextPermittedMutation,
     acceptance_run: {
       id: Number(runId),
       attempt: Number(runAttempt),
@@ -611,6 +645,7 @@ function recordActionsReceipt(args) {
     tree,
     runId,
     runAttempt,
+    phase,
   });
   writeFileSync(output, `${JSON.stringify(receipt, null, 2)}\n`);
   const githubOutput = value(args, "--github-output");
@@ -635,6 +670,7 @@ function verifyFile(args) {
     tree,
     runId: required(args, "--run-id"),
     runAttempt: required(args, "--run-attempt"),
+    phase: required(args, "--phase"),
   });
   process.stdout.write(`${receipt.digest}\n`);
 }
@@ -719,11 +755,13 @@ function verifyStatus(args) {
   const commit = required(args, "--commit");
   const tree = required(args, "--tree");
   const digest = required(args, "--receipt-digest");
+  const phase = required(args, "--phase");
   const status = matchingStatus({
     repository,
     commit,
     tree,
     digest,
+    phase,
   });
   if (!status) {
     fail("no successful exact-head release freeze status matches this receipt digest and tree");
@@ -761,6 +799,7 @@ function verifyStatus(args) {
     commit,
     tree,
     digest,
+    phase,
   });
   process.stdout.write(`${digest}\n`);
 }

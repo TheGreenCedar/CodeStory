@@ -7,9 +7,9 @@ use super::measurements::{
     declared_phase_boundaries, declared_workload_id, measurement_span_interval,
 };
 use super::process::{
-    LOAD_ESTABLISHMENT_WAITS, busy_retry_worker_timeout, dead_client_setup_timeout,
-    load_establishment_budget, load_establishment_timeout, measurement_worker_timeout,
-    published_control_events,
+    LOAD_ESTABLISHMENT_WAITS, MEASUREMENT_OWNER_ABSENCE_GRACE, busy_retry_worker_timeout,
+    dead_client_setup_timeout, load_establishment_budget, load_establishment_timeout,
+    measurement_worker_timeout, published_control_events,
 };
 use super::{ScenarioEvidence, WorkerOutput, opaque_measurement_sample_id};
 use crate::qualification::request::{QualificationContracts, REQUIRED_METRICS, REQUIRED_SCENARIOS};
@@ -76,15 +76,26 @@ fn measurement_worker_budgets_dominate_the_deadlines_workers_honor() {
         measurement_worker_timeout("measure_resident_identity"),
         "the scenario residency probe must carry the same bulk-deadline budget as the residency measurement"
     );
-    // The true-idle measurement worker waits out the server's own idle
-    // deadline before the absence observation; its watchdog must dominate
-    // that self-enforced wait plus its quiescence and absence-grace waits.
+    // The true-idle measurement worker now performs the product request that
+    // starts the idle epoch itself; its watchdog must cover that whole client
+    // chain before the server idle deadline and absence-grace wait.
+    assert_eq!(
+        MEASUREMENT_OWNER_ABSENCE_GRACE,
+        Duration::from_secs(30),
+        "the coordinator must mirror the measurement worker's owner-absence grace"
+    );
     assert!(
         measurement_worker_timeout("measure_true_idle")
-            >= Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
-                .saturating_add(Duration::from_secs(30))
+            >= budgets
+                .connect
+                .saturating_add(budgets.spawn)
+                .saturating_add(budgets.query_request)
+                .saturating_add(Duration::from_millis(
+                    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+                ))
+                .saturating_add(MEASUREMENT_OWNER_ABSENCE_GRACE)
                 .saturating_add(SNAPSHOT_TIMEOUT),
-        "true-idle measurement budget must dominate the server idle deadline plus the worker's own waits"
+        "true-idle measurement budget must dominate its product request, server idle deadline, and worker waits"
     );
     // The busy-retry worker seeds the held queues (queue-setup phase), then
     // after release drains queries bounded by its own 120s per-request

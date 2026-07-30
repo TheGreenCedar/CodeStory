@@ -541,8 +541,10 @@ function validateCalibrationPolicy(value) {
     calibration.coordinator_workflow !== "packaged-platform-pr.yml"
     || calibration.mode !== "calibration"
     || calibration.assembly_job !== "calibration-assemble"
+    || calibration.pre_collection_source_proof_required !== false
+    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
   ) {
-    fail("workflow_policy.calibration must name the canonical calibration coordinator and assembly job");
+    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
   }
   if (calibration.runs_per_required_cell !== 3) {
     fail("workflow_policy.calibration must require exactly three clean runs per required cell");
@@ -1522,8 +1524,8 @@ export function validateReleaseClaimGraph(graph) {
     policy.release_freeze_barrier,
     "workflow_policy.release_freeze_barrier",
   );
-  if (freeze.schema !== 2) {
-    fail("workflow_policy.release_freeze_barrier.schema must be 2");
+  if (freeze.schema !== 3) {
+    fail("workflow_policy.release_freeze_barrier.schema must be 3");
   }
   nonEmptyText(freeze.script, "workflow_policy.release_freeze_barrier.script");
   nonEmptyText(
@@ -1617,6 +1619,81 @@ export function validateReleaseClaimGraph(graph) {
       "workflow_policy.release_freeze_barrier.acceptance must bind the exact "
       + "Actions receipt authority, immutable artifact, producer, event, protected "
       + "probe budget, status scope, revocation, and status creator",
+    );
+  }
+  const freezePhases = object(
+    acceptance.phases,
+    "workflow_policy.release_freeze_barrier.acceptance.phases",
+  );
+  if (
+    JSON.stringify(Object.keys(freezePhases).sort())
+      !== JSON.stringify(["calibration_source", "frozen_candidate"])
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases must define "
+      + "exactly calibration_source and frozen_candidate",
+    );
+  }
+  const constantSet =
+    "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+  const calibrationSource = object(
+    freezePhases.calibration_source,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source",
+  );
+  const calibrationFuture = stringArray(
+    calibrationSource.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.known_future_source_changes",
+    { nonEmpty: true },
+  );
+  const calibrationActions = stringArray(
+    calibrationSource.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify(calibrationFuture) !== JSON.stringify([constantSet])
+    || JSON.stringify(calibrationActions) !== JSON.stringify([
+      "calibration-source-acceptance",
+      "calibration",
+      "generated-constant-freeze",
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || calibrationSource.next_permitted_mutation !== constantSet
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source "
+      + "must permit only calibration then the generated constant-set freeze before source proof",
+    );
+  }
+  const frozenCandidate = object(
+    freezePhases.frozen_candidate,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate",
+  );
+  const frozenFuture = stringArray(
+    frozenCandidate.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.known_future_source_changes",
+  );
+  const frozenActions = stringArray(
+    frozenCandidate.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    frozenFuture.length !== 0
+    || JSON.stringify(frozenActions) !== JSON.stringify([
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || frozenCandidate.next_permitted_mutation !== null
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate "
+      + "must permit no future source mutation before its sole source proof",
     );
   }
   const actionlint = object(policy.actionlint, "workflow_policy.actionlint");

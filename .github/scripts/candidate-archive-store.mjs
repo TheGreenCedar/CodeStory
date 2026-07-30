@@ -874,6 +874,7 @@ function publishStoreEntry(storeRoot, inputRoot, record) {
       removeOwnedTemporary(temporary, paths.parent, path.basename(paths.entry));
       return { admitted: false, ...concurrent };
     }
+    const prepared = lstatSync(temporary, { bigint: true });
     try {
       renameSync(temporary, paths.entry);
     } catch (error) {
@@ -883,6 +884,15 @@ function publishStoreEntry(storeRoot, inputRoot, record) {
       const concurrent = verifyStoreEntry(storeRoot, expected);
       removeOwnedTemporary(temporary, paths.parent, path.basename(paths.entry));
       return { admitted: false, ...concurrent };
+    }
+    const published = lstatSync(paths.entry, { bigint: true });
+    if (
+      !published.isDirectory()
+      || published.isSymbolicLink()
+      || published.dev !== prepared.dev
+      || published.ino !== prepared.ino
+    ) {
+      fail("candidate archive store entry was not published by atomic directory rename");
     }
     return { admitted: true, ...verifyStoreEntry(storeRoot, expected) };
   } catch (error) {

@@ -237,7 +237,11 @@ fn run_measure_operation(
             &request.parameters,
         ),
         "measure_resident_identity" => run_measure_resident_identity(runtime, clock.as_ref()),
-        "measure_true_idle" => run_measure_true_idle(runtime, clock.as_ref()),
+        "measure_true_idle" => run_measure_true_idle(
+            &PerUserEmbeddingClient::for_runtime(runtime)?,
+            clock.as_ref(),
+            request.parameters.input_bytes,
+        ),
         "measure_busy_retry" => {
             let marker = request
                 .retry_marker

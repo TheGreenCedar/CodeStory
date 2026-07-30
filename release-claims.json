@@ -1133,6 +1133,8 @@
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "calibration",
       "assembly_job": "calibration-assemble",
+      "pre_collection_source_proof_required": false,
+      "source_proof_stage": "frozen_candidate_before_qualification",
       "required_cells": [
         {
           "id": "protected_macos_arm64_metal",
@@ -1470,7 +1472,7 @@
       "required_events": []
     },
     "release_freeze_barrier": {
-      "schema": 2,
+      "schema": 3,
       "script": ".github/scripts/release-freeze-barrier.mjs",
       "status_context_prefix": "codestory/release-freeze",
       "allowed_future_source_changes": [
@@ -1519,7 +1521,34 @@
         "windows_probe_max_seconds": 90,
         "publisher_job": "freeze-acceptance",
         "publisher_step": "Publish executable release freeze",
-        "status_creator": "github-actions[bot]"
+        "status_creator": "github-actions[bot]",
+        "phases": {
+          "calibration_source": {
+            "known_future_source_changes": [
+              "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+            ],
+            "planned_actions": [
+              "calibration-source-acceptance",
+              "calibration",
+              "generated-constant-freeze",
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+          },
+          "frozen_candidate": {
+            "known_future_source_changes": [],
+            "planned_actions": [
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": null
+          }
+        }
       }
     },
     "actionlint": {

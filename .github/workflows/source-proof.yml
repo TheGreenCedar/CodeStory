@@ -40,6 +40,14 @@ on:
         required: false
         default: false
         type: boolean
+      acceptance_phase:
+        description: Candidate phase represented by an acceptance-only receipt.
+        required: false
+        default: frozen_candidate
+        type: choice
+        options:
+          - calibration_source
+          - frozen_candidate
       support_prs_json:
         description: JSON array of support PR numbers already merged into the release head.
         required: false
@@ -175,6 +183,7 @@ jobs:
         shell: bash
         env:
           CALLER_FREEZE_RECEIPT_DIGEST: ${{ inputs.freeze_receipt_digest }}
+          ACCEPTANCE_PHASE: ${{ inputs.acceptance_phase }}
           CANCELLED_RUNS_JSON: ${{ steps.cancel.outputs.cancelled }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.resolve.outputs.ref }}
@@ -202,6 +211,7 @@ jobs:
             --cancelled-runs-json "$CANCELLED_RUNS_JSON" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --phase "$ACCEPTANCE_PHASE" \
             --broad-workflow "Exact-head source proof" \
             --broad-workflow "Platform and integration proof" \
             --broad-workflow "Release" \
@@ -273,6 +283,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --commit "$HEAD_SHA" \
             --tree "$tree" \
+            --phase frozen_candidate \
             --receipt-digest "$FREEZE_RECEIPT_DIGEST"
 
   freeze-hostile-mutations:
@@ -413,6 +424,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FREEZE_RECEIPT_DIGEST: ${{ needs.resolve.outputs.freeze_digest }}
           HEAD_SHA: ${{ needs.resolve.outputs.ref }}
+          ACCEPTANCE_PHASE: ${{ inputs.acceptance_phase }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse 'HEAD^{tree}')"
@@ -423,7 +435,8 @@ jobs:
               --commit "$HEAD_SHA" \
               --tree "$tree" \
               --run-id "$GITHUB_RUN_ID" \
-              --run-attempt "$GITHUB_RUN_ATTEMPT"
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --phase "$ACCEPTANCE_PHASE"
           )"
           test "$verified_digest" = "$FREEZE_RECEIPT_DIGEST" || {
             echo "::error::Downloaded acceptance receipt digest differs from the Actions-generated resolve output."

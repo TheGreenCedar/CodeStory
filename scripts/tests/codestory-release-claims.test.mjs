@@ -178,6 +178,34 @@ test("versioned claim graph has one deterministic digest and all declared contro
       publisher_job: "freeze-acceptance",
       publisher_step: "Publish executable release freeze",
       status_creator: "github-actions[bot]",
+      phases: {
+        calibration_source: {
+          known_future_source_changes: [
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+          ],
+          planned_actions: [
+            "calibration-source-acceptance",
+            "calibration",
+            "generated-constant-freeze",
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation:
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        },
+        frozen_candidate: {
+          known_future_source_changes: [],
+          planned_actions: [
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation: null,
+        },
+      },
     },
   );
   assert.equal(
@@ -316,6 +344,11 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
   assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
   assert.equal(calibration.runs_per_required_cell, 3);
   assert.equal(calibration.samples_per_metric_per_run, 1);
+  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(
+    calibration.source_proof_stage,
+    "frozen_candidate_before_qualification",
+  );
   assert.deepEqual(calibration.forbidden_environment, [
     "CODESTORY_EMBED_ALLOW_CPU=1",
   ]);
@@ -339,6 +372,12 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
     [draft => {
       draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
     }, /exactly one sample per metric per run/u],
+    [draft => {
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
+    }, /sole frozen-candidate source proof/u],
+    [draft => {
+      draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
+    }, /sole frozen-candidate source proof/u],
     [draft => {
       draft.workflow_policy.calibration.forbidden_environment = [
         "CODESTORY_EMBED_ALLOW_CPU=0",
@@ -676,6 +715,31 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(persistentFreezeStatus),
     /release_freeze_barrier\.acceptance/u,
+  );
+
+  const preCalibrationSourceProof = structuredClone(graph);
+  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
+    .acceptance.phases.calibration_source.planned_actions = [
+      "calibration-source-acceptance",
+      "source-proof",
+      "calibration",
+      "generated-constant-freeze",
+      "qualification",
+      "release",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(preCalibrationSourceProof),
+    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+  );
+
+  const mutableFrozenCandidate = structuredClone(graph);
+  mutableFrozenCandidate.workflow_policy.release_freeze_barrier
+    .acceptance.phases.frozen_candidate.known_future_source_changes = [
+      "AGENTS.md",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFrozenCandidate),
+    /frozen_candidate.*no future source mutation/u,
   );
 
   const missingInvalidation = structuredClone(graph);

@@ -119,6 +119,19 @@ function regularFile(file, label) {
   return metadata;
 }
 
+function regularBuildOutput(file, label) {
+  const metadata = lstatSync(file);
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isFile()
+    || !Number.isSafeInteger(metadata.nlink)
+    || metadata.nlink < 1
+  ) {
+    fail(`${label} must be a regular, non-symlink build output`);
+  }
+  return metadata;
+}
+
 function regularDirectory(directory, label) {
   const metadata = lstatSync(directory);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
@@ -270,7 +283,10 @@ export function produceQualificationDriverArtifact({
     label: "qualification driver source",
     root: targetDir,
   });
-  const sourceMetadata = regularFile(source, "qualification driver");
+  const sourceMetadata = regularBuildOutput(
+    source,
+    "qualification driver source",
+  );
   if (process.platform !== "win32" && (sourceMetadata.mode & 0o111) === 0) {
     fail("qualification driver must be executable");
   }

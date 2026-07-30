@@ -35,7 +35,7 @@ QUALIFICATION_MEASUREMENT_SHAPE_FIELDS = (
     "calibration_workload_state_overrides",
 )
 EXPECTED_QUALIFICATION_MEASUREMENT_SHAPE_SHA256 = (
-    "1c065562adc34d0d9978187857807e491c4e6d4aa233fdd94f5636931a7b730e"
+    "bc78e8c0277062f1274b0ed97e9bafbef2574b2d1934cb6ab89e7f514900fef8"
 )
 
 
@@ -117,6 +117,11 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
             and all(isinstance(event, str) and event for event in boundaries),
             f"measurement metric {metric} must have exact start and end events",
         )
+    require(
+        phase_boundaries["true_idle_exit"]
+        == ["final_product_request_completed", "engine_and_server_absent"],
+        "true-idle qualification must start at final product completion",
+    )
     metric_contracts = protocol.get("metric_contracts")
     require(
         isinstance(metric_contracts, dict)
@@ -419,6 +424,11 @@ def _verify_measurement_sampling(
             workload.get("input_generator"),
             f"measurement workload {metric}.input_generator",
         )
+    require(
+        workloads["true_idle_exit"].get("workload_id")
+        == "true_idle_after_product_completion_60000_awake_ms_v2",
+        "true-idle qualification workload changed its product-completion boundary",
+    )
     sampling = protocol.get("metric_sampling")
     require(
         isinstance(sampling, dict) and set(sampling) == required_metrics,

@@ -10,7 +10,7 @@ use super::analysis::{
 };
 use super::process::{
     busy_retry_marker_timeout, busy_retry_worker_timeout, measurement_worker_timeout,
-    query_parameters, require_worker_success,
+    query_parameters,
 };
 use super::{
     RunningWorker, ScenarioRunner, WorkerOutput, opaque_constant_calibration_sample_id, push_metric,
@@ -71,7 +71,7 @@ pub(super) fn declared_phase_boundaries(metric: &str) -> Result<[&'static str; 2
         ],
         "busy_retry_usefulness" => ["typed_retry_emitted", "named_retry_condition_became_true"],
         "true_idle_exit" => [
-            "last_queued_active_or_leased_work_ended",
+            "final_product_request_completed",
             "engine_and_server_absent",
         ],
         "backend_observed_accelerator_residency" => [
@@ -94,7 +94,7 @@ pub(super) fn declared_workload_id(metric: &str) -> Result<&'static str> {
         "warm_bulk_ipc" => "warm_bulk_64x256b_v1",
         "bulk_documents_per_second" | "bulk_tokens_per_second" => "bulk_throughput_256x256b_v1",
         "busy_retry_usefulness" => "saturated_query_65th_retry_v1",
-        "true_idle_exit" => "true_idle_60000_awake_ms_v1",
+        "true_idle_exit" => "true_idle_after_product_completion_60000_awake_ms_v2",
         "backend_observed_accelerator_residency" => "resident_policy_identity_v1",
         _ => bail!("embedding_qualification_metric_workload_unknown:{metric}"),
     })
@@ -556,14 +556,6 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        let idle_worker = self.spawn_worker("query", query_parameters(1), None)?;
-        let idle_output = self.finish_worker(idle_worker, measurement_worker_timeout("query"))?;
-        require_worker_success(&idle_output, "true_idle_owner")?;
-        let idle_owner =
-            self.record_worker_snapshot("measurement_true_idle_owner", &idle_output)?;
-        if !snapshot_has_resident_generation(&idle_owner) {
-            bail!("embedding_qualification_true_idle_owner_not_resident");
-        }
         let measured = self.run_measure_worker(
             "measure_true_idle",
             "true_idle_exit",
@@ -846,7 +838,7 @@ fn validate_constant_engine_evidence(
         || identity.load_error.is_some()
         || identity.policy != "accelerated"
         || identity.backend.eq_ignore_ascii_case("cpu")
-        || !identity.backend.eq_ignore_ascii_case(expected_backend)
+        || !constant_backend_matches_expected(&identity.backend, expected_backend)
         || identity.model_digest != expected_model_sha256
         || identity.materialized_model_sha256 != expected_model_sha256
         || !identity.embedded_model
@@ -855,6 +847,29 @@ fn validate_constant_engine_evidence(
         bail!("embedding_constant_calibration_engine_identity_invalid");
     }
     Ok(())
+}
+
+fn constant_backend_matches_expected(observed: &str, expected: &str) -> bool {
+    let Some(expected_family) = constant_backend_family(expected) else {
+        return false;
+    };
+    constant_backend_family(observed) == Some(expected_family)
+}
+
+fn constant_backend_family(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "metal" | "mtl" => Some("metal"),
+        "vulkan" => Some("vulkan"),
+        value
+            if value.strip_prefix("vulkan").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            Some("vulkan")
+        }
+        _ => None,
+    }
 }
 
 fn expected_materialization_reuse(run_index: u32) -> Result<bool> {
@@ -1093,11 +1108,42 @@ mod constant_calibration_tests {
     fn engine_precondition_binds_accelerated_backend_model_and_reuse_only() {
         let server = server_identity("server-a");
         let metal = engine_identity("server-a", "Metal", false);
-        validate_constant_engine_evidence(&metal, &server, "metal", &"a".repeat(64), false)
-            .expect("Metal identity");
-        let vulkan = engine_identity("server-a", "Vulkan", false);
-        validate_constant_engine_evidence(&vulkan, &server, "vulkan", &"a".repeat(64), false)
-            .expect("Vulkan identity");
+        for (observed, expected) in [
+            ("Metal", "metal"),
+            ("MTL", "metal"),
+            ("Vulkan", "vulkan"),
+            ("Vulkan0", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            validate_constant_engine_evidence(&identity, &server, expected, &"a".repeat(64), false)
+                .unwrap_or_else(|error| {
+                    panic!("{observed} must satisfy expected GPU family {expected}: {error}")
+                });
+        }
+        for (observed, expected) in [
+            ("CPU", "metal"),
+            ("cpu_explicit", "metal"),
+            ("", "metal"),
+            ("unknown", "metal"),
+            ("metal-cpu", "metal"),
+            ("mtl0", "metal"),
+            ("MTL", "vulkan"),
+            ("Vulkan", "metal"),
+            ("vulkan-cpu", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            assert!(
+                validate_constant_engine_evidence(
+                    &identity,
+                    &server,
+                    expected,
+                    &"a".repeat(64),
+                    false,
+                )
+                .is_err(),
+                "{observed} must not satisfy expected GPU family {expected}"
+            );
+        }
 
         let mut invalid = metal.clone();
         invalid.policy = "cpu_explicit".into();

@@ -18,18 +18,32 @@ const RUN_ID = 77;
 const RUN_ATTEMPT = 2;
 const NEXT_PERMITTED_MUTATION =
   "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
-const PLANNED_PROOF_ACTIONS = [
-  "acceptance",
-  "source-proof",
+const CALIBRATION_SOURCE_ACTIONS = [
+  "calibration-source-acceptance",
   "calibration",
+  "generated-constant-freeze",
+  "frozen-candidate-acceptance",
+  "source-proof",
+  "qualification",
+  "release",
+];
+const FROZEN_CANDIDATE_ACTIONS = [
+  "frozen-candidate-acceptance",
+  "source-proof",
   "qualification",
   "release",
 ];
 
 function receipt(overrides = {}) {
+  const phase = overrides.phase ?? "calibration_source";
+  const frozen = phase === "frozen_candidate";
+  const plannedActions = frozen
+    ? FROZEN_CANDIDATE_ACTIONS
+    : CALIBRATION_SOURCE_ACTIONS;
   const candidate = {
-    schema: 2,
+    schema: 3,
     authority: "github_actions",
+    phase,
     repository: REPOSITORY,
     branch: "codex/release",
     commit: COMMIT,
@@ -44,15 +58,15 @@ function receipt(overrides = {}) {
       head_commit: COMMIT,
     },
     integrated_support_prs: [],
-    known_future_source_changes: [NEXT_PERMITTED_MUTATION],
-    planned_proof_actions: [...PLANNED_PROOF_ACTIONS],
+    known_future_source_changes: frozen ? [] : [NEXT_PERMITTED_MUTATION],
+    planned_proof_actions: [...plannedActions],
     proof_triggering_labels: [],
-    proof_triggering_actions: [...PLANNED_PROOF_ACTIONS],
+    proof_triggering_actions: [...plannedActions],
     reusable_evidence: [],
     invalidated_evidence: [],
     running_workflows: [],
     cancelled_superseded_runs: [],
-    next_permitted_mutation: NEXT_PERMITTED_MUTATION,
+    next_permitted_mutation: frozen ? null : NEXT_PERMITTED_MUTATION,
     acceptance_run: {
       id: RUN_ID,
       attempt: RUN_ATTEMPT,
@@ -71,10 +85,42 @@ const RECEIPT_CONTEXT = {
   tree: TREE,
   runId: String(RUN_ID),
   runAttempt: String(RUN_ATTEMPT),
+  phase: "calibration_source",
 };
 
-test("an exact clean pushed Actions receipt passes", () => {
+test("an exact clean pushed calibration-source Actions receipt passes", () => {
   validateReceipt(receipt(), RECEIPT_CONTEXT);
+});
+
+test("a frozen-candidate receipt carries no future mutation and passes", () => {
+  const frozen = receipt({ phase: "frozen_candidate" });
+  validateReceipt(frozen, {
+    ...RECEIPT_CONTEXT,
+    phase: "frozen_candidate",
+  });
+  assert.deepEqual(frozen.known_future_source_changes, []);
+  assert.equal(frozen.next_permitted_mutation, null);
+});
+
+test("calibration-source acceptance orders calibration before the sole source proof", () => {
+  const actions = receipt().planned_proof_actions;
+  assert.ok(actions.indexOf("calibration") < actions.indexOf("generated-constant-freeze"));
+  assert.ok(actions.indexOf("generated-constant-freeze") < actions.indexOf("source-proof"));
+  assert.equal(actions.filter(action => action === "source-proof").length, 1);
+});
+
+test("receipts cannot cross the calibration-source and frozen-candidate phases", () => {
+  assert.throws(
+    () => validateReceipt(receipt(), {
+      ...RECEIPT_CONTEXT,
+      phase: "frozen_candidate",
+    }),
+    /authority schema/u,
+  );
+  assert.throws(
+    () => validateReceipt(receipt({ phase: "frozen_candidate" }), RECEIPT_CONTEXT),
+    /authority schema/u,
+  );
 });
 
 test("a newer invalidation status revokes an older accepted freeze", () => {
@@ -123,20 +169,20 @@ for (const [name, mutate, pattern] of [
   }, /bind the open release PR/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
-  }, /only the generated constant-set change/u],
+  }, /future changes do not match calibration_source/u],
   ["caller-selected proof actions", (value) => {
     value.planned_proof_actions = ["source-proof"];
-  }, /exact proof-triggering actions/u],
+  }, /exact calibration_source actions/u],
   ["proof-triggering label", (value) => {
     value.proof_triggering_labels = ["source-proof"];
-  }, /exact proof-triggering actions/u],
+  }, /exact calibration_source actions/u],
   ["cross-attempt receipt", (value) => {
     value.acceptance_run.attempt = RUN_ATTEMPT + 1;
   }, /exact Actions run and attempt/u],
   ["missing handoff field", (value) => { delete value.running_workflows; }, /running_workflows/u],
   ["missing next mutation", (value) => {
     value.next_permitted_mutation = "";
-  }, /generated constant set as the next mutation/u],
+  }, /next mutation does not match calibration_source/u],
   ["tampered receipt", (value) => {
     value.reusable_evidence.push("unauthenticated evidence");
   }, /digest/u],
@@ -212,6 +258,7 @@ function acceptanceProvenance() {
     commit: COMMIT,
     tree: TREE,
     digest,
+    phase: "calibration_source",
   };
 }
 
@@ -286,6 +333,8 @@ test("verify-file is executable and rejects a later commit", () => {
       String(RUN_ID),
       "--run-attempt",
       String(RUN_ATTEMPT),
+      "--phase",
+      "calibration_source",
     ],
     { encoding: "utf8" },
   );
@@ -309,6 +358,8 @@ test("verify-file is executable and rejects a later commit", () => {
       String(RUN_ID),
       "--run-attempt",
       String(RUN_ATTEMPT),
+      "--phase",
+      "calibration_source",
     ],
     { encoding: "utf8" },
   );
@@ -342,6 +393,8 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
       String(RUN_ID),
       "--run-attempt",
       String(RUN_ATTEMPT),
+      "--phase",
+      "calibration_source",
       "--support-prs-json",
       "[]",
       "--broad-workflow",
@@ -433,6 +486,8 @@ exit 9
       String(RUN_ID),
       "--run-attempt",
       String(RUN_ATTEMPT),
+      "--phase",
+      "calibration_source",
       "--support-prs-json",
       "[]",
       "--reusable-evidence-json",
