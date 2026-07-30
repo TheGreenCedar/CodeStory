@@ -1,6 +1,6 @@
 {
   "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion, and total_markers must equal the number of markers listed below, so this file cannot grow without a reviewable diff that raises a stated number.",
-  "total_markers": 191,
+  "total_markers": 183,
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
@@ -68,6 +68,13 @@
       "markers": {
         "run_main": 10,
         "runmain": 2
+      }
+    },
+    "crates/codestory-runtime/src/agent/packet_evidence_carriers.rs": {
+      "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+      "reason": "The stylesheet carrier lists the words a CSS animation is written with, and one of them collides with a benchmark marker: `animated` is the class name Animate.css and its imitators ship, so a stylesheet whose only anchor is that class would stop closing the animation structure step without it. It goes when a stylesheet requirement is decided from the at-rules the indexer already extracts rather than from a word list.",
+      "markers": {
+        "animated": 1
       }
     },
     "crates/codestory-runtime/src/agent/packet_evidence_roles.rs": {
@@ -221,36 +228,27 @@
     },
     "crates/codestory-runtime/src/agent/packet_sufficiency.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-      "reason": "Sufficiency checks assert that a packet covers named holdout surfaces before it is allowed to answer. The check has to be expressed against the question and the index rather than against corpus spellings.",
+      "reason": "Sufficiency checks assert that a packet covers named holdout surfaces before it is allowed to answer. The check has to be expressed against the question and the index rather than against corpus spellings. Nine of these markers are gone and thirteen occur less often than they did: sufficiency now decides coverage from a citation's own structure, so the assertions that spelled out corpus symbols were replaced by ones that state the shape a step's evidence has to have.",
       "markers": {
-        "SourceGroup": 1,
-        "TypeMap": 2,
-        "addRecord": 3,
-        "addrecord": 3,
-        "bashcompletion": 1,
-        "dispatchrequest": 4,
-        "divapp": 2,
-        "foreignkey": 2,
-        "formaterror": 2,
-        "formatto": 2,
-        "fulldispatchrequest": 2,
-        "installsh": 1,
-        "internalMutate": 2,
-        "internalmutate": 2,
+        "addRecord": 1,
+        "addrecord": 1,
+        "dispatchrequest": 2,
+        "divapp": 1,
+        "foreignkey": 1,
+        "formaterror": 1,
+        "formatto": 1,
+        "fulldispatchrequest": 1,
+        "internalMutate": 1,
+        "internalmutate": 1,
         "isBlank": 1,
         "isEmpty": 1,
         "isblank": 1,
         "isempty": 1,
-        "pushHandler": 2,
-        "pushhandler": 2,
-        "regionMatches": 3,
-        "regionmatches": 3,
-        "requestresume": 1,
-        "sessionrequest": 1,
-        "siteprocess": 1,
-        "sitewrite": 1,
-        "typemap": 1,
-        "wsgiapp": 2
+        "pushHandler": 1,
+        "pushhandler": 1,
+        "regionMatches": 2,
+        "regionmatches": 2,
+        "wsgiapp": 1
       }
     },
     "crates/codestory-runtime/src/agent/packet_terms.rs": {

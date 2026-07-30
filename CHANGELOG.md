@@ -2,6 +2,96 @@
 
 ## Unreleased
 
+### Fixed
+
+- A packet no longer reports a step of a flow as covered because a different
+  step was. Coverage was decided by the kind of position a step occupies —
+  entrypoint, dispatch, terminal boundary — so when a question asked about two
+  steps of the same kind, evidence for one closed both, and an answer that only
+  used the right words could close either. Each step now has to be backed by
+  evidence for that step. Asking about an HTTP client that runs interceptors
+  before dispatching a request, for instance, no longer counts as answered when
+  the interceptor owner was never found.
+- A packet only repeats back the claims it proved. Claims the same packet
+  reported as unproven — an unsupported sentence, evidence it had already ruled
+  diagnostic, or prose that points at a file without explaining it — were still
+  published as covered, and the files behind them were listed as not worth
+  opening. Both lists now come from proven claims; the coverage report still
+  names every dropped claim and why.
+- Naming an exact file in a question holds the answer to that file. Only
+  architecture questions did; every other kind could answer around a requested
+  path and still report itself complete. Each unproven path is now reported on
+  its own, with its own follow-up, for every kind of question.
+- Evidence for a step now has to come from the part of the codebase that step is
+  about. A step was matched by looking for a word anywhere inside a symbol's
+  name, so a symbol could close a step it had nothing to do with whenever its
+  letters happened to line up — a command-line parser error standing in for a
+  formatter's failure path, or a page-layout helper standing in for a form's
+  input constraints, because "adminPanel" contains "min". Words are now matched
+  whole, and a step also checks that the symbol belongs to the subsystem in
+  question, so unrelated results no longer make a packet look complete.
+- The file a result sits in no longer decides which step it proves. Half of the
+  steps were matched by asking what kind of result something was, and that
+  question is largely answered by the file's path — so everything under a folder
+  called `views`, `runtime`, `store` or `flags` proved whichever step named that
+  kind, whatever the result actually was. A chart renderer stood in for a web
+  server's entrypoint and a cache deletion stood in for an indexer storing
+  symbols. A result now has to say what it is by its own name. The path is used
+  only to take a step away, never to hand one out — with one stated exception,
+  below.
+- The exception is a file that *is* the evidence: a stylesheet, an HTML
+  document, and a `.sql` schema. Their anchors are selectors, attributes and
+  statements with no symbol name to read, so there the file still says what the
+  result is about. It is one exception and it covers those three file kinds —
+  `.html`, `.htm` and `.xhtml` for the document — and nothing else.
+- A single-file component is read as a script, not as a document. `.vue` and
+  `.svelte` files were treated as markup, but CodeStory only ever reads their
+  `<script>` block, so every result from one is an ordinary function with a name
+  of its own. While they counted as markup, the folder they sat in answered the
+  question the name should have: three unrelated helpers in one component under
+  a `forms/` directory reported a form's constraints, its custom validation and
+  its submit guard as all proved, and none of the three mentions a form.
+- Within an HTML document, only the step whose evidence really is markup takes
+  the file's word for it. A form's native constraints are attributes written in
+  the document; its custom validation and its submit guard are code. While all
+  three took the document's word, any three text matches in one HTML file under
+  a `forms/` directory reported the whole flow as proved.
+- A static-site build step has to name the site. The folder was allowed to say
+  it instead, so a build pipeline and a layout renderer filed under `lib/site/`
+  reported a site's build lifecycle and its output boundary as proved, while the
+  identical two symbols one directory over proved nothing. Two ordinary web
+  words were allowed to stand in for the site as well, so an asset collection
+  and a page template did the same thing from a `src/ui/` folder. Both are now
+  results that say "site" in their own name. The cost is stated: a helper class
+  named only `Renderer` or `Reader` no longer closes a step on its own, which
+  makes an unproven step easier to report than a proven one — the safe
+  direction.
+- A result also has to be about the step in more than one word. A name like
+  `FrameBuffer`, `sourceMapOptions`, `PaymentHandler.process` or `Layout.render`
+  reads as two signals until you notice both come from the same word, or from a
+  word every codebase uses for something else. Those four each closed a step of
+  a flow they have nothing to do with, and between them they closed five whole
+  flows — a graphics buffer and a segment tree proving a byte-IO pipeline, a
+  build config and a route planner proving an object mapper. The words that can
+  still decide a step on their own are recorded in the codebase and checked on
+  every build, so the list cannot grow unnoticed.
+- That check now covers the two places it could not see, which is where the
+  remaining false reports were. It reads every kind of file the coverage rules
+  branch on — scripts, single-file components, HTML, stylesheets, shell scripts
+  and schemas — rather than two source extensions with a comment claiming the
+  rest behave the same; that claim is now itself a test, and it was untrue for
+  `.vue`. And it builds names that carry a subject *and* an action, not one word
+  each, because that is the shape that was slipping through: `ChartPipeline`
+  proved nothing while `ChartPipeline.run` proved a static-site build, and only
+  the second is a counter-example. Every step of every flow is now checked
+  against every such name the vocabulary can spell without the flow's own
+  subject in it, and at least one step of each flow has to survive — so a
+  question can no longer be reported as fully answered by results that never
+  mention what it asked about.
+- When a question names more files than fit in the follow-up list, the missing
+  parts of the flow are no longer pushed out of it. Follow-ups for requested
+  files and for unproven steps now alternate, so both survive the limit.
+
 ## 0.16.3
 
 ### Fixed
