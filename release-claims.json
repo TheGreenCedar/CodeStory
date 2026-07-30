@@ -1117,6 +1117,30 @@
     "qualification": {
       "coordinator_workflow": "packaged-platform-pr.yml",
       "mode": "qualification",
+      "driver_contract": {
+        "producer_workflow": "packaged-platform-proof.yml",
+        "producer_job": "build",
+        "artifact_name_template": "codestory-cli-{asset_target}",
+        "artifact_directory_template": "qualification-driver/{asset_target}",
+        "identity_file": "qualification-driver-identity.json",
+        "identity_schema_version": 1,
+        "identity_fields": [
+          "schema_version",
+          "source.commit",
+          "source.tree",
+          "release_version",
+          "asset_target",
+          "archive.file",
+          "archive.bytes",
+          "archive.sha256",
+          "driver.file",
+          "driver.bytes",
+          "driver.sha256"
+        ],
+        "build_invocations_per_platform": 1,
+        "reuse_required": true,
+        "public_release_asset": false
+      },
       "runs_per_available_cell": 1,
       "required_cells": [
         {

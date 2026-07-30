@@ -402,6 +402,7 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
       hermetic_linux: ${{ needs.route.outputs.mode == 'qualification' }}
+      include_qualification_driver: ${{ needs.route.outputs.mode == 'qualification' }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
 

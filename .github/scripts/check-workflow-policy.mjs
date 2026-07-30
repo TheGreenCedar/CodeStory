@@ -431,6 +431,30 @@ function stepIndex(job, name) {
   return list(job?.steps).map(object).findIndex(step => step.name === name);
 }
 
+function qualificationDriverHandoffIsSealed(
+  job,
+  verifierName,
+  engineName,
+  expectedIntermediateNames,
+) {
+  const steps = list(job?.steps).map(object);
+  const verifierIndex = stepIndex(job, verifierName);
+  const engineIndex = stepIndex(job, engineName);
+  if (verifierIndex < 0 || engineIndex <= verifierIndex) return false;
+  const intermediate = steps.slice(verifierIndex + 1, engineIndex);
+  if (
+    JSON.stringify(intermediate.map(step => step.name))
+      !== JSON.stringify(expectedIntermediateNames)
+  ) {
+    return false;
+  }
+  return intermediate.every(step =>
+    !scalarStrings(step).some(value =>
+      value.includes("qualification-driver")
+      || value.includes("VERIFIED_QUALIFICATION_DRIVER")
+      || value.includes("codestory_embedding_qualification")));
+}
+
 function cacheSteps(job) {
   return list(job?.steps)
     .map(object)
@@ -517,6 +541,102 @@ function requireCalibrationProducerBoundary(
   );
 }
 
+const qualificationDriverIdentityFields = [
+  "schema_version",
+  "source.commit",
+  "source.tree",
+  "release_version",
+  "asset_target",
+  "archive.file",
+  "archive.bytes",
+  "archive.sha256",
+  "driver.file",
+  "driver.bytes",
+  "driver.sha256",
+];
+
+function expectedQualificationDriverContract() {
+  return {
+    producer_workflow: "packaged-platform-proof.yml",
+    producer_job: "build",
+    artifact_name_template: "codestory-cli-{asset_target}",
+    artifact_directory_template: "qualification-driver/{asset_target}",
+    identity_file: "qualification-driver-identity.json",
+    identity_schema_version: 1,
+    identity_fields: qualificationDriverIdentityFields,
+    build_invocations_per_platform: 1,
+    reuse_required: true,
+    public_release_asset: false,
+  };
+}
+
+export function qualificationDriverArtifactViolations(
+  source,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
+  const violations = [];
+  const contract = object(
+    object(graph.workflow_policy).qualification,
+  ).driver_contract;
+  add(
+    violations,
+    JSON.stringify(contract) === JSON.stringify(expectedQualificationDriverContract()),
+    "release-claims.json must bind the private archive-qualified driver contract exactly",
+  );
+  const normalized = String(source ?? "").replace(/\r\n/gu, "\n");
+  add(
+    violations,
+    createHash("sha256").update(normalized).digest("hex")
+      === qualificationDriverArtifactDigest,
+    "qualification-driver-artifact.mjs must match the reviewed archive-bound producer and verifier contract",
+  );
+  for (const fragment of [
+    '"linux-x64", {',
+    'archiveExtension: "tar.gz"',
+    'binary: "codestory_embedding_qualification"',
+    'rustTarget: "x86_64-unknown-linux-gnu"',
+    '"macos-arm64", {',
+    'rustTarget: "aarch64-apple-darwin"',
+    '"windows-x64", {',
+    'archiveExtension: "zip"',
+    'binary: "codestory_embedding_qualification.exe"',
+    'rustTarget: "x86_64-pc-windows-msvc"',
+    "metadata.isSymbolicLink()\n    || !metadata.isFile()\n    || metadata.nlink !== 1",
+    "metadata.isSymbolicLink() || !metadata.isDirectory()",
+    'fail("qualification driver helper arguments changed")',
+    "containedRelativePath(root, candidate, label)",
+    "rejectSymlinkedPath({",
+    "const rootMetadata = lstatSync(resolvedRoot)",
+    'fail(`${label} must not traverse symbolic links`)',
+    "`codestory-cli-v${version}-${assetTarget}.${contract.archiveExtension}`",
+    'targetDir,\n    contract.rustTarget,\n    "release",\n    contract.binary',
+    'fail("qualification driver artifact directory must start empty")',
+    "archiveBytes: archiveMetadata.size",
+    "archiveDigest: sha256(archivePath)",
+    "archiveFile: expectedArchiveFile",
+    "identity.archive.file !== expectedArchiveFile",
+    "archiveMetadata.size !== identity.archive.bytes",
+    "sha256(archivePath) !== identity.archive.sha256",
+    "metadata.size !== identity.driver.bytes",
+    "sha256(driver) !== identity.driver.sha256",
+    '"qualification-driver-identity.json"',
+    'fail("qualification driver artifact directory contains unexpected files")',
+    "chmodSync(driver, 0o755)",
+    'archive: required(values, "--archive")',
+    'trustedRoot: required(values, "--trusted-root")',
+    'targetDir: required(values, "--target-dir")',
+    'requireExactFlags(values, [...commonFlags, "--out-dir", "--target-dir"])',
+    'requireExactFlags(values, [...commonFlags, "--artifact-dir"])',
+  ]) {
+    add(
+      violations,
+      normalized.includes(fragment),
+      `qualification-driver-artifact.mjs must retain ${fragment}`,
+    );
+  }
+  return violations;
+}
+
 function requireJob(violations, file, workflow, name) {
   const found = object(workflow.jobs)[name];
   add(violations, found !== undefined, `${file} must contain job ${name}`);
@@ -544,18 +664,40 @@ const packagedPlatformCloseoutDigest =
 // parsed executable structure so an unreviewed earlier step cannot replace an
 // owner binary while leaving the locally digested finalizer unchanged.
 const packagedPlatformWorkflowDigest =
-  "b8d981623dfbec100ce23470559071d05c5dc384e81164a7f571f915d903b843";
+  "d96f36e08888ba2806103829ddf737829d66efee0374138ae9634ed6d71bd355";
+// The frozen-candidate coordinator and protected GPU workflows are small
+// release-control programs, not loose collections of independently safe
+// fragments. Pin their complete parsed structure so a required check cannot be
+// made advisory, parked in dead code, or followed by a payload substitution
+// while leaving the expected tokens in place.
+const packagedPlatformCoordinatorWorkflowDigest =
+  "8efd162e5e5c42e1cbeb0e40378f631ce358feb9404e90e27e02aa0b382d481e";
+const macosMetalWorkflowDigest =
+  "7ff48fa410330a96f3c6da5f3efbb6131d4304fee837bd69c97c8e88e553ea0c";
+const windowsVulkanWorkflowDigest =
+  "f4f6031cb9595a3d1623567ff5b7fcdca5ae34de0a392fbb801138ddb750aa14";
+const linuxVulkanWorkflowDigest =
+  "cd3b2b719dafea2645079503ff4b58da66c085f3522e3921f77a76360554de9b";
 // Linux owns its compiler server inside Docker, while macOS and Windows own one
 // in the host shell. Pin both executable programs so a swallowed stop or a
 // dead-code copy cannot satisfy the ownership fragments below.
 const packagedSccacheIdentityDigest =
   "f844b8a3b2e0f0013b43f4ec661c237fb090a01c49316d8c2b301ba01cac4342";
 const packagedLinuxBuildDigest =
-  "fc02f682c294983989d5f63151f8af9b31febda2da6fa0933aa9b1f7c221b4aa";
+  "968f2ab585eb1870eea20f521d576bfaad2900fc14e6438074f62246a0c8652b";
 const packagedCompileClockStopDigest =
   "ef9f7ee4636c3466830447e2ed8a10c2030ca3949bca082652d9262848d258a5";
 const packagedHostCompilerFinalizerDigest =
   "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46";
+// The companion qualification driver is intentionally retained only inside
+// the private Actions package artifact. This digest pins both sides of that
+// contract: the producer copies only the selected target binary and binds it
+// to the exact candidate archive, while the consumer rejects symlinks, extra
+// files, identity drift, and byte drift before restoring execute permission.
+// Any helper edit therefore requires a policy and mutation-test review in the
+// same PR as the workflow change.
+const qualificationDriverArtifactDigest =
+  "f7946e03fa6e272ca17f12616b82579da041de4d7c30b19d24ddbc5f1c7f0063";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -2536,6 +2678,18 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     '"$live_head" != "$GITHUB_SHA"',
     "main moved from publishable head",
   ]);
+  const publishRun = shellLiteralNormalizedText(stepRun(
+    publish,
+    "Create GitHub release",
+  ));
+  add(
+    violations,
+    publishRun.includes("gh release create $TAG ${assets[@]}")
+      && publishRun.includes("find target/release-assets -maxdepth 1 -type f")
+      && !publishRun.includes("qualification-driver")
+      && !publishRun.includes("codestory_embedding_qualification"),
+    `${releaseFile} must publish only graph-declared root assets and exclude the private qualification driver`,
+  );
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
   const marketplacePublish = requireJob(violations, releaseFile, release, "marketplace-publish");
@@ -2837,6 +2991,20 @@ function validatePackagedProof(workflows, violations, graph) {
       && hermeticInput.type === "boolean",
     `${file} frozen Linux qualification must be explicit and off by default`,
   );
+  const qualificationDriverInput = object(at(
+    workflow,
+    "on",
+    "workflow_call",
+    "inputs",
+    "include_qualification_driver",
+  ));
+  add(
+    violations,
+    qualificationDriverInput.required === false
+      && qualificationDriverInput.default === false
+      && qualificationDriverInput.type === "boolean",
+    `${file} private qualification-driver retention must be explicit and off by default`,
+  );
   const shortWindowsTarget = namedStep(job, "Configure short Windows Cargo target");
   const checkout = namedStep(job, "Checkout");
   add(
@@ -2936,8 +3104,11 @@ function validatePackagedProof(workflows, violations, graph) {
       && nativeIdentityRun.includes("--lock-file Cargo.lock")
       && nativeIdentityRun.includes("--cargo-config .cargo/config.toml")
       && nativeIdentityRun.includes("--identity cargo_incremental=0")
-      && nativeIdentityRun.includes("qualification_driver=disabled")
-      && !nativeIdentityRun.includes("qualification_driver=enabled")
+      && object(nativeIdentity?.env).INCLUDE_QUALIFICATION_DRIVER
+        === "${{ inputs.include_qualification_driver }}"
+      && nativeIdentityRun.includes(
+        '--identity "qualification_driver=$INCLUDE_QUALIFICATION_DRIVER"',
+      )
       && nativeIdentityRun.includes(".cargo/llama-dynamic-backends.cmake")
       && nativeIdentityRun.includes("git ls-files '*Cargo.toml'")
       && nativeIdentityRun.includes("model-contract.json")
@@ -3052,7 +3223,7 @@ function validatePackagedProof(workflows, violations, graph) {
   requireStepRun(violations, file, job, "Compile native workspace path regression on Windows", [
     "cargo test --locked -p codestory-workspace repository_identity --no-run",
   ]);
-  const packageBuild = namedStep(job, "Build codestory-cli");
+  const packageBuild = namedStep(job, "Build package and qualification driver");
   const linuxBuild = namedStep(job, "Build Linux x64 at the glibc 2.31 baseline");
   const expectedSccacheIdentityEnv = {
     SCCACHE_BINARY: "${{ steps.sccache-identity.outputs.path }}",
@@ -3068,12 +3239,17 @@ function validatePackagedProof(workflows, violations, graph) {
     "$SCCACHE_BINARY:/sccache/sccache:ro",
     "$SCCACHE_DIR:/sccache/cache",
   ]);
+  const expectedLinuxBuildEnv = {
+    ...expectedSccacheIdentityEnv,
+    INCLUDE_QUALIFICATION_DRIVER: "${{ inputs.include_qualification_driver }}",
+    RELEASE_RUST_TARGET: "${{ matrix.rust_target }}",
+  };
   add(
     violations,
     linuxBuild?.if === "matrix.asset_target == 'linux-x64'"
       && linuxBuild?.shell === "bash"
-      && hasExactKeys(object(linuxBuild?.env), Object.keys(expectedSccacheIdentityEnv))
-      && Object.entries(expectedSccacheIdentityEnv).every(
+      && hasExactKeys(object(linuxBuild?.env), Object.keys(expectedLinuxBuildEnv))
+      && Object.entries(expectedLinuxBuildEnv).every(
         ([key, value]) => object(linuxBuild?.env)[key] === value,
       )
       && linuxBuild?.["continue-on-error"] === undefined,
@@ -3139,7 +3315,7 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   add(
     violations,
-    compilerSaveIndex > stepIndex(job, "Build codestory-cli")
+    compilerSaveIndex > stepIndex(job, "Build package and qualification driver")
       && compilerSaveIndex > stepIndex(job, "Build Linux x64 at the glibc 2.31 baseline"),
     `${file} compiler cache must save after every selected compilation step`,
   );
@@ -3148,7 +3324,7 @@ function validatePackagedProof(workflows, violations, graph) {
     stepIndex(job, "Build pinned Linux toolchain image")
       < stepIndex(job, "Start compilation clock")
       && stepIndex(job, "Stop compilation clock")
-        > stepIndex(job, "Build qualification driver")
+        > stepIndex(job, "Build package and qualification driver")
       && stepIndex(job, "Stop compilation clock") < compilerSaveIndex
       && stepIndex(job, "Start compiler cache save clock")
         > stepIndex(job, "Save Cargo dependency inputs")
@@ -3175,8 +3351,16 @@ function validatePackagedProof(workflows, violations, graph) {
   }
   add(
     violations,
-    packageBuild?.env === undefined,
-    `${file} native package build must not override the selected generator`,
+    packageBuild?.shell === "bash"
+      && hasExactKeys(object(packageBuild?.env), [
+        "INCLUDE_QUALIFICATION_DRIVER",
+        "RELEASE_RUST_TARGET",
+      ])
+      && object(packageBuild?.env).INCLUDE_QUALIFICATION_DRIVER
+        === "${{ inputs.include_qualification_driver }}"
+      && object(packageBuild?.env).RELEASE_RUST_TARGET
+        === "${{ matrix.rust_target }}",
+    `${file} native package build must not override the selected generator and must bind the reviewed target and qualification workload`,
   );
   requireStepRun(violations, file, job, "Smoke codestory-cli on Windows", [
     "$env:CARGO_TARGET_DIR",
@@ -3212,11 +3396,46 @@ function validatePackagedProof(workflows, violations, graph) {
     "LINUX_GLIBC_BUILD_IMAGE",
     "LINUX_GLSLC_IMAGE",
   ]);
-  requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
-    "cargo build --release --locked -p codestory-cli",
-    "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
-    "CXXFLAGS=-std=c++17",
-  ]);
+  const packageBuildRun = shellLiteralNormalizedText(stepRun(
+    job,
+    "Build package and qualification driver",
+  ));
+  const linuxBuildRun = shellLiteralNormalizedText(stepRun(
+    job,
+    "Build Linux x64 at the glibc 2.31 baseline",
+  ));
+  add(
+    violations,
+    shellInvocationsContaining(packageBuildRun, "cargo build").length === 1
+      && packageBuildRun.includes("-p codestory-cli")
+      && packageBuildRun.includes("--bin codestory-cli")
+      && packageBuildRun.includes("--bin codestory-cli-runtime")
+      && packageBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
+      && packageBuildRun.includes("-p codestory-bench")
+      && packageBuildRun.includes("--bin codestory_embedding_qualification")
+      && packageBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && !packageBuildRun.includes("codestory_embedding_constant_calibration")
+      && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
+    `${file} host package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
+  );
+  add(
+    violations,
+    shellInvocationsContaining(linuxBuildRun, "cargo build").length === 1
+      && linuxBuildRun.includes("CARGO_TARGET_DIR=/workspace/target/glibc-2.31")
+      && linuxBuildRun.includes("CXXFLAGS=-std=c++17")
+      && linuxBuildRun.includes("INCLUDE_QUALIFICATION_DRIVER=$INCLUDE_QUALIFICATION_DRIVER")
+      && linuxBuildRun.includes("RELEASE_RUST_TARGET=$RELEASE_RUST_TARGET")
+      && linuxBuildRun.includes("-p codestory-cli")
+      && linuxBuildRun.includes("--bin codestory-cli")
+      && linuxBuildRun.includes("--bin codestory-cli-runtime")
+      && linuxBuildRun.includes("if [ $INCLUDE_QUALIFICATION_DRIVER = true ]")
+      && linuxBuildRun.includes("-p codestory-bench")
+      && linuxBuildRun.includes("--bin codestory_embedding_qualification")
+      && linuxBuildRun.includes("--target $RELEASE_RUST_TARGET")
+      && !linuxBuildRun.includes("codestory_embedding_constant_calibration")
+      && !/(?:^|\s)--bins(?:\s|$)/u.test(linuxBuildRun),
+    `${file} Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation`,
+  );
   // The identity the smoke reads is the one `source-identity` proved against the dispatched ref,
   // and it now arrives through `env:` rather than spliced into the command. Both halves are pinned:
   // the script names the variable, and the variable names that step's output.
@@ -3234,6 +3453,63 @@ function validatePackagedProof(workflows, violations, graph) {
     ]);
     requireStepEnv(violations, file, job, smokeStep, sourceIdentityBindings);
   }
+  const driverStageName = "Stage qualification driver in package proof artifact";
+  const driverStage = namedStep(job, driverStageName);
+  const driverStageRun = shellLiteralNormalizedText(stepRun(job, driverStageName));
+  add(
+    violations,
+    driverStage?.if === "inputs.include_qualification_driver"
+      && driverStage?.shell === "bash"
+      && driverStage?.["continue-on-error"] === undefined
+      && hasExactKeys(object(driverStage?.env), [
+        "INPUT_VERSION",
+        "SOURCE_SHA",
+        "SOURCE_TREE",
+      ])
+      && object(driverStage?.env).INPUT_VERSION === "${{ inputs.version }}"
+      && object(driverStage?.env).SOURCE_SHA
+        === "${{ steps.source-identity.outputs.sha }}"
+      && object(driverStage?.env).SOURCE_TREE
+        === "${{ steps.source-identity.outputs.tree }}"
+      && shellInvocationsContaining(
+        driverStageRun,
+        "node .github/scripts/qualification-driver-artifact.mjs produce",
+      ).length === 1
+      && driverStageRun.includes("--asset-target ${{ matrix.asset_target }}")
+      && driverStageRun.includes("--source-sha $SOURCE_SHA")
+      && driverStageRun.includes("--source-tree $SOURCE_TREE")
+      && driverStageRun.includes("--version $INPUT_VERSION")
+      && driverStageRun.includes(
+        "--archive target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}",
+      )
+      && driverStageRun.includes("--trusted-root $GITHUB_WORKSPACE")
+      && driverStageRun.includes("--target-dir target")
+      && driverStageRun.includes(
+        "--out-dir target/release-dist/qualification-driver/${{ matrix.asset_target }}",
+      ),
+    `${file} must retain one archive-bound private qualification driver beside each selected package`,
+  );
+  add(
+    violations,
+    stepIndex(job, driverStageName) > stepIndex(job, "Package release asset")
+      && stepIndex(job, driverStageName)
+        > stepIndex(job, "Package release asset on Windows")
+      && stepIndex(job, driverStageName) < stepIndex(job, "Upload release asset"),
+    `${file} must bind the private qualification driver after archive creation and before artifact upload`,
+  );
+  add(
+    violations,
+    [
+      "Package release asset",
+      "Package release asset on Windows",
+      "Sign and notarize macOS CLI",
+    ].every(stepName => {
+      const run = shellLiteralNormalizedText(stepRun(job, stepName));
+      return !run.includes("qualification-driver")
+        && !run.includes("codestory_embedding_qualification");
+    }),
+    `${file} public archives and signing inputs must exclude the private qualification driver`,
+  );
   requireStepRun(violations, file, job, "Report fresh package identity", [
     "archive_sha256=",
     "Source SHA: \\`$SOURCE_SHA\\`",
@@ -3333,7 +3609,7 @@ function validatePackagedProof(workflows, violations, graph) {
       && namedStep(job, "Upload hosted Linux calibration runs") === undefined
       && namedStep(job, "Upload hosted Linux calibration failure evidence") === undefined
       && namedStep(job, "Upload packaged agent proof artifacts") === undefined,
-    `${file} package-only workflow must not collect calibration or run hosted qualification`,
+    `${file} package workflow must not add a second driver build, calibration, or hosted qualification`,
   );
   requireCalibrationProducerBoundary(
     violations,
@@ -3432,6 +3708,24 @@ function validatePackagedProof(workflows, violations, graph) {
     `${file} package-only workflow must not contain installed-runtime or server-scope routing`,
   );
   requireStepUses(violations, file, job, "Upload release asset", "actions/upload-artifact@v7.0.1");
+  const releaseAssetUpload = namedStep(job, "Upload release asset");
+  add(
+    violations,
+    object(releaseAssetUpload?.with).name
+        === "codestory-cli-${{ matrix.asset_target }}"
+      && String(object(releaseAssetUpload?.with).path ?? "")
+        === [
+          "target/release-dist/*.tar.gz",
+          "target/release-dist/*.zip",
+          "target/release-dist/*.sha256",
+          "target/release-dist/SHA256SUMS.txt",
+          "target/release-dist/qualification-driver/${{ matrix.asset_target }}",
+          "",
+        ].join("\n")
+      && object(releaseAssetUpload?.with)["if-no-files-found"] === "error"
+      && object(releaseAssetUpload?.with).overwrite === true,
+    `${file} existing package artifact must retain the private driver directory without changing its public archive`,
+  );
   requireStepUses(violations, file, job, "Upload macOS notarization proof", "actions/upload-artifact@v7.0.1");
   requireStepRun(violations, file, job, "Emit authenticated package release cell", [
     "codestory-release-cell-manifest.mjs produce",
@@ -3855,6 +4149,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations.push(`${file} must exist`);
     return;
   }
+  add(
+    violations,
+    createHash("sha256").update(JSON.stringify(workflow)).digest("hex")
+      === packagedPlatformCoordinatorWorkflowDigest,
+    `${file} must match the reviewed frozen-candidate coordinator structure`,
+  );
   const promotion = graph.workflow_policy.promotion;
   const calibrationPolicy = object(graph.workflow_policy.calibration);
   const qualificationPolicy = object(graph.workflow_policy.qualification);
@@ -3961,7 +4261,9 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && sameMembers(
         list(qualificationPolicy.forbidden_environment),
         ["CODESTORY_EMBED_ALLOW_CPU=1"],
-      ),
+      )
+      && JSON.stringify(object(qualificationPolicy.driver_contract))
+        === JSON.stringify(expectedQualificationDriverContract()),
     `${file} must implement the release claim graph qualification contract`,
   );
   const expectedConcurrency = [
@@ -4212,8 +4514,16 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && String(packaged.if ?? "").includes("needs.route.outputs.mode == 'platform'")
       && String(packaged.if ?? "").includes("needs.route.outputs.mode == 'qualification'")
       && object(packaged.with).hermetic_linux
+        === "${{ needs.route.outputs.mode == 'qualification' }}"
+      && object(packaged.with).include_qualification_driver
         === "${{ needs.route.outputs.mode == 'qualification' }}",
     `${file} package and platform modes must build fresh archives while only qualification runs the cold Linux boundary`,
+  );
+  add(
+    violations,
+    object(packaged.with).include_qualification_driver
+      === "${{ needs.route.outputs.mode == 'qualification' }}",
+    `${file} must retain the private qualification driver only for frozen-candidate qualification`,
   );
   for (const key of [
     "candidate_installed_proof",
@@ -4520,6 +4830,12 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!metal) {
     violations.push(`${metalFile} must exist`);
   } else {
+    add(
+      violations,
+      createHash("sha256").update(JSON.stringify(metal)).digest("hex")
+        === macosMetalWorkflowDigest,
+      `${metalFile} must match the reviewed protected Metal workflow structure`,
+    );
     add(violations, trigger(metal, "workflow_call") !== undefined && trigger(metal, "workflow_dispatch") !== undefined, `${metalFile} must support reusable and manual proof`);
     for (const event of ["workflow_call", "workflow_dispatch"]) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
@@ -4626,21 +4942,27 @@ function validateRemainingWorkflows(workflows, violations) {
     add(
       violations,
       namedStep(job, "Install pinned Rust")?.if
-        === "${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}",
-      `${metalFile} packaged server-behavior proof must skip unused Rust installation`,
+        === "${{ !inputs.use_packaged_cli_artifact }}",
+      `${metalFile} every packaged proof must skip Rust installation`,
     );
     add(
       violations,
-      namedStep(job, "Build qualification driver")?.if
-        === "${{ !inputs.calibration_mode && !inputs.server_behavior_only }}",
-      `${metalFile} calibration and packaged server-behavior proof must skip the qualification driver`,
+      namedStep(job, "Build qualification driver") === undefined,
+      `${metalFile} must not rebuild the qualification driver after package download`,
     );
     const nativeBuild = namedStep(job, "Build and package native CLI");
     const nativeBuildRun = executableRunText(String(nativeBuild?.run ?? ""));
     const normalizedNativeBuildRun = shellLiteralNormalizedText(nativeBuildRun);
     add(
       violations,
-      object(nativeBuild?.env).CALIBRATION_MODE === "${{ inputs.calibration_mode }}"
+      hasExactKeys(object(nativeBuild?.env), [
+        "VERSION",
+        "CALIBRATION_MODE",
+        "SERVER_BEHAVIOR_ONLY",
+      ])
+        && object(nativeBuild?.env).CALIBRATION_MODE === "${{ inputs.calibration_mode }}"
+        && object(nativeBuild?.env).SERVER_BEHAVIOR_ONLY
+          === "${{ inputs.server_behavior_only }}"
         && nativeBuild?.id === "native-build-package"
         && shellInvocationsContaining(normalizedNativeBuildRun, "cargo build").length === 1
         && normalizedNativeBuildRun.includes("-p codestory-cli")
@@ -4648,11 +4970,26 @@ function validateRemainingWorkflows(workflows, violations) {
         && normalizedNativeBuildRun.includes("--bin codestory-cli")
         && normalizedNativeBuildRun.includes("--bin codestory-cli-runtime")
         && normalizedNativeBuildRun.includes("--bin codestory_embedding_constant_calibration")
+        && normalizedNativeBuildRun.includes(
+          "--bin codestory_embedding_qualification",
+        )
+        && normalizedNativeBuildRun.includes("if [ $CALIBRATION_MODE = true ]")
+        && normalizedNativeBuildRun.includes(
+          "elif [ $SERVER_BEHAVIOR_ONLY != true ]",
+        )
+        && occurrenceCount(
+          normalizedNativeBuildRun,
+          "--bin codestory_embedding_qualification",
+        ) === 1
+        && occurrenceCount(
+          normalizedNativeBuildRun,
+          "--bin codestory_embedding_constant_calibration",
+        ) === 1
         && shellInvocationsContaining(
           normalizedNativeBuildRun,
           "python3 .github/scripts/package-codestory-release.py",
         ).length === 1
-        && jobShellInvocationsContaining(job, "cargo build").length === 2
+        && jobShellInvocationsContaining(job, "cargo build").length === 1
         && jobShellInvocationsContaining(
           job,
           ".github/scripts/package-codestory-release.py",
@@ -4676,11 +5013,24 @@ function validateRemainingWorkflows(workflows, violations) {
       packagedArtifactDownload?.if === "inputs.use_packaged_cli_artifact"
         && packagedArtifactDownload?.shell === "bash"
         && object(packagedArtifactDownload?.env).GH_TOKEN === "${{ github.token }}"
-        && object(packagedArtifactDownload?.env).ARTIFACT_NAME === "codestory-cli-macos-arm64",
+        && object(packagedArtifactDownload?.env).ARTIFACT_NAME === "codestory-cli-macos-arm64"
+        && object(packagedArtifactDownload?.env).CANDIDATE_PRODUCER_WORKFLOW_PATH
+          === "${{ inputs.candidate_producer_workflow_path }}"
+        && object(packagedArtifactDownload?.env).SERVER_BEHAVIOR_ONLY
+          === "${{ inputs.server_behavior_only }}",
       `${metalFile} packaged CLI download must be an authenticated exact-artifact Bash boundary`,
     );
     requireStepRun(violations, metalFile, job, "Download packaged CLI artifact", [
       "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100",
+      ".github/workflows/auto-release.yml",
+      ".github/workflows/release.yml",
+      ".github/workflows/packaged-platform-pr.yml",
+      'if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then',
+      'test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" =',
+      ".head_repository.full_name",
+      '.path\' <<<"$producer_run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"',
+      '.head_sha\' <<<"$producer_run")" = "$(git rev-parse HEAD)"',
+      '.run_attempt\' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"',
       ".workflow_run.id == $run_id",
       ".workflow_run.head_sha == $sha",
       ".digest",
@@ -4691,6 +5041,57 @@ function validateRemainingWorkflows(workflows, violations) {
       "test \"$actual_digest\" = \"${expected_digest#sha256:}\"",
       "ditto -x -k",
     ]);
+    const metalDriverVerify = namedStep(job, "Verify packaged qualification driver");
+    const metalDriverVerifyRun = shellLiteralNormalizedText(
+      stepRun(job, "Verify packaged qualification driver"),
+    );
+    add(
+      violations,
+      metalDriverVerify?.id === "qualification-driver"
+        && metalDriverVerify?.if
+          === "${{ inputs.use_packaged_cli_artifact && !inputs.calibration_mode && !inputs.server_behavior_only }}"
+        && metalDriverVerify?.shell === "bash"
+        && metalDriverVerify?.["continue-on-error"] === undefined
+        && hasExactKeys(object(metalDriverVerify?.env), ["INPUT_VERSION"])
+        && object(metalDriverVerify?.env).INPUT_VERSION === "${{ inputs.version }}"
+        && shellInvocationsContaining(
+          metalDriverVerifyRun,
+          "node .github/scripts/qualification-driver-artifact.mjs verify",
+        ).length === 1
+        && metalDriverVerifyRun.includes("--asset-target macos-arm64")
+        && metalDriverVerifyRun.includes("--source-sha $(git rev-parse HEAD)")
+        && metalDriverVerifyRun.includes("--source-tree $(git rev-parse HEAD^{tree})")
+        && metalDriverVerifyRun.includes("--version $version")
+        && metalDriverVerifyRun.includes(
+          "--archive target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz",
+        )
+        && metalDriverVerifyRun.includes("--trusted-root $GITHUB_WORKSPACE")
+        && metalDriverVerifyRun.includes(
+          "--artifact-dir target/release-dist/qualification-driver/macos-arm64",
+        )
+        && metalDriverVerifyRun.includes(
+          "echo path=$(jq -r .driver <<<$verified) >> $GITHUB_OUTPUT",
+        )
+        && stepIndex(job, "Verify packaged qualification driver")
+          > stepIndex(job, "Download packaged CLI artifact"),
+      `${metalFile} packaged qualification must verify the archive-bound private driver`,
+    );
+    add(
+      violations,
+      qualificationDriverHandoffIsSealed(
+        job,
+        "Verify packaged qualification driver",
+        "Prove protected Metal runtime",
+        [
+          "Download exact-head publishable packet quality evidence",
+          "Produce exact-head holdout quality on protected Metal",
+          "Upload exact-head protected Metal quality evidence",
+          "Authenticate calibration bundle producer",
+          "Download frozen calibration bundle",
+        ],
+      ),
+      `${metalFile} must not replace the verified qualification driver before execution`,
+    );
     const qualityDownload = namedStep(
       job,
       "Download exact-head publishable packet quality evidence",
@@ -4884,7 +5285,26 @@ function validateRemainingWorkflows(workflows, violations) {
       engineRun.includes("calibration_args=()")
         && engineRun.includes('"${calibration_args[@]}"')
         && engineRun.includes('claim_scope_args=(--server-behavior-only)')
-        && occurrenceCount(engineRun, "--calibration-bundle") === 1,
+        && occurrenceCount(engineRun, "--calibration-bundle") === 1
+        && object(engine?.env).USE_PACKAGED_CLI_ARTIFACT
+          === "${{ inputs.use_packaged_cli_artifact }}"
+        && object(engine?.env).VERIFIED_QUALIFICATION_DRIVER
+          === "${{ steps.qualification-driver.outputs.path }}"
+        && engineRun.includes(
+          "qualification_driver=target/release/codestory_embedding_qualification",
+        )
+        && engineRun.includes(
+          'if [ "$USE_PACKAGED_CLI_ARTIFACT" = true ]; then',
+        )
+        && engineRun.includes(
+          'qualification_driver="$VERIFIED_QUALIFICATION_DRIVER"',
+        )
+        && occurrenceCount(engineRun, "qualification_driver=") === 2
+        && engineRun.includes('test -x "$qualification_driver"')
+        && engineRun.includes('--qualification-driver "$qualification_driver"')
+        && !engineRun.includes(
+          "--qualification-driver target/release/codestory_embedding_qualification",
+        ),
       `${metalFile} server-behavior proof must omit calibration while qualification retains it`,
     );
     add(
@@ -5008,6 +5428,12 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!vulkan) {
     violations.push(`${vulkanFile} must exist`);
   } else {
+    add(
+      violations,
+      createHash("sha256").update(JSON.stringify(vulkan)).digest("hex")
+        === windowsVulkanWorkflowDigest,
+      `${vulkanFile} must match the reviewed protected Windows Vulkan workflow structure`,
+    );
     add(violations, trigger(vulkan, "workflow_call") !== undefined && trigger(vulkan, "workflow_dispatch") !== undefined, `${vulkanFile} must support reusable and manual proof`);
     for (const event of ["workflow_call", "workflow_dispatch"]) {
       for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
@@ -5109,6 +5535,8 @@ function validateRemainingWorkflows(workflows, violations) {
       "Capture source build tool evidence",
       "Install pinned Rust",
       "Build and package native CLI",
+      "Authenticate exact Windows package producer",
+      "Verify packaged qualification driver",
       "Authenticate calibration bundle producer",
       "Prove protected Windows Vulkan runtime",
       "Stage isolated candidate-managed Windows install",
@@ -5148,27 +5576,177 @@ function validateRemainingWorkflows(workflows, violations) {
     ]);
     requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     const nativeBuild = namedStep(job, "Build and package native CLI");
+    const nativeBuildRun = shellLiteralNormalizedText(String(nativeBuild?.run ?? ""));
     add(
       violations,
-      hasExactKeys(object(nativeBuild?.env), ["VERSION", "CMAKE_GENERATOR"])
+      hasExactKeys(object(nativeBuild?.env), [
+        "VERSION",
+        "CMAKE_GENERATOR",
+        "SERVER_BEHAVIOR_ONLY",
+      ])
         && object(nativeBuild?.env).CMAKE_GENERATOR === windowsNativeGenerator,
       `${vulkanFile} source package build must use the Ninja native generator`,
     );
-    requireStepRun(violations, vulkanFile, job, "Build and package native CLI", [
-      "cargo build --release --locked -p codestory-cli",
-      "package-codestory-release.py",
-    ]);
     add(
       violations,
-      namedStep(job, "Install pinned Rust")?.if
-        === "${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}",
-      `${vulkanFile} packaged server-behavior proof must skip unused Rust installation`,
+      shellInvocationsContaining(nativeBuildRun, "cargo @cargoArgs").length === 1
+        && nativeBuildRun.includes("-p, codestory-cli")
+        && nativeBuildRun.includes("--bin, codestory-cli")
+        && nativeBuildRun.includes("--bin, codestory-cli-runtime")
+        && nativeBuildRun.includes("$env:SERVER_BEHAVIOR_ONLY -ne true")
+        && nativeBuildRun.includes("-p, codestory-bench")
+        && nativeBuildRun.includes(
+          "--bin, codestory_embedding_qualification",
+        )
+        && occurrenceCount(
+          nativeBuildRun,
+          "codestory_embedding_qualification",
+        ) === 1
+        && !nativeBuildRun.includes("codestory_embedding_constant_calibration")
+        && shellInvocationsContaining(
+          nativeBuildRun,
+          "python .github/scripts/package-codestory-release.py",
+        ).length === 1
+        && jobShellInvocationsContaining(job, "cargo @cargoArgs").length === 1
+        && jobShellInvocationsContaining(job, "cargo build").length === 0,
+      `${vulkanFile} source fallback must build CLI, runtime, and qualification driver in one Cargo invocation`,
     );
     add(
       violations,
-      namedStep(job, "Build qualification driver")?.if
-        === "${{ !inputs.server_behavior_only }}",
-      `${vulkanFile} packaged server-behavior proof must skip the qualification driver`,
+      namedStep(job, "Install pinned Rust")?.if
+        === "${{ !inputs.use_packaged_cli_artifact }}",
+      `${vulkanFile} every packaged proof must skip Rust installation`,
+    );
+    add(
+      violations,
+      namedStep(job, "Build qualification driver") === undefined,
+      `${vulkanFile} must not rebuild the qualification driver after package download`,
+    );
+    const windowsPackageAuthentication = namedStep(
+      job,
+      "Authenticate exact Windows package producer",
+    );
+    const windowsPackageAuthenticationRun = shellLiteralNormalizedText(
+      stepRun(job, "Authenticate exact Windows package producer"),
+    );
+    add(
+      violations,
+      windowsPackageAuthentication?.if === "inputs.use_packaged_cli_artifact"
+        && windowsPackageAuthentication?.shell === windowsPowerShellShell
+        && windowsPackageAuthentication?.["continue-on-error"] === undefined
+        && hasExactKeys(object(windowsPackageAuthentication?.env), [
+          "GH_TOKEN",
+          "CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "SERVER_BEHAVIOR_ONLY",
+        ])
+        && object(windowsPackageAuthentication?.env).GH_TOKEN
+          === "${{ github.token }}"
+        && object(windowsPackageAuthentication?.env).CANDIDATE_PRODUCER_WORKFLOW_PATH
+          === "${{ inputs.candidate_producer_workflow_path }}"
+        && object(windowsPackageAuthentication?.env).SERVER_BEHAVIOR_ONLY
+          === "${{ inputs.server_behavior_only }}"
+        && windowsPackageAuthenticationRun.includes(
+          ".github/workflows/auto-release.yml",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          ".github/workflows/release.yml",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          ".github/workflows/packaged-platform-pr.yml",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$env:SERVER_BEHAVIOR_ONLY -ne true",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$env:CANDIDATE_PRODUCER_WORKFLOW_PATH -notin $allowedWorkflows",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$run.head_repository.full_name -ne $env:GITHUB_REPOSITORY",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$run.path -ne $env:CANDIDATE_PRODUCER_WORKFLOW_PATH",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$run.head_sha -ne $sourceSha",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "[string]$run.run_attempt -ne $env:GITHUB_RUN_ATTEMPT",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$_.name -eq codestory-cli-windows-x64",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "[string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "$_.workflow_run.head_sha -eq $sourceSha",
+        )
+        && windowsPackageAuthenticationRun.includes(
+          "if ($artifactCount -ne 1)",
+        ),
+      `${vulkanFile} packaged proof must authenticate one exact-head package from an allowlisted producer`,
+    );
+    const windowsPackageDownload = namedStep(job, "Download packaged CLI artifact");
+    add(
+      violations,
+      windowsPackageDownload?.if === "inputs.use_packaged_cli_artifact"
+        && windowsPackageDownload?.uses === "actions/download-artifact@v8.0.1"
+        && hasExactKeys(windowsPackageDownload?.with, ["name", "path"])
+        && object(windowsPackageDownload?.with).name
+          === "codestory-cli-windows-x64"
+        && object(windowsPackageDownload?.with).path === "target/release-dist"
+        && stepIndex(job, "Download packaged CLI artifact")
+          === stepIndex(job, "Authenticate exact Windows package producer") + 1,
+      `${vulkanFile} must download only the authenticated Windows package`,
+    );
+    const windowsDriverVerify = namedStep(job, "Verify packaged qualification driver");
+    const windowsDriverVerifyRun = shellLiteralNormalizedText(
+      stepRun(job, "Verify packaged qualification driver"),
+    );
+    add(
+      violations,
+      windowsDriverVerify?.id === "qualification-driver"
+        && windowsDriverVerify?.if
+          === "${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}"
+        && windowsDriverVerify?.shell === windowsPowerShellShell
+        && windowsDriverVerify?.["continue-on-error"] === undefined
+        && hasExactKeys(object(windowsDriverVerify?.env), ["INPUT_VERSION"])
+        && object(windowsDriverVerify?.env).INPUT_VERSION
+          === "${{ inputs.version }}"
+        && shellInvocationsContaining(
+          windowsDriverVerifyRun,
+          "node .github/scripts/qualification-driver-artifact.mjs verify",
+        ).length === 1
+        && windowsDriverVerifyRun.includes("--asset-target windows-x64")
+        && windowsDriverVerifyRun.includes("--source-sha $sourceSha")
+        && windowsDriverVerifyRun.includes("--source-tree $sourceTree")
+        && windowsDriverVerifyRun.includes("--version $version")
+        && windowsDriverVerifyRun.includes(
+          "--archive target/release-dist/codestory-cli-v$version-windows-x64.zip",
+        )
+        && windowsDriverVerifyRun.includes("--trusted-root $env:GITHUB_WORKSPACE")
+        && windowsDriverVerifyRun.includes(
+          "--artifact-dir target/release-dist/qualification-driver/windows-x64",
+        )
+        && windowsDriverVerifyRun.includes("$result.driver")
+        && windowsDriverVerifyRun.includes("$env:GITHUB_OUTPUT")
+        && stepIndex(job, "Verify packaged qualification driver")
+          === stepIndex(job, "Download packaged CLI artifact") + 1,
+      `${vulkanFile} packaged qualification must verify the archive-bound private driver`,
+    );
+    add(
+      violations,
+      qualificationDriverHandoffIsSealed(
+        job,
+        "Verify packaged qualification driver",
+        "Prove protected Windows Vulkan runtime",
+        [
+          "Download exact-head publishable packet quality evidence",
+          "Authenticate calibration bundle producer",
+          "Download frozen calibration bundle",
+        ],
+      ),
+      `${vulkanFile} must not replace the verified qualification driver before execution`,
     );
     const qualityDownload = namedStep(
       job,
@@ -5210,8 +5788,25 @@ function validateRemainingWorkflows(workflows, violations) {
         && engineRun.includes("@calibrationArgs")
         && engineRun.includes('$claimArgs = @("--server-behavior-only")')
         && engineRun.includes('"--produce-qualification-evidence"')
+        && object(engine?.env).USE_PACKAGED_CLI_ARTIFACT
+          === "${{ inputs.use_packaged_cli_artifact }}"
+        && object(engine?.env).VERIFIED_QUALIFICATION_DRIVER
+          === "${{ steps.qualification-driver.outputs.path }}"
         && engineRun.includes(
-          '"--qualification-driver", "target/release/codestory_embedding_qualification.exe"',
+          '$qualificationDriver = "target/release/codestory_embedding_qualification.exe"',
+        )
+        && engineRun.includes(
+          'if ($env:USE_PACKAGED_CLI_ARTIFACT -eq "true")',
+        )
+        && engineRun.includes(
+          "$qualificationDriver = $env:VERIFIED_QUALIFICATION_DRIVER",
+        )
+        && occurrenceCount(engineRun, "$qualificationDriver =") === 2
+        && engineRun.includes(
+          'Test-Path -LiteralPath $qualificationDriver -PathType Leaf',
+        )
+        && engineRun.includes(
+          '"--qualification-driver", $qualificationDriver',
         )
         && engineRun.includes(
           '"--qualification-evidence", "target/windows-vulkan-proof/qualification.json"',
@@ -5371,6 +5966,12 @@ function validateRemainingWorkflows(workflows, violations) {
   } else {
     add(
       violations,
+      createHash("sha256").update(JSON.stringify(linuxVulkan)).digest("hex")
+        === linuxVulkanWorkflowDigest,
+      `${linuxVulkanFile} must match the reviewed protected Linux Vulkan workflow structure`,
+    );
+    add(
+      violations,
       trigger(linuxVulkan, "workflow_call") !== undefined
         && trigger(linuxVulkan, "workflow_dispatch") !== undefined,
       `${linuxVulkanFile} must support reusable and manual proof`,
@@ -5511,12 +6112,98 @@ function validateRemainingWorkflows(workflows, violations) {
     requireStepEnv(violations, linuxVulkanFile, job, "Validate candidate-installed mode", {
       SERVER_BEHAVIOR_ONLY: "${{ inputs.server_behavior_only }}",
     });
+    const packageAuthentication = namedStep(
+      job,
+      "Authenticate exact Linux package producer",
+    );
+    const packageAuthenticationRun = shellLiteralNormalizedText(
+      stepRun(job, "Authenticate exact Linux package producer"),
+    );
+    add(
+      violations,
+      packageAuthentication?.shell === "bash"
+        && packageAuthentication?.if === undefined
+        && packageAuthentication?.["continue-on-error"] === undefined
+        && hasExactKeys(object(packageAuthentication?.env), [
+          "GH_TOKEN",
+          "CANDIDATE_PRODUCER_WORKFLOW_PATH",
+          "PACKAGE_RUN_ID",
+          "SERVER_BEHAVIOR_ONLY",
+        ])
+        && object(packageAuthentication?.env).GH_TOKEN === "${{ github.token }}"
+        && object(packageAuthentication?.env).CANDIDATE_PRODUCER_WORKFLOW_PATH
+          === "${{ inputs.candidate_producer_workflow_path }}"
+        && object(packageAuthentication?.env).PACKAGE_RUN_ID
+          === "${{ inputs.package_run_id || github.run_id }}"
+        && object(packageAuthentication?.env).SERVER_BEHAVIOR_ONLY
+          === "${{ inputs.server_behavior_only }}"
+        && packageAuthenticationRun.includes(
+          ".github/workflows/auto-release.yml",
+        )
+        && packageAuthenticationRun.includes(
+          ".github/workflows/release.yml",
+        )
+        && packageAuthenticationRun.includes(
+          ".github/workflows/packaged-platform-pr.yml",
+        )
+        && packageAuthenticationRun.includes(
+          "case $CANDIDATE_PRODUCER_WORKFLOW_PATH in",
+        )
+        && packageAuthenticationRun.includes(
+          "if [ $SERVER_BEHAVIOR_ONLY != true ]",
+        )
+        && packageAuthenticationRun.includes(
+          "test $CANDIDATE_PRODUCER_WORKFLOW_PATH =",
+        )
+        && packageAuthenticationRun.includes(
+          ".head_repository.full_name",
+        )
+        && packageAuthenticationRun.includes(
+          "test $(jq -r .path <<<$run) = $CANDIDATE_PRODUCER_WORKFLOW_PATH",
+        )
+        && packageAuthenticationRun.includes(
+          "test $(jq -r .head_sha <<<$run) = $(git rev-parse HEAD)",
+        )
+        && packageAuthenticationRun.includes(
+          "if [ $PACKAGE_RUN_ID = $GITHUB_RUN_ID ]",
+        )
+        && packageAuthenticationRun.includes(
+          "test $(jq -r .run_attempt <<<$run) = $GITHUB_RUN_ATTEMPT",
+        )
+        && packageAuthenticationRun.includes(
+          "test $(jq -r .status <<<$run) = completed",
+        )
+        && packageAuthenticationRun.includes(
+          "test $(jq -r .conclusion <<<$run) = success",
+        )
+        && packageAuthenticationRun.includes(
+          ".name == codestory-cli-linux-x64",
+        )
+        && packageAuthenticationRun.includes(
+          ".workflow_run.id == $run_id",
+        )
+        && packageAuthenticationRun.includes(
+          ".workflow_run.head_sha == $sha",
+        )
+        && packageAuthenticationRun.includes("test $artifact_count = 1"),
+      `${linuxVulkanFile} must authenticate one exact-head package from an allowlisted producer`,
+    );
     const packageDownload = namedStep(job, "Download exact Linux package");
     add(
       violations,
       packageDownload?.uses === "actions/download-artifact@v8.0.1"
-        && object(packageDownload.with).name === "codestory-cli-linux-x64",
-      `${linuxVulkanFile} must consume the graph-declared Linux x64 package`,
+        && hasExactKeys(
+          packageDownload?.with,
+          ["name", "path", "run-id", "github-token"],
+        )
+        && object(packageDownload.with).name === "codestory-cli-linux-x64"
+        && object(packageDownload.with).path === "target/release-dist"
+        && object(packageDownload.with)["run-id"]
+          === "${{ inputs.package_run_id || github.run_id }}"
+        && object(packageDownload.with)["github-token"] === "${{ github.token }}"
+        && stepIndex(job, "Download exact Linux package")
+          === stepIndex(job, "Authenticate exact Linux package producer") + 1,
+      `${linuxVulkanFile} must consume only the authenticated Linux x64 package`,
     );
     requireCalibrationProducerBoundary(
       violations,
@@ -5524,23 +6211,69 @@ function validateRemainingWorkflows(workflows, violations) {
       job,
       "${{ !inputs.server_behavior_only }}",
     );
-    const qualificationRust = namedStep(
-      job,
-      "Install pinned Rust for frozen-candidate qualification",
-    );
-    const qualificationDriver = namedStep(job, "Build qualification driver");
     add(
       violations,
-      qualificationRust?.if === "${{ !inputs.server_behavior_only }}"
-        && qualificationRust?.shell === "bash"
-        && String(qualificationRust?.run ?? "").includes(
-          "rustup toolchain install 1.95.0 --profile minimal",
+      namedStep(job, "Install pinned Rust for frozen-candidate qualification")
+          === undefined
+        && namedStep(job, "Build qualification driver") === undefined
+        && jobShellInvocationsContaining(job, "cargo build").length === 0
+        && jobShellInvocationsContaining(
+          job,
+          "node scripts/prepare-embedded-model.mjs",
+        ).length === 0
+        && jobShellInvocationsContaining(job, "rustup toolchain install").length
+          === 0,
+      `${linuxVulkanFile} packaged qualification must not reinstall Rust, prepare a model, or rebuild the retained driver`,
+    );
+    const linuxDriverVerify = namedStep(job, "Verify packaged qualification driver");
+    const linuxDriverVerifyRun = shellLiteralNormalizedText(
+      stepRun(job, "Verify packaged qualification driver"),
+    );
+    add(
+      violations,
+      linuxDriverVerify?.id === "qualification-driver"
+        && linuxDriverVerify?.if === "${{ !inputs.server_behavior_only }}"
+        && linuxDriverVerify?.shell === "bash"
+        && linuxDriverVerify?.["continue-on-error"] === undefined
+        && hasExactKeys(object(linuxDriverVerify?.env), ["INPUT_VERSION"])
+        && object(linuxDriverVerify?.env).INPUT_VERSION
+          === "${{ inputs.version }}"
+        && shellInvocationsContaining(
+          linuxDriverVerifyRun,
+          "node .github/scripts/qualification-driver-artifact.mjs verify",
+        ).length === 1
+        && linuxDriverVerifyRun.includes("--asset-target linux-x64")
+        && linuxDriverVerifyRun.includes("--source-sha $(git rev-parse HEAD)")
+        && linuxDriverVerifyRun.includes("--source-tree $(git rev-parse HEAD^{tree})")
+        && linuxDriverVerifyRun.includes("--version $version")
+        && linuxDriverVerifyRun.includes(
+          "--archive target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz",
         )
-        && qualificationDriver?.if === "${{ !inputs.server_behavior_only }}"
-        && qualificationDriver?.shell === "bash"
-        && String(qualificationDriver?.run ?? "")
-          === "cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification",
-      `${linuxVulkanFile} standalone qualification must build its pinned full qualification driver exactly once`,
+        && linuxDriverVerifyRun.includes("--trusted-root $GITHUB_WORKSPACE")
+        && linuxDriverVerifyRun.includes(
+          "--artifact-dir target/release-dist/qualification-driver/linux-x64",
+        )
+        && linuxDriverVerifyRun.includes(
+          "echo path=$(jq -r .driver <<<$verified) >> $GITHUB_OUTPUT",
+        )
+        && stepIndex(job, "Verify packaged qualification driver")
+          === stepIndex(job, "Download exact Linux package") + 1,
+      `${linuxVulkanFile} packaged qualification must verify the archive-bound private driver`,
+    );
+    add(
+      violations,
+      qualificationDriverHandoffIsSealed(
+        job,
+        "Verify packaged qualification driver",
+        "Prove offline Linux Vulkan retrieval",
+        [
+          "Authenticate calibration bundle producer",
+          "Download frozen calibration bundle",
+          "Authenticate protected Metal quality producer",
+          "Download exact-head protected Metal quality evidence",
+        ],
+      ),
+      `${linuxVulkanFile} must not replace the verified qualification driver before execution`,
     );
     const qualityAuthentication = namedStep(
       job,
@@ -5643,8 +6376,16 @@ function validateRemainingWorkflows(workflows, violations) {
           "quality_args=(--retrieval-quality-evidence $quality_path)",
         )
         && normalizedEngineRun.includes("--produce-qualification-evidence")
+        && object(engine?.env).VERIFIED_QUALIFICATION_DRIVER
+          === "${{ steps.qualification-driver.outputs.path }}"
         && normalizedEngineRun.includes(
-          "--qualification-driver target/release/codestory_embedding_qualification",
+          "qualification_driver=$VERIFIED_QUALIFICATION_DRIVER",
+        )
+        && occurrenceCount(normalizedEngineRun, "qualification_driver=") === 1
+        && normalizedEngineRun.includes("test -n $qualification_driver")
+        && normalizedEngineRun.includes("test -x $qualification_driver")
+        && normalizedEngineRun.includes(
+          "--qualification-driver $qualification_driver",
         )
         && normalizedEngineRun.includes(
           "--qualification-evidence target/linux-vulkan-proof/qualification.json",
@@ -5951,9 +6692,15 @@ function workflowCpuSelectorViolations(file, value) {
       violations.push(`[cpu_selector] ${file} ${location} selects CPU backend`);
     }
     const executable = shellLiteralNormalizedText(text);
+    const executableWithoutHostInventory = executable.replaceAll(
+      "machdep.cpu.brand_string",
+      "",
+    );
     if (
       hasNonLiteralCpuAssignment(executable)
+      || /\bCODESTORY_EMBED_ALLOW_CPU\b/iu.test(executable)
       || /\bcpu_explicit\b/iu.test(executable)
+      || /\bcpu\b/iu.test(executableWithoutHostInventory)
       || /--expected-backend(?:\s+|=)cpu\b/iu.test(executable)
       || /(?:expected_backend|backend)\s*=\s*cpu\b/iu.test(executable)
     ) {
@@ -6718,7 +7465,7 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     }],
     ["packaged-platform-proof.yml/build/Upload release asset", {
       name: "codestory-cli-${{ matrix.asset_target }}",
-      path: "target/release-dist/*.tar.gz\ntarget/release-dist/*.zip\ntarget/release-dist/*.sha256\ntarget/release-dist/SHA256SUMS.txt\n",
+      path: "target/release-dist/*.tar.gz\ntarget/release-dist/*.zip\ntarget/release-dist/*.sha256\ntarget/release-dist/SHA256SUMS.txt\ntarget/release-dist/qualification-driver/${{ matrix.asset_target }}\n",
     }],
     ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
       name: "embedding-calibration-macos-${{ inputs.version }}",
@@ -7268,6 +8015,18 @@ export function validateMarketplaceSync(workflows, violations) {
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...qualificationDriverArtifactViolations(
+    fs.readFileSync(
+      path.join(
+        repositoryRoot,
+        ".github",
+        "scripts",
+        "qualification-driver-artifact.mjs",
+      ),
+      "utf8",
+    ),
+    graph,
+  ));
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
   }

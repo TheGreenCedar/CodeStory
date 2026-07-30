@@ -645,6 +645,50 @@ function validateQualificationPolicy(value) {
   ) {
     fail("workflow_policy.qualification must name the canonical one-run frozen-candidate coordinator");
   }
+  const driver = object(
+    qualification.driver_contract,
+    "workflow_policy.qualification.driver_contract",
+  );
+  const expectedDriverKeys = [
+    "artifact_directory_template",
+    "artifact_name_template",
+    "build_invocations_per_platform",
+    "identity_fields",
+    "identity_file",
+    "identity_schema_version",
+    "producer_job",
+    "producer_workflow",
+    "public_release_asset",
+    "reuse_required",
+  ].sort();
+  const expectedIdentityFields = [
+    "schema_version",
+    "source.commit",
+    "source.tree",
+    "release_version",
+    "asset_target",
+    "archive.file",
+    "archive.bytes",
+    "archive.sha256",
+    "driver.file",
+    "driver.bytes",
+    "driver.sha256",
+  ];
+  if (
+    JSON.stringify(Object.keys(driver).sort()) !== JSON.stringify(expectedDriverKeys)
+    || driver.producer_workflow !== "packaged-platform-proof.yml"
+    || driver.producer_job !== "build"
+    || driver.artifact_name_template !== "codestory-cli-{asset_target}"
+    || driver.artifact_directory_template !== "qualification-driver/{asset_target}"
+    || driver.identity_file !== "qualification-driver-identity.json"
+    || driver.identity_schema_version !== 1
+    || JSON.stringify(driver.identity_fields) !== JSON.stringify(expectedIdentityFields)
+    || driver.build_invocations_per_platform !== 1
+    || driver.reuse_required !== true
+    || driver.public_release_asset !== false
+  ) {
+    fail("workflow_policy.qualification must bind one archive-matched package-built qualification driver");
+  }
   const requiredCells = qualification.required_cells;
   if (!Array.isArray(requiredCells) || requiredCells.length !== 2) {
     fail("workflow_policy.qualification must require protected macOS Metal and Windows Vulkan");

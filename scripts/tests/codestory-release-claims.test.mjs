@@ -212,6 +212,30 @@ test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => 
 
 test("claim graph freezes one GPU-only qualification run per available platform", () => {
   const qualification = graph.workflow_policy.qualification;
+  assert.deepEqual(qualification.driver_contract, {
+    producer_workflow: "packaged-platform-proof.yml",
+    producer_job: "build",
+    artifact_name_template: "codestory-cli-{asset_target}",
+    artifact_directory_template: "qualification-driver/{asset_target}",
+    identity_file: "qualification-driver-identity.json",
+    identity_schema_version: 1,
+    identity_fields: [
+      "schema_version",
+      "source.commit",
+      "source.tree",
+      "release_version",
+      "asset_target",
+      "archive.file",
+      "archive.bytes",
+      "archive.sha256",
+      "driver.file",
+      "driver.bytes",
+      "driver.sha256",
+    ],
+    build_invocations_per_platform: 1,
+    reuse_required: true,
+    public_release_asset: false,
+  });
   assert.equal(qualification.runs_per_available_cell, 1);
   assert.deepEqual(
     qualification.required_cells.map(({ id }) => id),
@@ -244,6 +268,28 @@ test("claim graph freezes one GPU-only qualification run per available platform"
     [draft => {
       draft.workflow_policy.qualification.runs_per_available_cell = 3;
     }, /canonical one-run frozen-candidate coordinator/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.producer_workflow =
+        "macos-metal-proof.yml";
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract
+        .build_invocations_per_platform = 2;
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.reuse_required = false;
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract
+        .artifact_directory_template = "qualification-driver";
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.identity_fields
+        .splice(5, 3);
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.public_release_asset = true;
+    }, /archive-matched package-built qualification driver/u],
     [draft => {
       draft.workflow_policy.qualification.required_cells[0].backend = "cpu";
     }, /protected Metal and Vulkan producers/u],

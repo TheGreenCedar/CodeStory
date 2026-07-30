@@ -46,6 +46,11 @@ on:
         required: false
         default: false
         type: boolean
+      include_qualification_driver:
+        description: Build and retain the exact full-qualification driver beside the candidate packages.
+        required: false
+        default: false
+        type: boolean
     secrets:
       APPLE_DEVELOPER_ID_P12_BASE64:
         required: false
@@ -209,6 +214,7 @@ jobs:
         shell: bash
         env:
           EXACT_SHA: ${{ inputs.ref }}
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
         run: |
           set -euo pipefail
           rust_version="$(rustc -Vv | sed -n 's/^release: //p')"
@@ -223,7 +229,7 @@ jobs:
           )
           extra_identity=(
             --identity cargo_incremental=0
-            --identity qualification_driver=disabled
+            --identity "qualification_driver=$INCLUDE_QUALIFICATION_DRIVER"
           )
           while IFS= read -r manifest; do
             relevant_inputs+=(--relevant-input "$manifest")
@@ -357,16 +363,37 @@ jobs:
           --target "${{ matrix.rust_target }}"
           --no-run
 
-      - name: Build codestory-cli
+      - name: Build package and qualification driver
         id: package-build
         if: matrix.asset_target != 'linux-x64'
-        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+        shell: bash
+        env:
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
+          RELEASE_RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          cargo_args=(
+            -p codestory-cli
+            --bin codestory-cli
+            --bin codestory-cli-runtime
+          )
+          if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_qualification
+            )
+          fi
+          cargo build --release --locked \
+            "${cargo_args[@]}" \
+            --target "$RELEASE_RUST_TARGET"
 
       - name: Build Linux x64 at the glibc 2.31 baseline
         id: linux-build
         if: matrix.asset_target == 'linux-x64'
         shell: bash
         env:
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
+          RELEASE_RUST_TARGET: ${{ matrix.rust_target }}
           SCCACHE_BINARY: ${{ steps.sccache-identity.outputs.path }}
           SCCACHE_SHA256: ${{ steps.sccache-identity.outputs.sha256 }}
         run: |
@@ -394,6 +421,8 @@ jobs:
             --env SCCACHE_CACHE_SIZE="$SCCACHE_CACHE_SIZE" \
             --env CMAKE_C_COMPILER_LAUNCHER=/sccache/sccache \
             --env CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache \
+            --env INCLUDE_QUALIFICATION_DRIVER="$INCLUDE_QUALIFICATION_DRIVER" \
+            --env RELEASE_RUST_TARGET="$RELEASE_RUST_TARGET" \
             --volume "$CARGO_HOME:/cargo" \
             --volume "$PWD:/workspace" \
             --volume "$SCCACHE_BINARY:/sccache/sccache:ro" \
@@ -401,8 +430,16 @@ jobs:
             --workdir /workspace \
             codestory-linux-glibc-build \
             sh -ceu '
-              cargo build --release --locked -p codestory-cli \
-                --target "${{ matrix.rust_target }}"
+              set -- \
+                -p codestory-cli \
+                --bin codestory-cli \
+                --bin codestory-cli-runtime
+              if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+                set -- "$@" \
+                  -p codestory-bench \
+                  --bin codestory_embedding_qualification
+              fi
+              cargo build --release --locked "$@" --target "$RELEASE_RUST_TARGET"
               /sccache/sccache --show-stats
               /sccache/sccache --stop-server
             '
@@ -411,6 +448,10 @@ jobs:
             "target/${{ matrix.rust_target }}/release/codestory-cli"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli-runtime" \
             "target/${{ matrix.rust_target }}/release/codestory-cli-runtime"
+          if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+            cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory_embedding_qualification" \
+              "target/${{ matrix.rust_target }}/release/codestory_embedding_qualification"
+          fi
           rm -rf "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
           cp -R "target/glibc-2.31/${{ matrix.rust_target }}/release/.codestory-native-seeds" \
             "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
@@ -936,6 +977,24 @@ jobs:
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
+      - name: Stage qualification driver in package proof artifact
+        if: inputs.include_qualification_driver
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+        run: >-
+          node .github/scripts/qualification-driver-artifact.mjs produce
+          --asset-target "${{ matrix.asset_target }}"
+          --source-sha "$SOURCE_SHA"
+          --source-tree "$SOURCE_TREE"
+          --version "$INPUT_VERSION"
+          --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}"
+          --trusted-root "$GITHUB_WORKSPACE"
+          --target-dir target
+          --out-dir "target/release-dist/qualification-driver/${{ matrix.asset_target }}"
+
       - name: Report fresh package identity
         id: fresh-package
         shell: bash
@@ -1013,6 +1072,7 @@ jobs:
             target/release-dist/*.zip
             target/release-dist/*.sha256
             target/release-dist/SHA256SUMS.txt
+            target/release-dist/qualification-driver/${{ matrix.asset_target }}
           if-no-files-found: error
           retention-days: 30
           overwrite: true
