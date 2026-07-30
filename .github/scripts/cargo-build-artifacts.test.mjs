@@ -18,7 +18,10 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function fixture() {
+function fixture({
+  includeQualificationDriver = true,
+  binaryTargetTest = true,
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-cargo-artifacts-"));
   const targetDir = path.join(root, "target");
   const releaseDir = path.join(targetDir, RUST_TARGET, "release");
@@ -59,6 +62,16 @@ function fixture() {
       contents: "path identity",
     },
   ];
+  if (includeQualificationDriver) {
+    artifacts.push({
+      alias: "qualification_driver",
+      packageName: "codestory-bench",
+      kind: "bin",
+      targetName: "codestory_embedding_qualification",
+      executable: path.join(releaseDir, "codestory_embedding_qualification.exe"),
+      contents: "qualification driver",
+    });
+  }
   for (const artifact of artifacts) {
     fs.writeFileSync(artifact.executable, artifact.contents);
     const manifest = path.join(root, "crates", artifact.packageName, "Cargo.toml");
@@ -84,7 +97,9 @@ function fixture() {
       edition: "2024",
       doc: false,
       doctest: false,
-      test: artifact.kind === "test",
+      // Cargo reports whether a target is test-capable here. Release binaries
+      // commonly report true; profile.test below identifies the active build.
+      test: artifact.kind === "test" ? true : binaryTargetTest,
     },
     profile: {
       opt_level: "3",
@@ -184,6 +199,24 @@ test("binds each requested executable to the exact Windows release graph", () =>
   );
 });
 
+test("accepts the release graph without the optional qualification driver", () => {
+  const input = fixture({ includeQualificationDriver: false });
+  const { manifest } = build(input);
+
+  assert.deepEqual(
+    Object.keys(manifest.artifacts).sort(),
+    ["cli", "native_staging", "runtime", "windows_path_identity"],
+  );
+});
+
+test("does not confuse a binary target's test capability with its active profile", () => {
+  const input = fixture({ binaryTargetTest: false });
+  const { manifest } = build(input);
+
+  assert.equal(input.messages[1].target.test, false);
+  assert.equal(manifest.artifacts.cli.profile.test, false);
+});
+
 test("rejects duplicate compiler artifacts instead of choosing one by path order", () => {
   const input = fixture();
   input.jsonLines = [...input.messages, input.messages[1]]
@@ -203,6 +236,36 @@ test("rejects debug-profile output even when the target name matches", () => {
   input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
 
   assert.throws(() => build(input), /not built with the release profile/u);
+});
+
+test("rejects a production binary actually built with the test profile", () => {
+  const input = fixture();
+  input.messages[1].profile.test = true;
+  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+
+  assert.throws(() => build(input), /profile\.test did not match bin/u);
+});
+
+test("rejects an expanded Cargo target kind instead of accepting a partial match", () => {
+  const input = fixture();
+  input.messages[1].target.kind = ["bin", "test"];
+  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+
+  assert.throws(
+    () => build(input),
+    /Cargo artifact target contract changed for cli/u,
+  );
+});
+
+test("rejects a renamed Cargo target instead of substituting another binary", () => {
+  const input = fixture();
+  input.messages[1].target.name = "codestory-cli-shadow";
+  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+
+  assert.throws(
+    () => build(input),
+    /expected exactly one Cargo artifact for cli, found 0/u,
+  );
 });
 
 test("rejects an executable emitted outside the exact target release directory", () => {
