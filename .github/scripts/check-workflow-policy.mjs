@@ -602,6 +602,8 @@ export function qualificationDriverArtifactViolations(
     'binary: "codestory_embedding_qualification.exe"',
     'rustTarget: "x86_64-pc-windows-msvc"',
     "metadata.isSymbolicLink()\n    || !metadata.isFile()\n    || metadata.nlink !== 1",
+    "function regularBuildOutput(file, label)",
+    "!Number.isSafeInteger(metadata.nlink)\n    || metadata.nlink < 1",
     "metadata.isSymbolicLink() || !metadata.isDirectory()",
     'fail("qualification driver helper arguments changed")',
     "containedRelativePath(root, candidate, label)",
@@ -610,7 +612,10 @@ export function qualificationDriverArtifactViolations(
     'fail(`${label} must not traverse symbolic links`)',
     "`codestory-cli-v${version}-${assetTarget}.${contract.archiveExtension}`",
     'targetDir,\n    contract.rustTarget,\n    "release",\n    contract.binary',
+    'const sourceMetadata = regularBuildOutput(',
     'fail("qualification driver artifact directory must start empty")',
+    "copyFileSync(source, staged)",
+    'const stagedMetadata = regularFile(staged, "staged qualification driver")',
     "archiveBytes: archiveMetadata.size",
     "archiveDigest: sha256(archivePath)",
     "archiveFile: expectedArchiveFile",
@@ -691,13 +696,14 @@ const packagedHostCompilerFinalizerDigest =
   "b77d8bb12c2748bfe016ab65ccb2f4581356f3ccf1d666e747306caffd6c0c46";
 // The companion qualification driver is intentionally retained only inside
 // the private Actions package artifact. This digest pins both sides of that
-// contract: the producer copies only the selected target binary and binds it
-// to the exact candidate archive, while the consumer rejects symlinks, extra
-// files, identity drift, and byte drift before restoring execute permission.
-// Any helper edit therefore requires a policy and mutation-test review in the
-// same PR as the workflow change.
+// contract: the producer may read Cargo's trusted hard-linked build output,
+// but retains only a new singly linked copy bound to the exact candidate
+// archive. The consumer rejects symlinks, retained hardlinks, extra files,
+// identity drift, and byte drift before restoring execute permission.
+// Any helper edit therefore requires policy and mutation-test review in the
+// same PR.
 const qualificationDriverArtifactDigest =
-  "f7946e03fa6e272ca17f12616b82579da041de4d7c30b19d24ddbc5f1c7f0063";
+  "efc5126e24162d52f9da8bac38c3414b3a7492fb17eed5ff19867fadad69623e";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",

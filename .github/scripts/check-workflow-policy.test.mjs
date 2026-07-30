@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -44,6 +46,10 @@ import {
   validateWorkflows,
   windowsManifestProofPolicyViolations,
 } from "./check-workflow-policy.mjs";
+import {
+  produceQualificationDriverArtifact,
+  verifyQualificationDriverArtifact,
+} from "./qualification-driver-artifact.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
 const proofTopology = "proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5";
@@ -1453,7 +1459,7 @@ test("qualification driver is built once, retained privately, authenticated, and
       source.replace("sha256(archivePath) !== identity.archive.sha256", "false")],
     ["helper follows linked path ancestors", source =>
       source.replace("lstatSync(cursor).isSymbolicLink()", "false")],
-    ["helper accepts hardlinked drivers", source =>
+    ["helper accepts hardlinked retained drivers", source =>
       source.replace("metadata.nlink !== 1", "false")],
     ["helper accepts extra identity fields", source =>
       source.replace('fail(`${label} keys changed`)', "return")],
@@ -1495,6 +1501,82 @@ test("qualification driver is built once, retained privately, authenticated, and
         /private archive-qualified driver contract exactly|release claim graph qualification contract/u,
       );
     });
+  }
+});
+
+test("qualification driver retention breaks a Cargo source hardlink and rejects retained hardlinks", () => {
+  const directory = mkdtempSync(
+    path.join(os.tmpdir(), "codestory-qualification-driver-"),
+  );
+  try {
+    const targetDirectory = path.join(directory, "target");
+    const releaseDirectory = path.join(
+      targetDirectory,
+      "x86_64-pc-windows-msvc",
+      "release",
+    );
+    const depsDirectory = path.join(releaseDirectory, "deps");
+    mkdirSync(depsDirectory, { recursive: true });
+    const originalDriver = path.join(
+      depsDirectory,
+      "codestory_embedding_qualification-hash.exe",
+    );
+    const cargoDriver = path.join(
+      releaseDirectory,
+      "codestory_embedding_qualification.exe",
+    );
+    writeFileSync(originalDriver, "qualification-driver-v1");
+    chmodSync(originalDriver, 0o755);
+    linkSync(originalDriver, cargoDriver);
+    assert.equal(lstatSync(cargoDriver).nlink, 2);
+
+    const archive = path.join(
+      directory,
+      "codestory-cli-v0.16.3-windows-x64.zip",
+    );
+    writeFileSync(archive, "candidate-archive");
+    const artifactDirectory = path.join(directory, "artifact");
+    const produced = produceQualificationDriverArtifact({
+      archive,
+      assetTarget: "windows-x64",
+      outDir: artifactDirectory,
+      sourceSha: "a".repeat(40),
+      sourceTree: "b".repeat(40),
+      targetDir: targetDirectory,
+      trustedRoot: directory,
+      version: "0.16.3",
+    });
+    assert.equal(lstatSync(produced.driver).nlink, 1);
+    assert.equal(readFileSync(produced.driver, "utf8"), "qualification-driver-v1");
+
+    writeFileSync(originalDriver, "qualification-driver-v2");
+    assert.equal(readFileSync(produced.driver, "utf8"), "qualification-driver-v1");
+    const verified = verifyQualificationDriverArtifact({
+      archive,
+      artifactDir: artifactDirectory,
+      assetTarget: "windows-x64",
+      sourceSha: "a".repeat(40),
+      sourceTree: "b".repeat(40),
+      trustedRoot: directory,
+      version: "0.16.3",
+    });
+    assert.equal(verified.identity.driver.sha256, produced.identity.driver.sha256);
+
+    linkSync(produced.driver, path.join(directory, "retained-driver-alias.exe"));
+    assert.throws(
+      () => verifyQualificationDriverArtifact({
+        archive,
+        artifactDir: artifactDirectory,
+        assetTarget: "windows-x64",
+        sourceSha: "a".repeat(40),
+        sourceTree: "b".repeat(40),
+        trustedRoot: directory,
+        version: "0.16.3",
+      }),
+      /qualification driver artifact must be a regular, non-symlink, singly linked file/u,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
