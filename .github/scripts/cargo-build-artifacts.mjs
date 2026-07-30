@@ -354,8 +354,9 @@ export function buildCargoArtifactManifest({
     );
     if (
       !Array.isArray(message.target.crate_types)
-      || !message.target.crate_types.includes("bin")
-      || message.target.test !== (expectation.kind === "test")
+      || JSON.stringify(message.target.kind) !== JSON.stringify([expectation.kind])
+      || JSON.stringify(message.target.crate_types) !== JSON.stringify(["bin"])
+      || typeof message.target.test !== "boolean"
     ) {
       fail(`Cargo artifact target contract changed for ${expectation.alias}`);
     }
