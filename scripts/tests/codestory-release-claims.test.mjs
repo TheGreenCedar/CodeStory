@@ -169,17 +169,20 @@ test("claim graph freezes one exact Windows release graph and protected content-
       "codestory-cli",
       "codestory-cli-runtime",
       "codestory_embedding_qualification",
-      "native_staging",
-      "windows_path_identity",
     ],
-    direct_test_harnesses: ["native_staging", "windows_path_identity"],
+    direct_test_harnesses: [],
+    source_test_harnesses: ["native_staging", "windows_path_identity"],
+    production_feature_probes: [
+      "cargo_message_feature_contract",
+      "runtime_observation_source",
+    ],
     package_artifact: "codestory-cli",
     timing_phases: [
       "cache_restore",
       "native_setup",
       "cargo_graph",
       "msvc_link",
-      "regression_execution",
+      "feature_probe",
       "packaging",
       "artifact_transfer",
     ],
@@ -227,8 +230,14 @@ test("claim graph freezes one exact Windows release graph and protected content-
       draft.workflow_policy.windows_package_graph.cargo_test_invocations_after_build = 1;
     }, /one exact Windows release graph/u],
     [draft => {
-      draft.workflow_policy.windows_package_graph.direct_test_harnesses.pop();
-    }, /direct_test_harnesses must be exactly/u],
+      draft.workflow_policy.windows_package_graph.direct_test_harnesses.push("native_staging");
+    }, /direct_test_harnesses must be empty/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.source_test_harnesses.pop();
+    }, /source_test_harnesses must be exactly/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.production_feature_probes.pop();
+    }, /production_feature_probes must be exactly/u],
     [draft => {
       draft.workflow_policy.candidate_archive_cache.key_fields.shift();
     }, /key_fields must be exactly/u],

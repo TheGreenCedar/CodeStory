@@ -427,12 +427,6 @@ jobs:
               "$@"
           }
           if [ "$RUNNER_OS" = Windows ]; then
-            cargo_args+=(
-              -p codestory-llama-sys
-              --test native_staging
-              -p codestory-workspace
-              --test windows_path_identity
-            )
             timing_dir="target/windows-package-build-timing"
             mkdir -p "$timing_dir"
             cargo_json="$timing_dir/cargo-messages.jsonl"
@@ -451,8 +445,6 @@ jobs:
             expectations=(
               --expect "cli=codestory-cli:bin:codestory-cli"
               --expect "runtime=codestory-cli:bin:codestory-cli-runtime"
-              --expect "native_staging=codestory-llama-sys:test:native_staging"
-              --expect "windows_path_identity=codestory-workspace:test:windows_path_identity"
             )
             if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
               expectations+=(
@@ -488,7 +480,16 @@ jobs:
               echo "- MSVC /TIME linker rows retained: ${linker_rows}"
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            build_package_graph
+            timing_dir="target/package-build-contract/${{ matrix.asset_target }}"
+            mkdir -p "$timing_dir"
+            cargo_json="$timing_dir/cargo-messages.jsonl"
+            build_package_graph \
+              --message-format=json-render-diagnostics \
+              > "$cargo_json"
+            cat "$cargo_json"
+            node .github/scripts/cargo-build-artifacts.mjs features \
+              --input "$cargo_json" \
+              --workspace-root "$GITHUB_WORKSPACE"
           fi
 
       - name: Build Linux x64 at the glibc 2.31 baseline
@@ -513,6 +514,7 @@ jobs:
           )"
           test "$actual_sccache_sha256" = "$SCCACHE_SHA256"
           mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"
+          mkdir -p "target/package-build-contract/${{ matrix.asset_target }}"
           model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
           docker run --rm --platform linux/amd64 \
             --user "$(id -u):$(id -g)" \
@@ -543,10 +545,17 @@ jobs:
                   -p codestory-bench \
                   --bin codestory_embedding_qualification
               fi
-              cargo build --release --locked "$@" --target "$RELEASE_RUST_TARGET"
+              cargo build --release --locked "$@" \
+                --target "$RELEASE_RUST_TARGET" \
+                --message-format=json-render-diagnostics \
+                > /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
+              cat /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
               /sccache/sccache --show-stats
               /sccache/sccache --stop-server
             '
+          node .github/scripts/cargo-build-artifacts.mjs features \
+            --input "target/package-build-contract/${{ matrix.asset_target }}/cargo-messages.jsonl" \
+            --workspace-root "$GITHUB_WORKSPACE"
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
@@ -692,28 +701,6 @@ jobs:
             --save-started-ms "$SAVE_STARTED_MS" \
             --save-result "$SAVE_RESULT" \
             --path "$SCCACHE_DIR"
-
-      - name: Prove native workspace path identity
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TEST_BINARY: ${{ steps.package-build.outputs.windows_path_identity }}
-        run: |
-          & "$env:TEST_BINARY" --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows path-identity release harness failed with exit code $LASTEXITCODE"
-          }
-
-      - name: Test immutable native staging on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TEST_BINARY: ${{ steps.package-build.outputs.native_staging }}
-        run: |
-          & "$env:TEST_BINARY" --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            throw "immutable native-staging release harness failed with exit code $LASTEXITCODE"
-          }
 
       - name: Sign and notarize macOS CLI
         if: runner.os == 'macOS' && inputs.sign_macos
@@ -906,6 +893,32 @@ jobs:
           "$bin" --version
           "$bin" --help
 
+      - name: Prove production feature identity
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          started_ms="$(node -p 'Date.now()')"
+          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
+          cache="$RUNNER_TEMP/codestory-package-feature-probe-${{ matrix.asset_target }}"
+          mkdir "$cache"
+          status="$(
+            "$bin" retrieval status \
+              --project "$GITHUB_WORKSPACE" \
+              --cache-dir "$cache" \
+              --format json
+          )"
+          jq -e \
+            '.embedding_device_observation_source == "per_user_server"' \
+            <<<"$status"
+          ended_ms="$(node -p 'Date.now()')"
+          elapsed_ms=$((ended_ms - started_ms))
+          test "$elapsed_ms" -ge 0
+          echo "- Production feature identity probe: ${elapsed_ms} ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Smoke codestory-cli on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -921,6 +934,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows CLI help smoke failed with exit code $LASTEXITCODE"
           }
+
+      - name: Prove production feature identity on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+          WINDOWS_CLI: ${{ steps.package-build.outputs.cli }}
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $cache = Join-Path $env:RUNNER_TEMP "codestory-package-feature-probe-windows-x64"
+          New-Item -ItemType Directory -Path $cache | Out-Null
+          $statusJson = & "$env:WINDOWS_CLI" retrieval status `
+            --project "$env:GITHUB_WORKSPACE" `
+            --cache-dir "$cache" `
+            --format json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows production feature probe failed with exit code $LASTEXITCODE"
+          }
+          $status = $statusJson | ConvertFrom-Json
+          if ($status.embedding_device_observation_source -ne "per_user_server") {
+            throw "production package contains a non-product embedding observation source: $($status.embedding_device_observation_source)"
+          }
+          $ended = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $elapsed = $ended - $started
+          if ($elapsed -lt 0) {
+            throw "Windows production feature-probe timing was negative"
+          }
+          "- Production feature identity probe: ${elapsed} ms" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Clear release asset output
         run: python -c "import shutil; shutil.rmtree('target/release-dist', ignore_errors=True)"
