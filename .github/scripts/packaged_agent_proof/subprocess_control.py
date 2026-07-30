@@ -22,24 +22,51 @@ from .foundation import (
 
 def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> dict:
     started = time.perf_counter()
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-    )
+    # A packaged worker can start the resident embedding server and then exit.
+    # Pipe capture makes communicate() wait for EOF from that descendant too,
+    # even though the direct worker has finished. Regular files retain the same
+    # output while letting subprocess.run() wait only for the process it owns.
+    with (
+        tempfile.TemporaryFile(mode="w+", encoding=None) as stdout_capture,
+        tempfile.TemporaryFile(mode="w+", encoding=None) as stderr_capture,
+    ):
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=stdout_capture,
+                stderr=stderr_capture,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout_capture.flush()
+            stderr_capture.flush()
+            stdout_capture.buffer.seek(0)
+            stderr_capture.buffer.seek(0)
+            stdout = stdout_capture.buffer.read()
+            stderr = stderr_capture.buffer.read()
+            # TimeoutExpired retains raw bytes even when subprocess text mode
+            # is enabled. Preserve that public shape as well as the output.
+            error.timeout = timeout
+            error.stdout = stdout or None
+            error.stderr = stderr or None
+            raise
+        stdout_capture.seek(0)
+        stderr_capture.seek(0)
+        stdout = stdout_capture.read()
+        stderr = stderr_capture.read()
     result = {
         "command": command,
         "exit_code": completed.returncode,
         "wall_ms": round((time.perf_counter() - started) * 1000, 3),
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
     }
     if completed.returncode != 0:
-        stdout_tail = completed.stdout[-2000:].strip()
-        stderr_tail = completed.stderr[-2000:].strip()
+        stdout_tail = stdout[-2000:].strip()
+        stderr_tail = stderr[-2000:].strip()
         details = "\n".join(
             part
             for part in (
