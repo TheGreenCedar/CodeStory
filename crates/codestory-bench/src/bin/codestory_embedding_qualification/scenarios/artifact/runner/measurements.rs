@@ -71,7 +71,7 @@ pub(super) fn declared_phase_boundaries(metric: &str) -> Result<[&'static str; 2
         ],
         "busy_retry_usefulness" => ["typed_retry_emitted", "named_retry_condition_became_true"],
         "true_idle_exit" => [
-            "last_queued_active_or_leased_work_ended",
+            "final_product_request_completed",
             "engine_and_server_absent",
         ],
         "backend_observed_accelerator_residency" => [
@@ -94,7 +94,7 @@ pub(super) fn declared_workload_id(metric: &str) -> Result<&'static str> {
         "warm_bulk_ipc" => "warm_bulk_64x256b_v1",
         "bulk_documents_per_second" | "bulk_tokens_per_second" => "bulk_throughput_256x256b_v1",
         "busy_retry_usefulness" => "saturated_query_65th_retry_v1",
-        "true_idle_exit" => "true_idle_60000_awake_ms_v1",
+        "true_idle_exit" => "true_idle_after_product_completion_60000_awake_ms_v2",
         "backend_observed_accelerator_residency" => "resident_policy_identity_v1",
         _ => bail!("embedding_qualification_metric_workload_unknown:{metric}"),
     })

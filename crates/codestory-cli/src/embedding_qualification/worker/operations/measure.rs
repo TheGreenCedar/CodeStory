@@ -68,7 +68,7 @@ fn workload_documents(workload_id: &str, repeat: u32, count: usize, bytes: usize
         .collect()
 }
 
-struct MeasurementSpanStart {
+pub(in crate::embedding_qualification::worker) struct MeasurementSpanStart {
     awake_started_ns: u64,
     inclusive_started_ns: u64,
     boot_id_started: String,
@@ -81,6 +81,26 @@ fn begin_span(clock: &dyn AwakeMonotonicClock) -> Result<MeasurementSpanStart> {
     let boot_id_started = crate::embedding_server_transport::boot_id()?;
     let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
     let awake_started_ns = clock.now_ns();
+    Ok(MeasurementSpanStart {
+        awake_started_ns,
+        inclusive_started_ns,
+        boot_id_started,
+    })
+}
+
+/// Stamp product completion for `true_idle_exit`.
+///
+/// The awake reading is deliberately first: once the product operation has
+/// stamped completion, a delay while returning to the measurement coordinator
+/// must remain inside the measured idle interval, never move its start
+/// forward. The suspend-inclusive and boot witnesses follow immediately and
+/// the downstream tolerance fails closed if sampling them is delayed.
+fn begin_true_idle_span_at_product_completion(
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<MeasurementSpanStart> {
+    let awake_started_ns = clock.now_ns();
+    let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
+    let boot_id_started = crate::embedding_server_transport::boot_id()?;
     Ok(MeasurementSpanStart {
         awake_started_ns,
         inclusive_started_ns,
@@ -467,7 +487,11 @@ fn validate_true_idle_boundary(
 /// bypass.
 pub(in crate::embedding_qualification::worker) trait TrueIdleMeasurementClient {
     fn observe_snapshot(&self) -> Result<Option<EmbeddingServerSnapshot>>;
-    fn complete_product_query(&self, input: &str) -> Result<()>;
+    fn complete_product_query_and_stamp(
+        &self,
+        input: &str,
+        clock: &dyn AwakeMonotonicClock,
+    ) -> Result<MeasurementSpanStart>;
     fn observe_owner_exit(&self) -> Result<OwnerExitObservation>;
 }
 
@@ -476,9 +500,13 @@ impl TrueIdleMeasurementClient for PerUserEmbeddingClient {
         self.observe()
     }
 
-    fn complete_product_query(&self, input: &str) -> Result<()> {
+    fn complete_product_query_and_stamp(
+        &self,
+        input: &str,
+        clock: &dyn AwakeMonotonicClock,
+    ) -> Result<MeasurementSpanStart> {
         let _ = self.embed_query(input)?;
-        Ok(())
+        begin_true_idle_span_at_product_completion(clock)
     }
 
     fn observe_owner_exit(&self) -> Result<OwnerExitObservation> {
@@ -487,9 +515,9 @@ impl TrueIdleMeasurementClient for PerUserEmbeddingClient {
 }
 
 /// `true_idle_exit`: this worker completes the last product request itself,
-/// stamps its return as `last_queued_active_or_leased_work_ended`, proves the
-/// resident scheduler is drained, then ends at the observation that returned
-/// no owner (`engine_and_server_absent`).
+/// stamps `final_product_request_completed` before returning to its caller,
+/// proves the resident scheduler is drained, then ends at the observation that
+/// returned no owner (`engine_and_server_absent`).
 pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
     client: &dyn TrueIdleMeasurementClient,
     clock: &dyn AwakeMonotonicClock,
@@ -500,8 +528,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
         .filter(resident_engine_generation)
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_true_idle_owner_missing"))?;
     let input = "q".repeat(input_bytes.max(1) as usize);
-    client.complete_product_query(&input)?;
-    let start = begin_span(clock)?;
+    let start = client.complete_product_query_and_stamp(&input, clock)?;
     let idle_owner = client
         .observe_snapshot()?
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_true_idle_owner_missing"))?;
@@ -786,8 +813,9 @@ fn validate_vector_response(
 mod tests {
     use super::super::owner_exit::OwnerExitObservation;
     use super::{
-        TrueIdleMeasurementClient, run_measure_true_idle, true_idle_scheduler_is_drained,
-        validate_true_idle_boundary, workload_input,
+        MeasurementSpanStart, TrueIdleMeasurementClient,
+        begin_true_idle_span_at_product_completion, run_measure_true_idle,
+        true_idle_scheduler_is_drained, validate_true_idle_boundary, workload_input,
     };
     use anyhow::Result;
     use codestory_retrieval::{
@@ -800,6 +828,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    const PRODUCT_COMPLETED_NS: u64 = 100;
+    const PRODUCT_RETURNED_NS: u64 = 10_000_000_100;
+    const DRAINED_OWNER_OBSERVED_NS: u64 = 10_000_000_145;
 
     struct ScriptClock {
         now_ns: AtomicU64,
@@ -822,7 +854,7 @@ mod tests {
     impl AwakeMonotonicClock for ScriptClock {
         fn now_ns(&self) -> u64 {
             let now_ns = self.now_ns.load(Ordering::Acquire);
-            if now_ns == 100 {
+            if now_ns == PRODUCT_COMPLETED_NS {
                 self.events
                     .lock()
                     .expect("lock events")
@@ -868,22 +900,32 @@ mod tests {
             let event = if remaining == 1 {
                 "expected_owner_observed"
             } else {
-                self.clock.set(145);
+                self.clock.set(DRAINED_OWNER_OBSERVED_NS);
                 "same_owner_drained_observed"
             };
             self.events.lock().expect("lock events").push(event);
             Ok(Some(snapshot))
         }
 
-        fn complete_product_query(&self, input: &str) -> Result<()> {
+        fn complete_product_query_and_stamp(
+            &self,
+            input: &str,
+            clock: &dyn AwakeMonotonicClock,
+        ) -> Result<MeasurementSpanStart> {
             assert_eq!(input, "q".repeat(256));
             self.product_calls.fetch_add(1, Ordering::AcqRel);
-            self.clock.set(100);
+            self.clock.set(PRODUCT_COMPLETED_NS);
             self.events
                 .lock()
                 .expect("lock events")
                 .push("product_completed");
-            Ok(())
+            let start = begin_true_idle_span_at_product_completion(clock)?;
+            self.clock.set(PRODUCT_RETURNED_NS);
+            self.events
+                .lock()
+                .expect("lock events")
+                .push("product_returned_after_delay");
+            Ok(start)
         }
 
         fn observe_owner_exit(&self) -> Result<OwnerExitObservation> {
@@ -969,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn true_idle_start_is_stamped_at_product_completion_before_observation_lag() {
+    fn true_idle_start_is_stamped_at_product_completion_before_return_and_observation_lag() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let clock = Arc::new(ScriptClock::new(Arc::clone(&events)));
         let client = ScriptedTrueIdleClient {
@@ -990,8 +1032,8 @@ mod tests {
             run_measure_true_idle(&client, clock.as_ref(), 256).expect("measure true idle");
 
         assert_eq!(client.product_calls.load(Ordering::Acquire), 1);
-        assert_eq!(measurement.span.awake_started_ns, 100);
-        assert!(measurement.span.awake_finished_ns >= 145);
+        assert_eq!(measurement.span.awake_started_ns, PRODUCT_COMPLETED_NS);
+        assert!(measurement.span.awake_finished_ns >= DRAINED_OWNER_OBSERVED_NS);
         assert_eq!(
             measurement.snapshot.process.server_instance_id,
             "measured-owner"
@@ -1002,6 +1044,7 @@ mod tests {
                 "expected_owner_observed",
                 "product_completed",
                 "span_started",
+                "product_returned_after_delay",
                 "same_owner_drained_observed",
                 "same_owner_still_present",
                 "owner_absence_observed",
