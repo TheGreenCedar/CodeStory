@@ -13,6 +13,20 @@ const DECIMAL_BIGINT = /^(?:0|[1-9][0-9]*)$/u;
 const ALIAS = /^[a-z][a-z0-9_]*$/u;
 const WINDOWS_TARGET = "x86_64-pc-windows-msvc";
 const RELEASE_OPT_LEVELS = new Set(["1", "2", "3", "s", "z"]);
+const SHIPPING_BINARIES = [
+  {
+    packageName: "codestory-cli",
+    targetName: "codestory-cli",
+  },
+  {
+    packageName: "codestory-cli",
+    targetName: "codestory-cli-runtime",
+  },
+];
+const FORBIDDEN_SHIPPING_FEATURES = new Map([
+  ["codestory-retrieval", new Set(["test-support"])],
+  ["codestory-runtime", new Set(["benchmark-support", "test-support"])],
+]);
 const ARTIFACT_CONTRACT = {
   cli: {
     packageName: "codestory-cli",
@@ -24,28 +38,13 @@ const ARTIFACT_CONTRACT = {
     kind: "bin",
     targetName: "codestory-cli-runtime",
   },
-  native_staging: {
-    packageName: "codestory-llama-sys",
-    kind: "test",
-    targetName: "native_staging",
-  },
-  windows_path_identity: {
-    packageName: "codestory-workspace",
-    kind: "test",
-    targetName: "windows_path_identity",
-  },
   qualification_driver: {
     packageName: "codestory-bench",
     kind: "bin",
     targetName: "codestory_embedding_qualification",
   },
 };
-const REQUIRED_ALIASES = [
-  "cli",
-  "runtime",
-  "native_staging",
-  "windows_path_identity",
-];
+const REQUIRED_ALIASES = ["cli", "runtime"];
 
 function fail(message) {
   throw new Error(message);
@@ -86,6 +85,15 @@ function packageNameFromId(packageId) {
   }
   const legacy = /^([^\s]+)\s+\d+\.\d+\.\d+(?:[-+][^\s]+)?(?:\s|$)/u.exec(packageId);
   if (legacy) return legacy[1];
+  if (packageId.startsWith("path+file:")) {
+    const source = packageId.slice("path+".length).split("#", 1)[0];
+    try {
+      const directory = path.posix.basename(new URL(source).pathname);
+      if (directory !== "") return decodeURIComponent(directory);
+    } catch {
+      // Fall through to the manifest-backed parser below.
+    }
+  }
   return null;
 }
 
@@ -153,7 +161,12 @@ function requireArtifactContract(expectations) {
 }
 
 function parseCargoMessages(jsonLines) {
-  const messages = [];
+  return parseCargoMessageStream(jsonLines).compilerArtifacts;
+}
+
+function parseCargoMessageStream(jsonLines) {
+  const compilerArtifacts = [];
+  const buildFinished = [];
   for (const [index, line] of jsonLines.split(/\r?\n/u).entries()) {
     if (line.trim() === "") continue;
     let message;
@@ -162,9 +175,99 @@ function parseCargoMessages(jsonLines) {
     } catch {
       fail(`Cargo JSON output line ${index + 1} is not valid JSON`);
     }
-    if (message?.reason === "compiler-artifact") messages.push(message);
+    if (message?.reason === "compiler-artifact") compilerArtifacts.push(message);
+    if (message?.reason === "build-finished") buildFinished.push(message);
   }
-  return messages;
+  return { compilerArtifacts, buildFinished };
+}
+
+export function assertShippingFeatureContract({
+  jsonLines,
+  workspaceRoot,
+}) {
+  const resolvedWorkspaceRoot = fs.realpathSync(workspaceRoot);
+  if (!fs.statSync(resolvedWorkspaceRoot).isDirectory()) {
+    fail("shipping Cargo workspace root is not a directory");
+  }
+  const { compilerArtifacts, buildFinished } = parseCargoMessageStream(jsonLines);
+  if (
+    buildFinished.length !== 1
+    || buildFinished[0]?.success !== true
+  ) {
+    fail("shipping Cargo message stream did not finish successfully");
+  }
+
+  const artifacts = compilerArtifacts.map((message) => {
+    const packageName = packageNameFromArtifact(message);
+    const targetName = message?.target?.name;
+    const targetKinds = message?.target?.kind;
+    if (
+      typeof targetName !== "string"
+      || targetName === ""
+      || !Array.isArray(targetKinds)
+      || targetKinds.some((kind) => typeof kind !== "string")
+      || message?.profile === null
+      || typeof message?.profile !== "object"
+    ) {
+      fail(`Cargo compiler artifact shape changed for ${packageName}`);
+    }
+    if (
+      message.profile.test === true
+      || targetKinds.includes("test")
+      || targetKinds.includes("bench")
+    ) {
+      fail(
+        `shipping Cargo graph emitted a test or benchmark target: `
+          + `${packageName}:${targetName}`,
+      );
+    }
+    return {
+      message,
+      packageName,
+      targetKinds,
+      targetName,
+    };
+  });
+
+  for (const expected of SHIPPING_BINARIES) {
+    const matches = artifacts.filter(({ message, packageName, targetKinds, targetName }) =>
+      packageName === expected.packageName
+      && targetName === expected.targetName
+      && JSON.stringify(targetKinds) === JSON.stringify(["bin"])
+      && message.profile.test === false
+    );
+    if (matches.length !== 1) {
+      fail(
+        `shipping Cargo graph must emit exactly one production binary `
+          + `${expected.packageName}:${expected.targetName}; found ${matches.length}`,
+      );
+    }
+  }
+
+  for (const [packageName, forbidden] of FORBIDDEN_SHIPPING_FEATURES) {
+    const matches = artifacts.filter((artifact) =>
+      artifact.packageName === packageName
+    );
+    if (matches.length === 0) {
+      fail(`shipping Cargo graph omitted feature evidence for ${packageName}`);
+    }
+    for (const { message } of matches) {
+      if (
+        !Array.isArray(message.features)
+        || message.features.some((feature) => typeof feature !== "string")
+      ) {
+        fail(`shipping Cargo feature evidence changed for ${packageName}`);
+      }
+      for (const feature of message.features) {
+        if (forbidden.has(feature)) {
+          fail(
+            `shipping Cargo graph enabled forbidden feature `
+              + `${packageName}/${feature}`,
+          );
+        }
+      }
+    }
+  }
 }
 
 function releaseProfile(message, kind) {
@@ -453,6 +556,7 @@ export function buildCargoArtifactManifest({
   targetDir,
   workspaceRoot,
 }) {
+  assertShippingFeatureContract({ jsonLines, workspaceRoot });
   requireSha(exactSha, "source SHA");
   requireSha(exactTree, "source tree");
   requireWindowsTarget(rustTarget);
@@ -813,6 +917,13 @@ function runSelect(values) {
   if (githubOutput) appendOutputs(githubOutput, output, manifest.artifacts);
 }
 
+function runFeatures(values) {
+  assertShippingFeatureContract({
+    jsonLines: fs.readFileSync(one(values, "--input"), "utf8"),
+    workspaceRoot: one(values, "--workspace-root"),
+  });
+}
+
 function runVerify(values) {
   const manifestFile = one(values, "--manifest");
   const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
@@ -829,7 +940,9 @@ function runVerify(values) {
 
 function main(argv) {
   const { command, values } = parseArguments(argv);
-  if (command === "select") {
+  if (command === "features") {
+    runFeatures(values);
+  } else if (command === "select") {
     runSelect(values);
   } else if (command === "verify") {
     runVerify(values);

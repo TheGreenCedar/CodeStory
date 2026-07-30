@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  assertShippingFeatureContract,
   buildCargoArtifactManifest,
   verifyCargoArtifactManifest,
 } from "./cargo-build-artifacts.mjs";
@@ -13,6 +16,7 @@ import {
 const SOURCE_SHA = "a".repeat(40);
 const SOURCE_TREE = "b".repeat(40);
 const RUST_TARGET = "x86_64-pc-windows-msvc";
+const SCRIPT = fileURLToPath(new URL("./cargo-build-artifacts.mjs", import.meta.url));
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -27,6 +31,18 @@ function fixture({
   const releaseDir = path.join(targetDir, RUST_TARGET, "release");
   const depsDir = path.join(releaseDir, "deps");
   fs.mkdirSync(depsDir, { recursive: true });
+
+  function writePackageManifest(packageName) {
+    const manifest = path.join(root, "crates", packageName, "Cargo.toml");
+    if (!fs.existsSync(manifest)) {
+      fs.mkdirSync(path.dirname(manifest), { recursive: true });
+      fs.writeFileSync(
+        manifest,
+        `[package]\nname = "${packageName}"\nversion = "0.16.3"\n`,
+      );
+    }
+    return manifest;
+  }
 
   const artifacts = [
     {
@@ -45,22 +61,6 @@ function fixture({
       executable: path.join(releaseDir, "codestory-cli-runtime.exe"),
       contents: "runtime",
     },
-    {
-      alias: "native_staging",
-      packageName: "codestory-llama-sys",
-      kind: "test",
-      targetName: "native_staging",
-      executable: path.join(depsDir, "native_staging-123456.exe"),
-      contents: "native staging",
-    },
-    {
-      alias: "windows_path_identity",
-      packageName: "codestory-workspace",
-      kind: "test",
-      targetName: "windows_path_identity",
-      executable: path.join(depsDir, "windows_path_identity-123456.exe"),
-      contents: "path identity",
-    },
   ];
   if (includeQualificationDriver) {
     artifacts.push({
@@ -74,15 +74,7 @@ function fixture({
   }
   for (const artifact of artifacts) {
     fs.writeFileSync(artifact.executable, artifact.contents);
-    const manifest = path.join(root, "crates", artifact.packageName, "Cargo.toml");
-    if (!fs.existsSync(manifest)) {
-      fs.mkdirSync(path.dirname(manifest), { recursive: true });
-      fs.writeFileSync(
-        manifest,
-        `[package]\nname = "${artifact.packageName}"\nversion = "0.16.3"\n`,
-      );
-    }
-    artifact.manifest = manifest;
+    artifact.manifest = writePackageManifest(artifact.packageName);
   }
 
   const messages = artifacts.map((artifact) => ({
@@ -99,20 +91,52 @@ function fixture({
       doctest: false,
       // Cargo reports whether a target is test-capable here. Release binaries
       // commonly report true; profile.test below identifies the active build.
-      test: artifact.kind === "test" ? true : binaryTargetTest,
+      test: binaryTargetTest,
     },
     profile: {
       opt_level: "3",
       debuginfo: 0,
       debug_assertions: false,
       overflow_checks: false,
-      test: artifact.kind === "test",
+      test: false,
     },
     features: [],
     filenames: [artifact.executable],
     executable: artifact.executable,
     fresh: false,
   }));
+  for (const packageName of ["codestory-retrieval", "codestory-runtime"]) {
+    const manifest = writePackageManifest(packageName);
+    messages.push({
+      reason: "compiler-artifact",
+      package_id:
+        `path+file://${path.dirname(manifest)}#${packageName}@0.16.3`,
+      manifest_path: manifest,
+      target: {
+        kind: ["lib"],
+        crate_types: ["lib"],
+        name: packageName.replaceAll("-", "_"),
+        src_path: `/checkout/crates/${packageName}/src/lib.rs`,
+        edition: "2024",
+        doc: true,
+        doctest: true,
+        test: true,
+      },
+      profile: {
+        opt_level: "3",
+        debuginfo: 0,
+        debug_assertions: false,
+        overflow_checks: false,
+        test: false,
+      },
+      features: [],
+      filenames: [
+        path.join(releaseDir, "deps", `lib${packageName.replaceAll("-", "_")}.rlib`),
+      ],
+      executable: null,
+      fresh: false,
+    });
+  }
   messages.unshift({
     reason: "compiler-artifact",
     package_id: "registry+https://example.invalid/index#serde@1.0.0",
@@ -136,6 +160,10 @@ function fixture({
     filenames: [path.join(releaseDir, "deps", "libserde.rlib")],
     executable: null,
   });
+  messages.push({
+    reason: "build-finished",
+    success: true,
+  });
 
   return {
     artifacts,
@@ -149,6 +177,20 @@ function fixture({
     root,
     targetDir,
   };
+}
+
+function refreshCargoJson(input) {
+  input.jsonLines = input.messages
+    .map((message) => JSON.stringify(message))
+    .join("\n");
+}
+
+function featureMessage(input, packageName) {
+  const message = input.messages.find(
+    (entry) => entry.target?.name === packageName.replaceAll("-", "_"),
+  );
+  assert.ok(message, `missing fixture message for ${packageName}`);
+  return message;
 }
 
 function build(input = fixture()) {
@@ -202,7 +244,7 @@ test("binds each requested executable to the exact Windows release graph", () =>
     assert.equal(selected.path, path.resolve(artifact.executable));
     assert.equal(selected.bytes, Buffer.byteLength(artifact.contents));
     assert.equal(selected.sha256, sha256(artifact.contents));
-    assert.equal(selected.profile.test, artifact.kind === "test");
+    assert.equal(selected.profile.test, false);
     assert.equal(selected.native_links.count, 1);
     assert.deepEqual(selected.native_links.paths, [selected.relative_path]);
     assert.match(selected.native_links.device, /^(?:0|[1-9][0-9]*)$/u);
@@ -258,7 +300,7 @@ test("accepts the release graph without the optional qualification driver", () =
 
   assert.deepEqual(
     Object.keys(manifest.artifacts).sort(),
-    ["cli", "native_staging", "runtime", "windows_path_identity"],
+    ["cli", "runtime"],
   );
 });
 
@@ -270,6 +312,133 @@ test("does not confuse a binary target's test capability with its active profile
   assert.equal(manifest.artifacts.cli.profile.test, false);
 });
 
+test("accepts an isolated shipping feature graph", () => {
+  const input = fixture();
+
+  assert.doesNotThrow(() =>
+    assertShippingFeatureContract({
+      jsonLines: input.jsonLines,
+      workspaceRoot: input.root,
+    })
+  );
+});
+
+test("rejects retrieval test support in the shipping graph", () => {
+  const input = fixture();
+  featureMessage(input, "codestory-retrieval").features = ["test-support"];
+  refreshCargoJson(input);
+
+  assert.throws(
+    () =>
+      assertShippingFeatureContract({
+        jsonLines: input.jsonLines,
+        workspaceRoot: input.root,
+      }),
+    /forbidden feature codestory-retrieval\/test-support/u,
+  );
+});
+
+test("rejects runtime benchmark or test support in the shipping graph", async (t) => {
+  for (const feature of ["benchmark-support", "test-support"]) {
+    await t.test(feature, () => {
+      const input = fixture();
+      featureMessage(input, "codestory-runtime").features = [feature];
+      refreshCargoJson(input);
+
+      assert.throws(
+        () =>
+          assertShippingFeatureContract({
+            jsonLines: input.jsonLines,
+            workspaceRoot: input.root,
+          }),
+        new RegExp(`forbidden feature codestory-runtime/${feature}`, "u"),
+      );
+    });
+  }
+});
+
+test("rejects any test or benchmark target mixed into the shipping build", () => {
+  const input = fixture();
+  input.messages.splice(-1, 0, {
+    reason: "compiler-artifact",
+    package_id: "registry+https://example.invalid/index#probe@1.0.0",
+    target: {
+      kind: ["test"],
+      name: "probe",
+    },
+    profile: {
+      test: true,
+    },
+    features: [],
+  });
+  refreshCargoJson(input);
+
+  assert.throws(
+    () =>
+      assertShippingFeatureContract({
+        jsonLines: input.jsonLines,
+        workspaceRoot: input.root,
+      }),
+    /shipping Cargo graph emitted a test or benchmark target: probe:probe/u,
+  );
+});
+
+test("requires one successful Cargo build completion", () => {
+  const input = fixture();
+  input.messages.at(-1).success = false;
+  refreshCargoJson(input);
+
+  assert.throws(
+    () =>
+      assertShippingFeatureContract({
+        jsonLines: input.jsonLines,
+        workspaceRoot: input.root,
+      }),
+    /shipping Cargo message stream did not finish successfully/u,
+  );
+});
+
+test("exposes the feature contract through the command-line helper", () => {
+  const input = fixture();
+  const jsonFile = path.join(input.root, "cargo.jsonl");
+  fs.writeFileSync(jsonFile, input.jsonLines);
+
+  const accepted = spawnSync(
+    process.execPath,
+    [
+      SCRIPT,
+      "features",
+      "--input",
+      jsonFile,
+      "--workspace-root",
+      input.root,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+
+  featureMessage(input, "codestory-runtime").features = ["benchmark-support"];
+  refreshCargoJson(input);
+  fs.writeFileSync(jsonFile, input.jsonLines);
+  const rejected = spawnSync(
+    process.execPath,
+    [
+      SCRIPT,
+      "features",
+      "--input",
+      jsonFile,
+      "--workspace-root",
+      input.root,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(rejected.status, 1);
+  assert.match(
+    rejected.stderr,
+    /forbidden feature codestory-runtime\/benchmark-support/u,
+  );
+});
+
 test("rejects duplicate compiler artifacts instead of choosing one by path order", () => {
   const input = fixture();
   input.jsonLines = [...input.messages, input.messages[1]]
@@ -278,7 +447,7 @@ test("rejects duplicate compiler artifacts instead of choosing one by path order
 
   assert.throws(
     () => build(input),
-    /expected exactly one Cargo artifact for cli, found 2/u,
+    /must emit exactly one production binary codestory-cli:codestory-cli; found 2/u,
   );
 });
 
@@ -305,30 +474,33 @@ test("rejects debug-profile output even when the target name matches", () => {
 test("rejects a production binary actually built with the test profile", () => {
   const input = fixture();
   input.messages[1].profile.test = true;
-  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+  refreshCargoJson(input);
 
-  assert.throws(() => build(input), /profile\.test did not match bin/u);
+  assert.throws(
+    () => build(input),
+    /shipping Cargo graph emitted a test or benchmark target/u,
+  );
 });
 
 test("rejects an expanded Cargo target kind instead of accepting a partial match", () => {
   const input = fixture();
   input.messages[1].target.kind = ["bin", "test"];
-  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+  refreshCargoJson(input);
 
   assert.throws(
     () => build(input),
-    /Cargo artifact target contract changed for cli/u,
+    /shipping Cargo graph emitted a test or benchmark target/u,
   );
 });
 
 test("rejects a renamed Cargo target instead of substituting another binary", () => {
   const input = fixture();
   input.messages[1].target.name = "codestory-cli-shadow";
-  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+  refreshCargoJson(input);
 
   assert.throws(
     () => build(input),
-    /expected exactly one Cargo artifact for cli, found 0/u,
+    /must emit exactly one production binary codestory-cli:codestory-cli; found 0/u,
   );
 });
 
@@ -419,32 +591,6 @@ test("rejects the release-root spelling where Cargo uses a normalized deps peer"
   assert.throws(
     () => build(input),
     /not exactly the release-root executable and one release\/deps peer/u,
-  );
-});
-
-test("rejects a hardlinked Cargo test executable", () => {
-  const input = fixture();
-  const native = input.artifacts.find((artifact) => artifact.alias === "native_staging");
-  const alias = path.join(input.releaseDir, "deps", "native_staging-copy.exe");
-  fs.linkSync(native.executable, alias);
-
-  assert.throws(
-    () => build(input),
-    /test executable has native aliases outside its Cargo output path/u,
-  );
-});
-
-test("rejects a mixed test and production profile", () => {
-  const input = fixture();
-  const native = input.messages.find(
-    (message) => message.target?.name === "native_staging",
-  );
-  native.profile.test = false;
-  input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
-
-  assert.throws(
-    () => build(input),
-    /profile\.test did not match test/u,
   );
 });
 
