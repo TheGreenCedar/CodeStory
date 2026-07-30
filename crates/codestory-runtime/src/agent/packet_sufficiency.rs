@@ -3875,7 +3875,7 @@ mod tests {
                 "The processing handler handles records by processing and writing them.",
                 None,
                 cited_anchor_with_tier(
-                    "ProcessingHandler::handle",
+                    "LogProcessingHandler::handle",
                     "src/logging/ProcessingHandler.php",
                     PacketEvidenceTierDto::ResolvedGraph,
                     Some(true),
@@ -3911,6 +3911,244 @@ mod tests {
             report.ineligible.is_empty(),
             "role-backed log-record source claims should be sufficiency-eligible: {report:?}"
         );
+    }
+
+    #[test]
+    fn unrelated_handler_cannot_complete_logger_flow() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        let record = anchor_at("Logger.addRecord", "src/logging/Logger.php");
+        let unrelated_handler = anchor_at("DefaultHandler.process", "src/http/default_handler.rs");
+        answer.citations = vec![
+            record.clone(),
+            unrelated_handler.clone(),
+            anchor_at("HttpResponse.write", "src/http/response.rs"),
+        ];
+        let claims = vec![
+            evidence_claim(
+                "addRecord creates a log record before passing it to handlers.",
+                record,
+            ),
+            evidence_claim(
+                "The processing handler handles records by processing and writing them.",
+                unrelated_handler,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "an unrelated HTTP handler must not complete a logging flow: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.contains(&"handler_processing".to_string())),
+            "the packet must name the unproved handler-processing step: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_source_and_sink_cannot_complete_buffered_io() {
+        let question = "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.";
+        let mut answer = answer_fixture(question);
+        let buffer = anchor_at("Buffer", "src/io/buffer.kt");
+        let unrelated_source = anchor_at("DatabaseSource.read", "src/database/source.rs");
+        let unrelated_sink = anchor_at("TelemetrySink.write", "src/telemetry/sink.rs");
+        answer.citations = vec![
+            buffer.clone(),
+            unrelated_source.clone(),
+            unrelated_sink.clone(),
+        ];
+        let claims = vec![
+            evidence_claim(
+                "Buffer is the in-memory byte store used by buffered reads and writes.",
+                buffer,
+            ),
+            evidence_claim(
+                "A buffered source wrapper reads from an upstream Source into a Buffer.",
+                unrelated_source,
+            ),
+            evidence_claim(
+                "A buffered sink wrapper writes buffered bytes to an upstream Sink.",
+                unrelated_sink,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "unrelated database and telemetry operations must not complete buffered IO: \
+             {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.contains(&"buffered_read_write".to_string())),
+            "the packet must name the unproved buffered read/write step: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn every_carrier_flow_is_partial_and_names_the_unproved_step() {
+        struct Case {
+            label: &'static str,
+            question: &'static str,
+            citations: Vec<AgentCitationDto>,
+            expected_missing: &'static [&'static str],
+        }
+
+        let cases = vec![
+            Case {
+                label: "form validation across component and markup surfaces",
+                question: "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation and a submit guard.",
+                citations: vec![
+                    anchor_at("clampMin", "src/forms/Widget.vue"),
+                    anchor_at("validateCoupon", "src/forms/Coupon.vue"),
+                    anchor_at("submitJob", "app/forms/Checkout.svelte"),
+                    anchor_at("maxRetries", "examples/forms/page.html"),
+                ],
+                expected_missing: &["form_custom_validation", "form_submit_guard"],
+            },
+            Case {
+                label: "static-site phases filed on site and component surfaces",
+                question: "Trace how the static site build command creates a site and runs the read, generate, render, and write phases.",
+                citations: vec![
+                    anchor_at("AssetPipeline.run", "lib/site/assets.rb"),
+                    anchor_at("Layout.render", "lib/site/Layout.vue"),
+                    anchor_at("ThemeGenerator.output", "src/ui/Theme.svelte"),
+                    anchor_at("PageTemplate.write", "public/static/page.html"),
+                ],
+                expected_missing: &["site_lifecycle", "site_terminal"],
+            },
+            Case {
+                label: "logger record plus unrelated handlers",
+                question: "Explain how a logger turns a log call into a record object and passes it through handlers.",
+                citations: vec![
+                    anchor_at("Logger.addRecord", "src/logging/Logger.php"),
+                    anchor_at("DefaultHandler.process", "src/http/default_handler.rs"),
+                    anchor_at("PaymentHandler.write", "src/logging/Payment.vue"),
+                    anchor_at("GenericHandler.process", "src/logging/Panel.svelte"),
+                ],
+                expected_missing: &["handler_processing"],
+            },
+            Case {
+                label: "object-map words over navigation and graphics objects",
+                question: "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type map plans.",
+                citations: vec![
+                    anchor_at("sourceMapOptions", "src/mapping/Config.vue"),
+                    anchor_at("RoadMapPlanner", "src/mapping/Planner.svelte"),
+                    anchor_at("HeatMapExecutor", "src/charts/heat.html"),
+                    anchor_at("TileMapPipeline", "src/mapping/tiles.rs"),
+                ],
+                expected_missing: &["mapper_config", "mapper_execution"],
+            },
+            Case {
+                label: "buffer plus unrelated source and sink operations",
+                question: "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.",
+                citations: vec![
+                    anchor_at("Buffer", "src/io/buffer.kt"),
+                    anchor_at("DatabaseSource.read", "src/database/Source.vue"),
+                    anchor_at("TelemetrySink.write", "src/telemetry/Sink.svelte"),
+                    anchor_at("NetworkStream.flush", "src/network/stream.html"),
+                ],
+                expected_missing: &["buffered_read_write"],
+            },
+            Case {
+                label: "format-looking failures without argument storage",
+                question: "Explain how formatting arguments become type-erased format args and reach the vformat error fallback path.",
+                citations: vec![
+                    anchor_at("ArgumentStore", "src/fmt/Args.vue"),
+                    anchor_at("NumberFormatError", "src/num/Parse.vue"),
+                    anchor_at("formatCurrencyError", "src/money/Format.svelte"),
+                    anchor_at("CliParseError", "src/cli/errors.html"),
+                ],
+                expected_missing: &["format_arguments"],
+            },
+        ];
+
+        assert_eq!(
+            cases.len(),
+            6,
+            "one executable verdict case per carrier flow"
+        );
+
+        for case in cases {
+            let mut answer = answer_fixture(case.question);
+            answer.citations = case.citations.clone();
+            let claims = case
+                .citations
+                .into_iter()
+                .enumerate()
+                .map(|(index, citation)| {
+                    let text = if index % 2 == 0 {
+                        "The public API entrypoint exposes the requested flow."
+                    } else {
+                        "The implementation delegates downstream work through this step."
+                    };
+                    evidence_claim(text, citation)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                packet_supported_claim_family_count(&claims) >= 2,
+                "{} must satisfy the DataFlow family floor so a Partial verdict cannot come from \
+                 an unrelated family-count gate",
+                case.label
+            );
+
+            let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question: case.question,
+                task_class: PacketTaskClassDto::DataFlow,
+                answer: &answer,
+                budget: &budget_fixture(),
+                supported_claims: claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            });
+
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Partial,
+                "{} returned a false-safe verdict: {sufficiency:?}",
+                case.label
+            );
+            let report = sufficiency
+                .coverage_report
+                .as_ref()
+                .expect("carrier-flow verdict includes a coverage report");
+            for requirement in case.expected_missing {
+                assert!(
+                    report.missing.contains(&requirement.to_string()),
+                    "{} did not name the unproved `{requirement}` step: {sufficiency:?}",
+                    case.label
+                );
+            }
+        }
     }
 
     #[test]
@@ -4027,7 +4265,7 @@ mod tests {
                 "The processing handler handles records by processing and writing them.",
                 None,
                 cited_anchor_with_tier(
-                    "ProcessingHandler::handle",
+                    "LogProcessingHandler::handle",
                     "src/logging/ProcessingHandler.php",
                     PacketEvidenceTierDto::ResolvedGraph,
                     Some(true),
@@ -6053,14 +6291,14 @@ mod tests {
             evidence_claim(
                 "The handler interface defines record handling and batch handling boundaries.",
                 anchor_at(
-                    "HandlerInterface.handleBatch",
+                    "LogHandlerInterface.handleBatch",
                     "src/logging/HandlerInterface.php",
                 ),
             ),
             evidence_claim(
                 "The processing handler handles records by processing and writing them.",
                 anchor_at(
-                    "AbstractProcessingHandler.write",
+                    "LogProcessingHandler.write",
                     "src/logging/AbstractProcessingHandler.php",
                 ),
             ),

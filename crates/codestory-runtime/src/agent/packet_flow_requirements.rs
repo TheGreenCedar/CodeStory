@@ -1435,7 +1435,7 @@ mod tests {
             (
                 ("handler_processing", "dispatch"),
                 witness(
-                    "AbstractProcessingHandler.write",
+                    "LogProcessingHandler.write",
                     "src/logging/Handler.php",
                     NodeKind::METHOD,
                 ),
@@ -3300,6 +3300,7 @@ mod tests {
                     "src/one.ts",
                     "src/forms/one.ts",
                     "src/forms/one.vue",
+                    "src/forms/one.svelte",
                     "src/forms/one.html",
                 ],
                 // The module header's declared exception, and the whole of what is left of it: a
@@ -3320,7 +3321,14 @@ mod tests {
                 prompt: "Trace how the static site build command creates a site and runs the read, \
                          generate, render, and write phases.",
                 subject_words: &["site", "sites"],
-                surfaces: &["lib/site/one.rs", "public/static/one.ts", "src/ui/one.tsx"],
+                surfaces: &[
+                    "lib/site/one.rs",
+                    "lib/site/one.vue",
+                    "lib/site/one.svelte",
+                    "lib/site/one.html",
+                    "public/static/one.ts",
+                    "src/ui/one.tsx",
+                ],
                 closable_without_the_subject: &[],
             },
             CarrierFlow {
@@ -3328,23 +3336,27 @@ mod tests {
                 prompt: "Explain how a logger turns a log call into a record object and passes it \
                          through handlers.",
                 subject_words: &["log", "logs", "logger", "loggers", "logging"],
-                surfaces: &["src/logging/one.rs", "src/one.ts"],
-                // A record pipeline qualifies its handler classes structurally — `AbstractHandler`,
-                // `HandlerInterface`, `ProcessorChain` — and that vocabulary is what separates them
-                // from a `PaymentHandler`. It does not say "log", so a structurally-qualified
-                // handler closes the dispatch step without one. Its sibling `logger_event` still
-                // needs the log word, so the flow does not close on this.
-                closable_without_the_subject: &[
-                    "handler_processing | src/logging/one.rs",
-                    "handler_processing | src/one.ts",
+                surfaces: &[
+                    "src/logging/one.rs",
+                    "src/logging/one.vue",
+                    "src/logging/one.svelte",
+                    "src/logging/one.html",
+                    "src/one.ts",
                 ],
+                closable_without_the_subject: &[],
             },
             CarrierFlow {
                 flow: "object mapper configuration + execution",
                 prompt: "Explain how mapper configuration and runtime mapper APIs cooperate to map \
                          source objects to destination objects through type map plans.",
                 subject_words: &["map", "maps", "mapper", "mappers", "mapping", "mappings"],
-                surfaces: &["src/mapping/one.rs", "src/one.ts"],
+                surfaces: &[
+                    "src/mapping/one.rs",
+                    "src/mapping/one.vue",
+                    "src/mapping/one.svelte",
+                    "src/mapping/one.html",
+                    "src/one.ts",
+                ],
                 closable_without_the_subject: &[],
             },
             CarrierFlow {
@@ -3352,15 +3364,14 @@ mod tests {
                 prompt: "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move \
                          bytes through reads and writes.",
                 subject_words: &["buffer"],
-                surfaces: &["src/io/one.rs", "src/one.ts"],
-                // The read/write step accepts a source, a sink or a stream beside its verb, because
-                // that is what the operations of a byte pipeline are named for and requiring the
-                // container in the name would make the step unreachable. The container step
-                // `buffered_storage` still needs the buffer, so the flow does not close on this.
-                closable_without_the_subject: &[
-                    "buffered_read_write | src/io/one.rs",
-                    "buffered_read_write | src/one.ts",
+                surfaces: &[
+                    "src/io/one.rs",
+                    "src/io/one.vue",
+                    "src/io/one.svelte",
+                    "src/io/one.html",
+                    "src/one.ts",
                 ],
+                closable_without_the_subject: &[],
             },
             CarrierFlow {
                 flow: "runtime formatting",
@@ -3383,7 +3394,13 @@ mod tests {
                     "sprintf",
                     "fprintf",
                 ],
-                surfaces: &["src/fmt/one.rs", "src/one.ts"],
+                surfaces: &[
+                    "src/fmt/one.rs",
+                    "src/fmt/one.vue",
+                    "src/fmt/one.svelte",
+                    "src/fmt/one.html",
+                    "src/one.ts",
+                ],
                 closable_without_the_subject: &[],
             },
         ]

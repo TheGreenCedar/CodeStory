@@ -33,7 +33,7 @@
 //! an HTML document and a schema file are proved *by the file*: what the indexer emits from them
 //! are selectors, attributes and statements — `:root`, `required`, `CREATE TABLE` — with no
 //! identifier to scope by, so there the path is the subsystem. That is the whole of the exception:
-//! `is_form_validation_surface` reads the path for a `.html`, `.htm` or `.xhtml` anchor and for
+//! `is_form_constraint_markup` reads the path for a `.html`, `.htm` or `.xhtml` anchor and for
 //! nothing else.
 //!
 //! A single-file component looks like that surface and is not it. The indexer blanks an SFC's
@@ -450,7 +450,7 @@ const FORM_SUBSYSTEM_WORDS: &[&str] = &[
 
 /// The anchor names a form, on a surface a form is written on. A browser document counts as such a
 /// surface because a `<script>` block inside one is indexed as script, so `setCustomValidity` in an
-/// browser document still reads as what it is — but the form factor comes from the name there, as it
+/// HTML document still reads as what it is — but the form factor comes from the name there, as it
 /// does everywhere else.
 fn is_form_validation_surface(citation: &AgentCitationDto) -> bool {
     (is_script_surface(citation) || is_markup_document(citation))
@@ -596,14 +596,13 @@ pub(crate) fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool 
 /// The operations that move bytes across that buffer. Sibling of `buffer_storage`, so a citation
 /// that only names the container must not close it.
 ///
-/// The buffer factor is `names_the_buffer_itself`, not `names_buffer`: reading a *frame* buffer or
-/// a *segment* tree is not this step, and both closed it while any token ending in the head noun
-/// counted. The `source`/`sink`/`stream` alternative is unchanged.
+/// The anchor must name the buffer itself as well as the operation. A bare `Source.read` or
+/// `Sink.write` names an IO operation, but not *this* buffer flow; accepting those generic peers
+/// let a real `Buffer` citation for storage combine with unrelated database and telemetry
+/// operations to close the whole flow. The positive surface remains the buffer's own methods
+/// (`Buffer.read`, `Buffer.write`, and their variants), which carry both factors in one citation.
 pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation)
-        && names_io_operation(citation)
-        && (names_the_buffer_itself(citation)
-            || names_token(citation, &["source", "sink", "stream"]))
+    owns_behavior(citation) && names_io_operation(citation) && names_the_buffer_itself(citation)
 }
 
 // ---------------------------------------------------------------------------
@@ -638,47 +637,6 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
     }
 }
 
-/// The words a logging framework qualifies its handler classes with.
-///
-/// "Handler" is the most reused noun in software, so the word beside it is what says whose handler
-/// it is. A record pipeline qualifies it structurally or by the pipeline itself — an interface, an
-/// abstract base, a processing stage, a group, a null implementation. Every other subsystem
-/// qualifies the same noun with the domain it serves: `PaymentHandler`, `ClickHandler`,
-/// `RequestHandler`. That difference is the only thing in the name that separates them, and it is
-/// what the directory was standing in for.
-const RECORD_PIPELINE_WORDS: &[&str] = &[
-    "abstract",
-    "base",
-    "default",
-    "generic",
-    "null",
-    "noop",
-    "interface",
-    "interfaces",
-    "impl",
-    "implementation",
-    "processing",
-    "processor",
-    "processors",
-    "record",
-    "records",
-    "entry",
-    "entries",
-    "formatter",
-    "formatters",
-    "formatted",
-    "group",
-    "chain",
-    "stack",
-    "fallback",
-];
-
-/// Whether the anchor belongs to a record pipeline: it says "log", or the words it qualifies its
-/// handler with are the pipeline's own structural vocabulary rather than a domain noun.
-fn belongs_to_record_pipeline(citation: &AgentCitationDto) -> bool {
-    belongs_to_logging(citation) || names_token(citation, RECORD_PIPELINE_WORDS)
-}
-
 /// Processing a record, not registering something that might: a symbol that pushes a handler onto
 /// a stack names a handler but does nothing with a record, so it must not close this requirement.
 ///
@@ -686,8 +644,15 @@ fn belongs_to_record_pipeline(citation: &AgentCitationDto) -> bool {
 /// `handleClick`, `handleScroll` and `handleResize` are callbacks in every front end ever written
 /// and were each accepted here, because `handle` is a prefix of `handler` and the second factor
 /// accepted the same prefix again.
+///
+/// It must also name the logging subsystem itself. Structural adjectives such as `Abstract`,
+/// `Default`, `Processing`, `Interface`, and `Fallback` occur on handlers in every domain. Treating
+/// one as a record-pipeline subject let `DefaultHandler.process` in an HTTP subsystem combine with
+/// a real `Logger.addRecord` citation and close the whole logging flow. A proof-bearing handler
+/// anchor therefore says both whose handler it is (`LogHandler`, `LoggerHandler`,
+/// `LogRecordHandler`) and which processing step it owns.
 pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && belongs_to_record_pipeline(citation) && {
+    owns_behavior(citation) && belongs_to_logging(citation) && {
         let tokens = name_tokens(citation);
         let names_a_handler = has_token(&tokens, &["handler", "handlers"]);
         let only_registers = has_token(
@@ -1390,7 +1355,7 @@ mod tests {
             );
         }
         assert!(citation_owns_log_handler_processing(&citation(
-            "AbstractProcessingHandler.write",
+            "LogProcessingHandler.write",
             "src/logging/Handler.php",
             NodeKind::METHOD
         )));
