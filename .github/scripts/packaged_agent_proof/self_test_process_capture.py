@@ -215,8 +215,10 @@ time.sleep(10)
             require(
                 error.cmd == command
                 and error.timeout == 1
-                and error.stdout == b"timeout-stdout-sentinel\n"
-                and error.stderr == b"timeout-stderr-sentinel\n",
+                and error.stdout
+                == f"timeout-stdout-sentinel{os.linesep}".encode()
+                and error.stderr
+                == f"timeout-stderr-sentinel{os.linesep}".encode(),
                 "file-backed capture changed timeout identity or retained output",
             )
         else:
