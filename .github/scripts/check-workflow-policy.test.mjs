@@ -3178,9 +3178,14 @@ test("release freeze policy pins live PR base and support ancestry revalidation"
         'gh(["api", `repos/${repository}/pulls/${number}`])',
         "JSON.parse('{}')",
       )],
+    ["release base lookup stops using the live integration ref", value =>
+      value.replace(
+        "`repos/${repository}/git/ref/heads/dev/codestory-next`",
+        "`repos/${repository}/git/commits/${pr.base.sha}`",
+      )],
     ["release PR head stops proving it contains the current dev base", value =>
       value.replace(
-        "`repos/${repository}/compare/${pr.base.sha}...${commit}`",
+        "`repos/${repository}/compare/${liveBaseCommit}...${commit}`",
         "`repos/${repository}/commits/${commit}`",
       )],
     ["verification stops detecting a base advance", value =>

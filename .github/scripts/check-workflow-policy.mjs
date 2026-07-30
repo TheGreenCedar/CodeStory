@@ -8033,8 +8033,13 @@ export function releaseFreezeBarrierWorkflowViolations(
   add(
     violations,
     barrierSource.includes('gh(["api", `repos/${repository}/pulls/${number}`])')
-      && barrierSource.includes("`repos/${repository}/compare/${pr.base.sha}...${commit}`")
-      && barrierSource.includes("base_commit: pr.base.sha")
+      && barrierSource.includes(
+        "`repos/${repository}/git/ref/heads/dev/codestory-next`",
+      )
+      && barrierSource.includes(
+        "`repos/${repository}/compare/${liveBaseCommit}...${commit}`",
+      )
+      && barrierSource.includes("base_commit: liveBaseCommit")
       && barrierSource.includes("const currentReleasePr = releasePr(")
       && barrierSource.includes(
         "currentReleasePr.base_commit !== receipt?.release_pr?.base_commit",

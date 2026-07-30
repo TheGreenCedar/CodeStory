@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -361,6 +361,101 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
     result.stderr,
     /canonical release freeze receipt may be produced only by workflow_dispatch/u,
   );
+});
+
+test("record-actions-receipt rejects a PR whose snapshot omits the live dev head", () => {
+  const sandbox = mkdtempSync(path.join(tmpdir(), "codestory-freeze-stale-base-"));
+  const root = path.join(sandbox, "repo");
+  mkdirSync(root);
+  execFileSync("git", ["init", "-q", "-b", "codex/release", root]);
+  execFileSync("git", ["-C", root, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", root, "config", "user.name", "Test"]);
+  writeFileSync(path.join(root, "tracked.txt"), "candidate\n");
+  execFileSync("git", ["-C", root, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", root, "commit", "-qm", "candidate"]);
+  const commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const tree = execFileSync("git", ["-C", root, "rev-parse", "HEAD^{tree}"], {
+    encoding: "utf8",
+  }).trim();
+  const staleBase = "a".repeat(40);
+  const liveBase = "b".repeat(40);
+  const fakeGh = path.join(sandbox, "gh");
+  writeFileSync(
+    fakeGh,
+    `#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/pulls/1597" ]; then
+  printf '%s\\n' '{"number":1597,"state":"open","base":{"ref":"dev/codestory-next","sha":"${staleBase}"},"head":{"ref":"codex/release","sha":"${commit}","repo":{"full_name":"${REPOSITORY}"}}}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/git/ref/heads/dev/codestory-next" ]; then
+  printf '%s\\n' '{"object":{"sha":"${liveBase}"}}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/compare/${liveBase}...${commit}" ]; then
+  printf '%s\\n' '{"status":"diverged"}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/compare/${staleBase}...${commit}" ]; then
+  printf '%s\\n' '{"status":"ahead"}'
+  exit 0
+fi
+if [ "$1 $2" = "run list" ]; then
+  printf '%s\\n' '[]'
+  exit 0
+fi
+exit 9
+`,
+  );
+  chmodSync(fakeGh, 0o755);
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "record-actions-receipt",
+      "--repo",
+      root,
+      "--repository",
+      REPOSITORY,
+      "--branch",
+      "codex/release",
+      "--commit",
+      commit,
+      "--tree",
+      tree,
+      "--release-pr",
+      "1597",
+      "--output",
+      path.join(root, "receipt.json"),
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
+      "--support-prs-json",
+      "[]",
+      "--reusable-evidence-json",
+      "[]",
+      "--invalidated-evidence-json",
+      "[]",
+      "--cancelled-runs-json",
+      "[]",
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "true",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        PATH: `${sandbox}${path.delimiter}${process.env.PATH}`,
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not contain current dev base/u);
 });
 
 test("cancel-superseded rejects a cancellation request that leaves the run active", () => {

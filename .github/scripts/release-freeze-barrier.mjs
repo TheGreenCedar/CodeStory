@@ -431,13 +431,18 @@ function supportPr(repository, number, commit, repo) {
 
 function releasePr(repository, number, { branch, commit }) {
   const pr = JSON.parse(gh(["api", `repos/${repository}/pulls/${number}`]));
+  const liveBaseRef = JSON.parse(gh([
+    "api",
+    `repos/${repository}/git/ref/heads/dev/codestory-next`,
+  ]));
+  const liveBaseCommit = liveBaseRef?.object?.sha;
   if (
     pr.state !== "open"
     || pr?.base?.ref !== "dev/codestory-next"
     || pr?.head?.ref !== branch
     || pr?.head?.sha !== commit
     || pr?.head?.repo?.full_name !== repository
-    || !/^[0-9a-f]{40}$/u.test(String(pr?.base?.sha ?? ""))
+    || !/^[0-9a-f]{40}$/u.test(String(liveBaseCommit ?? ""))
   ) {
     fail(
       `release PR #${number} must be an open same-repository ${branch} -> `
@@ -446,17 +451,17 @@ function releasePr(repository, number, { branch, commit }) {
   }
   const comparison = JSON.parse(gh([
     "api",
-    `repos/${repository}/compare/${pr.base.sha}...${commit}`,
+    `repos/${repository}/compare/${liveBaseCommit}...${commit}`,
   ]));
   if (!["ahead", "identical"].includes(comparison?.status)) {
     fail(
-      `release PR #${number} head ${commit} does not contain current dev base ${pr.base.sha}`,
+      `release PR #${number} head ${commit} does not contain current dev base ${liveBaseCommit}`,
     );
   }
   return {
     number: pr.number,
     base: pr.base.ref,
-    base_commit: pr.base.sha,
+    base_commit: liveBaseCommit,
     head: pr.head.ref,
     head_commit: pr.head.sha,
   };
