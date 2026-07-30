@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   admitCandidateArchive,
@@ -286,6 +286,45 @@ test("admission and a later hit materialize the complete exact payload as fresh 
       assert.equal(statSync(restoredFile).nlink, 1);
       assert.notEqual(restoredFile, storedPayloadPath(fixture, companion.relative_path));
     }
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test("admission rejects sequential publication beneath the final store key", async () => {
+  const fixture = createFixture();
+  try {
+    const source = readFileSync(SCRIPT, "utf8");
+    const atomicPublication = "      renameSync(temporary, paths.entry);";
+    assert.equal(
+      source.split(atomicPublication).length - 1,
+      1,
+      "atomic store publication must have one mutation target",
+    );
+    const sequentialPublication = [
+      "      mkdirSync(paths.entry, { mode: 0o700 });",
+      "      renameSync(temporaryPayload, paths.payload);",
+      "      renameSync(path.join(temporary, RECORD_FILE), paths.recordFile);",
+      "      rmSync(temporary, { recursive: true });",
+    ].join("\n");
+    const mutantFile = path.join(fixture.root, "candidate-archive-store-mutant.mjs");
+    writeFileSync(
+      mutantFile,
+      source.replace(atomicPublication, sequentialPublication),
+      { flag: "wx" },
+    );
+    const mutant = await import(pathToFileURL(mutantFile).href);
+    assert.throws(
+      () => mutant.admitCandidateArchive({
+        inputRoot: fixture.inputRoot,
+        outputDir: outputDir(fixture),
+        outputRoot: fixture.outputRoot,
+        record: fixture.record,
+        storeRoot: fixture.storeRoot,
+      }),
+      /not published by atomic directory rename/u,
+    );
+    assert.equal(statExists(outputDir(fixture)), false);
   } finally {
     cleanup(fixture);
   }
