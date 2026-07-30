@@ -3214,6 +3214,53 @@ test("release freeze barrier rejects every broad-proof bypass", async (t) => {
       );
       step.shell = "pwsh";
     }, /protected blocking Windows native probe/u],
+    ["Windows probe restores inline JavaScript", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(
+        "node $identityScriptPath $rootExe $depsExe",
+        "node -e $identityScript $rootExe $depsExe",
+      );
+    }, /Run exact-head Windows native probe/u],
+    ["Windows probe loses the literal owned path write", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(
+        "Set-Content -LiteralPath $identityScriptPath",
+        "Set-Content -Path $identityScriptPath",
+      );
+    }, /Run exact-head Windows native probe/u],
+    ["Windows probe loses explicit UTF-8 encoding", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(" -Encoding UTF8", "");
+    }, /Run exact-head Windows native probe/u],
+    ["Windows probe writes the script to a stale fixed path", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(
+        '$identityScriptPath = Join-Path $probeRoot "verify-hardlink-identity.cjs"',
+        '$identityScriptPath = "C:\\Temp\\verify-hardlink-identity.cjs"',
+      );
+    }, /Run exact-head Windows native probe/u],
+    ["Windows probe restores inline argv indexing", workflows => {
+      const step = draftStep(
+        workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],
+        "Run exact-head Windows native probe",
+      );
+      step.run = step.run.replace(
+        "process.argv.slice(2)",
+        "process.argv.slice(1)",
+      );
+    }, /Run exact-head Windows native probe/u],
     ["Windows probe restores a full build", workflows => {
       const step = draftStep(
         workflows.get("source-proof.yml").jobs["freeze-windows-native-probe"],

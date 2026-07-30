@@ -8757,12 +8757,26 @@ export function releaseFreezeBarrierWorkflowViolations(
       "cargo new --quiet --bin",
       "cargo build --release --quiet",
       "node --test .github/scripts/cargo-build-artifacts.test.mjs",
+      "const [root, deps] = process.argv.slice(2);",
       "left.dev !== right.dev",
       "left.ino !== right.ino",
       "left.nlink !== 2n",
       "right.nlink !== 2n",
+      '$identityScriptPath = Join-Path $probeRoot "verify-hardlink-identity.cjs"',
+      "Set-Content -LiteralPath $identityScriptPath -Value $identityScript -Encoding UTF8",
+      "node $identityScriptPath $rootExe $depsExe",
       "Elapsed.TotalSeconds -ge 90",
       "Remove-Item -LiteralPath $probeRoot -Recurse -Force",
+    ],
+  );
+  forbidStepRun(
+    violations,
+    "source-proof.yml",
+    windowsJob,
+    acceptance.windows_step,
+    [
+      "node -e $identityScript",
+      "process.argv.slice(1)",
     ],
   );
 

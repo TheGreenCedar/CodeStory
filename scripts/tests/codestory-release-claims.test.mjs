@@ -180,7 +180,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
       status_creator: "github-actions[bot]",
       job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
       job_manifest_sha256:
-        "2850e1897954e54762ef3f9ec7ad2b7c15af901a3617377640fb439d3f06c964",
+        "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
       phases: {
         calibration_source: {
           known_future_source_changes: [
