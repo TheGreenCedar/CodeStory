@@ -3076,23 +3076,43 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
     "producer-map",
     "--phase pre_publish",
-    "artifact_ids",
     "bash .github/scripts/collect-actions-job-evidence.sh",
     "--job-evidence target/release-closeout/job-evidence.json",
   ]);
-  const preDownload = namedStep(preCloseout, "Download selected pre-publish release cells");
+  const preDownload = namedStep(
+    preCloseout,
+    "Download and verify selected pre-publish release cells",
+  );
   add(
     violations,
-    preDownload?.uses === "actions/download-artifact@v8.0.1"
-      && object(preDownload.with)["artifact-ids"] === "${{ steps.pre-publish-provenance.outputs.artifact_ids }}"
-      && object(preDownload.with)["merge-multiple"] === false,
-    `${releaseFile} pre-publish closeout must download selected Actions artifact ids without flattening`,
+    preDownload?.uses === undefined && preDownload?.shell === "bash",
+    `${releaseFile} pre-publish closeout must materialize exact Actions artifact ids in blocking shell`,
   );
-  requireStepRun(violations, releaseFile, preCloseout, "Verify selected pre-publish artifact container digests", [
-    "/actions/artifacts/$artifact_id/zip",
-    "sha256sum",
-    "test \"$actual_digest\" = \"$expected_digest\"",
-  ]);
+  requireStepRun(
+    violations,
+    releaseFile,
+    preCloseout,
+    "Download and verify selected pre-publish release cells",
+    [
+      "test \"$(jq -r '.artifacts | length' \"$producer_map\")\" -gt 0",
+      ".artifacts[] | [.id, .name, .digest] | @tsv",
+      'destination="target/release-cell-manifests/$artifact_name"',
+      "test ! -e \"$destination\"",
+      "/actions/artifacts/$artifact_id/zip",
+      "sha256sum",
+      "test \"$actual_digest\" = \"$expected_digest\"",
+      "unzip -q \"$archive\" -d \"$destination\"",
+      "test -d \"target/release-cell-manifests/$artifact_name\"",
+    ],
+  );
+  add(
+    violations,
+    !list(preCloseout.steps).some(
+      (step) => object(step).uses === "actions/download-artifact@v8.0.1"
+        && object(step).with["artifact-ids"] !== undefined,
+    ),
+    `${releaseFile} pre-publish closeout must not filter mixed-run artifact ids through one Actions run`,
+  );
   requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
     "--trusted-producers",
     "codestory-release-closeout.mjs evaluate",
