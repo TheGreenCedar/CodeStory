@@ -22,24 +22,51 @@ from .foundation import (
 
 def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> dict:
     started = time.perf_counter()
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-    )
+    # A packaged worker can start the resident embedding server and then exit.
+    # Pipe capture makes communicate() wait for EOF from that descendant too,
+    # even though the direct worker has finished. Regular files retain the same
+    # output while letting subprocess.run() wait only for the process it owns.
+    with (
+        tempfile.TemporaryFile(mode="w+", encoding=None) as stdout_capture,
+        tempfile.TemporaryFile(mode="w+", encoding=None) as stderr_capture,
+    ):
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=stdout_capture,
+                stderr=stderr_capture,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout_capture.flush()
+            stderr_capture.flush()
+            stdout_capture.buffer.seek(0)
+            stderr_capture.buffer.seek(0)
+            stdout = stdout_capture.buffer.read()
+            stderr = stderr_capture.buffer.read()
+            # TimeoutExpired retains raw bytes even when subprocess text mode
+            # is enabled. Preserve that public shape as well as the output.
+            error.timeout = timeout
+            error.stdout = stdout or None
+            error.stderr = stderr or None
+            raise
+        stdout_capture.seek(0)
+        stderr_capture.seek(0)
+        stdout = stdout_capture.read()
+        stderr = stderr_capture.read()
     result = {
         "command": command,
         "exit_code": completed.returncode,
         "wall_ms": round((time.perf_counter() - started) * 1000, 3),
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
     }
     if completed.returncode != 0:
-        stdout_tail = completed.stdout[-2000:].strip()
-        stderr_tail = completed.stderr[-2000:].strip()
+        stdout_tail = stdout[-2000:].strip()
+        stderr_tail = stderr[-2000:].strip()
         details = "\n".join(
             part
             for part in (
@@ -143,11 +170,16 @@ class McpProcess:
         assert self.process.stderr
         self.stderr.extend(self.process.stderr.readlines())
 
-    def send(self, request: dict) -> dict:
+    def send(self, request: dict, deadline: float | None = None) -> dict:
         assert self.process.stdin
         self.process.stdin.write(json.dumps(request) + "\n")
         self.process.stdin.flush()
-        deadline = time.monotonic() + self.timeout
+        # A caller that already owns a bound threads it in; otherwise this call owns its own.
+        # Minting a fresh full budget underneath a caller's deadline is how a readiness loop
+        # burns several times the declared timeout: the loop only re-checks its bound between
+        # transport waits, so one late request can add another whole timeout past it.
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
         while True:
             remaining = deadline - time.monotonic()
             require(remaining > 0, f"MCP request timed out: {request.get('id')}")
@@ -238,14 +270,21 @@ class McpProcess:
             uri,
         )
 
-    def tool(self, name: str, arguments: dict, request_id: str) -> dict:
+    def tool(
+        self,
+        name: str,
+        arguments: dict,
+        request_id: str,
+        deadline: float | None = None,
+    ) -> dict:
         response = self.send(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments},
-            }
+            },
+            deadline=deadline,
         )
         require("error" not in response, f"MCP {name} failed: {response.get('error')}")
         return response
@@ -255,13 +294,20 @@ class McpProcess:
         name: str,
         arguments: dict,
         request_id: str,
+        deadline: float | None = None,
     ) -> tuple[dict, int]:
-        deadline = time.monotonic() + self.timeout
+        # A caller that already owns a bound threads it in; otherwise this call owns its own.
+        # The same bound has to reach the transport, or each retry's request mints a fresh
+        # budget and the readiness loop overruns whatever deadline it was handed.
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
         attempt = 0
         while True:
             attempt += 1
             self.tool_attempt_counts[request_id] = attempt
-            response = self.tool(name, arguments, f"{request_id}-{attempt}")
+            response = self.tool(
+                name, arguments, f"{request_id}-{attempt}", deadline=deadline
+            )
             result = response.get("result")
             require(
                 isinstance(result, dict),
@@ -331,7 +377,7 @@ class McpProcess:
                 request_id if poll == 1 else f"{request_id}-degraded-{poll}"
             )
             response, attempts = self.tool_until_ready(
-                "search", arguments, poll_request_id
+                "search", arguments, poll_request_id, deadline=deadline
             )
             total_attempts += attempts
             self.tool_attempt_counts[request_id] = total_attempts

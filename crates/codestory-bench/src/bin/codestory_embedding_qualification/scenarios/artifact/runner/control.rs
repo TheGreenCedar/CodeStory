@@ -4,8 +4,8 @@ use super::super::{
 };
 use super::analysis::{control_key, elapsed, same_server_authority, validated_idle_epoch};
 use super::process::{
-    existing_control_events, load_establishment_timeout, qualification_command_path,
-    qualification_nonce, query_parameters, require_worker_success,
+    existing_control_events_for_nonce, load_establishment_timeout, qualification_command_path,
+    query_parameters, require_worker_success,
 };
 use super::{ControlCommand, ControlCommandParameters, ScenarioRunner, WorkerOutput};
 use crate::qualification::output::write_atomic_json;
@@ -265,7 +265,7 @@ impl<'a> ScenarioRunner<'a> {
 
     pub(super) fn control(&mut self, action: &str, class: Option<&str>) -> Result<ControlEvent> {
         let command_path =
-            qualification_command_path(self.context.output_directory, &qualification_nonce()?);
+            qualification_command_path(self.context.output_directory, &self.qualification_nonce);
         let wait_started = self.clock.now_ns();
         while command_path.exists() {
             if elapsed(&self.clock, wait_started) >= CONTROL_TIMEOUT {
@@ -287,9 +287,12 @@ impl<'a> ScenarioRunner<'a> {
         let event_result = (|| -> Result<ControlEvent> {
             let started = self.clock.now_ns();
             loop {
-                if let Some(event) = existing_control_events(self.context.output_directory)?
-                    .into_iter()
-                    .find(|event| event.sequence == self.next_sequence)
+                if let Some(event) = existing_control_events_for_nonce(
+                    self.context.output_directory,
+                    &self.qualification_nonce,
+                )?
+                .into_iter()
+                .find(|event| event.sequence == self.next_sequence)
                 {
                     return Ok(event);
                 }

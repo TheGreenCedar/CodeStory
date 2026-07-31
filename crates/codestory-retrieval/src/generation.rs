@@ -1,13 +1,11 @@
 #[cfg(test)]
 use codestory_contracts::graph::NodeKind;
 use codestory_store::{RetrievalIndexManifest, Store};
-use std::collections::BTreeMap;
 
 pub const SIDECAR_SCHEMA_VERSION: i32 = 6;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v2";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
-const STALENESS_DOC_BATCH_SIZE: usize = 1024;
 
 pub fn sidecar_generation_id(project_id: &str, sidecar_input_hash: &str) -> String {
     let suffix = sidecar_input_hash.chars().take(16).collect::<String>();
@@ -112,7 +110,10 @@ pub fn manifest_staleness_reason_for_runtime(
         .dense_projection_count
         .or(manifest.projection_count)
     {
-        match collect_dense_anchor_stats(storage) {
+        // Aggregate, never paged rows: this scan is on every observational
+        // readiness and status call, and paging `DenseAnchorInput`s here
+        // materialized every anchor's `document_text` just to count them.
+        match storage.dense_anchor_input_stats() {
             Ok(stats) => {
                 if expected_count > 0 && stats.doc_count == 0 {
                     return Some(
@@ -132,7 +133,7 @@ pub fn manifest_staleness_reason_for_runtime(
                     ));
                 }
                 if let Some(expected_reasons) = manifest.dense_reason_counts_json.as_deref() {
-                    let actual_reasons = serde_json::to_string(&stats.dense_reason_counts)
+                    let actual_reasons = serde_json::to_string(&stats.selection_reason_counts)
                         .unwrap_or_else(|_| "{}".into());
                     if actual_reasons != expected_reasons {
                         return Some(format!(
@@ -170,6 +171,55 @@ pub fn manifest_unavailable_reason_for_runtime(
         .map(|reason| format!("retrieval_manifest_stale: {reason}"))
 }
 
+/// The incomplete-incremental-run refusal, named once.
+///
+/// Strict sidecar admission checks this before anything else and unconditionally
+/// — before the manifest-contract early return — so an interrupted incremental
+/// index refuses even while the manifest, counts, and mtimes still agree. It is
+/// re-exported through `storage_admission_refusal_reason_for_runtime` so a
+/// `&Store`-only caller outside this crate gates on the same marker rather than
+/// re-deriving one of its own.
+pub(crate) fn incomplete_incremental_run_reason(storage: &Store) -> Option<String> {
+    match storage.has_incomplete_incremental_run() {
+        Ok(true) => Some("incomplete_incremental_index_run".into()),
+        Ok(false) => None,
+        Err(error) => Some(format!(
+            "incomplete_incremental_index_marker_unavailable: {error}"
+        )),
+    }
+}
+
+/// Every sidecar-admission refusal a caller holding only `&Store` can re-derive.
+///
+/// This is deliberately **not** all of admission. `SidecarQuery::begin` refuses
+/// on two independent gates: this one, and
+/// `validate_strict_sidecar_readiness_for_runtime`, which is `pub(crate)` here
+/// and structurally unreachable from other crates because it additionally needs
+/// the storage path, the project root's workspace manifest, and a producer
+/// compatibility identity. The reasons only that second gate can raise are
+/// `sidecar_symbol_docs_mixed_embedding_backends`,
+/// `sidecar_symbol_doc_embedding_backend_changed`,
+/// `indexed_file_error_retry_required`,
+/// `indexable_file_added_or_changed_after_retrieval_manifest`,
+/// `indexed_file_removed_after_retrieval_manifest`, and
+/// `sidecar_input_hash_changed`. A caller of this function is therefore
+/// *conservative-agreeing* with admission, not equal to it: everything this
+/// refuses, admission also refuses, but admission can still refuse more.
+/// Callers that must not over-claim readiness need that direction; callers
+/// needing exact parity have to go through `retrieval status`, which runs the
+/// strict gate.
+pub fn storage_admission_refusal_reason_for_runtime(
+    project_id: &str,
+    storage: &Store,
+    manifest: &RetrievalIndexManifest,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<String> {
+    if let Some(reason) = incomplete_incremental_run_reason(storage) {
+        return Some(format!("retrieval_manifest_stale: {reason}"));
+    }
+    manifest_unavailable_reason_for_runtime(project_id, storage, manifest, runtime)
+}
+
 pub fn manifest_sidecar_generation(manifest: &RetrievalIndexManifest) -> &str {
     manifest
         .sidecar_generation
@@ -195,62 +245,6 @@ pub(crate) fn sidecar_semantic_node_kind(kind: NodeKind) -> bool {
             | NodeKind::CONSTANT
             | NodeKind::ENUM_CONSTANT
     )
-}
-
-#[derive(Default)]
-struct DenseAnchorStats {
-    doc_count: u32,
-    policy_version: Option<String>,
-    dense_reason_counts: BTreeMap<String, u32>,
-    mixed_policy_versions: bool,
-}
-
-fn collect_dense_anchor_stats(storage: &Store) -> Result<DenseAnchorStats, String> {
-    let mut stats = DenseAnchorStats::default();
-    let mut first_policy: Option<Option<String>> = None;
-    let mut after = None;
-
-    loop {
-        let anchors = storage
-            .get_dense_anchor_inputs_batch_after(after, STALENESS_DOC_BATCH_SIZE)
-            .map_err(|error| error.to_string())?;
-        if anchors.is_empty() {
-            break;
-        }
-        after = anchors.last().map(|anchor| anchor.node_id);
-        for anchor in anchors {
-            stats.doc_count = stats.doc_count.saturating_add(1);
-            observe_optional_string(
-                &mut first_policy,
-                &mut stats.policy_version,
-                &mut stats.mixed_policy_versions,
-                Some(&anchor.policy_version),
-            );
-            *stats
-                .dense_reason_counts
-                .entry(anchor.selection_reason)
-                .or_insert(0) += 1;
-        }
-    }
-
-    Ok(stats)
-}
-
-fn observe_optional_string(
-    first: &mut Option<Option<String>>,
-    value: &mut Option<String>,
-    mixed: &mut bool,
-    current: Option<&str>,
-) {
-    let current = current.map(str::to_string);
-    match first {
-        Some(first) if first != &current => *mixed = true,
-        Some(_) => {}
-        None => {
-            *value = current.clone();
-            *first = Some(current);
-        }
-    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,8 @@ developer shell, use `CMAKE_GENERATOR=Ninja` when the nested Vulkan shader build
 selects MSBuild, and keep the worktree path short enough for CMake's object-path
 limit. On macOS, CodeStory development supports macOS 15 or later and requires
 the Xcode Command Line Tools. Apple Silicon is the protected Metal cell; Intel
-Mac development uses explicit CPU operation and never claims Metal.
+Mac development can run source-only checks but cannot exercise or prove broad
+retrieval. CPU-only hosts are unsupported.
 
 Debug Rust builds compile without embedding the release model. Prepare the
 checksum-pinned model explicitly before a release build, then pass the printed
@@ -184,13 +185,13 @@ Useful diagnostic policies:
 
 | Variable | Purpose |
 | --- | --- |
-| `CODESTORY_EMBED_ALLOW_CPU=1` | Explicit hosted-CI or maintainer CPU operation; never an acceleration claim |
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Broader all-symbol diagnostic document set |
 | `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias|current_alias` | Reproduce nondefault alias experiments; default is compact `alias_variant` |
 | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=<n>` | Embedding batch-size experiment |
 
 Hash embeddings and lexical-only modes are diagnostics, not agent-facing full
-retrieval.
+retrieval. CPU embeddings are unsupported; supported broad retrieval requires
+Metal or Vulkan acceleration.
 
 ## Cache reuse across worktrees
 

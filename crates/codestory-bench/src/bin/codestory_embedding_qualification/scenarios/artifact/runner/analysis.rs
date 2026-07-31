@@ -42,7 +42,19 @@ pub(super) fn scheduler_values(snapshot: &EmbeddingServerSnapshot) -> BTreeMap<S
 }
 
 pub(super) fn completed_token_count(directory: &Path, request_id: &str) -> Result<u64> {
-    existing_control_events(directory)?
+    completed_token_count_for_nonce(
+        directory,
+        request_id,
+        &super::process::qualification_nonce()?,
+    )
+}
+
+pub(super) fn completed_token_count_for_nonce(
+    directory: &Path,
+    request_id: &str,
+    nonce: &str,
+) -> Result<u64> {
+    super::process::existing_control_events_for_nonce(directory, nonce)?
         .into_iter()
         .rev()
         .find_map(|event| {

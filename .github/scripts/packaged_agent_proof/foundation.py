@@ -141,10 +141,23 @@ def resource_uri_matches(
         return False
 
 
-EXTERNAL_QUALIFICATION_METRICS = {
-    "retrieval_quality",
-    "total_codestory_process_memory",
-}
+REQUIRED_QUALIFICATION_METRICS = frozenset(
+    {
+        "backend_observed_accelerator_residency",
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+        "busy_retry_usefulness",
+        "cold_first_vector",
+        "existing_owner_connect",
+        "first_product_ready",
+        "spawn_convergence",
+        "total_codestory_process_memory",
+        "true_idle_exit",
+        "warm_bulk_ipc",
+        "warm_query_ipc",
+    }
+)
+EXTERNAL_QUALIFICATION_METRICS = {"total_codestory_process_memory"}
 MEASUREMENT_PROTOCOL = (
     REPOSITORY_ROOT
     / "crates"
@@ -220,6 +233,84 @@ REQUIRED_SERVER_SCENARIOS = {
     "true_idle_respawn",
     "incompatible_owner",
     "frozen_owner",
+}
+REQUIRED_SERVER_SCENARIO_ASSERTIONS = {
+    "client_death": frozenset(
+        {
+            "dead_client_queue_and_leases_reclaimed",
+            "other_client_continues",
+            "no_server_replacement",
+        }
+    ),
+    "cold_race": frozenset(
+        {
+            "two_independent_plugin_hosts",
+            "same_os_account",
+            "different_repositories",
+            "one_lifetime_authority",
+            "one_listener",
+            "one_server",
+            "one_engine_owner",
+            "one_native_worker",
+            "one_load_generation",
+            "one_model_load",
+        }
+    ),
+    "frozen_owner": frozenset(
+        {
+            "owner_unresponsive_is_bounded",
+            "authority_retained",
+            "no_unlink",
+            "no_pid_kill",
+            "no_takeover",
+            "no_second_engine",
+        }
+    ),
+    "incompatible_owner": frozenset(
+        {
+            "idle_owner_drains",
+            "active_owner_returns_typed_retry",
+            "one_authority",
+            "one_engine_maximum",
+        }
+    ),
+    "mixed_queue": frozenset(
+        {
+            "query_and_bulk_capacities_are_64",
+            "fifo_within_each_class",
+            "query_preferred_between_bulk_batches",
+            "bulk_resumes_when_query_queue_permits",
+            "no_project_or_scope_round_robin",
+            "typed_retry_names_useful_condition",
+            "no_project_or_request_text_leakage",
+        }
+    ),
+    "server_crash": frozenset(
+        {
+            "one_replacement_server",
+            "pure_embedding_rpc_replayed_at_most_once",
+            "lost_publication_lease_blocks_commit",
+            "previous_publication_remains_usable",
+        }
+    ),
+    "true_idle_respawn": frozenset(
+        {
+            "queued_active_and_leased_work_prevent_exit",
+            "idle_connections_and_diagnostics_do_not_extend_idle",
+            "exit_after_60000_awake_ms",
+            "next_product_operation_respawns_without_consent",
+            "verified_materialization_reused",
+        }
+    ),
+    "worker_stall": frozenset(
+        {
+            "independent_watchdog_fail_stops_server",
+            "unrelated_process_survives",
+            "pure_embedding_rpc_replayed_at_most_once",
+            "lost_publication_lease_blocks_commit",
+            "previous_publication_remains_usable",
+        }
+    ),
 }
 LOWER_TIER_NONCLAIMS = {
     "answer_quality",

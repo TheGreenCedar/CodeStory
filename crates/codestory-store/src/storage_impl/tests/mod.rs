@@ -3173,6 +3173,127 @@ fn dense_anchor_inputs_round_trip_prune_and_copy_with_node_ownership() -> Result
 }
 
 #[test]
+fn dense_anchor_input_stats_aggregate_without_reading_document_text() -> Result<(), StorageError> {
+    // Regression: retrieval staleness derived these four numbers by paging
+    // `get_dense_anchor_inputs_batch_after`, which SELECTs `document_text` and
+    // builds a full `DenseAnchorInput` per anchor. That scan sits on
+    // observational readiness and status calls (project open, retrieval_state,
+    // grounding snapshots), so on a large repository every status call
+    // allocated the whole corpus of anchor documents just to count rows. The
+    // aggregate must answer from the grouped scan and never touch the document
+    // column.
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        file_node(700, "src/lib.rs"),
+        Node {
+            id: NodeId(701),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "function_701".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(702),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "function_702".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(703),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "function_703".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+    ])?;
+    let mut entrypoint = dense_anchor(703, Some(700), "core:g1:r1");
+    entrypoint.selection_reason = "entrypoint".to_string();
+    // A document large enough that materializing it is the dominant cost.
+    entrypoint.text = "x".repeat(64 * 1024);
+    storage.upsert_dense_anchor_inputs_batch(&[
+        dense_anchor(701, Some(700), "core:g1:r1"),
+        dense_anchor(702, Some(700), "core:g1:r1"),
+        entrypoint,
+    ])?;
+
+    let document_reads = Arc::new(AtomicUsize::new(0));
+    let anchor_reads = Arc::new(AtomicUsize::new(0));
+    let observed_documents = Arc::clone(&document_reads);
+    let observed_anchors = Arc::clone(&anchor_reads);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if let AuthAction::Read {
+                table_name,
+                column_name,
+                ..
+            } = context.action
+                && table_name == "dense_anchor_input"
+            {
+                observed_anchors.fetch_add(1, AtomicOrdering::SeqCst);
+                if column_name == "document_text" {
+                    observed_documents.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }
+            Authorization::Allow
+        }))?;
+
+    let stats = storage.dense_anchor_input_stats()?;
+    assert!(
+        anchor_reads.load(AtomicOrdering::SeqCst) > 0,
+        "the authorizer must actually observe the aggregate's column reads"
+    );
+    assert_eq!(
+        document_reads.load(AtomicOrdering::SeqCst),
+        0,
+        "the staleness aggregate must never read anchor document text"
+    );
+
+    // The row-paging path staleness used to take does read it, so the
+    // assertion above is a real difference and not a vacuous one.
+    document_reads.store(0, AtomicOrdering::SeqCst);
+    let rows = storage.get_dense_anchor_inputs_batch_after(None, 1024)?;
+    assert_eq!(rows.len(), 3);
+    assert!(
+        document_reads.load(AtomicOrdering::SeqCst) > 0,
+        "paging anchor rows reads document text — that is the cost being avoided"
+    );
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+
+    // ...and the aggregate still reports exactly what a row scan would.
+    assert_eq!(stats.doc_count, 3);
+    assert_eq!(stats.policy_version.as_deref(), Some("dense-anchor-v1"));
+    assert!(!stats.mixed_policy_versions);
+    assert_eq!(
+        stats.selection_reason_counts,
+        BTreeMap::from([
+            ("public_symbol".to_string(), 2u32),
+            ("entrypoint".to_string(), 1u32),
+        ])
+    );
+
+    // A second policy version anywhere in the table is the mixed signal, and
+    // the reported version stays the one at the lowest node id.
+    let mut drifted = dense_anchor(702, Some(700), "core:g1:r1");
+    drifted.policy_version = "dense-anchor-v2".to_string();
+    storage.upsert_dense_anchor_inputs_batch(&[drifted])?;
+    let stats = storage.dense_anchor_input_stats()?;
+    assert!(stats.mixed_policy_versions);
+    assert_eq!(stats.policy_version.as_deref(), Some("dense-anchor-v1"));
+    assert_eq!(stats.doc_count, 3);
+
+    assert_eq!(
+        Storage::new_in_memory()?.dense_anchor_input_stats()?,
+        DenseAnchorInputStats::default(),
+        "an unpublished store reports zero anchors, not an error"
+    );
+    Ok(())
+}
+
+#[test]
 fn dense_anchor_manifest_rebinds_carry_forward_and_detects_mutation() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[

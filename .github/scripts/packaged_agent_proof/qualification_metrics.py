@@ -14,9 +14,9 @@ from .contract_primitives import (
 from .foundation import require
 from .qualification_measurements import qualification_measurement_artifact
 from .qualification_production_types import (
-    QualificationExternalEvidence,
     QualificationProducerContext,
     QualificationRunnerEvidence,
+    QualificationScenarioEvidence,
 )
 from .runtime_evidence_support import metric_passes
 from .runtime_memory import retain_five_process_memory_evidence
@@ -64,17 +64,35 @@ def _qualification_measurement_sources(
     return measurement, memory
 
 
+def _qualification_cache_state_from_scenarios(
+    runner: QualificationRunnerEvidence,
+    scenarios: QualificationScenarioEvidence,
+) -> str:
+    cache_state = require_nonempty_string(
+        runner.matrix_cell.get("cache_state"),
+        "qualification matrix cache state",
+    )
+    if cache_state == "reused":
+        true_idle = scenarios.scenarios.get("true_idle_respawn")
+        assertions = (
+            true_idle.get("assertions") if isinstance(true_idle, dict) else None
+        )
+        require(
+            isinstance(assertions, dict)
+            and assertions.get("verified_materialization_reused") is True,
+            "qualification reused cache state lacks validated replacement reuse evidence",
+        )
+    return cache_state
+
+
 def _qualification_host(
     context: QualificationProducerContext,
     runner: QualificationRunnerEvidence,
     measurement: dict,
+    *,
+    cache_state: str,
 ) -> dict:
     identity = context.runtime["identity"]
-    cache_state = (
-        "reused"
-        if context.runtime["materialization"]["reused_on_rejoin"] is True
-        else "materialized"
-    )
     residency_state = require_nonempty_string(
         identity["embedding_engine_residency"],
         "runtime engine residency",
@@ -108,16 +126,9 @@ def _qualification_host(
 def _qualification_metric_value(
     metric: str,
     *,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> float | int | None:
-    if metric == "retrieval_quality":
-        return (
-            external.retrieval_quality["publishable_packet_pass_rate"]
-            if external.retrieval_quality is not None
-            else None
-        )
     if metric == "total_codestory_process_memory":
         return memory["value"]
     return measurement["values"][metric]
@@ -126,16 +137,9 @@ def _qualification_metric_value(
 def _qualification_raw_metric_evidence(
     metric: str,
     *,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> dict:
-    if metric == "retrieval_quality":
-        require(
-            external.retrieval_quality is not None,
-            "qualification retrieval quality omitted publishable packet evidence",
-        )
-        return external.retrieval_quality
     if metric == "total_codestory_process_memory":
         return memory["artifact"]
     return measurement["artifact"]
@@ -145,7 +149,6 @@ def _retained_qualification_metric(
     metric: str,
     *,
     context: QualificationProducerContext,
-    external: QualificationExternalEvidence,
     measurement: dict,
     memory: dict,
 ) -> dict:
@@ -153,31 +156,15 @@ def _retained_qualification_metric(
     contract = protocol["metric_contracts"][metric]
     value = _qualification_metric_value(
         metric,
-        external=external,
         measurement=measurement,
         memory=memory,
     )
-    if metric == "retrieval_quality" and value is None:
-        require(
-            context.args.proof_tier == "calibration",
-            "qualification retrieval quality omitted publishable packet evidence",
-        )
-        return {
-            "status": "not_measured",
-            "unit": contract["unit"],
-            "value": None,
-            "reason": (
-                "calibration omitted the separately produced exact-head "
-                "publishable packet artifact"
-            ),
-        }
     require(
         isinstance(value, (int, float)) and not isinstance(value, bool),
         f"qualification metric {metric} is not numeric",
     )
     raw_evidence = _qualification_raw_metric_evidence(
         metric,
-        external=external,
         measurement=measurement,
         memory=memory,
     )
@@ -213,9 +200,13 @@ def _retained_qualification_metric(
 def collect_qualification_measurements(
     context: QualificationProducerContext,
     runner: QualificationRunnerEvidence,
-    external: QualificationExternalEvidence,
+    scenarios: QualificationScenarioEvidence,
 ) -> QualificationMeasurementEvidence:
     measurement, memory = _qualification_measurement_sources(context, runner)
+    cache_state = _qualification_cache_state_from_scenarios(
+        runner,
+        scenarios,
+    )
     timing = {
         "clock_domain": "awake_monotonic",
         "cross_process_timestamp_subtraction": False,
@@ -229,7 +220,6 @@ def collect_qualification_measurements(
         metric: _retained_qualification_metric(
             metric,
             context=context,
-            external=external,
             measurement=measurement,
             memory=memory,
         )
@@ -241,6 +231,11 @@ def collect_qualification_measurements(
         measurement,
         memory,
         timing,
-        _qualification_host(context, runner, measurement),
+        _qualification_host(
+            context,
+            runner,
+            measurement,
+            cache_state=cache_state,
+        ),
         metrics,
     )

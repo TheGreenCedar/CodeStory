@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         default="hosted_package",
     )
     parser.add_argument("--plugin-handoff", action="store_true")
-    parser.add_argument("--engine-policy", choices=("accelerated", "cpu_explicit"))
+    parser.add_argument("--engine-policy", choices=("accelerated",))
     parser.add_argument("--expected-backend")
     parser.add_argument("--qualification-matrix-cell")
     parser.add_argument("--offline", action="store_true")
@@ -54,11 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-behavior-only", action="store_true")
     parser.add_argument("--ground-only", action="store_true")
     parser.add_argument("--publication-fault-evidence", type=Path)
-    parser.add_argument("--retrieval-quality-evidence", type=Path)
     parser.add_argument("--calibration-bundle", type=Path)
     parser.add_argument("--enforce-calibration-freeze-lineage", action="store_true")
-    parser.add_argument("--calibration-run-index", type=int)
-    parser.add_argument("--calibration-run-output", type=Path)
+    parser.add_argument("--collect-constant-calibration", action="store_true")
+    parser.add_argument("--constant-calibration-output-dir", type=Path)
     parser.add_argument("--assemble-calibration-bundle", action="store_true")
     parser.add_argument("--calibration-run", type=Path, action="append", default=[])
     parser.add_argument("--calibration-bundle-output", type=Path)
@@ -98,15 +97,53 @@ def _resolve_optional_paths(args: argparse.Namespace) -> None:
         "qualification_evidence",
         "qualification_driver",
         "publication_fault_evidence",
-        "retrieval_quality_evidence",
         "calibration_bundle",
-        "calibration_run_output",
         "installed_plugin_attestation",
         "installed_plugin_data",
     ):
         value = getattr(args, field)
         if value is not None:
             setattr(args, field, value.resolve())
+    if args.constant_calibration_output_dir is not None:
+        args.constant_calibration_output_dir = (
+            args.constant_calibration_output_dir.resolve()
+        )
+
+
+def _validate_calibration_mode(args: argparse.Namespace) -> None:
+    if args.collect_constant_calibration:
+        require(
+            args.proof_tier == "calibration"
+            and not args.version_only
+            and args.constant_calibration_output_dir is not None
+            and args.qualification_driver is not None
+            and args.engine_policy == "accelerated"
+            and args.offline
+            and args.project is None
+            and args.plugin_root is None
+            and not args.plugin_handoff
+            and not args.additional_project
+            and not args.additional_query
+            and not args.produce_qualification_evidence
+            and args.qualification_evidence is None
+            and args.publication_fault_evidence is None
+            and args.calibration_bundle is None,
+            "constant calibration requires its isolated GPU-only collector and rejects project, plugin, or qualification inputs",
+        )
+        retained_root = args.constant_calibration_output_dir.resolve()
+        proof_root = args.out_dir.resolve()
+        require(
+            retained_root != proof_root
+            and not retained_root.is_relative_to(proof_root)
+            and not proof_root.is_relative_to(retained_root),
+            "constant-calibration retained runs and package proof output must use disjoint directories",
+        )
+    else:
+        require(
+            args.proof_tier != "calibration"
+            and args.constant_calibration_output_dir is None,
+            "the calibration proof tier is valid only for constant-only collection",
+        )
 
 
 def _prepare_proof_arguments(args: argparse.Namespace) -> None:
@@ -118,14 +155,7 @@ def _prepare_proof_arguments(args: argparse.Namespace) -> None:
     args.checksum_file = args.checksum_file.resolve()
     args.out_dir = args.out_dir.resolve()
     _resolve_optional_paths(args)
-    require(
-        (args.calibration_run_output is None) == (args.calibration_run_index is None),
-        "--calibration-run-output and --calibration-run-index must be supplied together",
-    )
-    require(
-        args.calibration_run_output is None or args.proof_tier == "calibration",
-        "calibration run output is valid only for the calibration proof tier",
-    )
+    _validate_calibration_mode(args)
     validate_runtime_claim_scope(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(

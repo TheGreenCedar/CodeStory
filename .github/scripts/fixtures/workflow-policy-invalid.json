@@ -64,8 +64,8 @@
       "workflow": "release.yml",
       "job": "source-proof",
       "field": [
-        "with",
-        "ref"
+        "env",
+        "SOURCE_SHA"
       ],
       "value": "${{ github.ref }}"
     },
@@ -83,18 +83,18 @@
       ]
     },
     {
-      "id": "synchronize-proof-trigger",
+      "id": "support-proof-trigger",
       "class_prefix": "[proof_identity]",
       "workflow": "source-proof.yml",
       "field": [
         "on",
-        "pull_request",
-        "types"
+        "pull_request"
       ],
-      "value": [
-        "labeled",
-        "synchronize"
-      ]
+      "value": {
+        "types": [
+          "labeled"
+        ]
+      }
     },
     {
       "id": "pr-number-only-proof-concurrency",

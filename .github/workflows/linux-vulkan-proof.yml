@@ -45,43 +45,10 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        required: true
-        type: string
-      ref:
-        required: true
-        type: string
-      proof_key:
+      constant_calibration_mode:
+        description: Collect optional Linux Vulkan calibration evidence without feeding assembly.
         required: false
-        type: string
-      package_run_id:
-        description: Upstream packaged-platform run containing codestory-cli-linux-x64.
-        required: true
-        type: string
-      calibration_bundle_artifact:
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        required: false
-        default: ""
-        type: string
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: true
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/packaged-platform-pr.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -93,7 +60,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  route:
+    name: Validate Linux proof dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require an upstream package for standalone protected proof
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CONSTANT_CALIBRATION_MODE: ${{ inputs.constant_calibration_mode }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$CONSTANT_CALIBRATION_MODE" != true ]; then
+            test -n "$PACKAGE_RUN_ID"
+          fi
+
   packaged-vulkan:
+    if: ${{ !inputs.constant_calibration_mode }}
+    needs: route
     name: Packaged Linux Vulkan engine
     runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
     environment: linux-vulkan-proof
@@ -127,15 +113,238 @@ jobs:
       - name: Validate candidate-installed mode
         if: inputs.candidate_installed_proof
         shell: bash
-        run: test "${{ inputs.server_behavior_only }}" = true
+        env:
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: test "$SERVER_BEHAVIOR_ONLY" = true
 
-      - name: Download exact Linux package
+      - name: Authenticate exact Linux candidate artifacts
+        id: candidate-artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id || github.run_id }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: |
+          set -euo pipefail
+          test -n "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
+          case "$CANDIDATE_PRODUCER_WORKFLOW_PATH" in
+            .github/workflows/auto-release.yml | \
+            .github/workflows/release.yml | \
+            .github/workflows/packaged-platform-pr.yml)
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" = \
+              .github/workflows/packaged-platform-pr.yml
+          fi
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID")"
+          test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
+          test "$(jq -r '.head_sha' <<<"$run")" = "$(git rev-parse HEAD)"
+          if [ "$PACKAGE_RUN_ID" = "$GITHUB_RUN_ID" ]; then
+            test "$(jq -r '.run_attempt' <<<"$run")" = "$GITHUB_RUN_ATTEMPT"
+          else
+            test "$(jq -r '.status' <<<"$run")" = completed
+            test "$(jq -r '.conclusion' <<<"$run")" = success
+          fi
+          artifacts="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID/artifacts?per_page=100"
+          )"
+          select_artifact() {
+            local name="$1"
+            jq \
+              --arg name "$name" \
+              --arg sha "$(git rev-parse HEAD)" \
+              --argjson run_id "$PACKAGE_RUN_ID" \
+              '[
+                .artifacts[]
+                | select(
+                    .name == $name
+                    and .expired == false
+                    and .workflow_run.id == $run_id
+                    and .workflow_run.head_sha == $sha
+                  )
+              ] | if length == 1 then .[0] else error("expected one exact candidate artifact") end' \
+              <<<"$artifacts"
+          }
+          artifact="$(select_artifact codestory-cli-linux-x64)"
+          record_artifact="$(
+            select_artifact codestory-candidate-archive-record-linux-x64
+          )"
+          if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            select_artifact codestory-qualification-driver-linux-x64 >/dev/null
+          fi
+          artifact_id="$(jq -r .id <<<"$artifact")"
+          expected_size="$(jq -r .size_in_bytes <<<"$artifact")"
+          expected_digest="$(jq -r .digest <<<"$artifact")"
+          [[ "$artifact_id" =~ ^[0-9]+$ ]]
+          [[ "$expected_size" =~ ^[0-9]+$ ]]
+          [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(jq -r .id <<<"$record_artifact")" =~ ^[0-9]+$ ]]
+          [[ "$(jq -r .size_in_bytes <<<"$record_artifact")" =~ ^[0-9]+$ ]]
+          [[ "$(jq -r .digest <<<"$record_artifact")" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "package-id=$artifact_id"
+            echo "package-bytes=$expected_size"
+            echo "package-sha256=${expected_digest#sha256:}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download authenticated candidate record
         uses: actions/download-artifact@v8.0.1
         with:
-          name: codestory-cli-linux-x64
-          path: target/release-dist
+          name: codestory-candidate-archive-record-linux-x64
+          path: target/candidate-archive-record/linux-x64
           run-id: ${{ inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
+
+      - name: Restore exact candidate archive from protected host
+        id: candidate-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          record=target/candidate-archive-record/linux-x64/candidate-archive-record.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$(git rev-parse HEAD)" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg target linux-x64 \
+            '.repository == $repository
+              and .source.commit == $source_sha
+              and .source.tree == $source_tree
+              and .target == $target' \
+            "$record" >/dev/null
+          store="$RUNNER_TOOL_CACHE/codestory/candidate-archives"
+          mkdir -p "$store" target
+          rm -rf target/release-dist
+          restored="$(
+            node .github/scripts/candidate-archive-store.mjs restore \
+              --record "$record" \
+              --store-root "$store" \
+              --output-root target \
+              --output-dir target/release-dist
+          )"
+          hit="$(jq -r .hit <<<"$restored")"
+          test "$hit" = true || test "$hit" = false
+          finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          elapsed_ms=$(((finished_ns - started_ns) / 1000000))
+          echo "hit=$hit" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Candidate archive transfer"
+            echo
+            echo "- Protected-host cache lookup and verification: ${elapsed_ms} ms"
+            echo "- Cache hit: \`$hit\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download, authenticate, and admit candidate archive on miss
+        if: steps.candidate-cache.outputs.hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.candidate-artifacts.outputs.package-id }}
+          EXPECTED_SIZE: ${{ steps.candidate-artifacts.outputs.package-bytes }}
+          EXPECTED_SHA256: ${{ steps.candidate-artifacts.outputs.package-sha256 }}
+        run: |
+          set -euo pipefail
+          transfer_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          archive="$RUNNER_TEMP/codestory-cli-linux-x64-$ARTIFACT_ID.zip"
+          partial="$archive.partial"
+          download_url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip"
+          rm -f "$archive" "$partial"
+          trap 'rm -f "$archive" "$partial"' EXIT
+          complete=false
+          for attempt in $(seq 1 30); do
+            if curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --connect-timeout 30 \
+              --max-time 120 \
+              --continue-at - \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "$partial" \
+              "$download_url"; then
+              complete=true
+              break
+            fi
+            current_size=0
+            test ! -f "$partial" || current_size="$(stat -c %s "$partial")"
+            test "$current_size" -le "$EXPECTED_SIZE"
+            if [ "$current_size" = "$EXPECTED_SIZE" ]; then
+              complete=true
+              break
+            fi
+            echo "::warning title=Linux artifact transfer interrupted::Resuming the exact candidate at byte $current_size after attempt $attempt"
+            sleep 2
+          done
+          test "$complete" = true
+          actual_size="$(stat -c %s "$partial")"
+          actual_digest="$(sha256sum "$partial" | awk '{print $1}')"
+          test "$actual_size" = "$EXPECTED_SIZE"
+          test "$actual_digest" = "$EXPECTED_SHA256"
+          mv "$partial" "$archive"
+          transfer_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          record=target/candidate-archive-record/linux-x64/candidate-archive-record.json
+          stage=target/candidate-archive-stage/linux-x64
+          rm -rf "$stage"
+          python3 .github/scripts/extract-candidate-actions-artifact.py \
+            --artifact "$archive" \
+            --record "$record" \
+            --out "$stage"
+          admitted="$(
+            node .github/scripts/candidate-archive-store.mjs admit \
+              --record "$record" \
+              --input-root "$stage" \
+              --store-root "$RUNNER_TOOL_CACHE/codestory/candidate-archives" \
+              --output-root target \
+              --output-dir target/release-dist
+          )"
+          test "$(jq -r .hit <<<"$admitted")" = true || \
+            test "$(jq -r .admitted <<<"$admitted")" = true
+          admission_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          transfer_ms=$(((transfer_finished_ns - transfer_started_ns) / 1000000))
+          verification_ms=$(((admission_finished_ns - transfer_finished_ns) / 1000000))
+          {
+            echo "- Authenticated Actions transfer: ${transfer_ms} ms"
+            echo "- Payload verification and atomic admission: ${verification_ms} ms"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download separate authenticated qualification driver
+        if: ${{ !inputs.server_behavior_only }}
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-qualification-driver-linux-x64
+          path: target/qualification-driver-artifact/linux-x64
+          run-id: ${{ inputs.package_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify packaged qualification driver
+        id: qualification-driver
+        if: ${{ !inputs.server_behavior_only }}
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          verified="$(
+            node .github/scripts/qualification-driver-artifact.mjs verify \
+              --asset-target linux-x64 \
+              --source-sha "$(git rev-parse HEAD)" \
+              --source-tree "$(git rev-parse 'HEAD^{tree}')" \
+              --version "$version" \
+              --archive "target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz" \
+              --trusted-root "$GITHUB_WORKSPACE" \
+              --artifact-dir target/qualification-driver-artifact/linux-x64
+          )"
+          echo "path=$(jq -r .driver <<<"$verified")" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.server_behavior_only }}
@@ -174,24 +383,38 @@ jobs:
         shell: bash
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
+          INPUT_VERSION: ${{ inputs.version }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          VERIFIED_QUALIFICATION_DRIVER: ${{ steps.qualification-driver.outputs.path }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
+          qualification_args=()
           calibration_args=()
-          if [ "${{ inputs.server_behavior_only }}" = true ]; then
+          if [ "$SERVER_BEHAVIOR_ONLY" = true ]; then
             claim_args=(--server-behavior-only)
           else
             calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
             test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+            qualification_driver="$VERIFIED_QUALIFICATION_DRIVER"
+            test -n "$qualification_driver"
+            test -x "$qualification_driver"
+            qualification_args=(
+              --produce-qualification-evidence
+              --qualification-driver "$qualification_driver"
+              --qualification-evidence target/linux-vulkan-proof/qualification.json
+            )
             calibration_args=(
               --calibration-bundle "$calibration_bundle"
-              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
-              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
+              --calibration-producer-run-id "$CALIBRATION_RUN_ID"
+              --calibration-producer-artifact "$CALIBRATION_ARTIFACT"
             )
           fi
           python .github/scripts/check-packaged-agent-proof.py \
@@ -207,6 +430,7 @@ jobs:
             --proof-tier protected_hardware \
             --qualification-matrix-cell protected_linux_x64_vulkan \
             "${claim_args[@]}" \
+            "${qualification_args[@]}" \
             "${calibration_args[@]}" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
@@ -219,11 +443,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id || github.run_id }}
         run: |
           set -euo pipefail
           umask 077
           test -n "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
-          candidate_producer_run_id="${{ inputs.package_run_id || github.run_id }}"
+          candidate_producer_run_id="$PACKAGE_RUN_ID"
           run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$candidate_producer_run_id")"
           test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
           test "$(jq -r '.path' <<<"$run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
@@ -232,7 +458,7 @@ jobs:
           test "$candidate_producer_run_attempt" -ge 1
           echo "CODESTORY_CANDIDATE_PRODUCER_RUN_ID=$candidate_producer_run_id" >> "$GITHUB_ENV"
           echo "CODESTORY_CANDIDATE_PRODUCER_RUN_ATTEMPT=$candidate_producer_run_attempt" >> "$GITHUB_ENV"
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           candidate_root="$(mktemp -d "$RUNNER_TEMP/codestory-candidate-installed-linux.XXXXXX")"
@@ -266,9 +492,10 @@ jobs:
         env:
           CODESTORY_EMBED_ALLOW_CPU: "0"
           CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           python .github/scripts/check-packaged-agent-proof.py \
@@ -307,9 +534,13 @@ jobs:
       - name: Emit authenticated Linux Vulkan release cells
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          CANDIDATE_INSTALLED_PROOF: ${{ inputs.candidate_installed_proof }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
           mkdir -p target/release-cells
@@ -319,7 +550,7 @@ jobs:
             > target/linux-vulkan-proof/release-cell-identity.json
           common=(
             --repo "$GITHUB_WORKSPACE"
-            --expected-sha "${{ inputs.ref }}"
+            --expected-sha "$INPUT_REF"
             --version "$version"
             --producer-workflow .github/workflows/linux-vulkan-proof.yml
             --producer-job packaged-vulkan
@@ -339,7 +570,7 @@ jobs:
             --producer-artifact "release-cell-postpublish-retrieval-linux-x64-attempt-$GITHUB_RUN_ATTEMPT" \
             --archive "$archive" \
             --out target/release-cells/retrieval_readiness-linux-x64.json
-          if [ "${{ inputs.candidate_installed_proof }}" = true ]; then
+          if [ "$CANDIDATE_INSTALLED_PROOF" = true ]; then
             jq -n \
               --arg installer candidate_managed_plugin \
               --arg runtime_version "$version" \
@@ -389,4 +620,110 @@ jobs:
           name: linux-x64-vulkan-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/linux-vulkan-proof
           if-no-files-found: error
+          retention-days: 30
+
+  optional-constant-calibration:
+    if: ${{ inputs.constant_calibration_mode }}
+    needs: route
+    name: Optional Linux Vulkan constant calibration
+    runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
+    environment: linux-vulkan-proof
+    timeout-minutes: 180
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Capture optional Linux Vulkan calibration host evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/linux-vulkan-calibration
+          {
+            uname -a
+            uname -m
+            lscpu
+            command -v vulkaninfo
+            vulkaninfo --summary
+          } > target/linux-vulkan-calibration/host.txt 2>&1
+          test "$(uname -m)" = x86_64
+
+      - name: Prepare checksum-pinned embedded model
+        run: >-
+          node scripts/prepare-embedded-model.mjs
+          --cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"
+
+      - name: Build and package native CLI and constant driver
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          cargo build --release --locked \
+            -p codestory-cli \
+            --bin codestory-cli \
+            --bin codestory-cli-runtime \
+            -p codestory-bench \
+            --bin codestory_embedding_constant_calibration
+          python .github/scripts/package-codestory-release.py \
+            --version "$version" \
+            --target linux-x64 \
+            --binary target/release/codestory-cli \
+            --out-dir target/release-dist
+
+      - name: Collect optional Linux Vulkan constant calibration
+        shell: bash
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+          CONSTANT_CALIBRATION_MODE: ${{ inputs.constant_calibration_mode }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$CONSTANT_CALIBRATION_MODE" = true
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
+          version="${INPUT_VERSION#v}"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          mkdir -p target/calibration-runs/linux-vulkan
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz" \
+            --checksum-file target/release-dist/SHA256SUMS.txt \
+            --expected-version "$version" \
+            --engine-policy accelerated \
+            --expected-backend Vulkan \
+            --offline \
+            --proof-tier calibration \
+            --qualification-matrix-cell protected_linux_x64_vulkan \
+            --collect-constant-calibration \
+            --constant-calibration-output-dir target/calibration-runs/linux-vulkan \
+            --qualification-driver target/release/codestory_embedding_constant_calibration \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --timeout-secs 1800 \
+            --out-dir target/calibration-proof/linux-vulkan
+
+      - name: Upload optional Linux Vulkan calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: optional-embedding-calibration-linux-vulkan-${{ inputs.version }}-attempt-${{ github.run_attempt }}
+          path: |
+            target/calibration-runs/linux-vulkan
+            target/calibration-proof/linux-vulkan
+            target/linux-vulkan-calibration
+          if-no-files-found: warn
           retention-days: 30

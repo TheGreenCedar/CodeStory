@@ -27,15 +27,18 @@ on:
         description: "Exact dev/codestory-next head to authenticate without publishing"
         required: true
         type: string
-
 permissions:
-  actions: read
+  actions: write
+  # accelerator-non-claim reads the job annotation that identifies a lost runner, which the Actions
+  # annotations endpoint gates on `checks: read`. Without it the collector fails closed and this
+  # workflow stops rather than mistaking an unreadable signature for an ordinary failure.
+  checks: read
   contents: read
   pull-requests: read
 
 concurrency:
   group: release-${{ inputs.version }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   workflow-policy:
@@ -72,6 +75,7 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+          node --test .github/scripts/lost-runner-recovery.test.mjs
 
   preflight:
     name: Release preflight
@@ -89,6 +93,48 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Cancel superseded proof runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node .github/scripts/release-freeze-barrier.mjs cancel-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"
+
+      - name: Verify release-head calibration lineage
+        id: lineage
+        env:
+          BASH_ENV: /dev/null
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        working-directory: ${{ github.workspace }}
+        run: |
+          promotion_args=()
+          if [ "$PUBLISH_RELEASE" = true ]; then
+            promotion_args+=(--allow-promotion-commit)
+          fi
+          result="$(
+            /usr/bin/python3 -E -s \
+              "$GITHUB_WORKSPACE/.github/scripts/check-calibration-release-lineage.py" \
+              --repo "$GITHUB_WORKSPACE" \
+              --expected-sha "$GITHUB_SHA" \
+              "${promotion_args[@]}"
+          )"
+          jq -e '.status == "passed"' <<<"$result" >/dev/null
+          selection_commit="$(jq -r '.selection_commit' <<<"$result")"
+          selection_tree="$(jq -r '.selection_tree' <<<"$result")"
+          printf '%s' "$selection_commit" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$selection_tree" | grep -Eq '^[0-9a-f]{40}$'
+          {
+            echo "selection_commit=$selection_commit"
+            echo "selection_tree=$selection_tree"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate release authority
         env:
@@ -169,8 +215,9 @@ jobs:
           set -euo pipefail
           entries=()
 
-          # The source gate proves a tree. When dev was already gated and promoted without
-          # changing the tree, re-running it for an hour cannot reach a different answer.
+          # The one source proof belongs to the frozen candidate. A tree-preserving promotion
+          # may reuse it, but a calibration-source proof cannot stand in for the generated
+          # constant-set child.
           release_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
           while IFS= read -r run_id; do
             head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
@@ -178,25 +225,38 @@ jobs:
             test "$(git rev-parse "$head_sha^{tree}")" = "$release_tree" || continue
             git merge-base --is-ancestor "$head_sha" "$GITHUB_SHA" || continue
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name | endswith("full-source-gate")) | select(.conclusion == "success") | .id' \
+              --jq '.jobs[] | select(.name == "full-source-gate" and .conclusion == "success") | .id' \
               | grep -q . || continue
+            run_attempt="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.run_attempt'
+            )"
+            artifact_name="release-cell-prepublish-source-attempt-$run_attempt"
+            artifact_count="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                | jq --arg name "$artifact_name" \
+                  '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+            )"
+            test "$artifact_count" = 1 || continue
             entries+=("source_behavior=$run_id:$head_sha")
-            echo "Reusing source proof from run $run_id (tree $release_tree)."
+            echo "Reusing frozen-candidate source proof and $artifact_name from run $run_id (tree $release_tree)."
             break
           done < <(
             gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
               | jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .conclusion == "success") | .id'
+                '.workflow_runs[] | select(.path == ".github/workflows/source-proof.yml" and .head_repository.full_name == $repo and .event == "workflow_dispatch" and .conclusion == "success") | .id'
           )
 
           reuse="$(IFS=,; echo "${entries[*]:-}")"
-          echo "reuse=${reuse:--}" >> "$GITHUB_OUTPUT"
-          if [ -n "$reuse" ]; then
-            echo "source_proof_reused=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "source_proof_reused=false" >> "$GITHUB_OUTPUT"
-          fi
+          test -n "$reuse" || {
+            echo "::error::The frozen candidate has no reusable full-source-gate. The release workflow will not start a broad proof."
+            exit 1
+          }
+
+          {
+            echo "reuse=$reuse"
+            echo "source_proof_reused=true"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prove the public marketplace install path
         if: inputs.publish_release
@@ -213,7 +273,7 @@ jobs:
               https://github.com/TheGreenCedar/AgentPluginMarketplace.git \
               refs/heads/main | awk '{print $1}'
           )"
-          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$marketplace_revision" | grep -Eq '^[0-9a-f]{40}$'
           echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
           rm -rf "$install_root"
           npm install \
@@ -235,7 +295,7 @@ jobs:
           # the fixture's own revision. The live revision above is still the one
           # the post-publish smoke consumes, so both are captured.
           fixture_revision="$(git -C "$fixture_root" rev-parse HEAD)"
-          test "$(printf '%s' "$fixture_revision" | wc -c | tr -d ' ')" = 40
+          printf '%s' "$fixture_revision" | grep -Eq '^[0-9a-f]{40}$'
           node .github/scripts/install-codestory-marketplace-proof.mjs \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
@@ -251,15 +311,22 @@ jobs:
 
   source-proof:
     needs: preflight
-    # A completed gate for this exact tree is already authenticated evidence; the closeout
-    # consumes it through the reuse binding instead of re-running an hour of compilation.
+    # Preflight fails unless the one frozen-candidate source proof is reusable. Keep this
+    # structural DAG placeholder fail-closed without calling the broad source workflow again.
     if: needs.preflight.outputs.source_proof_reused != 'true'
-    uses: ./.github/workflows/source-proof.yml
-    with:
-      ref: ${{ github.sha }}
-      proof_key: release-${{ needs.preflight.outputs.version }}
-      version: ${{ needs.preflight.outputs.version }}
-      emit_release_cells: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - name: Refuse a second source proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          echo "::error::Preflight did not resolve reusable exact-head source proof; refusing to start a second broad proof."
+          exit 1
 
   packaged-proof:
     needs: preflight
@@ -327,9 +394,155 @@ jobs:
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
       emit_release_cells: true
 
+  # The repository owns one host per accelerator. When a host drops its connection instead of
+  # reporting, .github/scripts/lost-runner-rerun.yml re-dispatches it once; if the second attempt is
+  # lost the same way, this job records a populated non-claim for that host so the closeout has a
+  # visible withheld claim to accept instead of an unexplained gap. It refuses -- and fails the run
+  # -- for every other shape of failure, so a proof that ran and disagreed can never be withheld.
+  accelerator-non-claim:
+    name: Withhold unproven accelerator claims
+    if: always() && needs.preflight.result == 'success' && needs.packaged-proof.result == 'success'
+    needs:
+      - preflight
+      - packaged-proof
+      - macos-metal-proof
+      - windows-vulkan-proof
+      - linux-vulkan-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Collect protected accelerator job evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-non-claim/jobs.json
+          jq -n \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile graph release-claims.json \
+            --slurpfile jobs target/release-non-claim/jobs.json \
+            '{
+               run_attempt: $run_attempt,
+               hosts: [$graph[0].non_claim_policy.hosts[]
+                 | {id: .id, job_name: .unavailable_producer_job_name}],
+               jobs: $jobs[0]
+             }' > target/release-non-claim/plan-input.json
+
+      - name: Decide withheld accelerator hosts
+        id: non-claim
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/lost-runner-recovery.mjs plan-non-claim \
+            --input target/release-non-claim/plan-input.json \
+            --out target/release-non-claim/plan.json
+
+      - name: Download authenticated candidate records for withheld identity
+        if: steps.non-claim.outputs.withheld_hosts != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: codestory-candidate-archive-record-*
+          path: target/release-non-claim/candidate-records
+          merge-multiple: false
+
+      - name: Record populated accelerator non-claims
+        if: steps.non-claim.outputs.withheld_hosts != ''
+        env:
+          WITHHELD_HOSTS: ${{ steps.non-claim.outputs.withheld_hosts }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          jq -n \
+            --arg installer candidate_managed_plugin \
+            --arg native_engine coderank_q8_embedded \
+            '{installer: $installer, native_engine: $native_engine}' \
+            > target/release-non-claim/identity.json
+          for host in $WITHHELD_HOSTS; do
+            case "$host" in
+              macos-arm64-metal) target=macos-arm64 ;;
+              windows-x64-vulkan) target=windows-x64 ;;
+              linux-x64-vulkan) target=linux-x64 ;;
+              *) echo "::error::unknown non-claim host $host"; exit 1 ;;
+            esac
+            node scripts/codestory-release-cell-manifest.mjs withhold \
+              --repo "$GITHUB_WORKSPACE" \
+              --expected-sha "$GITHUB_SHA" \
+              --version "$version" \
+              --host "$host" \
+              --producer-run-id "$GITHUB_RUN_ID" \
+              --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --identity target/release-non-claim/identity.json \
+              --candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json" \
+              --out-dir "target/release-non-claim/cells/$host"
+          done
+
+      - name: Upload withheld pre-publish macOS accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'macos-arm64-metal')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/macos-arm64-metal/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish macOS accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'macos-arm64-metal')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/macos-arm64-metal/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld pre-publish Windows accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'windows-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/windows-x64-vulkan/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish Windows accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'windows-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/windows-x64-vulkan/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld pre-publish Linux accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'linux-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/linux-x64-vulkan/pre_publish
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload withheld post-publish Linux accelerator cells
+        if: contains(steps.non-claim.outputs.withheld_hosts, 'linux-x64-vulkan')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-non-claim/cells/linux-x64-vulkan/post_publish
+          if-no-files-found: error
+          retention-days: 30
+
   pre-publish-closeout:
     name: Authenticate pre-publish release cells
-    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped')
+    if: always() && needs.preflight.result == 'success' && (needs.source-proof.result == 'success' || needs.source-proof.result == 'skipped') && (needs.accelerator-non-claim.result == 'success' || needs.accelerator-non-claim.result == 'skipped')
     needs:
       - preflight
       - source-proof
@@ -337,6 +550,7 @@ jobs:
       - macos-metal-proof
       - windows-vulkan-proof
       - linux-vulkan-proof
+      - accelerator-non-claim
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -354,6 +568,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The closeout reads the lost-runner signature itself rather than trusting the non-claim
+          # producer's verdict, so it collects the same Actions evidence independently.
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
@@ -361,6 +579,7 @@ jobs:
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --reuse "$REUSE_SELECTION" \
+            --job-evidence target/release-closeout/job-evidence.json \
             --out target/release-closeout/trusted-pre-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-pre-publish-producers.json)"
           test -n "$artifact_ids"
@@ -395,13 +614,15 @@ jobs:
 
       - name: Evaluate authenticated pre-publish closeout
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           evaluated_at="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
           node scripts/codestory-release-closeout.mjs evaluate \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
-            --version "${{ needs.preflight.outputs.version }}" \
+            --version "$RELEASE_VERSION" \
             --phase pre_publish \
             --evaluated-at "$evaluated_at" \
             --trusted-producers target/release-closeout/trusted-pre-publish-producers.json \
@@ -455,12 +676,28 @@ jobs:
           pattern: codestory-cli-*
           merge-multiple: true
 
+      # The published notes and the shipped summary both have to say what this release proved, so
+      # they are rendered from the accepted ledger rather than from the static claim graph.
+      - name: Download the accepted pre-publish closeout
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          path: target/release-closeout
+
       - name: Combine and verify checksums
         run: |
           set -euo pipefail
           find target/release-assets -name '*.sha256' -print0 | sort -z | xargs -0 cat > target/release-assets/SHA256SUMS.txt
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
+
+      - name: Ship the accepted closeout summary with the release
+        run: |
+          set -euo pipefail
+          summary=target/release-closeout/pre_publish/summary.json
+          test -f "$summary"
+          test "$(jq -r .decision "$summary")" = accept
+          cp "$summary" target/release-assets/release-closeout-summary.json
 
       - name: Compose versioned GitHub release notes
         env:
@@ -472,7 +709,8 @@ jobs:
             --output target/release-assets/release-notes.md
           {
             printf '\n'
-            node scripts/codestory-release-claims.mjs release-platform-notes
+            node scripts/codestory-release-claims.mjs release-platform-notes \
+              --ledger target/release-closeout/pre_publish/ledger.json
             printf '\n'
           } >> target/release-assets/release-notes.md
 
@@ -514,7 +752,8 @@ jobs:
           actual_file="$(mktemp)"
           printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
           find target/release-assets -maxdepth 1 -type f \
-            \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' -o -name 'SHA256SUMS.txt' \) \
+            \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' \
+               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \) \
             -exec basename {} \; | sort > "$actual_file"
           if ! diff -u "$expected_file" "$actual_file"; then
             echo "::error::Release assets differ from the release claim graph."
@@ -531,6 +770,12 @@ jobs:
             --title "CodeStory $TAG" \
             --notes-file target/release-assets/release-notes.md
 
+  # Catalog publication is DELIVERY, not a release gate. It runs after the tag and the GitHub
+  # release already exist, so failing the release on a missing credential or a rejected push would
+  # only turn a recoverable delivery gap into an unrecoverable one -- and the catalog keeps serving
+  # the previous release either way, so no user is ever offered a plugin that does not exist.
+  # The price is that the run must SAY which state it ended in: this job always reports one of two
+  # explicit outcomes, and post-publish-smoke records that outcome in the release ledger.
   marketplace-publish:
     name: Publish the marketplace catalog
     if: inputs.publish_release
@@ -541,7 +786,8 @@ jobs:
     timeout-minutes: 10
     environment: marketplace-publish
     outputs:
-      marketplace_revision: ${{ steps.publish.outputs.marketplace_revision }}
+      catalog_published: ${{ steps.delivery.outputs.catalog_published }}
+      marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
     steps:
       - name: Checkout exact release source
         uses: actions/checkout@v5
@@ -550,6 +796,7 @@ jobs:
 
       - name: Mint a scoped marketplace token
         id: token
+        continue-on-error: true
         uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
         with:
           app-id: ${{ secrets.MARKETPLACE_APP_ID }}
@@ -559,21 +806,65 @@ jobs:
 
       # Publication already happened, so a failure here leaves the catalog serving the previous
       # release rather than a release that does not exist. marketplace-sync.yml recovers it.
+      # One attempt only: a retry loop here would hide which failure the run actually hit.
       - name: Point the catalog at the published release
         id: publish
+        if: steps.token.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           node .github/scripts/publish-marketplace-catalog.mjs \
             --source-repository "$GITHUB_WORKSPACE" \
             --commit "$GITHUB_SHA" \
-            --version "${{ needs.preflight.outputs.version }}" \
+            --version "$RELEASE_VERSION" \
             --github-output "$GITHUB_OUTPUT"
+
+      # The only place the "catalog was updated" claim is ever minted. It requires the token, the
+      # push, AND an immutable revision to have all landed; anything else records deferred, so an
+      # unknown or half-finished state can never read as published.
+      - name: Record catalog delivery outcome
+        id: delivery
+        if: always()
+        env:
+          TOKEN_OUTCOME: ${{ steps.token.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          RECOVERY_WORKFLOW: marketplace-sync.yml
+        run: |
+          set -euo pipefail
+          catalog_published=false
+          marketplace_revision=""
+          if [ "$TOKEN_OUTCOME" = "success" ] \
+            && [ "$PUBLISH_OUTCOME" = "success" ] \
+            && printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            catalog_published=true
+            marketplace_revision="$PUBLISHED_REVISION"
+          fi
+          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
+          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          if [ "$catalog_published" = "true" ]; then
+            echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a
+          # rejected push, not a missing credential. Saying so here keeps the recorded recovery
+          # instruction one that can actually be followed.
+          if [ "$TOKEN_OUTCOME" != "success" ]; then
+            recovery="provision the marketplace-publish credential, then run $RECOVERY_WORKFLOW (it mints the same token, so it defers as well when that credential is absent)"
+          else
+            recovery="re-run $RECOVERY_WORKFLOW with this version and commit"
+          fi
+          echo "::warning::Catalog publication deferred (token=$TOKEN_OUTCOME publish=$PUBLISH_OUTCOME). The release stands and the catalog still serves the previous release; recover with $RECOVERY_WORKFLOW: $recovery."
+          echo "Catalog delivery: DEFERRED. The release is published; the catalog still serves the previous release. Recover with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
 
   post-publish-smoke:
     name: Post-publish release asset smoke
-    if: inputs.publish_release
+    # Deliberately not gated on marketplace-publish: a deferred catalog must not suppress proof of
+    # the assets that were actually published. The delivery state is carried in, not depended on.
+    if: always() && inputs.publish_release && needs.preflight.result == 'success' && needs.publish.result == 'success'
     needs:
       - preflight
       - publish
@@ -581,6 +872,7 @@ jobs:
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
+      catalog_published: ${{ needs.marketplace-publish.outputs.catalog_published == 'true' }}
       marketplace_revision: ${{ needs.marketplace-publish.outputs.marketplace_revision }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
       emit_release_cells: true
@@ -611,12 +903,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bash .github/scripts/collect-actions-job-evidence.sh \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
             --phase post_publish \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job-evidence target/release-closeout/job-evidence.json \
             --out target/release-closeout/trusted-post-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-post-publish-producers.json)"
           test -n "$artifact_ids"
@@ -657,6 +952,8 @@ jobs:
 
       - name: Evaluate authenticated post-publish closeout
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           ledger="$(find target/accepted-pre-publish-closeout -type f -name ledger.json -print)"
@@ -665,7 +962,7 @@ jobs:
           node scripts/codestory-release-closeout.mjs evaluate \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
-            --version "${{ needs.preflight.outputs.version }}" \
+            --version "$RELEASE_VERSION" \
             --phase post_publish \
             --evaluated-at "$evaluated_at" \
             --trusted-producers target/release-closeout/trusted-post-publish-producers.json \

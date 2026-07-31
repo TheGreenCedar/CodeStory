@@ -96,7 +96,6 @@ def _frozen_calibration_constant_set(
     frozen = json.loads(json.dumps(constant_set))
     frozen["status"] = "frozen"
     frozen["calibration_required_values"] = selection["calibration_required_values"]
-    frozen["qualification_thresholds"] = selection["qualification_thresholds"]
     frozen["freeze_record"] = {
         "selection_source_commit": source["commit"],
         "selection_source_tree": source["tree"],
@@ -107,7 +106,7 @@ def _frozen_calibration_constant_set(
         "calibration_freeze_digest": selection["freeze_digest"],
         "run_artifact_sha256s": selection["run_artifact_sha256s"],
         "selection_rule": (
-            "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1"
+            "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2"
         ),
         "selected_at": require_nonempty_string(
             selected_at,

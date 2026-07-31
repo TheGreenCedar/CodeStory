@@ -11,6 +11,7 @@ pub(crate) mod packet_claim_profiles;
 pub(crate) mod packet_claims;
 pub(crate) mod packet_command_profiles;
 pub(crate) mod packet_evidence;
+pub(crate) mod packet_evidence_carriers;
 pub(crate) mod packet_evidence_roles;
 pub(crate) mod packet_flow_requirements;
 pub(crate) mod packet_plan;

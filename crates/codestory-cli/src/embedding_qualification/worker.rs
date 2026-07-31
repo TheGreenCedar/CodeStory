@@ -6,9 +6,10 @@ use self::gate::{
 };
 use self::operations::{
     run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load,
-    run_measure_busy_retry, run_measure_hello, run_measure_product_query,
-    run_measure_resident_identity, run_measure_spawn_hello, run_measure_true_idle,
-    run_measure_vector_frame, run_queue_load, wait_for_owner_absence,
+    run_measure_busy_retry, run_measure_constant_cold_query, run_measure_constant_spawn_hello,
+    run_measure_hello, run_measure_product_query, run_measure_resident_identity,
+    run_measure_spawn_hello, run_measure_true_idle, run_measure_vector_frame, run_queue_load,
+    wait_for_owner_absence,
 };
 use self::protocol::run_raw_protocol_exchange;
 use crate::args::InternalEmbeddingQualificationCommand;
@@ -204,6 +205,14 @@ fn run_measure_operation(
     match request.operation.as_str() {
         "measure_hello" => run_measure_hello(runtime, clock.as_ref()),
         "measure_spawn_hello" => run_measure_spawn_hello(runtime, clock.as_ref()),
+        "measure_constant_spawn_hello" => run_measure_constant_spawn_hello(runtime, clock.as_ref()),
+        "measure_constant_cold_query" => run_measure_constant_cold_query(
+            runtime,
+            clock.as_ref(),
+            workload_id,
+            repeat,
+            request.parameters.input_bytes,
+        ),
         "measure_product_query" => run_measure_product_query(
             runtime,
             clock.as_ref(),
@@ -228,7 +237,11 @@ fn run_measure_operation(
             &request.parameters,
         ),
         "measure_resident_identity" => run_measure_resident_identity(runtime, clock.as_ref()),
-        "measure_true_idle" => run_measure_true_idle(runtime, clock.as_ref()),
+        "measure_true_idle" => run_measure_true_idle(
+            &PerUserEmbeddingClient::for_runtime(runtime)?,
+            clock.as_ref(),
+            request.parameters.input_bytes,
+        ),
         "measure_busy_retry" => {
             let marker = request
                 .retry_marker

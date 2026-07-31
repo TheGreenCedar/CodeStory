@@ -747,16 +747,45 @@ pub(super) fn retrieval_state_from_storage(
 /// forever on stores whose sidecar vectors were fully published — including
 /// every fresh auto-bootstrap.
 ///
-/// Cost and parity: resolving the manifest key goes through
+/// Manifest identity: resolving the manifest key goes through
 /// `sidecar_project_id_for_root`, which re-observes project identity with
 /// three git subprocesses per call (`config --get remote.origin.url`,
 /// `rev-parse HEAD^{tree}`, and a workload-dependent `status --porcelain`)
-/// before the single indexed manifest-row lookup and pure contract checks.
-/// That is deliberately the same uncached helper per-search sidecar admission
-/// uses (`retrieval_primary::retrieval_manifest_exists`), so this projection
-/// and admission can never disagree about which manifest row is current. Do
-/// not substitute a cached identity here without proving admission reads the
-/// same cache. The read stays observational: no probing, repair, or refresh.
+/// before the manifest-row lookup, the pure contract checks, and the
+/// storage-derived staleness scan. That is deliberately the same uncached
+/// helper per-search sidecar admission uses
+/// (`retrieval_primary::retrieval_manifest_exists`), so this projection and
+/// admission can never disagree about *which manifest row is current*. Do not
+/// substitute a cached identity here without proving admission reads the same
+/// cache.
+///
+/// Agreement with admission is one-directional, not equality. Freshness comes
+/// from `storage_admission_refusal_reason_for_runtime`, the subset of sidecar
+/// admission derivable from `&Storage` alone: the incomplete-incremental-run
+/// marker plus the manifest staleness scan. `SidecarQuery::begin` runs a
+/// second gate, `validate_strict_sidecar_readiness_for_runtime`, which is
+/// `pub(crate)` in `codestory-retrieval` and structurally unreachable from
+/// here because it also needs the storage path, the project root's workspace
+/// manifest, and a producer compatibility identity. So this projection can
+/// still report hybrid for a publication that gate refuses — on
+/// `indexable_file_added_or_changed_after_retrieval_manifest`,
+/// `indexed_file_removed_after_retrieval_manifest`,
+/// `indexed_file_error_retry_required`, `sidecar_input_hash_changed`, or the
+/// two symbol-doc backend reasons. What is guaranteed is the direction that
+/// matters for not over-claiming: everything consulted here also makes
+/// admission refuse, so readiness never promises hybrid over a refusal this
+/// projection can see. `retrieval status` runs both gates and is the surface
+/// to trust for exact parity. Closing the remaining gap means making the
+/// strict gate reachable with a `&Storage`-only signature, not adding another
+/// private re-derivation here.
+///
+/// Cost: the staleness scan is two aggregate counts (symbol docs and the
+/// grouped `dense_anchor_input` projection), not a row sweep — see
+/// `Storage::dense_anchor_input_stats`. This runs on observational callers
+/// (project open, `retrieval_state`, grounding snapshots), so it must stay
+/// aggregate-only; paging `DenseAnchorInput`s here would put every anchor's
+/// `document_text` on a status call. The read stays observational: no
+/// probing, repair, or refresh.
 pub(super) fn retrieval_state_from_storage_for_runtime(
     storage: &Storage,
     project_root: &Path,
@@ -778,24 +807,48 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         .map(published_dense_projection_count)
         .unwrap_or(0);
     // Fail closed: published vectors count as semantic readiness only while the
-    // manifest still classifies as a current, non-degraded full publication.
-    let stale_publication = manifest
-        .as_ref()
-        .is_some_and(|manifest| !codestory_retrieval::manifest_classifies_full(manifest));
+    // manifest still classifies as a current, non-degraded full publication
+    // *and* the store the sidecar would be served from still agrees with it.
+    // Manifest shape alone is not enough: a core-only refresh leaves the
+    // manifest untouched while moving the symbol docs, dense anchors, and
+    // indexed-file mtimes underneath it, and an interrupted incremental run
+    // leaves all three untouched while still making admission refuse. Both are
+    // storage-derived, so both are read here through the one helper admission
+    // shares (`storage_admission_refusal_reason_for_runtime`) — see this
+    // function's doc comment for the strict gate this still cannot see.
+    let stale_publication = manifest.as_ref().is_some_and(|manifest| {
+        !codestory_retrieval::manifest_classifies_full(manifest)
+            || codestory_retrieval::storage_admission_refusal_reason_for_runtime(
+                &project_id,
+                storage,
+                manifest,
+                runtime,
+            )
+            .is_some()
+    });
     let contract_mismatch = manifest
         .as_ref()
         .is_some_and(|manifest| !manifest_matches_current_embedding_contract(manifest, runtime));
-    let runtime_degraded =
-        semantic_doc_count > 0 && probe.available && (stale_publication || contract_mismatch);
-    // A current, contract-matched full publication may legitimately select
-    // zero dense anchors (generation only requires the dense count to equal
-    // the projection count). Admission serves that sidecar as full, so the
-    // semantic lane is published-and-empty, not unbuilt: reporting
-    // `missing_semantic_docs` here would prescribe a refresh that republishes
-    // the identical zero-anchor manifest and can never clear the message.
-    let zero_dense_published = manifest.as_ref().is_some_and(|manifest| {
-        manifest.dense_projection_count == Some(0) && !stale_publication && !contract_mismatch
-    });
+    // A full publication may legitimately select zero dense anchors (generation
+    // only requires the dense count to equal the projection count), so a
+    // zero-anchor manifest still describes a *built* semantic lane. It must
+    // therefore be able to degrade like any other publication: gating
+    // `runtime_degraded` on `semantic_doc_count > 0` alone made a stale
+    // zero-anchor sidecar fall through to `missing_semantic_docs` — "semantic
+    // symbol docs have not been built yet" for a lane that was built and is
+    // merely stale, and doctor's "stale or degraded" gap never fired for it.
+    let zero_dense_manifest = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.dense_projection_count == Some(0));
+    let runtime_degraded = (semantic_doc_count > 0 || zero_dense_manifest)
+        && probe.available
+        && (stale_publication || contract_mismatch);
+    // A *current, contract-matched* zero-anchor publication is the other half:
+    // admission serves it as full, so the lane is published-and-empty rather
+    // than unbuilt. Reporting `missing_semantic_docs` there would prescribe a
+    // refresh that republishes the identical zero-anchor manifest and can
+    // never clear the message.
+    let zero_dense_published = zero_dense_manifest && !stale_publication && !contract_mismatch;
     let fallback_message = probe.fallback_message.or_else(|| {
         if !runtime_degraded {
             None
@@ -830,6 +883,119 @@ pub(super) fn retrieval_state_from_storage_for_runtime(
         zero_dense_published,
         runtime.retrieval.hybrid_enabled,
     ))
+}
+
+/// Test-support: stage the store a *served* full publication actually has.
+///
+/// Readiness derives freshness from
+/// `storage_admission_refusal_reason_for_runtime`, which recounts the symbol
+/// docs, dense anchors, and dense-reason histogram in the store and refuses a
+/// manifest that disagrees with them. Upserting only the manifest row
+/// therefore stages a publication the sidecar would *refuse*: a manifest whose
+/// recorded counts nothing in the store backs is exactly the core-only-refresh
+/// shape readiness is supposed to catch, so such a fixture can never stand in
+/// for a healthy project. Seed the rows the manifest's own counts describe, so
+/// a fixture that calls itself healthy is healthy.
+///
+/// Returns the manifest as published: `dense_reason_counts_json` is rewritten
+/// to the histogram of the anchors this seeds, because admission compares the
+/// manifest's copy against a recount rather than trusting it.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn publish_admissible_retrieval_manifest(
+    storage: &mut Storage,
+    manifest: &codestory_store::RetrievalIndexManifest,
+) -> Result<codestory_store::RetrievalIndexManifest, ApiError> {
+    use crate::semantic_projection::{
+        DenseAnchorReason, LLM_SYMBOL_DOC_SCHEMA_VERSION, SYMBOL_SEARCH_DOC_PROVENANCE,
+    };
+    use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind};
+    use codestory_store::{DenseAnchorInput, SymbolSearchDoc};
+
+    fn storage_error(context: &str, error: impl std::fmt::Display) -> ApiError {
+        ApiError::internal(format!("{context}: {error}"))
+    }
+
+    let mut manifest = manifest.clone();
+    let symbol_doc_count = manifest.symbol_doc_count.unwrap_or(0).max(0);
+    let dense_count = manifest
+        .dense_projection_count
+        .or(manifest.projection_count)
+        .unwrap_or(0)
+        .max(0);
+    let selection_reason = DenseAnchorReason::PublicApi.as_str().to_string();
+    manifest.dense_reason_counts_json = Some(if dense_count > 0 {
+        serde_json::json!({ selection_reason.clone(): dense_count }).to_string()
+    } else {
+        "{}".to_string()
+    });
+
+    // Nodes first: symbol docs and dense anchors are keyed by node id.
+    let node_count = symbol_doc_count.max(dense_count);
+    let nodes = (1..=node_count)
+        .map(|id| Node {
+            id: CoreNodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("admissible_{id:02}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage
+        .insert_nodes_batch(&nodes)
+        .map_err(|error| storage_error("Failed to seed admissible publication nodes", error))?;
+
+    let symbol_docs = (1..=symbol_doc_count)
+        .map(|id| SymbolSearchDoc {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: format!("admissible_{id:02}"),
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: format!("admissible-doc-{id:02}"),
+            policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.to_string(),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .upsert_symbol_search_docs_batch(&symbol_docs)
+        .map_err(|error| {
+            storage_error("Failed to seed admissible publication symbol docs", error)
+        })?;
+
+    let dense_inputs = (1..=dense_count)
+        .map(|id| DenseAnchorInput {
+            node_id: CoreNodeId(id),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: format!("admissible_{id:02}"),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            file_role: codestory_store::FileRole::Source,
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: format!("admissible_{id:02}"),
+            document_hash: format!("admissible-anchor-{id:02}"),
+            selection_reason: selection_reason.clone(),
+            policy_version: codestory_retrieval::SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: format!("core:admissible_{id:02}"),
+            updated_at_epoch_ms: 1,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .upsert_dense_anchor_inputs_batch(&dense_inputs)
+        .map_err(|error| {
+            storage_error("Failed to seed admissible publication dense anchors", error)
+        })?;
+
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .map_err(|error| storage_error("Failed to publish admissible retrieval manifest", error))?;
+    Ok(manifest)
 }
 
 fn published_dense_projection_count(manifest: &codestory_store::RetrievalIndexManifest) -> u32 {

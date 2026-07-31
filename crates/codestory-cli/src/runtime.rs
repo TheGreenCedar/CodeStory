@@ -1519,7 +1519,7 @@ mod tests {
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
         unsafe {
-            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         }
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
@@ -1583,7 +1583,7 @@ mod tests {
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
         unsafe {
-            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         }
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
@@ -1690,7 +1690,7 @@ mod tests {
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
         unsafe {
-            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+            env::set_var("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
         }
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");

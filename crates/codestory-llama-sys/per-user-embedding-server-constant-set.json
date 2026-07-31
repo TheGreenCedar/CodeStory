@@ -1,15 +1,15 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 40,
+      "retry_after_ms": 66,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 7,
+      "initial_backoff_ms": 8,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
-      "maximum_backoff_ms": 102
+      "maximum_backoff_ms": 106
     },
     "hard_native_no_progress_ms": 385431,
     "request_deadlines_ms": {
@@ -40,26 +40,24 @@
     "maximum_payload_bytes": 16777216,
     "protocol_schema_version": 1,
     "pure_embedding_rpc_replay_limit": 1,
-    "query_queue_capacity": 64
+    "query_queue_capacity": 64,
+    "true_idle_observation_grace_ms": 2500
   },
   "freeze_record": {
-    "calibration_bundle_sha256": "bdaf0d80a19af41cb1acdcc4d0ee7dbca4b90481d4e5616f72416b65923f5b0e",
-    "calibration_freeze_digest": "67e0af9456ddc1afc7ba2298b546024f36b1f92034b9b9e7363936ffbedae0b1",
-    "input_constant_set_sha256": "fb0326d180cc5e2e6cae46d70e5a7706d5ed423c30fb95b4b983ed61dcdc2e2c",
-    "measurement_protocol_sha256": "6d29a6a92dc6f9552d004806f0bb0785c040e57a9de25e3877d26bb76e78f04b",
+    "calibration_bundle_sha256": "9c9476f3098c7836394d84089a7856858c1c9eda7b6a8c0bc482796adc72f683",
+    "calibration_freeze_digest": "6ccda709725bfa3397e1595db0e866e94c1507e7ee370000b37e99ab803cdba2",
+    "input_constant_set_sha256": "ea58d298473ddf320469d15dc7c32176a1109d615a689c15ff76b67fb337e109",
+    "measurement_protocol_sha256": "d1bb9b2c7eb354fe98990aa32eedc0e165b0cf804212966e0a2ee362a2f5bf8e",
     "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
     "run_artifact_sha256s": [
-      "184d5aa079369f8057acb71576a6a1e4dfd2f4e2f56ec20d17a9aab147c9f8dc",
-      "2fd6767d1195f9852ca56dfffb8511eb3c001e7f65450aed33c77e27a5b60d44",
-      "5ef180010acdcb6f518fefc9dac00a9da8277b4c4d397c0006efd9e1424d2c42",
-      "6e5e26f19b6028d87bd19ffca8d4dbec5d3ebaa0fd2037003723f7eef9d9f557",
-      "943449b5c7c187c397f2530011d08d5f56b9f41509bd182fbd7b03f970678116",
-      "fcad9b4c59792c1493ccc4ae96c9d3377efced89460b561cd1c4a2c7017377d7"
+      "1e3bd8da8bb21fd6196a71101d17a49e70c2a57bc8baf6f6d8a7e16463259a2b",
+      "b38c009d4190c360bcf7790239d2cf22beea6bfb64c2920a1cd48019b0851dbb",
+      "dd204de79a20f6347e2c83e00876ba62840d3d3b619befa5fb1712f85b6c1ba8"
     ],
-    "selected_at": "github-actions-run:30329118684:1",
-    "selection_rule": "all_preregistered_clean_runs_no_outlier_removal+slow_host_floors_v1",
-    "selection_source_commit": "6b0f4b2edb7d99fe43b63cfb0bd3a85ca9d0032c",
-    "selection_source_tree": "c759c770b6de9b0b5051a145d5862444052d5cdd"
+    "selected_at": "github-actions-run:30590903374:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "ac2d788bd1de84ad7cc241f8d2a7efdabf8c9d35",
+    "selection_source_tree": "88583ad49a26f38cfb5f00aee6aee0236a70c833"
   },
   "qualification_thresholds": {
     "backend_observed_accelerator_residency": 1,
@@ -69,10 +67,9 @@
     "cold_first_vector": 1566,
     "existing_owner_connect": 16,
     "first_product_ready": 723,
-    "retrieval_quality": 1.0,
     "spawn_convergence": 486,
     "total_codestory_process_memory": 3366597428,
-    "true_idle_exit": 71374,
+    "true_idle_exit": 62500,
     "warm_bulk_ipc": 29119,
     "warm_query_ipc": 577
   },

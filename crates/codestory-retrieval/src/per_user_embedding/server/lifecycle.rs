@@ -192,6 +192,10 @@ pub(in crate::per_user_embedding) fn reap_finished_connection_handlers(
 }
 
 fn validate_server_config(config: &PerUserEmbeddingServerConfig) -> Result<()> {
+    #[cfg(not(any(test, feature = "test-support")))]
+    if config.allow_cpu {
+        bail!("embedding_backend_policy_cpu_unsupported");
+    }
     if config.budgets.idle_timeout
         != Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
     {

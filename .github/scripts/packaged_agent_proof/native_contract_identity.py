@@ -291,31 +291,18 @@ def verify_engine_identities_against_manifest(
         policy == expected_policy,
         "runtime policy does not match the requested proof lane",
     )
-    if policy == "accelerated":
-        expected_backend = accelerator.get("expected_protected_backend")
-        require(
-            isinstance(expected_backend, str) and bool(expected_backend),
-            "this package target has no protected accelerator execution claim",
-        )
-        require(
-            observed_backend == expected_backend,
-            "runtime accelerator backend does not match the protected package contract",
-        )
-        execution = "proven_by_live_runtime"
-        non_claim_reason = None
-    else:
-        require(
-            policy == "cpu_explicit",
-            "runtime used neither protected acceleration nor explicit CPU",
-        )
-        require(
-            observed_backend == "cpu", "explicit CPU proof selected a non-CPU backend"
-        )
-        execution = "explicit_cpu_execution"
-        non_claim_reason = (
-            accelerator.get("non_claim_reason")
-            or "explicit_cpu_execution_does_not_prove_acceleration"
-        )
+    require(policy == "accelerated", "runtime proof requires accelerated embeddings")
+    expected_backend = accelerator.get("expected_protected_backend")
+    require(
+        isinstance(expected_backend, str) and bool(expected_backend),
+        "this package target has no protected accelerator execution claim",
+    )
+    require(
+        observed_backend == expected_backend,
+        "runtime accelerator backend does not match the protected package contract",
+    )
+    execution = "proven_by_live_runtime"
+    non_claim_reason = None
 
     return {
         "build_identity": engine["build_identity"],

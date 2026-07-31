@@ -21,11 +21,6 @@ on:
         required: false
         default: false
         type: boolean
-      quality_evidence_artifact:
-        description: Exact-head release-evidence artifact containing packet/packet-runtime-summary.json.
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
         required: false
@@ -61,55 +56,6 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        description: CodeStory version to prove.
-        required: true
-        type: string
-      ref:
-        description: Git ref to check out. Defaults to the current SHA.
-        required: false
-        type: string
-      proof_key:
-        description: Stable proof identity for cancellation.
-        required: false
-        type: string
-      quality_evidence_artifact:
-        description: Existing exact-head release-evidence artifact name.
-        required: false
-        type: string
-      calibration_bundle_artifact:
-        description: Frozen calibration bundle artifact name.
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        description: Workflow run that produced the frozen calibration bundle artifact.
-        required: false
-        default: ""
-        type: string
-      calibration_mode:
-        description: Collect three independent pre-freeze Metal calibration runs.
-        required: false
-        default: false
-        type: boolean
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/macos-metal-proof.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   actions: read
   contents: read
@@ -133,6 +79,14 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
+      - name: Validate unfrozen Metal calibration source
+        if: inputs.calibration_mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
+          test "$(jq -r .freeze_record crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = null
+
       - name: Capture host evidence
         shell: bash
         run: |
@@ -154,73 +108,213 @@ jobs:
       - name: Validate candidate-installed mode
         if: inputs.candidate_installed_proof
         shell: bash
+        env:
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
         run: |
-          test "${{ inputs.server_behavior_only }}" = true
-          test "${{ inputs.calibration_mode }}" = false
+          test "$SERVER_BEHAVIOR_ONLY" = true
+          test "$CALIBRATION_MODE" = false
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact || inputs.calibration_mode || !inputs.server_behavior_only }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
 
+      - name: Start Metal constant calibration clock
+        if: inputs.calibration_mode
+        id: calibration-clock
+        shell: bash
+        run: echo "started-ns=$(python3 -c 'import time; print(time.monotonic_ns())')" >> "$GITHUB_OUTPUT"
+
       - name: Prepare checksum-pinned embedded model
+        id: model-prepare
         if: ${{ !inputs.use_packaged_cli_artifact }}
-        run: node scripts/prepare-embedded-model.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          model_prepare_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          node scripts/prepare-embedded-model.mjs \
+            --cache-root "$RUNNER_TOOL_CACHE/codestory/model-material"
+          model_prepare_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "duration-ms=$(((model_prepare_finished_ns - model_prepare_started_ns) / 1000000))" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Build and package native CLI
+        id: native-build-package
         if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           set -euo pipefail
+          build_package_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
           version="${VERSION#v}"
-          cargo build --release -p codestory-cli --locked
+          cargo_args=(
+            -p codestory-cli
+            --bin codestory-cli
+            --bin codestory-cli-runtime
+          )
+          if [ "$CALIBRATION_MODE" = true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_constant_calibration
+            )
+          elif [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_qualification
+            )
+          fi
+          cargo build --release --locked "${cargo_args[@]}"
           python3 .github/scripts/package-codestory-release.py \
             --version "$version" \
             --target macos-arm64 \
             --binary target/release/codestory-cli \
             --out-dir target/release-dist
+          build_package_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "duration-ms=$(((build_package_finished_ns - build_package_started_ns) / 1000000))" \
+            >> "$GITHUB_OUTPUT"
 
-      - name: Download packaged CLI artifact
+      - name: Authenticate exact candidate artifacts
+        id: candidate-artifacts
         if: inputs.use_packaged_cli_artifact
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_NAME: codestory-cli-macos-arm64
+          CANDIDATE_RECORD_ARTIFACT: codestory-candidate-archive-record-macos-arm64
+          QUALIFICATION_ARTIFACT: codestory-qualification-driver-macos-arm64
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           set -euo pipefail
-          artifact="$(
-            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-              | jq \
-                --arg name "$ARTIFACT_NAME" \
-                --arg sha "$GITHUB_SHA" \
-                --argjson run_id "$GITHUB_RUN_ID" \
-                '[
-                  .artifacts[]
-                  | select(
-                      .name == $name
-                      and .expired == false
-                      and .workflow_run.id == $run_id
-                      and .workflow_run.head_sha == $sha
-                    )
-                ] | sort_by(.created_at) | last'
+          case "$CANDIDATE_PRODUCER_WORKFLOW_PATH" in
+            .github/workflows/auto-release.yml | \
+            .github/workflows/release.yml | \
+            .github/workflows/packaged-platform-pr.yml)
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            test "$CANDIDATE_PRODUCER_WORKFLOW_PATH" = \
+              .github/workflows/packaged-platform-pr.yml
+          fi
+          producer_run="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           )"
-          test "$artifact" != null
-
+          test "$(jq -r '.head_repository.full_name' <<<"$producer_run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$producer_run")" = "$CANDIDATE_PRODUCER_WORKFLOW_PATH"
+          test "$(jq -r '.head_sha' <<<"$producer_run")" = "$(git rev-parse HEAD)"
+          test "$(jq -r '.run_attempt' <<<"$producer_run")" = "$GITHUB_RUN_ATTEMPT"
+          artifacts="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+          )"
+          select_artifact() {
+            local name="$1"
+            jq \
+              --arg name "$name" \
+              --arg sha "$(git rev-parse HEAD)" \
+              --argjson run_id "$GITHUB_RUN_ID" \
+              '[
+                .artifacts[]
+                | select(
+                    .name == $name
+                    and .expired == false
+                    and .workflow_run.id == $run_id
+                    and .workflow_run.head_sha == $sha
+                  )
+              ] | if length == 1 then .[0] else error("expected one exact candidate artifact") end' \
+              <<<"$artifacts"
+          }
+          artifact="$(select_artifact "$ARTIFACT_NAME")"
+          record_artifact="$(select_artifact "$CANDIDATE_RECORD_ARTIFACT")"
+          if [ "$SERVER_BEHAVIOR_ONLY" != true ]; then
+            select_artifact "$QUALIFICATION_ARTIFACT" >/dev/null
+          fi
           artifact_id="$(jq -r '.id' <<<"$artifact")"
           expected_size="$(jq -r '.size_in_bytes' <<<"$artifact")"
           expected_digest="$(jq -r '.digest' <<<"$artifact")"
           [[ "$artifact_id" =~ ^[0-9]+$ ]]
           [[ "$expected_size" =~ ^[0-9]+$ ]]
           [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(jq -r '.id' <<<"$record_artifact")" =~ ^[0-9]+$ ]]
+          [[ "$(jq -r '.size_in_bytes' <<<"$record_artifact")" =~ ^[0-9]+$ ]]
+          [[ "$(jq -r '.digest' <<<"$record_artifact")" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "package-id=$artifact_id"
+            echo "package-bytes=$expected_size"
+            echo "package-sha256=${expected_digest#sha256:}"
+          } >> "$GITHUB_OUTPUT"
 
-          archive="$RUNNER_TEMP/$ARTIFACT_NAME-$artifact_id.zip"
-          download_url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip"
-          rm -f "$archive"
-          trap 'rm -f "$archive"' EXIT
+      - name: Download authenticated candidate record
+        if: inputs.use_packaged_cli_artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-candidate-archive-record-macos-arm64
+          path: target/candidate-archive-record/macos-arm64
+
+      - name: Restore exact candidate archive from protected host
+        id: candidate-cache
+        if: inputs.use_packaged_cli_artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          record=target/candidate-archive-record/macos-arm64/candidate-archive-record.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$(git rev-parse HEAD)" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg target macos-arm64 \
+            '.repository == $repository
+              and .source.commit == $source_sha
+              and .source.tree == $source_tree
+              and .target == $target' \
+            "$record" >/dev/null
+          store="$RUNNER_TOOL_CACHE/codestory/candidate-archives"
+          mkdir -p "$store" target
+          rm -rf target/release-dist
+          restored="$(
+            node .github/scripts/candidate-archive-store.mjs restore \
+              --record "$record" \
+              --store-root "$store" \
+              --output-root target \
+              --output-dir target/release-dist
+          )"
+          hit="$(jq -r .hit <<<"$restored")"
+          test "$hit" = true || test "$hit" = false
+          finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          elapsed_ms=$(((finished_ns - started_ns) / 1000000))
+          echo "hit=$hit" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Candidate archive transfer"
+            echo
+            echo "- Protected-host cache lookup and verification: ${elapsed_ms} ms"
+            echo "- Cache hit: \`$hit\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download, authenticate, and admit candidate archive on miss
+        if: inputs.use_packaged_cli_artifact && steps.candidate-cache.outputs.hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.candidate-artifacts.outputs.package-id }}
+          EXPECTED_SIZE: ${{ steps.candidate-artifacts.outputs.package-bytes }}
+          EXPECTED_SHA256: ${{ steps.candidate-artifacts.outputs.package-sha256 }}
+        run: |
+          set -euo pipefail
+          transfer_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          archive="$RUNNER_TEMP/codestory-cli-macos-arm64-$ARTIFACT_ID.zip"
+          download_url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip"
+          partial="$archive.partial"
+          rm -f "$archive" "$partial"
+          trap 'rm -f "$archive" "$partial"' EXIT
 
           complete=false
           for attempt in $(seq 1 30); do
@@ -235,45 +329,85 @@ jobs:
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              --output "$archive" \
+              --output "$partial" \
               "$download_url"; then
               complete=true
               break
             fi
 
             current_size=0
-            test ! -f "$archive" || current_size="$(stat -f %z "$archive")"
-            test "$current_size" -le "$expected_size"
-            if [ "$current_size" = "$expected_size" ]; then
+            test ! -f "$partial" || current_size="$(stat -f %z "$partial")"
+            test "$current_size" -le "$EXPECTED_SIZE"
+            if [ "$current_size" = "$EXPECTED_SIZE" ]; then
               complete=true
               break
             fi
-            echo "::warning title=macOS artifact transfer interrupted::Resuming $ARTIFACT_NAME at byte $current_size after attempt $attempt"
+            echo "::warning title=macOS artifact transfer interrupted::Resuming the exact candidate at byte $current_size after attempt $attempt"
             sleep 2
           done
           test "$complete" = true
 
-          actual_size="$(stat -f %z "$archive")"
-          actual_digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
-          test "$actual_size" = "$expected_size"
-          test "$actual_digest" = "${expected_digest#sha256:}"
+          actual_size="$(stat -f %z "$partial")"
+          actual_digest="$(shasum -a 256 "$partial" | awk '{print $1}')"
+          test "$actual_size" = "$EXPECTED_SIZE"
+          test "$actual_digest" = "$EXPECTED_SHA256"
+          mv "$partial" "$archive"
+          transfer_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
           printf 'artifact_id=%s artifact_bytes=%s artifact_digest=%s\n' \
-            "$artifact_id" "$actual_size" "$expected_digest"
+            "$ARTIFACT_ID" "$actual_size" "$actual_digest"
 
-          mkdir -p target/release-dist
-          ditto -x -k "$archive" target/release-dist
+          record=target/candidate-archive-record/macos-arm64/candidate-archive-record.json
+          stage=target/candidate-archive-stage/macos-arm64
+          rm -rf "$stage"
+          python3 .github/scripts/extract-candidate-actions-artifact.py \
+            --artifact "$archive" \
+            --record "$record" \
+            --out "$stage"
+          admitted="$(
+            node .github/scripts/candidate-archive-store.mjs admit \
+              --record "$record" \
+              --input-root "$stage" \
+              --store-root "$RUNNER_TOOL_CACHE/codestory/candidate-archives" \
+              --output-root target \
+              --output-dir target/release-dist
+          )"
+          test "$(jq -r .hit <<<"$admitted")" = true || \
+            test "$(jq -r .admitted <<<"$admitted")" = true
+          admission_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          transfer_ms=$(((transfer_finished_ns - transfer_started_ns) / 1000000))
+          verification_ms=$(((admission_finished_ns - transfer_finished_ns) / 1000000))
+          {
+            echo "- Authenticated Actions transfer: ${transfer_ms} ms"
+            echo "- Payload verification and atomic admission: ${verification_ms} ms"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build qualification driver
-        if: inputs.calibration_mode || !inputs.server_behavior_only
-        shell: bash
-        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
-
-      - name: Download exact-head publishable packet quality evidence
-        if: inputs.quality_evidence_artifact != ''
+      - name: Download separate authenticated qualification driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.calibration_mode && !inputs.server_behavior_only }}
         uses: actions/download-artifact@v8.0.1
         with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
+          name: codestory-qualification-driver-macos-arm64
+          path: target/qualification-driver-artifact/macos-arm64
+
+      - name: Verify packaged qualification driver
+        id: qualification-driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.calibration_mode && !inputs.server_behavior_only }}
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          verified="$(
+            node .github/scripts/qualification-driver-artifact.mjs verify \
+              --asset-target macos-arm64 \
+              --source-sha "$(git rev-parse HEAD)" \
+              --source-tree "$(git rev-parse 'HEAD^{tree}')" \
+              --version "$version" \
+              --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
+              --trusted-root "$GITHUB_WORKSPACE" \
+              --artifact-dir target/qualification-driver-artifact/macos-arm64
+          )"
+          echo "path=$(jq -r .driver <<<"$verified")" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.calibration_mode && !inputs.server_behavior_only }}
@@ -314,6 +448,10 @@ jobs:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
           SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          USE_PACKAGED_CLI_ARTIFACT: ${{ inputs.use_packaged_cli_artifact }}
+          VERIFIED_QUALIFICATION_DRIVER: ${{ steps.qualification-driver.outputs.path }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
@@ -321,27 +459,29 @@ jobs:
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           export TMPDIR="${RUNNER_TEMP}/codestory metal proof ü"
           mkdir -p "$TMPDIR"
-          quality_args=()
           qualification_args=()
           calibration_args=()
           claim_scope_args=()
-          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           if [ "$SERVER_BEHAVIOR_ONLY" = true ]; then
             claim_scope_args=(--server-behavior-only)
           else
             calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
             test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-            test -f "$quality_path"
-            quality_args=(--retrieval-quality-evidence "$quality_path")
+            qualification_driver=target/release/codestory_embedding_qualification
+            if [ "$USE_PACKAGED_CLI_ARTIFACT" = true ]; then
+              qualification_driver="$VERIFIED_QUALIFICATION_DRIVER"
+              test -n "$qualification_driver"
+            fi
+            test -x "$qualification_driver"
             qualification_args=(
               --produce-qualification-evidence
-              --qualification-driver target/release/codestory_embedding_qualification
+              --qualification-driver "$qualification_driver"
               --qualification-evidence target/macos-metal-proof/qualification.json
             )
             calibration_args=(
               --calibration-bundle "$calibration_bundle"
-              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
-              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
+              --calibration-producer-run-id "$CALIBRATION_RUN_ID"
+              --calibration-producer-artifact "$CALIBRATION_ARTIFACT"
             )
           fi
           python3 .github/scripts/check-packaged-agent-proof.py \
@@ -361,11 +501,10 @@ jobs:
             "${calibration_args[@]}" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
-            "${quality_args[@]}" \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
 
-      - name: Collect three independent Metal calibration runs
+      - name: Collect three independent Metal constant calibration runs
         if: inputs.calibration_mode
         shell: bash
         env:
@@ -373,35 +512,78 @@ jobs:
           CODESTORY_EMBED_ALLOW_CPU: "0"
         run: |
           set -euo pipefail
-          test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
           version="${VERSION#v}"
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           export TMPDIR="${RUNNER_TEMP}/codestory metal calibration ü"
           mkdir -p "$TMPDIR" target/calibration-runs/macos
-          for run_index in 1 2 3; do
-            python3 .github/scripts/check-packaged-agent-proof.py \
-              --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
-              --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
-              --expected-version "$version" \
-              --project "${{ github.workspace }}" \
-              --plugin-root plugins/codestory \
-              --plugin-handoff \
-              --engine-policy accelerated \
-              --expected-backend Metal \
-              --offline \
-              --proof-tier calibration \
-              --qualification-matrix-cell protected_macos_arm64_metal \
-              --produce-qualification-evidence \
-              --qualification-driver target/release/codestory_embedding_qualification \
-              --qualification-evidence "target/calibration-runs/macos/qualification-${run_index}.json" \
-              --calibration-run-index "$run_index" \
-              --calibration-run-output "target/calibration-runs/macos/run-${run_index}.json" \
-              --expected-source-sha "$source_sha" \
-              --expected-source-tree "$source_tree" \
-              --timeout-secs 1800 \
-              --out-dir "target/calibration-runs/macos/proof-${run_index}"
-          done
+          python3 .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
+            --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
+            --expected-version "$version" \
+            --engine-policy accelerated \
+            --expected-backend Metal \
+            --offline \
+            --proof-tier calibration \
+            --qualification-matrix-cell protected_macos_arm64_metal \
+            --collect-constant-calibration \
+            --constant-calibration-output-dir target/calibration-runs/macos \
+            --qualification-driver target/release/codestory_embedding_constant_calibration \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --timeout-secs 1800 \
+            --out-dir target/calibration-proof/macos
+
+      - name: Publish Metal constant calibration timing
+        if: inputs.calibration_mode
+        shell: bash
+        env:
+          CALIBRATION_STARTED_NS: ${{ steps.calibration-clock.outputs.started-ns }}
+          MODEL_PREPARATION_DURATION_MS: ${{ steps.model-prepare.outputs.duration-ms }}
+          BUILD_PACKAGE_DURATION_MS: ${{ steps.native-build-package.outputs.duration-ms }}
+        run: |
+          set -euo pipefail
+          timing_path=target/calibration-runs/macos/timing.json
+          calibration_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          [[ "$CALIBRATION_STARTED_NS" =~ ^[0-9]+$ ]]
+          [[ "$MODEL_PREPARATION_DURATION_MS" =~ ^[0-9]+$ ]]
+          [[ "$BUILD_PACKAGE_DURATION_MS" =~ ^[0-9]+$ ]]
+          calibration_total_ms=$(((calibration_finished_ns - CALIBRATION_STARTED_NS) / 1000000))
+          test "$calibration_total_ms" -ge 0
+          test "$calibration_total_ms" -lt 600000
+          test "$BUILD_PACKAGE_DURATION_MS" -ge 0
+          jq -e '
+            .schema_version == 1
+            and all(
+              [
+                .archive_authentication_unpack_ms,
+                .project_and_request_setup_ms,
+                .measurement_ms,
+                .retention_validation_ms,
+                .end_to_end_ms
+              ][];
+              type == "number" and . >= 0
+            )
+          ' "$timing_path" >/dev/null
+          {
+            echo "### Metal constant calibration timing"
+            echo
+            echo "| Phase | Duration |"
+            echo "|---|---:|"
+            printf '| Model preparation | %s ms |\n' "$MODEL_PREPARATION_DURATION_MS"
+            printf '| Shared CLI build and package | %s ms |\n' "$BUILD_PACKAGE_DURATION_MS"
+            jq -r '
+              [
+                ["Archive authentication and unpack", .archive_authentication_unpack_ms],
+                ["Project and request setup", .project_and_request_setup_ms],
+                ["Measurement", .measurement_ms],
+                ["Retention validation", .retention_validation_ms],
+                ["Archive through retained evidence", .end_to_end_ms]
+              ][]
+              | "| \(.[0]) | \(.[1]) ms |"
+            ' "$timing_path"
+            printf '| Total calibration wall time | %s ms |\n' "$calibration_total_ms"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage isolated candidate-managed macOS install
         if: ${{ inputs.candidate_installed_proof && !inputs.calibration_mode }}
@@ -507,6 +689,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
@@ -516,7 +699,7 @@ jobs:
             > target/macos-metal-proof/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id accelerator_execution:macos-arm64-metal \
             --producer-workflow .github/workflows/macos-metal-proof.yml \
@@ -542,12 +725,13 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id retrieval_readiness:macos-arm64 \
             --producer-workflow .github/workflows/macos-metal-proof.yml \
@@ -572,6 +756,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
@@ -583,7 +768,7 @@ jobs:
             > target/candidate-installed-macos/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id candidate_installed_behavior:macos-arm64 \
             --producer-workflow .github/workflows/macos-metal-proof.yml \

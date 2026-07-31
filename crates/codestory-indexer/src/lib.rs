@@ -1480,6 +1480,8 @@ pub struct WorkspaceIndexer {
     artifact_cache_policies: ArtifactCachePolicies,
     #[cfg(test)]
     pipeline_test_hooks: FullRefreshPipelineTestHooks,
+    #[cfg(test)]
+    before_resolution_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl WorkspaceIndexer {
@@ -1517,6 +1519,8 @@ impl WorkspaceIndexer {
             artifact_cache_policies: ArtifactCachePolicies::default(),
             #[cfg(test)]
             pipeline_test_hooks: FullRefreshPipelineTestHooks::default(),
+            #[cfg(test)]
+            before_resolution_test_hook: None,
         }
     }
 
@@ -1558,6 +1562,12 @@ impl WorkspaceIndexer {
     #[cfg(test)]
     fn with_pipeline_test_hooks(mut self, hooks: FullRefreshPipelineTestHooks) -> Self {
         self.pipeline_test_hooks = hooks;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_resolution_test_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_resolution_test_hook = Some(hook);
         self
     }
 
@@ -1842,10 +1852,26 @@ impl WorkspaceIndexer {
                     "Resolution pass starting with {unresolved_calls_start} unresolved CALL edges, {unresolved_imports_start} unresolved IMPORT edges, and {unresolved_overrides_start} unresolved OVERRIDE edges{scope_suffix}."
                 ),
             });
+            #[cfg(test)]
+            if let Some(hook) = &self.before_resolution_test_hook {
+                hook();
+            }
             let resolution_started = Instant::now();
-            let resolution_stats = resolver
-                .run_with_scope_with_cancel(storage, resolution_scope, cancel_token)
-                .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
+            let resolution_stats = match resolver.run_with_scope_with_cancel(
+                storage,
+                resolution_scope,
+                cancel_token,
+            ) {
+                Ok(resolution_stats) => resolution_stats,
+                Err(error) if resolution::is_resolution_cancelled(&error) => {
+                    event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
+                    return Ok(WorkspaceIndexingOutcome {
+                        stats,
+                        policy_exclusions,
+                    });
+                }
+                Err(error) => return Err(anyhow!("Resolution error: {:?}", error)),
+            };
             stats.edge_resolution_ms = stats
                 .edge_resolution_ms
                 .saturating_add(duration_ms_u64(resolution_started.elapsed()));
@@ -24691,6 +24717,72 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert!(
             !storage.get_edges()?.is_empty(),
             "indexing should flush edges"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolution_cancellation_after_outer_check_returns_completed_indexing_work() -> Result<()>
+    {
+        use codestory_store::Store as Storage;
+        use codestory_workspace::RefreshInfo;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("module.rs");
+        std::fs::write(&path, "fn caller() { callee(); }\nfn callee() {}\n")?;
+
+        let mut storage = Storage::new_in_memory()?;
+        let cancel_token = CancellationToken::new();
+        let cancel_before_resolution = cancel_token.clone();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 1,
+                node_batch_size: usize::MAX,
+                edge_batch_size: usize::MAX,
+                occurrence_batch_size: usize::MAX,
+                error_batch_size: usize::MAX,
+            })
+            .with_before_resolution_test_hook(Arc::new(move || {
+                cancel_before_resolution.cancel();
+            }));
+        let refresh_info = RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+
+        let stats = indexer.run_incremental(
+            &mut storage,
+            &refresh_info,
+            &EventBus::new(),
+            Some(&cancel_token),
+        )?;
+
+        assert!(cancel_token.is_cancelled());
+        assert!(
+            !stats.resolution_ran,
+            "rolled-back resolution is not completed work"
+        );
+        assert_eq!(stats.artifact_cache_writes, 1);
+        assert_eq!(stats.artifact_cache_write_transactions, 1);
+        let edges = storage.get_edges()?;
+        assert!(!edges.is_empty(), "completed indexing work should remain");
+        let call_edges = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .collect::<Vec<_>>();
+        assert!(
+            !call_edges.is_empty(),
+            "fixture must produce a resolvable call"
+        );
+        assert!(
+            call_edges
+                .into_iter()
+                .all(|edge| edge.resolved_target.is_none()),
+            "cancelled resolution must not publish partial target updates"
         );
 
         Ok(())

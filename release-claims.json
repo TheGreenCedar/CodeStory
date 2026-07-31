@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 7,
+  "graph_version": 11,
   "graph_id": "codestory-release-claims",
   "standard_release_claims": [
     "source_behavior",
@@ -114,11 +114,23 @@
     },
     "native_reuse": "version_only_delta",
     "reuse": {
+      "equation": "Reuse anchors a row to the earlier run and commit it was produced by, so the commit identity is read at the release commit for every binding. Any further identity a reused row would otherwise be held to is checked as written unless the binding declares it below. A binding may declare an identity key only when the binding's own construction determines that key for the evidence being inherited, and an equated key is never dropped: the reused row must still carry the reused commit's own value for it, which the binding is what makes admissible in place of this release's.",
       "bindings": {
-        "source_tree": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
-        "native_fingerprint": "Accelerator evidence from the previous published release is admissible when the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited."
+        "source_tree": {
+          "admits": "Evidence from a prior run is admissible when its producing commit resolves to the identical source tree and is an ancestor of the release commit on the promotion path.",
+          "equates": []
+        },
+        "native_fingerprint": {
+          "admits": "Accelerator evidence from the previous published release is admissible when the reused commit is an ancestor of the release commit and the version-normalized native fingerprint (scripts/native-fingerprint.mjs) of both commits is identical: the built inputs differ only by the embedded version string. Packaging and signing always rerun; only accelerator behavior is inherited.",
+          "equates": [
+            {
+              "identity": "source_tree",
+              "justification": "The fingerprint covers every input that determines the native binary -- crates/**, Cargo.lock, vendor/**, the packaging scripts and the toolchain pins, with the version stamp normalized away -- so an equal fingerprint means the accelerator this evidence exercised is built from identical inputs. The source tree is what that evidence's identity would otherwise be standing in for, and here it is the one thing the two commits are known to differ in, in non-native code the accelerator never runs. Nothing else is equated: the fingerprint says nothing about which repository, which packaged bytes, which host, or which version produced the row, so those stay checked as written."
+            }
+          ]
+        }
       },
-      "verification": "The trusted producer map verifies the binding, the reused run's job success, artifact expiry, and container digest exactly as same-run evidence, and records the reused run, commit, and binding value in the ledger."
+      "verification": "The trusted producer map verifies the binding, the reused run's job success, artifact expiry, and container digest exactly as same-run evidence, and records the reused run, commit, and binding value in the ledger. The closeout re-proves the binding against its own checkout, and re-derives the reused commit's own value for every equated identity, before it reads any reused row at the release identity."
     }
   },
   "exception_policy": {
@@ -568,7 +580,7 @@
       "id": "benchmark_leakage",
       "claim": "answer_quality",
       "control": "negative_gate",
-      "command": "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard"
+      "command": "node --test scripts/tests/lint-retrieval-generalization.test.mjs"
     }
   ],
   "closeout": {
@@ -957,6 +969,71 @@
       }
     ]
   },
+  "non_claim_policy": {
+    "schema": "codestory.release-non-claim/v1",
+    "runtime_execution": "not_proven_by_package",
+    "reason": "accelerator_host_unavailable",
+    "annotation": "The self-hosted runner lost communication with the server. Verify the machine is running and has a healthy network connection.",
+    "maximum_run_attempts": 2,
+    "recovery_contract": ".github/scripts/lost-runner-recovery.mjs",
+    "producer_workflow": ".github/workflows/release.yml",
+    "producer_job": "accelerator-non-claim",
+    "producer_job_name": "Withhold unproven accelerator claims",
+    "withhold_policy": {
+      "maximum_withheld_hosts": 1,
+      "archive_identity_source": "candidate_archive_record",
+      "claims_requiring_proof": [
+        "accelerator_execution",
+        "installed_runtime_behavior",
+        "platform_support",
+        "retrieval_readiness"
+      ]
+    },
+    "hosts": [
+      {
+        "id": "macos-arm64-metal",
+        "unavailable_producer_workflow": ".github/workflows/macos-metal-proof.yml",
+        "unavailable_producer_job_name": "Packaged Apple Silicon Metal engine",
+        "producer_artifacts": {
+          "pre_publish": "release-cell-nonclaim-prepublish-macos-arm64-metal-attempt-{attempt}",
+          "post_publish": "release-cell-nonclaim-postpublish-macos-arm64-metal-attempt-{attempt}"
+        },
+        "withheld_cells": [
+          "accelerator_execution:macos-arm64-metal",
+          "candidate_installed_behavior:macos-arm64",
+          "retrieval_readiness:macos-arm64"
+        ]
+      },
+      {
+        "id": "windows-x64-vulkan",
+        "unavailable_producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+        "unavailable_producer_job_name": "Packaged Windows Vulkan engine",
+        "producer_artifacts": {
+          "pre_publish": "release-cell-nonclaim-prepublish-windows-x64-vulkan-attempt-{attempt}",
+          "post_publish": "release-cell-nonclaim-postpublish-windows-x64-vulkan-attempt-{attempt}"
+        },
+        "withheld_cells": [
+          "accelerator_execution:windows-x64-vulkan",
+          "candidate_installed_behavior:windows-x64",
+          "retrieval_readiness:windows-x64"
+        ]
+      },
+      {
+        "id": "linux-x64-vulkan",
+        "unavailable_producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
+        "unavailable_producer_job_name": "Packaged Linux Vulkan engine",
+        "producer_artifacts": {
+          "pre_publish": "release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-{attempt}",
+          "post_publish": "release-cell-nonclaim-postpublish-linux-x64-vulkan-attempt-{attempt}"
+        },
+        "withheld_cells": [
+          "accelerator_execution:linux-x64-vulkan",
+          "candidate_installed_behavior:linux-x64",
+          "retrieval_readiness:linux-x64"
+        ]
+      }
+    ]
+  },
   "workflow_policy": {
     "artifact_retention_days": 30,
     "package_matrix": [
@@ -982,6 +1059,240 @@
         "extension": "tar.gz"
       }
     ],
+    "windows_package_graph": {
+      "asset_target": "windows-x64",
+      "cargo_profile": "release",
+      "cargo_build_invocations": 1,
+      "cargo_test_invocations_after_build": 0,
+      "artifacts": [
+        "codestory-cli",
+        "codestory-cli-runtime",
+        "codestory_embedding_qualification"
+      ],
+      "direct_test_harnesses": [],
+      "source_test_harnesses": [
+        "native_staging",
+        "windows_path_identity"
+      ],
+      "production_feature_probes": [
+        "cargo_message_feature_contract",
+        "runtime_observation_source"
+      ],
+      "package_artifact": "codestory-cli",
+      "timing_phases": [
+        "cache_restore",
+        "native_setup",
+        "cargo_graph",
+        "msvc_link",
+        "feature_probe",
+        "packaging",
+        "artifact_transfer"
+      ]
+    },
+    "candidate_archive_cache": {
+      "record_schema": "codestory-candidate-archive-store/v1",
+      "key_fields": [
+        "source.commit",
+        "target",
+        "archive.sha256"
+      ],
+      "protected_host_root": "runner_tool_cache",
+      "package_producer_workflow": "packaged-platform-proof.yml",
+      "package_artifact_name": "codestory-cli-{asset_target}",
+      "record_artifact_name": "codestory-candidate-archive-record-{asset_target}",
+      "qualification_driver_artifact_name": "codestory-qualification-driver-{asset_target}",
+      "hit_verification": [
+        "repository",
+        "source.commit",
+        "source.tree",
+        "target",
+        "archive.file",
+        "archive.bytes",
+        "archive.sha256"
+      ],
+      "miss_admission": "same_filesystem_atomic_rename",
+      "owned_corruption": "quarantine_then_authenticated_miss",
+      "unowned_corruption": "fail_closed",
+      "cross_source_reuse": false,
+      "restore_prefixes": false,
+      "public_asset_reauthentication": true
+    },
+    "model_material_cache": {
+      "key_field": "model.sha256",
+      "source_sha_in_key": false,
+      "toolchain_in_key": false,
+      "hit_verification": [
+        "model.real_ancestry",
+        "model.single_link",
+        "model.size_bytes",
+        "model.sha256"
+      ],
+      "miss_admission": "same_filesystem_atomic_no_replace"
+    },
+    "calibration": {
+      "coordinator_workflow": "packaged-platform-pr.yml",
+      "mode": "calibration",
+      "assembly_job": "calibration-assemble",
+      "pre_collection_source_proof_required": false,
+      "source_proof_stage": "frozen_candidate_before_qualification",
+      "required_cells": [
+        {
+          "id": "protected_macos_arm64_metal",
+          "workflow": "macos-metal-proof.yml",
+          "job": "packaged-metal",
+          "policy": "accelerated",
+          "backend": "metal",
+          "feeds_constant_selection": true
+        }
+      ],
+      "optional_cells": [
+        {
+          "id": "protected_linux_x64_vulkan",
+          "workflow": "linux-vulkan-proof.yml",
+          "job": "optional-constant-calibration",
+          "trigger": "workflow_dispatch",
+          "policy": "accelerated",
+          "backend": "vulkan",
+          "assembly_dependency": false,
+          "feeds_constant_selection": false
+        }
+      ],
+      "runs_per_required_cell": 3,
+      "samples_per_metric_per_run": 1,
+      "constant_metrics": [
+        "existing_owner_connect",
+        "spawn_convergence",
+        "cold_first_vector",
+        "first_product_ready",
+        "warm_query_ipc",
+        "warm_bulk_ipc",
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+        "busy_retry_usefulness"
+      ],
+      "forbidden_evidence": [
+        "qualification_scenarios",
+        "true_idle_exit",
+        "total_codestory_process_memory",
+        "retrieval_quality",
+        "backend_observed_accelerator_residency"
+      ],
+      "forbidden_policies": [
+        "cpu_explicit"
+      ],
+      "forbidden_backends": [
+        "cpu"
+      ],
+      "forbidden_environment": [
+        "CODESTORY_EMBED_ALLOW_CPU=1"
+      ]
+    },
+    "qualification": {
+      "coordinator_workflow": "packaged-platform-pr.yml",
+      "mode": "qualification",
+      "driver_contract": {
+        "producer_workflow": "packaged-platform-proof.yml",
+        "producer_job": "build",
+        "artifact_name_template": "codestory-qualification-driver-{asset_target}",
+        "artifact_directory_template": ".",
+        "identity_file": "qualification-driver-identity.json",
+        "identity_schema_version": 1,
+        "identity_fields": [
+          "schema_version",
+          "source.commit",
+          "source.tree",
+          "release_version",
+          "asset_target",
+          "archive.file",
+          "archive.bytes",
+          "archive.sha256",
+          "driver.file",
+          "driver.bytes",
+          "driver.sha256"
+        ],
+        "build_invocations_per_platform": 1,
+        "reuse_required": true,
+        "public_release_asset": false
+      },
+      "runs_per_available_cell": 1,
+      "required_cells": [
+        {
+          "id": "protected_macos_arm64_metal",
+          "workflow": "macos-metal-proof.yml",
+          "job": "packaged-metal",
+          "policy": "accelerated",
+          "backend": "metal"
+        },
+        {
+          "id": "protected_windows_x64_vulkan",
+          "workflow": "windows-vulkan-proof.yml",
+          "job": "packaged-vulkan",
+          "policy": "accelerated",
+          "backend": "vulkan"
+        }
+      ],
+      "optional_cells": [
+        {
+          "id": "protected_linux_x64_vulkan",
+          "workflow": "linux-vulkan-proof.yml",
+          "job": "packaged-vulkan",
+          "trigger": "workflow_dispatch",
+          "policy": "accelerated",
+          "backend": "vulkan",
+          "closeout_dependency": false,
+          "blocking": false
+        }
+      ],
+      "quality_contract": {
+        "producer_workflow": "packaged-platform-pr.yml",
+        "producer_job": "frozen-candidate-quality",
+        "producer_cell": "protected_macos_arm64_metal",
+        "scheduled_once_per_frozen_candidate": true,
+        "blocking": false,
+        "closeout_dependency": false,
+        "claimed": false,
+        "archive_cache_key_fields": [
+          "source.commit",
+          "target",
+          "archive.sha256"
+        ],
+        "archive_cache_contract": "candidate_archive_cache",
+        "archive_transfer": "authenticated_miss_only",
+        "evaluation_owner": "isolated_reusable_workflow",
+        "evaluation_owner_sha256": "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+        "evaluation_contract": "publishable-three-repeat-packet/v1",
+        "task_count": 1,
+        "repeats_per_task": 3,
+        "row_count": 3
+      },
+      "required_evidence": [
+        "qualification_scenarios",
+        "true_idle_exit",
+        "total_codestory_process_memory",
+        "backend_observed_accelerator_residency"
+      ],
+      "required_scenarios": [
+        "client_death",
+        "cold_race",
+        "frozen_owner",
+        "incompatible_owner",
+        "mixed_queue",
+        "server_crash",
+        "true_idle_respawn",
+        "worker_stall"
+      ],
+      "true_idle_timeout_ms": 60000,
+      "true_idle_observation_grace_ms": 2500,
+      "forbidden_policies": [
+        "cpu_explicit"
+      ],
+      "forbidden_backends": [
+        "cpu"
+      ],
+      "forbidden_environment": [
+        "CODESTORY_EMBED_ALLOW_CPU=1"
+      ]
+    },
     "protected_jobs": [
       {
         "workflow": "macos-metal-proof.yml",
@@ -1062,13 +1373,21 @@
           "preflight",
           "packaged-proof"
         ],
+        "accelerator-non-claim": [
+          "preflight",
+          "packaged-proof",
+          "macos-metal-proof",
+          "windows-vulkan-proof",
+          "linux-vulkan-proof"
+        ],
         "pre-publish-closeout": [
           "preflight",
           "source-proof",
           "packaged-proof",
           "macos-metal-proof",
           "windows-vulkan-proof",
-          "linux-vulkan-proof"
+          "linux-vulkan-proof",
+          "accelerator-non-claim"
         ],
         "publish": [
           "preflight",
@@ -1090,6 +1409,47 @@
         ]
       }
     },
+    "plugin_chain": {
+      "dependencies": {
+        "preflight": [
+          "workflow-policy"
+        ],
+        "plugin-proof": [
+          "preflight"
+        ],
+        "publish": [
+          "preflight",
+          "plugin-proof"
+        ],
+        "marketplace-publish": [
+          "preflight",
+          "publish"
+        ],
+        "post-publish-smoke": [
+          "preflight",
+          "publish",
+          "marketplace-publish"
+        ]
+      }
+    },
+    "catalog_delivery": {
+      "publish_job": "marketplace-publish",
+      "recovery_workflow": "marketplace-sync.yml",
+      "release_gate": false,
+      "installed_cell_group": "installed_runtime_behavior",
+      "states": [
+        {
+          "id": "published",
+          "installer": "codex_marketplace_install",
+          "live_catalog_revision": true
+        },
+        {
+          "id": "deferred",
+          "installer": "codex_marketplace_deferred_fixture",
+          "live_catalog_revision": false
+        }
+      ]
+    },
     "artifact_workflows": [
       "source-proof.yml",
       "release-candidate-evidence.yml",
@@ -1108,13 +1468,90 @@
       "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
       "source_cache_namespace": "source-proof-v2",
       "packaged_cache_namespace": "codestory-cli-native-v4",
-      "label_routed_workflows": [
-        "source-proof.yml",
-        "packaged-platform-pr.yml"
+      "label_routed_workflows": [],
+      "required_events": []
+    },
+    "release_freeze_barrier": {
+      "schema": 3,
+      "script": ".github/scripts/release-freeze-barrier.mjs",
+      "status_context_prefix": "codestory/release-freeze",
+      "allowed_future_source_changes": [
+        "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
       ],
-      "required_events": [
-        "labeled"
-      ]
+      "required_hostile_mutations": [
+        "cpu_backend_rejected",
+        "calibration_qualification_rejected",
+        "calibration_three_by_three_rejected",
+        "calibration_repeated_setup_rejected",
+        "missing_linux_nonblocking",
+        "windows_duplicate_build_rejected",
+        "windows_debug_release_mix_rejected",
+        "windows_stale_archive_rejected"
+      ],
+      "broad_entry_workflows": [
+        "source-proof.yml",
+        "packaged-platform-pr.yml",
+        "release.yml"
+      ],
+      "invalidation_workflow": "release-freeze-invalidation.yml",
+      "coordinator_only_workflows": [
+        "macos-metal-proof.yml",
+        "windows-vulkan-proof.yml",
+        "linux-vulkan-proof.yml"
+      ],
+      "acceptance": {
+        "producer_workflow": "source-proof.yml",
+        "receipt_authority": "github_actions",
+        "receipt_artifact": "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+        "receipt_file": "release-freeze-receipt.json",
+        "receipt_producer_job": "resolve",
+        "status_scope": "exact_candidate_head",
+        "later_commit_revokes": true,
+        "event": "workflow_dispatch",
+        "hostile_job": "freeze-hostile-mutations",
+        "hostile_step": "Execute exact-head hostile mutation matrix",
+        "windows_job": "freeze-windows-native-probe",
+        "windows_step": "Run exact-head Windows native probe",
+        "windows_runner": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "windows_probe_max_seconds": 90,
+        "publisher_job": "freeze-acceptance",
+        "publisher_step": "Publish executable release freeze",
+        "status_creator": "github-actions[bot]",
+        "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
+        "job_manifest_sha256": "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+        "phases": {
+          "calibration_source": {
+            "known_future_source_changes": [
+              "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+            ],
+            "planned_actions": [
+              "calibration-source-acceptance",
+              "calibration",
+              "generated-constant-freeze",
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json"
+          },
+          "frozen_candidate": {
+            "known_future_source_changes": [],
+            "planned_actions": [
+              "frozen-candidate-acceptance",
+              "source-proof",
+              "qualification",
+              "release"
+            ],
+            "next_permitted_mutation": null
+          }
+        }
+      }
     },
     "actionlint": {
       "version": "1.7.12",

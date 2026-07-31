@@ -9,10 +9,11 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rm,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, parse, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -171,6 +172,7 @@ async function valid(path, contract) {
     const metadata = await lstat(path);
     return (
       metadata.isFile() &&
+      metadata.nlink === 1 &&
       metadata.size === contract.size &&
       (await digest(path)) === contract.sha256
     );
@@ -275,6 +277,35 @@ async function destinationMetadata(path) {
   }
 }
 
+function pathIdentity(path) {
+  const resolved = resolve(path);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function ensureRealDirectoryTree(directory, label) {
+  const resolved = resolve(directory);
+  const root = parse(resolved).root;
+  const components = relative(root, resolved).split(sep).filter(Boolean);
+  let cursor = root;
+  for (const component of components) {
+    cursor = resolve(cursor, component);
+    try {
+      await mkdir(cursor);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const metadata = await lstat(cursor);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`${label} must not traverse symbolic links, reparse points, or files: ${cursor}`);
+    }
+    const canonical = await realpath(cursor);
+    if (pathIdentity(canonical) !== pathIdentity(cursor)) {
+      throw new Error(`${label} must have real directory ancestry: ${cursor}`);
+    }
+  }
+  return resolved;
+}
+
 async function requireAbsentDestination(path) {
   if (await destinationMetadata(path)) {
     throw new Error(`refusing to overwrite model destination: ${path}`);
@@ -291,19 +322,38 @@ async function publishNoReplace(temporary, destination, contract) {
     }
     throw error;
   }
+  try {
+    await rm(temporary);
+  } catch (error) {
+    await rm(destination, { force: true });
+    throw error;
+  }
   if (!(await valid(destination, contract))) {
     await rm(destination, { force: true });
     throw new Error(`published model failed verification: ${destination}`);
   }
-  await rm(temporary);
 }
 
 const contract = await loadContract(resolve(argument("--contract") ?? defaultContract));
+const outputArgument = argument("--output");
+const cacheRootArgument = argument("--cache-root");
+if (outputArgument && cacheRootArgument) {
+  throw new Error("--output and --cache-root are mutually exclusive");
+}
+const cacheRoot = cacheRootArgument
+  ? await ensureRealDirectoryTree(cacheRootArgument, "model cache root")
+  : undefined;
 const destination = resolve(
-  argument("--output") ??
-    `target/build-assets/sha256/${contract.sha256}/${contract.fileName}`,
+  outputArgument ??
+    (cacheRoot
+      ? resolve(cacheRoot, "sha256", contract.sha256, contract.fileName)
+      : `target/build-assets/sha256/${contract.sha256}/${contract.fileName}`),
 );
-await mkdir(dirname(destination), { recursive: true });
+if (cacheRoot) {
+  await ensureRealDirectoryTree(dirname(destination), "model cache path");
+} else {
+  await mkdir(dirname(destination), { recursive: true });
+}
 const existingDestination = await destinationMetadata(destination);
 if (existingDestination && !existingDestination.isFile()) {
   throw new Error(`model destination is not a regular file: ${destination}`);
@@ -326,6 +376,9 @@ if (!(await valid(destination, contract))) {
     }
     if (!published) throw aggregatedDownloadError(failures);
   }
+}
+if (cacheRoot) {
+  await ensureRealDirectoryTree(dirname(destination), "model cache path");
 }
 
 if (process.env.GITHUB_ENV) {

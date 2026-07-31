@@ -150,7 +150,7 @@ fn indexed_fixture() -> HttpFixture {
         .arg(workspace.path())
         .arg("--cache-dir")
         .arg(cache_dir.path())
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run index");
     assert!(
@@ -185,7 +185,7 @@ fn indexed_zero_dense_fixture() -> HttpFixture {
         .arg(workspace.path())
         .arg("--cache-dir")
         .arg(cache_dir.path())
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run zero-dense index");
     assert!(
@@ -245,7 +245,7 @@ fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
         .arg(cache_dir.path())
         .arg("--addr")
         .arg("0.0.0.0:0")
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run serve");
     assert!(
@@ -273,7 +273,7 @@ fn spawn_http_server(fixture: &HttpFixture) -> (HttpServer, String) {
         .arg(fixture.cache_dir.path())
         .arg("--addr")
         .arg(&addr)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

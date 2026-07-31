@@ -101,7 +101,7 @@ install_service() {
     "Environment=XDG_RUNTIME_DIR=$runtime_dir" \
     "Environment=XDG_CACHE_HOME=$runner_root/cache/xdg" \
     "Environment=CODESTORY_CACHE_DIR=$runner_root/cache/codestory" \
-    "Environment=CODESTORY_EMBED_ALLOW_CPU=1" \
+    "Environment=CODESTORY_EMBED_ALLOW_CPU=0" \
     "Environment=CODESTORY_REAL_REPO_DRILL_CASES=$runner_root/drills/real-repo-drill-cases.json" \
     "Environment=CODESTORY_RELEASE_EVIDENCE_PROFILE_ID=$profile_id" \
     "Environment=CODESTORY_RELEASE_EVIDENCE_PROVISIONING=$runner_root/artifacts/provisioning.json" \

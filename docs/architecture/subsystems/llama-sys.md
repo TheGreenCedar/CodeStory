@@ -28,9 +28,9 @@ The build also embeds a parseable `codestory-native-engine-v1` marker with the
 target triple, native binary architecture, linkage and backend-loading mode,
 compiled backend set, llama crate/source identity, exact model digest, a stable
 digest of the model/vector/tokenizer contract, model presence, and producer
-version. macOS keeps Metal built in. Windows and Linux load packaged core, CPU,
-and Vulkan modules at runtime so the base executable does not acquire a
-mandatory Vulkan-loader dependency. Release packaging inspects PE imports, ELF
+version. macOS keeps Metal built in. Windows and Linux load packaged native
+modules at runtime so the base executable does not acquire a mandatory
+Vulkan-loader dependency. Release packaging inspects PE imports, ELF
 `DT_NEEDED`, or Mach-O load commands, verifies the complete target-specific
 runtime set, and records every artifact and digest in
 `codestory-native-manifest.json`.
@@ -59,7 +59,8 @@ batch limits, smoke input, backend, and device class. The crate checks only the
 compiled model compatibility facts it must execute, currently dimension and
 pooling, and returns raw vectors plus engine diagnostics. Model selection,
 prefixes, normalization, vector schema, batching policy, persisted evidence,
-and CPU/accelerator policy live in `codestory-retrieval`. The binding does not
+and accelerator admission policy live in `codestory-retrieval`. The binding
+does not
 select a project, publish a retrieval generation, or decide whether
 packet/search may serve.
 
@@ -68,7 +69,7 @@ packet/search may serve.
 A model, tokenizer, pooling, normalization, vector-dimension, backend, or ggml
 change creates a new producer identity and requires retrieval rebuild and
 same-run performance/quality evidence. Add capability reporting here; add
-product selection and fallback policy in retrieval. Production must never
+product selection and failure policy in retrieval. Production must never
 respond to accelerator failure by silently selecting CPU.
 
 ## Failure signatures

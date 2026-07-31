@@ -45,6 +45,8 @@ const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
 /// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
+/// Keep every call-degree IN-list well under SQLite's variable ceiling.
+const GROUNDING_CALL_DEGREE_CHUNK: usize = 500;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_READY: i64 = 2;
@@ -251,6 +253,93 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     } else {
         value as u32
     }
+}
+
+/// SQL for the directed CALL degrees of one bounded node chunk.
+///
+/// A read surface must cost what its bounded input costs, not what the
+/// repository happens to contain, so the candidate ids sit inside each `edge`
+/// predicate rather than in an outer filter over a repository-wide CALL scan.
+/// `COALESCE(resolved, raw) IN (ids)` is spelled as two branches because only a
+/// branch is index-seekable; the branches stay disjoint on `resolved IS NULL`,
+/// and `COUNT(DISTINCT ...)` runs over their union so an endpoint reachable
+/// through both a resolved and an unresolved edge still counts once.
+///
+/// The branches pin their index because both edge indexes match the kind
+/// prefix, and without pinning SQLite reads `resolved_target_node_id IS NULL` as
+/// the more selective equality and seeks every unresolved CALL edge in the
+/// repository. `grounding_call_degree_plan_seeks_the_candidate_chunk` holds the
+/// shape. Every pinned index is created for any live store (schema.rs:392-415).
+fn grounding_call_degree_query(ids: &str, certainty: &str) -> String {
+    let call_kind = EdgeKind::CALL as i32;
+    format!(
+        "WITH inbound_call AS (
+            SELECT
+                e.resolved_target_node_id AS node_id,
+                COALESCE(e.resolved_source_node_id, e.source_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_resolved_target
+            WHERE e.kind = {call_kind}
+              AND e.resolved_target_node_id IN ({ids})
+              AND {certainty} = 'certain'
+            UNION ALL
+            SELECT
+                e.target_node_id AS node_id,
+                COALESCE(e.resolved_source_node_id, e.source_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_target
+            WHERE e.kind = {call_kind}
+              AND e.target_node_id IN ({ids})
+              AND e.resolved_target_node_id IS NULL
+              AND {certainty} = 'certain'
+        ),
+        inbound AS (
+            SELECT
+                inbound_call.node_id AS node_id,
+                COUNT(DISTINCT inbound_call.other_id) AS in_degree,
+                0 AS out_degree
+            FROM inbound_call
+            LEFT JOIN node caller ON caller.id = inbound_call.other_id
+            LEFT JOIN file caller_file ON caller_file.id = caller.file_node_id
+            WHERE inbound_call.other_id != inbound_call.node_id
+              AND COALESCE(caller_file.file_role, 'source') NOT IN ('test', 'benchmark')
+            GROUP BY inbound_call.node_id
+        ),
+        outbound_call AS (
+            SELECT
+                e.resolved_source_node_id AS node_id,
+                COALESCE(e.resolved_target_node_id, e.target_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_resolved_source
+            WHERE e.resolved_source_node_id IN ({ids})
+              AND e.kind = {call_kind}
+              AND {certainty} = 'certain'
+            UNION ALL
+            SELECT
+                e.source_node_id AS node_id,
+                COALESCE(e.resolved_target_node_id, e.target_node_id) AS other_id
+            FROM edge e INDEXED BY idx_edge_kind_source
+            WHERE e.kind = {call_kind}
+              AND e.source_node_id IN ({ids})
+              AND e.resolved_source_node_id IS NULL
+              AND {certainty} = 'certain'
+        ),
+        outbound AS (
+            SELECT
+                outbound_call.node_id AS node_id,
+                0 AS in_degree,
+                COUNT(DISTINCT outbound_call.other_id) AS out_degree
+            FROM outbound_call
+            WHERE outbound_call.other_id != outbound_call.node_id
+            GROUP BY outbound_call.node_id
+        ),
+        combined AS (
+            SELECT node_id, in_degree, out_degree FROM inbound
+            UNION ALL
+            SELECT node_id, in_degree, out_degree FROM outbound
+        )
+        SELECT node_id, SUM(in_degree), SUM(out_degree)
+        FROM combined
+        GROUP BY node_id
+        ORDER BY node_id"
+    )
 }
 
 fn canonical_search_symbol_batch_limit(
@@ -2707,7 +2796,6 @@ impl FileRole {
             || marked.contains("/schema/typescript/")
             || marked.contains(".generated.")
             || file_name.ends_with(".g.cs")
-            || file_name.contains("payload-types")
         {
             return Self::Generated;
         }
@@ -3132,6 +3220,20 @@ pub struct GroundingEdgeKindCount {
     pub count: u32,
 }
 
+/// Directed CALL degrees for one node.
+///
+/// Undirected edge digests cannot tell a call-graph root from a leaf that many
+/// things call, so ranking needs the two directions apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroundingCallDegree {
+    pub node_id: NodeId,
+    /// Distinct non-speculative inbound CALL sources, excluding callers that
+    /// live in proven test or benchmark files.
+    pub production_in_calls: u32,
+    /// Distinct non-speculative outbound CALL targets.
+    pub out_calls: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileProjectionRemovalSummary {
     pub canonical_file_node_id: i64,
@@ -3284,6 +3386,21 @@ pub struct DenseAnchorInputReuseMetadata {
     pub selection_reason: String,
     pub policy_version: String,
     pub source_identity: String,
+}
+
+/// Row-count shape of the published dense-anchor table.
+///
+/// Freshness checks only need the counts and the policy-version agreement, so
+/// this is deliberately the aggregate projection rather than the rows: it is
+/// what staleness callers must use so an observational readiness or status
+/// call never materializes `document_text` for the whole table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DenseAnchorInputStats {
+    pub doc_count: u32,
+    /// Policy version of the lowest `node_id`, matching a row-order scan.
+    pub policy_version: Option<String>,
+    pub mixed_policy_versions: bool,
+    pub selection_reason_counts: BTreeMap<String, u32>,
 }
 
 pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 1;
@@ -7492,6 +7609,55 @@ impl Storage {
         Ok(inputs)
     }
 
+    /// Aggregate the published dense-anchor table without reading any row.
+    ///
+    /// Staleness comparison needs four numbers: how many anchors exist, how
+    /// they break down by selection reason, whether they agree on a policy
+    /// version, and which version that is. Paging
+    /// `get_dense_anchor_inputs_batch_after` to derive them `SELECT`s
+    /// `document_text` for every anchor and materializes a full
+    /// `DenseAnchorInput` per row — tens of megabytes of string allocation on
+    /// a large repository, paid on every observational readiness or status
+    /// call that re-derives freshness. SQLite answers all four from one
+    /// grouped scan that never touches the document column, so the group
+    /// cardinality is `distinct(selection_reason) x distinct(policy_version)`
+    /// rather than the anchor count. `MIN(node_id)` per group reproduces the
+    /// row-order "first policy version wins" rule exactly.
+    pub fn dense_anchor_input_stats(&self) -> Result<DenseAnchorInputStats, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT selection_reason, policy_version, COUNT(*), MIN(node_id)
+             FROM dense_anchor_input
+             GROUP BY selection_reason, policy_version",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut stats = DenseAnchorInputStats::default();
+        let mut policy_versions: BTreeSet<String> = BTreeSet::new();
+        let mut first_policy: Option<(i64, String)> = None;
+        while let Some(row) = rows.next()? {
+            let selection_reason: String = row.get(0)?;
+            let policy_version: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            let min_node_id: i64 = row.get(3)?;
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            stats.doc_count = stats.doc_count.saturating_add(count);
+            let reason_count = stats
+                .selection_reason_counts
+                .entry(selection_reason)
+                .or_insert(0);
+            *reason_count = reason_count.saturating_add(count);
+            if first_policy
+                .as_ref()
+                .is_none_or(|(lowest, _)| min_node_id < *lowest)
+            {
+                first_policy = Some((min_node_id, policy_version.clone()));
+            }
+            policy_versions.insert(policy_version);
+        }
+        stats.mixed_policy_versions = policy_versions.len() > 1;
+        stats.policy_version = first_policy.map(|(_, version)| version);
+        Ok(stats)
+    }
+
     pub fn get_dense_anchor_input_reuse_metadata(
         &self,
     ) -> Result<Vec<DenseAnchorInputReuseMetadata>, StorageError> {
@@ -10355,208 +10521,6 @@ impl Storage {
         Ok(nodes)
     }
 
-    /// Return a bounded set of root symbols whose serialized names match
-    /// caller-owned architecture patterns inside exact files.
-    ///
-    /// This complements the per-file structural window when a leaf-heavy
-    /// entrypoint file ranks its executable root below that window. The
-    /// runtime remains responsible for validating the name and file evidence.
-    pub fn get_grounding_named_root_symbols_for_files(
-        &self,
-        file_ids: &[i64],
-        normalized_exact_names: &[String],
-        uppercase_name_globs: &[String],
-        per_file_limit: usize,
-    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
-        if file_ids.is_empty()
-            || (normalized_exact_names.is_empty() && uppercase_name_globs.is_empty())
-            || per_file_limit == 0
-        {
-            return Ok(Vec::new());
-        }
-
-        let file_placeholders = question_placeholders(file_ids.len());
-        let mut name_conditions = Vec::new();
-        if !normalized_exact_names.is_empty() {
-            name_conditions.push(format!(
-                "LOWER(REPLACE(serialized_name, '_', '')) IN ({})",
-                question_placeholders(normalized_exact_names.len())
-            ));
-        }
-        name_conditions.extend(
-            uppercase_name_globs
-                .iter()
-                .map(|_| "serialized_name GLOB ?".to_string()),
-        );
-        let name_conditions = name_conditions.join(" OR ");
-        if self.has_ready_grounding_summary_snapshots()? {
-            let query = format!(
-                "WITH matched AS (
-                    SELECT
-                        node_id,
-                        kind,
-                        serialized_name,
-                        qualified_name,
-                        canonical_id,
-                        file_node_id,
-                        start_line,
-                        start_col,
-                        end_line,
-                        end_col,
-                        display_name,
-                        file_path,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY file_node_id
-                            ORDER BY file_symbol_rank, node_id
-                        ) AS named_rank
-                    FROM grounding_node_snapshot
-                         INDEXED BY idx_grounding_node_snapshot_file_rank
-                    WHERE file_node_id IN ({file_placeholders})
-                      AND is_root = 1
-                      AND kind IN ({function_kind}, {method_kind})
-                      AND ({name_conditions})
-                )
-                SELECT
-                    node_id,
-                    kind,
-                    serialized_name,
-                    qualified_name,
-                    canonical_id,
-                    file_node_id,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                    display_name,
-                    file_path
-                FROM matched
-                WHERE named_rank <= ?",
-                function_kind = NodeKind::FUNCTION as i32,
-                method_kind = NodeKind::METHOD as i32,
-            );
-            let mut values = Vec::with_capacity(
-                file_ids
-                    .len()
-                    .saturating_add(normalized_exact_names.len())
-                    .saturating_add(uppercase_name_globs.len())
-                    .saturating_add(1),
-            );
-            values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
-            values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
-            values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
-            values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
-            let mut stmt = self.conn.prepare(&query)?;
-            let mut rows = stmt.query(params_from_iter(values))?;
-            let mut nodes = Vec::new();
-            while let Some(row) = rows.next()? {
-                nodes.push(GroundingNodeRecord {
-                    node: Self::node_from_row(row)?,
-                    display_name: row.get(10)?,
-                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
-                });
-            }
-            return Ok(nodes);
-        }
-
-        let rank_sql = grounding_node_rank_sql("n");
-        let indexable = grounding_indexable_predicate("n");
-        let display_name = grounding_display_name_expr("n");
-        let mut fallback_name_conditions = Vec::new();
-        if !normalized_exact_names.is_empty() {
-            fallback_name_conditions.push(format!(
-                "LOWER(REPLACE(n.serialized_name, '_', '')) IN ({})",
-                question_placeholders(normalized_exact_names.len())
-            ));
-        }
-        fallback_name_conditions.extend(
-            uppercase_name_globs
-                .iter()
-                .map(|_| "n.serialized_name GLOB ?".to_string()),
-        );
-        let fallback_name_conditions = fallback_name_conditions.join(" OR ");
-        let query = format!(
-            "WITH matched AS (
-                SELECT
-                    n.id,
-                    n.kind,
-                    n.serialized_name,
-                    n.qualified_name,
-                    n.canonical_id,
-                    n.file_node_id,
-                    n.start_line,
-                    n.start_col,
-                    n.end_line,
-                    n.end_col,
-                    {display_name} AS display_name,
-                    COALESCE(f.path, file_node.serialized_name) AS file_path,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY n.file_node_id
-                        ORDER BY
-                            {rank_sql},
-                            COALESCE(n.start_line, 2147483647),
-                            {display_name},
-                            n.id
-                    ) AS named_rank
-                FROM node n
-                LEFT JOIN file f ON f.id = n.file_node_id
-                LEFT JOIN node file_node
-                    ON file_node.id = n.file_node_id
-                   AND file_node.kind = {file_kind}
-                WHERE n.file_node_id IN ({file_placeholders})
-                  AND {indexable}
-                  AND n.kind IN ({function_kind}, {method_kind})
-                  AND ({fallback_name_conditions})
-                  AND NOT EXISTS (
-                        SELECT 1
-                        FROM edge e
-                        WHERE e.kind = {member_kind}
-                          AND e.target_node_id = n.id
-                    )
-            )
-            SELECT
-                id,
-                kind,
-                serialized_name,
-                qualified_name,
-                canonical_id,
-                file_node_id,
-                start_line,
-                start_col,
-                end_line,
-                end_col,
-                display_name,
-                file_path
-            FROM matched
-            WHERE named_rank <= ?",
-            file_kind = NodeKind::FILE as i32,
-            function_kind = NodeKind::FUNCTION as i32,
-            method_kind = NodeKind::METHOD as i32,
-            member_kind = EdgeKind::MEMBER as i32,
-        );
-        let mut values = Vec::with_capacity(
-            file_ids
-                .len()
-                .saturating_add(normalized_exact_names.len())
-                .saturating_add(uppercase_name_globs.len())
-                .saturating_add(1),
-        );
-        values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
-        values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
-        values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
-        values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
-        let mut stmt = self.conn.prepare(&query)?;
-        let mut rows = stmt.query(params_from_iter(values))?;
-        let mut nodes = Vec::new();
-        while let Some(row) = rows.next()? {
-            nodes.push(GroundingNodeRecord {
-                node: Self::node_from_row(row)?,
-                display_name: row.get(10)?,
-                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
-            });
-        }
-        Ok(nodes)
-    }
-
     pub fn get_grounding_root_symbol_candidates(
         &self,
         limit: usize,
@@ -10862,6 +10826,63 @@ impl Storage {
                 .then((left.kind as i32).cmp(&(right.kind as i32)))
         });
         Ok(counts)
+    }
+
+    /// Return directed CALL degrees for a bounded node set.
+    ///
+    /// Root ranking needs to tell a call-DAG root (nothing calls it, it calls
+    /// out) from a widely-called leaf, which the undirected edge digest cannot
+    /// express. Speculative resolutions are ignored the same way the detail
+    /// snapshot ignores them, so a guessed edge never manufactures evidence.
+    /// Nodes with no qualifying edges are absent; callers read absence as zero.
+    pub fn get_grounding_call_degrees(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<GroundingCallDegree>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut merged = HashMap::<NodeId, GroundingCallDegree>::new();
+        for chunk in node_ids.chunks(GROUNDING_CALL_DEGREE_CHUNK) {
+            let ids = numbered_placeholders(1, chunk.len());
+            // A NULL certainty with a NULL confidence is an unannotated edge,
+            // which the runtime already treats as non-speculative.
+            let certainty = format!(
+                "COALESCE(
+                    e.certainty,
+                    CASE
+                        WHEN e.confidence IS NULL THEN 'certain'
+                        WHEN e.confidence >= {certain_min} THEN 'certain'
+                        WHEN e.confidence >= {probable_min} THEN 'probable'
+                        ELSE 'uncertain'
+                    END
+                 )",
+                certain_min = ResolutionCertainty::CERTAIN_MIN,
+                probable_min = ResolutionCertainty::PROBABLE_MIN,
+            );
+            let query = grounding_call_degree_query(&ids, &certainty);
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let node_id = NodeId(row.get(0)?);
+                let entry = merged.entry(node_id).or_insert(GroundingCallDegree {
+                    node_id,
+                    production_in_calls: 0,
+                    out_calls: 0,
+                });
+                entry.production_in_calls = entry
+                    .production_in_calls
+                    .saturating_add(clamp_i64_to_u32(row.get::<_, i64>(1)?));
+                entry.out_calls = entry
+                    .out_calls
+                    .saturating_add(clamp_i64_to_u32(row.get::<_, i64>(2)?));
+            }
+        }
+
+        let mut degrees = merged.into_values().collect::<Vec<_>>();
+        degrees.sort_by_key(|degree| degree.node_id.0);
+        Ok(degrees)
     }
 
     pub fn get_file_by_path(&self, path: &Path) -> Result<Option<FileInfo>, StorageError> {
@@ -11871,32 +11892,6 @@ mod grounding_snapshot_fast_path_tests {
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
         assert_eq!(fallback, vec!["AppConfig"]);
-        let named_exact = [
-            "runapp".to_string(),
-            "startapplication".to_string(),
-            "main".to_string(),
-        ];
-        let uppercase_globs = [
-            "Page".to_string(),
-            "Layout".to_string(),
-            "[A-Z]*Page".to_string(),
-            "[A-Z]*Layout".to_string(),
-        ];
-        let mut named_fallback = storage
-            .get_grounding_named_root_symbols_for_files(
-                &[5, 10, 20, 30],
-                &named_exact,
-                &uppercase_globs,
-                2,
-            )?
-            .into_iter()
-            .map(|record| record.display_name)
-            .collect::<Vec<_>>();
-        named_fallback.sort();
-        assert_eq!(
-            named_fallback,
-            vec!["Page", "main", "run_app", "run_app", "start_application"]
-        );
 
         storage.refresh_grounding_summary_snapshots()?;
 
@@ -11906,18 +11901,6 @@ mod grounding_snapshot_fast_path_tests {
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
         assert_eq!(snapshot, fallback);
-        let mut named_snapshot = storage
-            .get_grounding_named_root_symbols_for_files(
-                &[5, 10, 20, 30],
-                &named_exact,
-                &uppercase_globs,
-                2,
-            )?
-            .into_iter()
-            .map(|record| record.display_name)
-            .collect::<Vec<_>>();
-        named_snapshot.sort();
-        assert_eq!(named_snapshot, named_fallback);
 
         let base_plan = storage
             .conn
@@ -11971,53 +11954,272 @@ mod grounding_snapshot_fast_path_tests {
             "architecture root window sorted outside the file-rank index: {file_plan:?}"
         );
 
-        let named_plan = storage
-            .conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 WITH matched AS (
-                    SELECT
-                        node_id,
-                        file_node_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY file_node_id
-                            ORDER BY file_symbol_rank, node_id
-                        ) AS named_rank
-                    FROM grounding_node_snapshot
-                         INDEXED BY idx_grounding_node_snapshot_file_rank
-                    WHERE file_node_id IN (?1)
-                      AND is_root = 1
-                      AND kind IN (?2, ?3)
-                      AND LOWER(REPLACE(serialized_name, '_', '')) IN (?4)
-                 )
-                 SELECT node_id
-                 FROM matched
-                 WHERE named_rank <= ?5",
-            )?
-            .query_map(
-                params![
-                    10_i64,
-                    NodeKind::FUNCTION as i32,
-                    NodeKind::METHOD as i32,
-                    "startapplication",
-                    8_i64
-                ],
-                |row| row.get::<_, String>(3),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert!(
-            named_plan
-                .iter()
-                .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
-            "named architecture root window lost the file-rank index: {named_plan:?}"
-        );
-        assert!(
-            named_plan
-                .iter()
-                .all(|line| !line.contains("USE TEMP B-TREE")),
-            "named architecture root window sorted outside the file-rank index: {named_plan:?}"
-        );
+        Ok(())
+    }
 
+    fn call_edge(id: i64, source: i64, target: i64, confidence: Option<f32>) -> Edge {
+        Edge {
+            id: codestory_contracts::graph::EdgeId(id),
+            source: NodeId(source),
+            target: NodeId(target),
+            kind: EdgeKind::CALL,
+            confidence,
+            ..Default::default()
+        }
+    }
+
+    fn call_degrees_by_node(
+        storage: &Storage,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, (u32, u32)>, StorageError> {
+        Ok(storage
+            .get_grounding_call_degrees(node_ids)?
+            .into_iter()
+            .map(|degree| {
+                (
+                    degree.node_id,
+                    (degree.production_in_calls, degree.out_calls),
+                )
+            })
+            .collect())
+    }
+
+    #[test]
+    fn call_degrees_split_inbound_and_outbound_call_direction() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::FUNCTION, "run", 1),
+                (102, NodeKind::FUNCTION, "load", 5),
+                (103, NodeKind::FUNCTION, "store", 9),
+            ],
+        )?;
+        storage.insert_edges_batch(&[
+            call_edge(1, 101, 102, None),
+            call_edge(2, 101, 103, None),
+            call_edge(3, 102, 103, None),
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101), NodeId(102), NodeId(103)])?;
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(0, 2)));
+        assert_eq!(degrees.get(&NodeId(102)), Some(&(1, 1)));
+        assert_eq!(degrees.get(&NodeId(103)), Some(&(2, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn call_degrees_exclude_speculative_call_resolutions() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::FUNCTION, "caller", 1),
+                (102, NodeKind::FUNCTION, "guessed", 5),
+                (103, NodeKind::FUNCTION, "certain", 9),
+            ],
+        )?;
+        storage.insert_edges_batch(&[
+            call_edge(1, 101, 102, Some(0.4)),
+            call_edge(2, 101, 102, Some(0.6)),
+            call_edge(3, 101, 103, Some(0.95)),
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101), NodeId(102), NodeId(103)])?;
+        assert_eq!(degrees.get(&NodeId(102)), None);
+        assert_eq!(degrees.get(&NodeId(103)), Some(&(1, 0)));
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(0, 1)));
+        Ok(())
+    }
+
+    #[test]
+    fn call_degrees_exclude_test_and_benchmark_callers_from_inbound_counts()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[(101, NodeKind::FUNCTION, "target", 1)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            20,
+            "tests/suite.rs",
+            &[(201, NodeKind::FUNCTION, "exercises_target", 1)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            30,
+            "benches/throughput.rs",
+            &[(301, NodeKind::FUNCTION, "measures_target", 1)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            40,
+            "src/service.rs",
+            &[(401, NodeKind::FUNCTION, "uses_target", 1)],
+        )?;
+        storage.insert_edges_batch(&[
+            call_edge(1, 201, 101, None),
+            call_edge(2, 301, 101, None),
+            call_edge(3, 401, 101, None),
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101)])?;
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(1, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn call_degrees_count_distinct_endpoints_and_ignore_self_edges() -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::FUNCTION, "recursive", 1),
+                (102, NodeKind::FUNCTION, "helper", 5),
+            ],
+        )?;
+        storage.insert_edges_batch(&[
+            call_edge(1, 101, 101, None),
+            call_edge(2, 101, 102, None),
+            call_edge(3, 101, 102, None),
+            call_edge(4, 101, 102, None),
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101), NodeId(102)])?;
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(0, 1)));
+        assert_eq!(degrees.get(&NodeId(102)), Some(&(1, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn call_degrees_count_an_endpoint_once_across_resolved_and_unresolved_edges()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::FUNCTION, "caller", 1),
+                (102, NodeKind::FUNCTION, "callee", 5),
+                (103, NodeKind::FUNCTION, "caller_alias", 9),
+                (104, NodeKind::FUNCTION, "callee_alias", 13),
+            ],
+        )?;
+        // The seeking query reads resolved and unresolved edges through separate
+        // index branches; one endpoint pair reachable through both must still
+        // count once, or a re-resolved call would inflate its own evidence.
+        storage.insert_edges_batch(&[
+            call_edge(1, 101, 102, None),
+            Edge {
+                resolved_source: Some(NodeId(101)),
+                resolved_target: Some(NodeId(102)),
+                certainty: Some(ResolutionCertainty::Certain),
+                ..call_edge(2, 103, 104, None)
+            },
+        ])?;
+
+        let degrees = call_degrees_by_node(&storage, &[NodeId(101), NodeId(102)])?;
+        assert_eq!(degrees.get(&NodeId(101)), Some(&(0, 1)));
+        assert_eq!(degrees.get(&NodeId(102)), Some(&(1, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn call_degrees_return_rows_in_node_id_order_across_chunk_boundaries()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        let count = GROUNDING_CALL_DEGREE_CHUNK as i64 + 20;
+        let symbols = (0..count)
+            .map(|offset| (1000 + offset, NodeKind::FUNCTION, "leaf", 1 + offset as u32))
+            .collect::<Vec<_>>();
+        let symbol_refs = symbols
+            .iter()
+            .map(|(id, kind, name, line)| (*id, *kind, *name, *line))
+            .collect::<Vec<_>>();
+        insert_grounding_test_file(&mut storage, 10, "src/main.rs", &symbol_refs)?;
+        storage.insert_nodes_batch(&[Node {
+            id: NodeId(900),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "fan_out".to_string(),
+            file_node_id: Some(NodeId(10)),
+            start_line: Some(1),
+            ..Default::default()
+        }])?;
+        storage.insert_edges_batch(
+            &(0..count)
+                .map(|offset| call_edge(1 + offset, 900, 1000 + offset, None))
+                .collect::<Vec<_>>(),
+        )?;
+
+        let node_ids = (0..count)
+            .map(|offset| NodeId(1000 + offset))
+            .collect::<Vec<_>>();
+        let degrees = storage.get_grounding_call_degrees(&node_ids)?;
+        assert_eq!(degrees.len(), count as usize);
+        assert!(
+            degrees
+                .windows(2)
+                .all(|pair| pair[0].node_id.0 < pair[1].node_id.0),
+            "call degrees left node id order across chunk boundaries"
+        );
+        assert!(
+            degrees
+                .iter()
+                .all(|degree| degree.production_in_calls == 1 && degree.out_calls == 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grounding_call_degree_plan_seeks_the_candidate_chunk() -> Result<(), StorageError> {
+        let storage = Storage::new_in_memory()?;
+        let certainty = format!(
+            "COALESCE(
+                e.certainty,
+                CASE
+                    WHEN e.confidence IS NULL THEN 'certain'
+                    WHEN e.confidence >= {certain_min} THEN 'certain'
+                    WHEN e.confidence >= {probable_min} THEN 'probable'
+                    ELSE 'uncertain'
+                END
+             )",
+            certain_min = ResolutionCertainty::CERTAIN_MIN,
+            probable_min = ResolutionCertainty::PROBABLE_MIN,
+        );
+        let query = grounding_call_degree_query(&numbered_placeholders(1, 3), &certainty);
+        let plan = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+            .query_map(params![1_i64, 2_i64, 3_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Every step that touches `edge` is aliased `e` by the query above.
+        let edge_steps = plan
+            .iter()
+            .filter(|line| line.contains(" e USING "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edge_steps.len(),
+            4,
+            "expected one seek per directed branch: {plan:?}"
+        );
+        assert!(
+            edge_steps
+                .iter()
+                .all(|line| line.contains("node_id=?") && !line.ends_with("(kind=?)")),
+            "an edge branch seeks on kind alone, so its cost grows with the repository's \
+             CALL edge count instead of with the candidate chunk: {plan:?}"
+        );
         Ok(())
     }
 

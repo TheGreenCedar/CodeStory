@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .contract_primitives import sha256
 from .failure_evidence import register_failure_evidence_secret
-from .foundation import RETRIEVAL_QUALITY_EVIDENCE_CONTRACT, ProofFailure, require
+from .foundation import require
 from .native_manifest import runtime_executable_sha256
 from .publication_consistency_verifier import (
     verify_fault_recovery_consistency_raw_evidence,
@@ -20,7 +20,6 @@ from .qualification_production_types import (
     QualificationExternalEvidence,
     QualificationProducerContext,
 )
-from .runtime_retrieval_quality import verify_retrieval_quality_raw_evidence
 
 
 def prepare_qualification_producer(
@@ -150,20 +149,7 @@ def collect_qualification_external_evidence(
         package=context.package,
         contracts=context.contracts,
     )
-    retrieval_quality = None
-    if args.retrieval_quality_evidence is not None:
-        retrieval_quality = verify_retrieval_quality_raw_evidence(
-            args.retrieval_quality_evidence,
-            source=context.manifest["source"],
-        )
-    elif args.proof_tier != "calibration":
-        raise ProofFailure(
-            f"{args.proof_tier} qualification requires "
-            "--retrieval-quality-evidence "
-            f"from {RETRIEVAL_QUALITY_EVIDENCE_CONTRACT}"
-        )
     return QualificationExternalEvidence(
         publication_fault,
         consistency,
-        retrieval_quality,
     )

@@ -26,11 +26,6 @@ on:
         required: false
         default: false
         type: boolean
-      quality_evidence_artifact:
-        description: Exact-head release-evidence artifact containing packet/packet-runtime-summary.json.
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
         required: false
@@ -41,11 +36,6 @@ on:
         required: false
         default: ""
         type: string
-      calibration_mode:
-        description: Collect the three independent hosted Linux calibration runs only.
-        required: false
-        default: false
-        type: boolean
       emit_release_cells:
         description: Emit authenticated package cells for the production release coordinator.
         required: false
@@ -53,6 +43,11 @@ on:
         type: boolean
       hermetic_linux:
         description: Run the deliberately cold Linux network-denied build once for a frozen candidate.
+        required: false
+        default: false
+        type: boolean
+      include_qualification_driver:
+        description: Build and retain the exact full-qualification driver beside the candidate packages.
         required: false
         default: false
         type: boolean
@@ -96,13 +91,13 @@ jobs:
     # The six APPLE_* credentials are an environment-scoped release contract;
     # repository-only secrets are not the supported signing configuration.
     environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}
-    timeout-minutes: ${{ inputs.calibration_mode && 180 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60) }}
+    timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}
     strategy:
       fail-fast: false
       # GitHub applies matrix exclusions before includes, so an include-only
       # matrix must select the complete row set rather than trying to exclude
       # rows after the fact.
-      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}') }}
+      matrix: ${{ fromJSON(inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -127,9 +122,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install pinned Rust
+        # The toolchain is now read as a shell variable, which makes the script shell-dependent:
+        # this job's matrix includes windows-latest, where the runner default is pwsh.
+        shell: bash
         run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
           rustup target add "${{ matrix.rust_target }}"
 
       - name: Configure short Windows Cargo target
@@ -149,6 +147,11 @@ jobs:
           New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget | Out-Null
           "CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Start Windows native setup clock
+        id: windows-native-setup-clock
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
       - name: Prepare checksum-pinned embedded model
         run: node scripts/prepare-embedded-model.mjs
 
@@ -156,6 +159,27 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: .github/scripts/install-windows-vulkan-sdk.ps1
+
+      - name: Stop Windows native setup clock
+        id: windows-native-setup-clock-stop
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs stop
+
+      - name: Report Windows native setup timing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          STARTED_MS: ${{ steps.windows-native-setup-clock.outputs.started-ms }}
+          ENDED_MS: ${{ steps.windows-native-setup-clock-stop.outputs.ended-ms }}
+        run: |
+          set -euo pipefail
+          elapsed_ms=$((ENDED_MS - STARTED_MS))
+          test "$elapsed_ms" -ge 0
+          {
+            echo "### Windows package timing"
+            echo
+            echo "- Model and native SDK setup: ${elapsed_ms} ms"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Linux Vulkan build dependencies
         if: runner.os == 'Linux'
@@ -166,6 +190,30 @@ jobs:
         with:
           version: ${{ env.SCCACHE_VERSION }}
           disable_annotations: true
+
+      - name: Capture pinned sccache identity
+        id: sccache-identity
+        shell: bash
+        run: |
+          sccache_path="$(command -v sccache)"
+          if [[ "$RUNNER_OS" == "Windows" && "$sccache_path" != *.[eE][xX][eE] ]]; then
+            sccache_path="${sccache_path}.exe"
+          fi
+          test -f "$sccache_path"
+          test -x "$sccache_path"
+          sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$sccache_path"
+          )"
+          {
+            echo "path=$sccache_path"
+            echo "sha256=$sccache_sha256"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Configure bounded compiler cache
         shell: bash
@@ -192,8 +240,7 @@ jobs:
         shell: bash
         env:
           EXACT_SHA: ${{ inputs.ref }}
-          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
-          QUALITY_EVIDENCE_ARTIFACT: ${{ inputs.quality_evidence_artifact }}
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
         run: |
           set -euo pipefail
           rust_version="$(rustc -Vv | sed -n 's/^release: //p')"
@@ -206,13 +253,9 @@ jobs:
             --relevant-input crates/codestory-llama-sys/model-contract.json
             --relevant-input scripts/prepare-embedded-model.mjs
           )
-          qualification_driver=disabled
-          if [ "$CALIBRATION_MODE" = true ] || [ -n "$QUALITY_EVIDENCE_ARTIFACT" ]; then
-            qualification_driver=enabled
-          fi
           extra_identity=(
             --identity cargo_incremental=0
-            --identity "qualification_driver=$qualification_driver"
+            --identity "qualification_driver=$INCLUDE_QUALIFICATION_DRIVER"
           )
           while IFS= read -r manifest; do
             relevant_inputs+=(--relevant-input "$manifest")
@@ -220,6 +263,7 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then
             generator=ninja
             ninja_version="$(ninja --version)"
+            extra_identity+=(--identity windows_rustflags=-Clink-arg=/TIME)
             # shellcheck disable=SC2016
             native_toolchain="$(
               pwsh -NoProfile -Command '
@@ -262,6 +306,11 @@ jobs:
             --cargo-config .cargo/config.toml \
             "${relevant_inputs[@]}" \
             "${extra_identity[@]}"
+
+      - name: Start Windows cache restoration clock
+        id: windows-cache-restore-clock
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs start
 
       - name: Restore Cargo dependency inputs
         id: cargo-dependency-cache
@@ -316,13 +365,31 @@ jobs:
             --cache-hit "${CACHE_HIT:-false}" \
             --path "$SCCACHE_DIR"
 
+      - name: Stop Windows cache restoration clock
+        id: windows-cache-restore-clock-stop
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs stop
+
+      - name: Report Windows cache restoration timing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          STARTED_MS: ${{ steps.windows-cache-restore-clock.outputs.started-ms }}
+          ENDED_MS: ${{ steps.windows-cache-restore-clock-stop.outputs.ended-ms }}
+        run: |
+          set -euo pipefail
+          elapsed_ms=$((ENDED_MS - STARTED_MS))
+          test "$elapsed_ms" -ge 0
+          echo "- Cargo input and compiler-object cache restoration: ${elapsed_ms} ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build pinned Linux toolchain image
         if: matrix.asset_target == 'linux-x64'
         shell: bash
         run: |
           docker build --platform linux/amd64 \
-            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
-            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --build-arg "BUILD_IMAGE=$LINUX_GLIBC_BUILD_IMAGE" \
+            --build-arg "GLSLC_IMAGE=$LINUX_GLSLC_IMAGE" \
             --file .github/docker/linux-glibc-build.Dockerfile \
             --tag codestory-linux-glibc-build \
             .github/docker
@@ -331,32 +398,123 @@ jobs:
         id: compile-clock
         run: node .github/scripts/cargo-cache-contract.mjs start
 
-      - name: Compile native workspace path regression on Windows
-        id: windows-workspace-compile
-        if: runner.os == 'Windows'
-        run: cargo test --locked -p codestory-workspace repository_identity --no-run
-
-      - name: Compile immutable native staging regression on Windows
-        id: windows-native-compile
-        if: runner.os == 'Windows'
-        run: >-
-          cargo test --release --locked
-          -p codestory-llama-sys
-          --test native_staging
-          --target "${{ matrix.rust_target }}"
-          --no-run
-
-      - name: Build codestory-cli
+      - name: Build package and qualification driver
         id: package-build
         if: matrix.asset_target != 'linux-x64'
-        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+        shell: bash
+        env:
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
+          RELEASE_RUST_TARGET: ${{ matrix.rust_target }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+        run: |
+          set -euo pipefail
+          cargo_args=(
+            -p codestory-cli
+            --bin codestory-cli
+            --bin codestory-cli-runtime
+          )
+          if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+            cargo_args+=(
+              -p codestory-bench
+              --bin codestory_embedding_qualification
+            )
+          fi
+          build_package_graph() {
+            cargo build --release --locked \
+              "${cargo_args[@]}" \
+              --target "$RELEASE_RUST_TARGET" \
+              "$@"
+          }
+          if [ "$RUNNER_OS" = Windows ]; then
+            timing_dir="target/windows-package-build-timing"
+            mkdir -p "$timing_dir"
+            cargo_json="$timing_dir/cargo-messages.jsonl"
+            linker_log="$timing_dir/msvc-link-time.log"
+            build_started_ms="$(node -p 'Date.now()')"
+            export RUSTFLAGS="-C link-arg=/TIME"
+            build_package_graph \
+              --message-format=json-render-diagnostics \
+              --timings \
+              2> >(tee "$linker_log" >&2) \
+              | tee "$cargo_json"
+            build_ended_ms="$(node -p 'Date.now()')"
+            build_elapsed_ms=$((build_ended_ms - build_started_ms))
+            test "$build_elapsed_ms" -ge 0
+
+            expectations=(
+              --expect "cli=codestory-cli:bin:codestory-cli"
+              --expect "runtime=codestory-cli:bin:codestory-cli-runtime"
+            )
+            if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+              expectations+=(
+                --expect "qualification_driver=codestory-bench:bin:codestory_embedding_qualification"
+              )
+            fi
+            node .github/scripts/cargo-build-artifacts.mjs select \
+              --input "$cargo_json" \
+              --out "$timing_dir/cargo-build-artifacts.json" \
+              --target-dir "$CARGO_TARGET_DIR" \
+              --workspace-root "$GITHUB_WORKSPACE" \
+              --rust-target "$RELEASE_RUST_TARGET" \
+              --source-sha "$SOURCE_SHA" \
+              --source-tree "$SOURCE_TREE" \
+              --github-output "$GITHUB_OUTPUT" \
+              "${expectations[@]}"
+            node --input-type=module -e '
+              import fs from "node:fs";
+              import path from "node:path";
+              const source = path.join(process.env.CARGO_TARGET_DIR, "cargo-timings");
+              const destination = path.join(
+                "target",
+                "windows-package-build-timing",
+                "cargo-timings",
+              );
+              if (fs.existsSync(source)) {
+                fs.cpSync(source, destination, { recursive: true });
+              }
+            '
+            linker_rows="$(grep -Eic '(^|[[:space:]])time([[:space:](:]|$)' "$linker_log" || true)"
+            {
+              echo "- Exact release graph build: ${build_elapsed_ms} ms"
+              echo "- MSVC /TIME linker rows retained: ${linker_rows}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            timing_dir="target/package-build-contract/${{ matrix.asset_target }}"
+            mkdir -p "$timing_dir"
+            cargo_json="$timing_dir/cargo-messages.jsonl"
+            build_package_graph \
+              --message-format=json-render-diagnostics \
+              > "$cargo_json"
+            cat "$cargo_json"
+            node .github/scripts/cargo-build-artifacts.mjs features \
+              --input "$cargo_json" \
+              --workspace-root "$GITHUB_WORKSPACE"
+          fi
 
       - name: Build Linux x64 at the glibc 2.31 baseline
         id: linux-build
         if: matrix.asset_target == 'linux-x64'
+        shell: bash
+        env:
+          INCLUDE_QUALIFICATION_DRIVER: ${{ inputs.include_qualification_driver }}
+          RELEASE_RUST_TARGET: ${{ matrix.rust_target }}
+          SCCACHE_BINARY: ${{ steps.sccache-identity.outputs.path }}
+          SCCACHE_SHA256: ${{ steps.sccache-identity.outputs.sha256 }}
         run: |
-          test -x "$SCCACHE_PATH"
+          test -x "$SCCACHE_BINARY"
+          actual_sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$SCCACHE_BINARY"
+          )"
+          test "$actual_sccache_sha256" = "$SCCACHE_SHA256"
           mkdir -p "$CARGO_HOME" "$SCCACHE_DIR"
+          mkdir -p "target/package-build-contract/${{ matrix.asset_target }}"
           model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
           docker run --rm --platform linux/amd64 \
             --user "$(id -u):$(id -g)" \
@@ -369,23 +527,44 @@ jobs:
             --env SCCACHE_CACHE_SIZE="$SCCACHE_CACHE_SIZE" \
             --env CMAKE_C_COMPILER_LAUNCHER=/sccache/sccache \
             --env CMAKE_CXX_COMPILER_LAUNCHER=/sccache/sccache \
+            --env INCLUDE_QUALIFICATION_DRIVER="$INCLUDE_QUALIFICATION_DRIVER" \
+            --env RELEASE_RUST_TARGET="$RELEASE_RUST_TARGET" \
             --volume "$CARGO_HOME:/cargo" \
             --volume "$PWD:/workspace" \
-            --volume "$SCCACHE_PATH:/sccache/sccache:ro" \
+            --volume "$SCCACHE_BINARY:/sccache/sccache:ro" \
             --volume "$SCCACHE_DIR:/sccache/cache" \
             --workdir /workspace \
             codestory-linux-glibc-build \
             sh -ceu '
-              cargo build --release --locked -p codestory-cli \
-                --target "${{ matrix.rust_target }}"
+              set -- \
+                -p codestory-cli \
+                --bin codestory-cli \
+                --bin codestory-cli-runtime
+              if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+                set -- "$@" \
+                  -p codestory-bench \
+                  --bin codestory_embedding_qualification
+              fi
+              cargo build --release --locked "$@" \
+                --target "$RELEASE_RUST_TARGET" \
+                --message-format=json-render-diagnostics \
+                > /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
+              cat /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
               /sccache/sccache --show-stats
               /sccache/sccache --stop-server
             '
+          node .github/scripts/cargo-build-artifacts.mjs features \
+            --input "target/package-build-contract/${{ matrix.asset_target }}/cargo-messages.jsonl" \
+            --workspace-root "$GITHUB_WORKSPACE"
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli-runtime" \
             "target/${{ matrix.rust_target }}/release/codestory-cli-runtime"
+          if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+            cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory_embedding_qualification" \
+              "target/${{ matrix.rust_target }}/release/codestory_embedding_qualification"
+          fi
           rm -rf "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
           cp -R "target/glibc-2.31/${{ matrix.rust_target }}/release/.codestory-native-seeds" \
             "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
@@ -398,11 +577,6 @@ jobs:
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt" \
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
 
-      - name: Build qualification driver
-        id: qualification-driver
-        if: matrix.asset_target == 'linux-x64' && (inputs.calibration_mode || inputs.quality_evidence_artifact != '')
-        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
-
       - name: Stop compilation clock
         id: compile-clock-stop
         if: >-
@@ -411,23 +585,29 @@ jobs:
             (matrix.asset_target == 'linux-x64' && steps.linux-build.outcome == 'success') ||
             (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
           )
+        shell: bash
         run: node .github/scripts/cargo-cache-contract.mjs stop
 
       - name: Finalize compiler objects
-        if: >-
-          always() &&
-          (
-            (
-              matrix.asset_target == 'linux-x64' &&
-              steps.linux-build.outcome == 'success' &&
-              steps.qualification-driver.outcome != 'skipped'
-            ) ||
-            (matrix.asset_target != 'linux-x64' && steps.package-build.outcome == 'success')
-          )
+        if: always() && steps.package-build.outcome == 'success'
         shell: bash
+        env:
+          SCCACHE_BINARY: ${{ steps.sccache-identity.outputs.path }}
+          SCCACHE_SHA256: ${{ steps.sccache-identity.outputs.sha256 }}
         run: |
-          sccache --show-stats
-          sccache --stop-server
+          test -x "$SCCACHE_BINARY"
+          actual_sccache_sha256="$(
+            node --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              process.stdout.write(
+                createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"),
+              );
+            ' "$SCCACHE_BINARY"
+          )"
+          test "$actual_sccache_sha256" = "$SCCACHE_SHA256"
+          "$SCCACHE_BINARY" --show-stats
+          "$SCCACHE_BINARY" --stop-server
 
       - name: Bound Cargo dependency cache
         id: cargo-dependency-cache-size
@@ -521,19 +701,6 @@ jobs:
             --save-started-ms "$SAVE_STARTED_MS" \
             --save-result "$SAVE_RESULT" \
             --path "$SCCACHE_DIR"
-
-      - name: Prove native workspace path identity
-        if: runner.os == 'Windows'
-        run: cargo test --locked -p codestory-workspace repository_identity
-
-      - name: Test immutable native staging on Windows
-        if: runner.os == 'Windows'
-        run: >-
-          cargo test --release --locked
-          -p codestory-llama-sys
-          --test native_staging
-          --target "${{ matrix.rust_target }}"
-          stages_complete_immutable_native_seeds
 
       - name: Sign and notarize macOS CLI
         if: runner.os == 'macOS' && inputs.sign_macos
@@ -726,40 +893,109 @@ jobs:
           "$bin" --version
           "$bin" --help
 
+      - name: Prove production feature identity
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          started_ms="$(node -p 'Date.now()')"
+          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
+          cache="$RUNNER_TEMP/codestory-package-feature-probe-${{ matrix.asset_target }}"
+          mkdir "$cache"
+          status="$(
+            "$bin" retrieval status \
+              --project "$GITHUB_WORKSPACE" \
+              --cache-dir "$cache" \
+              --format json
+          )"
+          jq -e \
+            '.embedding_device_observation_source == "per_user_server"' \
+            <<<"$status"
+          ended_ms="$(node -p 'Date.now()')"
+          elapsed_ms=$((ended_ms - started_ms))
+          test "$elapsed_ms" -ge 0
+          echo "- Production feature identity probe: ${elapsed_ms} ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Smoke codestory-cli on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          WINDOWS_CLI: ${{ steps.package-build.outputs.cli }}
         run: |
-          $bin = Join-Path $env:CARGO_TARGET_DIR "${{ matrix.rust_target }}/release/codestory-cli${{ matrix.exe_suffix }}"
+          $bin = "$env:WINDOWS_CLI"
           & $bin --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows CLI version smoke failed with exit code $LASTEXITCODE"
+          }
           & $bin --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows CLI help smoke failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Prove production feature identity on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+          WINDOWS_CLI: ${{ steps.package-build.outputs.cli }}
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $cache = Join-Path $env:RUNNER_TEMP "codestory-package-feature-probe-windows-x64"
+          New-Item -ItemType Directory -Path $cache | Out-Null
+          $statusJson = & "$env:WINDOWS_CLI" retrieval status `
+            --project "$env:GITHUB_WORKSPACE" `
+            --cache-dir "$cache" `
+            --format json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows production feature probe failed with exit code $LASTEXITCODE"
+          }
+          $status = $statusJson | ConvertFrom-Json
+          if ($status.embedding_device_observation_source -ne "per_user_server") {
+            throw "production package contains a non-product embedding observation source: $($status.embedding_device_observation_source)"
+          }
+          $ended = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $elapsed = $ended - $started
+          if ($elapsed -lt 0) {
+            throw "Windows production feature-probe timing was negative"
+          }
+          "- Production feature identity probe: ${elapsed} ms" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Clear release asset output
         run: python -c "import shutil; shutil.rmtree('target/release-dist', ignore_errors=True)"
 
       - name: Package release asset
         if: runner.os != 'Windows'
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           bin="target/${{ matrix.rust_target }}/release/codestory-cli"
           python .github/scripts/package-codestory-release.py \
-            --version "${{ inputs.version }}" \
+            --version "$INPUT_VERSION" \
             --target "${{ matrix.asset_target }}" \
             --binary "$bin" \
             --out-dir target/release-dist
 
       - name: Prove Linux x64 glibc 2.31 baseline
         if: matrix.asset_target == 'linux-x64'
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "$PWD:/workspace" \
             --workdir /workspace \
-            "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
+            "$LINUX_GLIBC_BASELINE_IMAGE" \
             bash -lc '
               set -euo pipefail
               bash .github/scripts/check-linux-glibc-baseline.sh "$@"
             ' bash \
-              "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \
-              "${{ inputs.version }}" \
+              "target/release-dist/codestory-cli-v${INPUT_VERSION}-linux-x64.tar.gz" \
+              "$INPUT_VERSION" \
               target/linux-glibc-baseline \
               "glibc 2.31"
 
@@ -774,28 +1010,25 @@ jobs:
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz" \
             --checksum-file target/release-dist/SHA256SUMS.txt \
-            --expected-version "${{ inputs.version }}" \
-            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" \
-            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" \
+            --expected-version "$INPUT_VERSION" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-source-tree "$SOURCE_TREE" \
             --version-only \
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Download exact-head publishable packet quality evidence
-        if: matrix.asset_target == 'linux-x64' && inputs.quality_evidence_artifact != ''
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
         if: >-
           matrix.asset_target == 'linux-x64' &&
-          !inputs.calibration_mode &&
-          inputs.quality_evidence_artifact != ''
+          inputs.calibration_bundle_artifact != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -820,8 +1053,7 @@ jobs:
       - name: Download frozen calibration bundle
         if: >-
           matrix.asset_target == 'linux-x64' &&
-          !inputs.calibration_mode &&
-          inputs.quality_evidence_artifact != ''
+          inputs.calibration_bundle_artifact != ''
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ inputs.calibration_bundle_artifact }}
@@ -829,128 +1061,135 @@ jobs:
           run-id: ${{ inputs.calibration_bundle_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Packaged per-user server calibration or qualification
+      - name: Prove frozen calibration source lineage
+        # The source-lineage guard needs the authenticated bundle and full
+        # history from the frozen-candidate qualification lane.
+        # --version-only stops before the runtime proof but still loads and
+        # verifies the bundle, and without --enforce-calibration-freeze-lineage
+        # a version-only proof *rejects* calibration inputs outright -- so
+        # deleting the flag breaks this step loudly instead of silently
+        # dropping the guard.
         if: >-
           matrix.asset_target == 'linux-x64' &&
-          (inputs.calibration_mode ||
-            inputs.quality_evidence_artifact != '')
+          inputs.calibration_bundle_artifact != ''
+        shell: bash
         env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
-          source_sha="$(git rev-parse HEAD)"
-          source_tree="$(git rev-parse 'HEAD^{tree}')"
-          common_args=(
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz"
-            --checksum-file target/release-dist/SHA256SUMS.txt
-            --expected-version "${{ inputs.version }}"
-            --project "${{ github.workspace }}"
-            --plugin-root plugins/codestory
-            --plugin-handoff
-            --engine-policy cpu_explicit
-            --expected-backend CPU
-            --offline
-            --qualification-matrix-cell hosted_linux_x64_cpu
-            --expected-source-sha "$source_sha"
-            --expected-source-tree "$source_tree"
-            --timeout-secs 1800
-          )
-          if [ "$CALIBRATION_MODE" = true ]; then
-            test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
-            mkdir -p target/calibration-runs/linux
-            for run_index in 1 2 3; do
-              python .github/scripts/check-packaged-agent-proof.py \
-                "${common_args[@]}" \
-                --proof-tier calibration \
-                --produce-qualification-evidence \
-                --qualification-driver target/release/codestory_embedding_qualification \
-                --calibration-run-index "$run_index" \
-                --calibration-run-output "target/calibration-runs/linux/run-${run_index}.json" \
-                --qualification-evidence "target/calibration-runs/linux/qualification-${run_index}.json" \
-                --out-dir "target/calibration-runs/linux/proof-${run_index}"
-            done
-            exit 0
-          fi
           test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = frozen
           calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
           test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
-          test -f "$quality_path"
           python .github/scripts/check-packaged-agent-proof.py \
-            "${common_args[@]}" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.tar.gz" \
+            --checksum-file target/release-dist/SHA256SUMS.txt \
+            --expected-version "$INPUT_VERSION" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-source-tree "$SOURCE_TREE" \
+            --version-only \
             --proof-tier hosted_package \
-            --produce-qualification-evidence \
-            --qualification-driver target/release/codestory_embedding_qualification \
-            --qualification-evidence target/packaged-agent-proof/qualification.json \
             --calibration-bundle "$calibration_bundle" \
-            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
-            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --retrieval-quality-evidence "$quality_path" \
-            --out-dir target/packaged-agent-proof
+            --calibration-producer-run-id "$CALIBRATION_RUN_ID" \
+            --calibration-producer-artifact "$CALIBRATION_ARTIFACT" \
+            --enforce-calibration-freeze-lineage \
+            --out-dir target/packaged-calibration-lineage
 
-      - name: Upload hosted Linux calibration runs
-        if: success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: embedding-calibration-linux-${{ inputs.version }}
-          path: target/calibration-runs/linux
-          if-no-files-found: error
-          retention-days: 30
-          overwrite: true
-
-      - name: Upload hosted Linux calibration failure evidence
-        if: failure() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: embedding-calibration-linux-failure-evidence-attempt-${{ github.run_attempt }}
-          path: target/calibration-runs/linux
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload packaged agent proof artifacts
+      - name: Upload frozen calibration lineage proof
         if: >-
           always() &&
           matrix.asset_target == 'linux-x64' &&
-          (inputs.calibration_mode ||
-            inputs.quality_evidence_artifact != '')
+          inputs.calibration_bundle_artifact != ''
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: packaged-agent-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
-          path: target/packaged-agent-proof
+          name: packaged-calibration-lineage-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
+          path: target/packaged-calibration-lineage
           if-no-files-found: warn
           retention-days: 30
 
       - name: Package release asset on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          ARTIFACT_MANIFEST: ${{ steps.package-build.outputs.manifest }}
+          WINDOWS_CLI: ${{ steps.package-build.outputs.cli }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+          RELEASE_RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          $bin = Join-Path $env:CARGO_TARGET_DIR "${{ matrix.rust_target }}/release/codestory-cli${{ matrix.exe_suffix }}"
+          node .github/scripts/cargo-build-artifacts.mjs verify `
+            --manifest "$env:ARTIFACT_MANIFEST" `
+            --source-sha "$env:SOURCE_SHA" `
+            --source-tree "$env:SOURCE_TREE" `
+            --workspace-root "$env:GITHUB_WORKSPACE" `
+            --rust-target "$env:RELEASE_RUST_TARGET"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows build-artifact verification failed with exit code $LASTEXITCODE"
+          }
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $bin = "$env:WINDOWS_CLI"
           python .github/scripts/package-codestory-release.py `
-            --version "${{ inputs.version }}" `
+            --version "$env:INPUT_VERSION" `
             --target "${{ matrix.asset_target }}" `
             --binary $bin `
             --out-dir target/release-dist
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows release packaging failed with exit code $LASTEXITCODE"
+          }
+          $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY `
+            -Value "- Exact emitted CLI packaging: $elapsed ms"
 
       - name: Smoke packaged release asset on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           python .github/scripts/check-packaged-agent-proof.py `
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.zip" `
+            --archive "target/release-dist/codestory-cli-v$($env:INPUT_VERSION)-${{ matrix.asset_target }}.zip" `
             --checksum-file target/release-dist/SHA256SUMS.txt `
-            --expected-version "${{ inputs.version }}" `
-            --expected-source-sha "${{ steps.source-identity.outputs.sha }}" `
-            --expected-source-tree "${{ steps.source-identity.outputs.tree }}" `
+            --expected-version "$env:INPUT_VERSION" `
+            --expected-source-sha "$env:SOURCE_SHA" `
+            --expected-source-tree "$env:SOURCE_TREE" `
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
+
+      - name: Stage qualification driver in package proof artifact
+        if: inputs.include_qualification_driver
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/qualification-driver-artifact.mjs produce \
+            --asset-target "${{ matrix.asset_target }}" \
+            --source-sha "$SOURCE_SHA" \
+            --source-tree "$SOURCE_TREE" \
+            --version "$INPUT_VERSION" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
+            --trusted-root "$GITHUB_WORKSPACE" \
+            --target-dir target \
+            --out-dir "target/release-dist/qualification-driver/${{ matrix.asset_target }}"
 
       - name: Report fresh package identity
         id: fresh-package
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           set -euo pipefail
-          archive="target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
+          archive="target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}"
           archive_sha256="$(
             python -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' \
               "$archive"
@@ -958,12 +1197,44 @@ jobs:
           {
             echo "### Fresh package identity"
             echo
-            echo "- Source SHA: \`${{ steps.source-identity.outputs.sha }}\`"
-            echo "- Source tree: \`${{ steps.source-identity.outputs.tree }}\`"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- Source tree: \`$SOURCE_TREE\`"
             echo "- Archive: \`$(basename "$archive")\`"
             echo "- Archive SHA-256: \`$archive_sha256\`"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Produce exact candidate archive record
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source-identity.outputs.sha }}
+          SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
+        run: |
+          set -euo pipefail
+          archive_name="codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}"
+          archive="target/release-dist/$archive_name"
+          archive_checksum="${archive}.sha256"
+          checksum_manifest=target/release-dist/SHA256SUMS.txt
+          record_dir="target/candidate-archive-record/${{ matrix.asset_target }}"
+          mkdir -p "$record_dir"
+          file_bytes() {
+            python -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "$1"
+          }
+          file_sha256() {
+            python -c 'import hashlib, sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$1"
+          }
+          node .github/scripts/candidate-archive-store.mjs record \
+            --output "$record_dir/candidate-archive-record.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" \
+            --source-tree "$SOURCE_TREE" \
+            --target "${{ matrix.asset_target }}" \
+            --archive-name "$archive_name" \
+            --archive-bytes "$(file_bytes "$archive")" \
+            --archive-sha256 "$(file_sha256 "$archive")" \
+            --companion "archive_checksum|${archive_name}.sha256|$(file_bytes "$archive_checksum")|$(file_sha256 "$archive_checksum")" \
+            --companion "checksum_manifest|SHA256SUMS.txt|$(file_bytes "$checksum_manifest")|$(file_sha256 "$checksum_manifest")"
 
       - name: Upload packaged version proof
         if: always()
@@ -982,19 +1253,22 @@ jobs:
       - name: Emit authenticated package release cell
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
-            --version "${{ inputs.version }}" \
+            --expected-sha "$INPUT_REF" \
+            --version "$INPUT_VERSION" \
             --cell-id "package_identity:${{ matrix.asset_target }}" \
             --producer-workflow .github/workflows/packaged-platform-proof.yml \
             --producer-job build \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --producer-artifact "release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT" \
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
+            --archive "target/release-dist/codestory-cli-v${INPUT_VERSION}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
             --out "target/release-cells/package_identity-${{ matrix.asset_target }}.json"
 
       - name: Upload authenticated package release cell
@@ -1006,18 +1280,71 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Start package artifact transfer clock
+        id: package-transfer-clock
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs start
+
       - name: Upload release asset
         uses: actions/upload-artifact@v7.0.1
         with:
           name: codestory-cli-${{ matrix.asset_target }}
           path: |
-            target/release-dist/*.tar.gz
-            target/release-dist/*.zip
-            target/release-dist/*.sha256
+            target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}
+            target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}.sha256
             target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
           overwrite: true
+
+      - name: Upload exact candidate archive record
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: codestory-candidate-archive-record-${{ matrix.asset_target }}
+          path: target/candidate-archive-record/${{ matrix.asset_target }}/candidate-archive-record.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload separate qualification driver
+        if: inputs.include_qualification_driver
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: codestory-qualification-driver-${{ matrix.asset_target }}
+          path: target/release-dist/qualification-driver/${{ matrix.asset_target }}
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Stop package artifact transfer clock
+        id: package-transfer-clock-stop
+        if: runner.os == 'Windows'
+        run: node .github/scripts/cargo-cache-contract.mjs stop
+
+      - name: Report package artifact transfer timing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          STARTED_MS: ${{ steps.package-transfer-clock.outputs.started-ms }}
+          ENDED_MS: ${{ steps.package-transfer-clock-stop.outputs.ended-ms }}
+        run: |
+          set -euo pipefail
+          elapsed_ms=$((ENDED_MS - STARTED_MS))
+          test "$elapsed_ms" -ge 0
+          mkdir -p target/windows-package-build-timing
+          printf 'artifact_transfer_ms=%s\n' "$elapsed_ms" \
+            > target/windows-package-build-timing/artifact-transfer.txt
+          echo "- Candidate artifact upload: ${elapsed_ms} ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Windows package build timing
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-package-build-timing-attempt-${{ github.run_attempt }}
+          path: target/windows-package-build-timing
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload macOS notarization proof
         if: always() && runner.os == 'macOS' && inputs.sign_macos
@@ -1049,14 +1376,18 @@ jobs:
 
       - name: Require exact frozen source
         shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          test "$(git rev-parse HEAD)" = "${{ inputs.ref }}"
-          test -n "${{ inputs.version }}"
+          test "$(git rev-parse HEAD)" = "$INPUT_REF"
+          test -n "$INPUT_VERSION"
 
       - name: Install pinned Rust
+        shell: bash
         run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
           rustup target add x86_64-unknown-linux-gnu
 
       - name: Prepare checksum-pinned embedded model
@@ -1066,8 +1397,8 @@ jobs:
         shell: bash
         run: |
           docker build --platform linux/amd64 \
-            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
-            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --build-arg "BUILD_IMAGE=$LINUX_GLIBC_BUILD_IMAGE" \
+            --build-arg "GLSLC_IMAGE=$LINUX_GLSLC_IMAGE" \
             --file .github/docker/linux-glibc-build.Dockerfile \
             --tag codestory-linux-glibc-build \
             .github/docker

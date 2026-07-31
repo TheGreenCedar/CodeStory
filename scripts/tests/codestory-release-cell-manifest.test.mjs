@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   buildTrustedProducerMap,
-  verifyReuseBinding,
   produceReleaseCellManifest,
 } from "../codestory-release-cell-manifest.mjs";
 import {
@@ -14,6 +21,7 @@ import {
   resolveReleaseCellConstraints,
 } from "../codestory-release-closeout.mjs";
 import { loadReleaseClaimGraph } from "../codestory-release-claims.mjs";
+import { buildCandidateArchiveRecord } from "../../.github/scripts/candidate-archive-store.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const graph = loadReleaseClaimGraph(root);
@@ -24,6 +32,23 @@ const gitIdentity = {
 };
 const version = "0.16.0";
 const observedAt = "2026-07-19T12:00:00.000Z";
+
+/// The CLI authenticates a requested producer against the ambient `GITHUB_*` context whenever
+/// `GITHUB_ACTIONS` is "true", so a spawned case must carry an environment that agrees with the
+/// arguments it passes. Inheriting the runner's own context instead makes the case pass locally
+/// (where the guard is inert) and fail in Actions (where `GITHUB_RUN_ID` is the real run) -- which
+/// is exactly how this reached the release lane, the only lane that runs this file.
+function producerEnv(overrides) {
+  return {
+    ...process.env,
+    GITHUB_ACTIONS: "true",
+    GITHUB_REPOSITORY: gitIdentity.repository,
+    GITHUB_SHA: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
+    GITHUB_RUN_ATTEMPT: String(nonClaimPolicy.maximum_run_attempts),
+    GITHUB_JOB: nonClaimPolicy.producer_job,
+    ...overrides,
+  };
+}
 
 function cell(id) {
   return deriveReleaseCells(graph, "post_publish").find(({ id: candidate }) => candidate === id);
@@ -396,34 +421,333 @@ test("reused evidence keeps every same-run trust requirement", () => {
   assert.throws(withReuse(missing), /must retain one/u);
 });
 
-test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
-  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
-  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
-  // accelerator inheritance is exactly what version_only_delta authorizes).
-  const releaseTag = "00121349"; // v0.16.1 release commit
-  const priorTag = "29bd4795"; // v0.16.0 release commit
-  assert.throws(
-    () => verifyReuseBinding({
-      binding: "source_tree",
-      repository: root,
-      releaseCommit: releaseTag,
-      reusedCommit: priorTag,
-    }),
-    /does not match release tree/u,
+// ── Withheld accelerator claims ─────────────────────────────────────────────────────────────
+
+const nonClaimPolicy = graph.non_claim_policy;
+const linuxHost = nonClaimPolicy.hosts.find(({ id }) => id === "linux-x64-vulkan");
+
+const withheldAttempt = String(nonClaimPolicy.maximum_run_attempts);
+
+/// The Actions job evidence the closeout collects for itself: the annotation, the empty step
+/// conclusions, and the log-blob probe. `signature` picks which of the two shapes a failed Linux
+/// proof has, and only one of them may route a cell into the withheld lane.
+function lostHostEvidence({ signature = "lost", executions = nonClaimPolicy.maximum_run_attempts } = {}) {
+  const rows = [];
+  for (let attempt = 1; attempt <= executions; attempt += 1) {
+    rows.push({
+      id: 8000 + attempt,
+      name: `linux-vulkan-proof / ${linuxHost.unavailable_producer_job_name}`,
+      status: "completed",
+      conclusion: "failure",
+      run_attempt: String(attempt),
+      log_uploaded: signature !== "lost",
+      annotations: signature === "lost"
+        ? [{ message: nonClaimPolicy.annotation }]
+        : [{ message: "Process completed with exit code 1." }],
+      steps: signature === "lost"
+        ? [
+          { name: "Checkout exact source", status: "completed", conclusion: "success" },
+          { name: "Prove offline Linux Vulkan retrieval", status: "completed", conclusion: null },
+        ]
+        : [{ name: "Prove offline Linux Vulkan retrieval", status: "completed", conclusion: "failure" }],
+    });
+  }
+  return rows;
+}
+
+/// Actions metadata for a run whose Linux proof did not succeed and whose hosted non-claim job did.
+/// The run is at the recovery bound, because a cell may only be withheld once that bound is spent.
+function withheldRunMetadata(phase, {
+  hostConclusion = "failure",
+  withNonClaimArtifact = true,
+  jobEvidence = lostHostEvidence(),
+} = {}) {
+  const metadata = actionsMetadata(phase);
+  for (const jobs of Object.values(metadata.jobsByAttempt)) {
+    for (const job of jobs) {
+      if (job.name.endsWith(linuxHost.unavailable_producer_job_name)) job.conclusion = hostConclusion;
+    }
+  }
+  if (hostConclusion !== "success") {
+    const lostArtifacts = new Set(linuxHost.withheld_cells.map((id) =>
+      resolveReleaseCellConstraints(cell(id), "1").producer_artifact));
+    metadata.artifacts = metadata.artifacts.filter(({ name }) => !lostArtifacts.has(name));
+  }
+  metadata.jobsByAttempt[withheldAttempt].push({
+    id: 9001,
+    run_id: 12345,
+    run_attempt: withheldAttempt,
+    head_sha: gitIdentity.commit,
+    name: `Release / ${nonClaimPolicy.producer_job_name}`,
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-07-19T13:00:00.000Z",
+    completed_at: "2026-07-19T13:10:00.000Z",
+  });
+  if (withNonClaimArtifact) {
+    metadata.artifacts.push({
+      id: 9002,
+      name: linuxHost.producer_artifacts.pre_publish.replaceAll("{attempt}", withheldAttempt),
+      digest: `sha256:${"9".repeat(64)}`,
+      size_in_bytes: 1024,
+      expired: false,
+      created_at: "2026-07-19T13:05:00.000Z",
+      expires_at: "2026-08-18T12:05:00.000Z",
+      workflow_run: { id: 12345, head_sha: gitIdentity.commit },
+    });
+  }
+  return { ...metadata, jobEvidence };
+}
+
+test("a lost protected host routes only its own cells to the non-claim producer", () => {
+  const map = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: withheldAttempt,
+    ...withheldRunMetadata("pre_publish"),
+  });
+  const byCell = new Map(map.producers.map((row) => [row.cell_id, row]));
+  for (const cellId of ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"]) {
+    assert.equal(byCell.get(cellId).non_claim, true, cellId);
+    assert.equal(byCell.get(cellId).producer_job, nonClaimPolicy.producer_job);
+    assert.equal(
+      byCell.get(cellId).producer_artifact,
+      linuxHost.producer_artifacts.pre_publish.replaceAll("{attempt}", withheldAttempt),
+    );
+  }
+  // Every host that did report keeps its real proof producer, and nothing else is marked withheld.
+  assert.deepEqual(
+    map.producers.filter(({ non_claim: withheld }) => withheld === true)
+      .map(({ cell_id: id }) => id).sort(),
+    ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
   );
-  const fingerprint = verifyReuseBinding({
-    binding: "native_fingerprint",
-    repository: root,
-    releaseCommit: releaseTag,
-    reusedCommit: priorTag,
+  assert.equal(byCell.get("accelerator_execution:windows-x64-vulkan").non_claim, undefined);
+  assert.equal(byCell.get("package_identity:linux-x64").non_claim, undefined);
+});
+
+test("the non-claim producer is never substituted for a host that reported", () => {
+  // Success on the protected host keeps the proof producer even when a non-claim artifact exists.
+  const proven = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: withheldAttempt,
+    ...withheldRunMetadata("pre_publish", { hostConclusion: "success", jobEvidence: [] }),
   });
-  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
-  // Identical commits always satisfy the tree binding.
-  const tree = verifyReuseBinding({
-    binding: "source_tree",
-    repository: root,
-    releaseCommit: releaseTag,
-    reusedCommit: releaseTag,
+  assert.deepEqual(proven.producers.filter(({ non_claim: withheld }) => withheld === true), []);
+
+  // Without a recorded non-claim there is nothing to fall back to, and the run stays broken.
+  assert.throws(() => buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: withheldAttempt,
+    ...withheldRunMetadata("pre_publish", { withNonClaimArtifact: false }),
+  }), /must retain one release-cell-nonclaim-prepublish-linux-x64-vulkan-attempt-2 artifact/u);
+});
+
+test("the closeout reads the lost-runner signature itself before it trusts a non-claim", () => {
+  // The trust boundary decides whether a cell is authenticated against the real proof or against
+  // the non-claim producer. Routing on "the host job is not green" made the producer's own refusal
+  // to upload the single point of failure; the map now refuses the routing on its own evidence.
+  const withEvidence = (jobEvidence) => () => buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: withheldAttempt,
+    ...withheldRunMetadata("pre_publish", { jobEvidence }),
   });
-  assert.match(tree, /^[0-9a-f]{40}$/u);
+
+  // A proof that ran and failed its own assertions is red, and stays red.
+  assert.throws(
+    withEvidence(lostHostEvidence({ signature: "assertion" })),
+    /failed its own assertions, so accelerator_execution:linux-x64-vulkan may not be withheld/u,
+  );
+  // One loss is not a spent recovery bound, however many attempts the run has had.
+  assert.throws(
+    withEvidence(lostHostEvidence({ executions: 1 })),
+    /has been lost 1 time\(s\).*recovery bound is spent/su,
+  );
+  // No evidence at all is refused outright rather than defaulting to the permissive route.
+  assert.throws(withEvidence(null), /cannot route .* to a non-claim without its own Actions job evidence/u);
+  assert.throws(withEvidence([]), /has no failed execution of Packaged Linux Vulkan engine/u);
+
+  // And the honest shape still routes.
+  const routed = withEvidence(lostHostEvidence())();
+  assert.deepEqual(
+    routed.producers.filter(({ non_claim: withheld }) => withheld === true)
+      .map(({ cell_id: id }) => id).sort(),
+    ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
+  );
+});
+
+test("withheld manifests carry the populated non-claim and refuse an unspent retry bound", () => {
+  const bound = String(nonClaimPolicy.maximum_run_attempts);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-nonclaim-"));
+  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  writeFileSync(archive, "release archive bytes");
+  const selected = cell("accelerator_execution:linux-x64-vulkan");
+  const build = (attempt) => produceReleaseCellManifest({
+    graph,
+    gitIdentity,
+    version,
+    cell: selected,
+    identity: { native_engine: "coderank_q8_embedded" },
+    producer: {
+      producer_workflow: nonClaimPolicy.producer_workflow,
+      producer_job: nonClaimPolicy.producer_job,
+      producer_job_name: nonClaimPolicy.producer_job_name,
+      producer_run_id: "12345",
+      producer_run_attempt: attempt,
+      producer_artifact: linuxHost.producer_artifacts.pre_publish.replaceAll("{attempt}", attempt),
+    },
+    observedAt,
+    archivePath: archive,
+    nonClaim: {
+      host: linuxHost.id,
+      runtime_execution: nonClaimPolicy.runtime_execution,
+      non_claim_reason: nonClaimPolicy.reason,
+      annotation: nonClaimPolicy.annotation,
+      unavailable_producer_workflow: linuxHost.unavailable_producer_workflow,
+      unavailable_producer_job_name: linuxHost.unavailable_producer_job_name,
+      withheld_claims: ["accelerator_execution", "package_identity", "source_behavior"],
+      run_attempt: attempt,
+    },
+  });
+
+  const manifest = build(bound);
+  assert.equal(manifest.evidence.status, "withheld");
+  assert.equal(manifest.non_claim.runtime_execution, "not_proven_by_package");
+  assert.equal(manifest.non_claim.non_claim_reason, "accelerator_host_unavailable");
+  // The identity still describes the proof that did not happen, so the ledger names the host.
+  assert.equal(manifest.evidence.identity.backend, "Vulkan");
+  assert.equal(manifest.evidence.identity.runner, "codestory-linux-vulkan");
+  assert.equal(manifest.evidence.identity.producer_job, nonClaimPolicy.producer_job);
+
+  assert.throws(() => build("1"), /recovery bound/u);
+});
+
+test("withhold writes one container per closeout phase, never a phase-mixed one", () => {
+  // Each phase's trusted producer map authorizes only the manifests it selected, so a container
+  // holding another phase's cell is rejected at download time and the release is lost anyway.
+  const directory = mkdtempSync(
+    path.join(realpathSync.native(os.tmpdir()), "codestory-release-withhold-"),
+  );
+  const archiveName = "codestory-cli-v0.16.0-linux-x64.tar.gz";
+  const archiveBytes = Buffer.from("release archive bytes");
+  const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
+  const checksumBytes = Buffer.from(`${archiveSha256}  ${archiveName}\n`);
+  const checksumSha256 = createHash("sha256").update(checksumBytes).digest("hex");
+  const candidateRecord = path.join(directory, "candidate-archive-record.json");
+  const head = execFileSync(
+    "git",
+    ["rev-parse", "HEAD"],
+    { cwd: root, encoding: "utf8" },
+  ).trim();
+  const sourceTree = execFileSync(
+    "git",
+    ["rev-parse", "HEAD^{tree}"],
+    { cwd: root, encoding: "utf8" },
+  ).trim();
+  writeFileSync(
+    candidateRecord,
+    `${JSON.stringify(buildCandidateArchiveRecord({
+      repository: gitIdentity.repository,
+      sourceSha: head,
+      sourceTree,
+      target: "linux-x64",
+      archive: {
+        name: archiveName,
+        relative_path: archiveName,
+        bytes: archiveBytes.length,
+        sha256: archiveSha256,
+      },
+      companions: [
+        {
+          role: "archive_checksum",
+          relative_path: `${archiveName}.sha256`,
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+        {
+          role: "checksum_manifest",
+          relative_path: "SHA256SUMS.txt",
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+      ],
+    }), null, 2)}\n`,
+  );
+  const identityPath = path.join(directory, "identity.json");
+  writeFileSync(identityPath, JSON.stringify({
+    installer: "candidate_managed_plugin",
+    native_engine: "coderank_q8_embedded",
+  }));
+  const outDir = path.join(directory, "cells");
+  const withholdArgs = [
+    path.join(root, "scripts/codestory-release-cell-manifest.mjs"), "withhold",
+    "--repo", root,
+    "--expected-sha", head,
+    "--version", version,
+    "--host", "linux-x64-vulkan",
+    "--producer-run-id", "12345",
+    "--producer-run-attempt", String(nonClaimPolicy.maximum_run_attempts),
+    "--identity", identityPath,
+    "--candidate-record", candidateRecord,
+    "--out-dir", outDir,
+  ];
+  const result = spawnSync(process.execPath, withholdArgs, {
+    encoding: "utf8",
+    env: producerEnv({ GITHUB_RUN_ID: "12345" }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const staleRecord = path.join(directory, "stale-candidate-archive-record.json");
+  const stale = JSON.parse(readFileSync(candidateRecord, "utf8"));
+  stale.source.commit = "f".repeat(40);
+  writeFileSync(staleRecord, `${JSON.stringify(stale, null, 2)}\n`);
+  const staleResult = spawnSync(
+    process.execPath,
+    withholdArgs.map((value) => value === candidateRecord ? staleRecord : value),
+    {
+      encoding: "utf8",
+      env: producerEnv({ GITHUB_RUN_ID: "12345" }),
+    },
+  );
+  assert.notEqual(staleResult.status, 0);
+  assert.match(
+    staleResult.stderr,
+    /candidate archive record does not match the exact withheld source/u,
+  );
+
+  const expected = {
+    pre_publish: {
+      artifact: linuxHost.producer_artifacts.pre_publish,
+      cells: ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
+    },
+    post_publish: {
+      artifact: linuxHost.producer_artifacts.post_publish,
+      cells: ["retrieval_readiness:linux-x64"],
+    },
+  };
+  assert.deepEqual(readdirSync(outDir).sort(), ["post_publish", "pre_publish"]);
+  for (const [phase, { artifact, cells }] of Object.entries(expected)) {
+    const written = readdirSync(path.join(outDir, phase))
+      .map((name) => JSON.parse(readFileSync(path.join(outDir, phase, name), "utf8")));
+    assert.deepEqual(written.map(({ cell_id: id }) => id).sort(), [...cells].sort(), phase);
+    for (const manifest of written) {
+      assert.equal(manifest.phase, phase);
+      assert.equal(manifest.evidence.status, "withheld");
+      assert.equal(manifest.evidence.identity.artifact_sha256, archiveSha256);
+      assert.equal(
+        manifest.evidence.identity.producer_artifact,
+        artifact.replaceAll("{attempt}", String(nonClaimPolicy.maximum_run_attempts)),
+      );
+    }
+  }
 });

@@ -92,7 +92,7 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::O
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1");
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 
@@ -108,7 +108,7 @@ fn run_cli_with_stdin(
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -136,7 +136,7 @@ fn run_cli_with_embedding_env(
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1");
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1");
     for (name, value) in envs {
         command.env(name, value);
     }
@@ -201,7 +201,7 @@ fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_TEST_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -937,7 +937,7 @@ pub fn schedule_index(project_path: &str) -> usize {
         cache_dir.path(),
         &["agent", "preflight", "--format", "json"],
         &[
-            ("CODESTORY_EMBED_ALLOW_CPU", "1"),
+            ("CODESTORY_TEST_EMBED_ALLOW_CPU", "1"),
             ("CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS", "0"),
         ],
     );

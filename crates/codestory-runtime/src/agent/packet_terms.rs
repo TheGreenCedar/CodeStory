@@ -675,26 +675,28 @@ pub(crate) fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> 
     ) && packet_terms_have_any(terms, &["use", "switch", "active", "current", "needed"])
 }
 
+/// A shell-install prompt needs an actual shell signal. "command"/"function" alone also describe a
+/// command server, and a shell requirement raised over a command-server prompt is unclosable: no
+/// citation in such a repository is a shell script, so the packet would report partial forever.
 pub(crate) fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["bash", "shell", "script", "function", "command", "commands"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "install",
-            "installer",
-            "bootstraps",
-            "bootstrap",
-            "download",
-            "downloads",
-            "completion",
-            "profile",
-            "source",
-            "sourced",
-            "use",
-        ],
-    ) && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
+    packet_terms_have_any(terms, &["bash", "shell", "sh", "zsh", "script", "scripts"])
+        && packet_terms_have_any(
+            terms,
+            &[
+                "install",
+                "installer",
+                "bootstraps",
+                "bootstrap",
+                "download",
+                "downloads",
+                "completion",
+                "profile",
+                "source",
+                "sourced",
+                "use",
+            ],
+        )
+        && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
 }
 
 pub(crate) fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
@@ -876,5 +878,17 @@ mod tests {
             "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.",
         );
         assert!(packet_terms_indicate_shell_install_dispatch_flow(&terms));
+    }
+
+    #[test]
+    fn a_command_server_prompt_is_not_a_shell_install_prompt() {
+        // "command server bootstrap ... dispatches commands" satisfied the old bootstrap/dispatch
+        // pair on its own. Nothing in such a repository is a shell script, so the shell
+        // requirements it raised could never be closed once claim wording stopped standing in for
+        // cited evidence.
+        let terms = packet_probe_terms(
+            "Trace how a command server bootstrap enters an event loop, reads network command input, and dispatches commands through a command table.",
+        );
+        assert!(!packet_terms_indicate_shell_install_dispatch_flow(&terms));
     }
 }

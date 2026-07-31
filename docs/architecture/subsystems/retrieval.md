@@ -28,7 +28,7 @@ dense-anchor inputs, and the immutable embedding policy. Outputs are:
   execution and result identity
 - `health.rs` and `mode.rs`: artifact classification and live readiness
 - `embedding_contract.rs`: model, prefix, pooling, normalization, dimension,
-  batching, backend, and explicit CPU/accelerator policy
+  batching, backend, and accelerated execution policy
 - `per_user_embedding.rs`: bounded protocol, compatibility, server scheduler,
   leases, client replay boundary, and diagnostics
 - `retention.rs`: generation leases and owned cleanup

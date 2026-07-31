@@ -1,6 +1,6 @@
 use super::{
-    ControlEvent, MeasurementArtifact, ProcessInvocation, RawMetric, RawMetricSample,
-    ScenarioArtifact, ScenarioContext, ScenarioOrchestration,
+    ConstantCalibrationRunArtifact, ControlEvent, MeasurementArtifact, ProcessInvocation,
+    RawMetric, RawMetricSample, ScenarioArtifact, ScenarioContext, ScenarioOrchestration,
 };
 use crate::qualification::request::{QualificationExecutable, sha256_bytes};
 use anyhow::{Result, bail};
@@ -35,7 +35,8 @@ mod worker_stall;
 use analysis::project_identity_sha256;
 use evidence::validate_named_evidence;
 use process::{
-    cleanup_worker_files, existing_control_events, qualification_command_path, qualification_nonce,
+    cleanup_worker_files, existing_control_events_for_nonce, qualification_command_path,
+    qualification_nonce,
 };
 
 #[derive(Debug, Default)]
@@ -84,6 +85,7 @@ struct ScenarioRunner<'a> {
     evidence: ScenarioEvidence,
     active_controls: BTreeSet<String>,
     active_gates: BTreeSet<PathBuf>,
+    qualification_nonce: String,
     next_sequence: u64,
     next_worker: u64,
 }
@@ -150,6 +152,24 @@ pub(in crate::qualification) fn run_measurements(
     result
 }
 
+pub(in crate::qualification) fn run_constant_calibration(
+    context: ScenarioContext<'_>,
+    required_runs: u32,
+    model_sha256: &str,
+) -> Result<Vec<ConstantCalibrationRunArtifact>> {
+    let mut runner = ScenarioRunner::new_constant_calibration(context)?;
+    let mut result = runner.constant_calibration_runs(required_runs, model_sha256);
+    if result.is_ok() && !runner.active_controls.is_empty() {
+        result = Err(anyhow::anyhow!(
+            "embedding_constant_calibration_controls_not_released"
+        ));
+    }
+    if result.is_err() {
+        runner.cleanup_after_failure();
+    }
+    result
+}
+
 fn push_metric(
     metrics: &mut BTreeMap<String, RawMetric>,
     metric: &str,
@@ -187,6 +207,20 @@ fn opaque_measurement_sample_id(
     )
 }
 
+fn opaque_constant_calibration_sample_id(
+    nonce_sha256: &str,
+    matrix_cell_id: &str,
+    run_index: u32,
+    metric: &str,
+) -> String {
+    sha256_bytes(
+        format!(
+            "codestory-embedding-constant-calibration-sample-v1|{nonce_sha256}|{matrix_cell_id}|{run_index}|{metric}"
+        )
+        .as_bytes(),
+    )
+}
+
 impl<'a> ScenarioRunner<'a> {
     fn new(context: ScenarioContext<'a>) -> Result<Self> {
         if context.runtimes.len() != 2
@@ -197,11 +231,28 @@ impl<'a> ScenarioRunner<'a> {
         {
             bail!("embedding_qualification_scenario_projects_invalid");
         }
+        Self::build(context)
+    }
+
+    fn new_constant_calibration(context: ScenarioContext<'a>) -> Result<Self> {
+        if context.runtimes.len() != 1 || context.projects.len() != 1 || context.primary_index != 0
+        {
+            bail!("embedding_constant_calibration_project_invalid");
+        }
+        Self::build(context)
+    }
+
+    fn build(context: ScenarioContext<'a>) -> Result<Self> {
         let clock = CoordinatorClock::capture();
         let started_ns = clock.now_ns();
-        let next_sequence = existing_control_events(context.output_directory)?
-            .iter()
-            .fold(0, |maximum, event| maximum.max(event.sequence));
+        let qualification_nonce = match context.worker_nonce {
+            Some(nonce) => nonce.to_owned(),
+            None => qualification_nonce()?,
+        };
+        let next_sequence =
+            existing_control_events_for_nonce(context.output_directory, &qualification_nonce)?
+                .iter()
+                .fold(0, |maximum, event| maximum.max(event.sequence));
         Ok(Self {
             executable: context.executable.clone(),
             clock,
@@ -223,6 +274,7 @@ impl<'a> ScenarioRunner<'a> {
             evidence: ScenarioEvidence::default(),
             active_controls: BTreeSet::new(),
             active_gates: BTreeSet::new(),
+            qualification_nonce,
             next_sequence,
             next_worker: 0,
         })
@@ -250,12 +302,10 @@ impl<'a> ScenarioRunner<'a> {
             let _ = self.control("crash_server", None);
             self.active_controls.clear();
         }
-        if let Ok(nonce) = qualification_nonce() {
-            let _ = fs::remove_file(qualification_command_path(
-                self.context.output_directory,
-                &nonce,
-            ));
-        }
+        let _ = fs::remove_file(qualification_command_path(
+            self.context.output_directory,
+            &self.qualification_nonce,
+        ));
         for gate in std::mem::take(&mut self.active_gates) {
             let _ = fs::remove_file(gate);
         }

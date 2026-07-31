@@ -1,26 +1,28 @@
 [package]
 name = "codestory-bench"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 publish = false
 
 [dependencies]
-codestory-contracts = { workspace = true }
-codestory-indexer = { workspace = true }
-codestory-cli = { workspace = true }
-codestory-runtime = { workspace = true, features = ["benchmark-support"] }
 codestory-retrieval = { workspace = true }
-codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
-criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+codestory-cli = { workspace = true }
+codestory-contracts = { workspace = true }
+codestory-indexer = { workspace = true }
+codestory-runtime = { workspace = true, features = ["benchmark-support"] }
+codestory-store = { workspace = true }
+criterion = { workspace = true }
+uuid = { workspace = true }
 
 [[bench]]
 name = "indexing"

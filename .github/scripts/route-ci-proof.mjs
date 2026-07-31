@@ -30,8 +30,9 @@ const proofNeutralSurfaces = [
   /^CHANGELOG\.md$/u,
   /^docs\//u,
   /^\.github\/workflows\/retrieval-engine-smoke\.yml$/u,
-  /^crates\/codestory-runtime\/tests\/retrieval_generalization_guard\.rs$/u,
   /^scripts\/(?:codestory-agent-ab-benchmark|codestory-evidence-provenance|codestory-release-evidence-gate|lint-retrieval-generalization)\.mjs$/u,
+  /^scripts\/lib\/retrieval-generalization-lint\.mjs$/u,
+  /^scripts\/tests\/lint-retrieval-generalization\.test\.mjs$/u,
 ];
 
 function cleanPaths(paths) {
@@ -66,14 +67,29 @@ export function selectProofScope(paths, requested = "auto") {
 function selfTest() {
   const fixtures = [
     {
-      name: "script and guard tests do not package",
+      name: "generalization engine and contracts do not package",
       expected: "none",
       paths: [
         ".github/workflows/retrieval-engine-smoke.yml",
-        "crates/codestory-runtime/tests/retrieval_generalization_guard.rs",
         "scripts/lint-retrieval-generalization.mjs",
+        "scripts/lib/retrieval-generalization-lint.mjs",
+        "scripts/tests/lint-retrieval-generalization.test.mjs",
         "docs/testing/retrieval-architecture.md",
         "CHANGELOG.md",
+      ],
+    },
+    {
+      name: "nearby generalization library paths do not inherit the narrow exemption",
+      expected: "full",
+      paths: [
+        "scripts/lib/retrieval-generalization-lint-helper.mjs",
+      ],
+    },
+    {
+      name: "nearby generalization test paths do not inherit the narrow exemption",
+      expected: "full",
+      paths: [
+        "scripts/tests/lint-retrieval-generalization-helper.test.mjs",
       ],
     },
     {
@@ -124,13 +140,16 @@ function selfTest() {
   if (selectProofScope(fixtures[0].paths, "macos") !== "macos") {
     throw new Error("explicit promotion must be able to widen an inferred scope");
   }
-  if (selectProofScope(fixtures[2].paths, "macos") !== "full") {
+  const fullFixture = fixtures.find(({ name }) =>
+    name === "runtime identity changes use every platform"
+  );
+  if (selectProofScope(fullFixture.paths, "macos") !== "full") {
     throw new Error("explicit promotion must not narrow an inferred scope");
   }
-  if (selectProofScope(fixtures[2].paths, "windows") !== "windows") {
+  if (selectProofScope(fullFixture.paths, "windows") !== "windows") {
     throw new Error("coordinator Windows proof must select only Windows x64 packaging");
   }
-  if (selectProofScope(fixtures[2].paths, "linux") !== "linux") {
+  if (selectProofScope(fullFixture.paths, "linux") !== "linux") {
     throw new Error("coordinator Linux proof must select only Linux x64 packaging");
   }
 }

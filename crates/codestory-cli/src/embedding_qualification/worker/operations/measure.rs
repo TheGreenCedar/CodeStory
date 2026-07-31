@@ -19,7 +19,7 @@ use super::super::protocol::{
     run_raw_protocol_exchange_with_input, validated_hello, write_protocol_frame,
 };
 use super::ANTI_IDLE_PROTOCOL_DEADLINE_MS;
-use super::owner_exit::{observe_owner_exit, wait_for_owner_exit};
+use super::owner_exit::{OwnerExitObservation, observe_owner_exit, wait_for_owner_exit};
 use super::queue::{QueueOperation, run_queue_operation};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
@@ -68,7 +68,7 @@ fn workload_documents(workload_id: &str, repeat: u32, count: usize, bytes: usize
         .collect()
 }
 
-struct MeasurementSpanStart {
+pub(in crate::embedding_qualification::worker) struct MeasurementSpanStart {
     awake_started_ns: u64,
     inclusive_started_ns: u64,
     boot_id_started: String,
@@ -81,6 +81,26 @@ fn begin_span(clock: &dyn AwakeMonotonicClock) -> Result<MeasurementSpanStart> {
     let boot_id_started = crate::embedding_server_transport::boot_id()?;
     let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
     let awake_started_ns = clock.now_ns();
+    Ok(MeasurementSpanStart {
+        awake_started_ns,
+        inclusive_started_ns,
+        boot_id_started,
+    })
+}
+
+/// Stamp product completion for `true_idle_exit`.
+///
+/// The awake reading is deliberately first: once the product operation has
+/// stamped completion, a delay while returning to the measurement coordinator
+/// must remain inside the measured idle interval, never move its start
+/// forward. The suspend-inclusive and boot witnesses follow immediately and
+/// the downstream tolerance fails closed if sampling them is delayed.
+fn begin_true_idle_span_at_product_completion(
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<MeasurementSpanStart> {
+    let awake_started_ns = clock.now_ns();
+    let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
+    let boot_id_started = crate::embedding_server_transport::boot_id()?;
     Ok(MeasurementSpanStart {
         awake_started_ns,
         inclusive_started_ns,
@@ -212,6 +232,37 @@ pub(in crate::embedding_qualification::worker) fn run_measure_spawn_hello(
     Ok(measurement(span, resident))
 }
 
+/// Constant calibration's spawn sample stops after the compatible hello. It
+/// deliberately leaves the fresh owner without a resident model so the next
+/// product request can measure first-vector latency on this same generation.
+pub(in crate::embedding_qualification::worker) fn run_measure_constant_spawn_hello(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<WorkerMeasurement> {
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let client = PerUserEmbeddingClient::for_runtime(runtime)?;
+    if client.observe()?.is_some() {
+        bail!("embedding_constant_calibration_spawn_owner_present");
+    }
+    let start = begin_span(clock)?;
+    let spawn_attempt = transport.spawn_exact_current_exe()?;
+    let mut stream = connect_until(
+        &transport,
+        clock,
+        SPAWN_CONVERGENCE_BUDGET,
+        Some(&spawn_attempt),
+    )?;
+    let hello = validated_hello(&mut stream, &transport, runtime, clock)?;
+    let span = finish_span(clock, start)?;
+    if hello.process.server_instance_id.is_empty()
+        || hello.process.process_start_id.is_empty()
+        || hello.engine.is_some()
+    {
+        bail!("embedding_constant_calibration_spawn_not_cold");
+    }
+    Ok(measurement(span, hello))
+}
+
 /// `cold_first_vector` and `first_product_ready`: span
 /// [`product_request_started(...)` -> `..._validated`] around client
 /// construction plus one `embed_query`; the client validates identity,
@@ -236,6 +287,41 @@ pub(in crate::embedding_qualification::worker) fn run_measure_product_query(
         .observe()?
         .filter(resident_engine_generation)
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_product_owner_missing"))?;
+    Ok(measurement(span, snapshot))
+}
+
+/// Constant calibration decomposes process spawn from first model use. The
+/// fresh owner must still have no resident generation when this interval
+/// starts, and the first product query must load the model on that same server
+/// generation.
+pub(in crate::embedding_qualification::worker) fn run_measure_constant_cold_query(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+    workload_id: &str,
+    repeat: u32,
+    input_bytes: u32,
+) -> Result<WorkerMeasurement> {
+    let client = PerUserEmbeddingClient::for_runtime(runtime)?;
+    let cold_owner = client
+        .observe()?
+        .filter(|snapshot| snapshot.engine.is_none())
+        .ok_or_else(|| anyhow::anyhow!("embedding_constant_calibration_owner_not_cold"))?;
+    let input = workload_input(workload_id, repeat, 0, input_bytes.max(1) as usize);
+    let start = begin_span(clock)?;
+    let vector = client.embed_query(&input)?;
+    let span = finish_span(clock, start)?;
+    if vector.is_empty() {
+        bail!("embedding_constant_calibration_product_vector_missing");
+    }
+    let snapshot = client
+        .observe()?
+        .filter(resident_engine_generation)
+        .ok_or_else(|| anyhow::anyhow!("embedding_constant_calibration_product_owner_missing"))?;
+    if snapshot.process.server_instance_id != cold_owner.process.server_instance_id
+        || snapshot.process.process_start_id != cold_owner.process.process_start_id
+    {
+        bail!("embedding_constant_calibration_generation_changed");
+    }
     Ok(measurement(span, snapshot))
 }
 
@@ -350,30 +436,103 @@ pub(in crate::embedding_qualification::worker) fn run_measure_resident_identity(
     })
 }
 
-/// `true_idle_exit`: span start at the observation proving the resident owner
-/// carries zero queued, active, or leased work
-/// (`last_queued_active_or_leased_work_ended`), span end at the observation
-/// that returned no owner (`engine_and_server_absent`).
+fn true_idle_scheduler_is_drained(
+    active_request_count: u64,
+    query_depth: u64,
+    bulk_depth: u64,
+    lease_count: u64,
+) -> bool {
+    active_request_count == 0 && query_depth == 0 && bulk_depth == 0 && lease_count == 0
+}
+
+fn snapshot_is_true_idle_boundary(snapshot: &EmbeddingServerSnapshot) -> bool {
+    snapshot.lifecycle == "resident"
+        && resident_engine_generation(snapshot)
+        && true_idle_scheduler_is_drained(
+            snapshot.scheduler.active_request_count,
+            snapshot.scheduler.query_depth,
+            snapshot.scheduler.bulk_depth,
+            snapshot.scheduler.lease_count,
+        )
+}
+
+fn same_true_idle_owner(
+    expected_server_instance_id: &str,
+    observed_server_instance_id: &str,
+) -> bool {
+    expected_server_instance_id == observed_server_instance_id
+}
+
+fn validate_true_idle_boundary(
+    expected_server_instance_id: &str,
+    snapshot: &EmbeddingServerSnapshot,
+) -> Result<()> {
+    if !same_true_idle_owner(
+        expected_server_instance_id,
+        &snapshot.process.server_instance_id,
+    ) {
+        bail!("embedding_qualification_true_idle_owner_changed");
+    }
+    if !snapshot_is_true_idle_boundary(snapshot) {
+        bail!("embedding_qualification_true_idle_not_quiescent");
+    }
+    Ok(())
+}
+
+/// The product and observation operations used by the true-idle measurement.
+///
+/// The worker implements this interface with the real per-user embedding
+/// client. Tests use a scripted implementation to execute this same
+/// `run_measure_true_idle` algorithm rather than a helper that production can
+/// bypass.
+pub(in crate::embedding_qualification::worker) trait TrueIdleMeasurementClient {
+    fn observe_snapshot(&self) -> Result<Option<EmbeddingServerSnapshot>>;
+    fn complete_product_query_and_stamp(
+        &self,
+        input: &str,
+        clock: &dyn AwakeMonotonicClock,
+    ) -> Result<MeasurementSpanStart>;
+    fn observe_owner_exit(&self) -> Result<OwnerExitObservation>;
+}
+
+impl TrueIdleMeasurementClient for PerUserEmbeddingClient {
+    fn observe_snapshot(&self) -> Result<Option<EmbeddingServerSnapshot>> {
+        self.observe()
+    }
+
+    fn complete_product_query_and_stamp(
+        &self,
+        input: &str,
+        clock: &dyn AwakeMonotonicClock,
+    ) -> Result<MeasurementSpanStart> {
+        let _ = self.embed_query(input)?;
+        begin_true_idle_span_at_product_completion(clock)
+    }
+
+    fn observe_owner_exit(&self) -> Result<OwnerExitObservation> {
+        observe_owner_exit(self)
+    }
+}
+
+/// `true_idle_exit`: this worker completes the last product request itself,
+/// stamps `final_product_request_completed` before returning to its caller,
+/// proves the resident scheduler is drained, then ends at the observation that
+/// returned no owner (`engine_and_server_absent`).
 pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
-    runtime: &SidecarRuntimeConfig,
+    client: &dyn TrueIdleMeasurementClient,
     clock: &dyn AwakeMonotonicClock,
+    input_bytes: u32,
 ) -> Result<WorkerMeasurement> {
-    let client = PerUserEmbeddingClient::for_runtime(runtime)?;
-    let idle_owner = wait_for_observed_snapshot(
-        &client,
-        clock,
-        SNAPSHOT_TIMEOUT,
-        "embedding_qualification_true_idle_not_quiescent",
-        |snapshot| {
-            snapshot.lifecycle == "resident"
-                && resident_engine_generation(snapshot)
-                && snapshot.scheduler.active_request_count == 0
-                && snapshot.scheduler.query_depth == 0
-                && snapshot.scheduler.bulk_depth == 0
-                && snapshot.scheduler.lease_count == 0
-        },
-    )?;
-    let start = begin_span(clock)?;
+    let expected_owner = client
+        .observe_snapshot()?
+        .filter(resident_engine_generation)
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_true_idle_owner_missing"))?;
+    let input = "q".repeat(input_bytes.max(1) as usize);
+    let start = client.complete_product_query_and_stamp(&input, clock)?;
+    let idle_owner = client
+        .observe_snapshot()?
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_true_idle_owner_missing"))?;
+    validate_true_idle_boundary(&expected_owner.process.server_instance_id, &idle_owner)?;
     let timeout = Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
         .saturating_add(OWNER_ABSENCE_GRACE);
     let wait_started = clock.now_ns();
@@ -382,7 +541,7 @@ pub(in crate::embedding_qualification::worker) fn run_measure_true_idle(
         wait_started,
         timeout,
         &idle_owner.process.server_instance_id,
-        || observe_owner_exit(&client),
+        || client.observe_owner_exit(),
     )?;
     let span = finish_span(clock, start)?;
     Ok(measurement(span, idle_owner))
@@ -652,7 +811,191 @@ fn validate_vector_response(
 
 #[cfg(test)]
 mod tests {
-    use super::workload_input;
+    use super::super::owner_exit::OwnerExitObservation;
+    use super::{
+        MeasurementSpanStart, TrueIdleMeasurementClient,
+        begin_true_idle_span_at_product_completion, run_measure_true_idle,
+        true_idle_scheduler_is_drained, validate_true_idle_boundary, workload_input,
+    };
+    use anyhow::Result;
+    use codestory_retrieval::{
+        AwakeMonotonicClock, EmbeddingServerAuthoritySnapshot, EmbeddingServerClockSnapshot,
+        EmbeddingServerEngineSnapshot, EmbeddingServerProcessSnapshot,
+        EmbeddingServerProtocolSnapshot, EmbeddingServerSchedulerSnapshot, EmbeddingServerSnapshot,
+        PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const PRODUCT_COMPLETED_NS: u64 = 100;
+    const PRODUCT_RETURNED_NS: u64 = 10_000_000_100;
+    const DRAINED_OWNER_OBSERVED_NS: u64 = 10_000_000_145;
+
+    struct ScriptClock {
+        now_ns: AtomicU64,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ScriptClock {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                now_ns: AtomicU64::new(0),
+                events,
+            }
+        }
+
+        fn set(&self, now_ns: u64) {
+            self.now_ns.store(now_ns, Ordering::Release);
+        }
+    }
+
+    impl AwakeMonotonicClock for ScriptClock {
+        fn now_ns(&self) -> u64 {
+            let now_ns = self.now_ns.load(Ordering::Acquire);
+            if now_ns == PRODUCT_COMPLETED_NS {
+                self.events
+                    .lock()
+                    .expect("lock events")
+                    .push("span_started");
+            }
+            now_ns
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.now_ns.fetch_add(
+                u64::try_from(duration.as_nanos()).expect("test duration fits u64"),
+                Ordering::AcqRel,
+            );
+        }
+
+        fn snapshot(&self) -> EmbeddingServerClockSnapshot {
+            EmbeddingServerClockSnapshot {
+                domain: "awake_monotonic".into(),
+                api: "script_clock".into(),
+                boot_id: "test-boot".into(),
+                resolution_ns: 1,
+            }
+        }
+    }
+
+    struct ScriptedTrueIdleClient {
+        clock: Arc<ScriptClock>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        snapshots: Mutex<VecDeque<EmbeddingServerSnapshot>>,
+        exit_observations: Mutex<VecDeque<OwnerExitObservation>>,
+        product_calls: AtomicUsize,
+    }
+
+    impl TrueIdleMeasurementClient for ScriptedTrueIdleClient {
+        fn observe_snapshot(&self) -> Result<Option<EmbeddingServerSnapshot>> {
+            let (snapshot, remaining) = {
+                let mut snapshots = self.snapshots.lock().expect("lock snapshots");
+                let snapshot = snapshots
+                    .pop_front()
+                    .expect("the algorithm observed past its snapshot script");
+                (snapshot, snapshots.len())
+            };
+            let event = if remaining == 1 {
+                "expected_owner_observed"
+            } else {
+                self.clock.set(DRAINED_OWNER_OBSERVED_NS);
+                "same_owner_drained_observed"
+            };
+            self.events.lock().expect("lock events").push(event);
+            Ok(Some(snapshot))
+        }
+
+        fn complete_product_query_and_stamp(
+            &self,
+            input: &str,
+            clock: &dyn AwakeMonotonicClock,
+        ) -> Result<MeasurementSpanStart> {
+            assert_eq!(input, "q".repeat(256));
+            self.product_calls.fetch_add(1, Ordering::AcqRel);
+            self.clock.set(PRODUCT_COMPLETED_NS);
+            self.events
+                .lock()
+                .expect("lock events")
+                .push("product_completed");
+            let start = begin_true_idle_span_at_product_completion(clock)?;
+            self.clock.set(PRODUCT_RETURNED_NS);
+            self.events
+                .lock()
+                .expect("lock events")
+                .push("product_returned_after_delay");
+            Ok(start)
+        }
+
+        fn observe_owner_exit(&self) -> Result<OwnerExitObservation> {
+            let observation = self
+                .exit_observations
+                .lock()
+                .expect("lock exit observations")
+                .pop_front()
+                .expect("the algorithm observed past its exit script");
+            let event = match &observation {
+                OwnerExitObservation::Present(_) => "same_owner_still_present",
+                OwnerExitObservation::Lost => "owner_connection_lost",
+                OwnerExitObservation::Absent => "owner_absence_observed",
+            };
+            self.events.lock().expect("lock events").push(event);
+            Ok(observation)
+        }
+    }
+
+    fn true_idle_snapshot(
+        owner: &str,
+        active_request_count: u64,
+        query_depth: u64,
+        bulk_depth: u64,
+        lease_count: u64,
+    ) -> EmbeddingServerSnapshot {
+        EmbeddingServerSnapshot {
+            schema_version: PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
+            event_sequence: 1,
+            lifecycle: "resident".into(),
+            clock: EmbeddingServerClockSnapshot {
+                domain: "awake_monotonic".into(),
+                api: "script_clock".into(),
+                boot_id: "test-boot".into(),
+                resolution_ns: 1,
+            },
+            protocol: EmbeddingServerProtocolSnapshot::current(),
+            authority: EmbeddingServerAuthoritySnapshot {
+                endpoint_namespace_id: "endpoint".into(),
+                lifetime_authority_id: "authority".into(),
+                listener_id: "listener".into(),
+                peer_verified: true,
+            },
+            process: EmbeddingServerProcessSnapshot {
+                server_instance_id: owner.into(),
+                pid: 42,
+                process_start_id: "server-start".into(),
+                executable_sha256: "a".repeat(64),
+                executable_version: "0.16.3".into(),
+            },
+            scheduler: EmbeddingServerSchedulerSnapshot {
+                query_capacity: 64,
+                query_depth,
+                bulk_capacity: 64,
+                bulk_depth,
+                connection_count: 1,
+                active_request_count,
+                lease_count,
+                active_request: None,
+            },
+            engine: Some(EmbeddingServerEngineSnapshot {
+                engine_owner_id: owner.into(),
+                native_worker_id: "native-worker".into(),
+                load_generation: 1,
+                model_load_count: 1,
+                successful_encode_count: 1,
+            }),
+            failure: None,
+        }
+    }
 
     #[test]
     fn workload_inputs_are_deterministic_ascii_and_distinct_per_ordinal() {
@@ -665,5 +1008,89 @@ mod tests {
         assert!(first.is_ascii());
         assert_ne!(first, other_repeat);
         assert_ne!(first, other_ordinal);
+    }
+
+    #[test]
+    fn true_idle_start_is_stamped_at_product_completion_before_return_and_observation_lag() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(ScriptClock::new(Arc::clone(&events)));
+        let client = ScriptedTrueIdleClient {
+            clock: Arc::clone(&clock),
+            events: Arc::clone(&events),
+            snapshots: Mutex::new(VecDeque::from([
+                true_idle_snapshot("measured-owner", 0, 0, 0, 0),
+                true_idle_snapshot("measured-owner", 0, 0, 0, 0),
+            ])),
+            exit_observations: Mutex::new(VecDeque::from([
+                OwnerExitObservation::Present("measured-owner".into()),
+                OwnerExitObservation::Absent,
+            ])),
+            product_calls: AtomicUsize::new(0),
+        };
+
+        let measurement =
+            run_measure_true_idle(&client, clock.as_ref(), 256).expect("measure true idle");
+
+        assert_eq!(client.product_calls.load(Ordering::Acquire), 1);
+        assert_eq!(measurement.span.awake_started_ns, PRODUCT_COMPLETED_NS);
+        assert!(measurement.span.awake_finished_ns >= DRAINED_OWNER_OBSERVED_NS);
+        assert_eq!(
+            measurement.snapshot.process.server_instance_id,
+            "measured-owner"
+        );
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            [
+                "expected_owner_observed",
+                "product_completed",
+                "span_started",
+                "product_returned_after_delay",
+                "same_owner_drained_observed",
+                "same_owner_still_present",
+                "owner_absence_observed",
+            ]
+        );
+    }
+
+    #[test]
+    fn true_idle_boundary_rejects_each_queued_active_or_leased_shape() {
+        let occupied = [
+            ("active", (1, 0, 0, 0)),
+            ("query", (0, 1, 0, 0)),
+            ("bulk", (0, 0, 1, 0)),
+            ("lease", (0, 0, 0, 1)),
+        ];
+        assert!(true_idle_scheduler_is_drained(0, 0, 0, 0));
+        for (label, state) in occupied {
+            assert!(
+                !true_idle_scheduler_is_drained(state.0, state.1, state.2, state.3),
+                "{label} work must keep the true-idle boundary open"
+            );
+            let result = validate_true_idle_boundary(
+                "measured-owner",
+                &true_idle_snapshot("measured-owner", state.0, state.1, state.2, state.3),
+            );
+            assert_eq!(
+                result
+                    .expect_err("occupied scheduler must reject the sample")
+                    .to_string(),
+                "embedding_qualification_true_idle_not_quiescent",
+                "{label} work must fail closed rather than shift the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn true_idle_boundary_rejects_a_different_owner_after_product_completion() {
+        let result = validate_true_idle_boundary(
+            "measured-owner",
+            &true_idle_snapshot("replacement-owner", 0, 0, 0, 0),
+        );
+        assert_eq!(
+            result
+                .expect_err("replacement owner must reject the sample")
+                .to_string(),
+            "embedding_qualification_true_idle_owner_changed"
+        );
     }
 }

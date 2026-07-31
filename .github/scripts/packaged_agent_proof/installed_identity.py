@@ -10,7 +10,10 @@ from pathlib import Path
 from .contract_primitives import require_exact_keys, sha256
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .installation_support import directory_contract_sha256, same_existing_path
-from .marketplace_installation import marketplace_installed_plugin_identity
+from .marketplace_installation import (
+    delivery_state,
+    marketplace_installed_plugin_identity,
+)
 
 
 def _reject_source_checkout(plugin_root: Path) -> None:
@@ -157,9 +160,15 @@ def installed_plugin_identity(
     )
     _reject_source_checkout(plugin_root)
     attestation = _load_attestation(args.installed_plugin_attestation)
-    if attestation.get("installation_source") == "codex_marketplace_install":
+    # Each installer identity routes to exactly one accepted shape. A live public-catalog
+    # install and a deferred candidate-pinned fixture are different states of the world, so
+    # neither can be verified by the other's predicate -- the live check is not relaxed to
+    # admit a fixture, and the deferred check cannot mint the live repository name.
+    state = delivery_state(attestation.get("installation_source"))
+    if state is not None:
         return marketplace_installed_plugin_identity(
             attestation,
+            state,
             args.installed_plugin_data,
             plugin_root,
             manifest,

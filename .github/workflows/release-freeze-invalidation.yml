@@ -1,0 +1,78 @@
+name: Release freeze invalidation
+
+on:
+  pull_request:
+    branches:
+      - dev/codestory-next
+    types: [synchronize]
+  push:
+    branches:
+      - dev/codestory-next
+
+permissions:
+  actions: write
+  contents: read
+  statuses: write
+
+concurrency:
+  group: release-freeze-invalidation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  invalidate:
+    name: Cancel proof for a superseded frozen head
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Invalidate a superseded release freeze
+        shell: bash
+        env:
+          AFTER_SHA: ${{ github.event.after || github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$BEFORE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$AFTER_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$BEFORE_SHA" != "$AFTER_SHA"
+          if [ "$EVENT_NAME" = push ]; then
+            node .github/scripts/release-freeze-barrier.mjs invalidate-superseded \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$AFTER_SHA" \
+              --broad-workflow "Exact-head source proof" \
+              --broad-workflow "Platform and integration proof" \
+              --broad-workflow "Release" \
+              --broad-workflow "Auto Release"
+            exit 0
+          fi
+          freeze_contexts="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/$BEFORE_SHA/statuses?per_page=100" \
+              | jq -r \
+                '[.[] | select(
+                  .state == "success"
+                  and (.context | startswith("codestory/release-freeze/"))
+                ) | .context] | unique[]'
+          )"
+          if [ -z "$freeze_contexts" ]; then
+            echo "Previous head $BEFORE_SHA was not a declared release candidate."
+            exit 0
+          fi
+          while IFS= read -r context; do
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/statuses/$BEFORE_SHA" \
+              -f state=error \
+              -f "context=$context" \
+              -f "description=superseded-by=$AFTER_SHA" \
+              -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done <<<"$freeze_contexts"
+          node .github/scripts/release-freeze-barrier.mjs invalidate-superseded \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$AFTER_SHA" \
+            --broad-workflow "Exact-head source proof" \
+            --broad-workflow "Platform and integration proof" \
+            --broad-workflow "Release" \
+            --broad-workflow "Auto Release"

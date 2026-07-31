@@ -67,8 +67,8 @@ def _verify_engine_core(
         f"software adapter is not allowed: {adapter}",
     )
     require(
-        fields["embedding_policy"] in {"accelerated", "cpu_explicit"},
-        "status lacks an explicit embedding policy",
+        fields["embedding_policy"] == "accelerated",
+        "status lacks the required accelerated embedding policy",
     )
     require(
         bool(fields["embedding_engine_instance_id"]),

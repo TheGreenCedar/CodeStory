@@ -120,8 +120,8 @@ adapter to compensate for incorrect upstream state.
   lanes.
 - Do not use `cargo test --workspace --all-targets` as the routine broad gate;
   it expands Criterion targets. Draft work uses focused checks. The full
-  workspace test and all-target/all-feature clippy gate run once on an
-  independently accepted exact head.
+  workspace test and all-target/all-feature clippy gate run once on the source
+  head accepted by the executable release freeze barrier.
 - CLI integration tests must launch through
   `tests/test_support::cli_command` or its supplied-binary variant, use
   isolated cache/install/plugin state roots.
@@ -160,6 +160,9 @@ adapter to compensate for incorrect upstream state.
   saga label) must close a PR-sized issue with `Closes`, `Fixes`, or `Resolves`.
   Use `Refs` for broader parents. A partial slice closes only its child issue;
   keep the parent open until its acceptance criteria are met.
+- Before creating an issue, branch, worktree, or PR, search open and closed
+  issues, merged PRs, and integration history for the requested outcome, then
+  prove that outcome is absent from the current integration head.
 - For PRs targeting `dev/codestory-next`, add both the issue and PR to the
   Project; computed linked-PR fields may not populate before default-branch
   promotion.
@@ -170,6 +173,9 @@ adapter to compensate for incorrect upstream state.
 - PRs should explain context, what changed, how to review, verification, risk,
   and follow-up. Include exact SHAs and distinguish completed proof from
   non-claims.
+- Release handoffs must name the final intended source head, known future
+  source changes, proof-triggering labels or actions, reusable and invalidated
+  evidence, currently running workflows, and the next permitted mutation.
 - Public GitHub status comments must use
   `node scripts/github-status-comment.mjs --issue <n> --body-file <file>` or
   stdin; the helper rejects literal `\\n` text.
@@ -185,6 +191,44 @@ adapter to compensate for incorrect upstream state.
 - Commit messages are short, lowercase, and imperative.
 
 ## Release Rules
+
+### Candidate freeze and proof budget
+
+- Before any gate expected to exceed five minutes, record the exact commit and
+  tree, confirm the worktree is clean and pushed, and confirm that every
+  planned source or workflow change is already merged. Independent acceptance
+  must execute the required hostile mutations on that exact head; diff review
+  and existing green tests do not qualify. Any later commit revokes
+  acceptance.
+- Support PRs use focused checks only. Do not add a proof-triggering label or
+  dispatch a broad source, package, calibration, or hardware gate until all
+  support PRs are integrated into the release lane. Broad proof belongs to the
+  final integration head, not every independently mergeable PR.
+- Release order is: merge all blockers, run focused checks, run actual-host
+  microprobes, execute hostile mutation acceptance, push and declare the source
+  head frozen for calibration, calibrate, apply the sole generated constant-set
+  change, accept and freeze that generated head, run one broad source proof on
+  it, then qualify. If another source or workflow change becomes necessary,
+  immediately invalidate the candidate and cancel every queued or running
+  proof for it.
+- Run the full workspace source proof exactly once per release candidate, on
+  the generated constant-only frozen head after calibration. The calibration
+  source receives focused hostile-mutation and native-probe acceptance, not a
+  broad source proof. Use deterministic selection validation, direct
+  constant-only lineage verification, and frozen-candidate qualification;
+  never run both a pre-calibration and post-calibration workspace proof.
+- Cancel a run whose head is no longer the intended release candidate. Never
+  let an expensive obsolete run finish for information. Before dispatching,
+  inspect both in-flight runs and whether any known source change will
+  invalidate the result.
+- After a platform-specific packaging or filesystem failure, do not run a full
+  rebuild until a sub-90-second native probe reproduces the relevant path,
+  link, staging, cache, or identity behavior on that operating system. Test the
+  selector against the probe or captured artifact first.
+- Use one implementer and one adversarial verifier. Give the verifier the exact
+  mutation matrix and only the context needed to execute it. Its output is
+  limited to counterexamples or acceptance evidence. After two failed
+  revisions of the same shape, stop patching examples and redesign the seam.
 
 - Freeze the selected release claim before qualification. For the standard
   v0.16 release described in `CHANGELOG.md`, build one candidate; install its
@@ -216,6 +260,29 @@ adapter to compensate for incorrect upstream state.
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
+- Release ordering is **bump-then-calibrate**. Bump the version first,
+  calibrate the per-user embedding server on the bumped tree, land the
+  constant-set freeze commit, then package and release. The frozen-candidate
+  `qualification` dispatch authenticates the calibration bundle and runs
+  `Prove frozen calibration source lineage`. Every proof-only or publishing
+  release preflight separately runs
+  `.github/scripts/check-calibration-release-lineage.py` against its actual
+  checked-out head, even when no bundle is supplied. Both bindings require the
+  calibration commit to be an ancestor of the release commit and require
+  `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` to be
+  the only file that differs between them. A calibrate-then-bump ordering
+  fails the guard by name; the fix is to move the bump ahead of calibration and
+  recalibrate on the bumped tree, never to widen the allowed path set. Any other
+  commit -- a doc fix, a CI tweak, a rebase -- between calibration and the
+  package also fails, so recalibrate rather than reorder history.
+- CPU embeddings are unsupported. Calibration and release-proof execution must
+  use `accelerated` policy with CPU fallback disabled. Runtime-constant
+  calibration requires exactly three fresh protected Apple Silicon Metal runs
+  with one sample per metric per run. Optional Linux Vulkan calibration is a
+  standalone, non-selecting diagnostic; it never joins or blocks calibration
+  assembly. Calibration freezes runtime constants only. Lifecycle, fault,
+  true-idle, memory, retrieval-quality, and accelerator qualification run later
+  against the frozen candidate.
 - Validate release changes with
   `python .github/scripts/check-codestory-release.py --version <version>` and
   `node .github/scripts/check-workflow-policy.mjs`.
@@ -237,14 +304,50 @@ adapter to compensate for incorrect upstream state.
   hardware, post-publish, installed-runtime, and live behavior evidence for the
   claims being shipped. A merge, tag, or downloadable archive alone is not
   release completion.
-- The release workflow owns marketplace publication. Its `marketplace-publish`
-  job points `TheGreenCedar/AgentPluginMarketplace` at the published commit
-  after the release exists, and post-publish smoke proves that catalog. Do not
-  hand-edit the catalog before a release; preflight proves the install path
-  against a candidate-pinned fixture and no longer requires the live catalog to
-  match an unreleased commit. If the catalog push fails, the release is still
-  complete and the catalog still serves the previous release: recover with the
-  `marketplace-sync` workflow rather than editing by hand.
+- Both release lanes own marketplace publication. The `marketplace-publish` job
+  in `release.yml` and in `plugin-release.yml` points
+  `TheGreenCedar/AgentPluginMarketplace` at the published commit after the
+  release exists. Do not hand-edit the catalog before a release; preflight proves
+  the install path against a candidate-pinned fixture and no longer requires the
+  live catalog to match an unreleased commit.
+- Catalog publication is delivery, not a release gate. It runs after an
+  irreversible tag, so a missing credential or a rejected push must not fail the
+  release; `release-claims.json` records that with
+  `workflow_policy.catalog_delivery.release_gate: false`. The job absorbs its own
+  failure and records one of two explicit states, and post-publish smoke runs
+  either way: `published` resolves the live catalog, `deferred` resolves a catalog
+  pinned to the released commit and stamps the distinct installer identity
+  `codex_marketplace_deferred_fixture` into the release ledger. A release may say
+  the catalog was updated only when the push actually landed; the honest outcome
+  otherwise is "released, catalog sync deferred".
+- The two states are distinct **end to end**, not just in a log line. Each has its
+  own installer identity, its own `marketplace.repository` in the install
+  attestation (`local:candidate-pinned-marketplace-fixture` for a fixture), and
+  its own accepted shape in `marketplace_installation.py` — the resolver reports a
+  local source, a marketplace root outside the Codex home, and no pinned `ref`,
+  which the live shape cannot describe and must never be relaxed to admit. A
+  deferred install must resolve a catalog carrying the
+  `.codestory-marketplace-fixture.json` marker naming the exact released commit,
+  so an arbitrary local git directory cannot pass for one. The three names live in
+  `.github/scripts/marketplace-delivery-identity.mjs`; add a state there, in the
+  Python predicate, and in `release-claims.json` together or not at all.
+- The closeout *reads* the mark. `workflow_policy.catalog_delivery.installed_cell_group`
+  names the post-publish cells whose signed `installer` identity resolves the
+  state, and `ledger.json`/`summary.json` carry `catalog_delivery`. Every one of
+  those cells must agree on one declared identity; an undeclared installer or a
+  disagreement between targets rejects the closeout rather than passing quietly.
+- `marketplace-sync.yml` is the recovery path for a deferred catalog. Re-run it
+  with the published version and commit rather than editing the catalog by hand;
+  it is idempotent, so re-running it against an already-synced catalog succeeds
+  without pushing. It mints its token from the same `MARKETPLACE_APP_ID` /
+  `MARKETPLACE_APP_PRIVATE_KEY` in the same `marketplace-publish` environment the
+  release lanes use, so it recovers a push that was **rejected**, not a
+  credential that does not exist. While those secrets are absent every release
+  defers and re-running the sync defers too: the exit is to provision the
+  credential first. That is deliberate — the alternative is a second, unscoped
+  way to write another repository — but it means "deferred" persists until
+  someone with repository-settings access acts, and the ledger says so rather
+  than implying a one-click fix.
 - For a local plugin-source change Codex must observe outside a release, refresh
   the installed package and verify the managed runtime path/version plus
   project-scoped status. CodeStory repository state alone does not update an

@@ -14,7 +14,7 @@ Criterion targets.
 | --- | --- | --- |
 | Rust formatting or local logic | `cargo fmt --all -- --check`; owning crate tests | Workspace check/test/clippy |
 | Store/publication | Store tests plus named fault/concurrency cases | Workspace source gate |
-| Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run quality/performance gate and required hardware proof |
+| Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run performance gate, optional exact-candidate quality report, and required hardware proof |
 | CLI/stdio | Named CLI contract suites | Workspace source gate and packaged proof when package behavior changed |
 | Plugin launcher or CodeStoryDev staging | Installer tests plus `plugin-static` | Packaged plugin handoff |
 | Worktree setup | Node suite plus one platform adapter smoke | Mac/Windows platform cell when adapter changed |
@@ -137,7 +137,7 @@ Focused proof covers:
   for release builds;
 - embedded-model digest and atomic materialization;
 - linked ggml build identity;
-- explicit `accelerated` or `cpu_explicit` policy;
+- explicit `accelerated` policy with CPU embeddings disabled;
 - prohibited silent CPU fallback and software-adapter rejection;
 - live embedding smoke plus post-encode backend observations for execution
   device/backend, layer placement, resident tensor count/bytes, execution nodes,
@@ -183,13 +183,31 @@ alone is not treated as OS-level denial. This proves the Cargo release boundary,
 not that the separately packaged Linux archive was produced by that discarded
 fresh-target build.
 
-Hosted source/package jobs may set:
+CPU embeddings are unsupported in package, calibration, qualification, and
+release-proof jobs. Source-only contract tests may exercise CPU rejection, but
+cannot emit product or release evidence.
 
-```sh
-CODESTORY_EMBED_ALLOW_CPU=1
-```
+Runtime-constant calibration runs three clean protected Apple Silicon Metal
+generations with one sample per metric per run. It builds and packages once,
+prepares the projects and model once, and performs no lifecycle, fault,
+true-idle, memory, retrieval-quality, or accelerator qualification. A manually
+dispatched Linux Vulkan calibration may emit optional diagnostic evidence, but
+it does not feed or block the frozen calibration bundle.
 
-They must report `cpu_explicit` and make no acceleration claim.
+Frozen-candidate qualification is a separate one-run-per-platform lane.
+Metal and Windows Vulkan each run the full lifecycle, fault, true-idle, memory,
+and accelerator suite once. Protected Linux Vulkan may run that same
+qualification through a standalone dispatch when its GPU runner is online; it
+is not a coordinator closeout dependency and cannot block qualification when
+that runner is absent.
+
+Answer quality is a separate, optional frozen-candidate adjunct. After the
+protected Metal package proof, it runs the checksum-bound Axios JavaScript and
+TypeScript v2 task for three cold-CLI repeats against the same authenticated
+macOS archive. Its failure or absence cannot block Metal, Windows, Linux, or
+closeout, and the standard release makes no answer-quality claim. Promotion and
+release decisions consume the coordinator's `closeout` job result directly;
+they do not wait for this optional job or for workflow-wide completion.
 
 ### Packaged proof
 
@@ -207,17 +225,31 @@ commit and tree, executable digest, server protocol, accepted constant set, and
 measurement protocol. `--version-only` proves package structure, version, and
 help; it does not prove a running server.
 
-Full calibration and qualification use the ordinary plugin launcher with two
-independently started host processes and different repositories.
+Protected and installed qualification use the ordinary plugin launcher with
+two independently started host processes and different repositories.
 `--server-behavior-only` is the smaller release path: one host grounds one
 project, waits for search readiness in that same project, and verifies the
 resident engine and server against the package manifest. It rejects
 calibration and quality inputs and makes no two-host or broader lifecycle
 claim.
 
-`--proof-tier calibration` may collect draft measurements, but cannot satisfy a
-package, hardware, installed, or release claim. A higher qualification tier
-requires a frozen constant set and a retained qualification record.
+`--proof-tier calibration` collects draft runtime-constant measurements from a
+private synthetic project, but cannot satisfy a package, hardware, installed,
+or release claim. It never accepts a repository project, plugin root, or plugin
+handoff. A higher qualification tier requires a frozen constant set and a
+retained qualification record.
+A packaged proof handed an authenticated calibration bundle -- the manually
+dispatched `qualification` frozen-candidate lane -- runs one extra
+`--version-only --proof-tier hosted_package` invocation with
+`--enforce-calibration-freeze-lineage`, which requires the calibration commit to
+be an ancestor of the packaged commit with
+`crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` as the
+only differing path. Release ordering is therefore bump-then-calibrate: bump the
+version, calibrate on the bumped tree, then freeze and release. A
+calibrate-then-bump ordering fails the guard, which names the offending paths
+and the required ordering in its failure message. Dropping the flag does not
+weaken that invocation, it breaks it: a `--version-only` proof rejects
+calibration inputs unless the lineage is enforced.
 `--produce-qualification-evidence` requires the separate
 `codestory-embedding-qualification` driver through `--qualification-driver`.
 The harness passes the exact packaged executable to that driver through
@@ -229,15 +261,16 @@ fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship the runtime executable and native modules in one immutable generation
-selected by the public launcher through a single atomic pointer. Optional
-hosted Linux calibration and quality proof does not install a Vulkan loader
-before help, stdio initialization, or explicit diagnostic CPU execution. It
-cannot replace the protected Vulkan release proof.
+selected by the public launcher through a single atomic pointer. Help, status,
+and local navigation do not require a Vulkan loader, but broad retrieval does.
+Optional Linux constant calibration runs only on the protected Vulkan host and
+cannot feed or block the frozen bundle.
 
-Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
-to make the claim explicit. Protected and installed tiers additionally name
-their exact proof tier and retained qualification file. The harness self-test
-uses synthetic fixtures only:
+Non-calibration protected and installed tiers use `--plugin-handoff`,
+`--engine-policy accelerated`, `--expected-backend`, and `--offline` to make
+the claim explicit. Constant calibration uses only its synthetic-project
+collector flags and keeps proof output outside the initially empty retained
+calibration directory. The harness self-test uses synthetic fixtures only:
 
 ```sh
 python .github/scripts/check-packaged-agent-proof.py --self-test
@@ -260,20 +293,24 @@ Before replacing a model or native embedding implementation, compare incumbent
 and candidate in the same release build on the same machine. Keep that
 measurement selector private and delete it before merge. A server-ownership
 cutover does not relabel pre-fault and post-fault searches as two
-implementations: it consumes the existing exact-head
-`publishable-three-repeat-packet/v1` artifact and derives the pass rate from
-every row and repeat. Freeze every production timing value and qualification
-threshold before running the unchanged qualification candidate; a result
-cannot define its own pass threshold.
+implementations. The separate frozen-candidate quality adjunct consumes the
+existing `publishable-three-repeat-packet/v1` evaluation contract and derives
+the pass rate from every scoped Axios v2 row and repeat. Freeze every
+production timing value and qualification threshold before running the
+unchanged qualification candidate; a result cannot define its own pass
+threshold.
 
 Measure existing-owner connect, listener spawn, first residency, first product
 ready, warm query/bulk IPC, bulk documents and tokens per second, useful retry
 latency, true-idle exit, total CodeStory process memory, accelerator residency,
-retrieval quality, multi-process reuse, and restart reuse separately. Use
+retrieval quality, multi-process reuse, and restart reuse separately. Retrieval
+quality remains evaluation evidence, not a required lifecycle-qualification
+metric. Use
 awake-time monotonic clocks within each process; never subtract timestamps from
-different process origins. Quality cannot regress. A repeatable throughput,
-warm-latency, or memory regression blocks the cutover; 5% is measurement noise,
-not an accepted sustained loss.
+different process origins. Report quality separately as unclaimed optional
+evidence; its absence or result does not gate qualification or release. A
+repeatable throughput, warm-latency, or memory regression blocks the cutover;
+5% is measurement noise, not an accepted sustained loss.
 
 Historical reference: 368-372 documents/sec, 84.7 ms cross-repository search
 p95, MRR@10 0.9824, Hit@10 1.0, Hit@1 0.973, and 829-1,020 MB peak working set.
@@ -418,7 +455,8 @@ primary, so evidence must use the reported matched key to distinguish them.
 
 The workflow-dispatch-only Windows manifest-missing lane installs the repository's
 checksum-pinned Vulkan SDK before it compiles and runs the real locked
-`ready_command` integration target with explicit CPU runtime permission. Its
+`ready_command` integration target. Any CPU-selector coverage in that lane is
+a test-only rejection or compatibility contract, not runtime evidence. Its
 exact-only cache binds the hosted OS, Rust release, host target, versioned proof
 shape, Ninja generator, CMake and Ninja versions, default feature topology,
 workspace and vendor manifests, installer script, and lockfile. It has no
@@ -432,7 +470,8 @@ hosted package cache also binds that generator and its CMake/Ninja tool versions
 the protected Vulkan lane pins the same generator before building its package
 and records both tool versions in the retained host evidence.
 
-That Windows lane is source and protocol evidence on a hosted CPU runner. The
+That Windows lane is source and protocol evidence on a hosted runner without
+protected GPU evidence. The
 SDK preserves the production-default native compile topology; it does not prove
 Vulkan execution, a packaged archive, an installed runtime, or protected
 hardware behavior. Those claims remain with the package and protected Windows
@@ -493,6 +532,88 @@ its authenticated cell. Terminal evidence is never overwriteable.
 The v0.16 closeout consumes physical Metal and Vulkan execution evidence and
 makes those accelerator claims for the released targets. Accuracy, latency,
 and throughput remain independent evaluator lanes and release non-claims.
+
+### Withheld accelerator claims
+
+The repository owns one host per accelerator, so a host that loses its
+connection mid-proof used to cost the whole release. Recovery is automatic and
+bounded, and it never waits on a human click.
+
+`.github/scripts/lost-runner-recovery.mjs` classifies a failed job as a runner
+communication loss only when all three parts of the Actions signature are
+present at once: the exact `The self-hosted runner lost communication with the
+server.` annotation, at least one step that completed with an empty conclusion,
+and no uploaded log blob. A proof that ran and failed its own assertions has a
+real conclusion on every step and a log, so it is classified as an assertion
+failure and is never re-dispatched and never withheld. The classifier never
+reads job names.
+
+All three parts are read by `.github/scripts/collect-actions-job-evidence.sh`,
+which fails closed on every one of them. The annotation endpoint needs the
+`checks: read` token scope; without it the call 403s, and a 403 reported as "no
+annotations" would make the signature unmatchable and the whole recovery path
+inert. The collector treats any answer other than a successful read as an
+error, and only a `404` from the log-blob endpoint counts as "the runner
+uploaded no log". `.github/scripts/check-workflow-policy.mjs` refuses any
+workflow that runs the collector without `checks: read`, including the
+reusable-workflow callers whose grant is the ceiling for what they call.
+
+`.github/workflows/lost-runner-rerun.yml` watches completed release runs and
+re-dispatches the individual lost jobs by id. The bound is
+`non_claim_policy.maximum_run_attempts` (2, meaning one automatic recovery
+attempt) and it counts **lost executions of that job**, not run attempts: a
+release re-run for an unrelated reason has spent no recovery on any host, so
+the first loss of a runner is still owed its one retry. The collector reads
+every attempt of the run to make that count possible, and counts a job Actions
+carried forward unchanged once. Jobs that failed on their own assertions are
+not named in the rerun request and stay red.
+
+If a host is lost twice, `release.yml`'s `accelerator-non-claim` job records a
+**populated non-claim** for that host in place of the cells that host would
+have produced. It mirrors the package manifest's own shape:
+`runtime_execution: not_proven_by_package` with a `non_claim_reason`. Every
+cell that host owns -- accelerator execution, candidate-installed behavior, and
+retrieval readiness -- is written with evidence status `withheld`, naming the
+target, backend, runner, the unavailable producer job, the exact annotation,
+and every claim the missing proof would have carried.
+
+The closeout does not take the producer's word for any of that. Its own job
+runs the same collector and `buildTrustedProducerMap` re-derives the signature
+before it will authenticate a cell against the non-claim producer, so a red
+accelerator job cannot become an accepted withheld claim through a bug or a
+future edit in the producer alone.
+
+A withheld cell is recorded as `withheld` in `ledger.json` and in
+`summary.json`'s `withheld_cells`, `withheld_hosts`, and `counts.withheld`, and
+is never counted as passed. Any cell that still claims a pass while something
+it rests on was withheld fails closeout validation, so a withheld accelerator
+claim cannot be inherited as a silent pass by retrieval readiness.
+
+**How much may be withheld** is `non_claim_policy.withhold_policy` in
+`release-claims.json`, and the closeout enforces it:
+
+- `maximum_withheld_hosts` (1) bounds how many protected hosts may be silent at
+  once. The graph refuses a cap that does not leave at least one host proven, so
+  "no accelerator was proven anywhere" is unrepresentable rather than merely
+  discouraged.
+- `claims_requiring_proof` names the claims that must keep at least one
+  *passing* cell in any phase that closes them. A withheld cell records a
+  non-claim and can never satisfy one.
+
+Breaking either records a named `input_errors` entry and the closeout decision
+becomes `reject`, so `pre-publish-closeout` fails and `publish` is skipped.
+
+The two claim lists in the ledger are literal in both directions:
+`withheld_claims` is what nothing in that phase proved, and
+`partially_withheld_claims` is what a withheld cell rested on but another host
+still proved. Their union is every claim a withheld cell touched.
+
+The published surfaces say the same thing. The GitHub release notes' platform
+section is rendered from the accepted ledger --
+`codestory-release-claims.mjs release-platform-notes` requires `--ledger` and
+has no graph-only mode -- and `release-closeout-summary.json` ships as a
+release asset, so a consumer can read what a specific release proved without
+reaching into a 30-day Actions artifact.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -588,6 +709,7 @@ There is intentionally no `publish_release` field on this manual command.
 State the exact SHA, commands, machine/backend, cache state, and highest proof
 tier reached. Distinguish source, package, hardware, plugin, installed-runtime,
 and live behavior evidence. Include skipped work and platform evidence still
-owed; never upgrade a hosted CPU result into a Metal or Vulkan claim. A passing
+owed; never upgrade a hosted source or package result into a Metal or Vulkan
+claim. A passing
 lower-tier row cannot satisfy a higher-tier claim, and one current row cannot
 hide stale historical evidence for the same requirement.

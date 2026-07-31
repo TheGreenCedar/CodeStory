@@ -1,5 +1,6 @@
-# Retrieval smoke: hosted jobs use the explicit CPU policy. Hardware workflows
-# own Metal and Vulkan claims.
+# Retrieval smoke: hosted jobs may use the test-only CPU fixture seam to
+# exercise CPU-shaped failure boundaries. It is not a product CPU mode and
+# makes no hardware claim; protected workflows own Metal and Vulkan proof.
 # Contract: docs/ops/retrieval-engine.md#proof-boundary
 
 name: retrieval-engine-smoke
@@ -21,11 +22,27 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
-      - .github/scripts/check-packaged-agent-proof.py
-      - .github/scripts/install-linux-vulkan-build-deps.sh
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, on the
+      # non-Rust product surfaces it also scans, and on the lint itself.
+      # scripts/tests/lint-retrieval-generalization.test.mjs keeps this list
+      # covering every path the lint reports as guarded. The globs are
+      # whole trees on purpose: the lint reads every crate's `src`, all three
+      # eval corpora, and every file under `scripts/`, `.github/`,
+      # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
+      # lint reads is a gate that never fires on the code it guards.
+      - crates/**
+      - benchmarks/tasks/**
+      - scripts/**
+      - .github/**
+      - .cursor/rules/**
+      - plugins/codestory/**
+      - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
-      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/rust-ci.yml
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/lib/retrieval-generalization-lint.mjs
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -50,11 +67,27 @@ on:
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
       - crates/codestory-cli/src/stdio_transport.rs
-      - .github/scripts/check-packaged-agent-proof.py
-      - .github/scripts/install-linux-vulkan-build-deps.sh
+      # This job runs the generalization gate, so it has to trigger on the code
+      # that gate guards, on the corpus its bans are derived from, on the
+      # non-Rust product surfaces it also scans, and on the lint itself.
+      # scripts/tests/lint-retrieval-generalization.test.mjs keeps this list
+      # covering every path the lint reports as guarded. The globs are
+      # whole trees on purpose: the lint reads every crate's `src`, all three
+      # eval corpora, and every file under `scripts/`, `.github/`,
+      # `.cursor/rules` and `plugins/codestory`. A filter narrower than what the
+      # lint reads is a gate that never fires on the code it guards.
+      - crates/**
+      - benchmarks/tasks/**
+      - scripts/**
+      - .github/**
+      - .cursor/rules/**
+      - plugins/codestory/**
+      - .codex/environments/environment.toml
       - .github/scripts/install-windows-vulkan-sdk.ps1
-      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/rust-ci.yml
+      - scripts/lint-retrieval-generalization.mjs
+      - scripts/lib/retrieval-generalization-lint.mjs
+      - scripts/tests/lint-retrieval-generalization.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -73,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      CODESTORY_EMBED_ALLOW_CPU: "1"
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -84,6 +117,9 @@ jobs:
 
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
+
+      - name: Generalization lint hostile matrix
+        run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
 
       - name: Release evidence gate contracts
         run: node --test scripts/tests/codestory-release-evidence-gate.test.mjs
@@ -113,9 +149,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Generalization lint regression contracts
-        run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
 
       - name: Runtime retrieval and packet contract tests
         run: |
@@ -162,7 +195,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      CODESTORY_EMBED_ALLOW_CPU: "1"
+      CODESTORY_TEST_EMBED_ALLOW_CPU: "1"
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v5

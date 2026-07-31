@@ -120,6 +120,22 @@ use runtime::map_api_error;
 pub async fn run() -> ExitCode {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
+    if std::env::var_os("CODESTORY_EMBED_ALLOW_CPU")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+    {
+        let envelope = command_failure_envelope(
+            "unsupported_embedding_policy",
+            "embedding_backend",
+            "CPU embeddings are unsupported; CodeStory requires Metal or Vulkan acceleration",
+            serde_json::json!({"environment": "CODESTORY_EMBED_ALLOW_CPU"}),
+        );
+        if json {
+            emit_command_failure(&envelope, requested_output_file(&raw_args));
+        } else {
+            eprintln!("Error: {}", envelope.error.message);
+        }
+        return ExitCode::FAILURE;
+    }
     let cli = match Cli::try_parse_from(&raw_args) {
         Ok(cli) => cli,
         Err(error) => {

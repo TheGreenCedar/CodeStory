@@ -211,7 +211,7 @@ def _verify_cache_provenance(row: dict, index: int) -> None:
         and bool(cache.get("semantic_generation"))
         and bool(cache.get("manifest_embedding_backend"))
         and bool(cache.get("embedding_engine_instance_id"))
-        and cache.get("embedding_policy") in {"accelerated", "cpu_explicit"}
+        and cache.get("embedding_policy") == "accelerated"
         and cache.get("semantic_backend") is not None
         and cache.get("local_only") is True
         and cache.get("indexed") is True

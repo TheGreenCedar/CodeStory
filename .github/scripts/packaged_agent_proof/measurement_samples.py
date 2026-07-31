@@ -310,23 +310,6 @@ def _memory_metric_value(operands: dict) -> int:
     return total
 
 
-def _retrieval_quality_value(operands: dict) -> int:
-    require_exact_keys(
-        operands,
-        {"publishable_packet_pass", "raw_artifact_sha256"},
-        "qualification retrieval quality operands",
-    )
-    require_sha256(
-        operands["raw_artifact_sha256"],
-        "qualification retrieval quality raw artifact sha256",
-    )
-    require(
-        operands["publishable_packet_pass"] is True,
-        "qualification retrieval quality sample did not pass",
-    )
-    return 1
-
-
 def _accelerator_residency_value(
     operands: dict,
     *,
@@ -375,12 +358,6 @@ def _accelerator_residency_value(
         and tensor_count > 0
         and tensor_bytes > 0
         and offloaded == model_layers
-    ) or (
-        expected_policy == "cpu_explicit"
-        and operands["accelerator_execution_verified"] is False
-        and tensor_count == 0
-        and tensor_bytes == 0
-        and offloaded == 0
     )
     require(
         valid,
@@ -421,8 +398,6 @@ def qualification_measurement_sample_value(
         return _throughput_metric_value(metric, operands, awake_delta)
     if metric == "total_codestory_process_memory":
         return _memory_metric_value(operands)
-    if metric == "retrieval_quality":
-        return _retrieval_quality_value(operands)
     require(
         metric == "backend_observed_accelerator_residency",
         f"qualification measurement verifier omitted metric {metric}",

@@ -14,18 +14,17 @@ use super::{
     SEMANTIC_DOC_MAX_TOKENS_ENV, SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE,
     SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
     SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCompletion, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanAnchorGroupDto, SearchPlanChannelDto,
-    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, SearchSymbolProjection,
-    SemanticDocAliasMode, SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
-    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc,
-    TrailConfigDto, WorkspaceManifest, apply_hybrid_limits, architecture_query_intents,
-    arm_full_refresh_staged_store_hook, arm_incremental_staged_store_hook,
-    arm_publication_test_fault, arm_semantic_projection_before_revalidate_hook,
-    arm_source_policy_after_plan_hook, arm_source_policy_before_revalidate_hook,
-    build_component_report_docs, build_llm_symbol_doc_text,
-    build_persisted_search_state_from_canonical_symbols, build_search_state,
-    build_semantic_file_text_cache_with_limits, clamp_usize_to_u32, compare_search_hits,
-    current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
+    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
+    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto, SourceIndexPolicy,
+    SourcePolicyExclusionPolicyIdentity, Storage, Store, SymbolSearchDoc, TrailConfigDto,
+    WorkspaceManifest, apply_hybrid_limits, arm_full_refresh_staged_store_hook,
+    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
+    arm_source_policy_before_revalidate_hook, build_component_report_docs,
+    build_llm_symbol_doc_text, build_persisted_search_state_from_canonical_symbols,
+    build_search_state, build_semantic_file_text_cache_with_limits, clamp_usize_to_u32,
+    compare_search_hits, current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
     extract_symbol_search_terms, file_text_match_line, finalize_staged_semantic_docs,
     flush_pending_dense_anchor_inputs, graph_edge_dto, index_freshness_from_storage,
     llm_doc_embed_batch_size, llm_indexable_kind, llm_indexable_kind_for_scope,
@@ -61,21 +60,20 @@ use crate::search_intent::{
     exact_symbol_hit_count, language_filter_matches_path, parse_search_intent_query,
 };
 use crate::search_plan::{
-    SearchPlanActivePathEvidence, same_search_file, search_plan_anchor_groups,
-    search_plan_eligible, search_plan_next_actions, search_plan_path_is_test_or_bench,
-    search_plan_rejected_hits, search_plan_runtime_call_is_speculative, search_plan_subqueries,
+    SearchPlanActivePathEvidence, graph_bridge_evidence_kind, orientation_query, same_search_file,
+    search_plan_anchor_groups, search_plan_eligible, search_plan_next_actions,
+    search_plan_path_is_test_or_bench, search_plan_rejected_hits,
+    search_plan_runtime_call_is_speculative, search_plan_subqueries,
 };
 use crate::search_publication::{
     SearchGenerationCatalogGuard, prune_search_generations, read_search_generation_completion,
     search_index_path_for_publication, write_search_generation_completion,
 };
 use crate::search_scoring::{
-    HybridHitsContext, apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
-    dedupe_inexact_search_hits_by_display_key, exact_symbol_lexical_fast_path,
+    HybridHitsContext, dedupe_inexact_search_hits_by_display_key, exact_symbol_lexical_fast_path,
     exact_symbol_merged_lexical_hybrid_hits, hybrid_hits_for_retrieval_state,
     hybrid_search_config_for_request, merge_search_hits_by_node_id,
     primary_source_retention_threshold, should_pretruncate_primary_source_window,
-    truncate_repo_text_hits_for_query,
 };
 use crate::search_terms::search_plan_terms;
 use crate::semantic_projection::{
@@ -2014,6 +2012,38 @@ fn published_full_retrieval_manifest(project_root: &Path) -> RetrievalIndexManif
     manifest
 }
 
+/// Publish the full fixture manifest together with the storage rows strict
+/// sidecar admission re-derives freshness from.
+///
+/// Admission (`manifest_unavailable_reason_for_runtime`) recounts the symbol
+/// docs, dense anchors, and dense-reason histogram in the store and refuses a
+/// manifest that disagrees with them. A fixture that publishes only the
+/// manifest row is therefore a publication the sidecar would *not* serve, so
+/// it cannot stand in for a healthy project when asserting that readiness
+/// reports hybrid.
+///
+/// The seeding itself lives in `search_publication` so this fixture and the
+/// one consumer crates reach through
+/// `publish_admissible_retrieval_manifest_for_test` stage the same store; a
+/// second private copy here is how the CLI's doctor fixture silently fell
+/// behind this crate's in the first place.
+fn publish_admissible_full_retrieval_manifest(
+    storage: &mut Storage,
+    project_root: &Path,
+) -> RetrievalIndexManifest {
+    let manifest = published_full_retrieval_manifest(project_root);
+    let manifest =
+        crate::search_publication::publish_admissible_retrieval_manifest(storage, &manifest)
+            .expect("publish admissible retrieval manifest");
+    assert_eq!(
+        manifest.dense_reason_counts_json.as_deref(),
+        Some(serde_json::json!({ DenseAnchorReason::PublicApi.as_str(): 2 }).to_string())
+            .as_deref(),
+        "the shared fixture must publish the histogram of the anchors it seeds"
+    );
+    manifest
+}
+
 #[test]
 fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_docs() {
     // Regression: a fresh auto-bootstrap publishes semantic vectors through the
@@ -2027,9 +2057,7 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
     fs::create_dir_all(&project_root).expect("project root");
     let storage_path = temp.path().join("codestory.db");
     let mut storage = Storage::open(&storage_path).expect("open storage");
-    storage
-        .upsert_retrieval_index_manifest(&published_full_retrieval_manifest(&project_root))
-        .expect("publish retrieval manifest");
+    publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
     assert_eq!(
         storage
             .get_llm_symbol_doc_stats()
@@ -2091,6 +2119,292 @@ fn retrieval_state_reports_hybrid_ready_from_published_manifest_without_legacy_d
 }
 
 #[test]
+fn indexed_file_newer_than_manifest_stops_readiness_promising_hybrid() {
+    // Regression: readiness derived freshness from manifest *shape* while
+    // strict sidecar admission derives staleness from *storage*. A core-only
+    // refresh moves the indexed-file mtimes underneath an untouched manifest,
+    // so the shape-only projection kept reporting hybrid / semantic_ready with
+    // no fallback for a publication admission simultaneously refused to serve
+    // — the agent got an error contradicting what readiness had just promised.
+    //
+    // Scope: this pins exactly one refusal reason,
+    // `indexed_file_newer_than_retrieval_manifest`. It is not a proof that
+    // readiness and admission agree in general — admission's strict gate
+    // refuses on reasons no `&Storage`-only caller can re-derive (see
+    // `retrieval_state_from_storage_for_runtime`'s doc comment).
+    // `interrupted_incremental_run_stops_readiness_promising_hybrid` pins the
+    // other storage-derivable reason.
+    //
+    // Both directions matter: readiness must not over-claim once admission
+    // refuses, and must not newly under-claim while admission still serves.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let manifest = publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
+    let runtime = test_sidecar_runtime_from_env();
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
+    let source_path = project_root.join("core.rs");
+    fs::write(&source_path, "pub fn core() {}\n").expect("write core source");
+
+    // Direction one: a core publication that predates the sidecar leaves
+    // admission serving, so readiness must keep reporting hybrid.
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 100_001,
+            path: source_path.clone(),
+            language: "rust".to_string(),
+            modification_time: manifest.built_at_epoch_ms - 1_000,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }])
+        .expect("seed indexed core file");
+    assert_eq!(
+        codestory_retrieval::manifest_unavailable_reason_for_runtime(
+            &project_id,
+            &storage,
+            &manifest,
+            &runtime,
+        ),
+        None,
+        "admission must still serve a sidecar published after the core index"
+    );
+    let served = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("served retrieval state");
+    assert_eq!(served.mode, RetrievalModeDto::Hybrid);
+    assert!(served.semantic_ready);
+    assert_eq!(served.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(served.fallback_reason, None);
+    assert_eq!(served.fallback_message, None);
+
+    // Direction two: a core-only refresh republishes the core index without
+    // rebuilding the sidecar, so admission refuses the untouched manifest.
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 100_002,
+            path: project_root.join("refreshed.rs"),
+            language: "rust".to_string(),
+            modification_time: manifest.built_at_epoch_ms + 60_000,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }])
+        .expect("seed core-only refresh file");
+    let refusal = codestory_retrieval::manifest_unavailable_reason_for_runtime(
+        &project_id,
+        &storage,
+        &manifest,
+        &runtime,
+    )
+    .expect("core-only refresh must make admission refuse the stale sidecar");
+    assert!(
+        refusal.contains("indexed_file_newer_than_retrieval_manifest"),
+        "unexpected admission refusal: {refusal}"
+    );
+
+    let refused = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("refused retrieval state");
+    assert_eq!(
+        refused.mode,
+        RetrievalModeDto::Symbolic,
+        "readiness must not promise hybrid retrieval admission refuses to serve"
+    );
+    assert!(!refused.semantic_ready);
+    assert_ne!(refused.semantic_mode, SemanticModeDto::Enabled);
+    assert!(
+        refused.fallback_reason.is_some(),
+        "a refused publication must state why retrieval is not full"
+    );
+    let wire = serde_json::to_value(&refused).expect("serialize refused retrieval state");
+    assert_ne!(wire["mode"], serde_json::json!("hybrid"));
+    assert_eq!(wire["semantic_ready"], serde_json::json!(false));
+}
+
+#[test]
+fn interrupted_incremental_run_stops_readiness_promising_hybrid() {
+    // Regression: folding only the *manifest* staleness gate into readiness
+    // left the original #1557 symptom reachable. Interrupt an incremental index
+    // and the manifest, symbol-doc count, dense anchors, and indexed-file
+    // mtimes all still agree — `manifest_unavailable_reason_for_runtime`
+    // returns None — while sidecar admission refuses the very next search with
+    // `retrieval_manifest_stale: incomplete_incremental_index_run`. Readiness
+    // must gate on that marker too.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let manifest = publish_admissible_full_retrieval_manifest(&mut storage, &project_root);
+    let runtime = test_sidecar_runtime_from_env();
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
+
+    // Baseline: a complete store readiness truthfully reports as hybrid.
+    let served = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("served retrieval state");
+    assert_eq!(served.mode, RetrievalModeDto::Hybrid);
+    assert!(served.semantic_ready);
+    assert_eq!(served.fallback_reason, None);
+
+    // Interrupt an incremental run: the marker is set and nothing else moves.
+    storage
+        .begin_incremental_run()
+        .expect("mark incremental run in flight");
+    assert!(
+        storage
+            .has_incomplete_incremental_run()
+            .expect("incremental marker"),
+        "the interrupted-run marker must survive for the next process to see"
+    );
+    assert_eq!(
+        codestory_retrieval::manifest_unavailable_reason_for_runtime(
+            &project_id,
+            &storage,
+            &manifest,
+            &runtime,
+        ),
+        None,
+        "an interrupted incremental run leaves the manifest gate satisfied — \
+         that is exactly why readiness cannot stop at that gate"
+    );
+    let refusal = codestory_retrieval::storage_admission_refusal_reason_for_runtime(
+        &project_id,
+        &storage,
+        &manifest,
+        &runtime,
+    )
+    .expect("admission must refuse a store with an interrupted incremental run");
+    assert!(
+        refusal.contains("incomplete_incremental_index_run"),
+        "unexpected admission refusal: {refusal}"
+    );
+
+    let refused = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("refused retrieval state");
+    assert_eq!(
+        refused.mode,
+        RetrievalModeDto::Symbolic,
+        "readiness must not promise hybrid retrieval admission refuses to serve"
+    );
+    assert!(!refused.semantic_ready);
+    assert_ne!(refused.semantic_mode, SemanticModeDto::Enabled);
+    assert_eq!(
+        refused.fallback_reason,
+        Some(RetrievalFallbackReasonDto::DegradedRuntime),
+        "an interrupted run leaves a built-but-unservable lane, not an unbuilt one"
+    );
+    let wire = serde_json::to_value(&refused).expect("serialize refused retrieval state");
+    assert_ne!(wire["mode"], serde_json::json!("hybrid"));
+    assert_eq!(wire["semantic_ready"], serde_json::json!(false));
+
+    // Completing the run clears the marker and readiness recovers, so the gate
+    // is a marker check and not a permanent downgrade.
+    storage
+        .finish_incremental_run()
+        .expect("clear incremental marker");
+    let recovered = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("recovered retrieval state");
+    assert_eq!(recovered.mode, RetrievalModeDto::Hybrid);
+    assert_eq!(recovered.fallback_reason, None);
+}
+
+#[test]
+fn stale_zero_dense_publication_reports_degraded_not_missing_docs() {
+    // Regression: a zero-anchor manifest is a *built* semantic lane, so once
+    // storage staleness fed the readiness projection, a stale one flipped
+    // `zero_dense_published` off and — because `runtime_degraded` required
+    // `semantic_doc_count > 0` — fell through to `missing_semantic_docs`:
+    // "semantic symbol docs have not been built yet" for a lane that was built
+    // and is merely stale. It also meant doctor's `DegradedRuntime` gap ("the
+    // published retrieval index is stale or degraded") never fired for these
+    // publications.
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("temp dir");
+    let project_root = temp.path().join("project");
+    fs::create_dir_all(&project_root).expect("project root");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open storage");
+    let mut manifest = published_full_retrieval_manifest(&project_root);
+    manifest.projection_count = Some(0);
+    manifest.symbol_doc_count = Some(0);
+    manifest.dense_projection_count = Some(0);
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .expect("publish zero-dense manifest");
+    let runtime = test_sidecar_runtime_from_env();
+    let project_id = codestory_retrieval::sidecar_project_id_for_root(&project_root);
+
+    // The ordinary case: the user edited a file after the sidecar was built.
+    storage
+        .insert_files_batch(&[FileInfo {
+            id: 200_001,
+            path: project_root.join("edited.rs"),
+            language: "rust".to_string(),
+            modification_time: manifest.built_at_epoch_ms + 60_000,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }])
+        .expect("seed edited indexed file");
+    let refusal = codestory_retrieval::storage_admission_refusal_reason_for_runtime(
+        &project_id,
+        &storage,
+        &manifest,
+        &runtime,
+    )
+    .expect("admission must refuse a zero-dense sidecar older than the index");
+    assert!(
+        refusal.contains("indexed_file_newer_than_retrieval_manifest"),
+        "unexpected admission refusal: {refusal}"
+    );
+
+    let state = crate::search_publication::retrieval_state_from_storage_for_runtime(
+        &storage,
+        &project_root,
+        &runtime,
+    )
+    .expect("stale zero-dense retrieval state");
+    assert_eq!(state.mode, RetrievalModeDto::Symbolic);
+    assert!(!state.semantic_ready);
+    assert_eq!(
+        state.fallback_reason,
+        Some(RetrievalFallbackReasonDto::DegradedRuntime),
+        "a stale zero-anchor publication was built; it is degraded, not unbuilt"
+    );
+    let message = state.fallback_message.expect("stale state must state why");
+    assert!(
+        message.contains("stale or degraded"),
+        "a stale zero-anchor publication must not be described as never built: {message}"
+    );
+}
+
+#[test]
 fn zero_dense_full_publication_reports_ready_without_missing_docs() {
     // A tiny project can legally publish a current, non-degraded full sidecar
     // with zero dense anchors (generation only requires the dense projection
@@ -2135,9 +2449,13 @@ fn zero_dense_full_publication_reports_ready_without_missing_docs() {
         "the truthful published state remains visible as a zero dense count"
     );
 
-    // A zero-dense manifest that is stale or mismatched keeps the unbuilt
-    // classification: there a refresh genuinely rebuilds the publication, so
-    // the repair advice stays truthful and the state stays fail-closed.
+    // A zero-dense manifest that is stale or mismatched stops being ready, and
+    // says so as a *degraded* publication. It was previously classified
+    // `missing_semantic_docs`, which is the one thing that is not true of it:
+    // the lane was built, it just no longer matches the current contract. The
+    // fail-closed assertions (symbolic, not ready) are what this pins; the
+    // reason is asserted because it drives doctor's stale-or-degraded gap and
+    // the repair sentence the agent is shown.
     let mut mismatched = manifest.clone();
     mismatched.embedding_backend = Some("legacy-backend".to_string());
     storage
@@ -2153,7 +2471,18 @@ fn zero_dense_full_publication_reports_ready_without_missing_docs() {
     assert!(!state.semantic_ready);
     assert_eq!(
         state.fallback_reason,
-        Some(RetrievalFallbackReasonDto::MissingSemanticDocs)
+        Some(RetrievalFallbackReasonDto::DegradedRuntime)
+    );
+    let message = state
+        .fallback_message
+        .expect("a mismatched publication must state why");
+    assert!(
+        message.contains("do not match the current embedding contract"),
+        "the repair advice must name the contract mismatch: {message}"
+    );
+    assert!(
+        !message.contains("have not been built yet"),
+        "a published zero-anchor lane must never be described as unbuilt: {message}"
     );
 }
 

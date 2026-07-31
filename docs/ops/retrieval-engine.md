@@ -46,13 +46,14 @@ and vector-schema evidence. The binding retains only the compiled compatibility
 facts needed to execute the model.
 
 macOS keeps Metal built in. Windows and Linux put the native runtime executable
-and its core, CPU, and Vulkan modules in one immutable generation. The public
+and its target-specific modules in one immutable generation. The public
 `codestory-cli` launcher reads one atomically replaced generation pointer and
 starts the executable from that pinned directory.
 The base executable does not depend on the Vulkan loader, so help, status, local
-navigation, and explicit CPU execution remain available when that loader is
-absent. Packaging verifies the actual PE import table, ELF `DT_NEEDED` entries,
-or Mach-O load commands rather than trusting build markers alone.
+navigation, and diagnostics can start when that loader is absent. Broad
+retrieval remains unavailable until an eligible physical Vulkan adapter is
+verified. Packaging verifies the actual PE import table, ELF `DT_NEEDED`
+entries, or Mach-O load commands rather than trusting build markers alone.
 
 When llama.cpp needs a path for memory mapping, CodeStory verifies the embedded
 bytes and atomically materializes them under a content-addressed cache name. A
@@ -104,7 +105,7 @@ Engine readiness binds:
 - the exact model digest and size;
 - the linked llama.cpp/ggml build identity;
 - the selected backend and physical adapter;
-- `accelerated` or explicit `cpu_explicit` policy;
+- `accelerated` policy with CPU embeddings disabled;
 - a timed live embedding smoke;
 - a successful encode counter and backend-observed execution device/backend,
   nodes, resident accelerator tensor count/bytes, and layer placement; and
@@ -132,17 +133,12 @@ Windows source and package proof builds pin `CMAKE_GENERATOR=Ninja`; hosted
 native-build caches include the selected generator and CMake/Ninja versions.
 When protected Windows proof builds from source, it records those tool versions
 in its host artifact. This is build determinism evidence and does not upgrade a
-hosted CPU result into a Vulkan runtime claim.
+hosted source or package result into a Vulkan runtime claim.
 
 WARP, llvmpipe, lavapipe, and other software adapters cannot satisfy an
-accelerated policy. Production never silently falls back to CPU. Hosted CI may
-set:
-
-```sh
-CODESTORY_EMBED_ALLOW_CPU=1
-```
-
-That path must report `cpu_explicit` and carries no Metal or Vulkan claim.
+accelerated policy. CPU embeddings are unsupported in product, calibration,
+and release proof. Source-only contract tests may exercise rejection behavior,
+but they cannot produce runtime evidence.
 
 ## Diagnostics
 
@@ -212,9 +208,10 @@ ownership identity is current and unambiguous.
 
 ## Proof boundary
 
-Hosted CPU proof validates source, package, protocol, same-user IPC, and the
-explicit CPU runtime path. An acceleration claim requires the same manifest-
-bound package on physical hardware. Installed-runtime qualification additionally
+Hosted proof validates source, package structure, protocol framing, and
+rejection behavior; it does not qualify an embedding runtime. Broad retrieval
+requires the same manifest-bound package on physical Metal or Vulkan hardware.
+Installed-runtime qualification additionally
 requires two independent plugin hosts, all preregistered server fault scenarios,
 frozen thresholds, and exact source/tree/archive/executable/host/session/
 protocol/constant identities. See

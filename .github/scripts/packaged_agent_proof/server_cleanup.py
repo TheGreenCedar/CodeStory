@@ -97,28 +97,34 @@ def native_server_exit_wait_budget(manifest: dict, constant_set: dict) -> dict:
     # -- the calibration matrix has no Windows cell, and since the drain-time
     # release the calibrated true_idle_exit threshold ends at owner absence
     # rather than process exit -- so the conservative grace frozen by #1397
-    # stays. The frozen threshold still binds this budget as a floor: the
-    # receipt must never hold the exact process to a bound tighter than the
-    # whole-idle-exit claim the release itself makes.
+    # stays. The fixed product timeout plus its explicit observation grace
+    # binds this budget as a floor: calibration never selects this threshold.
     timeout_ms = product_idle_timeout_ms + NATIVE_SERVER_TEARDOWN_GRACE_MS
     require(
         isinstance(constant_set, dict),
         "native server exit-wait budget requires the verified constant set",
     )
     if constant_set.get("status") == "frozen":
-        thresholds = constant_set.get("qualification_thresholds")
+        fixed = constant_set.get("fixed_contract_values")
         require(
-            isinstance(thresholds, dict),
-            "frozen embedding server constants omit qualification thresholds",
+            isinstance(fixed, dict),
+            "frozen embedding server constants omit fixed contract values",
         )
-        true_idle_exit_ms = require_positive_int(
-            thresholds.get("true_idle_exit"),
-            "frozen true-idle exit qualification threshold",
+        fixed_idle_timeout_ms = require_positive_int(
+            fixed.get("idle_timeout_ms"),
+            "fixed true-idle product timeout",
+        )
+        true_idle_observation_grace_ms = require_positive_int(
+            fixed.get("true_idle_observation_grace_ms"),
+            "fixed true-idle observation grace",
+        )
+        true_idle_exit_ms = (
+            fixed_idle_timeout_ms + true_idle_observation_grace_ms
         )
         require(
             timeout_ms >= true_idle_exit_ms,
             f"native server exit-wait bound {timeout_ms}ms is tighter than the"
-            f" frozen {true_idle_exit_ms}ms true-idle exit claim",
+            f" fixed {true_idle_exit_ms}ms true-idle exit contract",
         )
     return {
         "product_idle_timeout_ms": product_idle_timeout_ms,

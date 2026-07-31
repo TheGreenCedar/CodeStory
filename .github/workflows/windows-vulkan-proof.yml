@@ -17,10 +17,6 @@ on:
         required: false
         default: false
         type: boolean
-      quality_evidence_artifact:
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         required: false
         default: ""
@@ -48,44 +44,6 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_dispatch:
-    inputs:
-      version:
-        required: true
-        type: string
-      ref:
-        required: false
-        type: string
-      proof_key:
-        required: false
-        type: string
-      quality_evidence_artifact:
-        required: false
-        type: string
-      calibration_bundle_artifact:
-        required: false
-        default: ""
-        type: string
-      calibration_bundle_run_id:
-        required: false
-        default: ""
-        type: string
-      candidate_installed_proof:
-        description: Install and prove the exact package through the candidate-managed launcher boundary.
-        required: false
-        default: false
-        type: boolean
-      candidate_producer_workflow_path:
-        description: Top-level workflow path authenticated as the candidate artifact producer.
-        required: false
-        default: ".github/workflows/windows-vulkan-proof.yml"
-        type: string
-      server_behavior_only:
-        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   actions: read
   contents: read
@@ -125,8 +83,10 @@ jobs:
       - name: Validate candidate-installed mode
         if: inputs.candidate_installed_proof
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
-          if ("${{ inputs.server_behavior_only }}" -ne "true") {
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
             throw "candidate_installed_proof requires server_behavior_only"
           }
 
@@ -139,7 +99,7 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact || !inputs.server_behavior_only }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -150,7 +110,9 @@ jobs:
         # The self-hosted runner service account has the default Restricted execution
         # policy, so every run step must carry the bypass shell or die before running.
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: node scripts/prepare-embedded-model.mjs
+        run: >-
+          node scripts/prepare-embedded-model.mjs
+          --cache-root "$env:RUNNER_TOOL_CACHE/codestory/model-material"
 
       - name: Build and package native CLI
         if: ${{ !inputs.use_packaged_cli_artifact }}
@@ -158,33 +120,277 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           CMAKE_GENERATOR: Ninja
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
           $version = $env:VERSION.TrimStart('v')
-          cargo build --release --locked -p codestory-cli
+          $cargoArgs = @(
+            "build",
+            "--release",
+            "--locked",
+            "-p", "codestory-cli",
+            "--bin", "codestory-cli",
+            "--bin", "codestory-cli-runtime"
+          )
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
+            $cargoArgs += @(
+              "-p", "codestory-bench",
+              "--bin", "codestory_embedding_qualification"
+            )
+          }
+          cargo @cargoArgs
           python .github/scripts/package-codestory-release.py `
             --version $version `
             --target windows-x64 `
             --binary target/release/codestory-cli.exe `
             --out-dir target/release-dist
 
-      - name: Download packaged CLI artifact
+      - name: Authenticate exact Windows candidate artifacts
+        id: candidate-artifacts
+        if: inputs.use_packaged_cli_artifact
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $allowedWorkflows = @(
+            ".github/workflows/auto-release.yml",
+            ".github/workflows/release.yml",
+            ".github/workflows/packaged-platform-pr.yml"
+          )
+          if ($env:CANDIDATE_PRODUCER_WORKFLOW_PATH -notin $allowedWorkflows) {
+            throw "candidate producer workflow is not trusted"
+          }
+          if (
+            $env:SERVER_BEHAVIOR_ONLY -ne "true" -and
+            $env:CANDIDATE_PRODUCER_WORKFLOW_PATH -ne
+              ".github/workflows/packaged-platform-pr.yml"
+          ) {
+            throw "full qualification requires the exact qualification coordinator"
+          }
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
+            ConvertFrom-Json
+          if (
+            $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+            $run.path -ne $env:CANDIDATE_PRODUCER_WORKFLOW_PATH -or
+            $run.head_sha -ne $sourceSha -or
+            [string]$run.run_attempt -ne $env:GITHUB_RUN_ATTEMPT
+          ) {
+            throw "Windows package producer is not the trusted exact-head run"
+          }
+          $artifacts = gh api `
+            "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=100" |
+            ConvertFrom-Json
+          function Select-ExactArtifact([string] $name) {
+            $selected = @(
+              $artifacts.artifacts | Where-Object {
+                $_.name -eq $name -and
+                $_.expired -eq $false -and
+                [string]$_.workflow_run.id -eq $env:GITHUB_RUN_ID -and
+                $_.workflow_run.head_sha -eq $sourceSha
+              }
+            )
+            if ($selected.Count -ne 1) {
+              throw "expected exactly one authenticated $name artifact"
+            }
+            return $selected[0]
+          }
+          $package = Select-ExactArtifact "codestory-cli-windows-x64"
+          $record = Select-ExactArtifact `
+            "codestory-candidate-archive-record-windows-x64"
+          if ($env:SERVER_BEHAVIOR_ONLY -ne "true") {
+            $null = Select-ExactArtifact `
+              "codestory-qualification-driver-windows-x64"
+          }
+          if (
+            [string]$package.id -notmatch '^[0-9]+$' -or
+            [string]$package.size_in_bytes -notmatch '^[0-9]+$' -or
+            [string]$package.digest -notmatch '^sha256:[0-9a-f]{64}$' -or
+            [string]$record.id -notmatch '^[0-9]+$' -or
+            [string]$record.size_in_bytes -notmatch '^[0-9]+$' -or
+            [string]$record.digest -notmatch '^sha256:[0-9a-f]{64}$'
+          ) {
+            throw "candidate artifact metadata is incomplete"
+          }
+          @(
+            "package-id=$($package.id)",
+            "package-bytes=$($package.size_in_bytes)",
+            "package-sha256=$($package.digest.Substring(7))"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download authenticated candidate record
         if: inputs.use_packaged_cli_artifact
         uses: actions/download-artifact@v8.0.1
         with:
-          name: codestory-cli-windows-x64
-          path: target/release-dist
+          name: codestory-candidate-archive-record-windows-x64
+          path: target/candidate-archive-record/windows-x64
 
-      - name: Build qualification driver
-        if: ${{ !inputs.server_behavior_only }}
+      - name: Restore exact candidate archive from protected host
+        id: candidate-cache
+        if: inputs.use_packaged_cli_artifact
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
+        run: |
+          $ErrorActionPreference = "Stop"
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $recordPath = "target/candidate-archive-record/windows-x64/candidate-archive-record.json"
+          $record = Get-Content -Raw -LiteralPath $recordPath | ConvertFrom-Json
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          if (
+            $record.repository -ne $env:GITHUB_REPOSITORY -or
+            $record.source.commit -ne $sourceSha -or
+            $record.source.tree -ne $sourceTree -or
+            $record.target -ne "windows-x64"
+          ) {
+            throw "candidate record provenance does not match the protected proof"
+          }
+          $store = Join-Path $env:RUNNER_TOOL_CACHE `
+            "codestory/candidate-archives"
+          New-Item -ItemType Directory -Force $store | Out-Null
+          New-Item -ItemType Directory -Force target | Out-Null
+          Remove-Item -Recurse -Force target/release-dist -ErrorAction SilentlyContinue
+          $restored = node .github/scripts/candidate-archive-store.mjs restore `
+            --record $recordPath `
+            --store-root $store `
+            --output-root target `
+            --output-dir target/release-dist | ConvertFrom-Json
+          $hit = "$($restored.hit)".ToLowerInvariant()
+          if ($hit -notin @("true", "false")) {
+            throw "candidate cache returned an invalid hit state"
+          }
+          "hit=$hit" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started
+          @(
+            "### Candidate archive transfer",
+            "",
+            "- Protected-host cache lookup and verification: $elapsed ms",
+            "- Cache hit: ``$hit``"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
-      - name: Download exact-head publishable packet quality evidence
-        if: inputs.quality_evidence_artifact != ''
+      - name: Download, authenticate, and admit candidate archive on miss
+        if: inputs.use_packaged_cli_artifact && steps.candidate-cache.outputs.hit != 'true'
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.candidate-artifacts.outputs.package-id }}
+          EXPECTED_SIZE: ${{ steps.candidate-artifacts.outputs.package-bytes }}
+          EXPECTED_SHA256: ${{ steps.candidate-artifacts.outputs.package-sha256 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $archive = Join-Path $env:RUNNER_TEMP `
+            "codestory-cli-windows-x64-$env:ARTIFACT_ID.zip"
+          $partial = "$archive.partial"
+          Remove-Item -Force $archive, $partial -ErrorAction SilentlyContinue
+          $url = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:ARTIFACT_ID/zip"
+          $complete = $false
+          foreach ($attempt in 1..30) {
+            & curl.exe `
+              --fail `
+              --location `
+              --silent `
+              --show-error `
+              --connect-timeout 30 `
+              --max-time 120 `
+              --continue-at - `
+              --header "Accept: application/vnd.github+json" `
+              --header "Authorization: Bearer $env:GH_TOKEN" `
+              --header "X-GitHub-Api-Version: 2022-11-28" `
+              --output $partial `
+              $url
+            if ($LASTEXITCODE -eq 0) {
+              $complete = $true
+              break
+            }
+            $currentSize = if (Test-Path -LiteralPath $partial -PathType Leaf) {
+              (Get-Item -LiteralPath $partial).Length
+            } else {
+              0
+            }
+            if ($currentSize -gt [long]$env:EXPECTED_SIZE) {
+              throw "candidate artifact exceeded its authenticated size"
+            }
+            if ($currentSize -eq [long]$env:EXPECTED_SIZE) {
+              $complete = $true
+              break
+            }
+            Write-Warning `
+              "resuming exact candidate at byte $currentSize after attempt $attempt"
+            Start-Sleep -Seconds 2
+          }
+          if (-not $complete) {
+            throw "exact candidate artifact transfer did not complete"
+          }
+          $actualSize = (Get-Item -LiteralPath $partial).Length
+          $actualDigest = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $partial
+          ).Hash.ToLowerInvariant()
+          if (
+            $actualSize -ne [long]$env:EXPECTED_SIZE -or
+            $actualDigest -ne $env:EXPECTED_SHA256
+          ) {
+            throw "candidate artifact container identity changed"
+          }
+          Move-Item -LiteralPath $partial -Destination $archive
+          $transferEnded = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $recordPath = "target/candidate-archive-record/windows-x64/candidate-archive-record.json"
+          $stage = "target/candidate-archive-stage/windows-x64"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          python .github/scripts/extract-candidate-actions-artifact.py `
+            --artifact $archive `
+            --record $recordPath `
+            --out $stage
+          if ($LASTEXITCODE -ne 0) {
+            throw "candidate artifact extraction failed"
+          }
+          $store = Join-Path $env:RUNNER_TOOL_CACHE `
+            "codestory/candidate-archives"
+          $admitted = node .github/scripts/candidate-archive-store.mjs admit `
+            --record $recordPath `
+            --input-root $stage `
+            --store-root $store `
+            --output-root target `
+            --output-dir target/release-dist | ConvertFrom-Json
+          if (-not $admitted.hit -and -not $admitted.admitted) {
+            throw "candidate archive was not admitted or restored"
+          }
+          $admissionEnded = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          @(
+            "- Authenticated Actions transfer: $($transferEnded - $started) ms",
+            "- Payload verification and atomic admission: $($admissionEnded - $transferEnded) ms"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Download separate authenticated qualification driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}
         uses: actions/download-artifact@v8.0.1
         with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
+          name: codestory-qualification-driver-windows-x64
+          path: target/qualification-driver-artifact/windows-x64
+
+      - name: Verify packaged qualification driver
+        id: qualification-driver
+        if: ${{ inputs.use_packaged_cli_artifact && !inputs.server_behavior_only }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $version = $env:INPUT_VERSION.TrimStart('v')
+          $verified = node .github/scripts/qualification-driver-artifact.mjs verify `
+            --asset-target windows-x64 `
+            --source-sha $sourceSha `
+            --source-tree $sourceTree `
+            --version $version `
+            --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
+            --trusted-root $env:GITHUB_WORKSPACE `
+            --artifact-dir target/qualification-driver-artifact/windows-x64
+          $result = $verified | ConvertFrom-Json
+          "path=$($result.driver)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Authenticate calibration bundle producer
         if: ${{ !inputs.server_behavior_only }}
@@ -233,6 +439,10 @@ jobs:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
           SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+          USE_PACKAGED_CLI_ARTIFACT: ${{ inputs.use_packaged_cli_artifact }}
+          VERIFIED_QUALIFICATION_DRIVER: ${{ steps.qualification-driver.outputs.path }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           $ErrorActionPreference = "Stop"
           $version = $env:VERSION.TrimStart('v')
@@ -240,7 +450,6 @@ jobs:
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
           $claimArgs = @()
           $calibrationArgs = @()
-          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
             $claimArgs = @("--server-behavior-only")
           } else {
@@ -250,19 +459,25 @@ jobs:
             if ($calibrationBundles.Count -ne 1) {
               throw "expected exactly one frozen calibration-bundle.json"
             }
-            if (-not (Test-Path $qualityPath)) {
-              throw "protected Windows proof requires exact-head quality evidence"
+            $qualificationDriver = "target/release/codestory_embedding_qualification.exe"
+            if ($env:USE_PACKAGED_CLI_ARTIFACT -eq "true") {
+              $qualificationDriver = $env:VERIFIED_QUALIFICATION_DRIVER
+              if ([String]::IsNullOrWhiteSpace($qualificationDriver)) {
+                throw "packaged qualification driver was not verified"
+              }
+            }
+            if (-not (Test-Path -LiteralPath $qualificationDriver -PathType Leaf)) {
+              throw "protected Windows proof requires the authenticated qualification driver"
             }
             $claimArgs = @(
               "--produce-qualification-evidence",
-              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
-              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
-              "--retrieval-quality-evidence", $qualityPath
+              "--qualification-driver", $qualificationDriver,
+              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json"
             )
             $calibrationArgs = @(
               "--calibration-bundle", $calibrationBundles[0].FullName,
-              "--calibration-producer-run-id", "${{ inputs.calibration_bundle_run_id }}",
-              "--calibration-producer-artifact", "${{ inputs.calibration_bundle_artifact }}"
+              "--calibration-producer-run-id", "$env:CALIBRATION_RUN_ID",
+              "--calibration-producer-artifact", "$env:CALIBRATION_ARTIFACT"
             )
           }
           python .github/scripts/check-packaged-agent-proof.py `
@@ -394,9 +609,12 @@ jobs:
       - name: Emit authenticated Vulkan release cell
         if: inputs.emit_release_cells
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           jq -n \
             --arg native_engine coderank_q8_embedded \
@@ -404,7 +622,7 @@ jobs:
             > target/windows-vulkan-proof/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id accelerator_execution:windows-x64-vulkan \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \
@@ -428,13 +646,16 @@ jobs:
       - name: Emit authenticated Windows retrieval-readiness release cell
         if: inputs.emit_release_cells && inputs.server_behavior_only
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id retrieval_readiness:windows-x64 \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \
@@ -457,9 +678,12 @@ jobs:
       - name: Emit authenticated candidate-installed Windows release cell
         if: inputs.emit_release_cells && inputs.candidate_installed_proof
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
+          version="$INPUT_VERSION"
           version="${version#v}"
           jq -n \
             --arg installer candidate_managed_plugin \
@@ -469,7 +693,7 @@ jobs:
             > target/candidate-installed-windows/release-cell-identity.json
           node scripts/codestory-release-cell-manifest.mjs produce \
             --repo "$GITHUB_WORKSPACE" \
-            --expected-sha "${{ inputs.ref }}" \
+            --expected-sha "$INPUT_REF" \
             --version "$version" \
             --cell-id candidate_installed_behavior:windows-x64 \
             --producer-workflow .github/workflows/windows-vulkan-proof.yml \

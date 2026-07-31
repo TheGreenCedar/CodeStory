@@ -1,17 +1,20 @@
 use super::super::{
-    MeasurementArtifact, MeasurementInterval, POLL, ProcessObservation,
-    QUALIFICATION_QUEUE_CAPACITY, RawMetric, RawMetricClock, RawMetricProcess,
-    RawMetricSampleInput, successful_operation_duration_ns, successful_operation_operands,
+    ConstantCalibrationRunArtifact, MeasurementArtifact, MeasurementInterval, POLL,
+    ProcessObservation, QUALIFICATION_QUEUE_CAPACITY, RawMetric, RawMetricClock, RawMetricProcess,
+    RawMetricSampleInput, RawServerIdentity, successful_operation_duration_ns,
+    successful_operation_operands,
 };
 use super::analysis::{
-    accelerator_operands, completed_token_count, elapsed, raw_server_identity,
-    snapshot_has_resident_generation,
+    accelerator_operands, completed_token_count, completed_token_count_for_nonce, elapsed,
+    raw_server_identity, snapshot_has_resident_generation,
 };
 use super::process::{
     busy_retry_marker_timeout, busy_retry_worker_timeout, measurement_worker_timeout,
-    query_parameters, require_worker_success,
+    query_parameters,
 };
-use super::{RunningWorker, ScenarioRunner, WorkerOutput, push_metric};
+use super::{
+    RunningWorker, ScenarioRunner, WorkerOutput, opaque_constant_calibration_sample_id, push_metric,
+};
 use crate::qualification::request::REQUIRED_METRICS;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
@@ -19,10 +22,22 @@ use codestory_retrieval::{
     EmbeddingQualificationWorkerMeasurementSpan as WorkerMeasurementSpan, EmbeddingServerSnapshot,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+
+pub(super) const CONSTANT_CALIBRATION_METRICS: &[&str] = &[
+    "spawn_convergence",
+    "existing_owner_connect",
+    "cold_first_vector",
+    "first_product_ready",
+    "warm_query_ipc",
+    "warm_bulk_ipc",
+    "bulk_documents_per_second",
+    "bulk_tokens_per_second",
+    "busy_retry_usefulness",
+];
 
 /// The measurement protocol's declared `phase_boundaries` for every metric the
 /// driver records. The WP5-floored frozen constants derive their meaning from
@@ -56,7 +71,7 @@ pub(super) fn declared_phase_boundaries(metric: &str) -> Result<[&'static str; 2
         ],
         "busy_retry_usefulness" => ["typed_retry_emitted", "named_retry_condition_became_true"],
         "true_idle_exit" => [
-            "last_queued_active_or_leased_work_ended",
+            "final_product_request_completed",
             "engine_and_server_absent",
         ],
         "backend_observed_accelerator_residency" => [
@@ -79,7 +94,7 @@ pub(super) fn declared_workload_id(metric: &str) -> Result<&'static str> {
         "warm_bulk_ipc" => "warm_bulk_64x256b_v1",
         "bulk_documents_per_second" | "bulk_tokens_per_second" => "bulk_throughput_256x256b_v1",
         "busy_retry_usefulness" => "saturated_query_65th_retry_v1",
-        "true_idle_exit" => "true_idle_60000_awake_ms_v1",
+        "true_idle_exit" => "true_idle_after_product_completion_60000_awake_ms_v2",
         "backend_observed_accelerator_residency" => "resident_policy_identity_v1",
         _ => bail!("embedding_qualification_metric_workload_unknown:{metric}"),
     })
@@ -97,6 +112,253 @@ pub(super) struct MeasuredWorker {
 }
 
 impl<'a> ScenarioRunner<'a> {
+    pub(super) fn constant_calibration_runs(
+        &mut self,
+        required_runs: u32,
+        model_sha256: &str,
+    ) -> Result<Vec<ConstantCalibrationRunArtifact>> {
+        if required_runs != 3 {
+            bail!("embedding_constant_calibration_run_count_invalid");
+        }
+        let mut observed_identities = BTreeSet::new();
+        let mut runs = Vec::with_capacity(required_runs as usize);
+        for run_index in 1..=required_runs {
+            let run = self.constant_calibration_run(run_index, model_sha256)?;
+            retain_fresh_server_identities(&mut observed_identities, run.server_identities())?;
+            runs.push(run);
+        }
+        self.reset_owner("constant_calibration_finish")?;
+        Ok(runs)
+    }
+
+    fn constant_calibration_run(
+        &mut self,
+        run_index: u32,
+        model_sha256: &str,
+    ) -> Result<ConstantCalibrationRunArtifact> {
+        let mut metrics = BTreeMap::new();
+        let mut sampled_identities = BTreeSet::new();
+        let expected_materialized_reused = expected_materialization_reuse(run_index)?;
+
+        self.reset_owner(&format!("constant_calibration_run_{run_index}_start"))?;
+        let spawn = self.run_measure_worker(
+            "measure_constant_spawn_hello",
+            "spawn_convergence",
+            1,
+            query_parameters(1),
+        )?;
+        let cold = self.run_measure_worker(
+            "measure_constant_cold_query",
+            "cold_first_vector",
+            1,
+            measurement_parameters(1, 0, 0, 256),
+        )?;
+        let cold_identity = raw_server_identity(&cold.snapshot)?;
+
+        let first_ready = self.run_measure_worker(
+            "measure_product_query",
+            "first_product_ready",
+            1,
+            measurement_parameters(1, 0, 0, 256),
+        )?;
+        let first_ready_identity = raw_server_identity(&first_ready.snapshot)?;
+
+        let warm_query = self.run_measure_worker(
+            "measure_query_frame",
+            "warm_query_ipc",
+            1,
+            measurement_parameters(1, 0, 0, 256),
+        )?;
+        require_completed_documents(&warm_query, 1)?;
+        let warm_query_identity = frame_server_identity(&warm_query)?;
+        let engine = require_constant_engine_identity(
+            &warm_query,
+            &warm_query_identity,
+            self.context.qualification_runtime.expected_backend.as_str(),
+            model_sha256,
+            expected_materialized_reused,
+        )?;
+        let engine_backend = engine.backend.clone();
+        let engine_policy = engine.policy.clone();
+        let engine_model_sha256 = engine.model_digest.clone();
+        let engine_materialized_reused = engine.materialized_reused;
+        if spawn.snapshot.process.server_instance_id != warm_query_identity.server_instance_id
+            || spawn.snapshot.process.process_start_id != warm_query_identity.process_start_id
+            || cold_identity != warm_query_identity
+            || first_ready_identity != warm_query_identity
+        {
+            bail!("embedding_constant_calibration_generation_changed");
+        }
+
+        sampled_identities.insert(warm_query_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "spawn_convergence",
+            run_index,
+            &spawn.interval,
+            warm_query_identity.clone(),
+            BTreeMap::new(),
+        )?;
+        sampled_identities.insert(cold_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "cold_first_vector",
+            run_index,
+            &cold.interval,
+            cold_identity,
+            successful_operation_operands(&cold.interval),
+        )?;
+        sampled_identities.insert(first_ready_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "first_product_ready",
+            run_index,
+            &first_ready.interval,
+            first_ready_identity,
+            successful_operation_operands(&first_ready.interval),
+        )?;
+        self.record_constant_metric(
+            &mut metrics,
+            "warm_query_ipc",
+            run_index,
+            &warm_query.interval,
+            warm_query_identity.clone(),
+            successful_operation_operands(&warm_query.interval),
+        )?;
+
+        let existing = self.run_measure_worker(
+            "measure_hello",
+            "existing_owner_connect",
+            1,
+            query_parameters(1),
+        )?;
+        let existing_identity = raw_server_identity(&existing.snapshot)?;
+        sampled_identities.insert(existing_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "existing_owner_connect",
+            run_index,
+            &existing.interval,
+            existing_identity,
+            BTreeMap::new(),
+        )?;
+
+        let warm_bulk = self.run_measure_worker(
+            "measure_bulk_frame",
+            "warm_bulk_ipc",
+            1,
+            measurement_parameters(0, 1, 64, 256),
+        )?;
+        require_completed_documents(&warm_bulk, 64)?;
+        let warm_bulk_identity = frame_server_identity(&warm_bulk)?;
+        require_constant_engine_identity(
+            &warm_bulk,
+            &warm_bulk_identity,
+            self.context.qualification_runtime.expected_backend.as_str(),
+            model_sha256,
+            expected_materialized_reused,
+        )?;
+        sampled_identities.insert(warm_bulk_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "warm_bulk_ipc",
+            run_index,
+            &warm_bulk.interval,
+            warm_bulk_identity,
+            successful_operation_operands(&warm_bulk.interval),
+        )?;
+
+        let throughput = self.run_measure_worker(
+            "measure_bulk_frame",
+            "bulk_documents_per_second",
+            1,
+            measurement_parameters(0, 1, 256, 256),
+        )?;
+        require_completed_documents(&throughput, 256)?;
+        let throughput_identity = frame_server_identity(&throughput)?;
+        require_constant_engine_identity(
+            &throughput,
+            &throughput_identity,
+            self.context.qualification_runtime.expected_backend.as_str(),
+            model_sha256,
+            expected_materialized_reused,
+        )?;
+        let request_id = throughput.request_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("embedding_constant_calibration_bulk_request_id_missing")
+        })?;
+        let completed_tokens = completed_token_count_for_nonce(
+            self.context.output_directory,
+            request_id,
+            &self.qualification_nonce,
+        )?;
+        let duration_ns = successful_operation_duration_ns(&throughput.interval);
+        sampled_identities.insert(throughput_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "bulk_documents_per_second",
+            run_index,
+            &throughput.interval,
+            throughput_identity.clone(),
+            BTreeMap::from([
+                ("completed_documents".into(), json!(256)),
+                (
+                    "successful_operation_duration_ns".into(),
+                    json!(duration_ns),
+                ),
+            ]),
+        )?;
+        self.record_constant_metric(
+            &mut metrics,
+            "bulk_tokens_per_second",
+            run_index,
+            &throughput.interval,
+            throughput_identity,
+            BTreeMap::from([
+                ("completed_tokens".into(), json!(completed_tokens)),
+                (
+                    "successful_operation_duration_ns".into(),
+                    json!(duration_ns),
+                ),
+            ]),
+        )?;
+
+        let busy = self.measure_busy_retry(1)?;
+        let busy_identity = raw_server_identity(&busy.snapshot)?;
+        sampled_identities.insert(busy_identity.clone());
+        self.record_constant_metric(
+            &mut metrics,
+            "busy_retry_usefulness",
+            run_index,
+            &busy.interval,
+            busy_identity,
+            BTreeMap::new(),
+        )?;
+
+        if metrics.len() != CONSTANT_CALIBRATION_METRICS.len()
+            || metrics.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                != CONSTANT_CALIBRATION_METRICS
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            || metrics.values().any(|metric| metric.samples.len() != 1)
+        {
+            bail!("embedding_constant_calibration_measurement_set_invalid");
+        }
+        require_one_run_server_identity(&sampled_identities, &warm_query_identity)?;
+
+        Ok(ConstantCalibrationRunArtifact {
+            schema_version: 1,
+            run_index,
+            contracts: self.context.contracts.clone(),
+            metrics,
+            server_identities: sampled_identities.into_iter().collect(),
+            backend: engine_backend,
+            policy: engine_policy,
+            model_sha256: engine_model_sha256,
+            materialized_reused: engine_materialized_reused,
+        })
+    }
+
     pub(super) fn measurements(&mut self) -> Result<MeasurementArtifact> {
         let mut metrics = BTreeMap::new();
 
@@ -294,14 +556,6 @@ impl<'a> ScenarioRunner<'a> {
             )?;
         }
 
-        let idle_worker = self.spawn_worker("query", query_parameters(1), None)?;
-        let idle_output = self.finish_worker(idle_worker, measurement_worker_timeout("query"))?;
-        require_worker_success(&idle_output, "true_idle_owner")?;
-        let idle_owner =
-            self.record_worker_snapshot("measurement_true_idle_owner", &idle_output)?;
-        if !snapshot_has_resident_generation(&idle_owner) {
-            bail!("embedding_qualification_true_idle_owner_not_resident");
-        }
         let measured = self.run_measure_worker(
             "measure_true_idle",
             "true_idle_exit",
@@ -326,16 +580,13 @@ impl<'a> ScenarioRunner<'a> {
             BTreeMap::new(),
         )?;
 
-        if metrics.len() != REQUIRED_METRICS.len().saturating_sub(2) {
+        if metrics.len() != REQUIRED_METRICS.len().saturating_sub(1) {
             bail!("embedding_qualification_measurement_set_incomplete");
         }
         Ok(MeasurementArtifact {
             schema_version: 2,
             contracts: self.context.contracts.clone(),
-            external_metrics: vec![
-                "retrieval_quality".into(),
-                "total_codestory_process_memory".into(),
-            ],
+            external_metrics: vec!["total_codestory_process_memory".into()],
             metrics,
         })
     }
@@ -492,6 +743,35 @@ impl<'a> ScenarioRunner<'a> {
         push_metric(metrics, metric, metric_unit(metric), sample)
     }
 
+    fn record_constant_metric(
+        &self,
+        metrics: &mut BTreeMap<String, RawMetric>,
+        metric: &str,
+        run_index: u32,
+        interval: &MeasurementInterval,
+        server_identity: RawServerIdentity,
+        operands: BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let [start_phase, end_phase] = declared_constant_phase_boundaries(metric)?;
+        let sample_id = opaque_constant_calibration_sample_id(
+            self.context.nonce_sha256,
+            &self.context.qualification_runtime.matrix_cell_id,
+            run_index,
+            metric,
+        );
+        let sample = interval.sample(RawMetricSampleInput {
+            sample_id: &sample_id,
+            repeat: 1,
+            runtime: self.context.qualification_runtime,
+            workload_id: declared_workload_id(metric)?,
+            server_identity,
+            start_phase,
+            end_phase,
+            operands,
+        });
+        push_metric(metrics, metric, metric_unit(metric), sample)
+    }
+
     pub(super) fn measurement_sample_id(&self, metric: &str, repeat: u32) -> String {
         super::opaque_measurement_sample_id(
             self.context.nonce_sha256,
@@ -500,6 +780,129 @@ impl<'a> ScenarioRunner<'a> {
             repeat,
         )
     }
+}
+
+fn declared_constant_phase_boundaries(metric: &str) -> Result<[&'static str; 2]> {
+    if metric == "cold_first_vector" {
+        return Ok([
+            "product_request_started_with_fresh_owner_model_absent",
+            "first_vector_and_engine_evidence_validated",
+        ]);
+    }
+    declared_phase_boundaries(metric)
+}
+
+fn require_constant_engine_identity<'a>(
+    measured: &'a MeasuredWorker,
+    server_identity: &RawServerIdentity,
+    expected_backend: &str,
+    expected_model_sha256: &str,
+    expected_materialized_reused: bool,
+) -> Result<&'a EmbeddingEngineIdentity> {
+    let identity = measured
+        .engine_identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("embedding_constant_calibration_engine_identity_missing"))?;
+    validate_constant_engine_evidence(
+        identity,
+        server_identity,
+        expected_backend,
+        expected_model_sha256,
+        expected_materialized_reused,
+    )?;
+    if measured.snapshot.process.server_instance_id != identity.server_instance_id
+        || measured
+            .snapshot
+            .engine
+            .as_ref()
+            .is_none_or(|engine| engine.load_generation != identity.load_generation)
+    {
+        bail!("embedding_constant_calibration_engine_identity_invalid");
+    }
+    Ok(identity)
+}
+
+fn validate_constant_engine_evidence(
+    identity: &EmbeddingEngineIdentity,
+    server_identity: &RawServerIdentity,
+    expected_backend: &str,
+    expected_model_sha256: &str,
+    expected_materialized_reused: bool,
+) -> Result<()> {
+    if identity.server_instance_id != server_identity.server_instance_id
+        || identity.load_generation != server_identity.load_generation
+        || identity.load_generation == 0
+        || identity.model_load_count == 0
+        || identity.residency != "resident"
+        || !identity.worker_alive
+        || identity.load_error.is_some()
+        || identity.policy != "accelerated"
+        || identity.backend.eq_ignore_ascii_case("cpu")
+        || !constant_backend_matches_expected(&identity.backend, expected_backend)
+        || identity.model_digest != expected_model_sha256
+        || identity.materialized_model_sha256 != expected_model_sha256
+        || !identity.embedded_model
+        || identity.materialized_reused != expected_materialized_reused
+    {
+        bail!("embedding_constant_calibration_engine_identity_invalid");
+    }
+    Ok(())
+}
+
+fn constant_backend_matches_expected(observed: &str, expected: &str) -> bool {
+    let Some(expected_family) = constant_backend_family(expected) else {
+        return false;
+    };
+    constant_backend_family(observed) == Some(expected_family)
+}
+
+fn constant_backend_family(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "metal" | "mtl" => Some("metal"),
+        "vulkan" => Some("vulkan"),
+        value
+            if value.strip_prefix("vulkan").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            Some("vulkan")
+        }
+        _ => None,
+    }
+}
+
+fn expected_materialization_reuse(run_index: u32) -> Result<bool> {
+    match run_index {
+        1 => Ok(false),
+        2 | 3 => Ok(true),
+        _ => bail!("embedding_constant_calibration_run_index_invalid"),
+    }
+}
+
+fn retain_fresh_server_identities(
+    observed: &mut BTreeSet<RawServerIdentity>,
+    current: &[RawServerIdentity],
+) -> Result<()> {
+    if current.is_empty() {
+        bail!("embedding_constant_calibration_server_identity_missing");
+    }
+    for identity in current {
+        if !observed.insert(identity.clone()) {
+            bail!("embedding_constant_calibration_server_identity_reused");
+        }
+    }
+    Ok(())
+}
+
+fn require_one_run_server_identity(
+    sampled: &BTreeSet<RawServerIdentity>,
+    expected: &RawServerIdentity,
+) -> Result<()> {
+    if sampled != &BTreeSet::from([expected.clone()]) {
+        bail!("embedding_constant_calibration_generation_changed");
+    }
+    Ok(())
 }
 
 /// Build the recorded interval from the worker's declared-instant span. The
@@ -588,5 +991,268 @@ fn metric_unit(metric: &str) -> &'static str {
         "bulk_tokens_per_second" => "tokens_per_second",
         "backend_observed_accelerator_residency" => "boolean",
         _ => "milliseconds",
+    }
+}
+
+#[cfg(test)]
+mod constant_calibration_tests {
+    use super::{
+        CONSTANT_CALIBRATION_METRICS, RawServerIdentity, declared_constant_phase_boundaries,
+        declared_phase_boundaries, expected_materialization_reuse,
+        opaque_constant_calibration_sample_id, require_one_run_server_identity,
+        retain_fresh_server_identities, validate_constant_engine_evidence,
+    };
+    use codestory_retrieval::EmbeddingEngineIdentity;
+    use std::collections::BTreeSet;
+
+    fn server_identity(name: &str) -> RawServerIdentity {
+        RawServerIdentity {
+            server_instance_id: name.into(),
+            process_start_id: format!("boot:{name}"),
+            load_generation: 1,
+        }
+    }
+
+    fn engine_identity(name: &str, backend: &str, reused: bool) -> EmbeddingEngineIdentity {
+        EmbeddingEngineIdentity {
+            server_instance_id: name.into(),
+            load_generation: 1,
+            model_load_count: 1,
+            residency: "resident".into(),
+            worker_alive: true,
+            load_error: None,
+            model_digest: "a".repeat(64),
+            ggml_build_identity: "ggml-test".into(),
+            backend: backend.into(),
+            adapter_name: backend.into(),
+            adapter_description: "test".into(),
+            policy: "accelerated".into(),
+            embedded_model: true,
+            materialized_model_sha256: "a".repeat(64),
+            materialized_reused: reused,
+            initialization_ms: 1,
+            smoke_ms: 1,
+            adapter_memory_total: 0,
+            adapter_memory_used_by_load: 0,
+            execution_device_names: Vec::new(),
+            execution_backend_names: Vec::new(),
+            execution_observation_source: "test".into(),
+            encode_count: 0,
+            execution_node_count: 0,
+            resident_accelerator_tensor_count: 0,
+            resident_accelerator_tensor_bytes: 0,
+            model_layer_count: 0,
+            offloaded_layer_count: 0,
+            accelerator_execution_verified: false,
+        }
+    }
+
+    #[test]
+    fn constant_plan_is_exactly_the_nine_runtime_constant_metrics() {
+        assert_eq!(
+            CONSTANT_CALIBRATION_METRICS,
+            [
+                "spawn_convergence",
+                "existing_owner_connect",
+                "cold_first_vector",
+                "first_product_ready",
+                "warm_query_ipc",
+                "warm_bulk_ipc",
+                "bulk_documents_per_second",
+                "bulk_tokens_per_second",
+                "busy_retry_usefulness",
+            ]
+        );
+        for forbidden in [
+            "true_idle_exit",
+            "total_codestory_process_memory",
+            "backend_observed_accelerator_residency",
+            "retrieval_quality",
+        ] {
+            assert!(!CONSTANT_CALIBRATION_METRICS.contains(&forbidden));
+        }
+        assert_eq!(
+            declared_constant_phase_boundaries("cold_first_vector")
+                .expect("constant cold boundary")[0],
+            "product_request_started_with_fresh_owner_model_absent"
+        );
+        assert_eq!(
+            declared_phase_boundaries("cold_first_vector").expect("qualification cold boundary")[0],
+            "product_request_started_with_owner_absent",
+            "the full qualification protocol must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn constant_sample_identity_is_unique_per_logical_run() {
+        let first = opaque_constant_calibration_sample_id("nonce", "metal", 1, "warm_query_ipc");
+        let second = opaque_constant_calibration_sample_id("nonce", "metal", 2, "warm_query_ipc");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            opaque_constant_calibration_sample_id("nonce", "metal", 1, "warm_query_ipc")
+        );
+    }
+
+    #[test]
+    fn materialized_model_is_new_once_then_reused_twice() {
+        assert!(!expected_materialization_reuse(1).expect("run one"));
+        assert!(expected_materialization_reuse(2).expect("run two"));
+        assert!(expected_materialization_reuse(3).expect("run three"));
+        for invalid in [0, 4] {
+            assert!(expected_materialization_reuse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn engine_precondition_binds_accelerated_backend_model_and_reuse_only() {
+        let server = server_identity("server-a");
+        let metal = engine_identity("server-a", "Metal", false);
+        for (observed, expected) in [
+            ("Metal", "metal"),
+            ("MTL", "metal"),
+            ("Vulkan", "vulkan"),
+            ("Vulkan0", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            validate_constant_engine_evidence(&identity, &server, expected, &"a".repeat(64), false)
+                .unwrap_or_else(|error| {
+                    panic!("{observed} must satisfy expected GPU family {expected}: {error}")
+                });
+        }
+        for (observed, expected) in [
+            ("CPU", "metal"),
+            ("cpu_explicit", "metal"),
+            ("", "metal"),
+            ("unknown", "metal"),
+            ("metal-cpu", "metal"),
+            ("mtl0", "metal"),
+            ("MTL", "vulkan"),
+            ("Vulkan", "metal"),
+            ("vulkan-cpu", "vulkan"),
+        ] {
+            let identity = engine_identity("server-a", observed, false);
+            assert!(
+                validate_constant_engine_evidence(
+                    &identity,
+                    &server,
+                    expected,
+                    &"a".repeat(64),
+                    false,
+                )
+                .is_err(),
+                "{observed} must not satisfy expected GPU family {expected}"
+            );
+        }
+
+        let mut invalid = metal.clone();
+        invalid.policy = "cpu_explicit".into();
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.backend = "CPU".into();
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        assert!(
+            validate_constant_engine_evidence(&metal, &server, "vulkan", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.load_generation = 2;
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.model_load_count = 0;
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.residency = "absent".into();
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.worker_alive = false;
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.load_error = Some("model load failed".into());
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.model_digest = "b".repeat(64);
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.materialized_model_sha256 = "b".repeat(64);
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.materialized_reused = true;
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal.clone();
+        invalid.embedded_model = false;
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+        invalid = metal;
+        invalid.server_instance_id = "server-b".into();
+        assert!(
+            validate_constant_engine_evidence(&invalid, &server, "metal", &"a".repeat(64), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_identities_must_be_disjoint_across_records() {
+        let first = server_identity("server-a");
+        let second = server_identity("server-b");
+        let third = server_identity("server-c");
+        let mut observed = BTreeSet::new();
+        retain_fresh_server_identities(&mut observed, std::slice::from_ref(&first))
+            .expect("first run");
+        retain_fresh_server_identities(&mut observed, std::slice::from_ref(&second))
+            .expect("second run");
+        assert!(
+            retain_fresh_server_identities(&mut observed, std::slice::from_ref(&first)).is_err()
+        );
+        retain_fresh_server_identities(&mut observed, std::slice::from_ref(&third))
+            .expect("third fresh run");
+        assert!(retain_fresh_server_identities(&mut observed, &[]).is_err());
+    }
+
+    #[test]
+    fn every_metric_in_one_record_must_share_one_generation() {
+        let expected = server_identity("server-a");
+        require_one_run_server_identity(&BTreeSet::from([expected.clone()]), &expected)
+            .expect("one generation");
+        assert!(
+            require_one_run_server_identity(
+                &BTreeSet::from([expected.clone(), server_identity("server-b")]),
+                &expected,
+            )
+            .is_err()
+        );
+        assert!(require_one_run_server_identity(&BTreeSet::new(), &expected).is_err());
     }
 }

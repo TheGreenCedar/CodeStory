@@ -16,6 +16,7 @@ import {
   renderReleasePlatformNotes,
   validatePublicSupportDocuments,
   validateReleaseClaimGraph,
+  verifyReuseBinding,
 } from "../codestory-release-claims.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -102,7 +103,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 7);
+  assert.equal(graph.graph_version, 11);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -151,11 +152,431 @@ test("versioned claim graph has one deterministic digest and all declared contro
     ],
   );
   assert.ok(graph.claims.every((claim) => claim.prerequisite_checks.every(({ command }) => command.length > 0)));
-  assert.deepEqual(graph.workflow_policy.promotion.required_events, ["labeled"]);
+  assert.deepEqual(graph.workflow_policy.promotion.required_events, []);
+  assert.deepEqual(graph.workflow_policy.promotion.label_routed_workflows, []);
   assert.equal(graph.workflow_policy.promotion.proof_run_sha_expression, "${{ github.sha }}");
   assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+  assert.deepEqual(
+    graph.workflow_policy.release_freeze_barrier.acceptance,
+    {
+      producer_workflow: "source-proof.yml",
+      receipt_authority: "github_actions",
+      receipt_artifact: "release-freeze-receipt-attempt-${{ github.run_attempt }}",
+      receipt_file: "release-freeze-receipt.json",
+      receipt_producer_job: "resolve",
+      status_scope: "exact_candidate_head",
+      later_commit_revokes: true,
+      event: "workflow_dispatch",
+      hostile_job: "freeze-hostile-mutations",
+      hostile_step: "Execute exact-head hostile mutation matrix",
+      windows_job: "freeze-windows-native-probe",
+      windows_step: "Run exact-head Windows native probe",
+      windows_runner: ["self-hosted", "Windows", "X64", "codestory-vulkan"],
+      windows_probe_max_seconds: 90,
+      publisher_job: "freeze-acceptance",
+      publisher_step: "Publish executable release freeze",
+      status_creator: "github-actions[bot]",
+      job_manifest: ".github/scripts/release-freeze-acceptance-jobs.json",
+      job_manifest_sha256:
+        "bb0a23ed7f74528fc3d4e4962c1b34f98758a628f48dd943b9d1356149e453c5",
+      phases: {
+        calibration_source: {
+          known_future_source_changes: [
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+          ],
+          planned_actions: [
+            "calibration-source-acceptance",
+            "calibration",
+            "generated-constant-freeze",
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation:
+            "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json",
+        },
+        frozen_candidate: {
+          known_future_source_changes: [],
+          planned_actions: [
+            "frozen-candidate-acceptance",
+            "source-proof",
+            "qualification",
+            "release",
+          ],
+          next_permitted_mutation: null,
+        },
+      },
+    },
+  );
+  assert.equal(
+    graph.workflow_policy.release_freeze_barrier.invalidation_workflow,
+    "release-freeze-invalidation.yml",
+  );
+});
+
+test("claim graph freezes one exact Windows release graph and protected content-addressed reuse", () => {
+  assert.deepEqual(graph.workflow_policy.windows_package_graph, {
+    asset_target: "windows-x64",
+    cargo_profile: "release",
+    cargo_build_invocations: 1,
+    cargo_test_invocations_after_build: 0,
+    artifacts: [
+      "codestory-cli",
+      "codestory-cli-runtime",
+      "codestory_embedding_qualification",
+    ],
+    direct_test_harnesses: [],
+    source_test_harnesses: ["native_staging", "windows_path_identity"],
+    production_feature_probes: [
+      "cargo_message_feature_contract",
+      "runtime_observation_source",
+    ],
+    package_artifact: "codestory-cli",
+    timing_phases: [
+      "cache_restore",
+      "native_setup",
+      "cargo_graph",
+      "msvc_link",
+      "feature_probe",
+      "packaging",
+      "artifact_transfer",
+    ],
+  });
+  assert.deepEqual(graph.workflow_policy.candidate_archive_cache.key_fields, [
+    "source.commit",
+    "target",
+    "archive.sha256",
+  ]);
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.qualification_driver_artifact_name,
+    "codestory-qualification-driver-{asset_target}",
+  );
+  assert.equal(graph.workflow_policy.candidate_archive_cache.cross_source_reuse, false);
+  assert.equal(graph.workflow_policy.candidate_archive_cache.restore_prefixes, false);
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.owned_corruption,
+    "quarantine_then_authenticated_miss",
+  );
+  assert.equal(
+    graph.workflow_policy.candidate_archive_cache.unowned_corruption,
+    "fail_closed",
+  );
+  assert.deepEqual(graph.workflow_policy.model_material_cache, {
+    key_field: "model.sha256",
+    source_sha_in_key: false,
+    toolchain_in_key: false,
+    hit_verification: [
+      "model.real_ancestry",
+      "model.single_link",
+      "model.size_bytes",
+      "model.sha256",
+    ],
+    miss_admission: "same_filesystem_atomic_no_replace",
+  });
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_build_invocations = 2;
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_profile = "debug";
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.cargo_test_invocations_after_build = 1;
+    }, /one exact Windows release graph/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.direct_test_harnesses.push("native_staging");
+    }, /direct_test_harnesses must be empty/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.source_test_harnesses.pop();
+    }, /source_test_harnesses must be exactly/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.production_feature_probes.pop();
+    }, /production_feature_probes must be exactly/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.key_fields.shift();
+    }, /key_fields must be exactly/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.cross_source_reuse = true;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.restore_prefixes = true;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.public_asset_reauthentication = false;
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.owned_corruption = "fail_closed";
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.candidate_archive_cache.unowned_corruption =
+        "quarantine_then_authenticated_miss";
+    }, /exact-source atomic protected-host reuse/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.key_field = "source.commit";
+    }, /only by model SHA/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.source_sha_in_key = true;
+    }, /only by model SHA/u],
+    [draft => {
+      draft.workflow_policy.model_material_cache.hit_verification = [
+        "model.size_bytes",
+        "model.sha256",
+      ];
+    }, /hit_verification must be exactly/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => {
+  const calibration = graph.workflow_policy.calibration;
+  assert.deepEqual(calibration.required_cells.map(({ id }) => id), [
+    "protected_macos_arm64_metal",
+  ]);
+  assert.deepEqual(calibration.optional_cells.map(({ id }) => id), [
+    "protected_linux_x64_vulkan",
+  ]);
+  assert.equal(calibration.optional_cells[0].assembly_dependency, false);
+  assert.equal(calibration.optional_cells[0].feeds_constant_selection, false);
+  assert.equal(calibration.runs_per_required_cell, 3);
+  assert.equal(calibration.samples_per_metric_per_run, 1);
+  assert.equal(calibration.pre_collection_source_proof_required, false);
+  assert.equal(
+    calibration.source_proof_stage,
+    "frozen_candidate_before_qualification",
+  );
+  assert.deepEqual(calibration.forbidden_environment, [
+    "CODESTORY_EMBED_ALLOW_CPU=1",
+  ]);
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.calibration.required_cells[0].backend = "cpu";
+    }, /required cell must be protected macOS Metal/u],
+    [draft => {
+      draft.workflow_policy.calibration.required_cells[0].policy = "cpu_explicit";
+    }, /required cell must be protected macOS Metal/u],
+    [draft => {
+      draft.workflow_policy.calibration.optional_cells[0].assembly_dependency = true;
+    }, /optional cell must be standalone non-selecting Linux Vulkan evidence/u],
+    [draft => {
+      draft.workflow_policy.calibration.optional_cells[0].feeds_constant_selection = true;
+    }, /optional cell must be standalone non-selecting Linux Vulkan evidence/u],
+    [draft => {
+      draft.workflow_policy.calibration.runs_per_required_cell = 6;
+    }, /exactly three clean runs/u],
+    [draft => {
+      draft.workflow_policy.calibration.samples_per_metric_per_run = 3;
+    }, /exactly one sample per metric per run/u],
+    [draft => {
+      draft.workflow_policy.calibration.pre_collection_source_proof_required = true;
+    }, /sole frozen-candidate source proof/u],
+    [draft => {
+      draft.workflow_policy.calibration.source_proof_stage = "before_calibration";
+    }, /sole frozen-candidate source proof/u],
+    [draft => {
+      draft.workflow_policy.calibration.forbidden_environment = [
+        "CODESTORY_EMBED_ALLOW_CPU=0",
+      ];
+    }, /must forbid CPU environment, policy, and backend selection/u],
+    [draft => {
+      draft.public_support.packages[0].broad_retrieval = "cpu_explicit";
+    }, /must require accelerated broad retrieval/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("claim graph freezes one GPU-only qualification run per available platform", () => {
+  const qualification = graph.workflow_policy.qualification;
+  assert.deepEqual(qualification.driver_contract, {
+    producer_workflow: "packaged-platform-proof.yml",
+    producer_job: "build",
+    artifact_name_template: "codestory-qualification-driver-{asset_target}",
+    artifact_directory_template: ".",
+    identity_file: "qualification-driver-identity.json",
+    identity_schema_version: 1,
+    identity_fields: [
+      "schema_version",
+      "source.commit",
+      "source.tree",
+      "release_version",
+      "asset_target",
+      "archive.file",
+      "archive.bytes",
+      "archive.sha256",
+      "driver.file",
+      "driver.bytes",
+      "driver.sha256",
+    ],
+    build_invocations_per_platform: 1,
+    reuse_required: true,
+    public_release_asset: false,
+  });
+  assert.equal(qualification.runs_per_available_cell, 1);
+  assert.deepEqual(
+    qualification.required_cells.map(({ id }) => id),
+    [
+      "protected_macos_arm64_metal",
+      "protected_windows_x64_vulkan",
+    ],
+  );
+  assert.deepEqual(
+    qualification.optional_cells.map(({ id }) => id),
+    ["protected_linux_x64_vulkan"],
+  );
+  assert.equal(qualification.optional_cells[0].closeout_dependency, false);
+  assert.equal(qualification.optional_cells[0].blocking, false);
+  assert.deepEqual(qualification.quality_contract, {
+    producer_workflow: "packaged-platform-pr.yml",
+    producer_job: "frozen-candidate-quality",
+    producer_cell: "protected_macos_arm64_metal",
+    scheduled_once_per_frozen_candidate: true,
+    blocking: false,
+    closeout_dependency: false,
+    claimed: false,
+    archive_cache_key_fields: [
+      "source.commit",
+      "target",
+      "archive.sha256",
+    ],
+    archive_cache_contract: "candidate_archive_cache",
+    archive_transfer: "authenticated_miss_only",
+    evaluation_owner: "isolated_reusable_workflow",
+    evaluation_owner_sha256:
+      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+    evaluation_contract: "publishable-three-repeat-packet/v1",
+    task_count: 1,
+    repeats_per_task: 3,
+    row_count: 3,
+  });
+  assert.deepEqual(qualification.required_evidence, [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "backend_observed_accelerator_residency",
+  ]);
+  assert.equal(
+    qualification.true_idle_timeout_ms
+      + qualification.true_idle_observation_grace_ms,
+    62_500,
+  );
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.qualification.runs_per_available_cell = 3;
+    }, /canonical one-run frozen-candidate coordinator/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.producer_workflow =
+        "macos-metal-proof.yml";
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract
+        .build_invocations_per_platform = 2;
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.reuse_required = false;
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract
+        .artifact_directory_template = "qualification-driver";
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.identity_fields
+        .splice(5, 3);
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.driver_contract.public_release_asset = true;
+    }, /archive-matched package-built qualification driver/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_cells[0].backend = "cpu";
+    }, /protected Metal and Vulkan producers/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_cells[1].policy = "cpu_explicit";
+    }, /protected Metal and Vulkan producers/u],
+    [draft => {
+      draft.workflow_policy.qualification.optional_cells[0].blocking = true;
+    }, /standalone and nonblocking/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.row_count = 9;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.blocking = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.claimed = true;
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_transfer = "unconditional_download";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_key_fields.shift();
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract
+        .archive_cache_contract = "mutable_candidate_cache";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner =
+        "protected_product_path";
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.quality_contract.evaluation_owner_sha256 =
+        "0".repeat(64);
+    }, /optional isolated exact-package adjunct/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_evidence.push("retrieval_quality");
+    }, /without optional retrieval quality/u],
+    [draft => {
+      draft.workflow_policy.qualification.required_scenarios.pop();
+    }, /each lifecycle and fault scenario once/u],
+    [draft => {
+      draft.workflow_policy.qualification.true_idle_observation_grace_ms = 11_374;
+    }, /product timeout plus explicit grace/u],
+    [draft => {
+      draft.workflow_policy.qualification.forbidden_environment = [];
+    }, /must forbid CPU environment, policy, and backend selection/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
+test("benchmark leakage names only the one-process Node contract", () => {
+  const benchmarkLeakage = graph.failure_controls
+    .find(({ id }) => id === "benchmark_leakage");
+  assert.equal(
+    benchmarkLeakage.command,
+    "node --test scripts/tests/lint-retrieval-generalization.test.mjs",
+  );
+
+  for (const command of [
+    "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard",
+    "node scripts/lint-retrieval-generalization.mjs",
+  ]) {
+    const mutated = structuredClone(graph);
+    mutated.failure_controls
+      .find(({ id }) => id === "benchmark_leakage")
+      .command = command;
+    assert.throws(
+      () => validateReleaseClaimGraph(mutated),
+      /failure control benchmark_leakage must be exactly node --test scripts\/tests\/lint-retrieval-generalization\.test\.mjs/u,
+    );
+  }
 });
 
 test("public support, assets, and release notes derive from the package and closeout graph", () => {
@@ -176,15 +597,37 @@ test("public support, assets, and release notes derive from the package and clos
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
       "codestory-cli-v0.16.0-linux-x64.tar.gz",
       "SHA256SUMS.txt",
+      // The README tells a reader to consult the ledger rather than the platform table, so the
+      // machine-readable closeout summary has to ship with the release itself.
+      "release-closeout-summary.json",
     ],
   );
-  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Supported with Metal/u);
-  assert.match(renderPublicSupport(graph), /Windows x64 \\| Supported with Vulkan/u);
-  assert.match(renderPublicSupport(graph), /Linux x64 \\| Supported with Vulkan/u);
-  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \\| Unsupported/u);
-  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: supported with Metal/u);
-  assert.match(renderReleasePlatformNotes(graph), /Windows x64: supported with Vulkan/u);
-  assert.match(renderReleasePlatformNotes(graph), /Linux x64: supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Apple Silicon \| Supported with Metal/u);
+  assert.match(renderPublicSupport(graph), /Windows x64 \| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Linux x64 \| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \| Unsupported/u);
+
+  // The release notes are a claim about one release, so they are rendered from that release's
+  // ledger. The graph alone can no longer produce them.
+  const proven = renderReleasePlatformNotes(graph, { withheld_cells: [] });
+  assert.match(proven, /macOS 15\+ on Apple Silicon: supported with Metal/u);
+  assert.match(proven, /Windows x64: supported with Vulkan/u);
+  assert.match(proven, /Linux x64: supported with Vulkan/u);
+  assert.throws(() => renderReleasePlatformNotes(graph), /closeout ledger/u);
+  assert.throws(() => renderReleasePlatformNotes(graph, {}), /withheld_cells/u);
+
+  const withheld = renderReleasePlatformNotes(graph, {
+    withheld_cells: [
+      "accelerator_execution:linux-x64-vulkan",
+      "candidate_installed_behavior:linux-x64",
+    ],
+  });
+  assert.match(
+    withheld,
+    /Linux x64: Vulkan not proven for this release \(accelerator_host_unavailable\)/u,
+  );
+  assert.equal(/Linux x64: supported with Vulkan/u.test(withheld), false);
+  assert.match(withheld, /Windows x64: supported with Vulkan/u);
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -245,6 +688,159 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /identity undeclared_identity must declare a format/u,
   );
 
+  const unprotectedFreezeProbe = structuredClone(graph);
+  unprotectedFreezeProbe.workflow_policy.release_freeze_barrier
+    .acceptance.windows_runner = ["windows-latest"];
+  assert.throws(
+    () => validateReleaseClaimGraph(unprotectedFreezeProbe),
+    /release_freeze_barrier\.acceptance\.windows_runner/u,
+  );
+
+  const callerAuthoredFreeze = structuredClone(graph);
+  callerAuthoredFreeze.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_authority = "caller";
+  assert.throws(
+    () => validateReleaseClaimGraph(callerAuthoredFreeze),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const mutableFreezeReceipt = structuredClone(graph);
+  mutableFreezeReceipt.workflow_policy.release_freeze_barrier
+    .acceptance.receipt_artifact = "release-freeze-receipt";
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFreezeReceipt),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const persistentFreezeStatus = structuredClone(graph);
+  persistentFreezeStatus.workflow_policy.release_freeze_barrier
+    .acceptance.later_commit_revokes = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(persistentFreezeStatus),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const unpinnedAcceptanceManifest = structuredClone(graph);
+  unpinnedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest_sha256 = "not-a-digest";
+  assert.throws(
+    () => validateReleaseClaimGraph(unpinnedAcceptanceManifest),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const substitutedAcceptanceManifest = structuredClone(graph);
+  substitutedAcceptanceManifest.workflow_policy.release_freeze_barrier
+    .acceptance.job_manifest = ".github/workflows/source-proof.yml";
+  assert.throws(
+    () => validateReleaseClaimGraph(substitutedAcceptanceManifest),
+    /release_freeze_barrier\.acceptance/u,
+  );
+
+  const preCalibrationSourceProof = structuredClone(graph);
+  preCalibrationSourceProof.workflow_policy.release_freeze_barrier
+    .acceptance.phases.calibration_source.planned_actions = [
+      "calibration-source-acceptance",
+      "source-proof",
+      "calibration",
+      "generated-constant-freeze",
+      "qualification",
+      "release",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(preCalibrationSourceProof),
+    /calibration_source.*calibration.*generated constant-set freeze before source proof/u,
+  );
+
+  const mutableFrozenCandidate = structuredClone(graph);
+  mutableFrozenCandidate.workflow_policy.release_freeze_barrier
+    .acceptance.phases.frozen_candidate.known_future_source_changes = [
+      "AGENTS.md",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(mutableFrozenCandidate),
+    /frozen_candidate.*no future source mutation/u,
+  );
+
+  const missingInvalidation = structuredClone(graph);
+  delete missingInvalidation.workflow_policy.release_freeze_barrier
+    .invalidation_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(missingInvalidation),
+    /release_freeze_barrier\.invalidation_workflow/u,
+  );
+
+  // A non-claim that withholds less than the lost host actually produced would leave a live claim
+  // resting on a proof that never ran, so the withheld set is checked against the graph itself.
+  const partialNonClaim = structuredClone(graph);
+  partialNonClaim.non_claim_policy.hosts.find(({ id }) => id === "linux-x64-vulkan")
+    .withheld_cells = ["accelerator_execution:linux-x64-vulkan"];
+  assert.throws(
+    () => validateReleaseClaimGraph(partialNonClaim),
+    /must withhold exactly the cells Packaged Linux Vulkan engine produces/u,
+  );
+
+  const unboundedRecovery = structuredClone(graph);
+  unboundedRecovery.non_claim_policy.maximum_run_attempts = 12;
+  assert.throws(
+    () => validateReleaseClaimGraph(unboundedRecovery),
+    /maximum_run_attempts must be 2/u,
+  );
+
+  const softenedNonClaim = structuredClone(graph);
+  softenedNonClaim.non_claim_policy.runtime_execution = "assumed_from_prior_release";
+  assert.throws(
+    () => validateReleaseClaimGraph(softenedNonClaim),
+    /runtime_execution must be not_proven_by_package/u,
+  );
+
+  // The withhold cap is data, and the graph refuses a cap that could leave nothing proven. A cap
+  // equal to the number of protected hosts makes "no accelerator was proven anywhere" a legal
+  // release, which is the whole thing the cap exists to make unrepresentable.
+  const uncappedWithholding = structuredClone(graph);
+  uncappedWithholding.non_claim_policy.withhold_policy.maximum_withheld_hosts =
+    uncappedWithholding.non_claim_policy.hosts.length;
+  assert.throws(
+    () => validateReleaseClaimGraph(uncappedWithholding),
+    /must leave at least one protected host proven/u,
+  );
+
+  const noCap = structuredClone(graph);
+  delete noCap.non_claim_policy.withhold_policy;
+  assert.throws(() => validateReleaseClaimGraph(noCap), /withhold_policy must be an object/u);
+
+  const zeroCap = structuredClone(graph);
+  zeroCap.non_claim_policy.withhold_policy.maximum_withheld_hosts = 0;
+  assert.throws(
+    () => validateReleaseClaimGraph(zeroCap),
+    /maximum_withheld_hosts must be a positive integer/u,
+  );
+
+  const packageDownloadWithholding = structuredClone(graph);
+  packageDownloadWithholding.non_claim_policy.withhold_policy.archive_identity_source =
+    "downloaded_archive";
+  assert.throws(
+    () => validateReleaseClaimGraph(packageDownloadWithholding),
+    /archive_identity_source must be candidate_archive_record/u,
+  );
+
+  // Dropping a claim a lost host can erase would make the cap silent about exactly that claim.
+  const unguardedClaim = structuredClone(graph);
+  unguardedClaim.non_claim_policy.withhold_policy.claims_requiring_proof =
+    unguardedClaim.non_claim_policy.withhold_policy.claims_requiring_proof
+      .filter((claimId) => claimId !== "accelerator_execution");
+  assert.throws(
+    () => validateReleaseClaimGraph(unguardedClaim),
+    /claims_requiring_proof must include accelerator_execution/u,
+  );
+
+  const unmatchedHosts = structuredClone(graph);
+  unmatchedHosts.non_claim_policy.hosts = unmatchedHosts.non_claim_policy.hosts
+    .filter(({ id }) => id !== "linux-x64-vulkan");
+  assert.throws(
+    () => validateReleaseClaimGraph(unmatchedHosts),
+    /must name exactly the protected accelerator instances/u,
+  );
+
   const mismatchedSupport = structuredClone(graph);
   mismatchedSupport.public_support.packages[0].target = "macos-x64";
   assert.throws(
@@ -287,6 +883,177 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
       () => validateReleaseClaimGraph(incompletePromotion),
       new RegExp(`workflow_policy\\.promotion\\.${field}`, "u"),
     );
+  }
+});
+
+// Catalog publication is delivery rather than a release gate, which is only honest if the run
+// records which of the two states it ended in. The graph is where that vocabulary lives, so
+// deleting it, reinstating the gate, or collapsing the two installer identities onto one -- which
+// is exactly how a deferred run would come to read as a published one -- must be refusals here,
+// not merely in the workflow policy that consumes them.
+test("catalog delivery declares two distinguishable states and no release gate", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  assert.equal(delivery.release_gate, false);
+  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published"]);
+  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 2);
+
+  const missing = structuredClone(graph);
+  delete missing.workflow_policy.catalog_delivery;
+  assert.throws(
+    () => validateReleaseClaimGraph(missing),
+    /workflow_policy\.catalog_delivery must be an object/u,
+  );
+
+  const gated = structuredClone(graph);
+  gated.workflow_policy.catalog_delivery.release_gate = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(gated),
+    /release_gate must be false: catalog publication is delivery, not a release gate/u,
+  );
+
+  const collapsed = structuredClone(graph);
+  const [first, second] = collapsed.workflow_policy.catalog_delivery.states;
+  second.installer = first.installer;
+  assert.throws(
+    () => validateReleaseClaimGraph(collapsed),
+    /must record distinct installer identities/u,
+  );
+
+  const renamed = structuredClone(graph);
+  renamed.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").id = "unknown";
+  assert.throws(
+    () => validateReleaseClaimGraph(renamed),
+    /must declare the deferred state/u,
+  );
+
+  const inverted = structuredClone(graph);
+  inverted.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "deferred").live_catalog_revision = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(inverted),
+    /deferred state must not consume a live catalog revision/u,
+  );
+
+  const unpublished = structuredClone(graph);
+  unpublished.workflow_policy.catalog_delivery.states
+    .find(({ id }) => id === "published").live_catalog_revision = false;
+  assert.throws(
+    () => validateReleaseClaimGraph(unpublished),
+    /published state must consume the live catalog revision/u,
+  );
+
+  const detached = structuredClone(graph);
+  detached.workflow_policy.catalog_delivery.publish_job = "no-such-job";
+  assert.throws(
+    () => validateReleaseClaimGraph(detached),
+    /publish_job no-such-job must be a release chain job/u,
+  );
+
+  const unrecoverable = structuredClone(graph);
+  delete unrecoverable.workflow_policy.catalog_delivery.recovery_workflow;
+  assert.throws(
+    () => validateReleaseClaimGraph(unrecoverable),
+    /workflow_policy\.catalog_delivery\.recovery_workflow/u,
+  );
+});
+
+// Naming the two delivery states buys nothing on its own: the first version of this graph
+// declared both and nothing anywhere read the mark, so a deferred release's closeout verdict was
+// identical in shape to a published one. The graph must therefore also name the cell family whose
+// signed installer identity the closeout resolves the state from -- and that family has to be a
+// post-publish one that actually carries `installer`, or the reader would have nothing to read.
+test("catalog delivery names the cells whose installer identity resolves the state", () => {
+  const delivery = graph.workflow_policy.catalog_delivery;
+  const group = graph.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group);
+  assert.equal(group.phase, "post_publish");
+  assert.ok(group.required_identity.includes("installer"));
+  assert.ok(group.singleton_identity.includes("installer"));
+
+  const unread = structuredClone(graph);
+  delete unread.workflow_policy.catalog_delivery.installed_cell_group;
+  assert.throws(
+    () => validateReleaseClaimGraph(unread),
+    /workflow_policy\.catalog_delivery\.installed_cell_group/u,
+  );
+
+  const unknown = structuredClone(graph);
+  unknown.workflow_policy.catalog_delivery.installed_cell_group = "no-such-group";
+  assert.throws(
+    () => validateReleaseClaimGraph(unknown),
+    /must be a closeout cell group/u,
+  );
+
+  // A pre-publish family cannot carry the delivery state: it is produced before the catalog is
+  // ever touched, so reading it would report a state nothing had decided yet.
+  const early = structuredClone(graph);
+  early.workflow_policy.catalog_delivery.installed_cell_group = "candidate_installed_behavior";
+  assert.throws(
+    () => validateReleaseClaimGraph(early),
+    /must be a post-publish cell group/u,
+  );
+
+  // The installer must be a singleton identity, or the three targets could each report a
+  // different catalog and no single state would exist to record.
+  const nonSingleton = structuredClone(graph);
+  nonSingleton.closeout.cell_groups
+    .find(({ id }) => id === delivery.installed_cell_group)
+    .singleton_identity = ["host_os", "host_arch", "native_engine"];
+  assert.throws(
+    () => validateReleaseClaimGraph(nonSingleton),
+    /must carry installer in singleton_identity/u,
+  );
+});
+
+// check-workflow-policy.mjs asserts only that plugin-release.yml's `needs:` match this data, so a
+// chain that parses but orders nothing would let both gates pass while `gh release create` ran
+// detached from the release-authority checks and the plugin-proof matrix. Every mutation below
+// leaves the workflow and the graph agreeing with each other; only the schema can refuse them.
+test("the plugin chain must order the lane, not merely name it", async (t) => {
+  const chain = (graphValue) => graphValue.workflow_policy.plugin_chain.dependencies;
+  const mutations = [
+    ["the ordering contract is dropped wholesale", (mutated) => {
+      delete mutated.workflow_policy.plugin_chain;
+    }, /workflow_policy\.plugin_chain must be an object/u],
+    ["the dependencies key is not a mapping", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = [];
+    }, /workflow_policy\.plugin_chain\.dependencies must be an object/u],
+    ["the lane declares no jobs at all", (mutated) => {
+      mutated.workflow_policy.plugin_chain.dependencies = {};
+    }, /plugin_chain\.dependencies must declare at least one job/u],
+    ["tagging is cut loose from every gate", (mutated) => {
+      chain(mutated).publish = [];
+    }, /plugin_chain\.dependencies\.publish must be a non-empty array/u],
+    ["the install proof is cut loose from every gate", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = [];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must be a non-empty array/u],
+    ["tagging stops waiting on the plugin proof", (mutated) => {
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies\.publish must run behind plugin-proof/u],
+    ["the plugin proof is deleted from the lane", (mutated) => {
+      delete chain(mutated)["plugin-proof"];
+      chain(mutated).publish = ["preflight"];
+    }, /plugin_chain\.dependencies must declare publish and plugin-proof/u],
+    ["catalog publication races the release it advertises", (mutated) => {
+      chain(mutated)["marketplace-publish"] = ["preflight"];
+    }, /plugin_chain\.dependencies\.marketplace-publish must run behind publish/u],
+    ["the install proof stops waiting on catalog publication", (mutated) => {
+      chain(mutated)["post-publish-smoke"] = ["preflight", "publish"];
+    }, /plugin_chain\.dependencies\.post-publish-smoke must run behind marketplace-publish/u],
+    ["a dependency names a job the lane never declares", (mutated) => {
+      chain(mutated).publish = ["preflight", "plugin-proof", "imaginary-gate"];
+    }, /plugin_chain\.dependencies\.publish names undeclared job imaginary-gate/u],
+    ["the lane closes into a cycle no job can enter", (mutated) => {
+      chain(mutated).preflight = ["plugin-proof"];
+    }, /plugin_chain\.dependencies\.(?:preflight|plugin-proof) cannot depend on itself/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const mutated = structuredClone(graph);
+      mutate(mutated);
+      assert.throws(() => validateReleaseClaimGraph(mutated), expected);
+    });
   }
 });
 
@@ -496,4 +1263,132 @@ test("CLI derives repository and tree identity from repo and rejects nonexistent
   ], { encoding: "utf8" });
   assert.notEqual(nonexistent.status, 0);
   assert.match(nonexistent.stderr, /git cat-file -e/u);
+});
+
+test("reuse bindings verify tree identity and fingerprint equality against real history", () => {
+  // Both sides of the ledger prove reuse with this one function -- the producer before it admits
+  // cross-run evidence, the closeout before it anchors a row onto the earlier run -- so it is
+  // proved here, against real history, in the suite pull requests actually run.
+  //
+  // v0.16.0 -> v0.16.1 is a pure version bump in this repository's real history: different
+  // trees (so source_tree reuse must refuse) but identical native fingerprints (so
+  // accelerator inheritance is exactly what version_only_delta authorizes).
+  const releaseTag = "00121349"; // v0.16.1 release commit
+  const priorTag = "29bd4795"; // v0.16.0 release commit
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_tree",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /does not match release tree/u,
+  );
+  const fingerprint = verifyReuseBinding({
+    binding: "native_fingerprint",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: priorTag,
+  });
+  assert.match(fingerprint, /^[0-9a-f]{64}$/u);
+  // Identical commits always satisfy the tree binding.
+  const tree = verifyReuseBinding({
+    binding: "source_tree",
+    repository: root,
+    releaseCommit: releaseTag,
+    reusedCommit: releaseTag,
+  });
+  assert.match(tree, /^[0-9a-f]{40}$/u);
+  // A binding name the claim graph never declared proves nothing.
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "source_history",
+      repository: root,
+      releaseCommit: releaseTag,
+      reusedCommit: priorTag,
+    }),
+    /unknown reuse binding source_history/u,
+  );
+  // Ancestry belongs to reuse itself, not to any one binding. Read the other way round, v0.16.1
+  // is not on v0.16.0's history, and the fingerprints are equal -- content equality alone would
+  // admit a run from a fork or an abandoned branch as this release's own proof.
+  assert.throws(
+    () => verifyReuseBinding({
+      binding: "native_fingerprint",
+      repository: root,
+      releaseCommit: priorTag,
+      reusedCommit: releaseTag,
+    }),
+    /is not an ancestor of the release commit/u,
+  );
+});
+
+test("a reuse binding may equate only identities its own construction determines", () => {
+  // What a reused row is allowed to differ from this release in is declared per binding, in the
+  // graph, with a reason -- never per cell group, and never by narrowing a group's
+  // required_identity, which would drop the check for fresh evidence too (#1567).
+  const declared = graph.evidence_policy.reuse.bindings;
+  assert.deepEqual(Object.keys(declared).sort(), ["native_fingerprint", "source_tree"]);
+  assert.deepEqual(declared.source_tree.equates, []);
+  assert.deepEqual(declared.native_fingerprint.equates.map(({ identity }) => identity), ["source_tree"]);
+  assert.ok(declared.native_fingerprint.equates[0].justification.length > 0);
+
+  // The fingerprint determines the built native binary. It says nothing about which repository
+  // produced the row, so it may not equate that -- graph text alone cannot grant an equation.
+  const foreignRepository = structuredClone(graph);
+  foreignRepository.evidence_policy.reuse.bindings.native_fingerprint.equates = [
+    { identity: "repository", justification: "same organisation, surely" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(foreignRepository),
+    /native_fingerprint may not equate identity repository, which its construction does not determine/u,
+  );
+
+  // The tree binding proves the reused commit resolves to this release's own tree, so there is
+  // nothing to substitute: equating the tree there would replace a live check with nothing.
+  const vacuousEquation = structuredClone(graph);
+  vacuousEquation.evidence_policy.reuse.bindings.source_tree.equates = [
+    { identity: "source_tree", justification: "the trees are equal anyway" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(vacuousEquation),
+    /source_tree may not equate identity source_tree, which its construction does not determine/u,
+  );
+
+  // An identity outside the release identity binding has no authoritative release-side value the
+  // closeout could put in its place, so it can never be equated whatever a binding proves.
+  const unboundIdentity = structuredClone(graph);
+  unboundIdentity.evidence_policy.reuse.bindings.native_fingerprint.equates = [
+    { identity: "artifact_sha256", justification: "the inputs were identical" },
+  ];
+  assert.throws(
+    () => validateReleaseClaimGraph(unboundIdentity),
+    /may not equate identity artifact_sha256 outside the release identity binding/u,
+  );
+
+  // An equation nobody can justify in a sentence is one nobody should be granting.
+  const unjustified = structuredClone(graph);
+  delete unjustified.evidence_policy.reuse.bindings.native_fingerprint.equates[0].justification;
+  assert.throws(
+    () => validateReleaseClaimGraph(unjustified),
+    /equated identity source_tree.justification must be a non-empty string/u,
+  );
+
+  // Every binding the verifier implements has to say what it equates, so a new binding cannot
+  // arrive with its equations left unstated.
+  const undeclaredBinding = structuredClone(graph);
+  delete undeclaredBinding.evidence_policy.reuse.bindings.native_fingerprint;
+  assert.throws(
+    () => validateReleaseClaimGraph(undeclaredBinding),
+    /reuse bindings must declare exactly native_fingerprint, source_tree/u,
+  );
+
+  // And a cell group admits cross-run evidence only under a binding the policy declares.
+  const inventedBinding = structuredClone(graph);
+  inventedBinding.closeout.cell_groups.find(({ id }) => id === "accelerator_execution")
+    .reuse_binding = "source_history";
+  assert.throws(
+    () => validateReleaseClaimGraph(inventedBinding),
+    /accelerator_execution names undeclared reuse binding source_history/u,
+  );
 });

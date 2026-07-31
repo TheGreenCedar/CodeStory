@@ -7,12 +7,18 @@
 // own archive digest, and the provisioned binary must report the pinned version.
 //
 //   node scripts/prove-plugin-pinned-provision.mjs [--timeout-ms 600000]
+//
+// This file is an entry point and nothing else imports it, so its body runs unconditionally.
+// The bounded wait lives in scripts/lib/wait-for-managed-runtime.mjs, which the test imports
+// without running the proof.
 
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { waitForManagedRuntime } from "./lib/wait-for-managed-runtime.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(repositoryRoot, "plugins/codestory/scripts/codestory-mcp.cjs");
@@ -25,8 +31,17 @@ function fail(message) {
   process.exit(1);
 }
 
+// A missing or non-numeric value used to yield NaN, and every `Date.now() > NaN` comparison is
+// false, so the one flag that declares the bound silently removed it. Refuse the argument
+// instead: an unbounded gate is the failure this timeout exists to prevent.
 const timeoutIndex = process.argv.indexOf("--timeout-ms");
 const timeoutMs = timeoutIndex >= 0 ? Number(process.argv[timeoutIndex + 1]) : 600_000;
+if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+  fail(
+    `--timeout-ms needs a positive number of milliseconds, got ` +
+      `${JSON.stringify(process.argv[timeoutIndex + 1] ?? null)}.`,
+  );
+}
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-pin-proof-"));
 const runtimeMetadata = path.join(dataDir, ".codestory-mcp-runtime.json");
@@ -49,56 +64,41 @@ child.stdin.write(
   })}\n`,
 );
 
-const deadline = Date.now() + timeoutMs;
-const poll = setInterval(() => {
-  let metadata;
-  try {
-    metadata = JSON.parse(fs.readFileSync(runtimeMetadata, "utf8"));
-  } catch {
-    if (child.exitCode !== null) {
-      clearInterval(poll);
-      fail(`launcher exited ${child.exitCode} before provisioning finished.\n${stderr}`);
-    }
-    if (Date.now() > deadline) {
-      clearInterval(poll);
-      child.kill();
-      fail(`provisioning did not finish within ${timeoutMs}ms.\n${stderr}`);
-    }
-    return;
-  }
-  if (metadata.source !== "managed") return;
-  clearInterval(poll);
-  child.kill();
+try {
+  await waitForManagedRuntime({ child, runtimeMetadata, timeoutMs });
+} catch (error) {
+  fail(`${error.message}\n${stderr}`);
+}
+child.kill();
 
-  const versionDir = path.join(dataDir, "codestory-cli", pin.cli_version);
-  const manifest = JSON.parse(fs.readFileSync(path.join(versionDir, "manifest.json"), "utf8"));
-  const target =
-    process.platform === "darwin"
-      ? "macos-arm64"
-      : process.platform === "win32"
-        ? "windows-x64"
-        : "linux-x64";
-  if (manifest.version !== pin.cli_version) {
-    fail(`provisioned ${manifest.version}, pin names ${pin.cli_version}.`);
-  }
-  if (manifest.build_source !== "github_release") {
-    fail(`expected a github_release provision, observed ${manifest.build_source}.`);
-  }
-  if (pin.archives?.[target] && manifest.archive_sha256 !== pin.archives[target]) {
-    fail(
-      `provisioned archive digest ${manifest.archive_sha256} does not match the pin's ` +
-        `${target} digest ${pin.archives[target]}.`,
-    );
-  }
-  const binary = path.join(versionDir, manifest.path);
-  const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim();
-  if (!reported.includes(pin.cli_version)) {
-    fail(`provisioned binary reports "${reported}", expected ${pin.cli_version}.`);
-  }
-  console.log(
-    `Pinned provision proven: ${target} ${pin.cli_version} from github_release, ` +
-      `archive ${manifest.archive_sha256.slice(0, 12)}…, binary reports "${reported}".`,
+const versionDir = path.join(dataDir, "codestory-cli", pin.cli_version);
+const manifest = JSON.parse(fs.readFileSync(path.join(versionDir, "manifest.json"), "utf8"));
+const target =
+  process.platform === "darwin"
+    ? "macos-arm64"
+    : process.platform === "win32"
+      ? "windows-x64"
+      : "linux-x64";
+if (manifest.version !== pin.cli_version) {
+  fail(`provisioned ${manifest.version}, pin names ${pin.cli_version}.`);
+}
+if (manifest.build_source !== "github_release") {
+  fail(`expected a github_release provision, observed ${manifest.build_source}.`);
+}
+if (pin.archives?.[target] && manifest.archive_sha256 !== pin.archives[target]) {
+  fail(
+    `provisioned archive digest ${manifest.archive_sha256} does not match the pin's ` +
+      `${target} digest ${pin.archives[target]}.`,
   );
-  fs.rmSync(dataDir, { recursive: true, force: true });
-  process.exit(0);
-}, 250);
+}
+const binary = path.join(versionDir, manifest.path);
+const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim();
+if (!reported.includes(pin.cli_version)) {
+  fail(`provisioned binary reports "${reported}", expected ${pin.cli_version}.`);
+}
+console.log(
+  `Pinned provision proven: ${target} ${pin.cli_version} from github_release, ` +
+    `archive ${manifest.archive_sha256.slice(0, 12)}…, binary reports "${reported}".`,
+);
+fs.rmSync(dataDir, { recursive: true, force: true });
+process.exit(0);

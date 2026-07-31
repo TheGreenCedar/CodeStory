@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
-const GRAPH_VERSION = 7;
+const GRAPH_VERSION = 11;
 const KNOWN_PACKAGE_TARGETS = new Set([
   "linux-arm64",
   "linux-x64",
@@ -78,6 +78,8 @@ const REQUIRED_FAILURE_CONTROLS = [
   "sidecar_runtime_mismatch",
   "stale_or_partial_publication",
 ];
+const BENCHMARK_LEAKAGE_COMMAND =
+  "node --test scripts/tests/lint-retrieval-generalization.test.mjs";
 const FAILURE_ORDER = new Map([
   ["unsupported_claim", 0],
   ["missing", 1],
@@ -172,6 +174,79 @@ export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
   };
 }
 
+/// What each reuse binding's own construction determines, and may therefore equate.
+///
+/// Reuse always reads a reused row's *commit* at the release commit -- that is what anchoring to
+/// the earlier run means. Equating goes further: it lets a reused row keep an identity whose value
+/// differs from this release's, so it may only ever name a key the binding itself determines. The
+/// graph declares which of these keys each binding actually uses (`evidence_policy.reuse.bindings`)
+/// and why; this map is the ceiling, stated next to the proofs that establish it, so a graph edit
+/// alone can never grant an equation no binding proves.
+///
+///   * `source_tree` proves the reused commit resolves to this release's own tree. Nothing needs
+///     substituting: every tree-derived identity a reused row declares is still checkable directly
+///     against this release, and equating one would replace a live check with nothing. Hence [].
+///   * `native_fingerprint` proves the two commits' native build inputs -- crates/**, Cargo.lock,
+///     vendor/**, the packaging scripts, the toolchain pins, version-normalized -- hash equal. That
+///     determines the built accelerator, so accelerator execution evidence transfers across the
+///     source_tree difference the binding exists to tolerate. It determines nothing about the
+///     repository, the packaged bytes, the host, or the version, so none of those may be equated.
+const REUSE_BINDING_EQUATABLE_IDENTITY = Object.freeze({
+  source_tree: Object.freeze([]),
+  native_fingerprint: Object.freeze(["source_tree"]),
+});
+
+/// Verify a reuse binding against the local repository and return its recorded value.
+///
+/// Both sides of the release ledger need this: the producer proves the binding before it admits
+/// cross-run evidence, and the closeout re-proves it against its own checkout before it anchors a
+/// reused row to the earlier run.
+export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
+  if (!Object.hasOwn(REUSE_BINDING_EQUATABLE_IDENTITY, binding)) {
+    fail(`unknown reuse binding ${binding}`);
+  }
+  // Ancestry is a property of reuse itself, not of any one binding: evidence may only be inherited
+  // forward along this release's own history. Without it, a binding that compares content alone --
+  // a fingerprint, say -- would admit a run from a fork or an abandoned branch that happens to
+  // share the content, which is a different repository's proof wearing this release's clothes.
+  if (spawnSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
+    cwd: repository,
+    encoding: "utf8",
+  }).status !== 0) {
+    fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
+  }
+  if (binding === "source_tree") {
+    const releaseTree = git(["rev-parse", `${releaseCommit}^{tree}`], repository);
+    const reusedTree = git(["rev-parse", `${reusedCommit}^{tree}`], repository);
+    if (releaseTree !== reusedTree) {
+      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
+    }
+    return releaseTree;
+  }
+  if (binding === "native_fingerprint") {
+    const script = fileURLToPath(new URL("./native-fingerprint.mjs", import.meta.url));
+    const fingerprint = (ref) => {
+      const result = spawnSync(process.execPath, [script, "--ref", ref], {
+        cwd: repository,
+        encoding: "utf8",
+      });
+      if (result.status !== 0) fail(`native fingerprint of ${ref} failed: ${result.stderr.trim()}`);
+      return result.stdout.trim();
+    };
+    const releasePrint = fingerprint(releaseCommit);
+    const reusedPrint = fingerprint(reusedCommit);
+    if (releasePrint !== reusedPrint) {
+      fail(
+        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
+          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
+      );
+    }
+    return releasePrint;
+  }
+  // Reachable only if a binding is added to the equation ceiling above without a proof here.
+  fail(`reuse binding ${binding} has no verification`);
+}
+
 function uniqueById(values, label) {
   if (!Array.isArray(values) || values.length === 0) fail(`${label} must be a non-empty array`);
   const found = new Map();
@@ -182,6 +257,688 @@ function uniqueById(values, label) {
     found.set(id, row);
   }
   return found;
+}
+
+/// Every closeout cell one protected job produces, keyed by the leaf Actions job name that produces
+/// it. A host that goes missing takes its whole column with it, so the withheld set is derived from
+/// the graph instead of listed by hand: adding a cell to a protected job cannot leave a stale
+/// non-claim behind that quietly keeps claiming something.
+function cellsByProducerJobName(cellGroups) {
+  const byJobName = new Map();
+  const record = (jobName, cellId) => {
+    if (typeof jobName !== "string" || jobName === "") return;
+    if (!byJobName.has(jobName)) byJobName.set(jobName, []);
+    byJobName.get(jobName).push(cellId);
+  };
+  for (const [groupId, group] of cellGroups) {
+    if (group.expansion === "instances") {
+      for (const instance of group.instances) {
+        record(
+          instance.identity_constraints?.producer_job_name
+            ?? group.identity_constraints?.producer_job_name,
+          `${groupId}:${instance.id}`,
+        );
+      }
+    }
+  }
+  return byJobName;
+}
+
+/// What each reuse binding is permitted to equate, declared per binding by the graph.
+///
+/// A reused row is read at the release commit; every other identity it carries is checked as
+/// written unless its binding declares that key here. That declaration is the whole authorisation:
+/// no cell group gets an exception, and no group narrows its own `required_identity` to make room
+/// for one, because narrowing would drop the check for fresh evidence too. So the equation has to
+/// survive three separate refusals before the closeout will honour it:
+///
+///   * The key must be one the binding's construction determines -- `REUSE_BINDING_EQUATABLE_IDENTITY`
+///     above is the ceiling, stated beside the proofs, so a graph edit alone cannot invent one.
+///   * The key must be part of the release identity binding (minus `commit`, which reuse anchors
+///     rather than equates), so the closeout always holds an authoritative release-side value and
+///     an authoritative reused-side value to put in its place.
+///   * The graph must say, in prose, why that particular key follows from that particular proof.
+///     An equation nobody can justify in a sentence is one nobody should be granting.
+function validateReuseBindings(evidencePolicy, identityBinding) {
+  const reuse = object(evidencePolicy.reuse, "release claim graph.evidence_policy.reuse");
+  nonEmptyText(reuse.equation, "release claim graph.evidence_policy.reuse.equation");
+  nonEmptyText(reuse.verification, "release claim graph.evidence_policy.reuse.verification");
+  const bindings = object(reuse.bindings, "release claim graph.evidence_policy.reuse.bindings");
+  const implemented = Object.keys(REUSE_BINDING_EQUATABLE_IDENTITY).sort();
+  if (JSON.stringify(Object.keys(bindings).sort()) !== JSON.stringify(implemented)) {
+    fail(`release claim graph reuse bindings must declare exactly ${implemented.join(", ")}`);
+  }
+  const equatable = new Set(identityBinding.filter((key) => key !== "commit"));
+  for (const [id, value] of Object.entries(bindings)) {
+    const binding = object(value, `release claim graph reuse binding ${id}`);
+    nonEmptyText(binding.admits, `release claim graph reuse binding ${id}.admits`);
+    if (!Array.isArray(binding.equates)) {
+      fail(`release claim graph reuse binding ${id}.equates must be an array`);
+    }
+    const determines = new Set(REUSE_BINDING_EQUATABLE_IDENTITY[id]);
+    const declared = new Set();
+    for (const [index, entryValue] of binding.equates.entries()) {
+      const entry = object(entryValue, `release claim graph reuse binding ${id}.equates[${index}]`);
+      const key = nonEmptyText(entry.identity, `release claim graph reuse binding ${id}.equates[${index}].identity`);
+      nonEmptyText(entry.justification, `release claim graph reuse binding ${id} equated identity ${key}.justification`);
+      if (declared.has(key)) fail(`release claim graph reuse binding ${id} equates ${key} twice`);
+      declared.add(key);
+      if (!equatable.has(key)) {
+        fail(`release claim graph reuse binding ${id} may not equate identity ${key} outside the release identity binding`);
+      }
+      if (!determines.has(key)) {
+        fail(`release claim graph reuse binding ${id} may not equate identity ${key}, which its construction does not determine`);
+      }
+    }
+  }
+}
+
+/// How much of a release may go unproven and still publish. Withholding exists so one dead host
+/// cannot cost a release its other nine cells -- it is not a way to publish a release nothing
+/// vouched for. The two numbers below are the whole policy and they live in the graph rather than
+/// in the closeout, because a reader deciding whether to trust a release reads the graph:
+///
+///   * `maximum_withheld_hosts` bounds how many of the protected hosts may be silent at once. It
+///     must stay strictly below the number of hosts, so "every accelerator was withheld" is
+///     unrepresentable rather than merely discouraged.
+///   * `claims_requiring_proof` names the claims that must retain at least one *passing* cell in
+///     any phase that requires them. A withheld cell records a non-claim, so it can never be the
+///     thing that satisfies one of these.
+function validateWithholdPolicy(policy, hosts, cellGroups) {
+  const withhold = object(
+    policy.withhold_policy,
+    "release claim graph.non_claim_policy.withhold_policy",
+  );
+  const maximum = withhold.maximum_withheld_hosts;
+  if (!Number.isInteger(maximum) || maximum < 1) {
+    fail("non_claim_policy.withhold_policy.maximum_withheld_hosts must be a positive integer");
+  }
+  if (maximum >= hosts.size) {
+    fail(
+      "non_claim_policy.withhold_policy.maximum_withheld_hosts must leave at least one protected "
+      + `host proven (${hosts.size} hosts are declared)`,
+    );
+  }
+  if (withhold.archive_identity_source !== "candidate_archive_record") {
+    fail(
+      "non_claim_policy.withhold_policy.archive_identity_source must be candidate_archive_record",
+    );
+  }
+  const required = stringArray(
+    withhold.claims_requiring_proof,
+    "non_claim_policy.withhold_policy.claims_requiring_proof",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(required) !== JSON.stringify([...required].sort())) {
+    fail("non_claim_policy.withhold_policy.claims_requiring_proof must be sorted");
+  }
+  const claimOfCellGroup = new Map(
+    [...cellGroups].map(([groupId, group]) => [groupId, group.claim]),
+  );
+  const closeoutClaims = new Set(claimOfCellGroup.values());
+  for (const claimId of required) {
+    if (!closeoutClaims.has(claimId)) {
+      fail(`non_claim_policy.withhold_policy.claims_requiring_proof names unclosed claim ${claimId}`);
+    }
+  }
+  const withheldClaims = new Set();
+  for (const host of hosts.values()) {
+    for (const cellId of host.withheld_cells ?? []) {
+      const claimId = claimOfCellGroup.get(String(cellId).split(":")[0]);
+      if (claimId !== undefined) withheldClaims.add(claimId);
+    }
+  }
+  // Every claim a host can withhold has to be one the policy insists stays proven somewhere,
+  // otherwise the cap would be silent about exactly the claims withholding can erase.
+  for (const claimId of [...withheldClaims].sort()) {
+    if (!required.includes(claimId)) {
+      fail(
+        `non_claim_policy.withhold_policy.claims_requiring_proof must include ${claimId}, `
+        + "which a withheld host can erase",
+      );
+    }
+  }
+}
+
+function validateNonClaimPolicy(graph, cellGroups) {
+  const policy = object(graph.non_claim_policy, "release claim graph.non_claim_policy");
+  if (policy.schema !== "codestory.release-non-claim/v1") {
+    fail("release claim graph.non_claim_policy.schema must be codestory.release-non-claim/v1");
+  }
+  // The recorded state mirrors the package manifest's own accelerator non-claim, so a reader who
+  // already understands `not_proven_by_package` reads a withheld release cell the same way.
+  if (policy.runtime_execution !== "not_proven_by_package") {
+    fail("release claim graph.non_claim_policy.runtime_execution must be not_proven_by_package");
+  }
+  nonEmptyText(policy.reason, "release claim graph.non_claim_policy.reason");
+  nonEmptyText(policy.annotation, "release claim graph.non_claim_policy.annotation");
+  nonEmptyText(policy.recovery_contract, "release claim graph.non_claim_policy.recovery_contract");
+  if (policy.maximum_run_attempts !== 2) {
+    fail("release claim graph.non_claim_policy.maximum_run_attempts must be 2");
+  }
+  for (const key of ["producer_workflow", "producer_job", "producer_job_name"]) {
+    nonEmptyText(policy[key], `release claim graph.non_claim_policy.${key}`);
+  }
+  const producedCells = cellsByProducerJobName(cellGroups);
+  const hosts = uniqueById(policy.hosts, "release claim graph.non_claim_policy.hosts");
+  validateWithholdPolicy(policy, hosts, cellGroups);
+  const artifacts = new Set();
+  const accelerator = cellGroups.get("accelerator_execution");
+  const acceleratorInstances = (accelerator?.instances ?? []).map(({ id }) => id).sort();
+  if (JSON.stringify([...hosts.keys()].sort()) !== JSON.stringify(acceleratorInstances)) {
+    fail("non_claim_policy.hosts must name exactly the protected accelerator instances");
+  }
+  for (const [hostId, host] of hosts) {
+    nonEmptyText(host.unavailable_producer_workflow, `non_claim_policy.hosts ${hostId}.unavailable_producer_workflow`);
+    const jobName = nonEmptyText(
+      host.unavailable_producer_job_name,
+      `non_claim_policy.hosts ${hostId}.unavailable_producer_job_name`,
+    );
+    // One artifact container may only hold cells of a single closeout phase, because the phase's
+    // trusted producer map is what authorizes every manifest inside the container it downloads.
+    const hostArtifacts = object(
+      host.producer_artifacts,
+      `non_claim_policy.hosts ${hostId}.producer_artifacts`,
+    );
+    if (JSON.stringify(Object.keys(hostArtifacts).sort()) !== JSON.stringify(["post_publish", "pre_publish"])) {
+      fail(`non_claim_policy.hosts ${hostId}.producer_artifacts must name one artifact per closeout phase`);
+    }
+    for (const [phase, artifact] of Object.entries(hostArtifacts)) {
+      nonEmptyText(artifact, `non_claim_policy.hosts ${hostId}.producer_artifacts.${phase}`);
+      if (!artifact.includes("{attempt}")) {
+        fail(`non_claim_policy.hosts ${hostId}.producer_artifacts.${phase} must be attempt-qualified`);
+      }
+      if (artifacts.has(artifact)) fail(`non_claim_policy.hosts duplicates artifact ${artifact}`);
+      artifacts.add(artifact);
+    }
+    const declared = stringArray(
+      host.withheld_cells,
+      `non_claim_policy.hosts ${hostId}.withheld_cells`,
+      { nonEmpty: true },
+    );
+    const derived = producedCells.get(jobName) ?? [];
+    if (JSON.stringify([...declared].sort()) !== JSON.stringify([...derived].sort())) {
+      fail(`non_claim_policy host ${hostId} must withhold exactly the cells ${jobName} produces`);
+    }
+  }
+}
+
+// Marketplace catalog publication is delivery, not a release gate: it happens after the tag and
+// the GitHub release already exist, so failing the release on it would only convert a recoverable
+// delivery gap into an unrecoverable one. The price of that is that the release must say which of
+// the two states it is in, so the graph names both and pins a distinct installer identity to each.
+// A run that could not publish records the deferred identity in its post-publish cells; nothing in
+// the pipeline is allowed to record the published identity without the catalog push succeeding.
+function validateCatalogDelivery(policy, dependencies, cellGroups) {
+  const delivery = object(policy.catalog_delivery, "workflow_policy.catalog_delivery");
+  const publishJob = nonEmptyText(delivery.publish_job, "workflow_policy.catalog_delivery.publish_job");
+  if (dependencies[publishJob] === undefined) {
+    fail(`workflow_policy.catalog_delivery.publish_job ${publishJob} must be a release chain job`);
+  }
+  nonEmptyText(delivery.recovery_workflow, "workflow_policy.catalog_delivery.recovery_workflow");
+  if (delivery.release_gate !== false) {
+    fail("workflow_policy.catalog_delivery.release_gate must be false: catalog publication is delivery, not a release gate");
+  }
+  if (!Array.isArray(delivery.states) || delivery.states.length !== 2) {
+    fail("workflow_policy.catalog_delivery.states must name exactly the published and deferred states");
+  }
+  const installers = new Set();
+  const byId = new Map();
+  for (const [index, stateValue] of delivery.states.entries()) {
+    const state = object(stateValue, `workflow_policy.catalog_delivery.states[${index}]`);
+    const id = nonEmptyText(state.id, `workflow_policy.catalog_delivery.states[${index}].id`);
+    const installer = nonEmptyText(
+      state.installer,
+      `workflow_policy.catalog_delivery.states[${index}].installer`,
+    );
+    if (!identityMatchesFormat(installer, "identifier")) {
+      fail(`workflow_policy.catalog_delivery.states[${index}].installer does not match identifier`);
+    }
+    if (typeof state.live_catalog_revision !== "boolean") {
+      fail(`workflow_policy.catalog_delivery.states[${index}].live_catalog_revision must be a boolean`);
+    }
+    if (installers.has(installer)) {
+      fail("workflow_policy.catalog_delivery states must record distinct installer identities");
+    }
+    installers.add(installer);
+    byId.set(id, state);
+  }
+  for (const id of ["published", "deferred"]) {
+    if (!byId.has(id)) fail(`workflow_policy.catalog_delivery.states must declare the ${id} state`);
+  }
+  if (byId.get("published").live_catalog_revision !== true) {
+    fail("workflow_policy.catalog_delivery published state must consume the live catalog revision");
+  }
+  if (byId.get("deferred").live_catalog_revision !== false) {
+    fail("workflow_policy.catalog_delivery deferred state must not consume a live catalog revision");
+  }
+  // Naming the two states is not enough on its own: something has to read the mark, or a
+  // deferred release's closeout verdict stays indistinguishable from a published one. This
+  // names the post-publish cell family whose signed `installer` identity the closeout resolves
+  // the delivery state from, so the graph cannot declare the states without a reader.
+  const installedCellGroup = nonEmptyText(
+    delivery.installed_cell_group,
+    "workflow_policy.catalog_delivery.installed_cell_group",
+  );
+  const group = cellGroups.get(installedCellGroup);
+  if (group === undefined) {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a closeout cell group`);
+  }
+  if (group.phase !== "post_publish") {
+    fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must be a post-publish cell group`);
+  }
+  for (const key of ["required_identity", "singleton_identity"]) {
+    if (!(group[key] ?? []).includes("installer")) {
+      fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must carry installer in ${key}`);
+    }
+  }
+  return delivery;
+}
+
+function validateCalibrationPolicy(value) {
+  const calibration = object(value, "workflow_policy.calibration");
+  if (
+    calibration.coordinator_workflow !== "packaged-platform-pr.yml"
+    || calibration.mode !== "calibration"
+    || calibration.assembly_job !== "calibration-assemble"
+    || calibration.pre_collection_source_proof_required !== false
+    || calibration.source_proof_stage !== "frozen_candidate_before_qualification"
+  ) {
+    fail("workflow_policy.calibration must collect before the sole frozen-candidate source proof");
+  }
+  if (calibration.runs_per_required_cell !== 3) {
+    fail("workflow_policy.calibration must require exactly three clean runs per required cell");
+  }
+  if (calibration.samples_per_metric_per_run !== 1) {
+    fail("workflow_policy.calibration must require exactly one sample per metric per run");
+  }
+  const requiredCells = calibration.required_cells;
+  if (!Array.isArray(requiredCells) || requiredCells.length !== 1) {
+    fail("workflow_policy.calibration must declare exactly one required cell");
+  }
+  const required = object(requiredCells[0], "workflow_policy.calibration.required_cells[0]");
+  if (
+    required.id !== "protected_macos_arm64_metal"
+    || required.workflow !== "macos-metal-proof.yml"
+    || required.job !== "packaged-metal"
+    || required.policy !== "accelerated"
+    || required.backend !== "metal"
+    || required.feeds_constant_selection !== true
+  ) {
+    fail("workflow_policy.calibration required cell must be protected macOS Metal");
+  }
+  const optionalCells = calibration.optional_cells;
+  if (!Array.isArray(optionalCells) || optionalCells.length !== 1) {
+    fail("workflow_policy.calibration must declare exactly one optional evidence cell");
+  }
+  const optional = object(optionalCells[0], "workflow_policy.calibration.optional_cells[0]");
+  if (
+    optional.id !== "protected_linux_x64_vulkan"
+    || optional.workflow !== "linux-vulkan-proof.yml"
+    || optional.job !== "optional-constant-calibration"
+    || optional.trigger !== "workflow_dispatch"
+    || optional.policy !== "accelerated"
+    || optional.backend !== "vulkan"
+    || optional.assembly_dependency !== false
+    || optional.feeds_constant_selection !== false
+  ) {
+    fail("workflow_policy.calibration optional cell must be standalone non-selecting Linux Vulkan evidence");
+  }
+  const expectedMetrics = [
+    "existing_owner_connect",
+    "spawn_convergence",
+    "cold_first_vector",
+    "first_product_ready",
+    "warm_query_ipc",
+    "warm_bulk_ipc",
+    "bulk_documents_per_second",
+    "bulk_tokens_per_second",
+    "busy_retry_usefulness",
+  ];
+  const metrics = stringArray(
+    calibration.constant_metrics,
+    "workflow_policy.calibration.constant_metrics",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(metrics) !== JSON.stringify(expectedMetrics)) {
+    fail("workflow_policy.calibration constant metrics must match the runtime-constant source set");
+  }
+  const expectedForbiddenEvidence = [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "retrieval_quality",
+    "backend_observed_accelerator_residency",
+  ];
+  const forbiddenEvidence = stringArray(
+    calibration.forbidden_evidence,
+    "workflow_policy.calibration.forbidden_evidence",
+    { nonEmpty: true },
+  );
+  if (JSON.stringify(forbiddenEvidence) !== JSON.stringify(expectedForbiddenEvidence)) {
+    fail("workflow_policy.calibration must exclude qualification-only evidence");
+  }
+  const forbiddenPolicies = stringArray(
+    calibration.forbidden_policies,
+    "workflow_policy.calibration.forbidden_policies",
+    { nonEmpty: true },
+  );
+  const forbiddenBackends = stringArray(
+    calibration.forbidden_backends,
+    "workflow_policy.calibration.forbidden_backends",
+    { nonEmpty: true },
+  );
+  const forbiddenEnvironment = stringArray(
+    calibration.forbidden_environment,
+    "workflow_policy.calibration.forbidden_environment",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify(forbiddenPolicies) !== JSON.stringify(["cpu_explicit"])
+    || JSON.stringify(forbiddenBackends) !== JSON.stringify(["cpu"])
+    || JSON.stringify(forbiddenEnvironment)
+      !== JSON.stringify(["CODESTORY_EMBED_ALLOW_CPU=1"])
+  ) {
+    fail("workflow_policy.calibration must forbid CPU environment, policy, and backend selection");
+  }
+}
+
+function validateQualificationPolicy(value) {
+  const qualification = object(value, "workflow_policy.qualification");
+  if (
+    qualification.coordinator_workflow !== "packaged-platform-pr.yml"
+    || qualification.mode !== "qualification"
+    || qualification.runs_per_available_cell !== 1
+  ) {
+    fail("workflow_policy.qualification must name the canonical one-run frozen-candidate coordinator");
+  }
+  const driver = object(
+    qualification.driver_contract,
+    "workflow_policy.qualification.driver_contract",
+  );
+  const expectedDriverKeys = [
+    "artifact_directory_template",
+    "artifact_name_template",
+    "build_invocations_per_platform",
+    "identity_fields",
+    "identity_file",
+    "identity_schema_version",
+    "producer_job",
+    "producer_workflow",
+    "public_release_asset",
+    "reuse_required",
+  ].sort();
+  const expectedIdentityFields = [
+    "schema_version",
+    "source.commit",
+    "source.tree",
+    "release_version",
+    "asset_target",
+    "archive.file",
+    "archive.bytes",
+    "archive.sha256",
+    "driver.file",
+    "driver.bytes",
+    "driver.sha256",
+  ];
+  if (
+    JSON.stringify(Object.keys(driver).sort()) !== JSON.stringify(expectedDriverKeys)
+    || driver.producer_workflow !== "packaged-platform-proof.yml"
+    || driver.producer_job !== "build"
+    || driver.artifact_name_template
+      !== "codestory-qualification-driver-{asset_target}"
+    || driver.artifact_directory_template !== "."
+    || driver.identity_file !== "qualification-driver-identity.json"
+    || driver.identity_schema_version !== 1
+    || JSON.stringify(driver.identity_fields) !== JSON.stringify(expectedIdentityFields)
+    || driver.build_invocations_per_platform !== 1
+    || driver.reuse_required !== true
+    || driver.public_release_asset !== false
+  ) {
+    fail("workflow_policy.qualification must bind one archive-matched package-built qualification driver");
+  }
+  const requiredCells = qualification.required_cells;
+  if (!Array.isArray(requiredCells) || requiredCells.length !== 2) {
+    fail("workflow_policy.qualification must require protected macOS Metal and Windows Vulkan");
+  }
+  const expectedRequiredCells = [
+    {
+      id: "protected_macos_arm64_metal",
+      workflow: "macos-metal-proof.yml",
+      job: "packaged-metal",
+      policy: "accelerated",
+      backend: "metal",
+    },
+    {
+      id: "protected_windows_x64_vulkan",
+      workflow: "windows-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      policy: "accelerated",
+      backend: "vulkan",
+    },
+  ];
+  if (JSON.stringify(requiredCells) !== JSON.stringify(expectedRequiredCells)) {
+    fail("workflow_policy.qualification required cells must be the protected Metal and Vulkan producers");
+  }
+  const optionalCells = qualification.optional_cells;
+  const expectedOptionalCells = [
+    {
+      id: "protected_linux_x64_vulkan",
+      workflow: "linux-vulkan-proof.yml",
+      job: "packaged-vulkan",
+      trigger: "workflow_dispatch",
+      policy: "accelerated",
+      backend: "vulkan",
+      closeout_dependency: false,
+      blocking: false,
+    },
+  ];
+  if (JSON.stringify(optionalCells) !== JSON.stringify(expectedOptionalCells)) {
+    fail("workflow_policy.qualification Linux Vulkan cell must be standalone and nonblocking");
+  }
+  const quality = object(
+    qualification.quality_contract,
+    "workflow_policy.qualification.quality_contract",
+  );
+  const expectedQuality = {
+    producer_workflow: "packaged-platform-pr.yml",
+    producer_job: "frozen-candidate-quality",
+    producer_cell: "protected_macos_arm64_metal",
+    scheduled_once_per_frozen_candidate: true,
+    blocking: false,
+    closeout_dependency: false,
+    claimed: false,
+    archive_cache_key_fields: [
+      "source.commit",
+      "target",
+      "archive.sha256",
+    ],
+    archive_cache_contract: "candidate_archive_cache",
+    archive_transfer: "authenticated_miss_only",
+    evaluation_owner: "isolated_reusable_workflow",
+    evaluation_owner_sha256:
+      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+    evaluation_contract: "publishable-three-repeat-packet/v1",
+    task_count: 1,
+    repeats_per_task: 3,
+    row_count: 3,
+  };
+  if (
+    JSON.stringify(quality) !== JSON.stringify(expectedQuality)
+  ) {
+    fail("workflow_policy.qualification quality contract must bind the optional isolated exact-package adjunct");
+  }
+  const expectedEvidence = [
+    "qualification_scenarios",
+    "true_idle_exit",
+    "total_codestory_process_memory",
+    "backend_observed_accelerator_residency",
+  ];
+  if (
+    JSON.stringify(stringArray(
+      qualification.required_evidence,
+      "workflow_policy.qualification.required_evidence",
+      { nonEmpty: true },
+    )) !== JSON.stringify(expectedEvidence)
+  ) {
+    fail("workflow_policy.qualification must retain lifecycle evidence without optional retrieval quality");
+  }
+  const expectedScenarios = [
+    "client_death",
+    "cold_race",
+    "frozen_owner",
+    "incompatible_owner",
+    "mixed_queue",
+    "server_crash",
+    "true_idle_respawn",
+    "worker_stall",
+  ];
+  if (
+    JSON.stringify(stringArray(
+      qualification.required_scenarios,
+      "workflow_policy.qualification.required_scenarios",
+      { nonEmpty: true },
+    )) !== JSON.stringify(expectedScenarios)
+  ) {
+    fail("workflow_policy.qualification must run each lifecycle and fault scenario once");
+  }
+  if (
+    qualification.true_idle_timeout_ms !== 60_000
+    || qualification.true_idle_observation_grace_ms !== 2_500
+  ) {
+    fail("workflow_policy.qualification true-idle bound must be the product timeout plus explicit grace");
+  }
+  if (
+    JSON.stringify(qualification.forbidden_policies) !== JSON.stringify(["cpu_explicit"])
+    || JSON.stringify(qualification.forbidden_backends) !== JSON.stringify(["cpu"])
+    || JSON.stringify(qualification.forbidden_environment)
+      !== JSON.stringify(["CODESTORY_EMBED_ALLOW_CPU=1"])
+  ) {
+    fail("workflow_policy.qualification must forbid CPU environment, policy, and backend selection");
+  }
+}
+
+function exactStringList(value, expected, label) {
+  const actual = stringArray(value, label, { nonEmpty: true });
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    fail(`${label} must be exactly ${expected.join(", ")}`);
+  }
+  return actual;
+}
+
+function validateWindowsPackageGraph(value) {
+  const graph = object(value, "workflow_policy.windows_package_graph");
+  if (
+    graph.asset_target !== "windows-x64"
+    || graph.cargo_profile !== "release"
+    || graph.cargo_build_invocations !== 1
+    || graph.cargo_test_invocations_after_build !== 0
+    || graph.package_artifact !== "codestory-cli"
+  ) {
+    fail("workflow_policy.windows_package_graph must build and package one exact Windows release graph");
+  }
+  exactStringList(
+    graph.artifacts,
+    [
+      "codestory-cli",
+      "codestory-cli-runtime",
+      "codestory_embedding_qualification",
+    ],
+    "workflow_policy.windows_package_graph.artifacts",
+  );
+  if (
+    JSON.stringify(stringArray(
+      graph.direct_test_harnesses,
+      "workflow_policy.windows_package_graph.direct_test_harnesses",
+    )) !== JSON.stringify([])
+  ) {
+    fail("workflow_policy.windows_package_graph.direct_test_harnesses must be empty");
+  }
+  exactStringList(
+    graph.source_test_harnesses,
+    ["native_staging", "windows_path_identity"],
+    "workflow_policy.windows_package_graph.source_test_harnesses",
+  );
+  exactStringList(
+    graph.production_feature_probes,
+    ["cargo_message_feature_contract", "runtime_observation_source"],
+    "workflow_policy.windows_package_graph.production_feature_probes",
+  );
+  exactStringList(
+    graph.timing_phases,
+    [
+      "cache_restore",
+      "native_setup",
+      "cargo_graph",
+      "msvc_link",
+      "feature_probe",
+      "packaging",
+      "artifact_transfer",
+    ],
+    "workflow_policy.windows_package_graph.timing_phases",
+  );
+}
+
+function validateCandidateArchiveCache(value) {
+  const cache = object(value, "workflow_policy.candidate_archive_cache");
+  if (
+    cache.record_schema !== "codestory-candidate-archive-store/v1"
+    || cache.protected_host_root !== "runner_tool_cache"
+    || cache.package_producer_workflow !== "packaged-platform-proof.yml"
+    || cache.package_artifact_name !== "codestory-cli-{asset_target}"
+    || cache.record_artifact_name
+      !== "codestory-candidate-archive-record-{asset_target}"
+    || cache.qualification_driver_artifact_name
+      !== "codestory-qualification-driver-{asset_target}"
+    || cache.miss_admission !== "same_filesystem_atomic_rename"
+    || cache.owned_corruption !== "quarantine_then_authenticated_miss"
+    || cache.unowned_corruption !== "fail_closed"
+    || cache.cross_source_reuse !== false
+    || cache.restore_prefixes !== false
+    || cache.public_asset_reauthentication !== true
+  ) {
+    fail("workflow_policy.candidate_archive_cache must retain exact-source atomic protected-host reuse");
+  }
+  exactStringList(
+    cache.key_fields,
+    ["source.commit", "target", "archive.sha256"],
+    "workflow_policy.candidate_archive_cache.key_fields",
+  );
+  exactStringList(
+    cache.hit_verification,
+    [
+      "repository",
+      "source.commit",
+      "source.tree",
+      "target",
+      "archive.file",
+      "archive.bytes",
+      "archive.sha256",
+    ],
+    "workflow_policy.candidate_archive_cache.hit_verification",
+  );
+}
+
+function validateModelMaterialCache(value) {
+  const cache = object(value, "workflow_policy.model_material_cache");
+  if (
+    cache.key_field !== "model.sha256"
+    || cache.source_sha_in_key !== false
+    || cache.toolchain_in_key !== false
+    || cache.miss_admission !== "same_filesystem_atomic_no_replace"
+  ) {
+    fail("workflow_policy.model_material_cache must key immutable model material only by model SHA");
+  }
+  exactStringList(
+    cache.hit_verification,
+    [
+      "model.real_ancestry",
+      "model.single_link",
+      "model.size_bytes",
+      "model.sha256",
+    ],
+    "workflow_policy.model_material_cache.hit_verification",
+  );
 }
 
 function validatePublicSupport(graph, packageTargets, cellGroups) {
@@ -205,8 +962,8 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
     if (row.local_map !== "supported") {
       fail(`public_support package ${target} must support the local map`);
     }
-    if (!new Set(["accelerated", "cpu_explicit"]).has(row.broad_retrieval)) {
-      fail(`public_support package ${target} has an invalid broad retrieval path`);
+    if (row.broad_retrieval !== "accelerated") {
+      fail(`public_support package ${target} must require accelerated broad retrieval`);
     }
     if (!new Set(["none", "metal", "vulkan"]).has(row.accelerator_claim)) {
       fail(`public_support package ${target} has an invalid accelerator claim`);
@@ -234,11 +991,8 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
     ) {
       fail(`public accelerator claim ${target}/${row.accelerator_claim} has no required closeout cell`);
     }
-    if (
-      (row.accelerator_claim === "none")
-      !== (row.broad_retrieval === "cpu_explicit")
-    ) {
-      fail(`public_support package ${target} has inconsistent execution and accelerator claims`);
+    if (row.accelerator_claim === "none") {
+      fail(`public_support package ${target} must name its accelerator claim`);
     }
   }
 
@@ -308,6 +1062,77 @@ function validatePublicSupport(graph, packageTargets, cellGroups) {
   }
 }
 
+// The plugin lane's job DAG lives in the claim graph rather than in check-workflow-policy.mjs, and
+// the checker only asserts that the workflow's `needs:` match whatever this data says. That makes
+// this the only place left that can tell a real ordering contract from an empty one: with the
+// dependency lists blanked out, both gates would pass while `gh release create` ran with the
+// release-authority checks and the whole plugin-proof matrix detached from it.
+const PLUGIN_CHAIN_ROOT = "workflow-policy";
+const PLUGIN_CHAIN_ORDER = [
+  // Tagging is irreversible, so everything that can still refuse the release runs before it.
+  ["publish", "preflight"],
+  ["publish", "plugin-proof"],
+  // The catalog and the install proof that reads it only mean anything once the release exists.
+  ["marketplace-publish", "publish"],
+  ["post-publish-smoke", "publish"],
+  ["post-publish-smoke", "marketplace-publish"],
+];
+
+function pluginChainAncestors(dependencies, job, seen = new Set()) {
+  for (const dependency of dependencies[job] ?? []) {
+    if (seen.has(dependency)) continue;
+    seen.add(dependency);
+    pluginChainAncestors(dependencies, dependency, seen);
+  }
+  return seen;
+}
+
+function validatePluginChain(value) {
+  const chain = object(value, "workflow_policy.plugin_chain");
+  const dependencies = object(chain.dependencies, "workflow_policy.plugin_chain.dependencies");
+  const jobs = Object.keys(dependencies);
+  if (jobs.length === 0) {
+    fail("workflow_policy.plugin_chain.dependencies must declare at least one job");
+  }
+  const declared = new Set([PLUGIN_CHAIN_ROOT, ...jobs]);
+  // Null-prototype so a job named after an Object member cannot smuggle a dependency list past the
+  // reachability walk below.
+  const resolved = Object.create(null);
+  for (const job of jobs) {
+    nonEmptyText(job, "workflow_policy.plugin_chain.dependencies job");
+    if (job === PLUGIN_CHAIN_ROOT) {
+      fail(`workflow_policy.plugin_chain.dependencies must not redeclare ${PLUGIN_CHAIN_ROOT}`);
+    }
+    resolved[job] = stringArray(
+      dependencies[job],
+      `workflow_policy.plugin_chain.dependencies.${job}`,
+      { nonEmpty: true },
+    );
+    for (const dependency of resolved[job]) {
+      if (!declared.has(dependency)) {
+        fail(`workflow_policy.plugin_chain.dependencies.${job} names undeclared job ${dependency}`);
+      }
+    }
+  }
+  for (const job of jobs) {
+    const ancestors = pluginChainAncestors(resolved, job);
+    if (ancestors.has(job)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} cannot depend on itself`);
+    }
+    if (!ancestors.has(PLUGIN_CHAIN_ROOT)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${PLUGIN_CHAIN_ROOT}`);
+    }
+  }
+  for (const [job, required] of PLUGIN_CHAIN_ORDER) {
+    if (!declared.has(job) || !declared.has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies must declare ${job} and ${required}`);
+    }
+    if (!pluginChainAncestors(resolved, job).has(required)) {
+      fail(`workflow_policy.plugin_chain.dependencies.${job} must run behind ${required}`);
+    }
+  }
+}
+
 export function canonicalReleaseClaimValue(value) {
   if (Array.isArray(value)) return value.map(canonicalReleaseClaimValue);
   if (value !== null && typeof value === "object") {
@@ -368,6 +1193,7 @@ export function validateReleaseClaimGraph(graph) {
   for (const key of identityBinding) {
     if (!identityFormats[key]) fail(`identity ${key} must declare a format`);
   }
+  validateReuseBindings(evidencePolicy, identityBinding);
 
   const exceptionPolicy = object(graph.exception_policy, "release claim graph.exception_policy");
   if (exceptionPolicy.schema !== "codestory.model-microbenchmark-exception/v1") {
@@ -498,7 +1324,13 @@ export function validateReleaseClaimGraph(graph) {
     if (!claims.has(control.claim)) fail(`failure control ${id} references unknown claim ${control.claim}`);
     if (control.control !== "negative_gate") fail(`failure control ${id} must be a negative_gate`);
     const command = nonEmptyText(control.command, `failure control ${id}.command`);
-    if (!command.startsWith("cargo test --locked ")) fail(`failure control ${id} must name a locked executable Cargo test`);
+    if (id === "benchmark_leakage") {
+      if (command !== BENCHMARK_LEAKAGE_COMMAND) {
+        fail(`failure control ${id} must be exactly ${BENCHMARK_LEAKAGE_COMMAND}`);
+      }
+    } else if (!command.startsWith("cargo test --locked ")) {
+      fail(`failure control ${id} must name a locked executable Cargo test`);
+    }
   }
 
   const closeout = object(graph.closeout, "release claim graph.closeout");
@@ -545,6 +1377,15 @@ export function validateReleaseClaimGraph(graph) {
     }
     if (!new Set(["none", "pre_publish", "post_publish_compare"]).has(group.archive_role)) {
       fail(`closeout cell group ${id} has unknown archive_role ${String(group.archive_role)}`);
+    }
+    // A group admits cross-run evidence by naming a binding the reuse policy declares -- and only
+    // by that. What the binding may then equate is the binding's business, stated once beside the
+    // proof, never a per-group exception.
+    if (group.reuse_binding !== undefined) {
+      const binding = nonEmptyText(group.reuse_binding, `closeout cell group ${id}.reuse_binding`);
+      if (!Object.hasOwn(evidencePolicy.reuse.bindings, binding)) {
+        fail(`closeout cell group ${id} names undeclared reuse binding ${binding}`);
+      }
     }
     const requiredIdentity = stringArray(
       group.required_identity,
@@ -593,6 +1434,8 @@ export function validateReleaseClaimGraph(graph) {
     }
   }
 
+  validateNonClaimPolicy(graph, cellGroups);
+
   const policy = object(graph.workflow_policy, "release claim graph.workflow_policy");
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
@@ -613,6 +1456,11 @@ export function validateReleaseClaimGraph(graph) {
     }
     targets.add(row.asset_target);
   }
+  validateWindowsPackageGraph(policy.windows_package_graph);
+  validateCandidateArchiveCache(policy.candidate_archive_cache);
+  validateModelMaterialCache(policy.model_material_cache);
+  validateCalibrationPolicy(policy.calibration);
+  validateQualificationPolicy(policy.qualification);
   validatePublicSupport(graph, targets, cellGroups);
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");
@@ -649,6 +1497,8 @@ export function validateReleaseClaimGraph(graph) {
       fail("optional release evidence must not block a standard release job");
     }
   }
+  validatePluginChain(policy.plugin_chain);
+  validateCatalogDelivery(policy, dependencies, cellGroups);
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");
@@ -658,9 +1508,199 @@ export function validateReleaseClaimGraph(graph) {
   nonEmptyText(promotion.manual_pr_ref_hint, "workflow_policy.promotion.manual_pr_ref_hint");
   nonEmptyText(promotion.source_cache_namespace, "workflow_policy.promotion.source_cache_namespace");
   nonEmptyText(promotion.packaged_cache_namespace, "workflow_policy.promotion.packaged_cache_namespace");
-  stringArray(promotion.label_routed_workflows, "workflow_policy.promotion.label_routed_workflows", { nonEmpty: true });
-  stringArray(promotion.required_events, "workflow_policy.promotion.required_events", { nonEmpty: true });
+  const labelRouted = stringArray(
+    promotion.label_routed_workflows,
+    "workflow_policy.promotion.label_routed_workflows",
+  );
+  const requiredEvents = stringArray(
+    promotion.required_events,
+    "workflow_policy.promotion.required_events",
+  );
+  if (labelRouted.length !== 0 || requiredEvents.length !== 0) {
+    fail("workflow_policy.promotion must not admit label-routed proof workflows");
+  }
 
+  const freeze = object(
+    policy.release_freeze_barrier,
+    "workflow_policy.release_freeze_barrier",
+  );
+  if (freeze.schema !== 3) {
+    fail("workflow_policy.release_freeze_barrier.schema must be 3");
+  }
+  nonEmptyText(freeze.script, "workflow_policy.release_freeze_barrier.script");
+  nonEmptyText(
+    freeze.status_context_prefix,
+    "workflow_policy.release_freeze_barrier.status_context_prefix",
+  );
+  stringArray(
+    freeze.allowed_future_source_changes,
+    "workflow_policy.release_freeze_barrier.allowed_future_source_changes",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.required_hostile_mutations,
+    "workflow_policy.release_freeze_barrier.required_hostile_mutations",
+    { nonEmpty: true },
+  );
+  stringArray(
+    freeze.broad_entry_workflows,
+    "workflow_policy.release_freeze_barrier.broad_entry_workflows",
+    { nonEmpty: true },
+  );
+  if (freeze.invalidation_workflow !== "release-freeze-invalidation.yml") {
+    fail(
+      "workflow_policy.release_freeze_barrier.invalidation_workflow must name "
+      + "release-freeze-invalidation.yml",
+    );
+  }
+  stringArray(
+    freeze.coordinator_only_workflows,
+    "workflow_policy.release_freeze_barrier.coordinator_only_workflows",
+    { nonEmpty: true },
+  );
+  const acceptance = object(
+    freeze.acceptance,
+    "workflow_policy.release_freeze_barrier.acceptance",
+  );
+  for (const field of [
+    "producer_workflow",
+    "receipt_authority",
+    "receipt_artifact",
+    "receipt_file",
+    "receipt_producer_job",
+    "status_scope",
+    "event",
+    "hostile_job",
+    "hostile_step",
+    "windows_job",
+    "windows_step",
+    "publisher_job",
+    "publisher_step",
+    "status_creator",
+    "job_manifest",
+    "job_manifest_sha256",
+  ]) {
+    nonEmptyText(
+      acceptance[field],
+      `workflow_policy.release_freeze_barrier.acceptance.${field}`,
+    );
+  }
+  const windowsRunner = stringArray(
+    acceptance.windows_runner,
+    "workflow_policy.release_freeze_barrier.acceptance.windows_runner",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify([...windowsRunner].sort())
+      !== JSON.stringify([
+        "self-hosted",
+        "Windows",
+        "X64",
+        "codestory-vulkan",
+      ].sort())
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.windows_runner "
+      + "must name the protected Windows Vulkan runner",
+    );
+  }
+  if (
+    acceptance.producer_workflow !== "source-proof.yml"
+    || acceptance.receipt_authority !== "github_actions"
+    || acceptance.receipt_artifact
+      !== "release-freeze-receipt-attempt-${{ github.run_attempt }}"
+    || acceptance.receipt_file !== "release-freeze-receipt.json"
+    || acceptance.receipt_producer_job !== "resolve"
+    || acceptance.status_scope !== "exact_candidate_head"
+    || acceptance.later_commit_revokes !== true
+    || acceptance.event !== "workflow_dispatch"
+    || acceptance.windows_probe_max_seconds !== 90
+    || acceptance.status_creator !== "github-actions[bot]"
+    || acceptance.job_manifest
+      !== ".github/scripts/release-freeze-acceptance-jobs.json"
+    || !SHA256.test(acceptance.job_manifest_sha256)
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance must bind the exact "
+      + "Actions receipt authority, immutable artifact, producer, event, protected "
+      + "probe budget, status scope, revocation, and status creator",
+    );
+  }
+  const freezePhases = object(
+    acceptance.phases,
+    "workflow_policy.release_freeze_barrier.acceptance.phases",
+  );
+  if (
+    JSON.stringify(Object.keys(freezePhases).sort())
+      !== JSON.stringify(["calibration_source", "frozen_candidate"])
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases must define "
+      + "exactly calibration_source and frozen_candidate",
+    );
+  }
+  const constantSet =
+    "crates/codestory-llama-sys/per-user-embedding-server-constant-set.json";
+  const calibrationSource = object(
+    freezePhases.calibration_source,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source",
+  );
+  const calibrationFuture = stringArray(
+    calibrationSource.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.known_future_source_changes",
+    { nonEmpty: true },
+  );
+  const calibrationActions = stringArray(
+    calibrationSource.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify(calibrationFuture) !== JSON.stringify([constantSet])
+    || JSON.stringify(calibrationActions) !== JSON.stringify([
+      "calibration-source-acceptance",
+      "calibration",
+      "generated-constant-freeze",
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || calibrationSource.next_permitted_mutation !== constantSet
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.calibration_source "
+      + "must permit only calibration then the generated constant-set freeze before source proof",
+    );
+  }
+  const frozenCandidate = object(
+    freezePhases.frozen_candidate,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate",
+  );
+  const frozenFuture = stringArray(
+    frozenCandidate.known_future_source_changes,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.known_future_source_changes",
+  );
+  const frozenActions = stringArray(
+    frozenCandidate.planned_actions,
+    "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate.planned_actions",
+    { nonEmpty: true },
+  );
+  if (
+    frozenFuture.length !== 0
+    || JSON.stringify(frozenActions) !== JSON.stringify([
+      "frozen-candidate-acceptance",
+      "source-proof",
+      "qualification",
+      "release",
+    ])
+    || frozenCandidate.next_permitted_mutation !== null
+  ) {
+    fail(
+      "workflow_policy.release_freeze_barrier.acceptance.phases.frozen_candidate "
+      + "must permit no future source mutation before its sole source proof",
+    );
+  }
   const actionlint = object(policy.actionlint, "workflow_policy.actionlint");
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");
   nonEmptyText(actionlint.config, "workflow_policy.actionlint.config");
@@ -774,6 +1814,8 @@ export function validatePlatformNarrativeDocuments(graph, repoRoot) {
   }
 }
 
+export const RELEASE_CLOSEOUT_SUMMARY_ASSET = "release-closeout-summary.json";
+
 export function releaseAssetNames(graph, version) {
   validateReleaseClaimGraph(graph);
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
@@ -785,23 +1827,66 @@ export function releaseAssetNames(graph, version) {
         `codestory-cli-v${version}-${target}.${extension}`,
     ),
     "SHA256SUMS.txt",
+    // The one machine-readable statement of what this release did and did not prove. It ships with
+    // the release because the README tells readers to consult the ledger rather than the platform
+    // table, and an Actions artifact with a 30-day retention is not something a release consumer
+    // can reach.
+    RELEASE_CLOSEOUT_SUMMARY_ASSET,
   ];
 }
 
-export function renderReleasePlatformNotes(graph) {
+/// Which package target each protected accelerator host speaks for, derived from the cells the host
+/// withholds rather than from a second copy of the mapping.
+function acceleratorHostByTarget(graph) {
+  const byTarget = new Map();
+  for (const host of graph.non_claim_policy.hosts) {
+    for (const cellId of host.withheld_cells) {
+      const [group, instance] = cellId.split(":");
+      if (group === "candidate_installed_behavior") byTarget.set(instance, host);
+    }
+  }
+  return byTarget;
+}
+
+/// The platform table that goes into the published GitHub release notes.
+///
+/// This is the surface a release consumer actually reads, so it is rendered from the accepted
+/// closeout ledger, never from the static graph alone. Rendering it from the graph is how a release
+/// whose Vulkan proof was withheld still announced "supported with Vulkan": the graph says what the
+/// repository intends to support, and only the ledger says what this release proved. A withheld
+/// accelerator is stated in the notes, in the same words the ledger recorded it in.
+export function renderReleasePlatformNotes(graph, ledger) {
   validateReleaseClaimGraph(graph);
-  const packages = graph.public_support.packages.map(
-    ({ label, accelerator_claim: claim }) =>
-      `- ${label}: supported with ${claim === "metal" ? "Metal" : "Vulkan"}`,
-  );
+  const closeout = object(ledger, "closeout ledger");
+  const withheldCells = new Set(stringArray(closeout.withheld_cells, "closeout ledger.withheld_cells"));
+  const hostByTarget = acceleratorHostByTarget(graph);
+  const reason = graph.non_claim_policy.reason;
+  const packages = graph.public_support.packages.map(({ label, target, accelerator_claim: claim }) => {
+    const accelerator = claim === "metal" ? "Metal" : "Vulkan";
+    const host = hostByTarget.get(target);
+    const withheld = host !== undefined
+      && host.withheld_cells.some((cellId) =>
+        cellId.startsWith("accelerator_execution:") && withheldCells.has(cellId));
+    return withheld
+      ? `- ${label}: ${accelerator} not proven for this release (${reason})`
+      : `- ${label}: supported with ${accelerator}`;
+  });
   const unsupported = graph.public_support.unsupported.map(
     ({ label }) => `- ${label}: unsupported`,
   );
+  const withheldNote = withheldCells.size === 0
+    ? []
+    : [
+      "",
+      `This release withheld ${withheldCells.size} evidence cell(s); `
+      + "release-closeout-summary.json names every one of them.",
+    ];
   return [
     "## Platform support",
     "",
     ...packages,
     ...unsupported,
+    ...withheldNote,
   ].join("\n");
 }
 
@@ -1288,7 +2373,10 @@ function main() {
     return;
   }
   if (command === "release-platform-notes") {
-    console.log(renderReleasePlatformNotes(graph));
+    // The ledger is required, not optional: an optional ledger would mean the published notes can
+    // still be produced from the graph alone, which is the exact fail-open this command had.
+    const ledgerPath = nonEmptyText(values.ledger, "--ledger");
+    console.log(renderReleasePlatformNotes(graph, JSON.parse(readFileSync(ledgerPath, "utf8"))));
     return;
   }
   if (command === "evaluate") {

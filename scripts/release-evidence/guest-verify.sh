@@ -138,8 +138,13 @@ test "$(stat -c '%u:%g:%a' "$runtime_dir")" = \
 test -f "$runner_root/actions-runner/.service"
 service=$(sed -n '1p' "$runner_root/actions-runner/.service")
 test -n "$service"
-systemctl show "$service" --property=Environment --value \
-  | tr ' ' '\n' | grep -qxF "XDG_RUNTIME_DIR=$runtime_dir"
+service_environment=$(systemctl show "$service" --property=Environment --value | tr ' ' '\n')
+printf '%s\n' "$service_environment" | grep -qxF "XDG_RUNTIME_DIR=$runtime_dir"
+printf '%s\n' "$service_environment" | grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"
+if printf '%s\n' "$service_environment" | grep -qxF "CODESTORY_EMBED_ALLOW_CPU=1"; then
+  echo "release-evidence runner must reject CPU embeddings" >&2
+  exit 1
+fi
 source_sha=$(sed -n '1p' "$runner_root/validation/source-sha")
 printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -10,15 +9,27 @@ import {
   deriveTrustedGitIdentity,
   loadReleaseClaimGraph,
   releaseClaimGraphDigest,
+  verifyReuseBinding,
 } from "./codestory-release-claims.mjs";
 import {
   deriveReleaseCells,
+  releaseCellWithheldClaims,
   resolveReleaseCellConstraints,
+  resolveReleaseCellNonClaimConstraints,
   validateReleaseCellManifest,
 } from "./codestory-release-closeout.mjs";
+import {
+  RUNNER_COMMUNICATION_LOSS,
+  classifyJobFailure,
+  countLostExecutions,
+} from "../.github/scripts/lost-runner-recovery.mjs";
+import {
+  readCandidateArchiveRecord,
+} from "../.github/scripts/candidate-archive-store.mjs";
 
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const SHA256 = /^[0-9a-f]{64}$/u;
 
 function fail(message) {
   throw new Error(message);
@@ -45,6 +56,39 @@ function fileAttestation(filePath) {
     name: path.basename(absolute),
     sha256: createHash("sha256").update(bytes).digest("hex"),
     bytes: bytes.length,
+  };
+}
+
+function archiveAttestation(value) {
+  if (
+    value === null
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort())
+      !== JSON.stringify(["bytes", "name", "sha256"])
+  ) {
+    fail("archive attestation keys changed");
+  }
+  const name = text(value.name, "archive attestation name");
+  if (
+    path.basename(name) !== name
+    || name === "."
+    || name === ".."
+    || name.includes("/")
+    || name.includes("\\")
+  ) {
+    fail("archive attestation name must be a simple filename");
+  }
+  if (!Number.isSafeInteger(value.bytes) || value.bytes <= 0) {
+    fail("archive attestation bytes must be a positive safe integer");
+  }
+  if (typeof value.sha256 !== "string" || !SHA256.test(value.sha256)) {
+    fail("archive attestation sha256 must be a lowercase SHA-256 digest");
+  }
+  return {
+    name,
+    sha256: value.sha256,
+    bytes: value.bytes,
   };
 }
 
@@ -134,8 +178,10 @@ export function produceReleaseCellManifest({
   observedAt,
   artifactPath = null,
   archivePath = null,
+  retainedArchive = null,
   prePublishLedger = null,
   evidence = null,
+  nonClaim = null,
 }) {
   const graphSha256 = releaseClaimGraphDigest(graph);
   const type = evidenceType(graph, cell.evidence_type);
@@ -148,12 +194,22 @@ export function produceReleaseCellManifest({
     ...(suppliedIdentity ?? {}),
     ...gitIdentity,
     ...resolveReleaseCellConstraints(cell, producer.producer_run_attempt),
+    ...(nonClaim ? resolveReleaseCellNonClaimConstraints(cell, producer.producer_run_attempt) : {}),
     ...producer,
   };
   if (cell.required_identity.includes("producer_version")) identity.producer_version = version;
   if (cell.required_identity.includes("runtime_version")) identity.runtime_version = version;
 
-  const artifact = archivePath ? fileAttestation(archivePath) : artifactPath ? fileAttestation(artifactPath) : null;
+  if (archivePath && retainedArchive) {
+    fail("archivePath and retainedArchive are mutually exclusive");
+  }
+  const artifact = archivePath
+    ? fileAttestation(archivePath)
+    : retainedArchive
+      ? archiveAttestation(retainedArchive)
+      : artifactPath
+        ? fileAttestation(artifactPath)
+        : null;
   if (artifact && cell.required_identity.includes("artifact_sha256")) {
     identity.artifact_sha256 = artifact.sha256;
   }
@@ -168,18 +224,23 @@ export function produceReleaseCellManifest({
       id: evidence?.id ?? `${cell.id}:${producer.producer_run_id}:${producer.producer_run_attempt}`,
       type: cell.evidence_type,
       tier: type.tier,
-      status: evidence?.status ?? "pass",
+      status: evidence?.status ?? (nonClaim ? "withheld" : "pass"),
       graph_sha256: graphSha256,
       observed_at: observed,
       expires_at: expires,
       identity,
     },
   };
+  if (nonClaim) manifest.non_claim = nonClaim;
   if (cell.archive_role === "pre_publish") {
-    if (!artifact || !archivePath) fail(`${cell.id} requires --archive`);
+    if (!artifact || (!archivePath && !retainedArchive)) {
+      fail(`${cell.id} requires authenticated archive identity`);
+    }
     manifest.archive = { name: artifact.name, sha256: artifact.sha256, bytes: artifact.bytes };
   } else if (cell.archive_role === "post_publish_compare") {
-    if (!artifact || !archivePath) fail(`${cell.id} requires --archive`);
+    if (!artifact || (!archivePath && !retainedArchive)) {
+      fail(`${cell.id} requires authenticated archive identity`);
+    }
     const packageRow = retainedPackageRow(prePublishLedger, identity.target);
     identity.pre_publish_artifact_sha256 = packageRow.archive.sha256;
     manifest.comparison = {
@@ -233,6 +294,83 @@ function produceOne(values) {
   writeJson(text(values.out, "--out"), manifest);
 }
 
+/// Record the populated non-claim for one protected host that never reported.
+///
+/// This is the only writer of a withheld release cell. It refuses to invent one for a host the
+/// graph does not declare, and it stamps the recovery bound into every manifest it writes, so a
+/// withheld cell always carries the evidence that the automatic reruns were spent first.
+function withholdHost(values) {
+  const { graph, gitIdentity } = common(values);
+  const version = text(values.version, "--version").replace(/^v/u, "");
+  const policy = graph.non_claim_policy;
+  const hostId = text(values.host, "--host");
+  const host = (policy?.hosts ?? []).find(({ id }) => id === hostId);
+  if (!host) fail(`release claim graph declares no non-claim host ${hostId}`);
+  const attempt = positiveInteger(values["producer-run-attempt"], "--producer-run-attempt");
+  if (Number(attempt) < policy.maximum_run_attempts) {
+    fail(`a non-claim may be recorded only after ${policy.maximum_run_attempts} run attempts`);
+  }
+  const identity = values.identity ? JSON.parse(readFileSync(values.identity, "utf8")) : {};
+  const candidateRecord = readCandidateArchiveRecord(
+    text(values["candidate-record"], "--candidate-record"),
+  );
+  if (
+    candidateRecord.repository !== gitIdentity.repository
+    || candidateRecord.source.commit !== gitIdentity.commit
+    || candidateRecord.source.tree !== gitIdentity.source_tree
+  ) {
+    fail("candidate archive record does not match the exact withheld source");
+  }
+  const retainedArchive = {
+    name: candidateRecord.archive.name,
+    bytes: candidateRecord.archive.bytes,
+    sha256: candidateRecord.archive.sha256,
+  };
+  const outDir = text(values["out-dir"], "--out-dir");
+  for (const cellId of host.withheld_cells) {
+    const cell = selectedCell(graph, cellId);
+    const cellTarget = resolveReleaseCellConstraints(cell, attempt).target;
+    if (cellTarget !== candidateRecord.target) {
+      fail(
+        `candidate archive record target ${candidateRecord.target} does not match ${cell.id}`,
+      );
+    }
+    // Each closeout phase downloads and authorizes its own container, so the manifests are written
+    // into one directory per phase and uploaded as one artifact per phase.
+    const producer = authenticatedProducer({
+      "producer-workflow": policy.producer_workflow,
+      "producer-job": policy.producer_job,
+      "producer-run-id": values["producer-run-id"],
+      "producer-run-attempt": attempt,
+      "producer-artifact": host.producer_artifacts[cell.phase].replaceAll("{attempt}", attempt),
+    }, gitIdentity);
+    const manifest = produceReleaseCellManifest({
+      graph,
+      gitIdentity,
+      version,
+      cell,
+      identity,
+      producer,
+      observedAt: values["observed-at"],
+      retainedArchive,
+      nonClaim: {
+        host: host.id,
+        runtime_execution: policy.runtime_execution,
+        non_claim_reason: policy.reason,
+        annotation: policy.annotation,
+        unavailable_producer_workflow: host.unavailable_producer_workflow,
+        unavailable_producer_job_name: host.unavailable_producer_job_name,
+        withheld_claims: releaseCellWithheldClaims(graph, cell),
+        run_attempt: attempt,
+      },
+    });
+    writeJson(
+      path.join(outDir, cell.phase, `${cellId.replaceAll(/[^A-Za-z0-9._-]/gu, "_")}.json`),
+      manifest,
+    );
+  }
+}
+
 function positiveInteger(value, label) {
   const selected = text(String(value ?? ""), label);
   if (!/^[1-9]\d*$/u.test(selected)) fail(`${label} must be a positive integer`);
@@ -247,6 +385,22 @@ function actionsTimestamp(value, label) {
 
 function leafJobName(value) {
   return text(value, "Actions job name").split(" / ").at(-1);
+}
+
+/// The one execution of `jobName` at the highest attempt at or below the current one. `absent` and
+/// `ambiguous` are reported distinctly and are never treated as "the host went away": only a single
+/// resolved execution that ran and did not succeed may hand a cell to its non-claim producer, so a
+/// missing or duplicated job still fails through the strict selection below.
+function latestExecution(jobs, jobName, currentAttempt) {
+  const occurrences = jobs.filter((job) =>
+    leafJobName(job.name) === jobName
+    && Number(positiveInteger(job.run_attempt, `${jobName} run attempt`)) <= Number(currentAttempt));
+  if (occurrences.length === 0) return { state: "absent", job: null };
+  const latestAttempt = Math.max(...occurrences.map(({ run_attempt: attempt }) => Number(attempt)));
+  const latest = occurrences.filter(({ run_attempt: attempt }) => Number(attempt) === latestAttempt);
+  return latest.length === 1
+    ? { state: "resolved", job: latest[0] }
+    : { state: "ambiguous", job: null };
 }
 
 function flattenJobs(jobsByAttempt) {
@@ -347,6 +501,38 @@ function selectReusedProducer({ cell, reused, binding }) {
   };
 }
 
+/// The closeout's own reading of the lost-runner signature.
+///
+/// This deliberately repeats work the non-claim producer already did. The producer decides whether
+/// to *write* a non-claim; this decides whether the closeout will *authenticate a cell against*
+/// one, and a single shared verdict would mean any bug or future edit in the producer silently
+/// converts every red accelerator job into an accepted withheld claim with nothing to object. The
+/// evidence is collected by the closeout job itself, so the producer is not consulted at all.
+function confirmsWithholding({ graph, jobEvidence, jobName, cellId }) {
+  if (jobEvidence === null) {
+    fail(`closeout cannot route ${cellId} to a non-claim without its own Actions job evidence`);
+  }
+  const executions = jobEvidence.filter((job) =>
+    leafJobName(String(job?.name ?? "")) === jobName
+    && String(job?.conclusion ?? "") === "failure");
+  if (executions.length === 0) {
+    fail(`Actions job evidence has no failed execution of ${jobName} to withhold ${cellId} for`);
+  }
+  for (const job of executions) {
+    if (classifyJobFailure(job).signature !== RUNNER_COMMUNICATION_LOSS) {
+      fail(`${jobName} failed its own assertions, so ${cellId} may not be withheld`);
+    }
+  }
+  const spent = countLostExecutions(jobEvidence, jobName);
+  if (spent < graph.non_claim_policy.maximum_run_attempts) {
+    fail(
+      `${jobName} has been lost ${spent} time(s); ${cellId} may not be withheld before the `
+      + `${graph.non_claim_policy.maximum_run_attempts}-execution recovery bound is spent`,
+    );
+  }
+  return true;
+}
+
 export function buildTrustedProducerMap({
   graph,
   gitIdentity,
@@ -355,6 +541,9 @@ export function buildTrustedProducerMap({
   currentRunAttempt,
   artifacts,
   jobsByAttempt,
+  // The closeout's own collected Actions job evidence -- annotations, step conclusions and the log
+  // blob probe -- for confirming a withheld routing without asking the non-claim producer.
+  jobEvidence = null,
   // Cross-run evidence, keyed by cell-group id. Admissible only for groups that declare a
   // reuse_binding in the claim graph; the caller is responsible for having verified the binding
   // (tree equality and ancestry, or native-fingerprint equality) before supplying an entry.
@@ -380,8 +569,32 @@ export function buildTrustedProducerMap({
     if (reused) {
       return selectReusedProducer({ cell, reused, binding: groupBindings.get(cell.group_id) });
     }
-    const jobName = text(cell.identity_constraints.producer_job_name, `${cell.id} producer job name`);
-    const cacheKey = `${jobName}\0${cell.identity_constraints.producer_artifact}`;
+    const primaryJobName = text(
+      cell.identity_constraints.producer_job_name,
+      `${cell.id} producer job name`,
+    );
+    // A protected host that never reported cannot sign its own absence. When -- and only when --
+    // its latest attempt did not succeed, the cell's producer becomes the hosted job that recorded
+    // the populated non-claim, and the row is stamped so the closeout knows to expect a withheld
+    // manifest rather than a proof.
+    //
+    // "Did not succeed" is necessary but nowhere near sufficient: on its own it routes every red
+    // accelerator job into the withheld lane, and the only thing keeping an assertion failure out
+    // would be the non-claim producer's own refusal to upload for it. This map is what decides
+    // whether a cell is authenticated against the real proof or against the non-claim producer, so
+    // it checks the lost-runner signature itself, from evidence it collected, rather than
+    // inheriting the producer's verdict.
+    const primaryLatest = latestExecution(jobs, primaryJobName, selectedCurrentAttempt);
+    const notGreen = cell.non_claim !== undefined
+      && primaryLatest.state === "resolved"
+      && (primaryLatest.job.status !== "completed" || primaryLatest.job.conclusion !== "success");
+    const withheld = notGreen
+      && confirmsWithholding({ graph, jobEvidence, jobName: primaryJobName, cellId: cell.id });
+    const jobName = withheld ? cell.non_claim.producer_job_name : primaryJobName;
+    const artifactTemplate = withheld
+      ? cell.non_claim.producer_artifact
+      : cell.identity_constraints.producer_artifact;
+    const cacheKey = `${jobName}\0${artifactTemplate}`;
     let selected = selectionCache.get(cacheKey);
     if (!selected) {
       const occurrences = jobs.filter((job) =>
@@ -401,7 +614,12 @@ export function buildTrustedProducerMap({
       if (String(job.run_id) !== selectedRunId || job.head_sha !== gitIdentity.commit) {
         fail(`Actions job ${jobName} is not bound to the selected run and commit`);
       }
-      const constraints = resolveReleaseCellConstraints(cell, String(latestAttempt));
+      const constraints = withheld
+        ? {
+          ...resolveReleaseCellConstraints(cell, String(latestAttempt)),
+          ...resolveReleaseCellNonClaimConstraints(cell, String(latestAttempt)),
+        }
+        : resolveReleaseCellConstraints(cell, String(latestAttempt));
       const matchingArtifacts = artifacts.filter(({ name }) => name === constraints.producer_artifact);
       if (matchingArtifacts.length !== 1) {
         fail(`Actions run must retain one ${constraints.producer_artifact} artifact`);
@@ -450,10 +668,12 @@ export function buildTrustedProducerMap({
           completed_at: completedAt,
         },
       };
+      selected.non_claim = withheld;
       selectionCache.set(cacheKey, selected);
     }
     return {
       cell_id: cell.id,
+      ...(selected.non_claim ? { non_claim: true } : {}),
       producer_workflow: selected.constraints.producer_workflow,
       producer_job: selected.constraints.producer_job,
       producer_job_name: selected.constraints.producer_job_name,
@@ -475,45 +695,6 @@ export function buildTrustedProducerMap({
     producers,
     artifacts: [...new Map(producers.map((row) => [row.artifact.id, row.artifact])).values()],
   };
-}
-
-/// Verify a reuse binding against the local repository and return its recorded value.
-export function verifyReuseBinding({ binding, repository, releaseCommit, reusedCommit }) {
-  const run = (args) =>
-    execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
-  if (binding === "source_tree") {
-    const releaseTree = run(["rev-parse", `${releaseCommit}^{tree}`]);
-    const reusedTree = run(["rev-parse", `${reusedCommit}^{tree}`]);
-    if (releaseTree !== reusedTree) {
-      fail(`reused commit ${reusedCommit} tree ${reusedTree} does not match release tree ${releaseTree}`);
-    }
-    try {
-      execFileSync("git", ["merge-base", "--is-ancestor", reusedCommit, releaseCommit], {
-        cwd: repository,
-      });
-    } catch {
-      fail(`reused commit ${reusedCommit} is not an ancestor of the release commit`);
-    }
-    return releaseTree;
-  }
-  if (binding === "native_fingerprint") {
-    const script = new URL("./native-fingerprint.mjs", import.meta.url).pathname;
-    const fingerprint = (ref) =>
-      execFileSync(process.execPath, [script, "--ref", ref], {
-        cwd: repository,
-        encoding: "utf8",
-      }).trim();
-    const releasePrint = fingerprint(releaseCommit);
-    const reusedPrint = fingerprint(reusedCommit);
-    if (releasePrint !== reusedPrint) {
-      fail(
-        `native fingerprint of reused commit ${reusedCommit} (${reusedPrint}) does not match `
-          + `the release commit (${releasePrint}); accelerator evidence cannot be inherited`,
-      );
-    }
-    return releasePrint;
-  }
-  fail(`unknown reuse binding ${binding}`);
 }
 
 async function githubPages(url, token, field) {
@@ -588,6 +769,10 @@ async function produceMap(values) {
       jobsByAttempt: await githubPages(`${reusedUrl}/jobs?filter=all`, token, "jobs"),
     };
   }
+  // Collected by the closeout job itself, never handed over by the non-claim producer.
+  const jobEvidence = values["job-evidence"]
+    ? JSON.parse(readFileSync(text(values["job-evidence"], "--job-evidence"), "utf8"))
+    : null;
   const map = buildTrustedProducerMap({
     graph,
     gitIdentity,
@@ -596,6 +781,7 @@ async function produceMap(values) {
     currentRunAttempt: runAttempt,
     artifacts,
     jobsByAttempt,
+    jobEvidence,
     reuse,
   });
   writeJson(text(values.out, "--out"), map);
@@ -604,8 +790,9 @@ async function produceMap(values) {
 async function main() {
   const { command, values } = parseArgs(process.argv.slice(2));
   if (command === "produce") produceOne(values);
+  else if (command === "withhold") withholdHost(values);
   else if (command === "producer-map") await produceMap(values);
-  else fail("command must be produce or producer-map");
+  else fail("command must be produce, withhold, or producer-map");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
