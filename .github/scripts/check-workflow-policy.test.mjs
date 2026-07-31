@@ -5700,6 +5700,166 @@ test("controlled semantic workflow fixtures emit class-prefixed diagnostics", as
   }
 });
 
+test("pre-publish closeout materializes exact artifact ids across workflow runs", (t) => {
+  const workflow = loadWorkflows().get("release.yml");
+  const materialize = draftStep(
+    workflow.jobs["pre-publish-closeout"],
+    "Download and verify selected pre-publish release cells",
+  ).run;
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "codestory-cross-run-closeout-"));
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+
+  const makeArchive = (id, fileName, contents) => {
+    const source = path.join(fixtureRoot, `source-${id}`);
+    const archive = path.join(fixtureRoot, `${id}.zip`);
+    mkdirSync(source);
+    writeFileSync(path.join(source, fileName), contents);
+    const zipped = spawnSync("zip", ["-q", archive, fileName], {
+      cwd: source,
+      encoding: "utf8",
+    });
+    assert.equal(zipped.status, 0, zipped.stderr || zipped.stdout);
+    return {
+      archive,
+      digest: `sha256:${createHash("sha256").update(readFileSync(archive)).digest("hex")}`,
+      fileName,
+      contents,
+    };
+  };
+  const current = {
+    id: "1001",
+    name: "release-cell-prepublish-package-linux-x64-attempt-2",
+    runId: "12345",
+    ...makeArchive("1001", "package_identity_linux-x64.json", "{\"run\":\"current\"}\n"),
+  };
+  const reused = {
+    id: "2002",
+    name: "release-cell-prepublish-source-attempt-1",
+    runId: "777",
+    ...makeArchive("2002", "source_behavior.json", "{\"run\":\"reused\"}\n"),
+  };
+
+  const fakeBin = path.join(fixtureRoot, "bin");
+  mkdirSync(fakeBin);
+  const fakeCurl = path.join(fakeBin, "curl");
+  writeFileSync(fakeCurl, `#!/usr/bin/env bash
+set -euo pipefail
+output=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output=$2
+      shift 2
+      ;;
+    --header)
+      shift 2
+      ;;
+    --fail|--location|--silent|--show-error)
+      shift
+      ;;
+    http*)
+      url=$1
+      shift
+      ;;
+    *)
+      echo "unexpected curl argument: $1" >&2
+      exit 64
+      ;;
+  esac
+done
+case "$url" in
+  */actions/artifacts/1001/zip) source_archive=$FIXTURE_CURRENT_ARCHIVE ;;
+  */actions/artifacts/2002/zip) source_archive=$FIXTURE_REUSED_ARCHIVE ;;
+  *)
+    echo "artifact was not requested by exact repository artifact id: $url" >&2
+    exit 65
+    ;;
+esac
+cp "$source_archive" "$output"
+printf '%s\\n' "$url" >> "$FIXTURE_URL_LOG"
+`);
+  chmodSync(fakeCurl, 0o755);
+
+  const producerMap = {
+    artifacts: [current, reused].map(({ id, name, digest, runId }) => ({
+      id,
+      name,
+      digest,
+      workflow_run_id: runId,
+    })),
+  };
+  const execute = (script, label) => {
+    const directory = path.join(fixtureRoot, label);
+    const closeout = path.join(directory, "target", "release-closeout");
+    const urlLog = path.join(directory, "urls.log");
+    mkdirSync(closeout, { recursive: true });
+    writeFileSync(
+      path.join(closeout, "trusted-pre-publish-producers.json"),
+      `${JSON.stringify(producerMap)}\n`,
+    );
+    writeFileSync(urlLog, "");
+    return {
+      directory,
+      urlLog,
+      result: spawnSync("bash", ["-c", script], {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          FIXTURE_CURRENT_ARCHIVE: current.archive,
+          FIXTURE_REUSED_ARCHIVE: reused.archive,
+          FIXTURE_URL_LOG: urlLog,
+          GH_TOKEN: "test-token",
+          GITHUB_API_URL: "https://api.github.test",
+          GITHUB_REPOSITORY: "TheGreenCedar/CodeStory",
+          GITHUB_RUN_ID: current.runId,
+        },
+      }),
+    };
+  };
+
+  const accepted = execute(materialize, "accepted");
+  assert.equal(
+    accepted.result.status,
+    0,
+    accepted.result.stderr || accepted.result.stdout,
+  );
+  for (const artifact of [current, reused]) {
+    assert.equal(
+      readFileSync(
+        path.join(
+          accepted.directory,
+          "target",
+          "release-cell-manifests",
+          artifact.name,
+          artifact.fileName,
+        ),
+        "utf8",
+      ),
+      artifact.contents,
+    );
+  }
+  const requested = readFileSync(accepted.urlLog, "utf8").trim().split("\n");
+  assert.deepEqual(requested, [
+    "https://api.github.test/repos/TheGreenCedar/CodeStory/actions/artifacts/1001/zip",
+    "https://api.github.test/repos/TheGreenCedar/CodeStory/actions/artifacts/2002/zip",
+  ]);
+
+  const currentRunOnly = materialize.replace(
+    ".artifacts[] | [.id, .name, .digest] | @tsv",
+    ".artifacts[] | select(.workflow_run_id == env.GITHUB_RUN_ID) | [.id, .name, .digest] | @tsv",
+  );
+  assert.notEqual(currentRunOnly, materialize, "current-run-only mutation did not apply");
+  const rejected = execute(currentRunOnly, "current-run-only");
+  assert.equal(
+    rejected.result.status,
+    1,
+    "a current-run-only transfer silently dropped the reused source container",
+  );
+});
+
 test("release policy rejects manifest producer, trusted-map, and publication bypasses", () => {
   const mutations = [
     ["call expected head", workflows => { delete workflows.get("release.yml").on.workflow_call.inputs.expected_head_sha; }],
@@ -5793,16 +5953,40 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
         .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
       step.run = step.run.replace("--trusted-producers", "--self-attested-producers");
     }],
-    ["flattened current-run JSON", workflows => {
+    ["run-scoped pre-publish artifact action", workflows => {
+      const steps = workflows.get("release.yml").jobs["pre-publish-closeout"].steps;
+      const index = steps.findIndex(
+        ({ name }) => name === "Download and verify selected pre-publish release cells",
+      );
+      steps[index] = {
+        name: "Download and verify selected pre-publish release cells",
+        uses: "actions/download-artifact@v8.0.1",
+        with: {
+          "artifact-ids": "${{ steps.pre-publish-provenance.outputs.artifact_ids }}",
+          path: "target/release-cell-manifests",
+          "merge-multiple": false,
+        },
+      };
+    }],
+    ["current-run-only pre-publish artifact selection", workflows => {
       const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
-        .find(({ name }) => name === "Download selected pre-publish release cells");
-      delete step.with["artifact-ids"];
-      step.with.pattern = "release-cell-prepublish-*";
-      step.with["merge-multiple"] = true;
+        .find(({ name }) => name === "Download and verify selected pre-publish release cells");
+      step.run = step.run.replace(
+        ".artifacts[] | [.id, .name, .digest] | @tsv",
+        ".artifacts[] | select(.workflow_run_id == env.GITHUB_RUN_ID) | [.id, .name, .digest] | @tsv",
+      );
+    }],
+    ["flattened pre-publish artifact extraction", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Download and verify selected pre-publish release cells");
+      step.run = step.run.replace(
+        'destination="target/release-cell-manifests/$artifact_name"',
+        'destination="target/release-cell-manifests"',
+      );
     }],
     ["container digest warning accepted", workflows => {
       const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
-        .find(({ name }) => name === "Verify selected pre-publish artifact container digests");
+        .find(({ name }) => name === "Download and verify selected pre-publish release cells");
       step.run = step.run.replace(
         'test "$actual_digest" = "$expected_digest"',
         'echo "$actual_digest $expected_digest"',
