@@ -826,6 +826,91 @@ function exactStringList(value, expected, label) {
   return actual;
 }
 
+function validateProofFloor(value) {
+  const floor = object(value, "workflow_policy.proof_floor");
+  if (
+    floor.schema !== 1
+    || JSON.stringify(Object.keys(floor).sort())
+      !== JSON.stringify(["architecture_contract", "crate_durability", "schema"])
+  ) {
+    fail("workflow_policy.proof_floor must use the exact schema 1 contract");
+  }
+
+  const architecture = object(
+    floor.architecture_contract,
+    "workflow_policy.proof_floor.architecture_contract",
+  );
+  nonEmptyText(
+    architecture.workflow,
+    "workflow_policy.proof_floor.architecture_contract.workflow",
+  );
+  if (
+    JSON.stringify(Object.keys(architecture).sort())
+      !== JSON.stringify(["command", "job", "workflow"])
+    || architecture.job !== "linux-contracts"
+    || architecture.command
+      !== "cargo test --locked -p codestory-cli --test architecture_contracts"
+  ) {
+    fail("workflow_policy.proof_floor architecture contract must stay in the universal linux-contracts lane");
+  }
+
+  const durability = object(
+    floor.crate_durability,
+    "workflow_policy.proof_floor.crate_durability",
+  );
+  if (
+    JSON.stringify(Object.keys(durability).sort())
+      !== JSON.stringify([
+        "artifact_free",
+        "branches",
+        "cache_namespace",
+        "commands",
+        "job",
+        "paths",
+        "timeout_minutes",
+        "workflow",
+      ])
+    || durability.workflow !== "crate-durability.yml"
+    || durability.job !== "linux-durability"
+    || durability.artifact_free !== true
+    || durability.timeout_minutes !== 60
+    || durability.cache_namespace !== "crate-durability-v1"
+  ) {
+    fail("workflow_policy.proof_floor crate durability lane must keep its source-only identity and bound");
+  }
+  exactStringList(
+    durability.branches,
+    ["main", "dev/codestory-next"],
+    "workflow_policy.proof_floor.crate_durability.branches",
+  );
+  exactStringList(
+    durability.paths,
+    [
+      "crates/codestory-store/**",
+      "crates/codestory-indexer/**",
+      "crates/codestory-workspace/**",
+      "crates/codestory-contracts/**",
+      ".github/workflows/crate-durability.yml",
+      ".github/scripts/check-workflow-policy.mjs",
+      ".github/scripts/check-workflow-policy.test.mjs",
+      "release-claims.json",
+      "scripts/codestory-release-claims.mjs",
+      "scripts/tests/codestory-release-claims.test.mjs",
+      "docs/contributors/testing-matrix.md",
+    ],
+    "workflow_policy.proof_floor.crate_durability.paths",
+  );
+  exactStringList(
+    durability.commands,
+    [
+      "cargo test --locked -p codestory-store",
+      "cargo test --locked -p codestory-indexer --test fidelity_regression",
+      "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+    ],
+    "workflow_policy.proof_floor.crate_durability.commands",
+  );
+}
+
 function validateWindowsPackageGraph(value) {
   const graph = object(value, "workflow_policy.windows_package_graph");
   if (
@@ -1440,6 +1525,7 @@ export function validateReleaseClaimGraph(graph) {
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
+  validateProofFloor(policy.proof_floor);
   if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
     fail("workflow_policy.package_matrix must define three release package rows");
   }

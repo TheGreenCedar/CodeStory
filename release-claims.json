@@ -1036,6 +1036,43 @@
   },
   "workflow_policy": {
     "artifact_retention_days": 30,
+    "proof_floor": {
+      "schema": 1,
+      "architecture_contract": {
+        "workflow": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "command": "cargo test --locked -p codestory-cli --test architecture_contracts"
+      },
+      "crate_durability": {
+        "workflow": "crate-durability.yml",
+        "job": "linux-durability",
+        "artifact_free": true,
+        "timeout_minutes": 60,
+        "branches": [
+          "main",
+          "dev/codestory-next"
+        ],
+        "paths": [
+          "crates/codestory-store/**",
+          "crates/codestory-indexer/**",
+          "crates/codestory-workspace/**",
+          "crates/codestory-contracts/**",
+          ".github/workflows/crate-durability.yml",
+          ".github/scripts/check-workflow-policy.mjs",
+          ".github/scripts/check-workflow-policy.test.mjs",
+          "release-claims.json",
+          "scripts/codestory-release-claims.mjs",
+          "scripts/tests/codestory-release-claims.test.mjs",
+          "docs/contributors/testing-matrix.md"
+        ],
+        "cache_namespace": "crate-durability-v1",
+        "commands": [
+          "cargo test --locked -p codestory-store",
+          "cargo test --locked -p codestory-indexer --test fidelity_regression",
+          "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage"
+        ]
+      }
+    },
     "package_matrix": [
       {
         "os": "windows-latest",
