@@ -87,7 +87,15 @@ pub(super) fn affected_change_records(
 
 pub(super) fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Output> {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(&cmd.project.project);
+    // The selected project is untrusted input: repository-local config can
+    // name a `core.fsmonitor` executable that status/diff walks would run.
+    // Disable it (and index writes) for these read-only queries.
+    command
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(&cmd.project.project);
     match cmd.changes {
         AffectedChangeSource::Head => {
             command

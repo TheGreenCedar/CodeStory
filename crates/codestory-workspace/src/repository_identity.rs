@@ -862,7 +862,14 @@ fn windows_ordinal_case_fold(source: &[u16]) -> io::Result<Vec<u16>> {
 }
 
 fn git_output(project: &Path, args: &[&str]) -> Result<String, ()> {
+    // The repository under inspection is untrusted input: a checkout can carry
+    // `.git/config` naming a `core.fsmonitor` executable that `git status`
+    // would run. Disable it (and index writes, which a read-only inspection
+    // must never perform) on every invocation.
     let output = Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(project)
         .args(args)
@@ -1372,6 +1379,55 @@ mod tests {
         assert_eq!(dirty.artifact_scope_id, dirty.workspace_id);
         assert_ne!(clean.artifact_scope_id, dirty.artifact_scope_id);
         assert_eq!(dirty.portable_reuse_reason, "git_worktree_dirty");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hostile_fsmonitor_hook_never_executes_during_identity_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let marker = project.path().join("fsmonitor-executed");
+        let hook = project.path().join("fsmonitor-hook.sh");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+        )
+        .expect("write hook");
+        let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).expect("make hook executable");
+        git(
+            project.path(),
+            &["config", "core.fsmonitor", &hook.display().to_string()],
+        );
+
+        // Prove the sentinel is live first: an unconstrained `git status` in
+        // this repository executes the configured hook. Without that, a git
+        // version that ignores `core.fsmonitor` would make the containment
+        // assertion below pass vacuously.
+        let unconstrained = Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("run unconstrained git status");
+        assert!(unconstrained.status.success());
+        assert!(
+            marker.exists(),
+            "unconstrained git status did not execute the configured core.fsmonitor hook"
+        );
+        fs::remove_file(&marker).expect("reset sentinel");
+
+        let identity = project_identity_v3(project.path());
+        assert!(!identity.project_id.is_empty());
+        assert!(
+            !marker.exists(),
+            "core.fsmonitor hook executed during repository identity inspection"
+        );
     }
 
     fn git_project() -> Option<tempfile::TempDir> {

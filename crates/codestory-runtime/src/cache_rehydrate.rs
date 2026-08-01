@@ -331,7 +331,13 @@ fn git_identity(project: &Path) -> Result<GitIdentity> {
 }
 
 fn git_output(project: &Path, args: &[&str]) -> Result<String> {
+    // The inspected checkout is untrusted: repository-local config can name a
+    // `core.fsmonitor` executable that `git status` would run. Disable it (and
+    // index writes) on every invocation of this read-only inspection.
     let output = Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(project)
         .args(args)
