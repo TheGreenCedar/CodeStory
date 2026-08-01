@@ -12,6 +12,7 @@ import {
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
+const crateDurabilityFile = "crate-durability.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const retrievalGeneralizationSuiteFile = path.join(
   "scripts",
@@ -38,7 +39,7 @@ const nextestLinuxSha256 = "7d07712519615722b19ffe3b3d1097b7d4fa390995e3cac1f9d6
 const sccacheCacheSize = "1G";
 const windowsSccacheCacheSize = "2G";
 
-export { retrievalFile };
+export { crateDurabilityFile, retrievalFile };
 
 function tomlSection(source, section) {
   const header = `[${section}]`;
@@ -1330,6 +1331,216 @@ export function retrievalProducerTriggerPolicyViolations(workflowValue) {
     violations,
     includesAll(at(workflow, "on", "push", "paths"), retrievalProducerTriggerPaths),
     "retrieval cache producer dev push paths must cover every manifest and draft consumer change",
+  );
+  return violations;
+}
+
+export function proofFloorPolicyViolations(
+  workflows,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
+  const violations = [];
+  const policy = object(object(graph.workflow_policy).proof_floor);
+  const architecture = object(policy.architecture_contract);
+  add(
+    violations,
+    architecture.workflow === retrievalFile,
+    `architecture proof must remain owned by ${retrievalFile}`,
+  );
+  const architectureWorkflow = workflows.get(architecture.workflow);
+  add(
+    violations,
+    architectureWorkflow !== undefined,
+    `${architecture.workflow} must exist for the architecture proof floor`,
+  );
+  const architectureJob = object(at(
+    architectureWorkflow,
+    "jobs",
+    architecture.job,
+  ));
+  add(
+    violations,
+    hasExactKeys(architectureJob, ["runs-on", "timeout-minutes", "env", "steps"])
+      && architectureJob["runs-on"] === "ubuntu-latest",
+    `${architecture.workflow} ${architecture.job} must remain an unconditional universal job`,
+  );
+  const architectureStep = namedStep(
+    architectureJob,
+    "Architecture ownership contract tests",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(architectureStep?.run), [architecture.command])
+      && architectureStep?.if === undefined
+      && architectureStep?.["continue-on-error"] === undefined,
+    `${architecture.workflow} ${architecture.job} must run the exact blocking architecture contract`,
+  );
+  add(
+    violations,
+    stepIndex(architectureJob, "Architecture ownership contract tests")
+      < stepIndex(architectureJob, "Seed draft proof test-profile artifacts"),
+    `${architecture.workflow} architecture contract must complete before draft artifacts are seeded and saved`,
+  );
+
+  const durability = object(policy.crate_durability);
+  const file = String(durability.workflow ?? crateDurabilityFile);
+  const workflow = workflows.get(file);
+  add(violations, workflow !== undefined, `${file} must exist`);
+  const triggers = object(workflow?.on);
+  const pullRequest = object(triggers.pull_request);
+  const push = object(triggers.push);
+  const permissions = object(workflow?.permissions);
+  const concurrency = object(workflow?.concurrency);
+  const jobs = object(workflow?.jobs);
+  const job = object(jobs[durability.job]);
+  const steps = list(job.steps).map(object);
+
+  add(
+    violations,
+    hasExactKeys(workflow, ["name", "on", "permissions", "concurrency", "jobs"])
+      && workflow?.name === "crate-durability",
+    `${file} must keep the exact source-only top-level shape`,
+  );
+  add(
+    violations,
+    hasExactKeys(triggers, ["pull_request", "push", "workflow_dispatch"])
+      && triggers.workflow_dispatch === null,
+    `${file} must run only on path-scoped pull requests, base pushes, and input-free dispatch`,
+  );
+  for (const [event, eventValue] of [
+    ["pull_request", pullRequest],
+    ["push", push],
+  ]) {
+    add(
+      violations,
+      list(eventValue.paths).length === list(durability.paths).length
+        && sameMembers(eventValue.paths, durability.paths),
+      `${file} ${event} paths must match the exact owning-path set`,
+    );
+  }
+  add(
+    violations,
+    hasExactKeys(pullRequest, ["paths"])
+      && hasExactKeys(push, ["branches", "paths"])
+      && list(push.branches).length === list(durability.branches).length
+      && sameMembers(push.branches, durability.branches),
+    `${file} push must seed only the declared integration branches`,
+  );
+  add(
+    violations,
+    hasExactKeys(permissions, ["contents"]) && permissions.contents === "read",
+    `${file} permissions must remain contents: read only`,
+  );
+  add(
+    violations,
+    hasExactKeys(concurrency, ["group", "cancel-in-progress"])
+      && concurrency.group
+        === "crate-durability-${{ github.event.pull_request.number || github.ref }}"
+      && concurrency["cancel-in-progress"] === true,
+    `${file} must cancel stale work within one PR or branch`,
+  );
+  add(
+    violations,
+    hasExactKeys(jobs, [durability.job])
+      && hasExactKeys(job, ["runs-on", "timeout-minutes", "steps"])
+      && job["runs-on"] === "ubuntu-latest"
+      && job["timeout-minutes"] === durability.timeout_minutes,
+    `${file} must contain one bounded Ubuntu durability job`,
+  );
+
+  const expectedSteps = [
+    { uses: "actions/checkout@v5", keys: ["uses"] },
+    { name: "Install Rust stable", keys: ["name", "run"] },
+    { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+    {
+      name: "Restore durability Cargo cache",
+      keys: ["name", "id", "uses", "continue-on-error", "with"],
+    },
+    { name: "Run durability and coverage contracts", keys: ["name", "run"] },
+    {
+      name: "Save durability Cargo cache",
+      keys: ["name", "if", "uses", "continue-on-error", "with"],
+    },
+  ];
+  add(
+    violations,
+    steps.length === expectedSteps.length
+      && steps.every((step, index) => {
+        const expected = expectedSteps[index];
+        return hasExactKeys(step, expected.keys)
+          && (expected.name === undefined || step.name === expected.name)
+          && (expected.uses === undefined || step.uses === expected.uses);
+      }),
+    `${file} must retain the exact serial checkout, cache, proof, and save sequence`,
+  );
+
+  const install = namedStep(job, "Install Rust stable");
+  add(
+    violations,
+    sameStrings(nonCommentLines(install?.run), [
+      "rustup toolchain install stable --profile minimal",
+      "rustup default stable",
+    ]),
+    `${file} must use the stable minimal Rust toolchain`,
+  );
+  const capture = namedStep(job, "Capture Rust cache identity");
+  add(
+    violations,
+    sameStrings(nonCommentLines(capture?.run), [
+      `echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"`,
+      `echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"`,
+    ]),
+    `${file} cache identity must bind the Rust release and host target`,
+  );
+
+  const restore = namedStep(job, "Restore durability Cargo cache");
+  const restoreWith = object(restore?.with);
+  const expectedCacheKey = [
+    "${{ runner.os }}",
+    durability.cache_namespace,
+    "${{ steps.rust-cache-key.outputs.version }}",
+    "${{ steps.rust-cache-key.outputs.target }}",
+    "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}",
+    "${{ hashFiles('Cargo.lock') }}",
+  ].join("-");
+  add(
+    violations,
+    restore?.uses === "actions/cache/restore@v5"
+      && restore?.["continue-on-error"] === true
+      && hasExactKeys(restoreWith, ["path", "key"])
+      && sameStrings(nonCommentLines(restoreWith.path), draftCachePaths)
+      && restoreWith.key === expectedCacheKey,
+    `${file} must use its isolated exact Cargo cache without fallback prefixes`,
+  );
+
+  const proof = namedStep(job, "Run durability and coverage contracts");
+  add(
+    violations,
+    sameStrings(nonCommentLines(proof?.run), durability.commands)
+      && proof?.if === undefined
+      && proof?.["continue-on-error"] === undefined,
+    `${file} must run the three declared durability commands serially and blocking`,
+  );
+
+  const save = namedStep(job, "Save durability Cargo cache");
+  const saveWith = object(save?.with);
+  add(
+    violations,
+    save?.uses === "actions/cache/save@v5"
+      && save?.["continue-on-error"] === true
+      && save?.if === cacheSaveCondition
+      && hasExactKeys(saveWith, ["path", "key"])
+      && sameStrings(nonCommentLines(saveWith.path), draftCachePaths)
+      && saveWith.key === cacheSaveKey
+      && stepIndex(job, "Save durability Cargo cache")
+        > stepIndex(job, "Run durability and coverage contracts"),
+    `${file} must save the exact cache only after every durability command passes`,
+  );
+  add(
+    violations,
+    durability.artifact_free === true
+      && !scalarStrings(workflow).some(value => /actions\/upload-artifact@/u.test(value)),
+    `${file} must remain artifact-free`,
   );
   return violations;
 }
@@ -10364,6 +10575,7 @@ export function validateMarketplaceSync(workflows, violations) {
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
+  violations.push(...proofFloorPolicyViolations(workflows, graph));
   violations.push(...benchmarkDependencyIsolationViolations(
     fs.readFileSync(
       path.join(repositoryRoot, "crates", "codestory-bench", "Cargo.toml"),

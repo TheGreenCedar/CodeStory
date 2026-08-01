@@ -21,6 +21,23 @@ Criterion targets.
 | Docs only | Read changed pages, doc links, `git diff --check` | No package matrix |
 | Release/version | Release and workflow policy scripts | Main-only signing, notarization, publish, install, and live runtime proof |
 
+`retrieval-engine-smoke.yml` runs the sub-second `architecture_contracts`
+binary in its universal `linux-contracts` job. Store, indexer, workspace, and
+contracts changes additionally run the path-scoped, artifact-free
+`crate-durability.yml` lane with these serial commands:
+
+```bash
+cargo test --locked -p codestory-store
+cargo test --locked -p codestory-indexer --test fidelity_regression
+cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
+```
+
+That lane has its own exact-key Cargo cache, derives the key from the Rust host
+and manifests plus `Cargo.lock`, and saves only after all three commands pass.
+It does not emit artifacts or turn unrelated crate changes into durability
+work. Run broad source proof once on the frozen candidate rather than using
+this focused durability lane as a second source-proof coordinator.
+
 ## Draft source checks
 
 Run the relevant focused commands while implementing. A typical Rust lane is:

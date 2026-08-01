@@ -25,6 +25,7 @@ import {
   annotationScopeViolations,
   basicWorkflowViolations,
   benchmarkDependencyIsolationViolations,
+  crateDurabilityFile,
   dispatchInputInterpolationViolations,
   draftSourcePolicyViolations,
   draftWorkflowPolicyViolations,
@@ -35,6 +36,7 @@ import {
   notaryStepViolations,
   packagedPrSigningViolations,
   parseWorkflow,
+  proofFloorPolicyViolations,
   qualificationDriverArtifactViolations,
   releaseEvidenceApprovalViolations,
   releaseProofCpuSelectorViolations,
@@ -5444,6 +5446,100 @@ test("package workflow keeps a packaging-only timeout", () => {
     validateWorkflows(workflows).join("\n"),
     /package build timeout must cover only signed macOS packaging/u,
   );
+});
+
+test("proof floor keeps architecture universal and durability path-scoped", async (t) => {
+  assert.deepEqual(proofFloorPolicyViolations(loadWorkflows()), []);
+
+  const redirectedGraph = structuredClone(loadReleaseClaimGraph(root));
+  redirectedGraph.workflow_policy.proof_floor.architecture_contract.workflow =
+    "alternate-proof.yml";
+  const aliasedWorkflows = loadWorkflows();
+  aliasedWorkflows.set(
+    "alternate-proof.yml",
+    structuredClone(aliasedWorkflows.get(retrievalFile)),
+  );
+  assert.notDeepEqual(
+    proofFloorPolicyViolations(aliasedWorkflows, redirectedGraph),
+    [],
+  );
+
+  const mutations = [
+    ["architecture command removed", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      steps.splice(steps.findIndex(step =>
+        step.name === "Architecture ownership contract tests"), 1);
+    }],
+    ["architecture job made conditional", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].if =
+        "github.event_name == 'workflow_dispatch'";
+    }],
+    ["architecture job made dependent", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].needs =
+        "windows-manifest-missing";
+    }],
+    ["architecture job put behind an environment", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"].environment =
+        "source-proof";
+    }],
+    ["architecture job made nonblocking", workflows => {
+      workflows.get(retrievalFile).jobs["linux-contracts"]["continue-on-error"] = true;
+    }],
+    ["owning path removed", workflows => {
+      workflows.get(crateDurabilityFile).on.pull_request.paths.shift();
+    }],
+    ["unrelated crate path added", workflows => {
+      const workflow = workflows.get(crateDurabilityFile);
+      workflow.on.pull_request.paths.push("crates/codestory-runtime/**");
+      workflow.on.push.paths.push("crates/codestory-runtime/**");
+    }],
+    ["commands reordered", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      const proof = draftStep(job, "Run durability and coverage contracts");
+      const commands = proof.run.trim().split("\n");
+      [commands[0], commands[1]] = [commands[1], commands[0]];
+      proof.run = commands.join("\n");
+    }],
+    ["cache namespace shared", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      draftStep(job, "Restore durability Cargo cache").with.key =
+        "${{ runner.os }}-draft-v2";
+    }],
+    ["cache fallback added", workflows => {
+      const job = workflows.get(crateDurabilityFile).jobs["linux-durability"];
+      draftStep(job, "Restore durability Cargo cache").with["restore-keys"] =
+        "${{ runner.os }}-draft-";
+    }],
+    ["cache saved before proof", workflows => {
+      const steps = workflows.get(crateDurabilityFile).jobs["linux-durability"].steps;
+      const saveIndex = steps.findIndex(step => step.name === "Save durability Cargo cache");
+      const [save] = steps.splice(saveIndex, 1);
+      const proofIndex = steps.findIndex(step =>
+        step.name === "Run durability and coverage contracts");
+      steps.splice(proofIndex, 0, save);
+    }],
+    ["artifact upload added", workflows => {
+      workflows.get(crateDurabilityFile).jobs["linux-durability"].steps.push({
+        name: "Upload durability output",
+        uses: "actions/upload-artifact@v4",
+        with: { path: "target" },
+      });
+    }],
+    ["dev push removed", workflows => {
+      workflows.get(crateDurabilityFile).on.push.branches = ["main"];
+    }],
+    ["write permission granted", workflows => {
+      workflows.get(crateDurabilityFile).permissions.contents = "write";
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows);
+      assert.notDeepEqual(proofFloorPolicyViolations(workflows), []);
+    });
+  }
 });
 
 test("draft source workflow freezes its complete top-level contract", async (t) => {

@@ -171,6 +171,9 @@ jobs:
       - name: Retrieval crate unit tests
         run: cargo test --locked -p codestory-retrieval
 
+      - name: Architecture ownership contract tests
+        run: cargo test --locked -p codestory-cli --test architecture_contracts
+
       - name: Seed draft proof test-profile artifacts
         run: |
           cargo test --locked -p codestory-llama-sys --test native_staging --no-run

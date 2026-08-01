@@ -335,6 +335,55 @@ test("claim graph freezes one exact Windows release graph and protected content-
   }
 });
 
+test("claim graph owns the universal architecture and path-scoped durability floor", () => {
+  const floor = graph.workflow_policy.proof_floor;
+  assert.deepEqual(floor.architecture_contract, {
+    workflow: "retrieval-engine-smoke.yml",
+    job: "linux-contracts",
+    command: "cargo test --locked -p codestory-cli --test architecture_contracts",
+  });
+  assert.equal(floor.crate_durability.workflow, "crate-durability.yml");
+  assert.equal(floor.crate_durability.job, "linux-durability");
+  assert.equal(floor.crate_durability.artifact_free, true);
+  assert.deepEqual(floor.crate_durability.commands, [
+    "cargo test --locked -p codestory-store",
+    "cargo test --locked -p codestory-indexer --test fidelity_regression",
+    "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+  ]);
+  assert.ok(!floor.crate_durability.paths.includes("crates/**"));
+
+  const mutations = [
+    [draft => {
+      draft.workflow_policy.proof_floor.schema = 2;
+    }, /exact schema 1 contract/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.architecture_contract.job = "optional-contracts";
+    }, /universal linux-contracts lane/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.architecture_contract.workflow = "";
+    }, /architecture_contract\.workflow must be a non-empty string/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.artifact_free = false;
+    }, /source-only identity and bound/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.paths.push(
+        "crates/codestory-runtime/**",
+      );
+    }, /paths must be exactly/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.commands.reverse();
+    }, /commands must be exactly/u],
+    [draft => {
+      draft.workflow_policy.proof_floor.crate_durability.cache_namespace = "draft-v2";
+    }, /source-only identity and bound/u],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const draft = structuredClone(graph);
+    mutate(draft);
+    assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+});
+
 test("claim graph freezes Mac-only accelerated 3x1 constant calibration", () => {
   const calibration = graph.workflow_policy.calibration;
   assert.deepEqual(calibration.required_cells.map(({ id }) => id), [
