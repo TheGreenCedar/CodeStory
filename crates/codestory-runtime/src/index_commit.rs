@@ -11,6 +11,7 @@ use crate::{
     current_epoch_ms, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
 };
 use codestory_contracts::api::{ApiError, IndexPublicationDto, IndexPublicationModeDto};
+use codestory_contracts::bounded_locks;
 use codestory_indexer::CancellationToken;
 use codestory_store::{
     IndexPublicationMode, IndexPublicationRecord, StagedSnapshot, StagedSnapshotPublishStats,
@@ -18,7 +19,6 @@ use codestory_store::{
 use codestory_workspace::{
     OversizedSourceExclusionCandidate, SourceIndexPolicy, WorkspaceManifest,
 };
-use fs4::fs_std::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -110,7 +110,7 @@ impl IndexWriterGuard {
 
 impl Drop for IndexWriterGuard {
     fn drop(&mut self) {
-        if let Err(error) = FileExt::unlock(&self.file) {
+        if let Err(error) = bounded_locks::release(&self.file) {
             tracing::warn!(
                 path = %self.path.display(),
                 "Failed to unlock index writer lock: {error}"

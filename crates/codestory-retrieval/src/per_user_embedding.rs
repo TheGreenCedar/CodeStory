@@ -41,7 +41,7 @@ pub use transport::{
 };
 
 use exchange::{
-    configure_exchange_timeout, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
+    arm_exchange_deadline, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
     encode_vectors, exchange, hello, is_server_loss, is_sha256, positive_duration_ms, read_frame,
     request, response_result, validate_engine_identity, validate_engine_server_identity,
     validate_lease_server_identity, validate_same_server, validate_server_snapshot, vectors_result,

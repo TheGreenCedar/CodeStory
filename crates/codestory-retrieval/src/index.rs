@@ -538,13 +538,22 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     let project_id = project_identity.artifact_scope_id;
     let workspace_id = project_identity.workspace_id;
     let global_gc_state_file = global_generation_gc_state_file(runtime);
-    let _global_gc_lock = GenerationRetentionLock::acquire_shared(
+    // Both waits can sit behind a sibling's whole publication pass. The
+    // finalize caller's cancellation flag is in scope here, so pass it: a
+    // cancelled activation must leave these waits at once instead of holding
+    // an eviction or shutdown open for the peer's commit.
+    let _global_gc_lock = GenerationRetentionLock::acquire_shared_with_cancel(
         &global_gc_state_file,
         GLOBAL_GENERATION_GC_LOCK_SCOPE,
+        Some(cancelled),
     )
     .context("coordinate sidecar publication with global generation cleanup")?;
-    let _generation_lock = GenerationRetentionLock::acquire(&layout.state_file, &project_id)
-        .context("lock sidecar generation publication and retention")?;
+    let _generation_lock = GenerationRetentionLock::acquire_with_cancel(
+        &layout.state_file,
+        &project_id,
+        Some(cancelled),
+    )
+    .context("lock sidecar generation publication and retention")?;
     layout.ensure_data_dirs()?;
     let embedding_residency =
         crate::embeddings::acquire_product_embedding_residency_for_runtime(runtime)

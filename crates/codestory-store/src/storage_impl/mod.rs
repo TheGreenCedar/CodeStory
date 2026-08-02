@@ -1,3 +1,6 @@
+use codestory_contracts::bounded_locks::{
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+};
 use codestory_contracts::owned_artifacts;
 
 use codestory_contracts::graph::{
@@ -10,7 +13,6 @@ use codestory_contracts::workspace::OversizedSourceExclusionCandidate;
 use codestory_contracts::workspace::{
     DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
 };
-use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, limits::Limit, params,
@@ -1194,12 +1196,24 @@ impl PromotionLock {
             })
     }
 
+    /// A peer holds this for the whole atomic old-or-new promotion, so the
+    /// budget is the publication one: a foreground budget would refuse
+    /// ordinary contention behind a legitimate commit. The wait stays
+    /// interruptible through the caller's ambient cancellation, so a cancelled
+    /// request or activation still leaves it at once.
     fn acquire(path: &Path) -> Result<Self, StorageError> {
         let file = Self::open(path)?;
-        FileExt::lock_exclusive(&file).map_err(|error| {
+        acquire_with_deadline(
+            &file,
+            FileLockKind::Exclusive,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            None,
+        )
+        .map_err(|error| {
             StorageError::Other(format!(
-                "Failed to acquire promotion lock for {}: {error}",
-                path.display()
+                "Failed to acquire promotion lock for {} ({}): {error}",
+                path.display(),
+                error.code()
             ))
         })?;
         Ok(Self { file })
@@ -1207,7 +1221,7 @@ impl PromotionLock {
 
     fn try_acquire(path: &Path) -> Result<Option<Self>, StorageError> {
         let file = Self::open(path)?;
-        FileExt::try_lock_exclusive(&file)
+        bounded_locks::try_acquire(&file, FileLockKind::Exclusive)
             .map(|locked| locked.then_some(Self { file }))
             .map_err(|error| {
                 StorageError::Other(format!(
@@ -1220,7 +1234,7 @@ impl PromotionLock {
 
 impl Drop for PromotionLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = bounded_locks::release(&self.file);
     }
 }
 

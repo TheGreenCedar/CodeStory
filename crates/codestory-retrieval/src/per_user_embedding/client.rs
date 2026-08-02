@@ -5,14 +5,14 @@ use super::qualification_control::{
     EmbeddingQualificationAttemptExchange, EmbeddingQualificationAttemptResult,
 };
 use super::{
-    CONNECTION_POLL, EmbeddingClientBudgets, EmbeddingClientTransport, EmbeddingCompatibility,
-    EmbeddingConnectIntent, EmbeddingConnectOutcome, EmbeddingEngineIdentity,
-    EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity, EmbeddingOperation, EmbeddingResult,
-    EmbeddingServerSnapshot, EmbeddingServerStream, PerUserEmbeddingError,
-    configure_exchange_timeout, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
-    exchange, hello, is_server_loss, positive_duration_ms, request, response_result,
-    validate_engine_identity, validate_engine_server_identity, validate_lease_server_identity,
-    validate_same_server, validate_server_snapshot, vectors_result,
+    AwakeMonotonicClock, CONNECTION_POLL, EmbeddingClientBudgets, EmbeddingClientTransport,
+    EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingConnectOutcome,
+    EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity,
+    EmbeddingOperation, EmbeddingResult, EmbeddingServerSnapshot, EmbeddingServerStream,
+    PerUserEmbeddingError, arm_exchange_deadline, decode_vectors, duration_ms, elapsed_since,
+    embedding_scope_id, exchange, hello, is_server_loss, positive_duration_ms, request,
+    response_result, validate_engine_identity, validate_engine_server_identity,
+    validate_lease_server_identity, validate_same_server, validate_server_snapshot, vectors_result,
 };
 use crate::config::SidecarRuntimeConfig;
 use crate::embedding_contract::normalize_and_validate_vectors;
@@ -361,7 +361,7 @@ impl PerUserEmbeddingClient {
     pub fn ensure_resident(&self) -> Result<EmbeddingEngineIdentity> {
         let budgets = self.transport.budgets();
         let mut connection = self.connect(EmbeddingConnectIntent::Activate, true)?;
-        configure_exchange_timeout(&*connection.stream, budgets.bulk_request)?;
+        let _deadline = arm_exchange_deadline(self.transport.clock(), budgets.bulk_request)?;
         let request_id = Uuid::new_v4().to_string();
         let operation = EmbeddingOperation::EnsureResident {
             scope_id: self.scope_id.clone(),
@@ -383,7 +383,7 @@ impl PerUserEmbeddingClient {
     pub fn acquire_residency_lease(&self) -> Result<PerUserEmbeddingResidencyLease> {
         let budgets = self.transport.budgets();
         let mut connection = self.connect(EmbeddingConnectIntent::Activate, true)?;
-        configure_exchange_timeout(&*connection.stream, budgets.bulk_request)?;
+        let _deadline = arm_exchange_deadline(self.transport.clock(), budgets.bulk_request)?;
         let request_id = Uuid::new_v4().to_string();
         let operation = EmbeddingOperation::AcquireLease {
             scope_id: self.scope_id.clone(),
@@ -407,6 +407,7 @@ impl PerUserEmbeddingClient {
             identity: *identity,
             server: connection.snapshot,
             budgets,
+            clock: self.transport.clock(),
         })
     }
 
@@ -424,7 +425,8 @@ impl PerUserEmbeddingClient {
             Err(error) if error.to_string().contains("embedding_server_absent") => return Ok(None),
             Err(error) => return Err(error),
         };
-        configure_exchange_timeout(&*connection.stream, self.transport.budgets().connect)?;
+        let _deadline =
+            arm_exchange_deadline(self.transport.clock(), self.transport.budgets().connect)?;
         let request_id = Uuid::new_v4().to_string();
         let (response, _) = exchange(
             &mut *connection.stream,
@@ -490,7 +492,7 @@ impl PerUserEmbeddingClient {
             let remaining = control.remaining(operation_timeout)?;
             let request_operation =
                 operation(positive_duration_ms(remaining), cancel_token.clone());
-            configure_exchange_timeout(&*connection.stream, remaining)?;
+            let _deadline = arm_exchange_deadline(Arc::clone(&clock), remaining)?;
             let server_instance_id = connection.snapshot.process.server_instance_id.clone();
             let submitted_ns = clock.now_ns();
             let completed = AtomicBool::new(false);
@@ -572,7 +574,8 @@ impl PerUserEmbeddingClient {
 
     fn send_cancel(&self, target_request_id: &str, cancel_token: &str) -> Result<bool> {
         let mut connection = self.connect(EmbeddingConnectIntent::Activate, false)?;
-        configure_exchange_timeout(&*connection.stream, self.transport.budgets().connect)?;
+        let _deadline =
+            arm_exchange_deadline(self.transport.clock(), self.transport.budgets().connect)?;
         let request_id = Uuid::new_v4().to_string();
         let (response, _) = exchange(
             &mut *connection.stream,
@@ -655,7 +658,7 @@ impl PerUserEmbeddingClient {
                 .map_err(anyhow::Error::new)?
             {
                 EmbeddingConnectOutcome::Connected(mut stream) => {
-                    configure_exchange_timeout(&*stream, connect_budget)?;
+                    let _deadline = arm_exchange_deadline(self.transport.clock(), connect_budget)?;
                     let transport_identity = stream.transport_identity().clone();
                     let executable = self.transport.executable_identity();
                     let snapshot = match hello(
@@ -740,6 +743,7 @@ pub struct PerUserEmbeddingResidencyLease {
     identity: EmbeddingEngineIdentity,
     server: EmbeddingServerSnapshot,
     budgets: EmbeddingClientBudgets,
+    clock: Arc<dyn AwakeMonotonicClock>,
 }
 
 impl fmt::Debug for PerUserEmbeddingResidencyLease {
@@ -766,7 +770,7 @@ impl PerUserEmbeddingResidencyLease {
             .stream
             .as_mut()
             .ok_or_else(|| anyhow!("embedding_publication_lease_released"))?;
-        configure_exchange_timeout(&**stream, self.budgets.bulk_request)?;
+        let _deadline = arm_exchange_deadline(Arc::clone(&self.clock), self.budgets.bulk_request)?;
         let request_id = Uuid::new_v4().to_string();
         let (response, _) = exchange(
             &mut **stream,
@@ -812,7 +816,7 @@ impl PerUserEmbeddingResidencyLease {
         let Some(mut stream) = self.stream.take() else {
             return Ok(());
         };
-        configure_exchange_timeout(&*stream, self.budgets.connect)?;
+        let _deadline = arm_exchange_deadline(Arc::clone(&self.clock), self.budgets.connect)?;
         let request_id = Uuid::new_v4().to_string();
         let (response, _) = exchange(
             &mut *stream,

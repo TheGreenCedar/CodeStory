@@ -14,10 +14,21 @@ use codestory_contracts::query::{
 
 use crate::{
     AppController, PublicOperationService, SymbolWorkflowOutcome, SymbolWorkflowRequest,
-    TargetResolution, TargetSelection, compare_ranked_hits, symbol_name_match_rank,
+    TargetResolution, TargetSelection, active_public_operation_cancellation, compare_ranked_hits,
+    symbol_name_match_rank,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+/// The facade runs inside whatever public operation the transport already
+/// opened. Minting a fresh flag here replaced the caller's live cancellation
+/// with a permanently-false one, so a host that cancelled mid-tool-body was
+/// never observed by anything the body called. Inheriting keeps the host's
+/// signal reachable; an unwrapped entry (tests, embedders) still gets an
+/// isolated flag rather than a shared global.
+fn inherited_cancellation() -> Arc<AtomicBool> {
+    active_public_operation_cancellation().unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+}
 
 #[derive(Debug, Clone)]
 pub struct BrowserQueryItem {
@@ -108,7 +119,7 @@ impl ReadOnlyBrowserService {
         build: impl FnMut() -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
         self.public_operation
-            .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), build)
+            .run_with_cancel(operation, inherited_cancellation(), build)
             .map(|operation| operation.value)
     }
 
@@ -118,7 +129,7 @@ impl ReadOnlyBrowserService {
         build: impl FnMut() -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
         self.public_operation
-            .run_observational_with_cancel(operation, Arc::new(AtomicBool::new(false)), build)
+            .run_observational_with_cancel(operation, inherited_cancellation(), build)
             .map(|operation| operation.value)
     }
 

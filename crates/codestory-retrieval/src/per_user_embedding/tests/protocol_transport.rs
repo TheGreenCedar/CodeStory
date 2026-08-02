@@ -1,17 +1,18 @@
 use super::super::{
-    EmbeddingClientBudgets, EmbeddingCompatibility, EmbeddingEngineLeaseIdentity,
-    EmbeddingOperation, EmbeddingProtocolRequest, EmbeddingResult, IncrementalProtocolFrameReader,
-    PER_USER_EMBEDDING_MAX_METADATA_BYTES, PER_USER_EMBEDDING_PROTOCOL_SHA256,
-    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
-    PerUserEmbeddingServerState, ProtocolFramePoll, ServerLeaseActivity,
-    configure_server_operation_timeout, elapsed_since, embedding_retry_state, exchange,
-    exchange_raw_os_error, hex_sha256, map_bounded_exchange_error, read_frame, request,
-    serve_embedding_connection, success_response, validate_lease_server_identity,
-    validate_same_server, validate_server_snapshot,
+    AwakeMonotonicClock, EmbeddingClientBudgets, EmbeddingCompatibility,
+    EmbeddingEngineLeaseIdentity, EmbeddingOperation, EmbeddingProtocolRequest, EmbeddingResult,
+    IncrementalProtocolFrameReader, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
+    PER_USER_EMBEDDING_PROTOCOL_SHA256, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+    PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PerUserEmbeddingServerState, ProtocolFramePoll,
+    ServerLeaseActivity, arm_exchange_deadline, configure_server_operation_timeout, elapsed_since,
+    embedding_retry_state, exchange, exchange_raw_os_error, hex_sha256, map_bounded_exchange_error,
+    read_frame, request, serve_embedding_connection, success_response,
+    validate_lease_server_identity, validate_same_server, validate_server_snapshot,
 };
 use super::{
-    MemoryStream, PollingStream, encode_test_frame, test_engine_identity, test_executable,
-    test_hello_operation, test_server_state, test_snapshot, test_transport_identity,
+    MemoryStream, PollingStream, TestClock, TricklePeerStream, encode_test_frame,
+    test_engine_identity, test_executable, test_hello_operation, test_server_state, test_snapshot,
+    test_transport_identity,
 };
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -349,5 +350,67 @@ fn lease_end_restarts_the_full_true_idle_window_before_native_release() {
     assert_eq!(
         elapsed_since(state.clock.as_ref(), idle_start),
         Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS)
+    );
+}
+
+#[test]
+fn a_trickling_peer_cannot_hold_the_exchange_past_one_absolute_deadline() {
+    // The response frame is long enough that a one-byte-per-syscall peer needs
+    // far more stalls than the budget allows.
+    let response = success_response("trickle", EmbeddingResult::Released);
+    let clock = TestClock::new();
+    let budget = Duration::from_millis(1_000);
+    let stall = Duration::from_millis(100);
+    let stream =
+        TricklePeerStream::new(encode_test_frame(&response, &[]), Arc::clone(&clock), stall);
+    let read_timeouts = stream.read_timeouts();
+    let mut stream = stream;
+
+    let started_ns = clock.now_ns();
+    let armed = arm_exchange_deadline(clock.clone(), budget).expect("arm exchange deadline");
+    let error = exchange(
+        &mut stream,
+        request(
+            "trickle",
+            EmbeddingCompatibility::current(true),
+            EmbeddingOperation::Snapshot,
+        ),
+    )
+    .expect_err("a trickling peer must not outlive the exchange deadline");
+    drop(armed);
+
+    assert!(
+        error
+            .to_string()
+            .contains("embedding_server_owner_unresponsive"),
+        "a bounded exchange timeout must stay typed: {error:#}"
+    );
+    let elapsed_ns = clock.now_ns() - started_ns;
+    assert!(
+        elapsed_ns <= budget.as_nanos() as u64 + stall.as_nanos() as u64,
+        "the exchange ran {elapsed_ns} ns past its {budget:?} deadline"
+    );
+
+    let armed_timeouts = read_timeouts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        armed_timeouts.len() > 1,
+        "every read syscall must re-arm its own timeout"
+    );
+    assert!(
+        armed_timeouts
+            .windows(2)
+            .all(|pair| pair[0] > pair[1] && pair[1] > Some(Duration::ZERO)),
+        "each syscall must be re-armed with the shrinking remaining budget: {armed_timeouts:?}"
+    );
+    assert!(
+        armed_timeouts
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|first| first <= budget),
+        "no syscall may be armed with more than the whole remaining budget"
     );
 }

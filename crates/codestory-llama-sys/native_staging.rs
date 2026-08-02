@@ -1,4 +1,6 @@
-use fs4::fs_std::FileExt;
+use codestory_contracts::bounded_locks::{
+    FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -900,7 +902,16 @@ fn acquire_profile_staging_lock(profile_dir: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(profile_dir.join(".codestory-native-staging.lock"))?;
-    FileExt::lock_exclusive(&lock)?;
+    // A sibling build staging the same profile holds this for a full runtime
+    // tree copy and verify. Bounded rather than blocking so a wedged sibling
+    // cannot hang the build forever.
+    acquire_with_deadline(
+        &lock,
+        FileLockKind::Exclusive,
+        LockDeadline::after(PUBLICATION_LOCK_WAIT),
+        None,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(lock)
 }
 

@@ -3,7 +3,7 @@ use super::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, CancellationToken,
     DEFAULT_SOURCE_FILE_BYTE_CAP, DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
     DENSE_CENTRAL_SCORE_THRESHOLD, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-    DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason, FileExt, FileInfo, GraphRequest,
+    DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason, FileInfo, GraphRequest,
     GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HybridSearchConfig, IndexFreshnessStatusDto,
     IndexPublicationRecord, IndexWriterGuard, IndexedFileRoleDto, IndexingPhaseTimings,
     LEGACY_OVERSIZED_SOURCE_POLICY_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,

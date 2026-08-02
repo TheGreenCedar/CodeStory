@@ -1,4 +1,6 @@
-use fs4::fs_std::FileExt;
+use codestory_contracts::bounded_locks::{
+    FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -6,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::native_runtime_layout::{
     NATIVE_RUNTIME_CURRENT_FILE, NATIVE_RUNTIME_EXECUTABLE, NATIVE_RUNTIME_FILE_LIST,
@@ -14,6 +17,16 @@ use crate::native_runtime_layout::{
 };
 
 const STAGING_LOCK: &str = ".codestory-native-staging.lock";
+/// A sibling launcher that is staging a generation copies and verifies the
+/// whole runtime tree, which is the same publication-class hold every other
+/// long budget names. It exists so a wedged staging process can never hold a
+/// new launcher for the session's lifetime.
+///
+/// This wait runs before the runtime exists, so it has no cancellation flag to
+/// inherit and is uninterruptible for its whole budget. That is sound only
+/// because no thread here is joined against a quiescence budget: the launcher
+/// process has no activation worker and installs no fail-stop hook.
+const STAGING_LOCK_WAIT: Duration = PUBLICATION_LOCK_WAIT;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn run() -> ExitCode {
@@ -81,7 +94,13 @@ fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
         .truncate(false)
         .open(root.join(STAGING_LOCK))
         .map_err(|error| staging_lock_error(root, error))?;
-    FileExt::lock_exclusive(&lock)?;
+    acquire_with_deadline(
+        &lock,
+        FileLockKind::Exclusive,
+        LockDeadline::after(STAGING_LOCK_WAIT),
+        None,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
 
     let seed_id = runtime_seed_id(&candidate)?;
     let seed_dir = root.join(NATIVE_RUNTIME_SEEDS_DIR).join(&seed_id);

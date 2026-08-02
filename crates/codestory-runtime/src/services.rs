@@ -20,11 +20,76 @@ use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_ACTIVATION_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const ACTIVATION_WAIT_SLICE: Duration = Duration::from_millis(25);
+/// Longest an eviction or shutdown waits for a cancelled activation worker to
+/// reach a quiescent boundary before fail-stopping the process.
+///
+/// The worker checks cancellation between every preparation stage and inside
+/// indexing, and [`run_activation_worker`] installs its cancellation flag as
+/// the ambient one for every bounded lock acquisition on the worker thread. A
+/// lock wait therefore never blocks the worker for its own budget — a peer's
+/// whole publication, up to [`bounded_locks::PUBLICATION_LOCK_WAIT`] — but only
+/// until the flag is observed, within
+/// [`bounded_locks::MAX_CANCELLATION_LATENCY`]. Exceeding this budget means the
+/// worker is wedged inside owned mutation, not merely waiting for a peer.
+const ACTIVATION_QUIESCENCE_BUDGET: Duration = Duration::from_secs(20);
+
+/// The invariant this whole path rests on: the budget an eviction uses before
+/// aborting the process must exceed the longest a worker can stay inside a
+/// bounded lock wait after its cancellation is raised. Without the ambient
+/// scope that longest wait would instead be `PUBLICATION_LOCK_WAIT`, and an
+/// ordinary slow activation would abort a healthy session.
+const _: () = assert!(
+    ACTIVATION_QUIESCENCE_BUDGET.as_millis()
+        > codestory_contracts::bounded_locks::MAX_CANCELLATION_LATENCY.as_millis(),
+    "the quiescence budget must exceed the bounded-lock cancellation latency"
+);
+/// Fail-stop reason recorded when a cancelled activation worker never reaches
+/// a quiescent boundary.
+pub const ACTIVATION_QUIESCENCE_FAIL_STOP: &str = "activation_quiescence_timeout";
+
+/// Process-level fail-stop installed by the host binary. The runtime never
+/// aborts on its own: an embedder or a test observes the verdict instead.
+pub type ActivationFailStopHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+static ACTIVATION_FAIL_STOP: RwLock<Option<ActivationFailStopHook>> = RwLock::new(None);
+
+/// Install (or clear) the process fail-stop used when a cancelled activation
+/// worker cannot be proven quiescent. Returns the previous hook.
+pub fn set_activation_fail_stop_hook(
+    hook: Option<ActivationFailStopHook>,
+) -> Option<ActivationFailStopHook> {
+    let mut installed = ACTIVATION_FAIL_STOP
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::replace(&mut *installed, hook)
+}
+
+fn run_activation_fail_stop(reason_code: &str) {
+    let hook = ACTIVATION_FAIL_STOP
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match hook {
+        Some(hook) => hook(reason_code),
+        None => tracing::error!(
+            reason_code,
+            "a cancelled activation worker never reached a quiescent boundary and no process fail-stop is installed"
+        ),
+    }
+}
+
+/// Whether a cancelled activation worker reached a boundary at which it
+/// provably holds no publication or store lock and mutates no owned state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationQuiescence {
+    Quiesced,
+    FailStopRequired,
+}
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
@@ -71,10 +136,14 @@ fn with_public_operation_cancellation<T>(
     cancelled: Arc<AtomicBool>,
     build: impl FnOnce() -> T,
 ) -> T {
-    let previous =
-        ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| active.replace(Some(cancelled)));
+    let previous = ACTIVE_PUBLIC_OPERATION_CANCELLATION
+        .with(|active| active.replace(Some(Arc::clone(&cancelled))));
     let _guard = ActivePublicOperationCancellationGuard { previous };
-    build()
+    // A request body reaches the same publication-class locks the activation
+    // worker does, and waits behind a peer's whole publication pass. That is
+    // only tolerable while the request's own cancellation can end the wait, so
+    // the flag becomes the ambient one for every bounded acquisition below.
+    codestory_contracts::bounded_locks::with_thread_cancellation(cancelled, build)
 }
 
 pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> {
@@ -1084,7 +1153,28 @@ impl ActivationService {
         }
     }
 
-    pub fn cancel_and_wait(&self) {
+    /// Cancel the in-flight activation and wait for it to reach a quiescent
+    /// boundary. Past the activation quiescence budget the worker is never
+    /// detached: it may still hold a publication or store lock, so the process
+    /// fail-stops with the recorded reason instead of continuing.
+    pub fn cancel_and_wait(&self) -> ActivationQuiescence {
+        self.cancel_and_wait_or_fail_stop(ACTIVATION_QUIESCENCE_BUDGET)
+    }
+
+    fn cancel_and_wait_or_fail_stop(&self, budget: Duration) -> ActivationQuiescence {
+        let quiescence = self.cancel_and_wait_within(budget);
+        if quiescence == ActivationQuiescence::FailStopRequired {
+            run_activation_fail_stop(ACTIVATION_QUIESCENCE_FAIL_STOP);
+        }
+        quiescence
+    }
+
+    /// Bounded quiescence join without the fail-stop side effect, so callers
+    /// (and deterministic tests) can observe the verdict directly.
+    pub fn cancel_and_wait_within(&self, budget: Duration) -> ActivationQuiescence {
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now);
         let mut state = self
             .coordinator
             .state
@@ -1094,12 +1184,19 @@ impl ActivationService {
             cancelled.store(true, Ordering::Release);
         }
         while state.running {
+            let now = Instant::now();
+            if now >= deadline {
+                return ActivationQuiescence::FailStopRequired;
+            }
+            let remaining = deadline.saturating_duration_since(now);
             state = self
                 .coordinator
                 .changed
-                .wait(state)
-                .expect("activation coordinator poisoned");
+                .wait_timeout(state, remaining.min(ACTIVATION_WAIT_SLICE))
+                .expect("activation coordinator poisoned")
+                .0;
         }
+        ActivationQuiescence::Quiesced
     }
 
     fn activate_once(
@@ -1767,16 +1864,29 @@ fn run_activation_worker(
     operation: &ActivationOperation,
     activate: impl FnOnce() -> Result<(), ApiError>,
 ) {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let attempt = operation.attempt();
-        activate().map_err(|error| classify_activation_api_error_for_attempt(error, attempt))
-    }))
-    .unwrap_or_else(|_| {
-        Err(ApiError::new(
-            "project_unavailable",
-            "project activation worker stopped unexpectedly",
-        ))
-    });
+    // This thread is the one whose quiescence an eviction or shutdown joins
+    // against ACTIVATION_QUIESCENCE_BUDGET, and past that budget the process
+    // aborts. Its lock waits must therefore all be interruptible. The deep ones
+    // — model materialization, promotion, the search index and generation
+    // catalog guards, retention — are reached through APIs that carry no
+    // cancellation flag, so the flag is installed on the thread instead and
+    // every bounded acquisition below inherits it.
+    let result = codestory_contracts::bounded_locks::with_thread_cancellation(
+        Arc::clone(&operation.cancelled),
+        || {
+            catch_unwind(AssertUnwindSafe(|| {
+                let attempt = operation.attempt();
+                activate()
+                    .map_err(|error| classify_activation_api_error_for_attempt(error, attempt))
+            }))
+            .unwrap_or_else(|_| {
+                Err(ApiError::new(
+                    "project_unavailable",
+                    "project activation worker stopped unexpectedly",
+                ))
+            })
+        },
+    );
     let _ = operation.finish(result.as_ref().err());
 }
 
@@ -4162,5 +4272,251 @@ mod activation_tests {
         assert!(snapshot.allows_operation("ground"));
         assert!(!snapshot.allows_operation("packet"));
         assert_ne!(snapshot.state, ActivationState::Ready);
+    }
+}
+
+#[cfg(test)]
+mod bounded_runtime_tests {
+    use super::*;
+    use crate::Runtime;
+    use std::fs;
+
+    struct BoundedRuntimeFixture {
+        project: tempfile::TempDir,
+        _cache: tempfile::TempDir,
+        runtime: Runtime,
+    }
+
+    /// A runtime with no published core: every test here decides before any
+    /// snapshot work, so publishing one would only slow the proof down.
+    fn bounded_runtime_fixture() -> BoundedRuntimeFixture {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        fs::write(project.path().join("anchor.rs"), "// BOUNDED_ANCHOR\n")
+            .expect("write source anchor");
+        let sidecar_cache = cache.path().join("sidecar");
+        fs::create_dir_all(&sidecar_cache).expect("create sidecar cache");
+        let mut sidecar = codestory_retrieval::with_test_cache_root(&sidecar_cache, || {
+            codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Agent,
+            )
+        });
+        sidecar.embedding.allow_cpu = true;
+        let runtime = Runtime::new_with_config(sidecar);
+        BoundedRuntimeFixture {
+            project,
+            _cache: cache,
+            runtime,
+        }
+    }
+
+    fn preparing_snapshot(operation_id: &str) -> ActivationSnapshot {
+        ActivationSnapshot {
+            operation_id: operation_id.to_string(),
+            revision: 1,
+            state: ActivationState::Preparing,
+            stage: ActivationStage::Publication,
+            progress: activation_stage_progress(ActivationStage::Publication),
+            attempt: 1,
+            retry_after_ms: Some(250),
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: None,
+            failure: None,
+            failure_details: None,
+            retained_core_publication: None,
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Unavailable,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        }
+    }
+
+    /// The invariant the fail-stop budget rests on: the longest a worker can be
+    /// stuck without observing cancellation must stay under
+    /// `ACTIVATION_QUIESCENCE_BUDGET`.
+    ///
+    /// A peer holding a retention lock for a whole publication is ordinary, not
+    /// a fault, and the waiter's own budget for it is
+    /// `PUBLICATION_LOCK_WAIT` — six times the quiescence budget. Unless the
+    /// wait ends on cancellation, an eviction or a shutdown during a slow first
+    /// activation joins a worker that is merely waiting, calls it unquiesced,
+    /// and aborts the process out from under a healthy session.
+    ///
+    /// `GenerationRetentionLock::acquire` is a real production call site that
+    /// passes no cancellation flag of its own, exactly like the promotion,
+    /// search index, generation catalog, and model materialization waits the
+    /// worker also reaches. It must inherit the worker's.
+    #[test]
+    fn a_worker_waiting_on_a_held_publication_lock_quiesces_on_cancellation() {
+        let fixture = bounded_runtime_fixture();
+        let service = fixture.runtime.activation_service();
+        let state_file = fixture.project.path().join("retrieval-sidecars.json");
+        let holder = codestory_retrieval::GenerationRetentionLock::acquire(
+            &state_file,
+            "quiescence_contention",
+        )
+        .expect("a peer takes the retention lock for its publication pass");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let operation_id = "activation-quiescence-contention".to_string();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.current = Some(preparing_snapshot(&operation_id));
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let waited_state_file = state_file.clone();
+        let worker = std::thread::spawn(move || {
+            run_activation_worker(&operation, || {
+                entered
+                    .send(())
+                    .expect("announce that the worker is running");
+                // Either outcome ends the body; the worker always reports a
+                // failure so completion takes the error path rather than the
+                // ready-lease one this fixture never publishes.
+                match codestory_retrieval::GenerationRetentionLock::acquire(
+                    &waited_state_file,
+                    "quiescence_contention",
+                ) {
+                    Ok(_) => Err(ApiError::new(
+                        "activation_retryable",
+                        "the wait outlived cancellation and ended by acquiring the lock",
+                    )),
+                    Err(error) => Err(ApiError::new("cancelled", error.to_string())),
+                }
+            });
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker entered its body");
+
+        let started = Instant::now();
+        let quiescence = service.cancel_and_wait_within(ACTIVATION_QUIESCENCE_BUDGET);
+        let waited = started.elapsed();
+
+        // Released before the join so a regression fails in the worker's own
+        // budget rather than parking this test behind PUBLICATION_LOCK_WAIT.
+        drop(holder);
+        worker.join().expect("activation worker thread");
+        let failure_code = service
+            .snapshot()
+            .expect("the fixture seeded a snapshot")
+            .failure_code;
+
+        assert_eq!(
+            quiescence,
+            ActivationQuiescence::Quiesced,
+            "a worker merely waiting behind a peer's publication was reported unquiesced after {waited:?}, which aborts the process"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the cancelled worker took {waited:?} to leave a lock wait it should have left within {:?}",
+            codestory_contracts::bounded_locks::MAX_CANCELLATION_LATENCY
+        );
+        // Not merely fast: the wait ended because the flag was raised, and not
+        // because the peer happened to release first.
+        assert_eq!(
+            failure_code.as_deref(),
+            Some("cancelled"),
+            "the worker must leave the lock wait on its cancellation flag"
+        );
+    }
+
+    #[test]
+    fn an_unquiesced_activation_worker_fail_stops_instead_of_being_detached() {
+        // A worker that has not reached a cancellation checkpoint may still
+        // hold a publication or store lock. Returning to the caller would
+        // detach it behind an evicted context, so the join reports a fail-stop
+        // and the hosting process records evidence and aborts.
+        let fixture = bounded_runtime_fixture();
+        let service = fixture.runtime.activation_service();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&recorded);
+        let previous = set_activation_fail_stop_hook(Some(Arc::new(move |reason: &str| {
+            sink.lock()
+                .expect("fail-stop sink")
+                .push(reason.to_string());
+        })));
+
+        let started = Instant::now();
+        let quiescence = service.cancel_and_wait_or_fail_stop(Duration::from_millis(80));
+        let waited = started.elapsed();
+        set_activation_fail_stop_hook(previous);
+
+        assert_eq!(quiescence, ActivationQuiescence::FailStopRequired);
+        assert!(
+            cancelled.load(Ordering::Acquire),
+            "the join must raise the worker's cancellation flag first"
+        );
+        assert_eq!(
+            recorded.lock().expect("fail-stop sink").as_slice(),
+            [ACTIVATION_QUIESCENCE_FAIL_STOP.to_string()]
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the join waited {waited:?} instead of its 80 ms budget"
+        );
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.running = false;
+            state.current_cancel = None;
+        }
+        service.coordinator.changed.notify_all();
+        assert_eq!(
+            service.cancel_and_wait_within(Duration::from_millis(80)),
+            ActivationQuiescence::Quiesced,
+            "a worker at a quiescent boundary must join without a fail-stop"
+        );
+    }
+
+    #[test]
+    fn the_read_only_facade_inherits_the_active_public_operation_cancellation() {
+        // The facade used to mint a fresh, permanently-false flag on entry,
+        // which replaced the host's live cancellation for the whole tool body.
+        let fixture = bounded_runtime_fixture();
+        let browser = fixture.runtime.browser_service();
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = with_public_operation_cancellation(Arc::clone(&cancelled), || {
+            browser
+                .search(SearchRequest {
+                    query: "anchor".into(),
+                    repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
+                    limit_per_source: 1,
+                    expand_search_plan: false,
+                    hybrid_weights: None,
+                    hybrid_limits: None,
+                })
+                .expect_err("an already-cancelled host request must not run a tool body")
+        });
+
+        assert_eq!(error.code, "cancelled");
     }
 }

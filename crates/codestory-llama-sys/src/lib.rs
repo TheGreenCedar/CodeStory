@@ -9,8 +9,8 @@ pub use admission::{
 };
 
 use admission::EmbeddingAdmissionTracker;
+use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline, acquire_with_deadline};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, bounded, select_biased, unbounded};
-use fs4::fs_std::FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -42,6 +42,16 @@ include!(concat!(env!("OUT_DIR"), "/model_contract.rs"));
 include!(concat!(env!("OUT_DIR"), "/embedding_server_contract.rs"));
 
 const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A peer materializing the embedded model writes and verifies the whole model
+/// file — the same publication-class hold every other long budget names. It
+/// exists so a wedged peer can never hold activation open indefinitely.
+///
+/// The activation worker reaches this through
+/// `ensure_product_embedding_backend_for_runtime`, whose signature carries no
+/// cancellation flag. The wait inherits the worker's flag from
+/// `bounded_locks::with_thread_cancellation` instead, so a cancelled activation
+/// leaves it without waiting out the peer.
+const MODEL_MATERIALIZE_LOCK_WAIT: Duration = bounded_locks::PUBLICATION_LOCK_WAIT;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUALIFICATION_NATIVE_STALL: AtomicBool = AtomicBool::new(false);
@@ -1936,9 +1946,16 @@ pub fn materialize_embedded_model(cache_root: &Path) -> Result<MaterializedModel
         .write(true)
         .open(directory.join(".materialize.lock"))
         .map_err(cache_error)?;
-    FileExt::lock_exclusive(&lock).map_err(cache_error)?;
+    acquire_with_deadline(
+        &lock,
+        FileLockKind::Exclusive,
+        LockDeadline::after(MODEL_MATERIALIZE_LOCK_WAIT),
+        None,
+    )
+    .map_err(|error| EngineError::ModelCache(error.to_string()))?;
     let result = materialize_embedded_model_locked(&directory);
-    let unlock = FileExt::unlock(&lock).map_err(cache_error);
+    let unlock =
+        bounded_locks::release(&lock).map_err(|error| EngineError::ModelCache(error.to_string()));
     match (result, unlock) {
         (Ok(reused), Ok(())) => Ok(MaterializedModel {
             path: directory.join(MODEL_FILE_NAME),

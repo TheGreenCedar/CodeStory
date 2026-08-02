@@ -1,5 +1,7 @@
 use anyhow::Result;
-use fs4::fs_std::FileExt;
+use codestory_contracts::bounded_locks::{
+    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
@@ -91,7 +93,7 @@ struct LocalRefreshStateGuard {
 
 impl Drop for LocalRefreshStateGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = bounded_locks::release(&self.file);
     }
 }
 
@@ -547,7 +549,14 @@ fn acquire_local_refresh_state_guard(cache_root: &Path) -> Result<LocalRefreshSt
     fs::create_dir_all(cache_root)?;
     let path = cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE);
     let file = open_local_refresh_state_guard_file(&path)?;
-    FileExt::lock_exclusive(&file)?;
+    // The critical section is one read-modify-write of the state file, never a
+    // publication, so the foreground budget is the matching one.
+    acquire_with_deadline(
+        &file,
+        FileLockKind::Exclusive,
+        LockDeadline::after(DEFAULT_LOCK_WAIT),
+        None,
+    )?;
     anyhow::ensure!(
         locked_guard_path_matches(&file, &path),
         "local refresh state guard was replaced at {}",
@@ -1044,10 +1053,19 @@ mod tests {
                 .send(())
                 .expect("announce replacement lock attempt");
             contention_tx
-                .send(FileExt::try_lock_exclusive(&guard_file).expect("try replacement guard"))
+                .send(
+                    bounded_locks::try_acquire(&guard_file, FileLockKind::Exclusive)
+                        .expect("try replacement guard"),
+                )
                 .expect("report replacement contention");
             retry_rx.recv().expect("retry replacement guard");
-            FileExt::lock_exclusive(&guard_file).expect("acquire replacement guard");
+            acquire_with_deadline(
+                &guard_file,
+                FileLockKind::Exclusive,
+                LockDeadline::after(DEFAULT_LOCK_WAIT),
+                None,
+            )
+            .expect("acquire replacement guard");
             let replacement_token = "replacement-owner".to_string();
             crate::file_state::write_json_atomic(
                 &local_refresh_lock_path(&replacement_cache),
@@ -1079,7 +1097,7 @@ mod tests {
                 },
             )
             .expect("replacement terminal status");
-            FileExt::unlock(&guard_file).expect("unlock replacement guard");
+            bounded_locks::release(&guard_file).expect("unlock replacement guard");
         });
         replacement_attempt_rx
             .recv()
