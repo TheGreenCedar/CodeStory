@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::Value;
@@ -640,6 +640,129 @@ fn legacy_crates_are_removed_from_the_workspace() {
             "workspace should not register removed crate {legacy}"
         );
     }
+}
+
+/// Production sources of the product crates, using the same test carve-out as
+/// the owned-artifact contract: files under a `tests` directory and the
+/// trailing inline test module pin identities on purpose.
+fn production_sources() -> Vec<(String, String)> {
+    let producer_crates = [
+        "crates/codestory-workspace/src",
+        "crates/codestory-store/src",
+        "crates/codestory-indexer/src",
+        "crates/codestory-retrieval/src",
+        "crates/codestory-runtime/src",
+        "crates/codestory-cli/src",
+    ];
+    let mut sources = Vec::new();
+    for dir in producer_crates {
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root().join(dir), &mut files);
+        files.sort();
+        for path in files {
+            let relative = path
+                .strip_prefix(repo_root())
+                .expect("producer file lives in the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative.split('/').any(|part| part == "tests")
+                || relative.ends_with("/tests.rs")
+                || relative.ends_with("/test_support.rs")
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read producer source");
+            let production = match source.rfind("\n#[cfg(test)]\nmod tests {") {
+                Some(index) => source[..index].to_string(),
+                None => source,
+            };
+            sources.push((relative, production));
+        }
+    }
+    sources
+}
+
+#[test]
+fn environment_identities_are_declared_in_the_config_registry_with_one_owner() {
+    // ARCH-021: every environment knob must exist in
+    // codestory_contracts::config_registry, which is what generates the
+    // configuration reference and records the module accountable for the
+    // setting. A second file spelling the same identity is the ambient read
+    // that let the same variable mean two things in two crates.
+    let identity = production_environment_identities();
+    let mut undeclared = Vec::new();
+    let mut misowned = Vec::new();
+    for (name, files) in &identity {
+        let Some(setting) = codestory_contracts::config_registry::env_setting(name) else {
+            let spelled_in = files.iter().map(String::as_str).collect::<Vec<_>>();
+            undeclared.push(format!("{name} in {}", spelled_in.join(", ")));
+            continue;
+        };
+        for file in files {
+            if file != setting.owner {
+                misowned.push(format!(
+                    "{name} is spelled in {file} but the registry owner is {}",
+                    setting.owner
+                ));
+            }
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "declare these environment identities in codestory_contracts::config_registry:\n{}",
+        undeclared.join("\n")
+    );
+    assert!(
+        misowned.is_empty(),
+        "import the identity from codestory_contracts::config_registry instead of spelling it:\n{}",
+        misowned.join("\n")
+    );
+}
+
+#[test]
+fn config_registry_owners_name_real_production_files() {
+    for setting in codestory_contracts::config_registry::ENV_SETTINGS {
+        assert!(
+            repo_root().join(setting.owner).is_file(),
+            "{} names a missing owner {}",
+            setting.name,
+            setting.owner
+        );
+    }
+}
+
+/// `CODESTORY_*` identities spelled in production, mapped to the files that
+/// spell them.
+fn production_environment_identities() -> BTreeMap<String, BTreeSet<String>> {
+    let mut identities: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (relative, source) in production_sources() {
+        for name in quoted_codestory_identities(&source) {
+            identities.entry(name).or_default().insert(relative.clone());
+        }
+    }
+    identities
+}
+
+fn quoted_codestory_identities(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("\"CODESTORY_") {
+        let after_quote = &rest[start + 1..];
+        match after_quote.find('"') {
+            Some(end) => {
+                let candidate = &after_quote[..end];
+                if candidate
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                {
+                    names.push(candidate.to_string());
+                }
+                rest = &after_quote[end + 1..];
+            }
+            None => break,
+        }
+    }
+    names
 }
 
 #[test]

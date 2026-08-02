@@ -75,6 +75,7 @@ evidence.
 | Coverage expectations | [users/what-to-expect.md](users/what-to-expect.md) |
 | Terminology | [glossary.md](glossary.md) |
 | CLI commands and repair transcripts | [users/cli-reference.md](users/cli-reference.md) |
+| Every configuration key and environment variable | [users/configuration-reference.md](users/configuration-reference.md) |
 | Verification lanes and proof tiers | [contributors/testing-matrix.md](contributors/testing-matrix.md) |
 | Host/plugin/native process boundary | [architecture/host-integration.md](architecture/host-integration.md) |
 | Core and retrieval publication | [architecture/retrieval-design.md](architecture/retrieval-design.md) |

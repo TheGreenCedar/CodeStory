@@ -23,11 +23,12 @@ use codestory_retrieval::{
 use std::sync::Arc;
 use std::time::Duration;
 
+use codestory_contracts::config_registry::EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV;
+
 mod gate;
 mod operations;
 mod protocol;
 
-const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const ANTI_IDLE_PROTOCOL_DEADLINE_MS: u64 = 90_000;
 
 pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> {

@@ -11,6 +11,7 @@
 //! reinterpreting the same contract differently.
 
 pub mod api;
+pub mod config_registry;
 pub mod events;
 pub mod graph;
 pub mod grounding;

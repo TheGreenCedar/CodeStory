@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, ProjectSummary, SearchHit,
 };
+use codestory_contracts::config_registry;
 use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
     PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, RuntimeProcessConfig,
@@ -117,7 +118,8 @@ impl RuntimeContextConfiguration {
         let logical_identity = retained_logical_identity.cloned().unwrap_or_else(|| {
             codestory_workspace::observe_logical_project_identity_v3(&project_root)
         });
-        let config = crate::config::load_config_with_startup(&project_root, startup)?;
+        let config = crate::config::load_config_with_startup(&project_root, startup)
+            .map_err(|error| map_api_error(error.into_api_error()))?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
         let process_cache_root = canonicalize_configuration_path(
             startup
@@ -534,12 +536,12 @@ pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value {
     let active_cli_version = env!("CARGO_PKG_VERSION");
-    let plugin_cli_version = publication_env_nonempty("CODESTORY_PLUGIN_CLI_VERSION");
-    let plugin_version = publication_env_nonempty("CODESTORY_PLUGIN_VERSION");
-    let cli_source = publication_env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE")
+    let plugin_cli_version = publication_env_nonempty(config_registry::PLUGIN_CLI_VERSION_ENV);
+    let plugin_version = publication_env_nonempty(config_registry::PLUGIN_VERSION_ENV);
+    let cli_source = publication_env_nonempty(config_registry::PLUGIN_CLI_SOURCE_ENV)
         .unwrap_or_else(|| "direct_cli_launch".to_string());
-    let override_configured =
-        publication_env_nonempty("CODESTORY_CLI").is_some() || cli_source == "local_dev_override";
+    let override_configured = publication_env_nonempty(config_registry::CLI_ENV).is_some()
+        || cli_source == "local_dev_override";
     codestory_publication_contract_runtime_meta_from(
         active_cli_version,
         plugin_version,

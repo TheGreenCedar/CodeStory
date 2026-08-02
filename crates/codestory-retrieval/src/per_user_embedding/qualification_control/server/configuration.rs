@@ -6,6 +6,7 @@ use super::filesystem::{
     validate_private_qualification_directory_metadata,
 };
 use anyhow::{Context, Result, bail};
+use codestory_contracts::config_registry;
 use std::fs;
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
@@ -24,8 +25,8 @@ pub(in crate::per_user_embedding) struct PinnedQualificationDirectory {
 pub(in crate::per_user_embedding) fn server_qualification_control_from_env()
 -> Result<Option<ServerQualificationControl>> {
     server_qualification_control_from_values(
-        std::env::var_os("CODESTORY_EMBED_QUALIFICATION_DIR"),
-        std::env::var("CODESTORY_EMBED_QUALIFICATION_NONCE").ok(),
+        std::env::var_os(config_registry::EMBED_QUALIFICATION_DIR_ENV),
+        std::env::var(config_registry::EMBED_QUALIFICATION_NONCE_ENV).ok(),
     )
 }
 

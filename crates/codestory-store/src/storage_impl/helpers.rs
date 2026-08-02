@@ -1,7 +1,7 @@
 use crate::StorageError;
+use codestory_contracts::config_registry::STORED_VECTOR_ENCODING_ENV;
 use codestory_contracts::graph::NodeId;
 
-const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 const EMBEDDING_BLOB_MAGIC: &[u8; 4] = b"CSE1";
 const EMBEDDING_BLOB_ENCODING_LEGACY_INT8: u8 = 1;
 const EMBEDDING_BLOB_ENCODING_SCALED_INT8: u8 = 2;

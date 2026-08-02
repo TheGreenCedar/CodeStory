@@ -8,6 +8,7 @@ use super::{
 };
 use crate::config::SidecarRuntimeConfig;
 use anyhow::{Context, Result, anyhow, bail};
+use codestory_contracts::config_registry;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -238,10 +239,10 @@ fn qualification_operation(
 }
 
 fn validate_qualification_gate(request: &EmbeddingQualificationRequest) -> Result<()> {
-    let directory = std::env::var_os("CODESTORY_EMBED_QUALIFICATION_DIR")
+    let directory = std::env::var_os(config_registry::EMBED_QUALIFICATION_DIR_ENV)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("embedding_qualification_gate_closed"))?;
-    let nonce = std::env::var("CODESTORY_EMBED_QUALIFICATION_NONCE")
+    let nonce = std::env::var(config_registry::EMBED_QUALIFICATION_NONCE_ENV)
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("embedding_qualification_gate_closed"))?;
