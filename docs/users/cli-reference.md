@@ -91,6 +91,58 @@ refresh cannot converge. Verify the path is under the active CodeStory cache
 root, preserve the old directory until the replacement is healthy, and never
 clean a user cache merely to make tests pass.
 
+## Roll a retrieval generation back
+
+CodeStory retains one deeply verified previous retrieval generation beside the
+current one. When broad retrieval stops being live-ready but the retained
+generation still proves out, activate it instead of rebuilding:
+
+```sh
+codestory-cli retrieval activate-rollback --project <repo> --dry-run
+codestory-cli retrieval activate-rollback --project <repo>
+```
+
+`--dry-run` runs every validation and changes nothing. Activation re-proves the
+retained generation against the live core publication and the artifacts on disk
+before it moves the pointer, so it can only ever refuse — with a typed code such
+as `rollback_evidence_invalid` or `rollback_not_live_ready` — never serve
+something the normal publication fence would have rejected. Activation consumes
+the retained pointer: the generation you stepped away from is not re-armed as a
+rollback target.
+
+`doctor` reports the retained generation and recommends this command when
+retrieval is not live-ready. `doctor` never activates anything itself.
+
+## Downgrade to an older CodeStory
+
+Schema migrations are forward-only. An older CodeStory pointed at a cache a
+newer release wrote fails closed with `Unsupported database schema version`, and
+`--refresh full` fails closed on it too. That is deliberate: the alternative is
+destroying a newer database. The executable recovery is to quarantine the
+derived cache and rebuild it.
+
+```sh
+codestory-cli cache reset --project <repo> --derived-only --dry-run
+codestory-cli cache reset --project <repo> --derived-only --confirm
+codestory-cli index --project <repo> --refresh full
+codestory-cli retrieval index --project <repo> --refresh full
+codestory-cli doctor --project <repo> --format markdown
+```
+
+`cache reset` requires `--derived-only` and exactly one of `--dry-run` or
+`--confirm`. It moves derived state — the core database and its SQLite
+siblings, the rollback backup, promotion journals, the search trees, and
+local-refresh state — into a timestamped `derived-reset-quarantine/` directory
+inside the same cache root. Nothing is deleted, so a mistaken reset is
+recoverable by moving the quarantined files back. It never opens the database,
+which is what makes it usable against a schema it cannot read.
+
+User-authored annotations live in a sidecar beside the cache and are preserved
+in place; the command reports exactly what it moved and what it preserved.
+Retrieval generations are reclaimed separately by
+`codestory-cli retrieval inventory --project <repo> --apply` once the rebuild
+has published a new generation.
+
 ## Index and ground
 
 ```sh
@@ -145,6 +197,8 @@ Embedding never uses a network endpoint. Put `cache_dir` in user home `.codestor
 | Change impact | `affected` with `--stdin` from `git diff` | Pick focused tests; not a test run |
 | Readiness | `agent preflight --format json` | `codestory://status{?project}` when MCP is live |
 | Broad evidence | `retrieval status --format json` | `packet` or `search` only after `full` mode |
+| Broad retrieval broke and a rollback is retained | `retrieval activate-rollback --project <repo> --dry-run` | Rerun without `--dry-run` once validation passes |
+| Rolled back CodeStory onto a newer cache | `cache reset --project <repo> --derived-only --dry-run` | `--confirm`, then `index --refresh full` |
 
 ## Managed search internals
 

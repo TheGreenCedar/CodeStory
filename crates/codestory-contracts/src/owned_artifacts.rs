@@ -88,6 +88,11 @@ pub fn embedded_model_directory(cache_root: &Path, digest: &str) -> PathBuf {
     embedded_model_digest_root(cache_root).join(digest)
 }
 
+/// Directory the guided derived-cache reset moves quarantined derived state
+/// into, inside the cache root that holds the storage file. The reset moves
+/// rather than deletes, so the name is an owned identity like any other.
+pub const DERIVED_RESET_QUARANTINE_DIR: &str = "derived-reset-quarantine";
+
 fn cache_root_for(storage_path: &Path) -> &Path {
     storage_path
         .parent()
@@ -179,6 +184,50 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// One promotion sibling path for a storage file.
+pub fn promotion_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
+    path_with_display_suffix(storage_path, suffix)
+}
+
+/// The annotations sidecar and its SQLite siblings in one cache root.
+///
+/// These hold user-authored state. Nothing that reclaims derived output may
+/// move or remove them, which is why they are named separately from the rest
+/// of the owned set rather than filtered at each call site.
+pub fn annotation_owned_file_identities(cache_root: &Path) -> Vec<PathBuf> {
+    sqlite_file_with_sidecars(&cache_root.join(ANNOTATIONS_SIDECAR_FILE))
+}
+
+/// Root the guided derived-cache reset quarantines into for one storage file.
+pub fn derived_reset_quarantine_root(storage_path: &Path) -> PathBuf {
+    cache_root_for(storage_path).join(DERIVED_RESET_QUARANTINE_DIR)
+}
+
+/// Derived file identities the guided reset quarantines.
+///
+/// This is every file identity the storage file owns, minus two exclusions.
+/// The annotation sidecar family is user-owned state and is preserved in
+/// place. The promotion lock is the exclusion the reset itself holds while it
+/// runs, and an empty coordination file carries no derived state, so moving it
+/// would only drop the exclusion a concurrent publisher is waiting on.
+pub fn derived_reset_file_identities(storage_path: &Path) -> Vec<PathBuf> {
+    let preserved = annotation_owned_file_identities(cache_root_for(storage_path));
+    let held_lock = promotion_sibling_path(storage_path, PROMOTION_LOCK_SUFFIX);
+    storage_owned_file_identities(storage_path)
+        .into_iter()
+        .filter(|path| *path != held_lock && !preserved.contains(path))
+        .collect()
+}
+
+/// Derived directory identities the guided reset quarantines: the search trees
+/// owned by one storage file.
+pub fn derived_reset_directory_identities(storage_path: &Path) -> Vec<PathBuf> {
+    SEARCH_DIRECTORY_SUFFIXES
+        .iter()
+        .map(|suffix| search_directory_for_storage(storage_path, suffix))
+        .collect()
+}
+
 /// Build the staged snapshot path for one live database and unique parts.
 pub fn staged_snapshot_path(live_path: &Path, pid: u32, epoch_ns: u128) -> PathBuf {
     cache_root_for(live_path).join(format!(
@@ -248,6 +297,56 @@ mod tests {
         expect("/cache/annotations.sqlite3");
         expect("/cache/annotations.sqlite3-shm");
         expect("/cache/annotations.pre-migration.json");
+    }
+
+    #[test]
+    fn derived_reset_quarantines_the_core_cache_and_preserves_annotations() {
+        let storage = Path::new("/cache/custom-core.db");
+        let derived = derived_reset_file_identities(storage);
+        let contains = |name: &str| derived.iter().any(|file| file == Path::new(name));
+
+        for annotation in annotation_owned_file_identities(Path::new("/cache")) {
+            assert!(
+                !derived.contains(&annotation),
+                "{} is user-owned annotation state and must never be quarantined",
+                annotation.display()
+            );
+        }
+        assert!(
+            !contains("/cache/custom-core.db.promotion.lock"),
+            "the reset holds the promotion lock; quarantining it would drop the exclusion"
+        );
+        for required in [
+            "/cache/custom-core.db",
+            "/cache/custom-core.db-wal",
+            "/cache/custom-core.db-shm",
+            "/cache/custom-core.index-writer.lock",
+            "/cache/custom-core.db.promotion.prepared.json",
+            "/cache/custom-core.db.promotion.committed.json",
+            "/cache/custom-core.db.promotion.cleanup-blocked",
+            "/cache/custom-core.sqlite.backup",
+            "/cache/custom-core.search.lock",
+            "/cache/custom-core.search-generations.lock",
+            "/cache/local-refresh-status.json",
+            "/cache/local-refresh.lock",
+            "/cache/local-refresh-state.guard",
+        ] {
+            assert!(
+                contains(required),
+                "{required} must be quarantined by the reset"
+            );
+        }
+        assert_eq!(
+            derived_reset_directory_identities(storage),
+            vec![
+                PathBuf::from("/cache/custom-core.search"),
+                PathBuf::from("/cache/custom-core.search-generations"),
+            ]
+        );
+        assert_eq!(
+            derived_reset_quarantine_root(storage),
+            Path::new("/cache").join(DERIVED_RESET_QUARANTINE_DIR)
+        );
     }
 
     #[test]

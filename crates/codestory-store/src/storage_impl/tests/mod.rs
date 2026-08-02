@@ -10577,3 +10577,96 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
     cleanup_sqlite_sidecars(&live_path)?;
     Ok(())
 }
+
+/// Read the durable schema shape a connection currently has.
+///
+/// `sqlite_master` is the only place both construction paths converge, so it
+/// is the only honest comparison surface for schema drift. Autoindexes are
+/// derived from the table SQL already present in the same dump, so including
+/// them would double-count rather than add signal.
+///
+/// Runs of whitespace are collapsed. SQLite stores the DDL text verbatim, and
+/// `create_tables` and the migration ladder indent the same table differently;
+/// that is layout, not shape. Everything that decides whether two caches are
+/// interchangeable — table set, index set, column names, types, defaults,
+/// constraints, and their order — survives the collapse.
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sqlite_master_shape(conn: &rusqlite::Connection) -> Vec<(String, String, String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY type, name, tbl_name",
+        )
+        .expect("prepare sqlite_master read");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                normalize_schema_sql(&row.get::<_, String>(3)?),
+            ))
+        })
+        .expect("query sqlite_master");
+    rows.map(|row| row.expect("read sqlite_master row"))
+        .collect()
+}
+
+#[test]
+fn a_replayed_migration_ladder_produces_the_same_schema_as_a_fresh_create() {
+    // ARCH-020: the CREATE TABLE definitions in `schema.rs` and the migration
+    // ladder are two sources of truth for one schema, and they have already
+    // drifted once. `init` stamps `user_version` to the current version before
+    // migrations run, so a freshly created database executes *no* migration —
+    // the ladder is only ever exercised on an upgraded cache, which is exactly
+    // where nothing was comparing the two shapes.
+    //
+    // This pins the drift direction that strands a rolled-back CLI: a
+    // conditional migration that changes the schema beyond what CREATE TABLE
+    // produces. Rewinding `user_version` replays the whole ladder over a
+    // freshly created database; the resulting `sqlite_master` must equal the
+    // fresh one, which also proves every migration is idempotent against the
+    // shape `schema.rs` ships.
+    //
+    // Scope, stated honestly: the tail of the ladder runs unconditionally on
+    // every open, so those steps already shape a fresh database and cannot
+    // drift from it. What this covers is the version-gated body — the steps a
+    // fresh create skips and only an upgraded cache ever runs.
+    let fresh_dir = tempfile::tempdir().expect("fresh schema directory");
+    let fresh_path = fresh_dir.path().join("codestory.db");
+    let fresh = Storage::open(&fresh_path).expect("create a fresh database");
+    let fresh_shape = sqlite_master_shape(fresh.get_connection());
+    drop(fresh);
+    assert!(
+        !fresh_shape.is_empty(),
+        "a fresh database must define a schema to compare"
+    );
+
+    let replay_dir = tempfile::tempdir().expect("replay schema directory");
+    let replay_path = replay_dir.path().join("codestory.db");
+    drop(Storage::open(&replay_path).expect("create the database to replay onto"));
+    let rewind = rusqlite::Connection::open(&replay_path).expect("open for version rewind");
+    rewind
+        .pragma_update(None, "user_version", 1i64)
+        .expect("rewind the recorded schema version");
+    drop(rewind);
+
+    let replayed = Storage::open(&replay_path).expect("replay the full migration ladder");
+    let replayed_shape = sqlite_master_shape(replayed.get_connection());
+    drop(replayed);
+
+    assert_eq!(
+        Storage::database_schema_version(&replay_path).expect("read replayed schema version"),
+        CURRENT_SCHEMA_VERSION,
+        "the replayed ladder must land on the current schema version"
+    );
+    assert_eq!(
+        replayed_shape, fresh_shape,
+        "the migration ladder and the CREATE TABLE definitions must agree; a fresh cache and a migrated cache have drifted"
+    );
+}

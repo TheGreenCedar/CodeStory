@@ -1524,7 +1524,7 @@ fn promote_retrieval_manifest_with_cancel<T>(
     Ok(prepared)
 }
 
-fn publish_derived_retention_marker(
+pub(crate) fn publish_derived_retention_marker(
     storage: &Store,
     layout: &SidecarLayout,
     workspace_id: &str,

@@ -7,6 +7,7 @@
 
 mod app;
 mod args;
+mod cache_reset;
 mod config;
 mod diagnostics;
 mod display;
