@@ -1,9 +1,12 @@
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -15,6 +18,11 @@ use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 const UPSTREAM_BUILD_SUPPORT_LIBRARY_NAMES: &[&str] = &["libllama-common.so"];
 pub(crate) const NATIVE_SEEDS_DIR: &str = ".codestory-native-seeds";
 pub(crate) const NATIVE_RUNTIME_FILE_LIST: &str = "codestory-native-runtime-files-v1.txt";
+/// Infix and suffix that make a staging residue name exclusively CodeStory's.
+/// Everything between them is the attempt identity; a name that does not parse
+/// completely is foreign and is never inspected, moved, or removed.
+const STAGING_RESIDUE_INFIX: &str = ".codestory-stage-";
+const STAGING_RESIDUE_SUFFIX: &str = ".tmp";
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -75,10 +83,10 @@ pub(crate) fn stage_native_generation(
     if generation_dir.exists() {
         verify_generation(&generation_dir, &entries)?;
     } else {
-        let temporary = seeds_dir.join(format!(
-            ".{id}.codestory-stage-{}-{}.tmp",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        let temporary = seeds_dir.join(residue_file_name(
+            &id,
+            StagingRole::Seed,
+            StagingAttempt::next(),
         ));
         fs::create_dir(&temporary)?;
         let result = (|| {
@@ -212,7 +220,7 @@ fn write_runtime_file_list<'a>(
 /// Copy one Windows runtime DLL without exposing a missing or partial destination.
 #[cfg(test)]
 pub(crate) fn stage_windows_runtime_file(source: &Path, destination: &Path) -> io::Result<()> {
-    stage_windows_runtime_files(&[(source, destination)])
+    stage_windows_runtime_files(&[(source, destination)]).map(|_| ())
 }
 
 /// Prepare every Windows runtime DLL before publishing the transaction.
@@ -221,12 +229,18 @@ pub(crate) fn stage_windows_runtime_file(source: &Path, destination: &Path) -> i
 /// Copying to unique same-directory files breaks those links. The publication
 /// transaction snapshots every destination before its first replacement and
 /// restores the complete previous set if a later replacement fails.
-pub(crate) fn stage_windows_runtime_files(entries: &[(&Path, &Path)]) -> io::Result<()> {
+///
+/// Process death skips that in-process rollback, so the attempt is classified
+/// and settled from disk first, under the same profile lock that proves no
+/// other attempt can own the residue found there.
+pub(crate) fn stage_windows_runtime_files(
+    entries: &[(&Path, &Path)],
+) -> io::Result<Vec<ResidueRecovery>> {
     let Some(profile_dir) = entries
         .first()
         .and_then(|(_, destination)| destination.parent())
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if entries
         .iter()
@@ -237,12 +251,31 @@ pub(crate) fn stage_windows_runtime_files(entries: &[(&Path, &Path)]) -> io::Res
             "Windows runtime destinations must share one profile directory",
         ));
     }
+    let destination_names = entries
+        .iter()
+        .map(|(_, destination)| {
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "native runtime destination name is not UTF-8: {}",
+                            destination.display()
+                        ),
+                    )
+                })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let _lock = acquire_profile_staging_lock(profile_dir)?;
+    let recovered = recover_staging_residue(profile_dir, &destination_names)?;
     let mut replacements = Vec::with_capacity(entries.len());
     for (source, destination) in entries {
         replacements.push(prepare_runtime_copy(source, destination)?);
     }
-    publish_all(replacements)
+    publish_all(replacements)?;
+    Ok(recovered)
 }
 
 /// Stage real Linux shared-library files into every Cargo runtime directory.
@@ -367,8 +400,13 @@ fn prepare_real_hard_link(source: &Path, destination: &Path) -> io::Result<Prepa
     let source = fs::canonicalize(source)?;
     validate_regular_source(&source, "Linux shared-library")?;
     validate_destination(destination, "shared-library", true)?;
-    let temporary = create_unique_hard_link(&source, destination)?;
-    Ok(PreparedReplacement::new(temporary, destination))
+    let temporary = create_unique_hard_link(&source, destination, StagingRole::Copy)?;
+    Ok(PreparedReplacement::new(
+        temporary,
+        destination,
+        "shared-library",
+        true,
+    ))
 }
 
 fn prepare_runtime_copy(source: &Path, destination: &Path) -> io::Result<PreparedReplacement> {
@@ -396,7 +434,12 @@ fn prepare_runtime_copy(source: &Path, destination: &Path) -> io::Result<Prepare
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    Ok(PreparedReplacement::new(temporary, destination))
+    Ok(PreparedReplacement::new(
+        temporary,
+        destination,
+        "native runtime",
+        false,
+    ))
 }
 
 fn validate_regular_source(source: &Path, label: &str) -> io::Result<()> {
@@ -434,7 +477,7 @@ fn validate_destination(destination: &Path, label: &str, allow_symlink: bool) ->
 
 fn create_unique_temp_file(destination: &Path) -> io::Result<(PathBuf, File)> {
     loop {
-        let temporary = staging_temp_path(destination);
+        let temporary = staging_temp_path(destination, StagingRole::Copy);
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -447,9 +490,13 @@ fn create_unique_temp_file(destination: &Path) -> io::Result<(PathBuf, File)> {
     }
 }
 
-fn create_unique_hard_link(source: &Path, destination: &Path) -> io::Result<PathBuf> {
+fn create_unique_hard_link(
+    source: &Path,
+    destination: &Path,
+    role: StagingRole,
+) -> io::Result<PathBuf> {
     loop {
-        let temporary = staging_temp_path(destination);
+        let temporary = staging_temp_path(destination, role);
         match fs::hard_link(source, &temporary) {
             Ok(()) => return Ok(temporary),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -458,16 +505,377 @@ fn create_unique_hard_link(source: &Path, destination: &Path) -> io::Result<Path
     }
 }
 
-fn staging_temp_path(destination: &Path) -> PathBuf {
-    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+/// Role every CodeStory staging residue records in its own name.
+///
+/// The role is what makes crash recovery a decision instead of a guess: a
+/// `Copy` never holds bytes that exist nowhere else, while a `Restore` is the
+/// only remaining witness of the runtime file its attempt was about to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum StagingRole {
+    /// Independent copy of a new runtime file, not yet published.
+    Copy,
+    /// Snapshot of the destination taken before its first replacement.
+    Restore,
+    /// Immutable-generation staging directory under the seeds directory.
+    Seed,
+}
+
+impl StagingRole {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Restore => "restore",
+            Self::Seed => "seed",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "copy" => Some(Self::Copy),
+            "restore" => Some(Self::Restore),
+            "seed" => Some(Self::Seed),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StagingRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.token())
+    }
+}
+
+/// Identity of one staging attempt, embedded in every residue name it creates.
+///
+/// `pid` alone cannot own residue: the operating system reuses process ids
+/// across a crash or reboot, so a later process could claim a dead process's
+/// files. Pairing the pid with the creating process's start epoch makes the
+/// identity exact — residue carrying this process's pid but an epoch older
+/// than this process incarnation provably belongs to a dead process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StagingAttempt {
+    pid: u32,
+    epoch_nanos: u128,
+    sequence: u64,
+}
+
+impl StagingAttempt {
+    fn next() -> Self {
+        Self {
+            pid: std::process::id(),
+            epoch_nanos: process_epoch_nanos(),
+            sequence: STAGING_COUNTER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Whether no live attempt in this process incarnation can own the residue.
+    fn is_abandoned(self) -> bool {
+        self.pid != std::process::id() || self.epoch_nanos < process_epoch_nanos()
+    }
+}
+
+impl fmt::Display for StagingAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}-{}-{}",
+            self.pid, self.epoch_nanos, self.sequence
+        )
+    }
+}
+
+/// Wall-clock start marker of this process incarnation, captured once.
+///
+/// A clock that cannot be read at all yields `0`, which classifies every
+/// same-pid residue as live and therefore untouchable. Recovery then does
+/// nothing rather than removing something it cannot prove it owns.
+fn process_epoch_nanos() -> u128 {
+    static PROCESS_EPOCH: OnceLock<u128> = OnceLock::new();
+    *PROCESS_EPOCH.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StagingResidue {
+    destination_name: String,
+    role: StagingRole,
+    attempt: StagingAttempt,
+}
+
+fn residue_file_name(destination_name: &str, role: StagingRole, attempt: StagingAttempt) -> String {
+    format!(".{destination_name}{STAGING_RESIDUE_INFIX}{role}-{attempt}{STAGING_RESIDUE_SUFFIX}")
+}
+
+/// Parse a directory entry name back into the attempt that owns it.
+///
+/// Every component must round-trip the exact formatting `residue_file_name`
+/// produces. A truncated, padded, or extended identity yields `None`, which
+/// keeps the name foreign and therefore immune to recovery.
+fn parse_staging_residue(file_name: &str) -> Option<StagingResidue> {
+    let body = file_name
+        .strip_prefix('.')?
+        .strip_suffix(STAGING_RESIDUE_SUFFIX)?;
+    let (destination_name, identity) = body.rsplit_once(STAGING_RESIDUE_INFIX)?;
+    if destination_name.is_empty() {
+        return None;
+    }
+    let mut parts = identity.split('-');
+    let role = StagingRole::from_token(parts.next()?)?;
+    let pid = parse_canonical_decimal::<u32>(parts.next()?)?;
+    let epoch_nanos = parse_canonical_decimal::<u128>(parts.next()?)?;
+    let sequence = parse_canonical_decimal::<u64>(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(StagingResidue {
+        destination_name: destination_name.to_owned(),
+        role,
+        attempt: StagingAttempt {
+            pid,
+            epoch_nanos,
+            sequence,
+        },
+    })
+}
+
+fn parse_canonical_decimal<T: std::str::FromStr>(part: &str) -> Option<T> {
+    if part.is_empty()
+        || !part.bytes().all(|byte| byte.is_ascii_digit())
+        || (part.len() > 1 && part.starts_with('0'))
+    {
+        return None;
+    }
+    part.parse().ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryDecision {
+    /// Residue whose bytes exist elsewhere; the destination was already whole.
+    Discarded,
+    /// The interrupted attempt's rollback, completed from its own snapshot.
+    RestoredPreviousRuntime,
+}
+
+impl fmt::Display for RecoveryDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Discarded => "discarded",
+            Self::RestoredPreviousRuntime => "restored-previous-runtime",
+        })
+    }
+}
+
+/// Attributable record of one recovery decision.
+#[derive(Debug)]
+pub(crate) struct ResidueRecovery {
+    residue: PathBuf,
+    destination: PathBuf,
+    role: StagingRole,
+    attempt: StagingAttempt,
+    decision: RecoveryDecision,
+}
+
+impl fmt::Display for ResidueRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native staging recovery: {} residue {} owned by attempt {} for destination {} was {}",
+            self.role,
+            self.residue.display(),
+            self.attempt,
+            self.destination.display(),
+            self.decision
+        )
+    }
+}
+
+/// Classify and settle every abandoned staging attempt in one directory.
+///
+/// Callers must already hold the profile staging lock, which is what proves a
+/// matching residue cannot belong to a concurrent attempt in another process.
+/// This settles the independent-copy path only, where a destination is always
+/// a regular file, so a link found at one is a swap rather than a layout.
+///
+/// A `Restore` snapshot is always rolled back onto its destination rather than
+/// only when the destination is missing. A crashed attempt cannot be asked
+/// whether it finished, so the only provable terminal state is the complete
+/// previous runtime; the caller re-stages immediately afterwards, so restoring
+/// a transaction that had in fact completed costs one repeated publication and
+/// never a torn set.
+pub(crate) fn recover_staging_residue(
+    directory: &Path,
+    destination_names: &[&str],
+) -> io::Result<Vec<ResidueRecovery>> {
+    for name in destination_names {
+        validate_runtime_file_name(name)?;
+    }
+    let owned = destination_names
+        .iter()
+        .map(|name| (destination_key(Path::new(name)), (*name).to_owned()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    let mut abandoned = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(residue) = parse_staging_residue(file_name) else {
+            continue;
+        };
+        // Seed residue is an immutable-generation directory under the seeds
+        // directory, never a runtime file beside a destination.
+        if residue.role == StagingRole::Seed {
+            continue;
+        }
+        let Some(destination_name) =
+            owned.get(&destination_key(Path::new(&residue.destination_name)))
+        else {
+            continue;
+        };
+        if !residue.attempt.is_abandoned() {
+            continue;
+        }
+        abandoned.push((
+            directory.join(destination_name),
+            directory.join(file_name),
+            residue,
+        ));
+    }
+    abandoned.sort_by(|left, right| {
+        (&left.0, left.2.role, left.2.attempt).cmp(&(&right.0, right.2.role, right.2.attempt))
+    });
+
+    for window in abandoned.windows(2) {
+        if window[0].2.role == StagingRole::Restore
+            && window[1].2.role == StagingRole::Restore
+            && window[0].0 == window[1].0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "native runtime destination {} has more than one owned restore snapshot ({} and {}); recovery cannot prove which one is the previous runtime",
+                    window[0].0.display(),
+                    window[0].1.display(),
+                    window[1].1.display()
+                ),
+            ));
+        }
+    }
+    for (_, residue_path, _) in &abandoned {
+        validate_owned_residue(residue_path)?;
+    }
+
+    let mut recoveries = Vec::with_capacity(abandoned.len());
+    for (destination, residue_path, residue) in abandoned {
+        let decision = match residue.role {
+            StagingRole::Restore => {
+                validate_destination(&destination, "native runtime", false)?;
+                // The snapshot is a hard link to the destination until the
+                // first replacement lands, so an unstarted or already rolled
+                // back attempt leaves the two identical. Replacing a file with
+                // its own link is a no-op that would strand the residue.
+                if destination_holds(&destination, &residue_path)? {
+                    fs::remove_file(&residue_path)?;
+                    RecoveryDecision::Discarded
+                } else {
+                    replace_file(&residue_path, &destination)?;
+                    RecoveryDecision::RestoredPreviousRuntime
+                }
+            }
+            // A prepared copy never holds the only instance of its bytes, and
+            // seed residue is filtered out above, so neither can strand a
+            // runtime file by being removed.
+            StagingRole::Copy | StagingRole::Seed => {
+                fs::remove_file(&residue_path)?;
+                RecoveryDecision::Discarded
+            }
+        };
+        recoveries.push(ResidueRecovery {
+            residue: residue_path,
+            destination,
+            role: residue.role,
+            attempt: residue.attempt,
+            decision,
+        });
+    }
+    if recoveries
+        .iter()
+        .any(|recovery| recovery.decision == RecoveryDecision::RestoredPreviousRuntime)
+    {
+        sync_destination_directories(
+            recoveries
+                .iter()
+                .map(|recovery| recovery.destination.as_path()),
+        )?;
+    }
+    Ok(recoveries)
+}
+
+/// Whether the destination already holds exactly the snapshot's bytes.
+///
+/// The caller has already proven the destination is absent or a regular file.
+fn destination_holds(destination: &Path, snapshot: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Ok(file_sha256(destination)? == file_sha256(snapshot)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reject anything wearing an owned residue name that is not a plain file.
+///
+/// A directory or reparse point at an exclusively CodeStory name means the
+/// name was taken by something else, so recovery stops before it could delete
+/// a directory tree or follow a link out of the profile directory.
+fn validate_owned_residue(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "owned native staging residue is a reparse point: {}",
+                path.display()
+            ),
+        ));
+    }
+    if file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            format!(
+                "owned native staging residue is a directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "owned native staging residue is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn staging_temp_path(destination: &Path, role: StagingRole) -> PathBuf {
     let name = destination
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| "native-runtime".into());
-    destination.with_file_name(format!(
-        ".{name}.codestory-stage-{}-{counter}.tmp",
-        std::process::id()
-    ))
+    destination.with_file_name(residue_file_name(&name, role, StagingAttempt::next()))
 }
 
 fn file_sha256(path: &Path) -> io::Result<[u8; 32]> {
@@ -498,6 +906,26 @@ fn acquire_profile_staging_lock(profile_dir: &Path) -> io::Result<File> {
 
 fn publish_all(replacements: Vec<PreparedReplacement>) -> io::Result<()> {
     publish_all_with(replacements, replace_file)
+}
+
+/// Reproduce process death partway through a publication transaction.
+///
+/// Leaking the transaction and its prepared replacements skips every `Drop`,
+/// which is precisely what a killed process leaves on disk: owned residue with
+/// no in-process rollback and no cleanup.
+#[cfg(test)]
+fn simulate_publication_death(
+    mut replacements: Vec<PreparedReplacement>,
+    published_before_death: usize,
+) -> io::Result<()> {
+    let transaction = PublicationTransaction::capture(&replacements)?;
+    let mut publish = replace_file;
+    for replacement in replacements.iter_mut().take(published_before_death) {
+        replacement.publish_with(&mut publish)?;
+    }
+    std::mem::forget(transaction);
+    std::mem::forget(replacements);
+    Ok(())
 }
 
 fn publish_all_with<F>(
@@ -563,13 +991,22 @@ fn destination_key(path: &Path) -> String {
 struct PreparedReplacement {
     temporary: Option<PathBuf>,
     destination: PathBuf,
+    label: &'static str,
+    allow_symlink: bool,
 }
 
 impl PreparedReplacement {
-    fn new(temporary: PathBuf, destination: &Path) -> Self {
+    fn new(
+        temporary: PathBuf,
+        destination: &Path,
+        label: &'static str,
+        allow_symlink: bool,
+    ) -> Self {
         Self {
             temporary: Some(temporary),
             destination: destination.to_path_buf(),
+            label,
+            allow_symlink,
         }
     }
 
@@ -581,6 +1018,9 @@ impl PreparedReplacement {
             .temporary
             .as_ref()
             .expect("prepared replacement has a temporary file");
+        // Preparation validated this path, but a directory or reparse point
+        // swapped in afterwards would otherwise be replaced silently.
+        validate_destination(&self.destination, self.label, self.allow_symlink)?;
         publish_replacement(temporary, &self.destination)?;
         self.temporary = None;
         Ok(())
@@ -643,9 +1083,9 @@ impl DestinationSnapshot {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 PreviousDestination::Symlink(fs::read_link(destination)?)
             }
-            Ok(metadata) if metadata.is_file() => {
-                PreviousDestination::File(create_unique_hard_link(destination, destination)?)
-            }
+            Ok(metadata) if metadata.is_file() => PreviousDestination::File(
+                create_unique_hard_link(destination, destination, StagingRole::Restore)?,
+            ),
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -713,7 +1153,7 @@ fn create_unique_symlink(target: &Path, destination: &Path) -> io::Result<PathBu
     use std::os::unix::fs::symlink;
 
     loop {
-        let temporary = staging_temp_path(destination);
+        let temporary = staging_temp_path(destination, StagingRole::Restore);
         match symlink(target, &temporary) {
             Ok(()) => return Ok(temporary),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -879,6 +1319,495 @@ mod generation_tests {
                 .expect("seed inventory")
                 .count(),
             2
+        );
+    }
+}
+
+/// Ownership, restart classification, and crash recovery for the accepted
+/// independent-copy staging path. The state machine is platform neutral, so it
+/// is proven on every host rather than only on Windows.
+#[cfg(test)]
+mod residue_tests {
+    use super::{
+        RecoveryDecision, StagingAttempt, StagingRole, parse_staging_residue, prepare_runtime_copy,
+        publish_all_with, recover_staging_residue, replace_file, residue_file_name,
+        simulate_publication_death, stage_windows_runtime_files, staging_temp_path,
+    };
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// Residue carrying this process's pid but an older epoch: exactly what a
+    /// crashed process leaves behind once the operating system reuses its pid.
+    fn abandoned_residue_name(destination_name: &str, role: StagingRole, sequence: u64) -> String {
+        residue_file_name(
+            destination_name,
+            role,
+            StagingAttempt {
+                pid: std::process::id(),
+                epoch_nanos: 1,
+                sequence,
+            },
+        )
+    }
+
+    /// Rewrite live residue identities as an earlier process incarnation.
+    ///
+    /// A simulated death happens inside the running test process, so its
+    /// residue is still owned by a live attempt. Ageing the epoch — and only
+    /// the epoch — turns the same real files, links, and roles into what a new
+    /// process finds after the previous one died and its pid was reused.
+    fn age_residue_into_a_dead_incarnation(directory: &Path) {
+        for entry in fs::read_dir(directory).expect("read staging directory") {
+            let entry = entry.expect("staging entry");
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(residue) = parse_staging_residue(&file_name) else {
+                continue;
+            };
+            let aged = residue_file_name(
+                &residue.destination_name,
+                residue.role,
+                StagingAttempt {
+                    epoch_nanos: 1,
+                    ..residue.attempt
+                },
+            );
+            fs::rename(entry.path(), directory.join(aged)).expect("age staging residue");
+        }
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
+
+    fn read(path: &Path) -> Vec<u8> {
+        fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    fn entry_names(directory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(directory)
+            .expect("read staging directory")
+            .map(|entry| {
+                entry
+                    .expect("staging entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn assert_no_staging_residue(directory: &Path) {
+        let names = entry_names(directory);
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains(super::STAGING_RESIDUE_INFIX)),
+            "staging residue remains: {names:?}"
+        );
+    }
+
+    #[test]
+    fn residue_names_round_trip_their_owning_attempt() {
+        let attempt = StagingAttempt {
+            pid: 4321,
+            epoch_nanos: 1_700_000_000_123_456_789,
+            sequence: 7,
+        };
+        let name = residue_file_name("llama.dll", StagingRole::Restore, attempt);
+        assert_eq!(
+            name,
+            ".llama.dll.codestory-stage-restore-4321-1700000000123456789-7.tmp"
+        );
+        let parsed = parse_staging_residue(&name).expect("owned residue parses");
+        assert_eq!(parsed.destination_name, "llama.dll");
+        assert_eq!(parsed.role, StagingRole::Restore);
+        assert_eq!(parsed.attempt, attempt);
+    }
+
+    #[test]
+    fn foreign_and_malformed_residue_is_never_classified_as_owned() {
+        let owned = abandoned_residue_name("llama.dll", StagingRole::Copy, 3);
+        assert!(parse_staging_residue(&owned).is_some());
+        for name in [
+            // No leading dot: not a CodeStory staging name.
+            "llama.dll.codestory-stage-copy-11-22-33.tmp",
+            // Truncated identity.
+            ".llama.dll.codestory-stage-copy-11-22.tmp",
+            // Extended identity.
+            ".llama.dll.codestory-stage-copy-11-22-33-44.tmp",
+            // Unknown role.
+            ".llama.dll.codestory-stage-publish-11-22-33.tmp",
+            // Non-numeric identity.
+            ".llama.dll.codestory-stage-copy-eleven-22-33.tmp",
+            // Zero-padded identity is not the canonical form we write.
+            ".llama.dll.codestory-stage-copy-011-22-33.tmp",
+            // Empty destination name.
+            "..codestory-stage-copy-11-22-33.tmp",
+            // Wrong suffix.
+            ".llama.dll.codestory-stage-copy-11-22-33.temp",
+            // No identity at all.
+            ".llama.dll.tmp",
+        ] {
+            assert!(
+                parse_staging_residue(name).is_none(),
+                "{name} must stay foreign"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_discards_abandoned_copies_and_leaves_foreign_files_untouched() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let abandoned = profile.join(abandoned_residue_name("llama.dll", StagingRole::Copy, 1));
+        write(&abandoned, b"half-written");
+        let foreign_lookalike = profile.join(".llama.dll.codestory-stage-copy-eleven-22-33.tmp");
+        write(&foreign_lookalike, b"foreign");
+        let unrelated_owned = profile.join(abandoned_residue_name(
+            "someone-else.dll",
+            StagingRole::Copy,
+            2,
+        ));
+        write(&unrelated_owned, b"another package");
+
+        let recovered = recover_staging_residue(profile, &["llama.dll"]).expect("recovery");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].role, StagingRole::Copy);
+        assert_eq!(recovered[0].decision, RecoveryDecision::Discarded);
+        assert_eq!(recovered[0].destination, destination);
+        assert_eq!(
+            read(&destination),
+            b"previous-runtime",
+            "the previous complete runtime must stay usable"
+        );
+        assert!(!abandoned.exists());
+        assert_eq!(read(&foreign_lookalike), b"foreign");
+        assert_eq!(read(&unrelated_owned), b"another package");
+    }
+
+    #[test]
+    fn recovery_rolls_an_abandoned_snapshot_back_onto_a_missing_destination() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        let snapshot = profile.join(abandoned_residue_name("llama.dll", StagingRole::Restore, 4));
+        write(&snapshot, b"previous-runtime");
+
+        let recovered = recover_staging_residue(profile, &["llama.dll"]).expect("recovery");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].decision,
+            RecoveryDecision::RestoredPreviousRuntime
+        );
+        assert_eq!(read(&destination), b"previous-runtime");
+        assert_no_staging_residue(profile);
+
+        let repeated = recover_staging_residue(profile, &["llama.dll"]).expect("repeated recovery");
+        assert!(repeated.is_empty(), "repeated recovery must be idempotent");
+        assert_eq!(read(&destination), b"previous-runtime");
+    }
+
+    #[test]
+    fn a_snapshot_its_destination_already_holds_is_discarded_not_replayed() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let snapshot = profile.join(abandoned_residue_name(
+            "llama.dll",
+            StagingRole::Restore,
+            12,
+        ));
+        fs::hard_link(&destination, &snapshot).expect("snapshot link");
+
+        let recovered = recover_staging_residue(profile, &["llama.dll"]).expect("recovery");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].decision, RecoveryDecision::Discarded);
+        assert_eq!(read(&destination), b"previous-runtime");
+        assert_no_staging_residue(profile);
+    }
+
+    #[test]
+    fn recovery_never_settles_residue_owned_by_a_live_attempt() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let live = staging_temp_path(&destination, StagingRole::Copy);
+        write(&live, b"in flight");
+
+        let recovered = recover_staging_residue(profile, &["llama.dll"]).expect("recovery");
+
+        assert!(recovered.is_empty());
+        assert_eq!(read(&live), b"in flight");
+    }
+
+    #[test]
+    fn a_directory_wearing_an_owned_residue_name_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let hostile = profile.join(abandoned_residue_name("llama.dll", StagingRole::Copy, 5));
+        fs::create_dir(&hostile).expect("hostile directory");
+        write(&hostile.join("payload"), b"do not delete me");
+
+        let error = recover_staging_residue(profile, &["llama.dll"])
+            .expect_err("a directory must fail before any mutation");
+
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(read(&hostile.join("payload")), b"do not delete me");
+        assert_eq!(read(&destination), b"previous-runtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_wearing_an_owned_residue_name_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let outside = temp.path().join("outside.bin");
+        write(&outside, b"outside the profile");
+        let hostile = profile.join(abandoned_residue_name("llama.dll", StagingRole::Copy, 6));
+        std::os::unix::fs::symlink(&outside, &hostile).expect("hostile link");
+
+        let error = recover_staging_residue(profile, &["llama.dll"])
+            .expect_err("a reparse point must fail before any mutation");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(read(&outside), b"outside the profile");
+        assert!(fs::symlink_metadata(&hostile).is_ok());
+    }
+
+    #[test]
+    fn a_destination_replaced_by_a_reparse_point_fails_before_recovery_mutates_it() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let destination = profile.join("llama.dll");
+        let snapshot = profile.join(abandoned_residue_name("llama.dll", StagingRole::Restore, 7));
+        write(&snapshot, b"previous-runtime");
+        fs::create_dir(&destination).expect("path swapped to a directory");
+
+        let error = recover_staging_residue(profile, &["llama.dll"])
+            .expect_err("a swapped destination must fail before rollback");
+
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert!(destination.is_dir());
+        assert_eq!(read(&snapshot), b"previous-runtime");
+    }
+
+    #[test]
+    fn two_snapshots_for_one_destination_fail_closed_every_time() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path();
+        let first = profile.join(abandoned_residue_name("llama.dll", StagingRole::Restore, 8));
+        let second = profile.join(abandoned_residue_name("llama.dll", StagingRole::Restore, 9));
+        write(&first, b"one previous runtime");
+        write(&second, b"another previous runtime");
+
+        for _ in 0..2 {
+            let error = recover_staging_residue(profile, &["llama.dll"])
+                .expect_err("ambiguous ownership must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(read(&first), b"one previous runtime");
+            assert_eq!(read(&second), b"another previous runtime");
+            assert!(!profile.join("llama.dll").exists());
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_a_destination_name_that_escapes_its_directory() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for name in ["../llama.dll", "nested/llama.dll", "..", ""] {
+            let error = recover_staging_residue(temp.path(), &[name])
+                .expect_err("unsafe destination name must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn process_death_at_every_publication_transition_leaves_the_previous_runtime_usable() {
+        for death_point in 0..=2 {
+            let temp = tempfile::tempdir().expect("temporary directory");
+            let profile = temp.path().join("debug");
+            fs::create_dir_all(&profile).expect("profile directory");
+            let first_source = temp.path().join("first-source.dll");
+            let second_source = temp.path().join("second-source.dll");
+            write(&first_source, b"new-first");
+            write(&second_source, b"new-second");
+            let first_destination = profile.join("first.dll");
+            let second_destination = profile.join("second.dll");
+            write(&first_destination, b"old-first");
+            write(&second_destination, b"old-second");
+
+            let prepared = vec![
+                prepare_runtime_copy(&first_source, &first_destination)
+                    .expect("prepare first copy"),
+                prepare_runtime_copy(&second_source, &second_destination)
+                    .expect("prepare second copy"),
+            ];
+            simulate_publication_death(prepared, death_point).expect("simulated process death");
+            age_residue_into_a_dead_incarnation(&profile);
+
+            let names = ["first.dll", "second.dll"];
+            let recovered =
+                recover_staging_residue(&profile, &names).expect("recovery after process death");
+            assert!(
+                !recovered.is_empty(),
+                "death at transition {death_point} must leave owned recoverable residue"
+            );
+            assert_eq!(
+                read(&first_destination),
+                b"old-first",
+                "death at transition {death_point} must leave the previous runtime usable"
+            );
+            assert_eq!(
+                read(&second_destination),
+                b"old-second",
+                "death at transition {death_point} must leave the previous runtime usable"
+            );
+            assert_no_staging_residue(&profile);
+
+            let repeated = recover_staging_residue(&profile, &names).expect("repeated recovery");
+            assert!(repeated.is_empty(), "repeated recovery must be idempotent");
+            assert_eq!(read(&first_destination), b"old-first");
+            assert_eq!(read(&second_destination), b"old-second");
+        }
+    }
+
+    #[test]
+    fn staging_settles_abandoned_residue_before_it_publishes() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path().join("debug");
+        fs::create_dir_all(&profile).expect("profile directory");
+        let source = temp.path().join("source.dll");
+        write(&source, b"new-runtime");
+        let destination = profile.join("llama.dll");
+        let snapshot = profile.join(abandoned_residue_name(
+            "llama.dll",
+            StagingRole::Restore,
+            10,
+        ));
+        let partial = profile.join(abandoned_residue_name("llama.dll", StagingRole::Copy, 11));
+        write(&snapshot, b"previous-runtime");
+        write(&partial, b"half-written");
+        let foreign = profile.join("upstream-note.txt");
+        write(&foreign, b"not ours");
+
+        let recovered = stage_windows_runtime_files(&[(source.as_path(), destination.as_path())])
+            .expect("stage the independent runtime copy");
+
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .iter()
+                .any(|recovery| recovery.role == StagingRole::Restore
+                    && recovery.decision == RecoveryDecision::RestoredPreviousRuntime)
+        );
+        assert!(
+            recovered
+                .iter()
+                .any(|recovery| recovery.role == StagingRole::Copy
+                    && recovery.decision == RecoveryDecision::Discarded)
+        );
+        assert_eq!(read(&destination), b"new-runtime");
+        assert_eq!(read(&foreign), b"not ours");
+        assert_no_staging_residue(&profile);
+    }
+
+    #[test]
+    fn a_destination_swapped_after_its_snapshot_fails_before_replacement() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path().join("debug");
+        fs::create_dir_all(&profile).expect("profile directory");
+        let first_source = temp.path().join("first-source.dll");
+        let second_source = temp.path().join("second-source.dll");
+        write(&first_source, b"new-first");
+        write(&second_source, b"new-second");
+        let first_destination = profile.join("first.dll");
+        let second_destination = profile.join("second.dll");
+        write(&first_destination, b"old-first");
+        write(&second_destination, b"old-second");
+        let first =
+            prepare_runtime_copy(&first_source, &first_destination).expect("prepare first copy");
+        let second =
+            prepare_runtime_copy(&second_source, &second_destination).expect("prepare second copy");
+        let swapped = second_destination.clone();
+        let mut attempt = 0;
+
+        let error = publish_all_with(vec![first, second], move |source, destination| {
+            attempt += 1;
+            replace_file(source, destination)?;
+            if attempt == 1 {
+                fs::remove_file(&swapped).expect("remove the swapped destination");
+                fs::create_dir(&swapped).expect("swap the destination for a directory");
+            }
+            Ok(())
+        })
+        .expect_err("a swapped destination must fail before replacement");
+
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(
+            read(&first_destination),
+            b"old-first",
+            "the rolled back destination must hold the previous runtime"
+        );
+        assert!(second_destination.is_dir());
+        let residue = entry_names(&profile)
+            .into_iter()
+            .filter(|name| name.contains(super::STAGING_RESIDUE_INFIX))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue remains: {residue:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_swapped_for_a_link_fails_before_replacement() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profile = temp.path().join("debug");
+        fs::create_dir_all(&profile).expect("profile directory");
+        let source = temp.path().join("source.dll");
+        write(&source, b"new-runtime");
+        let destination = profile.join("llama.dll");
+        write(&destination, b"previous-runtime");
+        let outside = temp.path().join("outside.bin");
+        write(&outside, b"outside the profile");
+        let prepared = prepare_runtime_copy(&source, &destination).expect("prepare copy");
+        // Renaming over a link silently consumes it, so only a re-check
+        // immediately before the replacement can refuse the swap.
+        fs::remove_file(&destination).expect("remove the validated destination");
+        std::os::unix::fs::symlink(&outside, &destination).expect("swap in a reparse point");
+
+        let error =
+            super::publish_all(vec![prepared]).expect_err("a swapped destination must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read_link(&destination).expect("the swapped link survives"),
+            outside
+        );
+        assert_eq!(read(&outside), b"outside the profile");
+        assert_no_staging_residue(&profile);
+    }
+
+    #[test]
+    fn recovery_ignores_a_missing_directory() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let missing: PathBuf = temp.path().join("never-created");
+        assert!(
+            recover_staging_residue(&missing, &["llama.dll"])
+                .expect("absent directory is not an error")
+                .is_empty()
         );
     }
 }
