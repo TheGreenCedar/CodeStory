@@ -297,14 +297,6 @@ fn staged_snapshot_finalize_stats(
     }
 }
 
-fn unique_staged_suffix() -> String {
-    let epoch_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{}-{}", std::process::id(), epoch_ns)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
