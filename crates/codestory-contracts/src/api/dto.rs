@@ -3660,6 +3660,11 @@ mod packet_tests {
             serde_json::to_value(updated).expect("serialize updated comment")["comment"],
             "note"
         );
+        // CR-054: an omitted comment must stay omitted on the way out, or the
+        // serialize half spells "clear the comment".
+        let omitted = serde_json::to_value(omitted).expect("serialize omitted comment");
+        assert!(omitted.get("comment").is_none());
+        assert!(omitted.get("category_id").is_none());
     }
 }
 
@@ -3673,6 +3678,34 @@ pub struct UpdateBookmarkCategoryRequest {
     pub name: String,
 }
 
+/// Whether an annotation currently resolves to a symbol in the live core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkResolutionStatusDto {
+    Bound,
+    Orphaned,
+}
+
+/// Why an annotation is not currently bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkOrphanReasonDto {
+    TargetDeleted,
+    AmbiguousMatch,
+    GenerationGap,
+    SignatureChanged,
+    UnresolvableAnchor,
+}
+
+/// Evidence recorded at an annotation's last successful bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct BookmarkEvidenceDto {
+    pub generation: Option<i64>,
+    pub file_path: Option<String>,
+    pub qualified_name: Option<String>,
+    pub start_line: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct BookmarkDto {
     pub id: String,
@@ -3682,6 +3715,11 @@ pub struct BookmarkDto {
     pub node_label: String,
     pub node_kind: NodeKind,
     pub file_path: Option<String>,
+    pub resolution_status: BookmarkResolutionStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_reason: Option<BookmarkOrphanReasonDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_evidence: Option<BookmarkEvidenceDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -3694,9 +3732,16 @@ pub struct CreateBookmarkRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct UpdateBookmarkRequest {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
-    #[serde(default, with = "::serde_with::rust::double_option")]
+    // CR-054: without `skip_serializing_if` the serialize half cannot express
+    // "leave untouched" — an omitted comment emitted `null`, which round-trips
+    // as "clear the comment".
+    #[serde(
+        default,
+        with = "::serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub comment: Option<Option<String>>,
 }
 

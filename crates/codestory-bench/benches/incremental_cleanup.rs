@@ -116,6 +116,7 @@ fn build_cleanup_storage() -> anyhow::Result<CleanupFixture> {
                 symbol_key: format!("caller::{caller_idx}"),
                 node_id: NodeId(caller_id),
                 signature_hash: caller_idx as i64,
+                normalized_signature: None,
                 body_hash: (file_idx * 10 + caller_idx) as i64,
                 start_line,
                 end_line,

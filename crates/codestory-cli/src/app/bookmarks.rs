@@ -10,8 +10,8 @@ use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
 use anyhow::Context;
 use anyhow::{Result, bail};
 use codestory_contracts::api::{
-    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
-    NodeKind,
+    BookmarkCategoryDto, BookmarkDto, BookmarkResolutionStatusDto, CreateBookmarkCategoryRequest,
+    CreateBookmarkRequest,
 };
 
 pub(super) fn run_bookmark(cmd: BookmarkCommand) -> Result<()> {
@@ -92,14 +92,13 @@ fn run_bookmark_remove(cmd: BookmarkRemoveCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let _summary = runtime.open_project_summary()?;
-    let bookmark_id = parse_bookmark_db_id(&cmd.id, "bookmark_id")?;
-    find_bookmark_by_id(&runtime, &cmd.id)?;
+    let bookmark = find_bookmark_by_id(&runtime, &cmd.id)?;
     runtime
         .bookmarks
-        .delete_bookmark(bookmark_id)
+        .delete_bookmark(&bookmark.id)
         .map_err(map_api_error)?;
     let output = BookmarkRemoveOutput {
-        removed_id: bookmark_id.to_string(),
+        removed_id: bookmark.id,
     };
     emit(
         cmd.format,
@@ -110,7 +109,7 @@ fn run_bookmark_remove(cmd: BookmarkRemoveCommand) -> Result<()> {
 }
 
 fn bookmark_output(bookmark: BookmarkDto) -> BookmarkOutput {
-    let stale = bookmark.node_kind == NodeKind::UNKNOWN;
+    let stale = bookmark.resolution_status == BookmarkResolutionStatusDto::Orphaned;
     BookmarkOutput { bookmark, stale }
 }
 
@@ -168,13 +167,16 @@ fn ensure_bookmark_category(runtime: &RuntimeContext, raw: &str) -> Result<Bookm
 }
 
 fn find_bookmark_by_id(runtime: &RuntimeContext, raw_id: &str) -> Result<BookmarkDto> {
-    let bookmark_id = parse_bookmark_db_id(raw_id, "bookmark_id")?;
+    let bookmark_id = raw_id.trim();
+    if bookmark_id.is_empty() {
+        bail!("Bookmark id cannot be empty.");
+    }
     runtime
         .bookmarks
         .list_bookmarks(None)
         .map_err(map_api_error)?
         .into_iter()
-        .find(|bookmark| bookmark.id == bookmark_id.to_string())
+        .find(|bookmark| bookmark.id == bookmark_id)
         .with_context(|| format!("Bookmark not found: {bookmark_id}"))
 }
 
@@ -182,12 +184,15 @@ pub(super) fn load_bookmark_focus_by_id(
     runtime: &RuntimeContext,
     raw_id: &str,
 ) -> Result<BookmarkDto> {
-    let bookmark_id = parse_bookmark_db_id(raw_id, "bookmark_id")?;
     let bookmark = find_bookmark_by_id(runtime, raw_id)?;
-    if bookmark.node_kind == NodeKind::UNKNOWN {
+    if bookmark.resolution_status == BookmarkResolutionStatusDto::Orphaned {
         bail!(
-            "Bookmark {bookmark_id} is stale: node {} is no longer present after reindex.",
-            bookmark.node_id.0
+            "Bookmark {} is an orphan ({}): relink or delete it before using it as a target.",
+            bookmark.id,
+            bookmark
+                .orphan_reason
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|| "unresolved".to_string())
         );
     }
     Ok(bookmark)

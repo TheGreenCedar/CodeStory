@@ -53,7 +53,7 @@ pub use repository_identity::{
     WorkspacePathIdentity, WorkspacePathLexicalIdentity, inspect_repository_identity_v2,
     observe_logical_project_identity_v3, project_identity_v3, project_identity_v3_from_repository,
     same_workspace_path, workspace_file_identity, workspace_id_v3_for_root,
-    workspace_path_identity, workspace_path_lexical_identity,
+    workspace_path_identity, workspace_path_identity_token, workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.

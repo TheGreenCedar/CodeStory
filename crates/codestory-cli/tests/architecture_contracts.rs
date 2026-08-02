@@ -1186,6 +1186,7 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         "local-refresh.lock",
         "local-refresh-state.guard",
         "annotations.sqlite3",
+        "annotations.pre-migration.json",
     ];
     let producer_crates = [
         "crates/codestory-workspace/src",

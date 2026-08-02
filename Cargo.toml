@@ -78,7 +78,7 @@ ratatui = "0.30"
 fs_at = "0.2.1"
 libc = "0.2"
 remove_dir_all = "1.0.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0.0"
 glob = "0.3"

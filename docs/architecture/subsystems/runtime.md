@@ -27,6 +27,7 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: packet, retrieval-primary, planning, and evidence workflows
+- `src/controller_bookmarks.rs`: annotation CRUD against the store's sidecar
 
 ## Publication contract
 
@@ -35,6 +36,13 @@ immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
 requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
+
+Every path that replaces core projections moves user annotations into the store
+sidecar first, and the ordering is enforced by the type system rather than by
+convention: `index_full_for_runtime` and `index_incremental_for_runtime` demand
+an `AnnotationsOwned`, which only
+`ensure_annotations_owned_before_core_replacement` can mint. A future refresh
+entry point that forgets the cutover does not compile.
 
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
