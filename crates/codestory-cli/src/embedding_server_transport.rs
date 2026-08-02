@@ -5,6 +5,10 @@
 //! that prove one local OS user is talking to one lifetime authority.
 
 use anyhow::{Context, Result, bail};
+use codestory_contracts::config_registry::{
+    EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV,
+    EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -20,8 +24,6 @@ use std::time::Duration;
 const INTERNAL_SERVER_COMMAND: &str = "internal-embedding-server";
 const EXPECTED_EXECUTABLE_SHA256_ENV: &str =
     "CODESTORY_INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256";
-const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
-const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
 const CHILD_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const EXECUTABLE_ATTESTATION_SCHEMA_VERSION: u32 = 1;

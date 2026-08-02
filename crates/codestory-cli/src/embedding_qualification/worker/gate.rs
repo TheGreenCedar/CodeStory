@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use codestory_contracts::config_registry::EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV;
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingQualificationWorkerError as WorkerError, ProcessStartProbe,
     SidecarRuntimeConfig, embedding_retry_state,
@@ -11,7 +12,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 /// Names the temporaries this protocol leaves beside a publication, so a
 /// half-written qualification document is recognisable as one.
 const QUALIFICATION_TEMP_PREFIX: &str = "codestory-qualification";

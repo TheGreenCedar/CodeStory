@@ -117,9 +117,16 @@ Environment variables win over files.
 Configuration is resolved independently for each project and retained for the
 life of that project runtime. Multi-project stdio captures the user home,
 project-network opt-in, cache root, and runtime environment once; it neither
-rewrites nor re-reads them when requests switch repositories. Trusted project files
-may also set `embedding_query_prefix` and `embedding_document_prefix` as part of
-their per-project embedding contract.
+rewrites nor re-reads them when requests switch repositories.
+
+[Configuration reference](configuration-reference.md) lists every honoured
+`.codestory.toml` key and environment variable; it is generated from the one
+registry the code reads, so a key that is absent there does nothing. Embedding
+query and document prefixes are compile-time constants of the pinned model and
+are not configurable. A file may declare `schema_version`: version 1 (the
+default when the key is absent) warns about unknown keys by name and ignores
+them, version 2 rejects them, and a higher version fails with
+`unsupported_config_schema`.
 
 Project `.codestory.toml` cannot choose cache roots. It also cannot choose
 network egress settings by default. A trusted operator may set

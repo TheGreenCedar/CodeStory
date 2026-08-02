@@ -149,9 +149,9 @@ struct PreparedGenerationRetention {
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
 #[cfg(any(not(feature = "test-support"), test))]
-const EMBEDDING_QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
+use codestory_contracts::config_registry::EMBED_QUALIFICATION_DIR_ENV as EMBEDDING_QUALIFICATION_DIR_ENV;
 #[cfg(any(not(feature = "test-support"), test))]
-const EMBEDDING_QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
+use codestory_contracts::config_registry::EMBED_QUALIFICATION_NONCE_ENV as EMBEDDING_QUALIFICATION_NONCE_ENV;
 #[cfg(any(not(feature = "test-support"), test))]
 const PUBLICATION_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 #[cfg(any(not(feature = "test-support"), test))]

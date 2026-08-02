@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
+pub(crate) use codestory_contracts::config_registry::HYBRID_RETRIEVAL_ENABLED_ENV;
 pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 = 1_000_000;
 pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 

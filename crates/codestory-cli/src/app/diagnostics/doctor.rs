@@ -11,6 +11,7 @@ use crate::runtime::RuntimeContext;
 use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessStatusDto, RetrievalFallbackReasonDto,
 };
+use codestory_contracts::config_registry::{self, ObservedSetting};
 
 pub(in crate::app) fn build_doctor_output(
     runtime: &RuntimeContext,
@@ -83,18 +84,23 @@ pub(in crate::app) fn build_doctor_output(
         checks.push(index_freshness_check(freshness));
     }
 
+    // Reported settings are observed through the registry so a secret-marked
+    // value can never reach a doctor line, whatever this list grows to hold.
     let environment = [
-        "CODESTORY_EMBED_ALLOW_CPU",
-        "CODESTORY_STORED_VECTOR_ENCODING",
-        "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
-        "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
+        config_registry::EMBED_ALLOW_CPU_ENV,
+        config_registry::STORED_VECTOR_ENCODING_ENV,
+        config_registry::HYBRID_RETRIEVAL_ENABLED_ENV,
+        config_registry::SEMANTIC_DOC_ALIAS_MODE_ENV,
     ]
     .into_iter()
-    .map(|name| match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => {
+    .map(|name| match config_registry::observe_env_setting(name) {
+        ObservedSetting::Set(value) => {
             doctor_check(name, "ok", doctor_env_check_message(name, &value))
         }
-        _ => doctor_check(name, "info", "not set; using runtime defaults".to_string()),
+        ObservedSetting::SetSecret => doctor_check(name, "ok", "set; value withheld".to_string()),
+        ObservedSetting::Unset => {
+            doctor_check(name, "info", "not set; using runtime defaults".to_string())
+        }
     })
     .collect::<Vec<_>>();
 

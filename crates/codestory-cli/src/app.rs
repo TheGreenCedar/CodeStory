@@ -122,14 +122,16 @@ pub async fn run() -> ExitCode {
     crate::diagnostics::install_process_diagnostics();
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
-    if std::env::var_os("CODESTORY_EMBED_ALLOW_CPU")
+    if std::env::var_os(codestory_contracts::config_registry::EMBED_ALLOW_CPU_ENV)
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
         let envelope = command_failure_envelope(
             "unsupported_embedding_policy",
             "embedding_backend",
             "CPU embeddings are unsupported; CodeStory requires Metal or Vulkan acceleration",
-            serde_json::json!({"environment": "CODESTORY_EMBED_ALLOW_CPU"}),
+            serde_json::json!({
+                "environment": codestory_contracts::config_registry::EMBED_ALLOW_CPU_ENV
+            }),
         );
         if json {
             emit_command_failure(&envelope, requested_output_file(&raw_args));

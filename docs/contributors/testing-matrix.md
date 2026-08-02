@@ -711,10 +711,13 @@ controlled-invalid fixtures must retain their class-prefixed diagnostics.
 Draft pushes run focused checks and one Linux source check. Exact-head review
 runs the broad source gate once. Packaged matrices and protected hardware run
 only through the coordinator/platform-proof gate. Draft pushes cancel stale
-draft work. Exact source and platform coordinators run only when their label is
-applied; their concurrency and cache identities include the exact Actions SHA,
-so a later push cannot cancel or populate proof for an accepted old head. Each
-target is built once then reused by its proof steps.
+draft work. Exact source and platform coordinators are reusable
+`workflow_call` workflows with a `workflow_dispatch` entry; no pull-request
+label starts them. A maintainer dispatches `packaged-platform-pr.yml` against
+an exact accepted head, and it calls the coordinators. Their concurrency and
+cache identities include the exact Actions SHA, so a later push cannot cancel
+or populate proof for an accepted old head. Each target is built once then
+reused by its proof steps.
 
 Release signing, notarization, post-publish quarantine/Gatekeeper checks,
 installed plugin readback, and live full retrieval run only from the main

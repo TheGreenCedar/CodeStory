@@ -144,8 +144,12 @@ stateDiagram-v2
     Published --> [*]: atomic pointer update
 ```
 
-Until the final pointer update, readers continue to use `Previous`. A rejected
-candidate never weakens the last known-good publication.
+Until the final pointer update, a reader that already holds a generation lease
+continues to use `Previous`, and a rejected candidate never weakens the last
+known-good publication. Opening a *new* query session is not lock-free: the
+writer holds the project generation lock exclusively for the whole candidate
+build, and a query session acquires the same lock shared, so a session that
+starts mid-build waits for publication instead of opening `Previous`.
 
 ## Reader protocol
 

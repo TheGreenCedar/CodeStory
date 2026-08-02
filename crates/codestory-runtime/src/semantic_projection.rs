@@ -371,20 +371,19 @@ pub(super) const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 #[cfg(test)]
 pub(super) const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
 #[cfg(test)]
-pub(super) const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
+pub(super) use codestory_contracts::config_registry::LLM_DOC_EMBED_BATCH_SIZE_ENV;
 #[cfg(test)]
-pub(super) const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
+pub(super) use codestory_contracts::config_registry::SEMANTIC_DOC_ALIAS_MODE_ENV;
 #[cfg(test)]
-pub(super) const SEMANTIC_DOC_ALIAS_MODE_ENV: &str = "CODESTORY_SEMANTIC_DOC_ALIAS_MODE";
+pub(super) use codestory_contracts::config_registry::SEMANTIC_DOC_MAX_TOKENS_ENV;
 #[cfg(test)]
-pub(super) const SEMANTIC_DOC_MAX_TOKENS_ENV: &str = "CODESTORY_SEMANTIC_DOC_MAX_TOKENS";
+pub(super) use codestory_contracts::config_registry::SEMANTIC_DOC_SCOPE_ENV;
 #[cfg(test)]
 pub(super) const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 128;
 #[cfg(test)]
-pub(super) const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
+pub(super) use codestory_contracts::config_registry::SEMANTIC_STREAM_PENDING_DOCS_ENV;
 #[cfg(test)]
-pub(super) const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
-    "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
+pub(super) use codestory_contracts::config_registry::SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV;
 #[cfg(test)]
 pub(super) const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
 pub(super) const SEMANTIC_POLICY_VERSION: &str = codestory_retrieval::SEMANTIC_POLICY_VERSION;

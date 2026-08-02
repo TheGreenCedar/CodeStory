@@ -111,6 +111,7 @@ flowchart LR
     Store --> Retrieval
     Store --> Runtime
     Llama --> Retrieval
+    Llama --> CLI
     Indexer --> Runtime
     Retrieval --> Runtime
     Retrieval --> CLI
@@ -130,7 +131,9 @@ flowchart LR
 - `codestory-indexer` parses and extracts graph projections, then resolves
   stored edges.
 - `codestory-llama-sys` compiles the pinned CodeRankEmbed Q8 model and
-  llama.cpp/ggml engine into the executable.
+  llama.cpp/ggml engine into the executable. Retrieval links it for embedding,
+  and the CLI links it directly so the internal embedding server binary carries
+  the same engine.
 - `codestory-retrieval` owns immutable lexical/vector/SCIP generations,
   manifests, engine integration, health, retention, and fail-closed queries.
 - `codestory-runtime` is the only product orchestration layer.

@@ -25,7 +25,8 @@ the linked page owns the concept.
 | Codex, Cursor, Claude Code, Copilot | [Host guides](users/README.md#pick-your-host) |
 | proof, hints, readiness, allowed surfaces | [Trust and readiness](users/trust-and-readiness.md) |
 | preparing, stale, unavailable, recovery | [Troubleshooting](users/troubleshooting.md) |
-| commands, status fields, configuration | [CLI reference](users/cli-reference.md) |
+| commands, status fields, repair transcripts | [CLI reference](users/cli-reference.md) |
+| environment variables, `.codestory.toml`, schema version | [Configuration reference](users/configuration-reference.md) |
 | prompt shapes | [Prompt patterns](users/prompt-patterns.md) |
 | terminology | [Glossary](glossary.md) |
 
