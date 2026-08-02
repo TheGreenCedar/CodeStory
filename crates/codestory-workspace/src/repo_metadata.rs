@@ -1655,6 +1655,10 @@ mod tests {
             ],
         );
         git(parent.path(), &["commit", "-am", "add submodule"]);
+        assert!(
+            !git_is_dirty(parent.path()),
+            "Git should prove the parent repository is clean"
+        );
 
         let metadata = read_repository_metadata(parent.path());
         assert!(metadata.dirty);
