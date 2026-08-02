@@ -156,6 +156,77 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   );
 });
 
+test("fail-open relay bounds hostile frames and survives null input and a missing catalog", async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.16.3", warnings: [] },
+    runtime: { state: "unavailable" },
+    warnings: [],
+    readiness: [{
+      goal: "runtime",
+      status: "unavailable",
+      summary: "fixture unavailable",
+      reason: "runtime_unavailable",
+      setup: {},
+    }],
+    managed_retrieval: { state: "unavailable", automatic: true },
+    degraded_reason: "runtime_unavailable",
+  };
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `run(${JSON.stringify(status)},{catalog:null});`,
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end([
+    "null",
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: "null-arguments",
+      method: "tools/call",
+      params: { name: "status", arguments: null },
+    }),
+    JSON.stringify({ jsonrpc: "2.0", id: "catalog", method: "tools/list" }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: "catalog-status",
+      method: "resources/read",
+      params: { uri: statusUri },
+    }),
+    "x".repeat(launcherTest.failOpenMaxFrameBytes + 1),
+    JSON.stringify({ jsonrpc: "2.0", id: "after-oversized", method: "initialize" }),
+    "",
+  ].join("\n"));
+  const [exitCode] = await once(child, "close");
+  assert.equal(exitCode, 0, stderr);
+  const responses = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(responses.find((response) => response.error?.code === -32600)?.id, null);
+  assert.equal(
+    responses.find((response) => response.id === "null-arguments")?.result.structuredContent.code,
+    "project_required",
+  );
+  assert.deepEqual(
+    responses.find((response) => response.id === "catalog")?.result.tools.map(({ name }) => name),
+    ["status"],
+  );
+  const catalogStatus = JSON.parse(
+    responses.find((response) => response.id === "catalog-status")?.result.contents[0].text,
+  );
+  assert.equal(catalogStatus.degraded_reason, "generated_mcp_catalog_missing");
+  const oversized = responses.find((response) => response.error?.data?.code === "stdio_frame_too_large");
+  assert.equal(oversized.error.data.max_frame_bytes, 1024 * 1024);
+  assert.ok(oversized.error.data.line_bytes > oversized.error.data.max_frame_bytes);
+  assert.equal(
+    responses.find((response) => response.id === "after-oversized")?.result.serverInfo.name,
+    "codestory",
+  );
+});
+
 test("fail-open project resource URIs use the native strict encoding contract", () => {
   for (const project of ["/tmp/Code Story/%/café", String.raw`C:\Code Story\100% data\Δ`]) {
     const encoded = launcherTest.strictUriComponentEncode(project);
@@ -224,6 +295,37 @@ test("fail-open handoff shutdown is bounded for a child that ignores stdin and S
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });
 
+test("fail-open handoff converts child stdin failure into a bounded request error", async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    "const {EventEmitter}=require('node:events');",
+    "const {PassThrough,Writable}=require('node:stream');",
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    "const child=new EventEmitter();",
+    "child.exitCode=null;child.signalCode=null;child.codestoryCorrelationId='stdin-fixture';",
+    "child.stdin=new Writable({write(_chunk,_encoding,callback){const error=new Error('unlabeled private query');error.code='EPIPE';callback(error);}});",
+    "child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>true;",
+    "const status={plugin_runtime:{plugin_version:'0.16.3',warnings:[]},runtime:{state:'unavailable'},warnings:[],readiness:[],managed_retrieval:{state:'unavailable'},degraded_reason:'runtime_unavailable'};",
+    "run(status,{shouldHandoff:()=>true,startRuntime:()=>child,onRuntimeFailure:()=>{},handoffTerminationGraceMs:1,handoffForceKillGraceMs:1});",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: "stdin", method: "tools/list" })}\n`);
+  const [exitCode] = await once(child, "close");
+  assert.equal(exitCode, 0, stderr);
+  const response = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line))
+    .find((candidate) => candidate.id === "stdin");
+  assert.equal(response.error.code, -32000);
+  assert.match(response.error.message, /handoff stdin failed/u);
+  assert.match(response.error.message, /correlation_id=stdin-fixture/u);
+  assert.doesNotMatch(`${stdout}\n${stderr}`, /unlabeled private query/u);
+});
+
 test("runtime death diagnostics retain only typed fields", () => {
   const correlationId = launcherTest.runtimeCorrelationId();
   assert.match(correlationId, /^[0-9a-f]{32}$/u);
@@ -277,6 +379,26 @@ test("runtime stderr metadata counters saturate at fixed bounds", () => {
     stderrBytesCapped: true,
     stderrChunksCapped: true,
   });
+});
+
+test("launcher records an uncaught exception and terminates instead of continuing", async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    `require(${JSON.stringify(launcher)})._test.installLauncherFatalHandlers();`,
+    "setImmediate(() => { throw new Error('unlabeled private query'); });",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [exitCode, signal] = await once(child, "close");
+  assert.equal(exitCode, 1);
+  assert.equal(signal, null);
+  const diagnostic = JSON.parse(stderr.trim());
+  assert.equal(diagnostic.event, "launcher_uncaught_exception");
+  assert.equal(diagnostic.error, "[redacted]");
+  assert.equal(diagnostic.stack, "[redacted]");
+  assert.doesNotMatch(stderr, /unlabeled private query/u);
 });
 
 function threadActiveStatePath(dataDir, threadId) {
@@ -553,7 +675,7 @@ async function writeLifecycleCli(cliPath) {
   const script = [
     "const fs=require('fs');",
     "const args=process.argv.slice(1);",
-    "if(args[0]==='--version'){console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
+    "if(args[0]==='--version'){const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
@@ -1755,6 +1877,55 @@ test("managed cli lock fails closed when self process identity is unavailable", 
     );
     assert.deepEqual(await readdir(root), []);
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli async lock hoists self identity and identity-probe deadline across retries", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-lock-identity-throttle-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  const held = launcherTest.acquireManagedCliLock(root, "holder");
+  assert.ok(held);
+  const identity = launcherTest.processStartIdentity(process.pid);
+  assert.ok(identity, `process start identity unavailable on ${process.platform}`);
+  const interval = launcherTest.managedCliIdentityProbeIntervalMs;
+  const startedAt = 10_000;
+  let now = startedAt;
+  let sleepCalls = 0;
+  const identityProbeTimes = [];
+
+  try {
+    const acquired = await launcherTest.acquireManagedCliLockAsync(
+      root,
+      "waiter",
+      (interval * 2) + 100,
+      {
+        now: () => now,
+        sleep: async (milliseconds) => {
+          sleepCalls += 1;
+          now += milliseconds;
+        },
+        processStartIdentity: () => {
+          identityProbeTimes.push(now);
+          return identity;
+        },
+      },
+    );
+
+    assert.equal(acquired, null);
+    assert.equal(sleepCalls, ((interval * 2) + 100) / 50);
+    // The first sample is the async acquisition's one self-identity read. The
+    // remaining samples are the live lock owner's probes: one immediately,
+    // then only when each shared two-second deadline expires.
+    assert.deepEqual(identityProbeTimes, [
+      startedAt,
+      startedAt,
+      startedAt + interval,
+      startedAt + (interval * 2),
+    ]);
+  } finally {
+    launcherTest.releaseManagedCliLock(held);
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -3861,6 +4032,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
         CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
         PLUGIN_DATA: dataDir,
         TEST_CODESTORY_VERSION: version,
+        CODESTORY_TEST_PROBE_DELAY_MS: "1500",
         TEST_OUT: outFile,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -3991,6 +4163,29 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
+    const managedRoot = join(dataDir, "codestory-cli");
+    const probeDeadline = Date.now() + 5000;
+    while (Date.now() < probeDeadline) {
+      const entries = await readdir(managedRoot).catch(() => []);
+      if (entries.some((entry) => entry.startsWith(`.provisioning-${version}-`))) break;
+      await delay(10);
+    }
+    assert.ok(
+      (await readdir(managedRoot)).some((entry) => entry.startsWith(`.provisioning-${version}-`)),
+      "provisioning should reach its deliberately slow synchronous version probe",
+    );
+    const responsiveStartedAt = Date.now();
+    const duringSlowProbe = await request({
+      jsonrpc: "2.0",
+      id: "during-slow-probe",
+      method: "resources/read",
+      params: { uri: statusUri },
+    });
+    assert.ok(Date.now() - responsiveStartedAt < 1000, "preparing relay must stay responsive");
+    assert.equal(
+      JSON.parse(duringSlowProbe.result.contents[0].text).degraded_reason,
+      "managed_cli_provisioning",
+    );
     const runtimeMetadata = join(dataDir, ".codestory-mcp-runtime.json");
     await waitForPath(runtimeMetadata);
     const deadline = Date.now() + 10000;
@@ -4838,6 +5033,228 @@ test("release asset publication survives a partial and destination on different 
   }
 });
 
+test("release asset publication atomically replaces a retained destination", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-existing-destination-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const completed = Buffer.from("new-completed-runtime-payload");
+  await writeFile(partialPath, completed);
+  await writeFile(destination, "retained-old-runtime-payload");
+  const realRename = fs.renameSync;
+  let renameAttempts = 0;
+  try {
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath && String(to) === destination) {
+        renameAttempts += 1;
+        assert.equal(fs.readFileSync(destination, "utf8"), "retained-old-runtime-payload");
+      }
+      return realRename(from, to);
+    };
+
+    launcherTest.publishDownloadedFile(partialPath, destination);
+
+    assert.equal(renameAttempts, 1);
+    assert.deepEqual(await readFile(destination), completed);
+    assert.equal(fs.existsSync(partialPath), false);
+  } finally {
+    fs.renameSync = realRename;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset publication reuses identical retained bytes without renaming", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-existing-reuse-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const completed = Buffer.from("same-completed-runtime-payload");
+  await writeFile(partialPath, completed);
+  await writeFile(destination, completed);
+  const realRename = fs.renameSync;
+  let renameAttempts = 0;
+  try {
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath && String(to) === destination) {
+        renameAttempts += 1;
+        assert.fail("identical retained bytes should be reused without a rename");
+      }
+      return realRename(from, to);
+    };
+
+    launcherTest.publishDownloadedFile(partialPath, destination);
+
+    assert.equal(renameAttempts, 0);
+    assert.deepEqual(await readFile(destination), completed);
+    assert.equal(fs.existsSync(partialPath), false);
+  } finally {
+    fs.renameSync = realRename;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a transient retained-destination lock preserves both completed files for retry", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-existing-lock-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const completed = Buffer.from("new-completed-runtime-payload");
+  await writeFile(partialPath, completed);
+  await writeFile(destination, "retained-old-runtime-payload");
+  const realRename = fs.renameSync;
+  let locked = true;
+  let renameAttempts = 0;
+  try {
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath && String(to) === destination) {
+        renameAttempts += 1;
+      }
+      if (locked && String(from) === partialPath && String(to) === destination) {
+        const error = new Error("synthetic retained destination lock");
+        error.code = "EBUSY";
+        throw error;
+      }
+      return realRename(from, to);
+    };
+
+    let failure;
+    try {
+      launcherTest.publishDownloadedFile(partialPath, destination);
+      assert.fail("the retained destination lock should fail publication");
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure.downloadKind, "publish");
+    assert.equal(failure.publishRetryable, true);
+    assert.equal(launcherTest.downloadFailurePermanent(failure), false);
+    assert.deepEqual(await readFile(partialPath), completed);
+    assert.equal(await readFile(destination, "utf8"), "retained-old-runtime-payload");
+
+    locked = false;
+    launcherTest.publishDownloadedFile(partialPath, destination);
+    assert.equal(renameAttempts, 2);
+    assert.deepEqual(await readFile(destination), completed);
+    assert.equal(fs.existsSync(partialPath), false);
+  } finally {
+    fs.renameSync = realRename;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("cross-device overwrite failure preserves the old destination and completed partial", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-exdev-existing-lock-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const completed = Buffer.from("new-completed-runtime-payload");
+  await writeFile(partialPath, completed);
+  await writeFile(destination, "retained-old-runtime-payload");
+  const realRename = fs.renameSync;
+  let locked = true;
+  let stagingAttempts = 0;
+  try {
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath && String(to) === destination) {
+        const error = new Error("synthetic cross-device boundary");
+        error.code = "EXDEV";
+        throw error;
+      }
+      if (String(to) === destination && String(from).startsWith(`${destination}.publish-`)) {
+        stagingAttempts += 1;
+        if (locked) {
+          const error = new Error("synthetic retained destination lock");
+          error.code = "EBUSY";
+          throw error;
+        }
+      }
+      return realRename(from, to);
+    };
+
+    let failure;
+    try {
+      launcherTest.publishDownloadedFile(partialPath, destination);
+      assert.fail("the staging overwrite lock should fail publication");
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure.downloadKind, "publish");
+    assert.equal(failure.publishRetryable, true);
+    assert.deepEqual(await readFile(partialPath), completed);
+    assert.equal(await readFile(destination, "utf8"), "retained-old-runtime-payload");
+    assert.equal(
+      fs.readdirSync(dataDir).some((name) => name.includes(".publish-")),
+      false,
+    );
+
+    locked = false;
+    launcherTest.publishDownloadedFile(partialPath, destination);
+    assert.equal(stagingAttempts, 2);
+    assert.deepEqual(await readFile(destination), completed);
+    assert.equal(fs.existsSync(partialPath), false);
+  } finally {
+    fs.renameSync = realRename;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset publication leaves a non-regular retained destination and partial untouched", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-nonregular-destination-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  await writeFile(partialPath, "new-completed-runtime-payload");
+  await mkdir(destination);
+  try {
+    assert.throws(
+      () => launcherTest.publishDownloadedFile(partialPath, destination),
+      /download_publish_failed/u,
+    );
+    assert.equal((await stat(destination)).isDirectory(), true);
+    assert.equal(await readFile(partialPath, "utf8"), "new-completed-runtime-payload");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset publication does not replace a retained destination symlink", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-symlink-destination-"));
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const outside = join(dataDir, "outside.bin");
+  await writeFile(partialPath, "new-completed-runtime-payload");
+  await writeFile(outside, "precious-retained-payload");
+  await symlink(outside, destination, "file");
+  try {
+    assert.throws(
+      () => launcherTest.publishDownloadedFile(partialPath, destination),
+      /download_publish_failed:destination_not_replaceable/u,
+    );
+    assert.equal(fs.lstatSync(destination).isSymbolicLink(), true);
+    assert.equal(await readFile(outside, "utf8"), "precious-retained-payload");
+    assert.equal(await readFile(partialPath, "utf8"), "new-completed-runtime-payload");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("cross-device publication completes short writes before advancing the input", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-short-write-"));
+  const source = join(dataDir, "runtime.bin.part");
+  const destination = join(dataDir, "runtime.bin");
+  const body = Buffer.from("short writes must not truncate a completed managed runtime archive");
+  await writeFile(source, body);
+  const sourceFd = fs.openSync(source, "r");
+  let writeCalls = 0;
+  try {
+    launcherTest.copyVerifiedPartial(sourceFd, destination, {
+      writeSync(fd, buffer, offset, length) {
+        writeCalls += 1;
+        return fs.writeSync(fd, buffer, offset, Math.min(3, length));
+      },
+    });
+    assert.ok(writeCalls > 1);
+    assert.deepEqual(await readFile(destination), body);
+  } finally {
+    fs.closeSync(sourceFd);
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("a publication failure is permanent instead of restarting the transfer", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-"));
   const partialPath = join(dataDir, "runtime.bin.part");
@@ -4852,6 +5269,102 @@ test("a publication failure is permanent instead of restarting the transfer", as
       launcherTest.downloadFailurePermanent({ downloadKind: "publish" }),
       true,
     );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader retries a transient publish without transferring again", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-retry-"));
+  const destination = join(dataDir, "runtime.bin");
+  const partialPath = `${destination}.part`;
+  const body = Buffer.from("completed-runtime-payload");
+  let served = 0;
+  const fakeGet = (_url, onResponse) => {
+    const request = new EventEmitter();
+    request.destroy = () => request;
+    served += 1;
+    process.nextTick(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = { "content-length": String(body.length) };
+      onResponse(response);
+      response.end(body);
+    });
+    return request;
+  };
+  const realRename = fs.renameSync;
+  let publishAttempts = 0;
+  try {
+    fs.renameSync = (from, to) => {
+      if (String(from) === partialPath && String(to) === destination) {
+        publishAttempts += 1;
+        if (publishAttempts === 1) {
+          const error = new Error("synthetic transient publish lock");
+          error.code = "EPERM";
+          throw error;
+        }
+      }
+      return realRename(from, to);
+    };
+    await launcherTest.downloadFile("https://example.invalid/runtime", destination, {
+      attempts: 3,
+      get: fakeGet,
+      retryDelayMs: () => 1,
+      timeoutMs: 5000,
+    });
+    assert.equal(served, 1);
+    assert.equal(publishAttempts, 2);
+    assert.deepEqual(await readFile(destination), body);
+    assert.equal(fs.existsSync(partialPath), false);
+    assert.equal(
+      launcherTest.downloadFailurePermanent({ downloadKind: "publish", publishRetryable: true }),
+      false,
+    );
+  } finally {
+    fs.renameSync = realRename;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("terminal publish failure preserves the completed partial and its typed failure kind", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-publish-retained-"));
+  const destination = join(dataDir, "missing", "runtime.bin");
+  const partialPath = join(dataDir, "runtime.bin.part");
+  const body = Buffer.from("completed-runtime-payload");
+  let served = 0;
+  const fakeGet = (_url, onResponse) => {
+    const request = new EventEmitter();
+    request.destroy = () => request;
+    served += 1;
+    process.nextTick(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = { "content-length": String(body.length) };
+      onResponse(response);
+      response.end(body);
+    });
+    return request;
+  };
+  try {
+    let failure;
+    try {
+      await launcherTest.downloadFile("https://example.invalid/runtime", destination, {
+        attempts: 3,
+        get: fakeGet,
+        partialPath,
+        retryDelayMs: () => 1,
+        timeoutMs: 5000,
+      });
+      assert.fail("publish should fail when the destination parent is absent");
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure.downloadFailure.kind, "publish");
+    assert.equal(launcherTest.sanitizeDownloadFailure(failure.downloadFailure).kind, "publish");
+    assert.equal(served, 1);
+    assert.deepEqual(await readFile(partialPath), body);
+    assert.equal(fs.existsSync(destination), false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

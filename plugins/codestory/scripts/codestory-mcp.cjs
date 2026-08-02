@@ -10,6 +10,7 @@ const os = require('os');
 const path = require('path');
 const { Transform, pipeline } = require('stream');
 const { TextDecoder } = require('util');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const zlib = require('zlib');
 const {
   cliVersionProbeTimeoutMs,
@@ -18,7 +19,7 @@ const {
 } = require('./codestory-dev-cli-contract.cjs');
 
 const pluginRoot = path.dirname(__dirname);
-const launchCwd = process.cwd();
+const launchCwd = workerData?.codestoryLaunchCwd || process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 function positiveDurationEnv(name, fallback) {
   const raw = process.env[name];
@@ -53,6 +54,7 @@ const releaseDownloadRetryDelaysMs = [1000, 2000, 5000, 10000, 15000];
 const releaseDownloadRetryJitterMs = 250;
 const managedCliLockStaleMs = 10 * 60 * 1000;
 const managedCliLockMaxAgeMs = 30 * 60 * 1000;
+const managedCliIdentityProbeIntervalMs = 2000;
 const releaseAssetRetryBudgetMs = releaseArchiveTotalTimeoutMs;
 const managedCliStagingBudgetMs = 30 * 1000;
 // A waiter blocks only the background provisioning task, never a tool call, so it can afford to
@@ -75,6 +77,7 @@ const managedCliProbeForceKillGraceMs = 1000;
 const managedCliMcpProtocolVersion = '2024-11-05';
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
+const failOpenMaxFrameBytes = 1024 * 1024;
 
 function isWindowsBatchCli(cliPath, platform = process.platform) {
   return platform === 'win32' && /\.(?:cmd|bat)$/iu.test(String(cliPath || ''));
@@ -347,6 +350,19 @@ const managedCliDownloadProgress = {
   updatedAt: null,
 };
 
+function publishManagedCliProgress() {
+  if (!isMainThread && workerData?.codestoryMode === 'managed-provision' && parentPort) {
+    parentPort.postMessage({ type: 'progress', progress: { ...managedCliDownloadProgress } });
+  }
+}
+
+function applyManagedCliProgress(progress) {
+  if (!progress || typeof progress !== 'object') return;
+  for (const key of Object.keys(managedCliDownloadProgress)) {
+    if (Object.hasOwn(progress, key)) managedCliDownloadProgress[key] = progress[key];
+  }
+}
+
 function resetManagedCliDownloadProgress(stage, asset) {
   managedCliDownloadProgress.stage = stage;
   managedCliDownloadProgress.asset = asset;
@@ -355,6 +371,7 @@ function resetManagedCliDownloadProgress(stage, asset) {
   managedCliDownloadProgress.totalBytes = null;
   managedCliDownloadProgress.startedAt = Date.now();
   managedCliDownloadProgress.updatedAt = Date.now();
+  publishManagedCliProgress();
 }
 
 function recordManagedCliDownloadProgress(progress) {
@@ -370,6 +387,7 @@ function recordManagedCliDownloadProgress(progress) {
     managedCliDownloadProgress.attempt = progress.attempt;
   }
   managedCliDownloadProgress.updatedAt = Date.now();
+  publishManagedCliProgress();
 }
 
 function formatByteSize(bytes) {
@@ -473,14 +491,33 @@ function downloadFailureKind(error) {
 // before showing the same error, so the retry loop stops at the first one.
 function downloadFailurePermanent(error) {
   const kind = downloadFailureKind(error);
-  // `publish` is a local filesystem failure after a complete transfer. Retrying re-downloads the
-  // whole asset only to fail identically at the same step, so it stops here.
-  if (['size_limit', 'content_length', 'transport', 'publish'].includes(kind)) return true;
+  if (kind === 'publish') return error?.publishRetryable !== true;
+  if (['size_limit', 'content_length', 'transport'].includes(kind)) return true;
   if (kind !== 'http_status') return false;
   const status = Number(error?.httpStatus);
   // 408/425/429 are explicitly "come back later"; every other 4xx is a fixed answer.
   return Number.isInteger(status) && status >= 400 && status < 500 &&
     ![408, 425, 429].includes(status);
+}
+
+const retryablePublishErrorCodes = new Set([
+  'EACCES',
+  'EBUSY',
+  'EMFILE',
+  'ENFILE',
+  'ENOTEMPTY',
+  'EPERM',
+  'ETXTBSY',
+]);
+
+function publishError(errorOrCode) {
+  const code = typeof errorOrCode === 'string'
+    ? errorOrCode
+    : String(errorOrCode?.code || 'unknown');
+  return downloadError('publish', `download_publish_failed:${code}`, {
+    publishCode: code,
+    publishRetryable: retryablePublishErrorCodes.has(code),
+  });
 }
 
 function parseContentRangeStart(header) {
@@ -714,13 +751,13 @@ function openVerifiedPartial(partialPath, identity) {
       fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
     );
   } catch (error) {
-    throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+    throw publishError(error);
   }
   try {
     const opened = fs.fstatSync(fd);
     const ours = opened.isFile() && opened.nlink === 1 &&
       (!identity || (opened.dev === identity.dev && opened.ino === identity.ino));
-    if (!ours) throw downloadError('publish', 'download_publish_failed:partial_identity');
+    if (!ours) throw publishError('partial_identity');
     return { fd, metadata: opened };
   } catch (error) {
     try {
@@ -730,30 +767,172 @@ function openVerifiedPartial(partialPath, identity) {
     }
     throw downloadFailureKind(error) === 'publish'
       ? error
-      : downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
+      : publishError(error);
+  }
+}
+
+function descriptorsHaveSameContent(leftFd, leftMetadata, rightFd, rightMetadata) {
+  if (leftMetadata.size !== rightMetadata.size) return false;
+  const left = Buffer.allocUnsafe(1024 * 1024);
+  const right = Buffer.allocUnsafe(left.length);
+  let position = 0;
+  while (position < leftMetadata.size) {
+    const wanted = Math.min(left.length, leftMetadata.size - position);
+    let leftBytes = 0;
+    let rightBytes = 0;
+    while (leftBytes < wanted) {
+      const read = fs.readSync(leftFd, left, leftBytes, wanted - leftBytes, position + leftBytes);
+      if (read <= 0) return false;
+      leftBytes += read;
+    }
+    while (rightBytes < wanted) {
+      const read = fs.readSync(rightFd, right, rightBytes, wanted - rightBytes, position + rightBytes);
+      if (read <= 0) return false;
+      rightBytes += read;
+    }
+    if (!left.subarray(0, wanted).equals(right.subarray(0, wanted))) return false;
+    position += wanted;
+  }
+  return true;
+}
+
+function openReplaceableDownloadDestination(destination) {
+  let fd;
+  try {
+    fd = fs.openSync(
+      destination,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+    );
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    if (error?.code === 'ELOOP') throw publishError('destination_not_replaceable');
+    throw publishError(error);
+  }
+  try {
+    const opened = fs.fstatSync(fd);
+    const named = fs.lstatSync(destination);
+    if (
+      !opened.isFile() || opened.nlink !== 1 || !named.isFile() || named.nlink !== 1 ||
+      opened.dev !== named.dev || opened.ino !== named.ino
+    ) {
+      throw publishError('destination_not_replaceable');
+    }
+    return { fd, metadata: opened };
+  } catch (error) {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // The descriptor is being abandoned either way.
+    }
+    throw downloadFailureKind(error) === 'publish' ? error : publishError(error);
+  }
+}
+
+function unlinkNamedFileIfIdentity(filePath, identity) {
+  const named = fs.lstatSync(filePath);
+  if (
+    !named.isFile() || named.nlink !== 1 ||
+    named.dev !== identity.dev || named.ino !== identity.ino
+  ) {
+    throw publishError('destination_identity');
+  }
+  fs.unlinkSync(filePath);
+}
+
+// Production reaches this only while holding the managed provisioning lock. A retained cache
+// destination may be reused byte-for-byte; otherwise rename directly over the verified regular
+// file. Node/libuv gives that operation old-or-new atomicity on supported platforms: a lock may
+// make the rename fail, but the old destination and completed source both remain for retry. Never
+// pre-unlink the destination, because a rename failure after that would expose a missing archive.
+function replaceOrReuseDownloadedFile(
+  sourcePath,
+  destination,
+  sourceFd,
+  sourceMetadata,
+  sourceIdentity = sourceMetadata,
+) {
+  const existing = openReplaceableDownloadDestination(destination);
+  if (!existing) {
+    try {
+      fs.renameSync(sourcePath, destination);
+      return false;
+    } catch (error) {
+      throw publishError(error);
+    }
+  }
+  let reuse;
+  try {
+    reuse = descriptorsHaveSameContent(sourceFd, sourceMetadata, existing.fd, existing.metadata);
+  } catch (error) {
+    throw publishError(error);
+  } finally {
+    try {
+      fs.closeSync(existing.fd);
+    } catch {
+      // The descriptor is no longer needed once comparison is complete.
+    }
+  }
+  if (reuse) {
+    try {
+      unlinkNamedFileIfIdentity(sourcePath, sourceIdentity);
+    } catch {
+      // The retained destination already has the exact completed bytes. A raced source name is
+      // left alone rather than turning successful reuse into deletion of an unrelated path.
+    }
+    return true;
+  }
+  try {
+    fs.renameSync(sourcePath, destination);
+    return false;
+  } catch (error) {
+    throw downloadFailureKind(error) === 'publish' ? error : publishError(error);
   }
 }
 
 // Copies from the verified descriptor rather than re-opening the partial by name, so the
-// cross-device path publishes the same bytes the same-device path would. `O_EXCL` means the
-// destination is one this call created: a file raced into that name is a failure, not a target.
-function copyVerifiedPartial(fd, destination) {
-  const out = fs.openSync(
-    destination,
-    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
-    0o600,
-  );
+// cross-device path publishes the same bytes the same-device path would. The sibling staging file
+// is created with `O_EXCL`, flushed, and then renamed over the destination atomically.
+function copyVerifiedPartial(fd, destination, options = {}) {
+  const staging = `${destination}.publish-${process.pid}-${randomBytes(6).toString('hex')}.tmp`;
+  const writeSync = options.writeSync || fs.writeSync;
+  let out;
+  let stagingMetadata;
   try {
+    out = fs.openSync(
+      staging,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
+      0o600,
+    );
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let position = 0;
     for (;;) {
       const read = fs.readSync(fd, buffer, 0, buffer.length, position);
       if (read <= 0) break;
-      fs.writeSync(out, buffer, 0, read);
+      let written = 0;
+      while (written < read) {
+        const progress = writeSync(out, buffer, written, read - written);
+        if (!Number.isSafeInteger(progress) || progress <= 0 || progress > read - written) {
+          throw Object.assign(new Error('download_publish_short_write'), { code: 'EIO' });
+        }
+        written += progress;
+      }
       position += read;
     }
+    fs.fsyncSync(out);
+    stagingMetadata = fs.fstatSync(out);
+    const completedOut = out;
+    out = undefined;
+    fs.closeSync(completedOut);
+    replaceOrReuseDownloadedFile(
+      staging,
+      destination,
+      fd,
+      fs.fstatSync(fd),
+      stagingMetadata,
+    );
   } finally {
-    fs.closeSync(out);
+    if (out !== undefined) fs.closeSync(out);
+    fs.rmSync(staging, { force: true });
   }
 }
 
@@ -763,28 +942,29 @@ function copyVerifiedPartial(fd, destination) {
 function publishDownloadedFile(partialPath, destination, identity = null) {
   const { fd, metadata } = openVerifiedPartial(partialPath, identity);
   try {
+    let reused = false;
     try {
-      fs.rmSync(destination, { force: true });
-      fs.renameSync(partialPath, destination);
+      reused = replaceOrReuseDownloadedFile(partialPath, destination, fd, metadata);
     } catch (error) {
-      if (error?.code !== 'EXDEV') {
-        throw downloadError('publish', `download_publish_failed:${error?.code || 'unknown'}`);
-      }
+      if (error?.publishCode !== 'EXDEV') throw error;
       try {
         copyVerifiedPartial(fd, destination);
         fs.rmSync(partialPath, { force: true });
       } catch (copyError) {
-        throw downloadError('publish', `download_publish_failed:${copyError?.code || 'unknown'}`);
+        throw downloadFailureKind(copyError) === 'publish'
+          ? copyError
+          : publishError(copyError);
       }
       return;
     }
+    if (reused) return;
     // A rename keeps the inode, so the published name must still be the verified file. If it is
     // not, something replaced the partial between the check and the rename: drop what landed
     // instead of handing a foreign file to the checksum step as this release's archive.
     const published = fs.lstatSync(destination);
     if (!published.isFile() || published.dev !== metadata.dev || published.ino !== metadata.ino) {
       fs.rmSync(destination, { force: true });
-      throw downloadError('publish', 'download_publish_failed:published_identity');
+      throw publishError('published_identity');
     }
   } finally {
     try {
@@ -837,30 +1017,38 @@ async function downloadFile(url, destination, options = {}) {
   let lastError = null;
   let attempt = 0;
   let stalledAttempts = 0;
+  let completedTransfer = null;
   while (attempt < attempts) {
     attempt += 1;
     const resumeFrom = partialDownloadBytes(partialPath);
     if (onProgress) onProgress({ receivedBytes: resumeFrom, attempt });
     try {
-      const transferred = await downloadFileOnce(url, partialPath, {
-        ...options,
-        resumeFrom,
-        deadlineMs,
-        onProgress: onProgress
-          ? (progress) => onProgress({ ...progress, attempt })
-          : undefined,
-      });
-      publishDownloadedFile(partialPath, destination, transferred?.partial || null);
+      if (!completedTransfer) {
+        completedTransfer = await downloadFileOnce(url, partialPath, {
+          ...options,
+          resumeFrom,
+          deadlineMs,
+          onProgress: onProgress
+            ? (progress) => onProgress({ ...progress, attempt })
+            : undefined,
+        });
+      }
+      publishDownloadedFile(partialPath, destination, completedTransfer?.partial || null);
       return;
     } catch (error) {
       lastError = error;
+      const failureKind = downloadFailureKind(error);
       if (downloadFailurePermanent(error)) {
-        purgePartial();
+        // Publication happens only after the transfer is complete. Preserve
+        // those verified bytes on a terminal local publish failure; unlike a
+        // malformed response, they remain useful evidence and retry input.
+        if (failureKind !== 'publish') purgePartial();
         break;
       }
       // A partial that the server rejects or that drifted out of sync is worthless; drop it so the
       // next attempt starts clean instead of failing the same way forever.
-      if (downloadFailureKind(error) === 'range') purgePartial();
+      if (failureKind === 'range') purgePartial();
+      if (failureKind !== 'publish') completedTransfer = null;
       const advanced = partialDownloadBytes(partialPath) > resumeFrom;
       stalledAttempts = advanced ? 0 : stalledAttempts + 1;
       if (Date.now() >= deadlineMs || attempt >= attempts) break;
@@ -1426,10 +1614,18 @@ function reclaimStaleManagedCliPendingOwners(
   return removed;
 }
 
-function reclaimStaleManagedCliInitialization(lockPath, checkProcessIdentity = true) {
+function reclaimStaleManagedCliInitialization(
+  lockPath,
+  checkProcessIdentity = true,
+  processStartIdentityFor = processStartIdentity,
+) {
   const initializationPath = `${lockPath}.initializing`;
   return removeManagedCliInitializationIf(initializationPath, (owner, metadata) => {
-    const stale = managedCliLockOwnerIsStale(owner, checkProcessIdentity);
+    const stale = managedCliLockOwnerIsStale(
+      owner,
+      checkProcessIdentity,
+      processStartIdentityFor,
+    );
     return stale === null ? Date.now() - metadata.mtimeMs > managedCliLockStaleMs : stale;
   });
 }
@@ -1496,11 +1692,19 @@ function removeManagedCliInitializationIf(initializationPath, shouldRemove, opti
   }
 }
 
-function reclaimStaleManagedCliLock(lockPath, checkProcessIdentity = true) {
+function reclaimStaleManagedCliLock(
+  lockPath,
+  checkProcessIdentity = true,
+  processStartIdentityFor = processStartIdentity,
+) {
   const ownerPath = path.join(lockPath, 'owner.json');
   const owner = readJson(ownerPath);
   const initializationOwner = owner ? null : readJson(`${lockPath}.initializing`);
-  let stale = managedCliLockOwnerIsStale(owner || initializationOwner, checkProcessIdentity);
+  let stale = managedCliLockOwnerIsStale(
+    owner || initializationOwner,
+    checkProcessIdentity,
+    processStartIdentityFor,
+  );
   if (stale === null) {
     try {
       stale = Date.now() - fs.statSync(lockPath).mtimeMs > managedCliLockStaleMs;
@@ -1510,7 +1714,13 @@ function reclaimStaleManagedCliLock(lockPath, checkProcessIdentity = true) {
   }
   if (!stale) return false;
   const removed = removeManagedCliLockArtifact(lockPath);
-  if (removed) reclaimStaleManagedCliInitialization(lockPath, checkProcessIdentity);
+  if (removed) {
+    reclaimStaleManagedCliInitialization(
+      lockPath,
+      checkProcessIdentity,
+      processStartIdentityFor,
+    );
+  }
   return removed;
 }
 
@@ -1528,8 +1738,10 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
   const initializationPath = `${lockPath}.initializing`;
   const token = randomBytes(16).toString('hex');
   const processStartIdentityFor = options.processStartIdentity || processStartIdentity;
-  const selfIdentity = processStartIdentityFor(process.pid);
+  const selfIdentity = options.selfIdentity ?? processStartIdentityFor(process.pid);
   if (!selfIdentity) throw new Error('managed_cli_process_identity_unavailable');
+  const nowFor = options.now || Date.now;
+  const identityProbeThrottle = options.identityProbeThrottle || { nextIdentityCheckAt: 0 };
   const owner = {
     pid: process.pid,
     purpose,
@@ -1538,14 +1750,29 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
     started_at: new Date().toISOString(),
   };
   const pendingOwnerPath = `${lockPath}.owner-${process.pid}-${token}`;
-  const deadline = Date.now() + waitMs;
+  const deadline = nowFor() + waitMs;
   let waited = false;
   let reclaimed = false;
-  let nextIdentityCheckAt = 0;
-  reclaimStaleManagedCliPendingOwners(root);
+  let firstAttempt = true;
   fs.writeFileSync(pendingOwnerPath, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
   try {
     while (true) {
+      const now = nowFor();
+      const nextIdentityCheckAt = Number.isFinite(identityProbeThrottle.nextIdentityCheckAt)
+        ? identityProbeThrottle.nextIdentityCheckAt
+        : 0;
+      const checkProcessIdentity = now >= nextIdentityCheckAt;
+      if (checkProcessIdentity) {
+        identityProbeThrottle.nextIdentityCheckAt = now + managedCliIdentityProbeIntervalMs;
+      }
+      if (firstAttempt || checkProcessIdentity) {
+        reclaimStaleManagedCliPendingOwners(
+          root,
+          checkProcessIdentity,
+          processStartIdentityFor,
+        );
+        firstAttempt = false;
+      }
       let createdLock = false;
       let ownsInitialization = false;
       let publishedOwner = false;
@@ -1566,7 +1793,7 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
         } catch {
           // The owner-bearing directory is authoritative; release retries this alias.
         }
-        reclaimStaleManagedCliPendingOwners(root);
+        reclaimStaleManagedCliPendingOwners(root, false, processStartIdentityFor);
         return { lockPath, token, waited, reclaimed };
       } catch (error) {
         if (ownsInitialization && !publishedOwner) {
@@ -1574,17 +1801,22 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
         }
         if (error.code !== 'EEXIST') throw error;
         waited = true;
-        const checkProcessIdentity = Date.now() >= nextIdentityCheckAt;
-        if (checkProcessIdentity) nextIdentityCheckAt = Date.now() + 2000;
-        if (checkProcessIdentity) reclaimStaleManagedCliPendingOwners(root);
         if (
-          reclaimStaleManagedCliLock(lockPath, checkProcessIdentity) ||
-          reclaimStaleManagedCliInitialization(lockPath, checkProcessIdentity)
+          reclaimStaleManagedCliLock(
+            lockPath,
+            checkProcessIdentity,
+            processStartIdentityFor,
+          ) ||
+          reclaimStaleManagedCliInitialization(
+            lockPath,
+            checkProcessIdentity,
+            processStartIdentityFor,
+          )
         ) {
           reclaimed = true;
           continue;
         }
-        if (Date.now() >= deadline) return null;
+        if (now >= deadline) return null;
         sleepSync(50);
       }
     }
@@ -1593,16 +1825,28 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
   }
 }
 
-async function acquireManagedCliLockAsync(root, purpose, waitMs) {
-  const deadline = Date.now() + waitMs;
+async function acquireManagedCliLockAsync(root, purpose, waitMs, options = {}) {
+  const nowFor = options.now || Date.now;
+  const sleepFor = options.sleep || sleep;
+  const processStartIdentityFor = options.processStartIdentity || processStartIdentity;
+  const selfIdentity = processStartIdentityFor(process.pid);
+  if (!selfIdentity) throw new Error('managed_cli_process_identity_unavailable');
+  const identityProbeThrottle = { nextIdentityCheckAt: 0 };
+  const deadline = nowFor() + waitMs;
   let waited = false;
   while (true) {
-    const lock = acquireManagedCliLock(root, purpose, 0);
+    const lock = acquireManagedCliLock(root, purpose, 0, {
+      ...options,
+      identityProbeThrottle,
+      now: nowFor,
+      processStartIdentity: processStartIdentityFor,
+      selfIdentity,
+    });
     if (lock) return { ...lock, waited: waited || lock.waited };
     waited = true;
-    const remaining = deadline - Date.now();
+    const remaining = deadline - nowFor();
     if (remaining <= 0) return null;
-    await sleep(Math.min(50, remaining));
+    await sleepFor(Math.min(50, remaining));
   }
 }
 
@@ -1665,6 +1909,7 @@ const downloadFailureKinds = new Set([
   'range',
   'redirect',
   'partial_open',
+  'publish',
   'network',
 ]);
 
@@ -1723,6 +1968,9 @@ function managedCliDownloadHint(context, code) {
     case 'redirect':
     case 'partial_open':
       return 'The release download could not be resumed and was reset. Retry the tool to start it again.';
+    case 'publish':
+      return 'The runtime download completed, but the local publish step could not finish.' +
+        `${resumeNote} Retry the tool to publish it again. ${manualInstallHint}`;
     default:
       return null;
   }
@@ -2326,6 +2574,81 @@ async function resolveCli(options = {}) {
     managedFailure,
     warnings,
   };
+}
+
+function managedCliProvisionFailureSnapshot() {
+  return {
+    code: managedCliProvisionFailure.code,
+    context: managedCliProvisionFailure.context,
+    hint: managedCliProvisionFailure.hint,
+  };
+}
+
+function applyManagedCliProvisionFailure(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  managedCliProvisionFailure.code = snapshot.code ?? null;
+  managedCliProvisionFailure.context = snapshot.context ?? null;
+  managedCliProvisionFailure.hint = snapshot.hint ?? null;
+}
+
+function runManagedProvisioningWorker(options = {}) {
+  const WorkerClass = options.Worker || Worker;
+  return new Promise((resolve, reject) => {
+    const worker = new WorkerClass(__filename, {
+      workerData: {
+        codestoryMode: 'managed-provision',
+        codestoryLaunchCwd: launchCwd,
+      },
+    });
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error instanceof Error ? error : new Error(String(error || 'managed_cli_worker_failed')));
+    };
+    worker.on('message', (message) => {
+      if (message?.type === 'progress') {
+        applyManagedCliProgress(message.progress);
+        return;
+      }
+      if (message?.type === 'result') {
+        if (settled) return;
+        settled = true;
+        applyManagedCliProvisionFailure(message.provisionFailure);
+        resolve(message.outcome);
+        return;
+      }
+      if (message?.type === 'error') {
+        fail(new Error(message.code || 'managed_cli_worker_failed'));
+      }
+    });
+    worker.once('error', fail);
+    worker.once('exit', (code) => {
+      if (!settled) fail(new Error(`managed_cli_worker_exit:${code}`));
+    });
+    worker.unref?.();
+  });
+}
+
+async function runManagedProvisioningWorkerEntrypoint() {
+  try {
+    const resolved = await resolveCli();
+    const probe = probeResolvedCli(resolved);
+    const reason = failOpenReasonForProbe(resolved, probe);
+    resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, {
+      dryRun: Boolean(reason),
+    });
+    parentPort.postMessage({
+      type: 'result',
+      outcome: { resolved, probe, reason },
+      provisionFailure: managedCliProvisionFailureSnapshot(),
+    });
+  } catch (error) {
+    parentPort.postMessage({ type: 'error', code: managedCliFailureCode(error) });
+    process.exitCode = 1;
+  } finally {
+    parentPort.close();
+  }
 }
 
 function normalizeVersion(value) {
@@ -2980,8 +3303,23 @@ function jsonrpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
 
-function jsonrpcError(id, code, message) {
-  return { jsonrpc: '2.0', id, error: { code, message } };
+function jsonrpcError(id, code, message, data = undefined) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  return { jsonrpc: '2.0', id, error };
+}
+
+function failOpenFrameTooLargeError(lineBytes) {
+  return jsonrpcError(
+    null,
+    -32700,
+    `Parse error: stdio frame exceeded ${failOpenMaxFrameBytes} byte limit`,
+    {
+      code: 'stdio_frame_too_large',
+      max_frame_bytes: failOpenMaxFrameBytes,
+      line_bytes: lineBytes,
+    },
+  );
 }
 
 function resourceContents(uri, value) {
@@ -3098,11 +3436,53 @@ function parseFailOpenResourceRequest(uri, legacyProject) {
   };
 }
 
-function failOpenToolCatalog() {
-  if (!Array.isArray(canonicalMcpCatalog?.tools)) {
+function failOpenToolCatalog(catalog = canonicalMcpCatalog) {
+  if (!Array.isArray(catalog?.tools)) {
     throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
   }
-  return JSON.parse(JSON.stringify(canonicalMcpCatalog.tools));
+  return JSON.parse(JSON.stringify(catalog.tools));
+}
+
+function emergencyStatusToolCatalog() {
+  return [{
+    name: 'status',
+    description: 'Inspect CodeStory launcher readiness for one explicit repository.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { project: { type: 'string', minLength: 1 } },
+      required: ['project'],
+    },
+    annotations: {
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+      readOnlyHint: true,
+    },
+  }];
+}
+
+function catalogFailureStatus(status, catalogFailure) {
+  const reason = 'generated_mcp_catalog_missing';
+  const warning = `${reason}:${safeFailureToken(catalogFailure?.message, 'unreadable')}`;
+  return {
+    ...status,
+    degraded_reason: reason,
+    warnings: [...new Set([...(status.warnings || []), warning])],
+    plugin_runtime: {
+      ...(status.plugin_runtime || {}),
+      warnings: [...new Set([...(status.plugin_runtime?.warnings || []), warning])],
+    },
+    runtime: { ...(status.runtime || {}), state: 'unavailable' },
+    managed_retrieval: { ...(status.managed_retrieval || {}), state: 'unavailable' },
+    readiness: [{
+      goal: 'runtime',
+      status: 'unavailable',
+      summary: 'CodeStory could not load its generated MCP catalog.',
+      reason,
+      setup: { catalog_error: warning },
+    }],
+  };
 }
 
 function selectExplicitProject(value) {
@@ -3263,13 +3643,14 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
 }
 
 const shuttingDownHandoffs = new WeakSet();
+const runtimeDiagnosticRedacted = '[redacted]';
 
 function runtimeCorrelationId() {
   return randomBytes(16).toString('hex');
 }
 
 function sanitizeRuntimeDiagnosticText(value) {
-  return String(value || '') ? '[redacted]' : '';
+  return String(value || '') ? runtimeDiagnosticRedacted : '';
 }
 
 function appendRuntimeStderrTail(current, chunk) {
@@ -3339,6 +3720,33 @@ function runtimeFailureDetail(reasonCode, details = {}) {
   return `${reason} (${fields.join(' ')})`;
 }
 
+let launcherFatalHandlersInstalled = false;
+
+function installLauncherFatalHandlers() {
+  if (launcherFatalHandlersInstalled) return;
+  launcherFatalHandlersInstalled = true;
+  process.once('uncaughtException', () => {
+    const suppliedCorrelation = String(process.env.CODESTORY_LOG_CORRELATION_ID || '');
+    const correlationId = /^[A-Za-z0-9_-]{1,128}$/u.test(suppliedCorrelation)
+      ? suppliedCorrelation
+      : runtimeCorrelationId();
+    const diagnostic = {
+      event: 'launcher_uncaught_exception',
+      level: 'ERROR',
+      pid: process.pid,
+      correlation_id: correlationId,
+      error: runtimeDiagnosticRedacted,
+      stack: runtimeDiagnosticRedacted,
+    };
+    try {
+      fs.writeSync(2, `${JSON.stringify(diagnostic)}\n`);
+    } catch {
+      // Termination is unconditional even when the diagnostic sink is gone.
+    }
+    process.exit(1);
+  });
+}
+
 function shutdownHandoffChild(child, options = {}) {
   if (!child || typeof child !== 'object' || shuttingDownHandoffs.has(child)) return;
   shuttingDownHandoffs.add(child);
@@ -3349,8 +3757,8 @@ function shutdownHandoffChild(child, options = {}) {
   }
   if (typeof child.kill !== 'function') return;
   const isRunning = () => child.exitCode == null && child.signalCode == null;
-  const graceMs = options.handoffTerminationGraceMs ?? 500;
-  const forceGraceMs = options.handoffForceKillGraceMs ?? 500;
+  const graceMs = options.handoffTerminationGraceMs ?? 5000;
+  const forceGraceMs = options.handoffForceKillGraceMs ?? 5000;
   let forceTimer = null;
   const terminateTimer = setTimeout(() => {
     if (!isRunning()) return;
@@ -3379,8 +3787,36 @@ function shutdownHandoffChild(child, options = {}) {
 }
 
 function runFailOpenMcp(status, options = {}) {
-  const currentStatus = () => (typeof status === 'function' ? status() : status);
+  const baseCurrentStatus = () => (typeof status === 'function' ? status() : status);
+  const catalog = Object.hasOwn(options, 'catalog') ? options.catalog : canonicalMcpCatalog;
+  let catalogFailure = null;
+  let tools;
+  let resources;
+  let resourceTemplates;
+  try {
+    tools = failOpenToolCatalog(catalog);
+    if (!Array.isArray(catalog.resources) || !Array.isArray(catalog.resourceTemplates)) {
+      throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
+    }
+    resources = catalog.resources.filter(({ uri }) => uri === 'codestory://agent-guide');
+    resourceTemplates = catalog.resourceTemplates.filter(({ uriTemplate }) =>
+      uriTemplate === 'codestory://status{?project}');
+  } catch (error) {
+    catalogFailure = error;
+    tools = emergencyStatusToolCatalog();
+    resources = [];
+    resourceTemplates = [{
+      mimeType: 'application/json',
+      name: 'Status',
+      uriTemplate: 'codestory://status{?project}',
+    }];
+  }
+  const currentStatus = () => {
+    const current = baseCurrentStatus();
+    return catalogFailure ? catalogFailureStatus(current, catalogFailure) : current;
+  };
   let handoff = null;
+  let handoffWrite = null;
   let initializeRequest = null;
   let initializedNotification = null;
   let runtimeReadyNotified = false;
@@ -3436,6 +3872,7 @@ function runFailOpenMcp(status, options = {}) {
       };
       const detailedReason = runtimeFailureDetail(reasonCode, failureDetails);
       handoff = null;
+      handoffWrite = null;
       shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
         process.exit(failureDetails.code || 1);
@@ -3455,6 +3892,34 @@ function runFailOpenMcp(status, options = {}) {
         ...failureDetails,
       });
     };
+    handoffWrite = (line) => {
+      try {
+        if (!handoff?.stdin || handoff.stdin.destroyed) {
+          throw Object.assign(new Error('child stdin is unavailable'), { code: 'EPIPE' });
+        }
+        handoff.stdin.write(`${line}\n`, (error) => {
+          if (error) {
+            failHandoff('runtime_stdio_child_stdin', {
+              errorCode: error?.code,
+              stdinError: true,
+            });
+          }
+        });
+        return true;
+      } catch (error) {
+        failHandoff('runtime_stdio_child_stdin', {
+          errorCode: error?.code,
+          stdinError: true,
+        });
+        return false;
+      }
+    };
+    handoff.stdin?.on?.('error', (error) => {
+      failHandoff('runtime_stdio_child_stdin', {
+        errorCode: error?.code,
+        stdinError: true,
+      });
+    });
     if (handoff.stdout) {
       let stdout = '';
       let suppressInitialize = Boolean(initializeRequest);
@@ -3502,23 +3967,19 @@ function runFailOpenMcp(status, options = {}) {
       });
     });
     if (initializeRequest) {
-      handoff.stdin.write(`${JSON.stringify(initializeRequest)}\n`);
-      handoff.stdin.write(`${JSON.stringify(initializedNotification || {
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-      })}\n`);
+      if (handoffWrite(JSON.stringify(initializeRequest))) {
+        handoffWrite?.(JSON.stringify(initializedNotification || {
+          jsonrpc: '2.0',
+          method: 'notifications/initialized',
+        }));
+      }
     }
     if (stdinEnded) handoff.stdin.end();
     return handoff;
   };
-  const tools = failOpenToolCatalog();
-  const resources = (canonicalMcpCatalog.resources || []).filter(({ uri }) =>
-    uri === 'codestory://agent-guide');
   // Fail-open serves the project-bound status template and static guide. Do
   // not advertise other generated templates or prompts until the native
   // runtime owns their read/get handlers.
-  const resourceTemplates = (canonicalMcpCatalog.resourceTemplates || []).filter(({ uriTemplate }) =>
-    uriTemplate === 'codestory://status{?project}');
   const prompts = [];
   const guide = () => {
     return {
@@ -3526,107 +3987,144 @@ function runFailOpenMcp(status, options = {}) {
       diagnostics_uri_template: 'codestory://status{?project}',
     };
   };
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
+      return;
+    }
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
+      return;
+    }
+    if (request.method === 'notifications/initialized') {
+      initializedNotification = request;
+      notifyRuntimeReady();
+      return;
+    }
+    if (request.method === 'initialize' && request.id !== undefined) {
+      initializeRequest = request;
+    }
+    const delegated = request.method === 'initialize' ? null : maybeHandoff();
+    if (delegated) {
+      if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
+      handoffWrite(line);
+      return;
+    }
+    if (request.id === undefined) return;
+    let response;
+    if (request.method === 'initialize') {
+      const liveStatus = currentStatus();
+      response = jsonrpcResult(request.id, {
+        protocolVersion: request.params?.protocolVersion || '2024-11-05',
+        capabilities: {
+          tools: { listChanged: true },
+          resources: { subscribe: false, listChanged: true },
+          prompts: { listChanged: true },
+        },
+        serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
+      });
+    } else if (request.method === 'tools/list') {
+      response = jsonrpcResult(request.id, { tools });
+    } else if (request.method === 'resources/list') {
+      response = jsonrpcResult(request.id, { resources });
+    } else if (request.method === 'resources/templates/list') {
+      response = jsonrpcResult(request.id, { resourceTemplates });
+    } else if (request.method === 'prompts/list') {
+      response = jsonrpcResult(request.id, { prompts });
+    } else if (request.method === 'resources/read') {
+      const uri = request.params?.uri;
+      let parsedResource;
+      try {
+        parsedResource = parseFailOpenResourceRequest(uri, request.params?.project);
+      } catch (error) {
+        response = jsonrpcError(request.id, -32602, error.message);
+      }
+      if (parsedResource?.kind === 'status') {
+        const project = parsedResource.project;
+        const statusValue = { ...currentStatus() };
+        statusValue.project_root = project;
+        statusValue.project_root_source = parsedResource.projectSource;
+        statusValue.diagnostics_uri = parsedResource.uri;
+        if (Array.isArray(statusValue.recommended_next_calls)) {
+          statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) => {
+            if (call?.method === 'resources/read'
+              && call?.uri_template === 'codestory://status{?project}') {
+              return { method: call.method, uri: parsedResource.uri };
+            }
+            // The preparing diagnostic is snapshotted when provisioning starts; the retry hint
+            // must track the download progress observed at this read, not that initial instant.
+            if (call?.method === 'tools/call' && Number.isSafeInteger(call.after_ms)) {
+              return { ...call, after_ms: provisioningRetryHintMs() };
+            }
+            return call;
+          });
+        }
+        response = jsonrpcResult(
+          request.id,
+          resourceContents(parsedResource.uri, statusValue),
+        );
+      } else if (parsedResource?.kind === 'agent-guide') {
+        response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
+      }
+    } else if (request.method === 'tools/call') {
+      const tool = request.params?.name;
+      response = tools.some((candidate) => candidate.name === tool)
+        ? jsonrpcResult(
+            request.id,
+            failOpenToolResult(tool, currentStatus(), request.params?.arguments ?? {}),
+          )
+        : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
+    } else {
+      response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
+    }
+    process.stdout.write(`${JSON.stringify(response)}\n`);
+  };
   let buffer = '';
+  let bufferBytes = 0;
+  let discardedFrameBytes = 0;
+  const reportDiscardedFrame = () => {
+    process.stdout.write(`${JSON.stringify(failOpenFrameTooLargeError(discardedFrameBytes))}\n`);
+    discardedFrameBytes = 0;
+  };
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
-    buffer += chunk;
-    const lines = buffer.split(/\r?\n/u);
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let request;
-      try {
-        request = JSON.parse(line);
-      } catch {
-        process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
-        continue;
-      }
-      if (request.method === 'notifications/initialized') {
-        initializedNotification = request;
-        notifyRuntimeReady();
-        continue;
-      }
-      if (request.method === 'initialize' && request.id !== undefined) {
-        initializeRequest = request;
-      }
-      const delegated = request.method === 'initialize' ? null : maybeHandoff();
-      if (delegated) {
-        if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
-        try {
-          delegated.stdin.write(`${line}\n`);
-        } catch (error) {
-          process.stdout.write(`${JSON.stringify(jsonrpcError(request.id ?? null, -32000, `CodeStory stdio handoff failed: ${error.message}`))}\n`);
-        }
-        continue;
-      }
-      if (request.id === undefined) continue;
-      let response;
-      if (request.method === 'initialize') {
-        const liveStatus = currentStatus();
-        response = jsonrpcResult(request.id, {
-          protocolVersion: request.params?.protocolVersion || '2024-11-05',
-          capabilities: {
-            tools: { listChanged: true },
-            resources: { subscribe: false, listChanged: true },
-            prompts: { listChanged: true },
-          },
-          serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
-        });
-      } else if (request.method === 'tools/list') {
-        response = jsonrpcResult(request.id, { tools });
-      } else if (request.method === 'resources/list') {
-        response = jsonrpcResult(request.id, { resources });
-      } else if (request.method === 'resources/templates/list') {
-        response = jsonrpcResult(request.id, { resourceTemplates });
-      } else if (request.method === 'prompts/list') {
-        response = jsonrpcResult(request.id, { prompts });
-      } else if (request.method === 'resources/read') {
-        const uri = request.params?.uri;
-        let parsedResource;
-        try {
-          parsedResource = parseFailOpenResourceRequest(uri, request.params?.project);
-        } catch (error) {
-          response = jsonrpcError(request.id, -32602, error.message);
-        }
-        if (parsedResource?.kind === 'status') {
-          const project = parsedResource.project;
-          const statusValue = { ...currentStatus() };
-          statusValue.project_root = project;
-          statusValue.project_root_source = parsedResource.projectSource;
-          statusValue.diagnostics_uri = parsedResource.uri;
-          if (Array.isArray(statusValue.recommended_next_calls)) {
-            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) => {
-              if (call?.method === 'resources/read'
-                && call?.uri_template === 'codestory://status{?project}') {
-                return { method: call.method, uri: parsedResource.uri };
-              }
-              // The preparing diagnostic is snapshotted when provisioning starts; the retry hint
-              // must track the download progress observed at this read, not that initial instant.
-              if (call?.method === 'tools/call' && Number.isSafeInteger(call.after_ms)) {
-                return { ...call, after_ms: provisioningRetryHintMs() };
-              }
-              return call;
-            });
-          }
-          response = jsonrpcResult(
-            request.id,
-            resourceContents(parsedResource.uri, statusValue),
-          );
-        } else if (parsedResource?.kind === 'agent-guide') {
-          response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
-        }
-      } else if (request.method === 'tools/call') {
-        const tool = request.params?.name;
-        response = tools.some((candidate) => candidate.name === tool)
-          ? jsonrpcResult(request.id, failOpenToolResult(tool, currentStatus(), request.params?.arguments))
-          : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf('\n', offset);
+      const end = newline >= 0 ? newline + 1 : chunk.length;
+      const segment = chunk.slice(offset, end);
+      const segmentBytes = Buffer.byteLength(segment, 'utf8');
+      if (discardedFrameBytes > 0) {
+        discardedFrameBytes += segmentBytes;
+        if (newline >= 0) reportDiscardedFrame();
+      } else if (bufferBytes + segmentBytes > failOpenMaxFrameBytes) {
+        discardedFrameBytes = bufferBytes + segmentBytes;
+        buffer = '';
+        bufferBytes = 0;
+        if (newline >= 0) reportDiscardedFrame();
       } else {
-        response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
+        buffer += segment;
+        bufferBytes += segmentBytes;
+        if (newline >= 0) {
+          let line = buffer.slice(0, -1);
+          if (line.endsWith('\r')) line = line.slice(0, -1);
+          buffer = '';
+          bufferBytes = 0;
+          handleLine(line);
+        }
       }
-      process.stdout.write(`${JSON.stringify(response)}\n`);
+      offset = end;
     }
   });
   process.stdin.on('end', () => {
+    if (discardedFrameBytes > 0) reportDiscardedFrame();
+    else if (buffer.trim()) handleLine(buffer);
+    buffer = '';
+    bufferBytes = 0;
     stdinEnded = true;
     shutdownHandoffChild(handoff, options);
   });
@@ -3723,10 +4221,7 @@ async function main() {
       summary: 'CodeStory is preparing. The requested tool will be available shortly.',
     });
     setImmediate(() => {
-      resolveCli().then((resolved) => {
-        const probe = probeResolvedCli(resolved);
-        const reason = failOpenReasonForProbe(resolved, probe);
-        resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: Boolean(reason) });
+      runManagedProvisioningWorker().then(({ resolved, probe, reason }) => {
         rememberLaunch(resolved, runtimeCwd);
         if (reason) {
           status = fallbackDiagnostic(resolved, probe, reason, {
@@ -3750,7 +4245,9 @@ async function main() {
       onRuntimeFailure: (failure) => {
         const failed = ready;
         ready = null;
-        const reason = failure.spawnError ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
+        const reason = failure.stdinError
+          ? 'runtime_stdio_child_stdin'
+          : failure.spawnError ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
         status = fallbackDiagnostic(failed, {
           status: failure.code ?? null,
           error: failure.reason,
@@ -3800,7 +4297,9 @@ async function main() {
     startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
     onRuntimeFailure: (failure) => {
       handoffReady = false;
-      const reason = failure.spawnError ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
+      const reason = failure.stdinError
+        ? 'runtime_stdio_child_stdin'
+        : failure.spawnError ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
       const error = failure.code != null
         ? `codestory-cli serve --stdio exited with status ${failure.code}`
         : failure.reason;
@@ -3852,7 +4351,14 @@ function runLauncherError(error) {
 }
 
 if (require.main === module) {
-  main().catch(runLauncherError);
+  installLauncherFatalHandlers();
+  if (!isMainThread && workerData?.codestoryMode === 'managed-provision') {
+    runManagedProvisioningWorkerEntrypoint().catch((error) => {
+      throw error;
+    });
+  } else {
+    main().catch(runLauncherError);
+  }
 } else {
   module.exports = {
     _test: {
@@ -3860,6 +4366,7 @@ if (require.main === module) {
       cleanPublicProjectPath,
       downloadFile,
       downloadFailurePermanent,
+      copyVerifiedPartial,
       pinnedCliContract,
       pinnedCliVersion,
       pinnedArchiveSha256,
@@ -3882,6 +4389,8 @@ if (require.main === module) {
       runtimeCorrelationId,
       runtimeStderrObservedBytesCap,
       runtimeStderrObservedChunksCap,
+      installLauncherFatalHandlers,
+      runManagedProvisioningWorker,
       releaseDownloadStallTimeoutMs,
       releaseArchiveTotalTimeoutMs,
       releaseChecksumTotalTimeoutMs,
@@ -3889,6 +4398,7 @@ if (require.main === module) {
       extractArchive,
       failOpenToolResult,
       failOpenToolCatalog,
+      failOpenMaxFrameBytes,
       managedCliFailureCode,
       managedCliVersionProbeFailure,
       recordManagedCliProvisionFailure,
@@ -3897,6 +4407,8 @@ if (require.main === module) {
       strictUriComponentDecode,
       strictUriComponentEncode,
       acquireManagedCliLock,
+      acquireManagedCliLockAsync,
+      managedCliIdentityProbeIntervalMs,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
       managedAssetIdentity,
