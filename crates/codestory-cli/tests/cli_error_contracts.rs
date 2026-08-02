@@ -300,6 +300,64 @@ fn top_level_help_names_command_purposes() {
     }
 }
 
+/// `drill --jobs` never scheduled anything, and help plus the grounding skill
+/// advertised it as a real control. For its final release it must keep parsing
+/// so pinned invocations do not break, and it must say plainly that it is
+/// ignored — supplying it is the only thing that prints the notice.
+#[test]
+fn deprecated_drill_jobs_warns_when_supplied_and_stays_silent_otherwise() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    let output_dir = tempdir().expect("drill output dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let notice = "--jobs is deprecated and ignored";
+
+    let with_flag = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "drill",
+            "--refresh",
+            "none",
+            "--anchors",
+            "AppController",
+            "--output-dir",
+            &output_dir.path().to_string_lossy(),
+            "--jobs",
+            "4",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&with_flag.stderr);
+    assert!(
+        stderr.contains(notice),
+        "supplying the deprecated flag must say it is ignored:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("removed next release"),
+        "the notice must name the removal release:\n{stderr}"
+    );
+
+    let without_flag = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "drill",
+            "--refresh",
+            "none",
+            "--anchors",
+            "AppController",
+            "--output-dir",
+            &output_dir.path().to_string_lossy(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&without_flag.stderr);
+    assert!(
+        !stderr.contains(notice),
+        "a run that never mentioned --jobs must not be warned:\n{stderr}"
+    );
+}
+
 #[test]
 fn product_cli_rejects_the_removed_cpu_embedding_selector() {
     let output = test_support::cli_command()

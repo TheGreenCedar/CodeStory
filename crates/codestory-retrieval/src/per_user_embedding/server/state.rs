@@ -358,12 +358,14 @@ impl PerUserEmbeddingServerState {
     }
 
     pub(in crate::per_user_embedding) fn finish_request(&self, key: &str) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(key);
-        }
-        if let Ok(mut cancellations) = self.cancellations.lock() {
-            cancellations.remove(key);
-        }
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
         self.restart_idle_window();
         self.bump_event();
     }
@@ -373,8 +375,24 @@ impl PerUserEmbeddingServerState {
             .store(self.clock.now_ns(), Ordering::Release);
     }
 
+    /// Whether nothing is in flight, so the idle window may retire the process.
+    ///
+    /// Lock poisoning is recovered here rather than read as work. Every
+    /// *serving* path still refuses a poisoned lock — `engine`,
+    /// `register_request`, and the admission accounting all fail closed with a
+    /// typed `..._poisoned` error, and this function grants nothing. Treating
+    /// poison as "busy" was the only reachable consequence, and it was a
+    /// zombie: one panicked worker made every later idle check false, so a
+    /// server that could no longer serve also never exited its idle window and
+    /// kept holding its socket and its native engine until the machine
+    /// rebooted.
     pub(in crate::per_user_embedding) fn true_idle(&self) -> bool {
-        if self.active.lock().map_or(true, |active| !active.is_empty()) {
+        if !self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
             return false;
         }
         if self.request_admission.snapshot() != ServerRequestAdmissionDepths::default() {
@@ -390,9 +408,12 @@ impl PerUserEmbeddingServerState {
     }
 
     pub(in crate::per_user_embedding) fn begin_draining_if_idle(&self) -> bool {
-        let Ok(_admission) = self.admission_gate.lock() else {
-            return false;
-        };
+        // Same reasoning as `true_idle`: a poisoned admission gate must not be
+        // the reason a server that cannot serve refuses to drain.
+        let _admission = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .draining
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

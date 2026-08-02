@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
-#[cfg(any(test, feature = "test-support"))]
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
 
@@ -584,7 +582,97 @@ fn uncached_user_cache_root() -> PathBuf {
     }
     ProjectDirs::from("dev", "codestory", "codestory")
         .map(|dirs| dirs.cache_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"))
+        .unwrap_or_else(temporary_cache_root)
+}
+
+/// The per-user name the temporary-directory cache fallback claims.
+///
+/// Unix `/tmp` is shared, so the name carries the effective uid; Windows and
+/// the remaining platforms get a per-user temporary directory from the OS, so
+/// the bare name is already private there.
+fn temporary_cache_root_name() -> String {
+    #[cfg(unix)]
+    {
+        format!("codestory-cache-{}", unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        "codestory-cache".to_string()
+    }
+}
+
+/// Cache root used only when no home directory resolves.
+///
+/// The old fallback was the fixed `<temp>/codestory/cache`. Nothing created it
+/// privately and nothing checked who owned it, so on a shared Unix host any
+/// local user could pre-create that exact path and then read the full source
+/// text every sidecar and index database writes underneath it — the 0600 socket
+/// discipline next door made the asymmetry plain.
+///
+/// The replacement never uses a directory it did not itself create privately:
+/// the per-user name is claimed with mode 0700, an existing name is accepted
+/// only when [`private_cache_directory`] confirms this user owns it with no
+/// group or other access, and an occupied or untrusted name is refused in
+/// favour of an unpredictable private directory rather than shared. If even
+/// that cannot be created the uncreated unpredictable path is returned, so
+/// downstream writes fail on a path an attacker cannot have staged instead of
+/// succeeding into one they can read.
+fn temporary_cache_root() -> PathBuf {
+    let temporary = std::env::temp_dir();
+    let shared = temporary.join(temporary_cache_root_name());
+    if private_cache_directory(&shared).is_ok() {
+        return shared;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let unpredictable = temporary.join(format!(
+        "{}-{}-{nonce}",
+        temporary_cache_root_name(),
+        std::process::id()
+    ));
+    let _ = private_cache_directory(&unpredictable);
+    unpredictable
+}
+
+/// Make `path` a directory this user owns privately, or report why it is not.
+///
+/// Creating it is the ordinary case and is exclusive: the directory is created
+/// with mode 0700 on Unix, so no other user ever sees it in a permissive state.
+/// An existing name is not trusted for being there — it is accepted only after
+/// `symlink_metadata` shows a real directory (never a symlink) owned by the
+/// effective uid with `mode & 0o077 == 0`.
+fn private_cache_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "codestory_cache_root_untrusted",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "codestory_cache_root_untrusted",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -726,6 +814,78 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The temporary-directory cache fallback holds sidecar and index databases
+    /// that contain full source text, so it may only ever be a directory this
+    /// user owns privately. A world-writable directory already sitting at the
+    /// fallback name is exactly the ARCH-027 attack: a local user pre-creates
+    /// the fixed path and reads whatever the next indexing run writes into it.
+    #[test]
+    fn temporary_cache_fallback_refuses_a_directory_another_user_could_have_staged() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+
+        let fresh = temporary.path().join("fresh");
+        private_cache_directory(&fresh).expect("fresh fallback is claimed privately");
+        assert!(fresh.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&fresh)
+                    .expect("fresh fallback metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        // Claiming a name that is already a private directory of ours is the
+        // ordinary second run and must keep working.
+        private_cache_directory(&fresh).expect("private fallback is reused");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let staged = temporary.path().join("staged");
+            std::fs::create_dir(&staged).expect("staged directory");
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o777))
+                .expect("stage a world-writable directory");
+            let refusal =
+                private_cache_directory(&staged).expect_err("staged fallback must be refused");
+            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(refusal.to_string(), "codestory_cache_root_untrusted");
+
+            let link = temporary.path().join("link");
+            std::os::unix::fs::symlink(&fresh, &link).expect("symlinked fallback");
+            let refusal =
+                private_cache_directory(&link).expect_err("symlinked fallback must be refused");
+            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(refusal.to_string(), "codestory_cache_root_untrusted");
+        }
+    }
+
+    /// The fallback name must be per-user on the shared Unix temporary
+    /// directory, and the root it hands back must always be a directory this
+    /// process created privately — never the bare `<temp>/codestory/cache`.
+    #[test]
+    fn temporary_cache_root_is_per_user_and_privately_created() {
+        let root = temporary_cache_root();
+
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert_ne!(root, std::env::temp_dir().join("codestory").join("cache"));
+        assert!(root.is_dir(), "{} should exist", root.display());
+        private_cache_directory(&root).expect("returned root is privately owned");
+        #[cfg(unix)]
+        assert!(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name
+                    .starts_with(&format!("codestory-cache-{}", unsafe { libc::geteuid() }))),
+            "{} should carry the effective uid",
+            root.display()
+        );
+    }
 
     fn defaults(cache_root: &Path, values: &[(&str, &str)]) -> SidecarProcessDefaults {
         SidecarProcessDefaults::new(

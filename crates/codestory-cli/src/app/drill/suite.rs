@@ -146,12 +146,7 @@ pub(super) fn execute_codestory_real_repo_drill_suite(
         display::clean_path_string(&cmd.output_dir.to_string_lossy())
     ));
     let suite_jobs = drill_suite_case_jobs(cmd.jobs, cmd.refresh, total_cases);
-    let drill_jobs = if suite_jobs > 1 {
-        1
-    } else {
-        drill_read_only_jobs(cmd.jobs, cmd.refresh)
-    };
-    let repos = run_drill_suite_cases(cmd, cases, suite_jobs, drill_jobs);
+    let repos = run_drill_suite_cases(cmd, cases, suite_jobs);
 
     let degraded_count = drill_suite_verdict_count(&repos, "degraded");
     let blocked_count = drill_suite_verdict_count(&repos, "blocked");
@@ -193,16 +188,13 @@ pub(super) fn run_drill_suite_cases(
     cmd: &DrillSuiteCommand,
     cases: Vec<DrillSuiteCase>,
     jobs: usize,
-    drill_jobs: usize,
 ) -> Vec<DrillSuiteRepoOutput> {
     let total_cases = cases.len();
     if jobs <= 1 || total_cases <= 1 {
         return cases
             .iter()
             .enumerate()
-            .map(|(case_index, case)| {
-                run_drill_suite_case(cmd, case_index, total_cases, case, drill_jobs)
-            })
+            .map(|(case_index, case)| run_drill_suite_case(cmd, case_index, total_cases, case))
             .collect();
     }
 
@@ -216,7 +208,7 @@ pub(super) fn run_drill_suite_cases(
                 chunk
                     .iter()
                     .map(|(case_index, case)| {
-                        let repo = run_drill_suite_case(cmd, *case_index, total_cases, case, 1);
+                        let repo = run_drill_suite_case(cmd, *case_index, total_cases, case);
                         (*case_index, repo)
                     })
                     .collect::<Vec<_>>()
@@ -241,7 +233,6 @@ pub(super) fn run_drill_suite_case(
     case_index: usize,
     total_cases: usize,
     case: &DrillSuiteCase,
-    drill_jobs: usize,
 ) -> DrillSuiteRepoOutput {
     let progress_index = case_index + 1;
     let repo_output_dir = cmd.output_dir.join(format!("{}-drill", case.slug));
@@ -268,7 +259,9 @@ pub(super) fn run_drill_suite_case(
         profile: None,
         run_id: None,
         format: cmd.format,
-        jobs: drill_jobs,
+        // The suite schedules cases itself; the deprecated per-drill flag is
+        // never synthesized, so an internal case never prints its warning.
+        jobs: None,
     };
     match execute_drill(&drill_cmd).and_then(|operation| {
         write_drill_outputs(cmd.format, &repo_output_dir, &operation)?;
