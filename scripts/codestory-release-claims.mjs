@@ -886,6 +886,9 @@ function validateProofFloor(value) {
   exactStringList(
     durability.paths,
     [
+      "Cargo.toml",
+      "Cargo.lock",
+      "vendor/**",
       "crates/codestory-store/**",
       "crates/codestory-indexer/**",
       "crates/codestory-workspace/**",

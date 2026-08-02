@@ -5831,6 +5831,31 @@ test("proof floor keeps architecture universal and durability path-scoped", asyn
     [],
   );
 
+  for (const requiredPath of ["Cargo.toml", "Cargo.lock", "vendor/**"]) {
+    await t.test(`${requiredPath} remains a dependency-graph trigger`, () => {
+      const workflows = loadWorkflows();
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      graph.workflow_policy.proof_floor.crate_durability.paths =
+        graph.workflow_policy.proof_floor.crate_durability.paths
+          .filter(triggerPath => triggerPath !== requiredPath);
+      const workflow = workflows.get(crateDurabilityFile);
+      for (const event of ["pull_request", "push"]) {
+        workflow.on[event].paths = workflow.on[event].paths
+          .filter(triggerPath => triggerPath !== requiredPath);
+      }
+
+      const violations = proofFloorPolicyViolations(workflows, graph).join("\n");
+      assert.match(
+        violations,
+        /crate-durability\.yml pull_request paths must cover root Cargo manifests, the lockfile, and vendored dependencies/u,
+      );
+      assert.match(
+        violations,
+        /crate-durability\.yml push paths must cover root Cargo manifests, the lockfile, and vendored dependencies/u,
+      );
+    });
+  }
+
   const mutations = [
     ["architecture command removed", workflows => {
       const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;

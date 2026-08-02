@@ -350,6 +350,11 @@ test("claim graph owns the universal architecture and path-scoped durability flo
     "cargo test --locked -p codestory-indexer --test fidelity_regression",
     "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
   ]);
+  assert.deepEqual(floor.crate_durability.paths.slice(0, 3), [
+    "Cargo.toml",
+    "Cargo.lock",
+    "vendor/**",
+  ]);
   assert.ok(!floor.crate_durability.paths.includes("crates/**"));
 
   const mutations = [
@@ -381,6 +386,16 @@ test("claim graph owns the universal architecture and path-scoped durability flo
     const draft = structuredClone(graph);
     mutate(draft);
     assert.throws(() => validateReleaseClaimGraph(draft), expected);
+  }
+  for (const requiredPath of ["Cargo.toml", "Cargo.lock", "vendor/**"]) {
+    const draft = structuredClone(graph);
+    draft.workflow_policy.proof_floor.crate_durability.paths =
+      draft.workflow_policy.proof_floor.crate_durability.paths
+        .filter(triggerPath => triggerPath !== requiredPath);
+    assert.throws(
+      () => validateReleaseClaimGraph(draft),
+      /crate_durability\.paths must be exactly/u,
+    );
   }
 });
 
