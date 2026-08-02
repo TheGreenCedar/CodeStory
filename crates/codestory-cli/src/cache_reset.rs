@@ -13,6 +13,10 @@
 //! state in place. The reindex step that rebuilds what was quarantined is
 //! named in the output.
 //!
+//! It holds the same writer exclusions an indexing run holds, for the whole
+//! move, so it cannot move the cache out from under a live indexer or
+//! publisher.
+//!
 //! Every identity it moves and every identity it preserves comes from
 //! `codestory_contracts::owned_artifacts`, so a future owned artifact cannot
 //! be silently left behind — or silently destroyed — by this path.
@@ -29,10 +33,11 @@ use crate::args::{CacheResetCommand, CacheResetOutput};
 use crate::output::emit;
 use crate::runtime::RuntimeContext;
 
-/// Wait budget for the promotion exclusion the reset holds.
+/// Wait budget for each writer exclusion the reset holds.
 ///
-/// A legitimate holder is a whole publication or promotion pass, so this
-/// matches the publication budget every other waiter behind such a pass uses.
+/// A legitimate holder is a whole indexing, publication, or promotion pass, so
+/// this matches the publication budget every other waiter behind such a pass
+/// uses.
 const RESET_LOCK_WAIT: Duration = bounded_locks::PUBLICATION_LOCK_WAIT;
 
 pub(crate) fn run_cache_reset(cmd: CacheResetCommand) -> Result<()> {
@@ -130,32 +135,58 @@ fn apply_derived_reset(
     let cache_root = storage_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache root {}", cache_root.display()))?;
-    let lock_path = owned_artifacts::promotion_sibling_path(
-        storage_path,
-        owned_artifacts::PROMOTION_LOCK_SUFFIX,
-    );
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("open promotion lock {}", lock_path.display()))?;
-    bounded_locks::acquire_with_deadline(
-        &lock_file,
-        FileLockKind::Exclusive,
-        LockDeadline::after(RESET_LOCK_WAIT),
-        None,
-    )
-    .with_context(|| {
-        format!(
-            "acquire the promotion lock for the derived cache reset at {}",
-            lock_path.display()
-        )
-    })?;
-    let result = move_plan_into_quarantine(storage_path, plan, quarantine_dir);
-    let _ = bounded_locks::release(&lock_file);
-    result
+    let _exclusion = ResetExclusion::acquire(storage_path)?;
+    move_plan_into_quarantine(storage_path, plan, quarantine_dir)
+}
+
+/// Every writer exclusion the reset holds for the whole move.
+///
+/// The promotion lock alone is not enough: a publisher holds it only for the
+/// publish critical section, so an indexing run that is between publishes owns
+/// none of it while it keeps writing the cache this reset is moving. The
+/// index-writer lock is the one a run holds end to end, so the reset takes
+/// both, outermost first, in the order an indexing run takes them.
+struct ResetExclusion {
+    held: Vec<fs::File>,
+}
+
+impl ResetExclusion {
+    fn acquire(storage_path: &Path) -> Result<Self> {
+        let mut exclusion = Self { held: Vec::new() };
+        for lock_path in owned_artifacts::derived_reset_held_lock_paths(storage_path) {
+            let lock_file = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("open cache lock {}", lock_path.display()))?;
+            bounded_locks::acquire_with_deadline(
+                &lock_file,
+                FileLockKind::Exclusive,
+                LockDeadline::after(RESET_LOCK_WAIT),
+                None,
+            )
+            .with_context(|| {
+                format!(
+                    "acquire {} exclusively for the derived cache reset",
+                    lock_path.display()
+                )
+            })?;
+            // Push after the acquisition so a refusal releases only what this
+            // reset actually took.
+            exclusion.held.push(lock_file);
+        }
+        Ok(exclusion)
+    }
+}
+
+impl Drop for ResetExclusion {
+    fn drop(&mut self) {
+        for lock_file in self.held.iter().rev() {
+            let _ = bounded_locks::release(lock_file);
+        }
+    }
 }
 
 fn move_plan_into_quarantine(
@@ -251,13 +282,23 @@ fn render_cache_reset_markdown(output: &CacheResetOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::{OutputFormat, ProjectArgs};
+    use std::sync::mpsc;
     use tempfile::TempDir;
 
     struct CacheFixture {
         _root: TempDir,
         project_root: PathBuf,
+        cache_root: PathBuf,
+        /// Outside the cache root, so emitting the report cannot itself change
+        /// what the reset observes.
+        output_dir: PathBuf,
         storage_path: PathBuf,
         annotations: PathBuf,
+        /// Spelled here rather than derived from the registry so a registry
+        /// edit cannot move the expectation along with the behaviour.
+        index_writer_lock: PathBuf,
+        promotion_lock: PathBuf,
     }
 
     /// A cache root holding derived core state plus a user annotation sidecar.
@@ -265,8 +306,10 @@ mod tests {
         let root = TempDir::new().expect("fixture root");
         let project_root = root.path().join("project");
         let cache_root = root.path().join("cache");
+        let output_dir = root.path().join("reports");
         fs::create_dir_all(&project_root).expect("create project");
         fs::create_dir_all(&cache_root).expect("create cache root");
+        fs::create_dir_all(&output_dir).expect("create report directory");
         let storage_path = cache_root.join("codestory.db");
         fs::write(&storage_path, b"core database bytes").expect("write core database");
         fs::write(cache_root.join("codestory.db-wal"), b"wal").expect("write wal");
@@ -287,12 +330,189 @@ mod tests {
             b"annotation wal",
         )
         .expect("write annotation wal");
+        // Both writer locks exist in any cache an indexing run has touched, so
+        // the fixture carries them: whether the reset moves them decides
+        // whether a peer can take a fresh lock at the live path mid-reset.
+        let index_writer_lock = cache_root.join("codestory.index-writer.lock");
+        let promotion_lock = cache_root.join("codestory.db.promotion.lock");
+        fs::write(&index_writer_lock, b"").expect("write index writer lock");
+        fs::write(&promotion_lock, b"").expect("write promotion lock");
         CacheFixture {
             _root: root,
             project_root,
+            cache_root,
+            output_dir,
             storage_path,
             annotations,
+            index_writer_lock,
+            promotion_lock,
         }
+    }
+
+    /// The command as the CLI dispatches it, writing JSON to `output_file`.
+    fn boundary_command(
+        fixture: &CacheFixture,
+        confirm: bool,
+        output_file: &Path,
+    ) -> CacheResetCommand {
+        CacheResetCommand {
+            project: ProjectArgs {
+                project: fixture.project_root.clone(),
+                cache_dir: Some(fixture.cache_root.clone()),
+            },
+            derived_only: true,
+            confirm,
+            dry_run: !confirm,
+            format: OutputFormat::Json,
+            output_file: Some(output_file.to_path_buf()),
+        }
+    }
+
+    fn emitted_output(output_file: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(output_file).expect("read emitted output"))
+            .expect("parse emitted output")
+    }
+
+    fn open_peer_lock(path: &Path) -> fs::File {
+        fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .expect("open peer lock")
+    }
+
+    /// How long a peer keeps its lock while the command boundary runs.
+    ///
+    /// The whole move is a handful of renames, so a reset that is not excluded
+    /// finishes many times over inside this window. A reset that is excluded
+    /// cannot finish inside it at any speed, which is what makes the
+    /// observation one-sided rather than a race.
+    const PEER_HOLD: Duration = Duration::from_millis(500);
+
+    /// Drive `cache reset --confirm` at the command boundary while a peer owns
+    /// `lock_path` the way a live indexing run or publication owns it, and
+    /// report whether the derived cache was still in place when the peer let
+    /// go.
+    fn reset_under_peer_lock(
+        fixture: &CacheFixture,
+        lock_path: &Path,
+    ) -> (bool, serde_json::Value) {
+        let peer = open_peer_lock(lock_path);
+        assert!(
+            bounded_locks::try_acquire(&peer, FileLockKind::Exclusive).expect("peer lock attempt"),
+            "the peer must own {} before the reset starts",
+            lock_path.display()
+        );
+        let output_file = fixture.output_dir.join("reset.json");
+        let command = boundary_command(fixture, true, &output_file);
+        let (started, start_signal) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started
+                .send(())
+                .expect("signal that the reset thread began");
+            run_cache_reset(command)
+        });
+        start_signal.recv().expect("the reset thread must begin");
+        std::thread::sleep(PEER_HOLD);
+
+        let derived_still_live = fixture.storage_path.is_file();
+        bounded_locks::release(&peer).expect("release the peer lock");
+        drop(peer);
+        worker
+            .join()
+            .expect("join the reset thread")
+            .expect("the reset must succeed once the peer releases");
+        (derived_still_live, emitted_output(&output_file))
+    }
+
+    #[test]
+    fn the_command_boundary_resets_a_database_no_build_can_open() {
+        // The command exists for a cache this binary refuses to open, so the
+        // boundary itself — not just the layer under it — must reach the move
+        // without a store open. Bytes no SQLite build can open stand in for
+        // that cache: anything that opens the database on the way in turns the
+        // command into the failure it is supposed to recover from.
+        let _env_lock = crate::config::config_env_test_lock();
+        let fixture = seed_cache();
+        fs::write(&fixture.storage_path, b"not a sqlite database at all")
+            .expect("write unopenable core database");
+        let output_file = fixture.output_dir.join("reset.json");
+
+        run_cache_reset(boundary_command(&fixture, true, &output_file))
+            .expect("the command boundary must reach a cache it cannot open");
+
+        let output = emitted_output(&output_file);
+        assert_eq!(output["applied"], serde_json::Value::Bool(true));
+        assert!(
+            !fixture.storage_path.exists(),
+            "the derived cache must leave the live location"
+        );
+        let quarantine = PathBuf::from(
+            output["quarantine_dir"]
+                .as_str()
+                .expect("quarantine_dir is a string"),
+        );
+        assert_eq!(
+            fs::read(quarantine.join("codestory.db")).expect("quarantined core database"),
+            b"not a sqlite database at all",
+            "the reset must move the database untouched, not open or migrate it"
+        );
+        assert_eq!(
+            fs::read(&fixture.annotations).expect("annotation sidecar still readable"),
+            b"user bookmarks",
+            "user-authored annotations must survive the command boundary too"
+        );
+    }
+
+    #[test]
+    fn the_command_boundary_waits_out_an_indexing_run_that_owns_the_writer_lock() {
+        // The promotion lock is held only for the publish critical section, so
+        // it does not exclude an indexing run that is between publishes — and
+        // that run keeps writing the very cache this reset moves. The
+        // index-writer lock is the one a run holds end to end.
+        let _env_lock = crate::config::config_env_test_lock();
+        let fixture = seed_cache();
+
+        let (derived_still_live, output) =
+            reset_under_peer_lock(&fixture, &fixture.index_writer_lock);
+
+        assert!(
+            derived_still_live,
+            "the reset must not move the cache out from under an indexing run that owns the writer lock"
+        );
+        assert_eq!(output["applied"], serde_json::Value::Bool(true));
+        assert!(
+            !fixture.storage_path.exists(),
+            "the reset must complete once the indexing run releases"
+        );
+        assert!(
+            fixture.index_writer_lock.exists(),
+            "the writer lock must stay at the live path; quarantining it lets the next run take a fresh lock mid-reset"
+        );
+    }
+
+    #[test]
+    fn the_command_boundary_waits_out_a_publication_that_owns_the_promotion_lock() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let fixture = seed_cache();
+
+        let (derived_still_live, output) = reset_under_peer_lock(&fixture, &fixture.promotion_lock);
+
+        assert!(
+            derived_still_live,
+            "the reset must not move the cache out from under a publication that owns the promotion lock"
+        );
+        assert_eq!(output["applied"], serde_json::Value::Bool(true));
+        assert!(
+            !fixture.storage_path.exists(),
+            "the reset must complete once the publication releases"
+        );
+        assert!(
+            fixture.promotion_lock.exists(),
+            "the promotion lock must stay at the live path; quarantining it drops the exclusion a waiting publisher is behind"
+        );
     }
 
     #[test]
@@ -330,6 +550,13 @@ mod tests {
                 .exists(),
             "annotation SQLite siblings must survive too"
         );
+        for held in [&fixture.index_writer_lock, &fixture.promotion_lock] {
+            assert!(
+                held.exists(),
+                "{} is an exclusion the reset holds and must stay at the live path",
+                held.display()
+            );
+        }
         let quarantined = Path::new(&output.quarantine_dir);
         assert_eq!(
             fs::read(quarantined.join("codestory.db")).expect("quarantined core database"),

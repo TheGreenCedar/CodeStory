@@ -154,6 +154,11 @@ pub fn annotations_migration_backup_path(storage_path: &Path) -> PathBuf {
     cache_root_for(storage_path).join(ANNOTATIONS_MIGRATION_BACKUP_FILE)
 }
 
+/// The index-writer lock one storage file's indexing runs hold end to end.
+pub fn index_writer_lock_path(storage_path: &Path) -> PathBuf {
+    storage_path.with_extension(INDEX_WRITER_LOCK_EXTENSION)
+}
+
 /// Exact owned file identities beside one storage file: the database and its
 /// sidecars, the index-writer lock, promotion siblings, the rollback backup
 /// and its sidecars, the search directory locks, the local-refresh files, and
@@ -162,7 +167,7 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     let cache_root = cache_root_for(storage_path);
     let rollback_backup = storage_path.with_extension(ROLLBACK_BACKUP_EXTENSION);
     let mut files = sqlite_file_with_sidecars(storage_path);
-    files.push(storage_path.with_extension(INDEX_WRITER_LOCK_EXTENSION));
+    files.push(index_writer_lock_path(storage_path));
     files.extend(
         PROMOTION_SIBLING_SUFFIXES
             .iter()
@@ -203,19 +208,36 @@ pub fn derived_reset_quarantine_root(storage_path: &Path) -> PathBuf {
     cache_root_for(storage_path).join(DERIVED_RESET_QUARANTINE_DIR)
 }
 
+/// Exclusions the guided reset holds for the whole move, in acquisition order.
+///
+/// An indexing run holds the index-writer lock for its entire pass and takes
+/// the promotion lock inside it, so the reset must take them in the same order
+/// or the two paths can deadlock against each other. The promotion lock alone
+/// excludes only the publish critical section, which is a few milliseconds of
+/// a minutes-long index run — a reset that took only that lock would move the
+/// cache out from under a live indexer.
+pub fn derived_reset_held_lock_paths(storage_path: &Path) -> [PathBuf; 2] {
+    [
+        index_writer_lock_path(storage_path),
+        promotion_sibling_path(storage_path, PROMOTION_LOCK_SUFFIX),
+    ]
+}
+
 /// Derived file identities the guided reset quarantines.
 ///
-/// This is every file identity the storage file owns, minus two exclusions.
-/// The annotation sidecar family is user-owned state and is preserved in
-/// place. The promotion lock is the exclusion the reset itself holds while it
-/// runs, and an empty coordination file carries no derived state, so moving it
-/// would only drop the exclusion a concurrent publisher is waiting on.
+/// This is every file identity the storage file owns, minus two exclusion
+/// families. The annotation sidecar family is user-owned state and is
+/// preserved in place. The locks in [`derived_reset_held_lock_paths`] are the
+/// exclusions the reset itself holds while it runs, and an empty coordination
+/// file carries no derived state, so moving one would only drop the exclusion
+/// a concurrent publisher or indexer is waiting on — or let a new indexer take
+/// a fresh lock file at the old path and start writing mid-reset.
 pub fn derived_reset_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     let preserved = annotation_owned_file_identities(cache_root_for(storage_path));
-    let held_lock = promotion_sibling_path(storage_path, PROMOTION_LOCK_SUFFIX);
+    let held = derived_reset_held_lock_paths(storage_path);
     storage_owned_file_identities(storage_path)
         .into_iter()
-        .filter(|path| *path != held_lock && !preserved.contains(path))
+        .filter(|path| !held.contains(path) && !preserved.contains(path))
         .collect()
 }
 
@@ -312,15 +334,25 @@ mod tests {
                 annotation.display()
             );
         }
-        assert!(
-            !contains("/cache/custom-core.db.promotion.lock"),
-            "the reset holds the promotion lock; quarantining it would drop the exclusion"
+        assert_eq!(
+            derived_reset_held_lock_paths(storage),
+            [
+                PathBuf::from("/cache/custom-core.index-writer.lock"),
+                PathBuf::from("/cache/custom-core.db.promotion.lock"),
+            ],
+            "the reset must exclude an indexing run, not only a publish, and must take the two locks in the order an indexer takes them"
         );
+        for held in derived_reset_held_lock_paths(storage) {
+            assert!(
+                !derived.contains(&held),
+                "{} is the exclusion the reset holds; quarantining it would let a peer take a fresh lock at the live path mid-reset",
+                held.display()
+            );
+        }
         for required in [
             "/cache/custom-core.db",
             "/cache/custom-core.db-wal",
             "/cache/custom-core.db-shm",
-            "/cache/custom-core.index-writer.lock",
             "/cache/custom-core.db.promotion.prepared.json",
             "/cache/custom-core.db.promotion.committed.json",
             "/cache/custom-core.db.promotion.cleanup-blocked",

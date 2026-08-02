@@ -139,6 +139,11 @@ which is what makes it usable against a schema it cannot read.
 
 User-authored annotations live in a sidecar beside the cache and are preserved
 in place; the command reports exactly what it moved and what it preserved.
+The reset holds this project's index-writer and promotion locks for the whole
+move, so a concurrent indexing run or publication either finishes first or is
+refused with `cache_busy`; if neither releases within the wait budget the reset
+itself refuses and moves nothing.
+
 Retrieval generations are reclaimed separately by
 `codestory-cli retrieval inventory --project <repo> --apply` once the rebuild
 has published a new generation.
