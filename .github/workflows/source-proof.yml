@@ -767,6 +767,24 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
+      - name: Prove the Windows-native qualification harness contracts
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          python .github/scripts/check-packaged-agent-proof.py --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows-native qualification harness contracts failed with exit code $LASTEXITCODE"
+          }
+          $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started
+          if ($elapsed -lt 0) {
+            throw "Windows-native qualification harness timing was negative"
+          }
+          if ($elapsed -ge 90000) {
+            throw "Windows-native qualification harness contracts took ${elapsed} ms, past their 90000 ms budget: the qualification directory regression has to stay reproducible without rebuilding the package"
+          }
+          "- Windows-native qualification harness contracts: ${elapsed} ms" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
       - name: Install Rust stable
         shell: pwsh
         run: |
