@@ -64,6 +64,25 @@ pub fn phantom_sidecar_candidates_only(candidates: &[CandidateHit]) -> bool {
     !candidates.is_empty() && candidates.iter().all(is_phantom_sidecar_hit)
 }
 
+/// Identity two lane candidates must share before fusion may collapse them.
+///
+/// A resolved node id is the strongest identity a lane can offer, so two
+/// candidates that both carry one are the same evidence only when the ids
+/// match: the schema permits duplicate display names in one file, and
+/// overloads or repeated local names are distinct nodes at distinct lines.
+/// When at least one lane left the candidate unresolved there is no id to
+/// compare, so identity falls back to the definition site itself.
+pub fn fused_candidate_identity_matches(left: &CandidateHit, right: &CandidateHit) -> bool {
+    match (left.node_id.as_deref(), right.node_id.as_deref()) {
+        (Some(left_node_id), Some(right_node_id)) => left_node_id == right_node_id,
+        _ => {
+            left.file_path == right.file_path
+                && left.symbol_name == right.symbol_name
+                && left.start_line == right.start_line
+        }
+    }
+}
+
 impl CandidateHit {
     pub fn lexical_stub(file_path: impl Into<String>, score: f32) -> Self {
         Self {
@@ -109,5 +128,55 @@ impl CandidateHit {
         if !self.provenance.iter().any(|existing| existing == &label) {
             self.provenance.push(label);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overload(node_id: &str, start_line: u32) -> CandidateHit {
+        let mut hit = CandidateHit::with_source(
+            "src/search.rs",
+            Some("search".into()),
+            0.5,
+            CandidateSource::Lexical,
+        );
+        hit.node_id = Some(node_id.into());
+        hit.start_line = Some(start_line);
+        hit
+    }
+
+    #[test]
+    fn distinct_nodes_sharing_a_name_and_file_are_not_the_same_candidate() {
+        assert!(!fused_candidate_identity_matches(
+            &overload("11", 40),
+            &overload("12", 120)
+        ));
+    }
+
+    #[test]
+    fn same_node_id_matches_across_lanes_that_spell_the_symbol_differently() {
+        let mut lexical = overload("11", 40);
+        let mut dense = overload("11", 40);
+        dense.source = CandidateSource::Semantic;
+        dense.symbol_name = Some("core::search".into());
+        dense.start_line = None;
+        lexical.symbol_name = Some("search".into());
+
+        assert!(fused_candidate_identity_matches(&lexical, &dense));
+    }
+
+    #[test]
+    fn unresolved_candidates_fall_back_to_the_definition_site() {
+        let mut anchored = overload("11", 40);
+        anchored.node_id = None;
+        let mut same_site = anchored.clone();
+        same_site.source = CandidateSource::Scip;
+        let mut other_site = anchored.clone();
+        other_site.start_line = Some(120);
+
+        assert!(fused_candidate_identity_matches(&anchored, &same_site));
+        assert!(!fused_candidate_identity_matches(&anchored, &other_site));
     }
 }

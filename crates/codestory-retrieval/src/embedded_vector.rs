@@ -30,6 +30,14 @@ const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const VECTOR_NORM_TOLERANCE: f64 = 1.0e-3;
+/// Share of the lane's own best similarity a neighbour must reach to be
+/// reported as dense evidence.
+///
+/// The rule is stated against this query's own best hit rather than an
+/// absolute cosine, so it carries no corpus, repository, or model-scale
+/// assumption: a neighbour less than half as similar as the best vector the
+/// lane found is one the lane's own evidence argues against.
+const DENSE_ABSTENTION_RELATIVE_MARGIN: f32 = 0.5;
 type ScoredHit = (
     f32,
     String,
@@ -1396,6 +1404,7 @@ fn search_database(
         }
     }
     scored.sort_unstable_by(compare_scored_hits);
+    retain_dense_evidence(&mut scored);
     Ok(scored
         .into_iter()
         .map(
@@ -1420,6 +1429,25 @@ fn search_database(
             },
         )
         .collect())
+}
+
+/// Drop the neighbours this lane cannot claim are related, leaving the whole
+/// stage empty when none survive.
+///
+/// A bounded scan always fills its window: without this the top `limit`
+/// vectors are reported even at zero or negative cosine, so a query with no
+/// dense evidence still emits a full set of confident-looking anchors.
+/// Requires `scored` sorted by descending similarity.
+fn retain_dense_evidence(scored: &mut Vec<ScoredHit>) {
+    let Some(best) = scored.first().map(|hit| hit.0) else {
+        return;
+    };
+    if best <= 0.0 {
+        scored.clear();
+        return;
+    }
+    let floor = best * DENSE_ABSTENTION_RELATIVE_MARGIN;
+    scored.retain(|hit| hit.0 > 0.0 && hit.0 >= floor);
 }
 
 fn compare_scored_hits(left: &ScoredHit, right: &ScoredHit) -> Ordering {
@@ -1793,6 +1821,65 @@ mod tests {
                 2,
             )
             .ready
+        );
+    }
+
+    #[test]
+    fn dense_search_abstains_instead_of_filling_its_window_with_unrelated_vectors() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let points = [
+            point("related", vec![1.0, 0.0]),
+            point("near", vec![0.707_106_77, 0.707_106_77]),
+            point("distant", vec![0.258_819_04, 0.965_925_8]),
+            point("opposed", vec![-1.0, 0.0]),
+        ];
+        EmbeddedVectorIndex::build_with_points(
+            &layout,
+            "codestory_abstention_deadbeefdeadbeef",
+            "abstention-deadbeefdeadbeef",
+            "input",
+            "backend",
+            2,
+            |visit| {
+                for point in points {
+                    visit(point)?;
+                }
+                Ok(())
+            },
+        )
+        .expect("build");
+        let path = index_path(&layout, "codestory_abstention_deadbeefdeadbeef");
+
+        let hits = search_database(
+            &path,
+            "abstention-deadbeefdeadbeef",
+            "input",
+            &[1.0, 0.0],
+            4,
+            || false,
+        )
+        .expect("search");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.node_id.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["related", "near"],
+            "the window must not be padded with vectors the lane cannot claim"
+        );
+
+        let abstained = search_database(
+            &path,
+            "abstention-deadbeefdeadbeef",
+            "input",
+            &[0.0, -1.0],
+            4,
+            || false,
+        )
+        .expect("search");
+        assert!(
+            abstained.is_empty(),
+            "no positively related vector must yield no dense evidence: {abstained:?}"
         );
     }
 
