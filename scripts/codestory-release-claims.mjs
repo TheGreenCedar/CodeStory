@@ -1000,6 +1000,41 @@ function validateWindowsPackageGraph(value) {
     ],
     "workflow_policy.windows_package_graph.timing_phases",
   );
+  validateWindowsLinkTiming(graph.link_timing);
+}
+
+// `msvc_link` was reported from a substring count that the Cargo progress line
+// for the crate named `time` satisfied. The claim graph now names the selector,
+// the receipt it writes, and the typed states it may report, so a package can
+// only claim a linker duration that came from an explicit link boundary.
+function validateWindowsLinkTiming(value) {
+  const timing = object(value, "workflow_policy.windows_package_graph.link_timing");
+  if (
+    timing.phase !== "msvc_link"
+    || timing.selector !== ".github/scripts/windows-link-timing.mjs"
+    || timing.record_schema !== "codestory.windows-link-timing/v1"
+    || timing.record_file !== "windows-link-timing.json"
+    || timing.evidence !== "explicit_link_time_boundary"
+  ) {
+    fail("workflow_policy.windows_package_graph.link_timing must bind the explicit linker boundary selector");
+  }
+  if (timing.substring_match !== false) {
+    fail("workflow_policy.windows_package_graph.link_timing.substring_match must be false");
+  }
+  if (timing.observational !== true) {
+    fail("workflow_policy.windows_package_graph.link_timing.observational must be true: missing timing cannot invalidate a package");
+  }
+  exactStringList(
+    timing.unavailable_reasons,
+    [
+      "incoherent-linker-report",
+      "link-exceeds-build-interval",
+      "linker-log-empty",
+      "linker-log-missing",
+      "no-explicit-linker-report",
+    ],
+    "workflow_policy.windows_package_graph.link_timing.unavailable_reasons",
+  );
 }
 
 function validateCandidateArchiveCache(value) {

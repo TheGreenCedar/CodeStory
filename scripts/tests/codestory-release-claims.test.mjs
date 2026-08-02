@@ -244,6 +244,22 @@ test("claim graph freezes one exact Windows release graph and protected content-
       "packaging",
       "artifact_transfer",
     ],
+    link_timing: {
+      phase: "msvc_link",
+      selector: ".github/scripts/windows-link-timing.mjs",
+      record_schema: "codestory.windows-link-timing/v1",
+      record_file: "windows-link-timing.json",
+      evidence: "explicit_link_time_boundary",
+      substring_match: false,
+      observational: true,
+      unavailable_reasons: [
+        "incoherent-linker-report",
+        "link-exceeds-build-interval",
+        "linker-log-empty",
+        "linker-log-missing",
+        "no-explicit-linker-report",
+      ],
+    },
   });
   assert.deepEqual(graph.workflow_policy.candidate_archive_cache.key_fields, [
     "source.commit",
@@ -296,6 +312,30 @@ test("claim graph freezes one exact Windows release graph and protected content-
     [draft => {
       draft.workflow_policy.windows_package_graph.production_feature_probes.pop();
     }, /production_feature_probes must be exactly/u],
+    [draft => {
+      delete draft.workflow_policy.windows_package_graph.link_timing;
+    }, /link_timing must be an object/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.substring_match = true;
+    }, /link_timing\.substring_match must be false/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.evidence = "build_log_substring";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.selector =
+        ".github/scripts/cargo-cache-contract.mjs";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.record_schema =
+        "codestory.windows-link-timing/v2";
+    }, /link_timing must bind the explicit linker boundary selector/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.observational = false;
+    }, /missing timing cannot invalidate a package/u],
+    [draft => {
+      draft.workflow_policy.windows_package_graph.link_timing.unavailable_reasons
+        = ["no-explicit-linker-report"];
+    }, /link_timing\.unavailable_reasons must be exactly/u],
     [draft => {
       draft.workflow_policy.candidate_archive_cache.key_fields.shift();
     }, /key_fields must be exactly/u],
