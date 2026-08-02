@@ -12,7 +12,6 @@ use crate::{
     workspace_path_lexical_identity,
 };
 use fs_at::{OpenOptions as AtOpenOptions, OpenOptionsWriteMode};
-use fs4::fs_std::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -2508,7 +2507,7 @@ fn acquire_transaction_lock(parent: &File) -> io::Result<File> {
     }
     let lock = options.open_at(parent, TRANSACTION_LOCK_NAME)?;
     validate_private_regular_file(&lock, "hook transaction lock")?;
-    if !lock.try_lock_exclusive()? {
+    if !crate::locking::try_lock_exclusive_outliving_spawn_ghosts(&lock)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "another hook transaction is active",

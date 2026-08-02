@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod locking;
 pub mod owned_deletion;
 pub mod paths;
 mod repo_metadata;
