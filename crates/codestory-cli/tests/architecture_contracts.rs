@@ -78,6 +78,12 @@ fn read_source_tree(dir: &str) -> String {
         .join("\n")
 }
 
+fn production_source_prefix(source: &str) -> &str {
+    source
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(source, |(production, _)| production)
+}
+
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source.find(start).expect("start marker exists");
     let tail = &source[start_index..];
@@ -284,6 +290,7 @@ fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
+    let runtime_source = read_source_tree("crates/codestory-runtime/src");
     let cli_app = read_source_tree("crates/codestory-cli/src/app");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
@@ -318,6 +325,13 @@ fn runtime_exposes_read_only_browser_service_boundary() {
     assert!(
         !browser.contains("run_local_agent"),
         "read-only browser context retrieval should not carry local-agent execution controls"
+    );
+    assert!(
+        !repo_root()
+            .join("crates/codestory-runtime/src/system_actions.rs")
+            .exists()
+            && !runtime_source.contains("CODESTORY_IDE_COMMAND"),
+        "the unreachable system-actions shell surface must stay deleted"
     );
 
     for forbidden in [
@@ -364,6 +378,8 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
     let stdio_tool_catalog = source_between(&stdio_catalog, "static TOOLS", "static RESOURCES");
+    let controller_files = read("crates/codestory-runtime/src/controller_files.rs");
+    let services = read("crates/codestory-runtime/src/services.rs");
 
     let expected_tools = [
         ("search", ".search_results(", "pub fn search_results"),
@@ -427,6 +443,39 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
             "stdio read-only tool catalog should not expose write/system tool prefix {forbidden}"
         );
     }
+    for forbidden in ["open_definition", "open_containing_folder"] {
+        assert!(
+            !controller_files.contains(forbidden) && !services.contains(forbidden),
+            "dormant runtime system action must stay absent: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn production_source_never_spawns_git() {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join("crates"), &mut files);
+    let mut violations = Vec::new();
+    for path in files {
+        if !path
+            .components()
+            .any(|component| component.as_os_str() == "src")
+        {
+            continue;
+        }
+        if path == repo_root().join("crates/codestory-runtime/src/test_support.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read Rust source");
+        if production_source_prefix(&source).contains("Command::new(\"git\")") {
+            violations.push(path.display().to_string());
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "production Git reads must stay behind the non-executing workspace reader:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]

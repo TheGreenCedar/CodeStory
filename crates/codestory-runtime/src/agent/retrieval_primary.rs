@@ -1959,6 +1959,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::agent::packet_evidence::PacketEvidenceTier;
+    use crate::test_support::{git, git_available};
     use codestory_contracts::api::{
         NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
     };
@@ -3472,11 +3473,7 @@ mod tests {
     }
 
     fn git_project() -> Option<tempfile::TempDir> {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !git_available() {
             return None;
         }
         let project = tempfile::tempdir().expect("project");
@@ -3499,21 +3496,6 @@ mod tests {
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "init"]);
         Some(project)
-    }
-
-    fn git(project: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     #[test]

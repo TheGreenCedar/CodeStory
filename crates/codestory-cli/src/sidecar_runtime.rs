@@ -100,6 +100,19 @@ pub(crate) fn for_project_auto_with_process_defaults(
     SidecarRuntimeConfig::for_project_auto_with_process_defaults(project_root, defaults, overrides)
 }
 
+pub(crate) fn for_project_auto_with_process_defaults_and_identity(
+    project_identity: &codestory_workspace::ProjectIdentityV3,
+    defaults: &SidecarProcessDefaults,
+    overrides: &SidecarRuntimeOverrides,
+) -> SidecarRuntimeConfig {
+    prepare_cache_access();
+    SidecarRuntimeConfig::for_project_auto_with_process_defaults_and_identity(
+        project_identity,
+        defaults,
+        overrides,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_with_cache_access<T: Send + 'static>(
     task: impl FnOnce() -> T + Send + 'static,

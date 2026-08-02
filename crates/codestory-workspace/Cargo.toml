@@ -3,11 +3,15 @@ name = "codestory-workspace"
 version = "0.16.3"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
 fs_at = { workspace = true }
 glob = { workspace = true }
+gix = { workspace = true }
 ignore = { workspace = true }
 remove_dir_all = { workspace = true }
 serde = { workspace = true }

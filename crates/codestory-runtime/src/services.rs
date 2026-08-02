@@ -6,11 +6,10 @@ use codestory_contracts::api::{
     GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessDto,
     IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
     IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest,
-    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
-    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenProjectRequest,
+    ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
+    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
+    SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto,
 };
 
 use crate::AppController;
@@ -1766,13 +1765,6 @@ impl GroundingService {
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
         self.controller.list_children_symbols(req)
     }
-
-    pub fn open_definition(
-        &self,
-        req: OpenDefinitionRequest,
-    ) -> Result<SystemActionResponse, ApiError> {
-        self.controller.open_definition(req)
-    }
 }
 
 #[derive(Clone)]
@@ -1986,18 +1978,8 @@ mod activation_tests {
     use crate::search_publication::{
         read_search_generation_completion, search_index_path_for_publication,
     };
+    use crate::test_support::git;
     use std::fs;
-    use std::process::Command;
-
-    fn git(project: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .status()
-            .expect("run git fixture command");
-        assert!(status.success(), "git fixture command failed: {args:?}");
-    }
 
     fn initialize_identifiable_git_project(project: &Path) {
         git(project, &["init", "-q"]);

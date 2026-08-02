@@ -18,7 +18,6 @@ use codestory_contracts::api::{
     ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope,
     TrailDirection, TrailMode,
 };
-use codestory_workspace::project_identity_v3;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -2963,7 +2962,11 @@ fn handle_stdio_search(
         })
         .map(|result| {
             serde_json::json!({
-                "result": enrich_stdio_search_result(result, &runtime.project_root)
+                "result": enrich_stdio_search_result(
+                    result,
+                    &runtime.context_key.project_id,
+                    &runtime.project_root,
+                )
             })
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
@@ -5380,6 +5383,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
 
 fn enrich_stdio_search_result(
     result: codestory_contracts::api::SearchResultsDto,
+    project_id: &str,
     project_root: &Path,
 ) -> serde_json::Value {
     let continuation =
@@ -5387,7 +5391,7 @@ fn enrich_stdio_search_result(
             .retrieval_publication
             .as_ref()
             .map(|publication| StdioContinuationBinding {
-                project_id: project_identity_v3(project_root).project_id,
+                project_id: project_id.to_string(),
                 core_generation_id: publication.core_generation_id.clone(),
                 retrieval_generation: Some(publication.retrieval_generation.clone()),
             });
@@ -5563,7 +5567,7 @@ fn stdio_continuation_binding(runtime: &RuntimeContext) -> Option<StdioContinuat
         })
         .map(|retrieval| retrieval.retrieval_generation);
     Some(StdioContinuationBinding {
-        project_id: project_identity_v3(&runtime.project_root).project_id,
+        project_id: runtime.context_key.project_id.clone(),
         core_generation_id: publication.core_publication.generation_id,
         retrieval_generation,
     })
@@ -6424,7 +6428,7 @@ version = "0.11.20"
 
         let response = stdio_tool_call_success(
             "search",
-            enrich_stdio_search_result(result, Path::new("/tmp/project")),
+            enrich_stdio_search_result(result, "project-test", Path::new("/tmp/project")),
         );
         let hit = &response["structuredContent"]["hits"][0];
 
@@ -6481,7 +6485,12 @@ version = "0.11.20"
             repo_text_hits: Vec::new(),
             hits: Vec::new(),
         };
-        let compacted = enrich_stdio_search_result(dto, std::path::Path::new("/repo"));
+        let project_root = std::path::Path::new("/repo");
+        let compacted =
+            codestory_workspace::with_repository_metadata_observation_limit_for_test(1, || {
+                let identity = codestory_workspace::project_identity_v3(project_root);
+                enrich_stdio_search_result(dto, &identity.project_id, project_root)
+            });
         let undeclared = compacted
             .as_object()
             .expect("compacted search result is an object")
