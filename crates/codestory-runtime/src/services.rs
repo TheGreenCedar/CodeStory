@@ -1154,7 +1154,7 @@ impl ActivationService {
     }
 
     /// Cancel the in-flight activation and wait for it to reach a quiescent
-    /// boundary. Past [`ACTIVATION_QUIESCENCE_BUDGET`] the worker is never
+    /// boundary. Past the activation quiescence budget the worker is never
     /// detached: it may still hold a publication or store lock, so the process
     /// fail-stops with the recorded reason instead of continuing.
     pub fn cancel_and_wait(&self) -> ActivationQuiescence {
