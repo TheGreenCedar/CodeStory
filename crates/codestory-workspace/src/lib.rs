@@ -163,6 +163,7 @@ pub struct WorkspaceManifest {
     members: Vec<PathBuf>,
     discovery_excluded_files: Vec<PathBuf>,
     discovery_excluded_directory_roots: Vec<PathBuf>,
+    discovery_owned_storage_paths: Vec<PathBuf>,
     #[cfg(test)]
     discovery_exclusion_observation_count: Cell<usize>,
 }
@@ -178,6 +179,100 @@ fn default_source_exclude_patterns() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+fn path_with_display_suffix(path: &Path, suffix: &str) -> PathBuf {
+    // Match the sibling naming used by the storage promotion owner.
+    PathBuf::from(format!("{}{}", path.display(), suffix))
+}
+
+fn path_with_native_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(suffix);
+    PathBuf::from(suffixed)
+}
+
+fn storage_parent_for_observation(storage_path: &Path) -> &Path {
+    storage_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
+    let rollback_backup = storage_path.with_extension("sqlite.backup");
+    let legacy_search = legacy_search_directory_for_storage(storage_path);
+    let search_generations = search_generation_directory_for_storage(storage_path);
+    vec![
+        storage_path.to_path_buf(),
+        path_with_native_suffix(storage_path, "-wal"),
+        path_with_native_suffix(storage_path, "-shm"),
+        path_with_native_suffix(storage_path, "-journal"),
+        storage_path.with_extension("index-writer.lock"),
+        path_with_display_suffix(storage_path, ".promotion.lock"),
+        path_with_display_suffix(storage_path, ".promotion.prepared.json"),
+        path_with_display_suffix(storage_path, ".promotion.committed.json"),
+        path_with_display_suffix(storage_path, ".promotion.cleanup-blocked"),
+        rollback_backup.clone(),
+        path_with_native_suffix(&rollback_backup, "-wal"),
+        path_with_native_suffix(&rollback_backup, "-shm"),
+        path_with_native_suffix(&rollback_backup, "-journal"),
+        path_with_native_suffix(&legacy_search, ".lock"),
+        path_with_native_suffix(&search_generations, ".lock"),
+    ]
+}
+
+fn storage_owned_staged_discovery_files(storage_path: &Path) -> io::Result<Vec<PathBuf>> {
+    let parent = storage_parent_for_observation(storage_path);
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    let extension = storage_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlite");
+    let prefix = format!("{stem}.staged.");
+    let suffixes = [
+        format!(".{extension}"),
+        format!(".{extension}-wal"),
+        format!(".{extension}-shm"),
+        format!(".{extension}-journal"),
+    ];
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut owned = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(candidate) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(unique) = suffixes
+            .iter()
+            .find_map(|suffix| candidate.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        let mut unique_parts = unique.split('-');
+        if unique_parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            && unique_parts.next().is_some_and(|part| {
+                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && unique_parts.next().is_none()
+        {
+            owned.push(entry.path());
+        }
+    }
+    owned.sort();
+    Ok(owned)
 }
 
 /// Multi-member workspace manifest.
@@ -299,6 +394,7 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
         }
@@ -316,6 +412,7 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
         })
@@ -346,6 +443,7 @@ impl WorkspaceManifest {
             members: Vec::new(),
             discovery_excluded_files: Vec::new(),
             discovery_excluded_directory_roots: Vec::new(),
+            discovery_owned_storage_paths: Vec::new(),
             #[cfg(test)]
             discovery_exclusion_observation_count: Cell::new(0),
         }
@@ -397,11 +495,10 @@ impl WorkspaceManifest {
         storage_path: &Path,
     ) -> Result<Self> {
         let mut manifest = Self::open(root_path)?;
-        manifest.exclude_discovery_files([
-            storage_path.to_path_buf(),
-            storage_path.with_extension("db-wal"),
-            storage_path.with_extension("db-shm"),
-        ]);
+        manifest.exclude_discovery_files(storage_owned_discovery_files(storage_path));
+        manifest
+            .discovery_owned_storage_paths
+            .push(storage_path.to_path_buf());
         manifest.exclude_discovery_directory_roots([
             legacy_search_directory_for_storage(storage_path),
             search_generation_directory_for_storage(storage_path),
@@ -1496,7 +1593,16 @@ fn observe_discovery_exclusions(
     manifest.discovery_exclusion_observation_count.set(0);
 
     let mut observed = ObservedDiscoveryExclusions::default();
-    for path in &manifest.discovery_excluded_files {
+    let mut excluded_files = manifest.discovery_excluded_files.clone();
+    for storage_path in &manifest.discovery_owned_storage_paths {
+        excluded_files.extend(storage_owned_staged_discovery_files(storage_path).map_err(
+            |error| DiscoveryExclusionObservationError {
+                path: storage_parent_for_observation(storage_path).to_path_buf(),
+                error,
+            },
+        )?);
+    }
+    for path in &excluded_files {
         #[cfg(test)]
         manifest
             .discovery_exclusion_observation_count
@@ -2908,7 +3014,85 @@ mod tests {
         let files = manifest.source_files()?;
 
         assert_eq!(files.len(), 256);
-        assert_eq!(manifest.discovery_exclusion_observation_count(), 5);
+        assert_eq!(
+            manifest.discovery_exclusion_observation_count(),
+            storage_owned_discovery_files(&storage_path).len() + 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_owned_artifacts_stay_excluded_while_hidden_user_sources_remain_visible() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let storage_path = root.join(".cache/custom-core.db");
+        let hidden_source = root.join(".github/workflows/ci.yml");
+        fs::create_dir_all(storage_path.parent().expect("storage parent"))?;
+        fs::create_dir_all(hidden_source.parent().expect("hidden source parent"))?;
+        fs::write(&hidden_source, "name: CI\non: push\njobs: {}\n")?;
+
+        let owned_files = storage_owned_discovery_files(&storage_path);
+        for path in &owned_files {
+            fs::write(path, b"codestory-owned\n")?;
+        }
+        let staged_files = [
+            root.join(".cache/custom-core.staged.123-456.db"),
+            root.join(".cache/custom-core.staged.123-456.db-wal"),
+            root.join(".cache/custom-core.staged.123-456.db-shm"),
+            root.join(".cache/custom-core.staged.123-456.db-journal"),
+        ];
+        for path in &staged_files {
+            fs::write(path, b"codestory-owned stage\n")?;
+        }
+        let staged_near_miss = root.join(".cache/custom-core.staged.notes.db");
+        fs::write(&staged_near_miss, b"user-owned\n")?;
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&hidden_source));
+        assert!(inventory.files.contains(&staged_near_miss));
+        assert!(
+            owned_files
+                .iter()
+                .all(|owned| !inventory.files.contains(owned))
+        );
+        assert!(
+            staged_files
+                .iter()
+                .all(|owned| !inventory.files.contains(owned))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bare_storage_path_observes_staged_siblings_from_current_directory() {
+        assert_eq!(
+            storage_parent_for_observation(Path::new("codestory.db")),
+            Path::new(".")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_owned_sqlite_sidecars_preserve_non_utf8_path_bytes() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let storage_path = root.join(std::ffi::OsString::from_vec(b"core-\xff.db".to_vec()));
+        let native_wal = path_with_native_suffix(&storage_path, "-wal");
+        let lossy_user_file = root.join("core-�.db-wal");
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let exclusions =
+            observe_discovery_exclusions(&manifest).expect("observe storage-owned exclusions");
+
+        assert!(exclusions.file_is_excluded(&native_wal)?);
+        assert!(!exclusions.file_is_excluded(&lossy_user_file)?);
         Ok(())
     }
 
