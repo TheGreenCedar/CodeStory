@@ -220,6 +220,7 @@ fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
     let rollback_backup = storage_path.with_extension("sqlite.backup");
     let legacy_search = legacy_search_directory_for_storage(storage_path);
     let search_generations = search_generation_directory_for_storage(storage_path);
+    let cache_root = storage_parent_for_observation(storage_path);
     vec![
         storage_path.to_path_buf(),
         path_with_native_suffix(storage_path, "-wal"),
@@ -236,6 +237,15 @@ fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
         path_with_native_suffix(&rollback_backup, "-journal"),
         path_with_native_suffix(&legacy_search, ".lock"),
         path_with_native_suffix(&search_generations, ".lock"),
+        // The CLI serializes local refresh in the cache root that holds the
+        // storage file; its status, lock, and persistent guard files are
+        // CodeStory-owned state, and the status file is rewritten on a
+        // heartbeat while a refresh runs. Names mirror
+        // crates/codestory-cli/src/local_refresh_status.rs until one shared
+        // owned-artifact registry replaces this enumeration.
+        cache_root.join("local-refresh-status.json"),
+        cache_root.join("local-refresh.lock"),
+        cache_root.join("local-refresh-state.guard"),
     ]
 }
 
