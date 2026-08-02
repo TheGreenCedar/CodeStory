@@ -1,10 +1,10 @@
 pub(crate) use crate::search::engine::SearchEngine;
 pub use crate::search::engine::{
     EmbeddingProfileContract, EmbeddingRuntimeAvailability, HybridSearchConfig, HybridSearchHit,
-    LlmSearchDoc, STORED_VECTOR_ENCODING_ENV, embedding_profile_contract_from_config,
-    embedding_profile_contract_from_env, embedding_runtime_availability_from_config,
-    embedding_runtime_availability_from_env,
+    LlmSearchDoc, embedding_profile_contract_from_config, embedding_profile_contract_from_env,
+    embedding_runtime_availability_from_config, embedding_runtime_availability_from_env,
 };
+pub use codestory_contracts::config_registry::STORED_VECTOR_ENCODING_ENV;
 
 pub mod embedding {
     pub use crate::search::engine::EmbeddingRuntime;
@@ -19,7 +19,7 @@ pub mod lexical {
 }
 
 pub mod model_config {
-    pub use crate::search::engine::STORED_VECTOR_ENCODING_ENV;
+    pub use codestory_contracts::config_registry::STORED_VECTOR_ENCODING_ENV;
 }
 
 pub mod semantic {

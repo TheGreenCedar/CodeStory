@@ -95,23 +95,23 @@ pub(in crate::app) fn build_doctor_output(
 
     // Reported settings are observed through the registry so a secret-marked
     // value can never reach a doctor line, whatever this list grows to hold.
-    let environment = [
-        config_registry::EMBED_ALLOW_CPU_ENV,
-        config_registry::STORED_VECTOR_ENCODING_ENV,
-        config_registry::HYBRID_RETRIEVAL_ENABLED_ENV,
-        config_registry::SEMANTIC_DOC_ALIAS_MODE_ENV,
-    ]
-    .into_iter()
-    .map(|name| match config_registry::observe_env_setting(name) {
-        ObservedSetting::Set(value) => {
-            doctor_check(name, "ok", doctor_env_check_message(name, &value))
-        }
-        ObservedSetting::SetSecret => doctor_check(name, "ok", "set; value withheld".to_string()),
-        ObservedSetting::Unset => {
-            doctor_check(name, "info", "not set; using runtime defaults".to_string())
-        }
-    })
-    .collect::<Vec<_>>();
+    // The list itself lives in the registry too: naming these identities here
+    // would make doctor a second reader of four settings other modules own.
+    let environment = config_registry::REPORTED_ENV_SETTINGS
+        .iter()
+        .copied()
+        .map(|name| match config_registry::observe_env_setting(name) {
+            ObservedSetting::Set(value) => {
+                doctor_check(name, "ok", doctor_env_check_message(name, &value))
+            }
+            ObservedSetting::SetSecret => {
+                doctor_check(name, "ok", "set; value withheld".to_string())
+            }
+            ObservedSetting::Unset => {
+                doctor_check(name, "info", "not set; using runtime defaults".to_string())
+            }
+        })
+        .collect::<Vec<_>>();
 
     DoctorOutput {
         project: project.clone(),

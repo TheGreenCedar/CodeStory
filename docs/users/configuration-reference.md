@@ -31,7 +31,11 @@ CodeStory reads configuration from two places: `.codestory.toml` files and the p
 
 Warnings and errors name unknown keys. They never repeat a configured value, so a mistyped credential key cannot reach a log line.
 
-## Supported environment variables
+## Environment variables
+
+The owner column names the one source file that reads a variable. A build check rejects any other production file that reads it, so a setting has one meaning: no second module can clamp, default, or reject a value the owner accepted.
+
+### Supported environment variables
 
 Operator-facing settings. Environment values win over `.codestory.toml`.
 
@@ -63,7 +67,7 @@ Operator-facing settings. Environment values win over `.codestory.toml`.
 | `CODESTORY_SUMMARY_MODEL` | text | `crates/codestory-retrieval/src/config.rs` | Model name sent to the symbol summary endpoint. |
 | `CODESTORY_SUMMARY_TIMEOUT_SECS` | integer | `crates/codestory-retrieval/src/config.rs` | Seconds a symbol summary request may take, clamped to 1-300. |
 
-## Host-provided environment variables
+### Host-provided environment variables
 
 The plugin launcher and installed hosts set these. Setting them by hand misreports provisioning provenance.
 
@@ -95,7 +99,7 @@ The plugin launcher and installed hosts set these. Setting them by hand misrepor
 | `CODESTORY_PLUGIN_RUNTIME_CWD` | path | `crates/codestory-cli/src/stdio_transport.rs` | Working directory the runtime binary should adopt. |
 | `CODESTORY_PLUGIN_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Version of the installed plugin package. |
 
-## Diagnostic environment variables
+### Diagnostic environment variables
 
 Rollout and diagnostic switches. They are not product configuration and may change or disappear without a compatibility window.
 
@@ -125,7 +129,7 @@ Rollout and diagnostic switches. They are not product configuration and may chan
 | `CODESTORY_RETRIEVAL_SHADOW` | boolean | `crates/codestory-runtime/src/agent/retrieval_primary.rs` | Runs published retrieval beside the incumbent path for comparison. |
 | `CODESTORY_SYMBOL_FULL_TEXT_INDEX` | boolean | `crates/codestory-runtime/src/search/engine.rs` | Builds the symbol full-text index (default on). |
 
-## Test-harness environment variables
+### Test-harness environment variables
 
 Only the test suites set these. They drive failure shapes that must never occur in a product run.
 

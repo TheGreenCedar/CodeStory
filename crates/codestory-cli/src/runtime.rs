@@ -536,16 +536,18 @@ pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value {
     let active_cli_version = env!("CARGO_PKG_VERSION");
-    let plugin_cli_version = publication_env_nonempty(config_registry::PLUGIN_CLI_VERSION_ENV);
-    let plugin_version = publication_env_nonempty(config_registry::PLUGIN_VERSION_ENV);
-    let cli_source = publication_env_nonempty(config_registry::PLUGIN_CLI_SOURCE_ENV)
+    // The plugin identities are declared to stdio_transport.rs, which reads
+    // them; this stamp consumes that value rather than reading them again.
+    let host = crate::stdio_transport::host_provisioning_identity();
+    let cli_source = host
+        .cli_source
         .unwrap_or_else(|| "direct_cli_launch".to_string());
     let override_configured = publication_env_nonempty(config_registry::CLI_ENV).is_some()
         || cli_source == "local_dev_override";
     codestory_publication_contract_runtime_meta_from(
         active_cli_version,
-        plugin_version,
-        plugin_cli_version,
+        host.plugin_version,
+        host.plugin_cli_version,
         cli_source,
         override_configured,
     )

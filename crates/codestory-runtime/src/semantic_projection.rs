@@ -369,8 +369,6 @@ pub(super) const SEMANTIC_NODE_STREAM_BATCH_SIZE: usize = 4_096;
 pub(super) const SEMANTIC_EDGE_STREAM_BATCH_SIZE: usize = 4_096;
 pub(super) const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 #[cfg(test)]
-pub(super) const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
-#[cfg(test)]
 pub(super) use codestory_contracts::config_registry::LLM_DOC_EMBED_BATCH_SIZE_ENV;
 #[cfg(test)]
 pub(super) use codestory_contracts::config_registry::SEMANTIC_DOC_ALIAS_MODE_ENV;
@@ -384,8 +382,6 @@ pub(super) const SEMANTIC_DOC_DEFAULT_MAX_TOKENS: usize = 128;
 pub(super) use codestory_contracts::config_registry::SEMANTIC_STREAM_PENDING_DOCS_ENV;
 #[cfg(test)]
 pub(super) use codestory_contracts::config_registry::SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV;
-#[cfg(test)]
-pub(super) const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
 pub(super) const SEMANTIC_POLICY_VERSION: &str = codestory_retrieval::SEMANTIC_POLICY_VERSION;
 pub(super) const LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION: u32 = 29;
 pub(super) const LEGACY_OVERSIZED_SOURCE_POLICY_VERSION: &str = "oversized-source-v1";
@@ -556,9 +552,23 @@ pub(super) fn semantic_doc_stats_match_contract(
         && stats.semantic_policy_version.as_deref() == Some(SEMANTIC_POLICY_VERSION)
 }
 
+/// The retrieval-owned semantic settings for this process.
+///
+/// Every `*_from_env` accessor below goes through here. The settings are
+/// declared to `codestory-retrieval/src/config.rs`, which reads and clamps
+/// them; the runtime interprets the resulting *values*, never the variables. A
+/// second parse here is how a clamp drifts: this file used to reject
+/// `CODESTORY_SEMANTIC_DOC_MAX_TOKENS=0` back to the default while the owner
+/// clamped it to the floor of 16, so the same environment described two
+/// different token budgets depending on which code asked.
+#[cfg(test)]
+fn retrieval_settings() -> codestory_retrieval::RetrievalRuntimeConfig {
+    codestory_retrieval::retrieval_runtime_config_from_process_env()
+}
+
 #[cfg(test)]
 pub(super) fn semantic_doc_scope_from_env() -> SemanticDocScope {
-    semantic_doc_scope_from_value(&std::env::var(SEMANTIC_DOC_SCOPE_ENV).unwrap_or_default())
+    semantic_doc_scope_from_value(&retrieval_settings().semantic_doc_scope)
 }
 
 pub(super) fn semantic_doc_scope_from_value(value: &str) -> SemanticDocScope {
@@ -570,9 +580,7 @@ pub(super) fn semantic_doc_scope_from_value(value: &str) -> SemanticDocScope {
 
 #[cfg(test)]
 pub(super) fn semantic_doc_alias_mode_from_env() -> SemanticDocAliasMode {
-    semantic_doc_alias_mode_from_value(
-        &std::env::var(SEMANTIC_DOC_ALIAS_MODE_ENV).unwrap_or_default(),
-    )
+    semantic_doc_alias_mode_from_value(&retrieval_settings().semantic_doc_alias_mode)
 }
 
 pub(super) fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAliasMode {
@@ -589,33 +597,17 @@ pub(super) fn semantic_doc_alias_mode_from_value(value: &str) -> SemanticDocAlia
 
 #[cfg(test)]
 pub(super) fn semantic_doc_max_tokens_from_env() -> usize {
-    std::env::var(SEMANTIC_DOC_MAX_TOKENS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.clamp(16, 8_192))
-        .unwrap_or(SEMANTIC_DOC_DEFAULT_MAX_TOKENS)
+    retrieval_settings().semantic_doc_max_tokens
 }
 
 #[cfg(test)]
 pub(super) fn stream_pending_llm_symbol_docs_from_env() -> bool {
-    !matches!(
-        std::env::var(SEMANTIC_STREAM_PENDING_DOCS_ENV)
-            .unwrap_or_else(|_| "true".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    retrieval_settings().stream_pending_docs
 }
 
 #[cfg(test)]
 pub(super) fn semantic_stream_sort_window_batches_from_env() -> usize {
-    std::env::var(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 16))
-        .unwrap_or(SEMANTIC_STREAM_SORT_WINDOW_BATCHES)
+    retrieval_settings().stream_sort_window_batches
 }
 
 pub(super) fn llm_indexable_kind_for_scope(

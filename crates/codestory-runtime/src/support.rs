@@ -12,19 +12,16 @@ pub(crate) use codestory_contracts::config_registry::HYBRID_RETRIEVAL_ENABLED_EN
 pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 = 1_000_000;
 pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 
+/// Whether hybrid lexical/semantic ranking is on for this process.
+///
+/// `CODESTORY_HYBRID_RETRIEVAL_ENABLED` is declared to
+/// `codestory-retrieval/src/config.rs`, which is where the value is read and
+/// interpreted; the runtime asks rather than parsing the variable a second
+/// time. Query paths that already hold a `SidecarRuntimeConfig` should prefer
+/// `runtime.retrieval.hybrid_enabled`, which additionally honours the
+/// `.codestory.toml` override.
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
-    env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)
-}
-
-fn env_flag_enabled(var_name: &str, default: bool) -> bool {
-    match std::env::var(var_name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
-    }
+    codestory_retrieval::hybrid_retrieval_enabled_from_process_env()
 }
 
 #[cfg(test)]

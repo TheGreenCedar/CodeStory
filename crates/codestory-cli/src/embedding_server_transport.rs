@@ -1901,10 +1901,8 @@ mod platform {
     }
 
     fn runtime_paths() -> Result<RuntimePaths> {
-        match (
-            std::env::var_os(QUALIFICATION_DIR_ENV),
-            std::env::var_os(QUALIFICATION_NONCE_ENV),
-        ) {
+        let gate = codestory_retrieval::qualification_gate_environment();
+        match (gate.directory, gate.nonce) {
             (None, None) => platform_runtime_paths(),
             (Some(dir), Some(nonce)) => qualification_runtime_paths(
                 PathBuf::from(dir),
@@ -3865,10 +3863,8 @@ mod platform {
     }
 
     fn qualification_namespace_salt() -> Result<String> {
-        match (
-            std::env::var_os(QUALIFICATION_DIR_ENV),
-            std::env::var_os(QUALIFICATION_NONCE_ENV),
-        ) {
+        let gate = codestory_retrieval::qualification_gate_environment();
+        match (gate.directory, gate.nonce) {
             (None, None) => Ok("production".into()),
             (Some(dir), Some(nonce)) => {
                 let dir = PathBuf::from(dir);

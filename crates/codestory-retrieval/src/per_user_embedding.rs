@@ -22,6 +22,7 @@ pub use client::{
 pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    QualificationGateEnvironment, qualification_gate_environment,
     run_per_user_embedding_qualification,
 };
 pub use qualification_worker::{

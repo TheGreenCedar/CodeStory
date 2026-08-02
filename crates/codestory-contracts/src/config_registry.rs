@@ -10,6 +10,21 @@
 //! catalog entry, documentation, or a stated owner the way an ad-hoc
 //! `std::env::var` call did.
 //!
+//! The owner is the single reader, and that is enforced, not merely intended:
+//! the same architecture contract rejects any production file other than the
+//! owner that uses a registered identity in expression position — spelling it,
+//! importing the constant and passing it to `std::env::var`, or handing it to a
+//! helper that reads on its behalf. A non-owner consumes the owner's typed
+//! value instead. That is the difference between one name for a setting and one
+//! meaning for it: while two modules could each read
+//! `CODESTORY_STORED_VECTOR_ENCODING`, one could clamp, default, or reject a
+//! value the other accepted, and the setting meant two things at once.
+//!
+//! Two things deliberately stay legal for a non-owner, because neither reads a
+//! value: naming an identity inside a message so an operator learns which
+//! variable to set, and [`observe_env_setting`], the registry's own read path
+//! for surfaces that display presence rather than act on it.
+//!
 //! Secrecy is a property of the setting, not of the call site: a secret value
 //! is never rendered into documentation, warnings, or diagnostics, so a caller
 //! cannot accidentally echo it by reaching for the wrong formatter.
@@ -30,8 +45,6 @@ pub const DISABLE_RELEASE_PROBE_ENV: &str = "CODESTORY_DISABLE_RELEASE_PROBE";
 pub const EMBED_ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 pub const EMBED_QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 pub const EMBED_QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
-pub const EVAL_PROBES_ENV: &str = "CODESTORY_EVAL_PROBES";
-pub const EVAL_PROBES_MANIFEST_ENV: &str = "CODESTORY_EVAL_PROBES_MANIFEST";
 pub const GRAPH_INCLUDE_CALLSITE_IDENTITY_ENV: &str = "CODESTORY_GRAPH_INCLUDE_CALLSITE_IDENTITY";
 pub const GRAPH_INCLUDE_CANDIDATE_TARGETS_ENV: &str = "CODESTORY_GRAPH_INCLUDE_CANDIDATE_TARGETS";
 pub const GRAPH_INCLUDE_EDGE_CERTAINTY_ENV: &str = "CODESTORY_GRAPH_INCLUDE_EDGE_CERTAINTY";
@@ -190,7 +203,10 @@ pub enum SettingSecrecy {
 pub struct EnvSetting {
     /// Process environment variable name.
     pub name: &'static str,
-    /// The one production source file allowed to spell this identity.
+    /// The one production source file that reads this setting.
+    ///
+    /// No other production file may spell the identity or use the registry
+    /// constant in expression position; consumers take the owner's typed value.
     pub owner: &'static str,
     pub kind: SettingKind,
     pub audience: SettingAudience,
@@ -794,7 +810,7 @@ pub fn env_setting(name: &str) -> Option<&'static EnvSetting> {
     ENV_SETTINGS.iter().find(|setting| setting.name == name)
 }
 
-/// Production source file allowed to spell one environment identity.
+/// The one production source file that reads one environment identity.
 pub fn env_setting_owner(name: &str) -> Option<&'static str> {
     env_setting(name).map(|setting| setting.owner)
 }
@@ -811,10 +827,26 @@ pub enum ObservedSetting {
     SetSecret,
 }
 
+/// Settings the diagnostic surfaces report on, in report order.
+///
+/// The list lives here rather than in the reporting file for the same reason
+/// the owner is the single reader: a diagnostic that named these identities
+/// itself would be a second module deciding what four settings mean, and it
+/// would need to name identities four other modules own. Observation is a
+/// registry act, so the registry holds the list.
+pub const REPORTED_ENV_SETTINGS: &[&str] = &[
+    EMBED_ALLOW_CPU_ENV,
+    STORED_VECTOR_ENCODING_ENV,
+    HYBRID_RETRIEVAL_ENABLED_ENV,
+    SEMANTIC_DOC_ALIAS_MODE_ENV,
+];
+
 /// Observe one registered setting without ever exposing a secret value.
 ///
 /// This is the only read path a non-owner may use, so a diagnostic surface
-/// cannot echo a credential by reaching for `std::env::var` directly.
+/// cannot echo a credential by reaching for `std::env::var` directly. It
+/// reports presence, never an interpretation: a surface that needs to act on a
+/// setting takes the owner's typed value instead.
 pub fn observe_env_setting(name: &str) -> ObservedSetting {
     let Some(setting) = env_setting(name) else {
         return ObservedSetting::Unset;
@@ -1073,6 +1105,13 @@ pub fn render_configuration_reference() -> String {
          mistyped credential key cannot reach a log line.\n\n"
     );
 
+    page.push_str(
+        "## Environment variables\n\n\
+         The owner column names the one source file that reads a variable. A build check \
+         rejects any other production file that reads it, so a setting has one meaning: no \
+         second module can clamp, default, or reject a value the owner accepted.\n\n",
+    );
+
     for audience in AUDIENCES {
         let settings = ENV_SETTINGS
             .iter()
@@ -1083,7 +1122,7 @@ pub fn render_configuration_reference() -> String {
         }
         let _ = write!(
             page,
-            "## {}\n\n{}\n\n| Variable | Type | Owner | Meaning |\n| --- | --- | --- | --- |\n",
+            "### {}\n\n{}\n\n| Variable | Type | Owner | Meaning |\n| --- | --- | --- | --- |\n",
             audience.heading(),
             audience.note()
         );
@@ -1212,6 +1251,35 @@ mod tests {
                 "{name} row must state that values stay hidden"
             );
         }
+    }
+
+    #[test]
+    fn generated_reference_states_the_enforced_single_reader_rule() {
+        // The claim is only allowed on the page because a contract enforces it
+        // (`registered_settings_are_read_only_by_their_owner` in
+        // `codestory-cli/tests/architecture_contracts.rs`). If that contract is
+        // ever deleted, this sentence has to go with it.
+        let reference = render_configuration_reference();
+        assert!(
+            reference.contains(
+                "The owner column names the one source file that reads a variable. A build check \
+                 rejects any other production file that reads it"
+            ),
+            "the environment section must state the enforced single-reader rule"
+        );
+    }
+
+    #[test]
+    fn reported_settings_are_registered_and_reported_once() {
+        let mut seen = BTreeSet::new();
+        for name in REPORTED_ENV_SETTINGS {
+            assert!(
+                env_setting(name).is_some(),
+                "{name} is reported by diagnostics but is not registered"
+            );
+            assert!(seen.insert(*name), "{name} is reported twice");
+        }
+        assert!(seen.contains(&STORED_VECTOR_ENCODING_ENV));
     }
 
     #[test]
