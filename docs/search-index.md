@@ -35,6 +35,7 @@ the linked page owns the concept.
 | --- | --- |
 | local setup, worktrees | [Contributor setup](contributors/getting-started.md) |
 | test lane, proof tier, release gate | [Testing matrix](contributors/testing-matrix.md) |
+| release freeze, calibration, promotion, publication, closeout | [Release runbook](contributors/release-runbook.md) |
 | engine package, hardware, restart proof | [Retrieval verification](testing/retrieval-architecture.md) |
 | embedding measurements | [Embedding benchmarks](testing/embedding-backend-benchmarks.md) |
 | indexing and packet telemetry | [E2E stats log](testing/codestory-e2e-stats-log.md) |
@@ -42,6 +43,13 @@ the linked page owns the concept.
 | retrieval diagnostics | [Retrieval operations](ops/retrieval-engine.md) |
 | research comparisons | [Research handbook](research.md) |
 | docs checks and ownership | [Documentation checklist](contributors/documentation-maintenance-checklist.md) |
+
+## Dated evidence
+
+| Snapshot | Source state |
+| --- | --- |
+| [August 2026 architecture review](testing/architecture-review-2026-08.md) | `78cc2539`; point-in-time remediation evidence |
+| [August 2026 code review](testing/code-review-2026-08.md) | `78cc2539`; point-in-time remediation evidence |
 
 ## Common routing
 

@@ -707,7 +707,7 @@ release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
 
 Maintainers may manually dispatch `release.yml` from an exact
-`dev/codestory-next` SHA to authenticate the 7-cell pre-publish ledger without
+`dev/codestory-next` SHA to authenticate the graph-declared pre-publish ledger without
 publishing. The required `expected_head_sha` must equal both the workflow SHA
 and the live dev branch head. Manual dispatch exposes no publication input;
 only the automatic reusable-workflow caller on the live `main` head passes the
