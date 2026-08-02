@@ -152,6 +152,10 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         .map(packet_display_path)
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let behavioral_node = matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    );
 
     if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
         Some(PacketEvidenceRole::SqlTableDefinition)
@@ -249,14 +253,17 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         && (normalized_display.contains("file") || normalized_display.contains("source"))
     {
         Some(PacketEvidenceRole::CandidateFileConstruction)
-    } else if normalized_display.contains("search")
+    } else if behavioral_node
+        && normalized_display.contains("search")
         && (normalized_display.contains("driver")
             || normalized_display.contains("entrypoint")
             || normalized_display.contains("parallel")
             || display_is_command_entrypoint(&citation.display_name, &normalized_display, &path))
     {
         Some(PacketEvidenceRole::SearchDriver)
-    } else if display_is_command_entrypoint(&citation.display_name, &normalized_display, &path) {
+    } else if behavioral_node
+        && display_is_command_entrypoint(&citation.display_name, &normalized_display, &path)
+    {
         Some(PacketEvidenceRole::CommandEntrypoint)
     } else if (display.contains("event") && display.contains("processor"))
         || display.contains("event_processor")
@@ -278,12 +285,13 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         || path.contains("/protocol/")
     {
         Some(PacketEvidenceRole::AppServerRequestProtocol)
-    } else if display.contains("run_exec")
-        || display.contains("run_main")
-        || display.contains("service")
-        || display.contains("orchestrat")
-        || display.contains("runtime")
-        || path.contains("runtime")
+    } else if behavioral_node
+        && (display.contains("run_exec")
+            || display.contains("run_main")
+            || display.contains("service")
+            || display.contains("orchestrat")
+            || display.contains("runtime")
+            || path.contains("runtime"))
     {
         Some(PacketEvidenceRole::RuntimeOrchestration)
     } else if display.contains("manifest") || display.contains("plan") || path.contains("workspace")
@@ -293,11 +301,12 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         Some(PacketEvidenceRole::SnapshotRefresh)
     } else if packet_display_is_runtime_formatting_arg_store(&normalized_display) {
         Some(PacketEvidenceRole::SourceEvidence)
-    } else if display.contains("projection")
-        || display.contains("persist")
-        || display.contains("storage")
-        || display.contains("store")
-        || path.contains("store")
+    } else if behavioral_node
+        && (display.contains("projection")
+            || display.contains("persist")
+            || display.contains("storage")
+            || display.contains("store")
+            || path.contains("store"))
     {
         Some(PacketEvidenceRole::PersistenceAndSearchProjection)
     } else if display.contains("indexer")
@@ -424,7 +433,10 @@ fn display_is_command_entrypoint(display: &str, normalized_display: &str, path: 
     {
         return true;
     }
-    if display.contains("::Cli") || display.contains("::cli") {
+    if display
+        .split("::")
+        .any(|segment| matches!(segment, "Cli" | "cli"))
+    {
         return true;
     }
     let normalized_path = packet_display_path(path).replace('\\', "/");
@@ -513,6 +525,49 @@ mod tests {
         citation.origin = SearchHitOrigin::TextMatch;
 
         assert_eq!(packet_evidence_role(&citation), None);
+    }
+
+    #[test]
+    fn behavioral_roles_reject_named_types_and_runtime_variables() {
+        for (name, path, kind, rejected_role) in [
+            (
+                "CliErrorBody",
+                "src/cli/errors.rs",
+                NodeKind::STRUCT,
+                PacketEvidenceRole::CommandEntrypoint,
+            ),
+            (
+                "runtime_path",
+                "src/runtime/config.rs",
+                NodeKind::VARIABLE,
+                PacketEvidenceRole::RuntimeOrchestration,
+            ),
+            (
+                "CompilationDatabase",
+                "src/store/database.rs",
+                NodeKind::CLASS,
+                PacketEvidenceRole::PersistenceAndSearchProjection,
+            ),
+        ] {
+            let mut candidate = citation(name, path);
+            candidate.kind = kind;
+            assert_ne!(packet_evidence_role(&candidate), Some(rejected_role));
+        }
+    }
+
+    #[test]
+    fn cli_entrypoint_detection_requires_a_complete_segment() {
+        assert_ne!(
+            packet_evidence_role(&citation(
+                "ScenarioRunner::client_death",
+                "src/scenario_runner.rs"
+            )),
+            Some(PacketEvidenceRole::CommandEntrypoint)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("Application::Cli::run", "src/commands.rs")),
+            Some(PacketEvidenceRole::CommandEntrypoint)
+        );
     }
 
     #[test]

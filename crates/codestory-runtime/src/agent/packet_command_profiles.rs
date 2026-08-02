@@ -364,11 +364,13 @@ fn packet_push_flow_template_claim_with_citations(
     }
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
+        required_obligation_ids: Vec::new(),
+        required_obligation_kinds: Vec::new(),
         proof_status: None,
         required_evidence_role: None,
         citations,
         coverage_role: Some("command profile".to_string()),
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: Some(false),
     });
 }
 

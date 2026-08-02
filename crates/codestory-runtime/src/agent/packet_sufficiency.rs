@@ -6,6 +6,11 @@ use crate::agent::packet_flow_requirements::FlowRole;
 use crate::agent::packet_flow_requirements::{
     CoverageMode, FlowRequirement, packet_flow_requirements_for_terms,
 };
+use crate::agent::packet_obligations::{
+    PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE, bind_claims_to_packet_obligations,
+    material_packet_obligations_are_proven, packet_claims_with_obligation_receipts,
+    packet_obligation_open_next_candidates, packet_proven_obligation_carrier_paths,
+};
 use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{
@@ -16,8 +21,10 @@ use crate::agent::packet_terms::packet_probe_terms;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphArtifactDto,
     GraphResponse, NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
-    PacketCoverageReportDto, PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketClaimObligationDto, PacketCoverageReportDto, PacketEvidenceTierDto,
+    PacketObligationPlanDto, PacketObligationProofStatusDto, PacketProbeDto,
+    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
@@ -67,6 +74,7 @@ pub(crate) fn build_packet_sufficiency_with_extra(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_packet_sufficiency_with_probe_context(
     project_root: &Path,
     question: &str,
@@ -76,7 +84,55 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
     extra_probes: &[String],
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
-    let supported_claims = packet_supported_claims(answer);
+    build_packet_sufficiency_with_optional_obligation_context(
+        project_root,
+        question,
+        task_class,
+        answer,
+        budget,
+        extra_probes,
+        exact_probe_paths,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_packet_sufficiency_with_obligation_context(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    extra_probes: &[String],
+    exact_probe_paths: &[String],
+    obligations: &PacketObligationPlanDto,
+) -> PacketSufficiencyDto {
+    build_packet_sufficiency_with_optional_obligation_context(
+        project_root,
+        question,
+        task_class,
+        answer,
+        budget,
+        extra_probes,
+        exact_probe_paths,
+        Some(obligations),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_packet_sufficiency_with_optional_obligation_context(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    extra_probes: &[String],
+    exact_probe_paths: &[String],
+    obligations: Option<&PacketObligationPlanDto>,
+) -> PacketSufficiencyDto {
+    let supported_claims = obligations
+        .map(|plan| packet_claims_with_obligation_receipts(answer, plan))
+        .unwrap_or_else(|| packet_supported_claims(answer));
     let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
         question,
         task_class,
@@ -97,12 +153,13 @@ pub(crate) fn build_packet_sufficiency_with_probe_context(
         },
         extra_probes,
         exact_probe_paths,
+        obligations,
     )
 }
 
 #[cfg(test)]
 fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, &[], &[])
+    assemble_packet_sufficiency_with_probe_context(input, &[], &[], None)
 }
 
 #[cfg(test)]
@@ -110,7 +167,7 @@ fn assemble_packet_sufficiency_with_route_probes(
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
 ) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, selected_probes, &[])
+    assemble_packet_sufficiency_with_probe_context(input, selected_probes, &[], None)
 }
 
 #[cfg(test)]
@@ -118,13 +175,14 @@ fn assemble_packet_sufficiency_with_exact_paths(
     input: PacketSufficiencyInput<'_>,
     exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_probe_context(input, &[], exact_probe_paths)
+    assemble_packet_sufficiency_with_probe_context(input, &[], exact_probe_paths, None)
 }
 
 fn assemble_packet_sufficiency_with_probe_context(
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
     exact_probe_paths: &[String],
+    obligations: Option<&PacketObligationPlanDto>,
 ) -> PacketSufficiencyDto {
     let PacketSufficiencyInput {
         project_root,
@@ -138,6 +196,9 @@ fn assemble_packet_sufficiency_with_probe_context(
     } = input;
 
     decorate_packet_claims_proof_metadata(&mut supported_claims);
+    if let Some(obligations) = obligations {
+        bind_claims_to_packet_obligations(obligations, &mut supported_claims);
+    }
 
     let has_errors = answer
         .retrieval_trace
@@ -145,19 +206,20 @@ fn assemble_packet_sufficiency_with_probe_context(
         .iter()
         .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
     let min_citations = packet_sufficiency_min_citations(task_class);
-    let min_claims = packet_sufficiency_min_claims(task_class);
+    let min_claims = packet_sufficiency_min_claims_with_obligations(task_class, obligations);
+    let min_claim_families =
+        packet_sufficiency_min_claim_families_with_obligations(task_class, obligations);
     let route_stages = packet_route_proof_stages(question, selected_probes);
     let sufficiency_claims = supported_claims
         .iter()
         .filter(|claim| {
             packet_claim_can_satisfy_sufficiency(claim)
-                || (task_class == PacketTaskClassDto::RouteTracing
+                || (obligations.is_none()
+                    && task_class == PacketTaskClassDto::RouteTracing
                     && packet_route_claim_binds_stage(&route_stages, selected_probes, claim))
         })
         .cloned()
         .collect::<Vec<_>>();
-    // Binding a requested route stage lets a claim hold that stage, but it does not make the claim
-    // something the caller may repeat: only claims with no ineligibility reason are published.
     let proven_claims = sufficiency_claims
         .iter()
         .filter(|claim| packet_claim_can_satisfy_sufficiency(claim))
@@ -174,43 +236,73 @@ fn assemble_packet_sufficiency_with_probe_context(
     let has_minimum_coverage = eligible_citation_count >= min_citations;
     let has_minimum_claims = sufficiency_claims.len() >= min_claims;
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
-    let has_minimum_claim_families =
-        packet_has_minimum_claim_family_coverage(task_class, &sufficiency_claims);
+    let has_minimum_claim_families = claim_family_count >= min_claim_families;
     let missing_exact_path_claims =
         packet_missing_exact_path_claims(project_root, exact_probe_paths, &sufficiency_claims);
+    // Legacy/unit callers without an obligation ledger retain the pre-EV-5 route-probe contract.
+    // Production claims must survive typed binding; route stages may additionally use the exact
+    // Proven carrier rows from that same plan below.
+    let route_claims = if obligations.is_some() {
+        &proven_claims
+    } else {
+        &supported_claims
+    };
     let route_proof = packet_route_proof_assessment(
         task_class,
         answer,
-        &supported_claims,
+        route_claims,
         &route_stages,
         selected_probes,
+        obligations,
     );
     let mut missing_required_flow_requirements =
         packet_missing_required_flow_requirements(question, task_class, &sufficiency_claims);
     if task_class == PacketTaskClassDto::RouteTracing && route_proof.complete {
         missing_required_flow_requirements.clear();
     }
-    let has_required_flow_roles = missing_required_flow_requirements.is_empty();
-    let blocking_missing_probe_queries = packet_blocking_missing_probe_queries(
-        question,
-        task_class,
-        &missing_required_probe_queries,
-        &missing_required_flow_requirements,
-    );
+    let obligations_proven = obligations
+        .map(material_packet_obligations_are_proven)
+        .unwrap_or(true);
+    let has_required_flow_roles =
+        missing_required_flow_requirements.is_empty() && obligations_proven;
+    let blocking_missing_probe_queries = obligations
+        .map(packet_incomplete_material_query_obligations)
+        .unwrap_or_else(|| {
+            packet_blocking_missing_probe_queries(
+                &missing_required_probe_queries,
+                &missing_required_flow_requirements,
+            )
+        });
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
         budget,
         &missing_required_flow_requirements,
         &missing_required_probe_queries,
     );
+    let blocking_route_probe_queries = if obligations.is_none() {
+        packet_blocking_incomplete_route_probe_queries(
+            question,
+            task_class,
+            route_proof.complete,
+            &missing_required_probe_queries,
+            selected_probes,
+        )
+    } else {
+        Vec::new()
+    };
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
-    let blocking_unresolved_sidecar_queries = packet_blocking_unresolved_sidecar_queries(
-        question,
-        task_class,
-        &unresolved_sidecar_queries,
-        &missing_required_probe_queries,
-        &blocking_missing_probe_queries,
-        &missing_required_flow_requirements,
-    );
+    let blocking_unresolved_sidecar_queries = if obligations.is_some() {
+        packet_blocking_unresolved_obligation_queries(
+            &unresolved_sidecar_queries,
+            &blocking_missing_probe_queries,
+        )
+    } else {
+        packet_blocking_unresolved_sidecar_queries(
+            &unresolved_sidecar_queries,
+            &blocking_missing_probe_queries,
+            &missing_required_flow_requirements,
+            &blocking_route_probe_queries,
+        )
+    };
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
         budget,
         eligible_citation_count,
@@ -226,7 +318,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         unresolved_sidecar_queries: &blocking_unresolved_sidecar_queries,
     });
 
-    let gaps = packet_sufficiency_gaps(
+    let mut gaps = packet_sufficiency_gaps(
         task_class,
         answer,
         budget,
@@ -235,6 +327,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         min_claims,
         sufficiency_claims.len(),
         claim_family_count,
+        min_claim_families,
         generic_navigation_claim_count,
         status,
         has_minimum_coverage,
@@ -248,6 +341,9 @@ fn assemble_packet_sufficiency_with_probe_context(
         &missing_required_flow_requirements,
         &blocking_unresolved_sidecar_queries,
     );
+    if let Some(obligations) = obligations {
+        append_packet_obligation_gaps(&mut gaps, obligations);
+    }
     let blocking_probe_queries = packet_blocking_follow_up_probe_queries(
         &blocking_missing_probe_queries,
         &blocking_unresolved_sidecar_queries,
@@ -261,32 +357,106 @@ fn assemble_packet_sufficiency_with_probe_context(
     for query in &blocking_probe_queries {
         push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
-    if blocking_probe_queries.is_empty() {
-        for query in &missing_required_probe_queries {
+    for query in &blocking_route_probe_queries {
+        push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
+    }
+    // The legacy no-ledger path may still report uncovered planner probes whose flow requirement
+    // is already covered. Those are hints, not repair work. Production ledgers put every
+    // incomplete material query in `blocking_probe_queries`, so command assembly can consume that
+    // set directly without resurrecting nonblocking hints.
+    if has_sufficiency_blocking_budget_omission {
+        // A compact packet can prove every flow role and still omit the source proof required by
+        // a proof-critical probe. The deeper-budget command repairs capacity; retain the concrete
+        // probe beside it so the caller also knows which evidence to reacquire.
+        for query in missing_required_probe_queries
+            .iter()
+            .filter(|query| packet_missing_probe_requires_compact_proof(query))
+        {
             push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
         }
     }
     for query in &route_proof.follow_up_queries {
         push_unique_term(&mut blocking_follow_up_probe_query_seeds, query);
     }
+    let terminally_sufficient = status == PacketSufficiencyStatusDto::Sufficient;
+    let obligation_open_next_paths = if terminally_sufficient {
+        Vec::new()
+    } else {
+        obligations
+            .map(packet_obligation_open_next_candidates)
+            .unwrap_or_default()
+    };
+    let reported_claim_open_next_paths = if terminally_sufficient || obligations.is_none() {
+        // A finalized sufficient packet has no material work left. Diagnostic claim and guard
+        // receipts stay visible in the coverage report, but cannot contradict the stop signal by
+        // reopening any carrier path. Legacy no-ledger callers likewise keep their previous hint
+        // behavior; typed obligation state is what makes a reported carrier actionable here.
+        BTreeSet::new()
+    } else {
+        supported_claims
+            .iter()
+            .filter(|claim| {
+                claim.proof_status == Some(codestory_contracts::api::PacketProofStatusDto::Reported)
+                    || claim.eligible_for_sufficiency == Some(false)
+            })
+            .flat_map(|claim| claim.citations.iter())
+            .filter_map(|citation| citation.file_path.as_ref())
+            .map(|path| packet_display_path(path))
+            .collect::<BTreeSet<_>>()
+    };
+    let unproven_obligation_carrier_paths = obligations
+        .map(|obligations| {
+            obligations
+                .claim_obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.proof_status != PacketObligationProofStatusDto::Proven
+                })
+                .flat_map(|obligation| obligation.carrier_paths.iter())
+                .map(|path| packet_display_path(path))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut open_next_paths = if terminally_sufficient {
+        Vec::new()
+    } else {
+        missing_exact_path_claims.clone()
+    };
+    for path in obligation_open_next_paths {
+        push_unique_term(&mut open_next_paths, &path);
+    }
+    for path in &reported_claim_open_next_paths {
+        push_unique_term(&mut open_next_paths, path);
+    }
     let blocking_follow_up_probe_queries = packet_interleave_follow_up_queries(
-        &missing_exact_path_claims,
+        &open_next_paths,
         &blocking_follow_up_probe_query_seeds,
     );
-    let follow_up_probe_queries = if blocking_follow_up_probe_queries.is_empty() {
-        &missing_required_probe_queries
+    let follow_up_probe_queries = &blocking_follow_up_probe_queries;
+    let targeted_follow_up_queries = targeted_follow_up_queries
+        .into_iter()
+        .filter(|query| {
+            !missing_required_probe_queries
+                .iter()
+                .any(|missing| missing == query)
+                || blocking_probe_queries
+                    .iter()
+                    .any(|blocking| blocking == query)
+        })
+        .collect::<Vec<_>>();
+    let follow_up_commands = if terminally_sufficient {
+        Vec::new()
     } else {
-        &blocking_follow_up_probe_queries
+        packet_follow_up_commands(
+            project_root,
+            question,
+            status,
+            budget,
+            follow_up_probe_queries,
+            targeted_follow_up_queries,
+            packet_full_retrieval_available(answer),
+        )
     };
-    let follow_up_commands = packet_follow_up_commands(
-        project_root,
-        question,
-        status,
-        budget,
-        follow_up_probe_queries,
-        targeted_follow_up_queries,
-        packet_full_retrieval_available(answer),
-    );
     let coverage_report = packet_coverage_report(PacketCoverageReportInput {
         supported_claims: &supported_claims,
         proven_claims: &proven_claims,
@@ -297,14 +467,51 @@ fn assemble_packet_sufficiency_with_probe_context(
         budget,
         has_sufficiency_blocking_budget_omission,
     });
-    let open_next = follow_up_commands.clone();
+    let mut open_next = if terminally_sufficient {
+        Vec::new()
+    } else {
+        follow_up_commands.clone()
+    };
+    if !terminally_sufficient && !open_next_paths.is_empty() {
+        let quoted_project = quote_packet_project_arg(project_root);
+        let candidate_commands = if packet_full_retrieval_available(answer) {
+            packet_follow_up_search_commands(&quoted_project, &open_next_paths)
+        } else {
+            packet_follow_up_trail_commands(&quoted_project, &open_next_paths)
+        };
+        for command in candidate_commands {
+            push_unique_term(&mut open_next, &command);
+        }
+        open_next.truncate(12);
+    }
+    debug_assert!(
+        !terminally_sufficient
+            || (open_next_paths.is_empty()
+                && follow_up_commands.is_empty()
+                && open_next.is_empty()),
+        "a Sufficient packet is terminal and cannot publish open-next paths or commands"
+    );
     // Only a file the packet actually proved something about is one the caller can skip opening.
+    let proven_obligation_paths = obligations.map(|obligations| {
+        packet_proven_obligation_carrier_paths(obligations)
+            .into_iter()
+            .map(|path| packet_display_path(&path))
+            .collect::<BTreeSet<_>>()
+    });
     let avoid_opening_paths = proven_claims
         .iter()
         .flat_map(|claim| &claim.citations)
         .filter(|citation| citation_sufficiency_eligible(citation))
         .filter_map(|citation| citation.file_path.as_ref())
         .map(|path| packet_display_path(path))
+        .filter(|path| {
+            proven_obligation_paths
+                .as_ref()
+                .is_none_or(|ledger_paths| ledger_paths.contains(path))
+        })
+        .filter(|path| !reported_claim_open_next_paths.contains(path))
+        .filter(|path| !unproven_obligation_carrier_paths.contains(path))
+        .filter(|path| !missing_exact_path_claims.contains(path))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .take(12)
@@ -452,6 +659,7 @@ fn packet_route_proof_assessment(
     claims: &[PacketClaimDto],
     stages: &[String],
     selected_probes: &[String],
+    obligations: Option<&PacketObligationPlanDto>,
 ) -> RouteProofAssessment {
     if task_class != PacketTaskClassDto::RouteTracing {
         return RouteProofAssessment::not_required();
@@ -485,6 +693,14 @@ fn packet_route_proof_assessment(
             .iter()
             .flat_map(|claim| packet_route_claim_node_ids(stage, selected_probes, claim))
             .collect::<Vec<_>>();
+        if let Some(obligations) = obligations {
+            node_ids.extend(packet_route_obligation_node_ids(
+                stage,
+                selected_probes,
+                answer,
+                obligations,
+            ));
+        }
         node_ids.sort();
         node_ids.dedup();
         if node_ids.is_empty() {
@@ -550,6 +766,116 @@ fn packet_route_proof_assessment(
         );
     }
     RouteProofAssessment::not_required()
+}
+
+fn packet_route_obligation_node_ids(
+    stage: &str,
+    selected_probes: &[String],
+    answer: &AgentAnswerDto,
+    obligations: &PacketObligationPlanDto,
+) -> Vec<String> {
+    let endpoint_citation_ids = answer
+        .citations
+        .iter()
+        .filter(|citation| packet_route_citation_is_endpoint(citation))
+        .map(|citation| &citation.node_id)
+        .collect::<HashSet<_>>();
+    obligations
+        .claim_obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.material
+                && obligation.proof_status == PacketObligationProofStatusDto::Proven
+                && packet_route_obligation_binds_stage(obligation, stage, selected_probes)
+        })
+        .flat_map(|obligation| &obligation.carrier_node_ids)
+        .filter(|node_id| endpoint_citation_ids.contains(node_id))
+        .map(|node_id| node_id.0.clone())
+        .collect()
+}
+
+fn packet_route_obligation_binds_stage(
+    obligation: &PacketClaimObligationDto,
+    stage: &str,
+    selected_probes: &[String],
+) -> bool {
+    obligation
+        .binding_terms
+        .iter()
+        .any(|binding| packet_route_exact_binding_matches_stage(binding, stage, selected_probes))
+        || obligation.probe_binding.as_ref().is_some_and(|binding| {
+            let mut exact_bindings = Vec::new();
+            match &binding.probe {
+                PacketProbeDto::ExactPath { path } => {
+                    exact_bindings.push(path.as_str());
+                    if let Some(path) = binding.path.as_deref() {
+                        exact_bindings.push(path);
+                    }
+                }
+                PacketProbeDto::SymbolId { id } => {
+                    exact_bindings.push(id.as_str());
+                    if let Some(symbol_id) = binding.symbol_id.as_deref() {
+                        exact_bindings.push(symbol_id);
+                    }
+                }
+                PacketProbeDto::FileSymbol { path, symbol } => {
+                    exact_bindings.push(path.as_str());
+                    exact_bindings.push(symbol.as_str());
+                    if let Some(path) = binding.path.as_deref() {
+                        exact_bindings.push(path);
+                    }
+                    if let Some(symbol_id) = binding.symbol_id.as_deref() {
+                        exact_bindings.push(symbol_id);
+                    }
+                }
+                PacketProbeDto::Continuation { symbol_id, .. } => {
+                    if let Some(symbol_id) = symbol_id.as_deref() {
+                        exact_bindings.push(symbol_id);
+                    }
+                    if let Some(symbol_id) = binding.symbol_id.as_deref() {
+                        exact_bindings.push(symbol_id);
+                    }
+                }
+                PacketProbeDto::FreeQuery { .. } => {}
+            }
+            exact_bindings.into_iter().any(|exact_binding| {
+                packet_route_exact_binding_matches_stage(exact_binding, stage, selected_probes)
+            })
+        })
+}
+
+fn packet_route_exact_binding_matches_stage(
+    binding: &str,
+    stage: &str,
+    selected_probes: &[String],
+) -> bool {
+    packet_route_exact_identities_overlap(binding, stage)
+        || selected_probes.iter().any(|probe| {
+            packet_route_probe_is_unscoped(probe)
+                && packet_route_labels_overlap(stage, probe)
+                && packet_route_exact_identities_overlap(binding, probe)
+        })
+}
+
+fn packet_route_exact_identities_overlap(left: &str, right: &str) -> bool {
+    let left = packet_route_exact_identity_segments(left);
+    let right = packet_route_exact_identity_segments(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left.len() == 1 || right.len() == 1 {
+        return left.last() == right.last();
+    }
+    left == right
+}
+
+fn packet_route_exact_identity_segments(value: &str) -> Vec<&str> {
+    value
+        .split([':', '.', '#', '/', '\\'])
+        .map(str::trim)
+        .map(|segment| segment.strip_suffix("()").unwrap_or(segment))
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn packet_route_proof_stages(question: &str, selected_probes: &[String]) -> Vec<String> {
@@ -696,7 +1022,9 @@ fn packet_route_claim_node_ids(
     selected_probes: &[String],
     claim: &PacketClaimDto,
 ) -> Vec<String> {
-    if claim.eligible_for_sufficiency == Some(false) {
+    if claim.eligible_for_sufficiency == Some(false)
+        || claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
+    {
         return Vec::new();
     }
     claim
@@ -814,7 +1142,7 @@ fn packet_route_citation_is_endpoint(citation: &AgentCitationDto) -> bool {
         )
 }
 
-fn packet_execution_graphs(answer: &AgentAnswerDto) -> Vec<&GraphResponse> {
+pub(crate) fn packet_execution_graphs(answer: &AgentAnswerDto) -> Vec<&GraphResponse> {
     answer
         .graphs
         .iter()
@@ -881,7 +1209,11 @@ fn packet_missing_route_transitions(
         .collect()
 }
 
-fn packet_execution_path_exists(graph: &GraphResponse, source: &str, target: &str) -> bool {
+pub(crate) fn packet_execution_path_exists(
+    graph: &GraphResponse,
+    source: &str,
+    target: &str,
+) -> bool {
     if source == target {
         return false;
     }
@@ -915,6 +1247,7 @@ fn packet_sufficiency_gaps(
     min_claims: usize,
     supported_claim_count: usize,
     claim_family_count: usize,
+    min_claim_families: usize,
     generic_navigation_claim_count: usize,
     status: PacketSufficiencyStatusDto,
     has_minimum_coverage: bool,
@@ -958,7 +1291,7 @@ fn packet_sufficiency_gaps(
             "{:?} packet covered only {} distinct claim families; at least {} are required before treating the packet as sufficient.",
             task_class,
             claim_family_count,
-            packet_sufficiency_min_claim_families(task_class)
+            min_claim_families
         ));
     }
     if eligible_citation_count > 0 && !has_required_flow_roles {
@@ -1046,10 +1379,71 @@ fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnost
     if diagnostic.blocking_unresolved_candidate_count > 0 {
         return true;
     }
-    diagnostic
-        .diagnostic
-        .as_deref()
-        .is_some_and(|message| message.starts_with("sidecar query has blocking cancel reason "))
+    matches!(
+        diagnostic.completion,
+        codestory_contracts::api::PacketQueryCompletionDto::Cancelled { .. }
+    )
+}
+
+fn packet_incomplete_material_query_obligations(
+    obligations: &PacketObligationPlanDto,
+) -> Vec<String> {
+    obligations
+        .query_obligations
+        .iter()
+        .filter(|obligation| obligation.material)
+        .filter(|obligation| {
+            !matches!(
+                obligation.completion,
+                Some(PacketQueryCompletionDto::Completed)
+            )
+        })
+        .map(|obligation| obligation.query.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn append_packet_obligation_gaps(gaps: &mut Vec<String>, obligations: &PacketObligationPlanDto) {
+    for obligation in obligations.claim_obligations.iter().filter(|obligation| {
+        obligation.proof_status != PacketObligationProofStatusDto::Proven
+            && (obligation.material || !obligation.carrier_node_ids.is_empty())
+    }) {
+        push_unique_term(
+            gaps,
+            &format!(
+                "obligation {} ({:?}) is {:?}: {}",
+                obligation.id,
+                obligation.kind,
+                obligation.proof_status,
+                obligation.reason.as_deref().unwrap_or("reason_unavailable")
+            ),
+        );
+    }
+    for obligation in obligations
+        .query_obligations
+        .iter()
+        .filter(|obligation| obligation.material)
+        .filter(|obligation| {
+            !matches!(
+                obligation.completion,
+                Some(PacketQueryCompletionDto::Completed)
+            )
+        })
+    {
+        let reason = match obligation.completion.as_ref() {
+            Some(PacketQueryCompletionDto::Cancelled { reason }) => reason.as_str(),
+            Some(PacketQueryCompletionDto::Completed) => continue,
+            None => "completion_missing",
+        };
+        push_unique_term(
+            gaps,
+            &format!(
+                "query obligation {} ({:?}) is cancelled: {}",
+                obligation.id, obligation.kind, reason
+            ),
+        );
+    }
 }
 
 fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
@@ -1074,6 +1468,28 @@ fn packet_sufficiency_min_claims(task_class: PacketTaskClassDto) -> usize {
     }
 }
 
+fn packet_sufficiency_min_claims_with_obligations(
+    task_class: PacketTaskClassDto,
+    obligations: Option<&PacketObligationPlanDto>,
+) -> usize {
+    let baseline = packet_sufficiency_min_claims(task_class);
+    let planned_material_claims = obligations.map_or(0, |plan| {
+        plan.claim_obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.material
+                    && obligation.kind
+                        != codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe
+            })
+            .count()
+    });
+    if planned_material_claims == 0 {
+        baseline
+    } else {
+        baseline.min(planned_material_claims)
+    }
+}
+
 fn packet_sufficiency_min_claim_families(task_class: PacketTaskClassDto) -> usize {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => 3,
@@ -1086,12 +1502,28 @@ fn packet_sufficiency_min_claim_families(task_class: PacketTaskClassDto) -> usiz
     }
 }
 
-fn packet_has_minimum_claim_family_coverage(
+fn packet_sufficiency_min_claim_families_with_obligations(
     task_class: PacketTaskClassDto,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    packet_supported_claim_family_count(supported_claims)
-        >= packet_sufficiency_min_claim_families(task_class)
+    obligations: Option<&PacketObligationPlanDto>,
+) -> usize {
+    let baseline = packet_sufficiency_min_claim_families(task_class);
+    let planned_material_families = obligations.map_or(0, |plan| {
+        plan.claim_obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.material
+                    && obligation.kind
+                        != codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe
+            })
+            .map(|obligation| obligation.kind)
+            .collect::<HashSet<_>>()
+            .len()
+    });
+    if planned_material_families == 0 {
+        baseline
+    } else {
+        baseline.min(planned_material_families)
+    }
 }
 
 pub(crate) fn packet_supported_claim_family_count(supported_claims: &[PacketClaimDto]) -> usize {
@@ -1105,6 +1537,27 @@ pub(crate) fn packet_supported_claim_family_count(supported_claims: &[PacketClai
 }
 
 pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
+    if claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE) {
+        return match claim.required_obligation_kinds.as_slice() {
+            [codestory_contracts::api::PacketClaimObligationKindDto::Entrypoint] => {
+                Some("planned entrypoint evidence")
+            }
+            [codestory_contracts::api::PacketClaimObligationKindDto::Dispatch] => {
+                Some("planned dispatch evidence")
+            }
+            [codestory_contracts::api::PacketClaimObligationKindDto::Orchestration] => {
+                Some("planned orchestration evidence")
+            }
+            [codestory_contracts::api::PacketClaimObligationKindDto::StateWrite] => {
+                Some("planned state-write evidence")
+            }
+            [codestory_contracts::api::PacketClaimObligationKindDto::ExternalIo] => {
+                Some("planned external-I/O evidence")
+            }
+            [codestory_contracts::api::PacketClaimObligationKindDto::ExactProbe] => None,
+            _ => None,
+        };
+    }
     let normalized_claim = normalize_identifier(&claim.claim);
     if !normalized_claim.is_empty() {
         if normalized_claim.contains("serialize") && normalized_claim.contains("key") {
@@ -1897,8 +2350,6 @@ fn flow_requirement_blocks_sufficiency(requirement: &FlowRequirement) -> bool {
 }
 
 fn packet_blocking_missing_probe_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
     missing_required_probe_queries: &[String],
     missing_required_flow_requirements: &[FlowRequirement],
 ) -> Vec<String> {
@@ -1906,71 +2357,125 @@ fn packet_blocking_missing_probe_queries(
         return Vec::new();
     }
 
-    let missing_requirement_ids = missing_required_flow_requirements
-        .iter()
-        .map(|requirement| requirement.id)
-        .collect::<HashSet<_>>();
-    let question_terms = packet_probe_terms(question);
-    let blocking_query_seeds = packet_flow_requirements_for_terms(&question_terms, task_class)
-        .into_iter()
-        .filter(|requirement| {
-            flow_requirement_blocks_sufficiency(requirement)
-                && missing_requirement_ids.contains(requirement.id)
-        })
-        .flat_map(|requirement| requirement.query_seeds.iter().copied())
-        .collect::<HashSet<_>>();
-
     missing_required_probe_queries
         .iter()
-        .filter(|query| blocking_query_seeds.contains(query.as_str()))
+        .filter(|query| {
+            missing_required_flow_requirements
+                .iter()
+                .any(|requirement| {
+                    flow_requirement_blocks_sufficiency(requirement)
+                        && packet_query_binds_flow_requirement(query, requirement)
+                })
+        })
         .cloned()
         .collect()
 }
 
+fn packet_query_binds_flow_requirement(query: &str, requirement: &FlowRequirement) -> bool {
+    if requirement.query_seeds.contains(&query) {
+        return true;
+    }
+
+    // Selected probes may compose the requirement vocabulary differently from its canonical
+    // seeds: `response send`, for example, combines `response finalization` and `transport send`.
+    // Requiring every query term to come from one open requirement maps that alias without making
+    // an arbitrary raw missing probe blocking.
+    let query_terms = packet_probe_terms(query);
+    if query_terms.len() < 2 {
+        return false;
+    }
+    let requirement_terms = requirement
+        .query_seeds
+        .iter()
+        .flat_map(|seed| packet_probe_terms(seed))
+        .collect::<HashSet<_>>();
+    query_terms
+        .iter()
+        .all(|term| requirement_terms.contains(term))
+}
+
 fn packet_blocking_unresolved_sidecar_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
     unresolved_sidecar_queries: &[String],
-    missing_required_probe_queries: &[String],
     blocking_missing_probe_queries: &[String],
     missing_required_flow_requirements: &[FlowRequirement],
+    blocking_route_probe_queries: &[String],
 ) -> Vec<String> {
     if unresolved_sidecar_queries.is_empty()
-        || (missing_required_probe_queries.is_empty()
-            && missing_required_flow_requirements.is_empty())
+        || (blocking_missing_probe_queries.is_empty()
+            && missing_required_flow_requirements.is_empty()
+            && blocking_route_probe_queries.is_empty())
     {
         return Vec::new();
     }
 
-    let missing_requirement_ids = missing_required_flow_requirements
+    let blocking_query_seeds = missing_required_flow_requirements
         .iter()
-        .map(|requirement| requirement.id)
-        .collect::<HashSet<_>>();
-    let question_terms = packet_probe_terms(question);
-    let blocking_query_seeds = packet_flow_requirements_for_terms(&question_terms, task_class)
-        .into_iter()
-        .filter(|requirement| {
-            flow_requirement_blocks_sufficiency(requirement)
-                && missing_requirement_ids.contains(requirement.id)
-        })
+        .filter(|requirement| flow_requirement_blocks_sufficiency(requirement))
         .flat_map(|requirement| requirement.query_seeds.iter().copied())
         .collect::<HashSet<_>>();
     let blocking_probe_queries = blocking_missing_probe_queries
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let missing_probe_queries = missing_required_probe_queries
+    let blocking_route_probe_queries = blocking_route_probe_queries
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-
     unresolved_sidecar_queries
         .iter()
         .filter(|query| {
             blocking_query_seeds.contains(query.as_str())
                 || blocking_probe_queries.contains(query.as_str())
-                || missing_probe_queries.contains(query.as_str())
+                || blocking_route_probe_queries.contains(query.as_str())
         })
+        .cloned()
+        .collect()
+}
+
+fn packet_blocking_incomplete_route_probe_queries(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    route_proof_complete: bool,
+    missing_required_probe_queries: &[String],
+    selected_probes: &[String],
+) -> Vec<String> {
+    if task_class != PacketTaskClassDto::RouteTracing || route_proof_complete {
+        return Vec::new();
+    }
+    let selected_probes = selected_probes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    missing_required_probe_queries
+        .iter()
+        .filter(|query| {
+            selected_probes.contains(query.as_str())
+                || packet_normalized_query_phrase_present(question, query)
+        })
+        .cloned()
+        .collect()
+}
+
+fn packet_normalized_query_phrase_present(question: &str, query: &str) -> bool {
+    let question_terms = packet_probe_terms(question);
+    let query_terms = packet_probe_terms(query);
+    !query_terms.is_empty()
+        && question_terms
+            .windows(query_terms.len())
+            .any(|window| window == query_terms)
+}
+
+fn packet_blocking_unresolved_obligation_queries(
+    unresolved_sidecar_queries: &[String],
+    incomplete_material_queries: &[String],
+) -> Vec<String> {
+    let incomplete_material_queries = incomplete_material_queries
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    unresolved_sidecar_queries
+        .iter()
+        .filter(|query| incomplete_material_queries.contains(query.as_str()))
         .cloned()
         .collect()
 }
@@ -1997,13 +2502,16 @@ fn packet_blocking_follow_up_probe_queries(
 mod tests {
     use super::*;
     use crate::agent::packet_budget::{apply_packet_budget, packet_budget_limits};
+    use crate::agent::packet_obligations::{
+        build_packet_obligation_plan, finalize_packet_obligation_plan,
+    };
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, EdgeId,
         GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
         PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
-        PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto, RetrievalScoreBreakdownDto,
-        RetrievalShadowDto, SearchHitOrigin,
+        PacketEvidenceTierDto, PacketProofStatusDto, PacketSidecarQueryDiagnosticDto,
+        RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHitOrigin,
     };
     use std::path::Path;
 
@@ -2022,6 +2530,8 @@ mod tests {
     fn claim(text: &str) -> PacketClaimDto {
         PacketClaimDto {
             claim: text.to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: None,
             required_evidence_role: None,
             citations: Vec::new(),
@@ -2101,6 +2611,8 @@ mod tests {
     ) -> PacketClaimDto {
         PacketClaimDto {
             claim: text.to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: None,
             required_evidence_role: None,
             citations: vec![citation],
@@ -2281,6 +2793,73 @@ mod tests {
         )
     }
 
+    #[test]
+    fn obligation_receipts_use_only_their_planned_family_and_never_route_endpoints() {
+        let receipt = PacketClaimDto {
+            // Deliberately contains unrelated dispatch/cache words: receipt classification must use
+            // the exact planned kind instead of inferring a semantic family from prose or citation.
+            claim: "Dispatch cache evidence is present at RequestedEndpoint.".to_string(),
+            required_obligation_ids: vec!["state_row".to_string()],
+            required_obligation_kinds: vec![
+                codestory_contracts::api::PacketClaimObligationKindDto::StateWrite,
+            ],
+            proof_status: Some(PacketProofStatusDto::Proven),
+            required_evidence_role: None,
+            citations: vec![cited_anchor("RequestedEndpoint")],
+            coverage_role: Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE.to_string()),
+            eligible_for_sufficiency: Some(true),
+        };
+
+        assert_eq!(
+            packet_claim_family(&receipt),
+            Some("planned state-write evidence")
+        );
+        assert_eq!(packet_supported_claim_family_count(&[receipt.clone()]), 1);
+        assert!(packet_route_claim_node_ids("RequestedEndpoint", &[], &receipt).is_empty());
+        assert!(!packet_route_claim_binds_stage(
+            &["RequestedEndpoint".to_string()],
+            &[],
+            &receipt
+        ));
+
+        let answer = route_answer(
+            "RequestedEndpoint -> DownstreamEndpoint",
+            &["RequestedEndpoint", "DownstreamEndpoint"],
+            &[("RequestedEndpoint", "DownstreamEndpoint")],
+        );
+        let mut obligations = PacketObligationPlanDto {
+            version: codestory_contracts::api::PACKET_OBLIGATION_PLAN_VERSION,
+            binding_terms: Vec::new(),
+            claim_obligations: vec![PacketClaimObligationDto {
+                id: "requested_claim:other".to_string(),
+                kind: codestory_contracts::api::PacketClaimObligationKindDto::Dispatch,
+                binding_terms: vec!["OtherEndpoint".to_string()],
+                probe_binding: None,
+                material: true,
+                allowed_node_kinds: vec![NodeKind::FUNCTION],
+                required_edge_kind: Some(EdgeKind::CALL),
+                requires_complete_discovery: false,
+                proof_status: PacketObligationProofStatusDto::Proven,
+                reason: None,
+                carrier_node_ids: vec![NodeId("RequestedEndpoint".to_string())],
+                carrier_paths: vec!["src/RequestedEndpoint.rs".to_string()],
+                open_next_candidates: Vec::new(),
+            }],
+            query_obligations: Vec::new(),
+        };
+        assert!(
+            packet_route_obligation_node_ids("RequestedEndpoint", &[], &answer, &obligations,)
+                .is_empty(),
+            "a Proven receipt bound to a different exact identity must not satisfy this endpoint"
+        );
+        obligations.claim_obligations[0].binding_terms.clear();
+        assert!(
+            packet_route_obligation_node_ids("RequestedEndpoint", &[], &answer, &obligations,)
+                .is_empty(),
+            "a generic role obligation with no exact binding must not satisfy an endpoint"
+        );
+    }
+
     fn route_transition_claim(source: &str, target: &str) -> PacketClaimDto {
         let mut claim = route_claim(source);
         claim.claim = format!("`{source}` calls `{target}` on the requested route.");
@@ -2327,15 +2906,68 @@ mod tests {
         edges: &[(&str, &str)],
         extra_probes: &[String],
     ) -> (PacketSufficiencyDto, Vec<PacketClaimDto>) {
-        let answer = route_answer(question, names, edges);
-        let claims = packet_supported_claims(&answer);
-        let sufficiency = build_packet_sufficiency_with_extra(
+        let mut answer = route_answer(question, names, edges);
+        for citation in &mut answer.citations {
+            citation.file_path = Some(format!("src/router/{}.rs", citation.display_name));
+        }
+        let graph_edges = answer
+            .graphs
+            .iter()
+            .flat_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => graph.edges.as_slice(),
+                _ => &[],
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for citation in &mut answer.citations {
+            citation.evidence_edge_ids = graph_edges
+                .iter()
+                .filter(|edge| edge.source == citation.node_id || edge.target == citation.node_id)
+                .map(|edge| edge.id.clone())
+                .collect();
+        }
+        let mut obligations =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        answer.retrieval_trace.packet_sidecar_diagnostics.extend(
+            obligations
+                .query_obligations
+                .iter()
+                .filter(|query| query.material)
+                .map(|query| PacketSidecarQueryDiagnosticDto {
+                    query: query.query.clone(),
+                    completion: PacketQueryCompletionDto::Completed,
+                    retrieval_mode: "full".to_string(),
+                    sidecar_query_ms: Some(1),
+                    candidate_resolution_ms: Some(0),
+                    total_elapsed_ms: Some(1),
+                    sidecar_stage_count: 1,
+                    sidecar_stage_total_ms: Some(1),
+                    batch_query_wall_ms: Some(1),
+                    candidate_count: 1,
+                    resolved_hit_count: 1,
+                    unresolved_candidate_count: 0,
+                    blocking_unresolved_candidate_count: 0,
+                    diagnostic: None,
+                }),
+        );
+        let budget = budget_fixture();
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut obligations,
+            &answer,
+            &budget,
+        );
+        let claims = packet_claims_with_obligation_receipts(&answer, &obligations);
+        let sufficiency = build_packet_sufficiency_with_obligation_context(
             Path::new("C:/workspace/project"),
             question,
             PacketTaskClassDto::RouteTracing,
             &answer,
-            &budget_fixture(),
+            &budget,
             extra_probes,
+            &[],
+            &obligations,
         );
         (sufficiency, claims)
     }
@@ -2400,6 +3032,7 @@ mod tests {
     fn unresolved_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
         PacketSidecarQueryDiagnosticDto {
             query: query.to_string(),
+            completion: codestory_contracts::api::PacketQueryCompletionDto::Completed,
             retrieval_mode: "full".to_string(),
             sidecar_query_ms: None,
             candidate_resolution_ms: None,
@@ -2418,6 +3051,9 @@ mod tests {
     fn cancelled_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
         PacketSidecarQueryDiagnosticDto {
             query: query.to_string(),
+            completion: codestory_contracts::api::PacketQueryCompletionDto::Cancelled {
+                reason: "stage_deadline".to_string(),
+            },
             retrieval_mode: "full".to_string(),
             sidecar_query_ms: None,
             candidate_resolution_ms: None,
@@ -2721,9 +3357,9 @@ mod tests {
     #[test]
     fn production_claims_prove_lowercase_arrow_route() {
         let (sufficiency, claims) = production_route_sufficiency(
-            "main -> run",
-            &["main", "run", "RouteSupport"],
-            &[("main", "run")],
+            "alpha -> omega",
+            &["alpha", "omega", "RouteSupport"],
+            &[("alpha", "omega")],
         );
 
         assert_eq!(
@@ -2774,7 +3410,7 @@ mod tests {
     #[test]
     fn production_exact_plain_phrase_matches_unscoped_probe() {
         let (sufficiency, _) = production_route_sufficiency_with_probes(
-            "sha256 digest -> DigestExit",
+            "sha256Digest -> DigestExit",
             &["sha256Digest", "DigestExit", "RouteSupport"],
             &[("sha256Digest", "DigestExit")],
             &["sha256Digest".to_string()],
@@ -2818,16 +3454,16 @@ mod tests {
 
     #[test]
     fn production_source_evidence_proves_explicit_marker_route() {
-        let question = "from CustomEntry through request dispatch to CustomExit";
-        let names = ["CustomEntry", "dispatch_request", "CustomExit"];
+        let question = "from CustomEntry through CustomDispatcher to CustomExit";
+        let names = ["CustomEntry", "CustomDispatcher", "CustomExit"];
         let (sufficiency, claims) = production_route_sufficiency_with_probes(
             question,
             &names,
             &[
-                ("CustomEntry", "dispatch_request"),
-                ("dispatch_request", "CustomExit"),
+                ("CustomEntry", "CustomDispatcher"),
+                ("CustomDispatcher", "CustomExit"),
             ],
-            &["dispatch_request".to_string()],
+            &["CustomDispatcher".to_string()],
         );
 
         assert_eq!(
@@ -2835,12 +3471,16 @@ mod tests {
             PacketSufficiencyStatusDto::Sufficient,
             "{sufficiency:?}"
         );
-        assert!(claims.iter().any(|claim| {
-            claim.coverage_role.as_deref() == Some("source evidence")
-                && claim.citations.iter().any(|citation| {
-                    citation.display_name == "CustomEntry" || citation.display_name == "CustomExit"
-                })
-        }));
+        for endpoint in ["CustomEntry", "CustomExit"] {
+            assert!(claims.iter().any(|claim| {
+                claim.coverage_role.as_deref() == Some(PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE)
+                    && claim.proof_status == Some(PacketProofStatusDto::Proven)
+                    && claim
+                        .citations
+                        .iter()
+                        .any(|citation| citation.display_name == endpoint)
+            }));
+        }
         assert!(
             claims
                 .iter()
@@ -2866,19 +3506,19 @@ mod tests {
 
     #[test]
     fn production_claims_prove_explicit_packaged_runtime_route() {
-        let question = "`plugin launcher` through `stdio transport` via `runtime packet orchestration` to `retrieval` to `packet sufficiency`";
+        let question = "PluginLauncher -> StdioTransport -> RuntimePacket -> RetrievalStage -> PacketSufficiency";
         let names = [
-            "plugin launcher",
-            "stdio transport",
-            "runtime packet orchestration",
-            "retrieval",
-            "packet sufficiency",
+            "PluginLauncher",
+            "StdioTransport",
+            "RuntimePacket",
+            "RetrievalStage",
+            "PacketSufficiency",
         ];
         let edges = [
-            ("plugin launcher", "stdio transport"),
-            ("stdio transport", "runtime packet orchestration"),
-            ("runtime packet orchestration", "retrieval"),
-            ("retrieval", "packet sufficiency"),
+            ("PluginLauncher", "StdioTransport"),
+            ("StdioTransport", "RuntimePacket"),
+            ("RuntimePacket", "RetrievalStage"),
+            ("RetrievalStage", "PacketSufficiency"),
         ];
         let (sufficiency, claims) = production_route_sufficiency(question, &names, &edges);
 
@@ -3491,7 +4131,7 @@ mod tests {
             runtime_path.to_string(),
         ];
         let sufficiency =
-            assemble_packet_sufficiency_with_probe_context(input(), &[], &exact_paths);
+            assemble_packet_sufficiency_with_probe_context(input(), &[], &exact_paths, None);
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         assert!(
@@ -3674,6 +4314,7 @@ mod tests {
             },
             &[],
             &exact_paths,
+            None,
         );
 
         assert_eq!(
@@ -5364,9 +6005,18 @@ mod tests {
         mark_full_retrieval_available(&mut answer);
         let budget = compact_truncated_budget(question, vec!["citations", "trail_edges"]);
         let claims = vec![
-            claim("Buffer is the in-memory byte store used by buffered reads and writes."),
-            claim("A buffered source wrapper reads from an upstream Source into a Buffer."),
-            claim("A buffered sink wrapper writes buffered bytes to an upstream Sink."),
+            evidence_claim(
+                "Buffer is the in-memory byte store used by buffered reads and writes.",
+                anchor_at("Buffer", "src/io/buffer.rs"),
+            ),
+            evidence_claim(
+                "Buffer::read moves bytes from an upstream source through the buffer.",
+                anchor_at("Buffer::read", "src/io/buffer.rs"),
+            ),
+            evidence_claim(
+                "Buffer::write moves buffered bytes to an upstream sink.",
+                anchor_at("Buffer::write", "src/io/buffer.rs"),
+            ),
         ];
 
         let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
@@ -5381,6 +6031,13 @@ mod tests {
         });
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        for requirement in ["buffered_storage", "buffered_read_write"] {
+            assert!(
+                !report.missing.contains(&requirement.to_string()),
+                "the fixture must cover flow roles so only compact proof omission drives repair: {report:?}"
+            );
+        }
         assert!(
             sufficiency
                 .gaps
@@ -5700,6 +6357,7 @@ mod tests {
             ],
         );
         answer.retrieval_trace.packet_sidecar_diagnostics = vec![
+            unresolved_sidecar_diagnostic("response send"),
             unresolved_sidecar_diagnostic("response send helper"),
             unresolved_sidecar_diagnostic("helpers"),
         ];
@@ -5739,7 +6397,7 @@ mod tests {
                 answer: &answer,
                 budget: &budget,
                 supported_claims: claims,
-                missing_required_probe_queries: Vec::new(),
+                missing_required_probe_queries: vec!["response send".to_string()],
                 targeted_follow_up_queries: Vec::new(),
             },
             &[
@@ -5757,7 +6415,11 @@ mod tests {
         assert!(report.missing.is_empty());
         assert_eq!(
             report.unresolved,
-            vec!["response send helper".to_string(), "helpers".to_string()]
+            vec![
+                "response send".to_string(),
+                "response send helper".to_string(),
+                "helpers".to_string(),
+            ]
         );
     }
 
@@ -5772,6 +6434,8 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Selected callback invocation happens.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
                 proof_status: None,
                 required_evidence_role: None,
                 citations: Vec::new(),
@@ -5780,6 +6444,8 @@ mod tests {
             },
             PacketClaimDto {
                 claim: "Selected handler invocation happens.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
                 proof_status: None,
                 required_evidence_role: None,
                 citations: Vec::new(),
@@ -5844,6 +6510,8 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Selected callback invocation happens.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
                 proof_status: None,
                 required_evidence_role: None,
                 citations: Vec::new(),
@@ -5852,6 +6520,8 @@ mod tests {
             },
             PacketClaimDto {
                 claim: "Selected handler invocation happens.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
                 proof_status: None,
                 required_evidence_role: None,
                 citations: Vec::new(),
@@ -6574,6 +7244,7 @@ mod tests {
                 },
                 &[],
                 &exact_paths,
+                None,
             );
 
             assert_ne!(
@@ -6626,6 +7297,7 @@ mod tests {
             },
             &[],
             &exact_paths,
+            None,
         );
 
         let path_gaps = sufficiency
@@ -6913,6 +7585,7 @@ mod tests {
             },
             &[],
             &route_paths.map(str::to_string),
+            None,
         );
 
         assert_eq!(

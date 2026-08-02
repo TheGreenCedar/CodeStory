@@ -45,7 +45,9 @@ cargo test -p codestory-cli --test packet_search_eval
 
 This non-ignored command is the CI-safe packet/search gate. It validates fixture
 schema, category coverage, baselines, and non-full-mode behavior without claiming
-live retrieval readiness.
+live retrieval readiness. Schema v2's sufficiency counts, obligation proof-status
+counts, and per-category verdict causes are source-fixture contract values in this
+gate; they are not installed-runtime or protected-host calibration evidence.
 
 The live production-path check is ignored by default because it repairs and
 requires `retrieval_mode=full` agent retrievals for the checkout:
@@ -56,6 +58,8 @@ cargo test -p codestory-cli --test packet_search_eval -- --ignored --nocapture p
 
 Rows where readiness is not `ready` or retrieval mode is not `full` stay
 diagnostic and do not count toward the full-retrieval baseline.
+The installed negative/positive controls and fresh full-sidecar counter
+calibration remain tracked in #1351.
 
 ## When To Run
 

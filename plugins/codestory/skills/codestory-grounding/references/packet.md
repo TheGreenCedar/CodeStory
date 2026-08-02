@@ -29,7 +29,11 @@ Use `<codestory-cli> <command> --help` for the complete option set.
   one combined 16-item limit; every string field is limited to 240 characters.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
-  into display-name searches.
+  into display-name searches. Each also creates a material `exact_probe`
+  obligation keyed by its input index, with the structured probe resolution in
+  `probe_binding`. Rejected and ambiguous probes remain blocking receipts;
+  resolved probes are proven only by their own exact path or node carrier, and
+  file-symbol carriers must also preserve the requested symbol identity.
 - A continuation also supplies `contract_version`, `project_id`,
   `core_generation_id`, optional `retrieval_generation`, optional exact
   `symbol_id`, and `query`; reuse fails closed when the selected evidence
@@ -39,3 +43,18 @@ Use `<codestory-cli> <command> --help` for the complete option set.
   packet sufficiency or choose route order.
 - Treat `sufficiency.status=partial` as useful but incomplete evidence. The packet should say which next command would deepen or verify the answer.
 - Architecture, data-flow, and route-tracing sufficiency requires causal flow-role coverage, not just citation or claim counts. Generic "inspect this anchor" claims may guide follow-up, but they do not make a packet safe to answer from.
+- JSON packets include `plan.obligations.version=1`. Material claim obligations must be
+  `proven`, and material query obligations must report `completion.status=completed`,
+  before they can support `sufficiency.status=sufficient`. A claim with
+  `proof_status=reported` names a carrier lead that did not satisfy its typed node-kind and
+  evidence-edge contract; do not treat it as proof or skip opening its file. Default-profile
+  packets retain one material obligation per concrete `binding_terms` request, including terms
+  for which retrieval found no carrier. Every citation carried by a multi-citation claim must bind
+  to a proven obligation; one proven carrier cannot promote another reported carrier.
+- The Markdown Packet Claims section uses fixed-width status markers: `P` proven, `R`
+  reported lead, `L` likely, `D` diagnostic, and `U` unsupported or unclassified. Only `P`
+  claims may be repeated as supported facts; the structured ledger remains authoritative.
+- CLI JSON, HTTP, and MCP consumers can detect the additive `reported` proof-status value through
+  `_meta.codestory_publication.schema_version` and should also inspect
+  `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is surfaced as
+  `contract_runtime.known_override_skew_channel`.

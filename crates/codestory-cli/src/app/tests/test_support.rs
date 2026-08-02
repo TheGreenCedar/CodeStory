@@ -79,6 +79,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                     purpose: "find packet entry points".to_string(),
                 }],
                 probe_resolutions: Vec::new(),
+                obligations: Default::default(),
                 trace: Vec::new(),
             },
             answer: AgentAnswerDto {
@@ -131,6 +132,8 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                 status: PacketSufficiencyStatusDto::Partial,
                 covered_claims: vec![PacketClaimDto {
                     claim: "Packet command is the starting point.".to_string(),
+                    required_obligation_ids: Vec::new(),
+                    required_obligation_kinds: Vec::new(),
                     proof_status: None,
                     required_evidence_role: None,
                     citations: vec![source, test],

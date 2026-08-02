@@ -78,6 +78,13 @@ complete core and retrieval publication identities used by the runtime-owned
 operation. Treat that metadata as the response's evidence boundary rather than
 re-reading status around the call.
 
+The envelope also carries `schema_version` and `contract_runtime`. The latter
+records the active CLI, the launcher-provided plugin/CLI pair, whether that pair
+matches, and whether the explicit `CODESTORY_CLI` skew channel is active. A
+missing schema version is the legacy v0 envelope. CLI JSON, HTTP, and MCP use the
+same stamp. When neither a core nor retrieval identity exists, the stamp remains
+present with `served_from=contract_only`; it must not claim a complete publication.
+
 Local navigation is useful while broad search prepares, but it is not full
 retrieval proof. Trust a broad result only when the requested tool succeeds
 against a current complete publication. Under accelerator-required policy,

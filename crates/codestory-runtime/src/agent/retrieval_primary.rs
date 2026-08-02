@@ -7,9 +7,9 @@ use anyhow::Error as AnyhowError;
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto,
-    PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
-    RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
+    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
+    RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
+    RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
@@ -850,6 +850,12 @@ fn packet_sidecar_query_diagnostic(
         .fold(0_u32, u32::saturating_add);
     PacketSidecarQueryDiagnosticDto {
         query: query_result.query.clone(),
+        completion: sidecar_blocking_cancel_reason(query_result).map_or(
+            PacketQueryCompletionDto::Completed,
+            |reason| PacketQueryCompletionDto::Cancelled {
+                reason: reason.to_string(),
+            },
+        ),
         retrieval_mode: query_result.trace.retrieval_mode.clone(),
         sidecar_query_ms: Some(sidecar_query_ms),
         candidate_resolution_ms: Some(candidate_resolution_ms),
@@ -3662,6 +3668,10 @@ mod tests {
         assert_eq!(empty_diagnostic.resolved_hit_count, 0);
         assert_eq!(empty_diagnostic.unresolved_candidate_count, 0);
         assert!(empty_diagnostic.diagnostic.is_none());
+        assert_eq!(
+            empty_diagnostic.completion,
+            PacketQueryCompletionDto::Completed
+        );
 
         let unresolved = QueryResult {
             publication_identity: None,
@@ -3700,6 +3710,10 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("did not all resolve"))
         );
+        assert_eq!(
+            unresolved_diagnostic.completion,
+            PacketQueryCompletionDto::Completed
+        );
 
         let cancelled = QueryResult {
             publication_identity: None,
@@ -3733,6 +3747,12 @@ mod tests {
         assert_eq!(
             cancelled_diagnostic.diagnostic.as_deref(),
             Some("sidecar query has blocking cancel reason `stage_deadline`")
+        );
+        assert_eq!(
+            cancelled_diagnostic.completion,
+            PacketQueryCompletionDto::Cancelled {
+                reason: "stage_deadline".to_string()
+            }
         );
     }
 

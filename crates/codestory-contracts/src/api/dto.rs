@@ -2314,6 +2314,8 @@ pub struct RetrievalShadowDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct PacketSidecarQueryDiagnosticDto {
     pub query: String,
+    #[serde(default)]
+    pub completion: PacketQueryCompletionDto,
     pub retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_query_ms: Option<u32>,
@@ -2408,6 +2410,102 @@ pub enum PacketTaskClassDto {
     SymbolOwnership,
     DataFlow,
     EditPlanning,
+}
+
+pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketClaimObligationKindDto {
+    Entrypoint,
+    Dispatch,
+    Orchestration,
+    StateWrite,
+    ExternalIo,
+    ExactProbe,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketQueryObligationKindDto {
+    RequiredFlow,
+    RequiredProbe,
+    Supplemental,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PacketQueryCompletionDto {
+    Completed,
+    Cancelled { reason: String },
+}
+
+impl Default for PacketQueryCompletionDto {
+    fn default() -> Self {
+        Self::Cancelled {
+            reason: "completion_missing".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketObligationProofStatusDto {
+    Planned,
+    Proven,
+    Reported,
+    Unsupported,
+    Contradicted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimObligationDto {
+    pub id: String,
+    pub kind: PacketClaimObligationKindDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_terms: Vec<String>,
+    /// Exact typed-probe resolution bound to this material row. Kept structured so input identity,
+    /// requested path/symbol casing, resolved node/path, ambiguity, and rejection cannot be inferred
+    /// from an opaque obligation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_binding: Option<PacketProbeResolutionDto>,
+    pub material: bool,
+    #[serde(default)]
+    pub allowed_node_kinds: Vec<NodeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_edge_kind: Option<EdgeKind>,
+    #[serde(default)]
+    pub requires_complete_discovery: bool,
+    pub proof_status: PacketObligationProofStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carrier_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_next_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketQueryObligationDto {
+    pub id: String,
+    pub kind: PacketQueryObligationKindDto,
+    pub query: String,
+    pub material: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<PacketQueryCompletionDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketObligationPlanDto {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_terms: Vec<String>,
+    #[serde(default)]
+    pub claim_obligations: Vec<PacketClaimObligationDto>,
+    #[serde(default)]
+    pub query_obligations: Vec<PacketQueryObligationDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2578,6 +2676,8 @@ pub struct PacketPlanDto {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_resolutions: Vec<PacketProbeResolutionDto>,
     #[serde(default)]
+    pub obligations: PacketObligationPlanDto,
+    #[serde(default)]
     pub trace: Vec<String>,
 }
 
@@ -2640,6 +2740,9 @@ pub enum PacketSufficiencyStatusDto {
 #[serde(rename_all = "snake_case")]
 pub enum PacketProofStatusDto {
     Proven,
+    /// A carrier reported a behavior, but did not satisfy the planned kind/edge obligation.
+    /// MCP consumers can detect this additive enum value through the publication schema stamp.
+    Reported,
     Likely,
     Diagnostic,
     Unsupported,
@@ -2648,6 +2751,14 @@ pub enum PacketProofStatusDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketClaimDto {
     pub claim: String,
+    /// Exact obligation rows this claim asserts. Every listed row must be proven by one of this
+    /// claim's own citations before the claim can be promoted to proven.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_obligation_ids: Vec<String>,
+    /// Optional category constraints on the exact rows named by `required_obligation_ids`.
+    /// Categories never substitute for exact row identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_obligation_kinds: Vec<PacketClaimObligationKindDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_status: Option<PacketProofStatusDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2992,6 +3103,30 @@ mod packet_tests {
     }
 
     #[test]
+    fn absent_sidecar_query_completion_fails_closed() {
+        let diagnostic: PacketSidecarQueryDiagnosticDto =
+            serde_json::from_value(serde_json::json!({
+                "query": "dispatch",
+                "retrieval_mode": "full",
+                "candidate_count": 0,
+                "resolved_hit_count": 0,
+                "unresolved_candidate_count": 0
+            }))
+            .expect("legacy diagnostic");
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Cancelled {
+                reason: "completion_missing".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(PacketProofStatusDto::Reported).expect("reported status"),
+            serde_json::json!("reported")
+        );
+    }
+
+    #[test]
     fn retrieval_shadow_serializes_snake_case_fields() {
         let shadow = RetrievalShadowDto {
             retrieval_mode: "full".to_string(),
@@ -3066,6 +3201,7 @@ mod packet_tests {
     fn packet_sidecar_query_diagnostic_serializes_timing_fields() {
         let diagnostic = PacketSidecarQueryDiagnosticDto {
             query: "StringUtils".to_string(),
+            completion: PacketQueryCompletionDto::Completed,
             retrieval_mode: "full".to_string(),
             sidecar_query_ms: Some(17),
             candidate_resolution_ms: Some(3),
@@ -3252,6 +3388,8 @@ mod packet_tests {
     fn packet_claim_serializes_machine_checkable_proof_metadata() {
         let value = serde_json::to_value(PacketClaimDto {
             claim: "Dense hits need backing source proof.".to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: Some(PacketProofStatusDto::Diagnostic),
             required_evidence_role: Some(PacketEvidenceTierDto::ExactSource),
             citations: Vec::new(),
@@ -3268,6 +3406,25 @@ mod packet_tests {
                 .expect("deserialize legacy packet claim");
         assert_eq!(legacy.proof_status, None);
         assert_eq!(legacy.required_evidence_role, None);
+        assert!(legacy.required_obligation_ids.is_empty());
+        assert!(legacy.required_obligation_kinds.is_empty());
+    }
+
+    #[test]
+    fn legacy_packet_obligation_defaults_missing_probe_binding() {
+        let legacy: PacketClaimObligationDto = serde_json::from_str(
+            r#"{
+                "id":"legacy",
+                "kind":"orchestration",
+                "material":true,
+                "proof_status":"planned"
+            }"#,
+        )
+        .expect("deserialize obligation written before exact probe bindings");
+
+        assert_eq!(legacy.probe_binding, None);
+        assert!(legacy.binding_terms.is_empty());
+        assert!(legacy.carrier_node_ids.is_empty());
     }
 
     #[test]

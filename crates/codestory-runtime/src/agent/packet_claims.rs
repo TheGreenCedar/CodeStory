@@ -33,7 +33,9 @@ const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 
 pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
     let mut markdown = String::new();
-    markdown.push_str("Supported claims for a compact agent answer:\n");
+    markdown.push_str(
+        "Packet claim status: `P` proven, `R` reported lead, `L` likely, `D` diagnostic, `U` unsupported or unclassified. Only `P` claims support sufficiency.\n",
+    );
     for claim in claims {
         let citation = claim.citations.first();
         let suffix = citation
@@ -41,7 +43,14 @@ pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
             .map(packet_display_path)
             .map(|path| format!(" (`{path}`)"))
             .unwrap_or_default();
-        let _ = writeln!(markdown, "- {}{}", claim.claim, suffix);
+        let status = match claim.proof_status {
+            Some(PacketProofStatusDto::Proven) => "P",
+            Some(PacketProofStatusDto::Reported) => "R",
+            Some(PacketProofStatusDto::Likely) => "L",
+            Some(PacketProofStatusDto::Diagnostic) => "D",
+            Some(PacketProofStatusDto::Unsupported) | None => "U",
+        };
+        let _ = writeln!(markdown, "- [`{status}`] {}{}", claim.claim, suffix);
     }
     markdown
 }
@@ -195,7 +204,7 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "Indexing entrypoint evidence delegates indexing work into the runtime orchestration layer.",
+            "The packet carries independent indexing-entrypoint and runtime-orchestration source anchors.",
             claim_citations,
         );
     }
@@ -210,7 +219,7 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "Runtime orchestration evidence opens workspace/store state and coordinates refresh phases.",
+            "The packet carries independent runtime-orchestration and workspace-planning source anchors.",
             claim_citations,
         );
     }
@@ -224,22 +233,13 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         );
     }
 
-    let workspace_indexer =
-        packet_citation_matching_role(citations, PacketEvidenceRole::IndexingWorkQueue);
     let index_file = packet_citation_matching_role(citations, PacketEvidenceRole::SymbolExtraction);
-    if workspace_indexer.is_some() || index_file.is_some() {
-        let mut claim_citations = Vec::new();
-        if let Some(workspace_indexer) = workspace_indexer {
-            claim_citations.push(workspace_indexer.clone());
-        }
-        if let Some(index_file) = index_file {
-            claim_citations.push(index_file.clone());
-        }
-        packet_push_flow_template_claim_with_citations(
+    if let Some(index_file) = index_file {
+        packet_push_flow_template_claim(
             claims,
             seen,
             "Symbol extraction evidence builds graph nodes, edges, occurrences, and related source data.",
-            claim_citations,
+            Some(index_file),
         );
     }
 
@@ -280,10 +280,28 @@ fn packet_citation_matching_role(
     citations: &[AgentCitationDto],
     role: PacketEvidenceRole,
 ) -> Option<AgentCitationDto> {
-    citations
+    let matching = citations
         .iter()
-        .find(|citation| packet_evidence_role(citation) == Some(role))
-        .cloned()
+        .filter(|citation| packet_evidence_role(citation) == Some(role));
+    if role == PacketEvidenceRole::SymbolExtraction {
+        return matching
+            .min_by_key(|citation| packet_symbol_extraction_witness_rank(citation))
+            .cloned();
+    }
+    matching.into_iter().next().cloned()
+}
+
+fn packet_symbol_extraction_witness_rank(citation: &AgentCitationDto) -> u8 {
+    let display = normalize_identifier(&citation.display_name);
+    if display == "indexfile" || display.ends_with("indexfile") {
+        0
+    } else if display.contains("extract") || display.contains("symbol") {
+        1
+    } else if display.contains("indexer") {
+        2
+    } else {
+        3
+    }
 }
 
 fn packet_append_source_derived_flow_claims(
@@ -300,7 +318,11 @@ fn packet_append_source_derived_flow_claims(
         for claim in packet_source_derived_claims_for_citation(prompt, citation, &source) {
             let claim_citation =
                 packet_preferred_source_derived_claim_citation(&claim, citation, citations);
-            packet_push_flow_template_claim(claims, seen, &claim, Some(claim_citation));
+            // The pending source-derived profiles still return prose only, so they cannot declare
+            // which sibling flow obligation the prose asserts. Keep the evidence visible, but do
+            // not let a citation's broad role promote every phase-specific sentence it happened
+            // to emit. Contracted profiles must return explicit obligation bindings first.
+            packet_push_unbound_reported_claim(claims, seen, &claim, Some(claim_citation));
             if claims.len() >= 18 {
                 return;
             }
@@ -563,11 +585,35 @@ fn packet_push_flow_template_claim_with_citations(
     }
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
+        required_obligation_ids: Vec::new(),
+        required_obligation_kinds: Vec::new(),
         proof_status: None,
         required_evidence_role: None,
         citations,
         coverage_role: Some("flow template".to_string()),
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: Some(false),
+    });
+}
+
+fn packet_push_unbound_reported_claim(
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+    claim_text: &str,
+    citation: Option<AgentCitationDto>,
+) {
+    let key = normalize_identifier(claim_text);
+    if key.is_empty() || !seen.insert(key) {
+        return;
+    }
+    claims.push(PacketClaimDto {
+        claim: claim_text.to_string(),
+        required_obligation_ids: Vec::new(),
+        required_obligation_kinds: Vec::new(),
+        proof_status: None,
+        required_evidence_role: None,
+        citations: citation.into_iter().collect(),
+        coverage_role: Some("source-derived lead".to_string()),
+        eligible_for_sufficiency: Some(false),
     });
 }
 
@@ -595,6 +641,8 @@ pub(crate) fn append_ranked_citation_claims(
             if seen_claims.insert(key) {
                 claims.push(PacketClaimDto {
                     claim: shaped,
+                    required_obligation_ids: Vec::new(),
+                    required_obligation_kinds: Vec::new(),
                     proof_status: None,
                     required_evidence_role: None,
                     citations: vec![citation.clone()],
@@ -626,11 +674,13 @@ pub(crate) fn append_ranked_citation_claims(
         }
         claims.push(PacketClaimDto {
             claim: packet_claim_for_role(role, citation, prompt, rank_terms),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: None,
             required_evidence_role: None,
             citations: vec![citation.clone()],
             coverage_role: Some(role.as_str().to_string()),
-            eligible_for_sufficiency: Some(true),
+            eligible_for_sufficiency: Some(false),
         });
         if claims.len() >= 18 {
             break;
@@ -884,6 +934,8 @@ fn packet_push_claim(
     }
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
+        required_obligation_ids: Vec::new(),
+        required_obligation_kinds: Vec::new(),
         proof_status: None,
         required_evidence_role: None,
         citations: citation.map(|value| vec![value]).unwrap_or_default(),
@@ -1017,6 +1069,41 @@ mod tests {
         NodeKind, PacketProofStatusDto, RetrievalScoreBreakdownDto, SearchHitOrigin,
     };
 
+    #[test]
+    fn packet_claim_markdown_distinguishes_reported_leads_from_proven_claims() {
+        let claims = vec![
+            PacketClaimDto {
+                claim: "The real dispatch edge is present.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
+                proof_status: Some(PacketProofStatusDto::Proven),
+                required_evidence_role: None,
+                citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: Some(true),
+            },
+            PacketClaimDto {
+                claim: "RuntimeVariable coordinates state transitions.".to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
+                proof_status: Some(PacketProofStatusDto::Reported),
+                required_evidence_role: None,
+                citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: Some(false),
+            },
+        ];
+
+        let markdown = packet_flow_claims_markdown(&claims);
+
+        assert!(markdown.contains("[`P`] The real dispatch edge is present."));
+        assert!(
+            markdown.contains("[`R`] RuntimeVariable coordinates state transitions."),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("Supported claims for a compact agent answer"));
+    }
+
     fn test_answer(prompt: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
             answer_id: "packet-claims-test".to_string(),
@@ -1093,6 +1180,8 @@ mod tests {
 
         let mut claims = vec![PacketClaimDto {
             claim: "Runtime dispatch is covered.".to_string(),
+            required_obligation_ids: Vec::new(),
+            required_obligation_kinds: Vec::new(),
             proof_status: None,
             required_evidence_role: None,
             citations: vec![generated, dense],

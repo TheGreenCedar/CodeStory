@@ -1,6 +1,6 @@
 {
   "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion, and total_markers must equal the number of markers listed below, so this file cannot grow without a reviewable diff that raises a stated number.",
-  "total_markers": 183,
+  "total_markers": 182,
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
@@ -58,7 +58,6 @@
       "reason": "Claim assembly names holdout storage engines when it decides a claim is source-backed. The check has to move to what the indexed file says about itself.",
       "markers": {
         "SourceGroup": 1,
-        "foreignkey": 1,
         "json_output": 2
       }
     },
