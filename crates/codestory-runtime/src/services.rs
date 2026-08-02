@@ -1756,9 +1756,13 @@ impl PublicOperationService {
         // One public operation derives source freshness at least twice (before
         // and after the build) and the MCP transport wraps the same request in
         // a second public operation. Scoping the freshness verdict memo to the
-        // operation makes those derivations share one content pass instead of
-        // re-hashing every unchanged file. Nested scopes share the outer memo;
-        // the memo never outlives the outermost operation.
+        // operation makes the derivations that ask the same question at the
+        // same instant — this pre-build check, a nested wrapper's pre-build
+        // check, strict retrieval readiness — share one content pass instead of
+        // re-hashing every unchanged file. The post-build check below is not
+        // one of those: it asks whether the source drifted *since*, so it
+        // re-derives from content. Nested scopes share the outer memo; the memo
+        // never outlives the outermost operation.
         let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
@@ -1786,7 +1790,12 @@ impl PublicOperationService {
                             format!("request cancelled during {operation}"),
                         ));
                     }
-                    let after = self.controller.index_freshness_uncached()?;
+                    // Reverified, not `index_freshness_uncached`: this refusal
+                    // exists to catch source that moved while the build ran,
+                    // including a mutation that preserved both mtime and byte
+                    // length. Only re-hashing content sees that, so the
+                    // operation-scoped verdict memo must not answer here.
+                    let after = self.controller.index_freshness_reverified()?;
                     if !index_freshness_admits_operation(&after)
                         && !self.retained_core_allows(operation, publication)
                     {
@@ -2846,10 +2855,13 @@ mod activation_tests {
 
     /// One public operation derives source freshness before and after the
     /// build, and the MCP transport wraps the same request in a second public
-    /// operation. All four derivations answer the same question about the same
-    /// unchanged files, so the operation must read each file's content once.
+    /// operation. The pre-build derivations all ask about the same instant, so
+    /// they share one content pass; every post-build derivation asks whether
+    /// the source moved *since*, so it re-reads content. Four derivations
+    /// therefore cost three passes over the indexed files, not four and not
+    /// one.
     #[test]
-    fn a_warm_public_operation_content_hashes_each_indexed_file_once() {
+    fn a_warm_public_operation_shares_one_pre_build_content_pass() {
         let fixture = ready_activation_fixture();
         let indexed_files = fixture
             .runtime
@@ -2880,23 +2892,89 @@ mod activation_tests {
             .expect("warm public operation");
 
         // Sampled where a response is assembled, so three of the operation's
-        // four freshness derivations have run: the outer pre-build check, and
-        // the nested operation's pre- and post-build checks. The outer
-        // post-build check runs after the response is built.
+        // four freshness derivations have run: the outer pre-build check, the
+        // nested operation's pre-build check, and the nested operation's
+        // post-build check. The outer post-build check runs after the response
+        // is built.
         let counts = observed.expect("a public operation arms the source freshness scope");
         assert_eq!(
             counts.content_hash_reads,
-            u64::from(indexed_files),
-            "a warm operation must perform exactly one content pass over the indexed files"
+            u64::from(indexed_files) * 2,
+            "the two pre-build derivations share one pass; the post-build check \
+             re-reads content because it must see drift the pre-build pass could \
+             not have seen"
         );
         assert_eq!(
             counts.verdict_reuses,
-            u64::from(indexed_files) * 2,
-            "the other freshness derivations must reuse that pass"
+            u64::from(indexed_files),
+            "the nested pre-build derivation must reuse the outer pre-build pass"
         );
         let telemetry = observed_telemetry.expect("the operation publishes its pass counters");
-        assert_eq!(telemetry.content_hash_reads, indexed_files);
-        assert_eq!(telemetry.verdict_reuses, indexed_files * 2);
+        assert_eq!(telemetry.content_hash_reads, indexed_files * 2);
+        assert_eq!(telemetry.verdict_reuses, indexed_files);
+    }
+
+    /// Issue #1700 requires the operation-scoped freshness memo to leave
+    /// same-mtime drift detection intact. The post-build "source inputs changed
+    /// while running {operation}" refusal is the only mechanism that sees a
+    /// mutation preserving both mtime and byte length — metadata alone cannot —
+    /// so the memo must never answer it. Coarse-mtime filesystems, a `git
+    /// checkout` restoring a same-length variant inside one mtime tick, and any
+    /// mtime-preserving tool all produce exactly this shape.
+    #[test]
+    fn a_mid_build_same_mtime_same_length_edit_refuses_instead_of_serving() {
+        let fixture = ready_activation_fixture();
+        let source = fixture.project.path().join("metadata.rs");
+        let original = fs::read(&source).expect("read the indexed source");
+        let original_mtime = fs::metadata(&source)
+            .expect("stat the indexed source")
+            .modified()
+            .expect("indexed source modification time");
+
+        let mut builds = 0_usize;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                builds += 1;
+                let mut drifted = original.clone();
+                let last_byte = drifted.len() - 2;
+                drifted[last_byte] = b'X';
+                assert_ne!(drifted, original, "the drift must change the file's bytes");
+                fs::write(&source, &drifted).expect("apply the mid-build drift");
+                fs::File::options()
+                    .write(true)
+                    .open(&source)
+                    .expect("reopen the drifted source")
+                    .set_modified(original_mtime)
+                    .expect("restore the modification time");
+                let observed = fs::metadata(&source).expect("stat the drifted source");
+                assert_eq!(
+                    observed.len(),
+                    original.len() as u64,
+                    "the drift must preserve the byte length to exercise the guard"
+                );
+                assert_eq!(
+                    observed.modified().expect("drifted modification time"),
+                    original_mtime,
+                    "the drift must preserve the modification time to exercise the guard"
+                );
+                Ok(())
+            })
+            .expect_err("a source mutated mid-operation must not be served");
+
+        assert_eq!(
+            builds, 1,
+            "the first attempt must have been admitted and entered the build, so \
+             the refusal came from the post-build check rather than from pre-flight \
+             admission"
+        );
+        assert_eq!(
+            refusal.code, "project_unavailable",
+            "the bounded retry re-derives freshness from content and now blocks the \
+             second attempt up front: {}",
+            refusal.message
+        );
     }
 
     /// The memo is scoped to the operation, never to the process: the next
@@ -2932,6 +3010,76 @@ mod activation_tests {
             codestory_workspace::source_freshness_counts(),
             None,
             "no scope may outlive the operation that armed it"
+        );
+    }
+
+    fn warm_packet_request() -> codestory_contracts::api::AgentPacketRequestDto {
+        codestory_contracts::api::AgentPacketRequestDto {
+            question: "how does the ready lease source anchor work".to_string(),
+            budget: codestory_contracts::api::PacketBudgetModeDto::default(),
+            task_class: None,
+            probes: Vec::new(),
+            extra_probes: Vec::new(),
+            include_evidence: true,
+            latency_budget_ms: Some(30_000),
+        }
+    }
+
+    /// The readiness cost of a packet has to be readable off the packet itself.
+    ///
+    /// This drives the real production path — `ReadOnlyBrowserService::packet`
+    /// runs a public operation, pins retrieval, and builds a packet through the
+    /// orchestrator — and then reads the wire field the orchestrator populated,
+    /// instead of asserting on a hand-built DTO or on the counter helper. It
+    /// also pins what the pin short-circuit buys: the MCP transport wraps a
+    /// packet request in a *second* public operation, and that wrapper must
+    /// borrow the operation's existing retrieval pin rather than begin a new
+    /// one. Beginning a second pin would re-run strict readiness, so the
+    /// wrapped packet's published pass count must equal the unwrapped one's.
+    #[test]
+    fn a_warm_packet_publishes_its_readiness_cost_and_a_wrapper_adds_no_pass() {
+        let fixture = ready_activation_fixture();
+        let browser = fixture.runtime.browser_service();
+
+        let flat = browser
+            .packet(warm_packet_request())
+            .expect("a warm packet over the ready fixture");
+        let flat_telemetry = flat
+            .answer
+            .retrieval_trace
+            .source_freshness_telemetry
+            .expect("a packet built inside a public operation publishes its pass counters");
+        assert!(
+            flat_telemetry.readiness_fingerprint_passes > 0,
+            "a strict retrieval packet pays at least one whole-repository readiness pass"
+        );
+        assert!(
+            flat_telemetry.content_hash_reads > 0,
+            "a warm packet content-verifies its indexed source at least once"
+        );
+
+        let mut wrapped = None;
+        fixture
+            .runtime
+            .public_operation_service()
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                wrapped = Some(browser.packet(warm_packet_request())?);
+                Ok(())
+            })
+            .expect("the transport wrapper around a packet request");
+        let wrapped_telemetry = wrapped
+            .expect("wrapped packet")
+            .answer
+            .retrieval_trace
+            .source_freshness_telemetry
+            .expect("the wrapped packet publishes its pass counters too");
+
+        assert_eq!(
+            wrapped_telemetry.readiness_fingerprint_passes,
+            flat_telemetry.readiness_fingerprint_passes,
+            "wrapping a packet request in a second public operation must borrow \
+             the outer retrieval pin; beginning a second pin would buy another \
+             whole-repository readiness pass"
         );
     }
 

@@ -33,7 +33,7 @@ pub mod paths;
 pub mod source_freshness;
 pub use source_freshness::{
     SourceFreshnessCounts, SourceFreshnessScope, record_readiness_fingerprint_pass,
-    source_freshness_counts,
+    reverify_from_content as reverify_source_freshness_from_content, source_freshness_counts,
 };
 mod repo_metadata;
 mod repository_hooks;
@@ -1649,7 +1649,10 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     // The hash below is the verification, never a redundant double-check: an
     // mtime mismatch already short-circuited, so this is the only mechanism
     // that sees same-mtime drift. The memo caches that verdict for one armed
-    // operation scope; it never substitutes metadata for content.
+    // operation scope; it never substitutes metadata for content, and any
+    // check whose job is to detect drift *since* an earlier derivation calls
+    // `source_freshness::reverify_from_content` first, which drops the memo so
+    // this hash runs again.
     if let Some(verdict) =
         source_freshness::memoized_verdict(path, observed.modified_ms, observed.len, expected_hash)
     {
@@ -2871,6 +2874,55 @@ mod tests {
             drifted.files_to_index,
             vec![file],
             "a length change is a positive drift signal the memo key must not absorb"
+        );
+        Ok(())
+    }
+
+    /// Drift that preserves BOTH the modification time and the byte length is
+    /// invisible to metadata, so the content hash is the only mechanism that
+    /// sees it. A memoized verdict describes the instant it was taken at, so a
+    /// derivation that must see drift *since* then reverifies from content
+    /// first — and after that call the plan must name the drifted file again.
+    #[test]
+    fn same_mtime_same_length_drift_is_detected_after_reverification() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+        let original_len = fs::metadata(&file)?.len();
+
+        let _scope = SourceFreshnessScope::enter();
+        let clean = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert!(clean.files_to_index.is_empty());
+
+        // Same length, same mtime, different bytes: exactly the coarse-mtime /
+        // mtime-preserving-tool case the content hash exists to catch.
+        fs::write(&file, "fn maim() {}\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        let observed = fs::metadata(&file)?;
+        assert_eq!(
+            observed.len(),
+            original_len,
+            "the drift must preserve the byte length to exercise the guard"
+        );
+        assert_eq!(
+            observed.modified()?,
+            original_mtime,
+            "the drift must preserve the modification time to exercise the guard"
+        );
+
+        source_freshness::reverify_from_content();
+
+        let drifted = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            drifted.files_to_index,
+            vec![file],
+            "reverification must re-read content, which is the only thing that \
+             sees same-mtime same-length drift"
         );
         Ok(())
     }

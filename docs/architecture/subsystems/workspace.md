@@ -55,6 +55,14 @@ inert with no scope armed. `source_freshness_counts` reports the content
 hashes, verdict reuses, and strict-readiness fingerprint passes one scope paid
 for.
 
+A memoized verdict describes one instant, so it may only answer derivations
+asking about that instant. Any check whose job is to detect drift that happened
+*since* an earlier derivation calls `reverify_source_freshness_from_content()`
+first, which drops the recorded verdicts and forces the next derivation to hash
+content again. The runtime's post-build "source inputs changed while running
+{operation}" refusal is exactly such a check, and it is the only mechanism that
+sees a mutation preserving both mtime and byte length.
+
 ## Filesystem safety
 
 - `atomic_file.rs` owns durable temporary-write and rename publication helpers.

@@ -274,6 +274,22 @@ impl AppController {
         ))
     }
 
+    /// Derive source freshness from content, ignoring any verdict the current
+    /// operation already memoized.
+    ///
+    /// `index_freshness_uncached` bypasses the *time-based* freshness cache but
+    /// still consults `codestory_workspace`'s operation-scoped verdict memo, so
+    /// on its own it reports what the operation observed at its first
+    /// derivation. That is correct for a pre-flight admission check and wrong
+    /// for any check that must see drift which happened since: a mutation that
+    /// preserves both mtime and byte length is invisible to metadata, and the
+    /// content hash is the only mechanism that catches it. Callers guarding the
+    /// *end* of an operation use this entry point so the hash runs again.
+    pub(crate) fn index_freshness_reverified(&self) -> Result<IndexFreshnessDto, ApiError> {
+        codestory_workspace::reverify_source_freshness_from_content();
+        self.index_freshness_uncached()
+    }
+
     pub(crate) fn clear_search_state(&self) {
         let mut s = self.state.lock();
         s.node_names.clear();

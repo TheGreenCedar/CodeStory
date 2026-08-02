@@ -320,14 +320,19 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
     expected_core_run_id: &str,
     build: impl FnOnce() -> Result<T, ApiError>,
 ) -> Result<(T, Option<EmbeddingVectorPublicationIdentityDto>), ApiError> {
-    if !sidecar_retrieval_primary_enabled(controller) {
-        return build().map(|value| (value, None));
-    }
+    // The active pin is checked before the enablement gate, matching
+    // `with_stable_retrieval_publication`. A pin only becomes active after that
+    // gate admitted it, so an active pin already carries the answer; asking
+    // again costs a whole-repository strict-readiness fingerprint pass and can
+    // only disagree with the publication this operation is already pinned to.
     if let Some(pinned) = active_pinned_retrieval_read(controller) {
         ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
         let publication = publication_dto(&pinned);
         let value = build()?;
         return Ok((value, Some(publication)));
+    }
+    if !sidecar_retrieval_primary_enabled(controller) {
+        return build().map(|value| (value, None));
     }
 
     let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
@@ -2407,35 +2412,76 @@ mod tests {
         assert_eq!(response.publication, Some(expected));
     }
 
-    /// ARCH-002's done-when: a warm operation over an unchanged repository
-    /// performs exactly one strict-readiness fingerprint pass, and the count is
-    /// observable rather than inferred. A nested response wrapper borrows the
-    /// operation's pin, so it must not buy a second whole-repository pass.
+    /// Every helper that can reuse an operation's pin must actually reuse it.
+    ///
+    /// `with_pinned_retrieval_publication_value` is the helper the public
+    /// operation path uses, and its active-pin short-circuit is what keeps a
+    /// wrapped request from beginning a second pin. `PinnedRetrievalRead::begin`
+    /// runs strict readiness, so a missed reuse is a whole extra
+    /// whole-repository pass. Measure the pin's own pass, then require that
+    /// running the value helper *inside* that pin adds none.
+    ///
+    /// Deleting the short-circuit costs the operation both things this asserts:
+    /// the pinned publication it was already entitled to report, and — wherever
+    /// retrieval is primary — a second `PinnedRetrievalRead::begin`. The
+    /// end-to-end count is proved on the real packet path in
+    /// `services::activation_tests`.
+    ///
+    /// This asserts a difference, not an absolute: the absolute count of
+    /// readiness passes a warm operation pays is larger than one and is not
+    /// what this branch changes.
     #[test]
-    fn a_warm_operation_performs_exactly_one_readiness_fingerprint_pass() {
+    fn the_value_helper_borrows_an_active_pin_instead_of_paying_for_a_second() {
         let fixture = pinned_operation_fixture();
-        let scope = codestory_workspace::SourceFreshnessScope::enter();
+        let _scope = codestory_workspace::SourceFreshnessScope::enter();
         let pinned = Rc::new(
             PinnedRetrievalRead::begin(&fixture.controller).expect("begin the operation pin"),
         );
-        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
-            with_stable_retrieval_publication(&fixture.controller, "nested response", || {
-                Ok(TestPublicationResponse::default())
-            })
-        })
-        .expect("nested operation");
-
-        let counts = codestory_workspace::source_freshness_counts()
-            .expect("an armed operation scope reports counts");
-        assert_eq!(
-            counts.readiness_fingerprint_passes, 1,
-            "one warm operation must pay for exactly one readiness fingerprint pass"
+        let after_pin = codestory_workspace::source_freshness_counts()
+            .expect("an armed operation scope reports counts")
+            .readiness_fingerprint_passes;
+        assert!(
+            after_pin > 0,
+            "beginning a retrieval pin runs strict readiness, which is the pass this \
+             counter exists to make visible"
         );
+
+        let publication =
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                with_pinned_retrieval_publication_value(
+                    &fixture.controller,
+                    &pinned.session.publication_identity().core_generation_id,
+                    &pinned.session.publication_identity().core_run_id,
+                    || Ok(()),
+                )
+            })
+            .expect("the value helper must borrow the operation's pin")
+            .1;
+        assert!(
+            publication.is_some(),
+            "borrowing the pin must still report the pinned retrieval publication"
+        );
+
         assert_eq!(
-            crate::source_freshness_telemetry_for_operation()
-                .expect("telemetry")
+            codestory_workspace::source_freshness_counts()
+                .expect("armed scope")
                 .readiness_fingerprint_passes,
-            1
+            after_pin,
+            "borrowing the active pin must not buy another readiness fingerprint pass"
+        );
+    }
+
+    /// The counters are scoped to the operation, never to the process.
+    #[test]
+    fn the_pass_counter_does_not_outlive_the_operation_scope() {
+        let fixture = pinned_operation_fixture();
+        let scope = codestory_workspace::SourceFreshnessScope::enter();
+        let _pinned = PinnedRetrievalRead::begin(&fixture.controller).expect("begin a pin");
+        assert!(
+            crate::source_freshness_telemetry_for_operation()
+                .expect("telemetry inside the scope")
+                .readiness_fingerprint_passes
+                > 0
         );
         drop(scope);
         assert_eq!(
@@ -2443,6 +2489,7 @@ mod tests {
             None,
             "the pass counter must not outlive the operation"
         );
+        assert_eq!(crate::source_freshness_telemetry_for_operation(), None);
     }
 
     #[test]

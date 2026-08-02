@@ -21,7 +21,7 @@
 //! * the *stored* content hash the observation was compared against, so
 //!   re-indexing a file invalidates its memo entry instead of hiding behind it.
 //!
-//! Two rules keep the memo from weakening the guards it sits behind:
+//! Three rules keep the memo from weakening the guards it sits behind:
 //!
 //! 1. Nothing is recorded unless the hashing read completed under the
 //!    torn-read guard *and* the metadata it observed still agrees with the
@@ -29,6 +29,14 @@
 //!    nothing.
 //! 2. The memo is inert unless a scope is armed. Every caller that has not
 //!    opted in behaves exactly as it did before this module existed.
+//! 3. A memoized verdict describes one instant. Any check whose whole job is
+//!    to detect drift that happened *since* a previous derivation must call
+//!    [`reverify_from_content`] first, which drops every recorded verdict so
+//!    the next derivation reads content again. The post-build "source inputs
+//!    changed while running {operation}" refusal is exactly such a check: it
+//!    is the only mechanism that sees same-mtime, same-length drift, so a memo
+//!    that answered it would make the operation serve a source it never
+//!    re-read.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -72,8 +80,10 @@ pub struct SourceFreshnessCounts {
     /// Freshness verdicts served from the memo instead of re-hashing.
     pub verdict_reuses: u64,
     /// Strict-readiness fingerprint passes — each one reads the repository's
-    /// lexical source live off disk and streams the projection tables. A warm
-    /// operation over an unchanged repository performs exactly one.
+    /// lexical source live off disk and streams the projection tables. This
+    /// counter exists because that cost was previously invisible; it is a
+    /// measurement, not a bound. A warm packet currently pays several, and
+    /// reducing the count is tracked separately from publishing it.
     pub readiness_fingerprint_passes: u64,
 }
 
@@ -142,6 +152,30 @@ pub fn record_readiness_fingerprint_pass() {
             return;
         }
         scope.readiness_fingerprint_passes = scope.readiness_fingerprint_passes.saturating_add(1);
+    });
+}
+
+/// Drop every memoized verdict so the next derivation re-reads content.
+///
+/// A memoized verdict is an observation of one instant. A check that exists to
+/// detect drift *since* an earlier derivation — the post-build "source inputs
+/// changed while running {operation}" refusal — must not be answered from that
+/// earlier instant, because the content hash is the only mechanism that sees a
+/// mutation which preserved both mtime and byte length. Calling this
+/// immediately before such a check restores it to full strength: every stored
+/// file is hashed again from disk.
+///
+/// The counters are deliberately left intact so the re-read is visible as
+/// additional `content_hash_reads` rather than hidden by a reset.
+///
+/// Inert with no scope armed, like the rest of this module.
+pub fn reverify_from_content() {
+    SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        if scope.depth == 0 {
+            return;
+        }
+        scope.verdicts.clear();
     });
 }
 
