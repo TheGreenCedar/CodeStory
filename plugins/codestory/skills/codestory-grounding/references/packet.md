@@ -54,7 +54,8 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 - The Markdown Packet Claims section uses fixed-width status markers: `P` proven, `R`
   reported lead, `L` likely, `D` diagnostic, and `U` unsupported or unclassified. Only `P`
   claims may be repeated as supported facts; the structured ledger remains authoritative.
-- CLI JSON, HTTP, and MCP consumers can detect the additive `reported` proof-status value through
-  `_meta.codestory_publication.schema_version` and should also inspect
-  `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is surfaced as
-  `contract_runtime.known_override_skew_channel`.
+- CLI JSON, HTTP, and MCP consumers detect the `reported` proof-status value through
+  `_meta.codestory_publication.schema_version`, which is `2` for this contract, and should also
+  inspect `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is
+  surfaced as `contract_runtime.known_override_skew_channel`. The stamp rides on the `initialize`
+  result too, so the version is known before the first tool call.

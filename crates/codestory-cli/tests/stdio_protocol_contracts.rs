@@ -965,7 +965,7 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     assert_eq!(
         result.get("protocolVersion"),
         Some(&json!("2024-11-05")),
-        "initialize should echo the requested protocol version: {response}"
+        "initialize should agree to a supported protocol version: {response}"
     );
     assert!(
         result
@@ -988,6 +988,153 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     assert!(
         result.get("capabilities").is_some(),
         "initialize should report server capabilities: {response}"
+    );
+}
+
+/// CR-064 + ARCH-035. `initialize` is the first frame an out-of-repo consumer
+/// sees, so it is where the session's two compatibility identities must be
+/// truthful: the protocol revision the server actually implements, and the
+/// response-schema version that defines the vocabulary of everything after it.
+#[test]
+fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let agreed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-agreed",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    let agreed = assert_success_envelope(&agreed, json!("init-agreed"));
+    assert_eq!(agreed.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol"),
+        Some(&json!({
+            "requested": "2024-11-05",
+            "negotiated": "2024-11-05",
+            "supported": ["2024-11-05"],
+            "status": "agreed",
+            "compatible": true
+        })),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/schema_version"),
+        Some(&json!(2)),
+        "the session-start stamp publishes the v0.17.0 response schema: {agreed}"
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+        Some(&json!(2)),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/served_from"),
+        Some(&json!("contract_only")),
+        "initialize serves no publication and must not claim one: {agreed}"
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),
+        Some(&json!(env!("CARGO_PKG_VERSION"))),
+    );
+
+    let unsupported = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-unsupported",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    let unsupported = assert_success_envelope(&unsupported, json!("init-unsupported"));
+    assert_eq!(
+        unsupported.get("protocolVersion"),
+        Some(&json!("2024-11-05")),
+        "an unimplemented revision must not be echoed back as supported: {unsupported}"
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol"),
+        Some(&json!({
+            "requested": "2025-06-18",
+            "negotiated": "2024-11-05",
+            "supported": ["2024-11-05"],
+            "status": "unsupported_client_revision",
+            "compatible": false
+        })),
+    );
+
+    let defaulted = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-defaulted",
+            "method": "initialize",
+            "params": {"capabilities": {}}
+        }),
+    );
+    let defaulted = assert_success_envelope(&defaulted, json!("init-defaulted"));
+    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(
+        defaulted.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("defaulted")),
+    );
+    assert_eq!(
+        defaulted.pointer("/_meta/codestory_protocol/requested"),
+        Some(&Value::Null),
+    );
+}
+
+/// ARCH-035 + EV-5. `proof_status: "reported"` is a v2 vocabulary value: it
+/// names a carrier lead that failed its typed proof contract. An out-of-repo
+/// reader may only interpret it when the response says which schema produced
+/// it, so every publication-backed tool payload carries the stamp.
+#[test]
+fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-stamp");
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-stamp",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {
+                    "project": fixture.workspace.path(),
+                    "budget": "strict"
+                }
+            }
+        }),
+    );
+    assert_tool_success(&response, json!("ground-stamp"));
+    let result = assert_success_envelope(&response, json!("ground-stamp"));
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/schema_version"),
+        Some(&json!(2)),
+        "a served payload must name the schema its vocabulary belongs to: {response}"
+    );
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+        Some(&json!(2)),
+    );
+    assert_eq!(
+        result.pointer("/_meta/codestory_publication/served_from"),
+        Some(&json!("complete_publication")),
+        "a served payload must name the publication it came from: {response}"
     );
 }
 

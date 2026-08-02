@@ -63,11 +63,18 @@ pub struct IndexPublicationDto {
     pub published_at_epoch_ms: i64,
 }
 
+/// Mode the served publication was produced by.
+///
+/// Emission stays `snake_case`. The PascalCase aliases accept the spelling the
+/// mirrored `IndexMode` request enum emits on the same wire surfaces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexPublicationModeDto {
+    #[serde(alias = "Full")]
     Full,
+    #[serde(alias = "Incremental")]
     Incremental,
+    #[serde(alias = "SemanticProjection")]
     SemanticProjection,
 }
 
@@ -1704,12 +1711,20 @@ pub enum CanonicalRouteKind {
     Hierarchy,
 }
 
+/// Canonical member visibility.
+///
+/// Emission stays `snake_case`. The PascalCase aliases accept the spelling the
+/// mirrored `MemberAccess` enum emits on the same wire surfaces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalMemberVisibility {
+    #[serde(alias = "Public")]
     Public,
+    #[serde(alias = "Protected")]
     Protected,
+    #[serde(alias = "Private")]
     Private,
+    #[serde(alias = "Default")]
     Default,
 }
 
@@ -2152,11 +2167,14 @@ pub struct AgentCitationDto {
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub score: f32,
-    #[serde(default = "default_search_hit_origin")]
+    // `origin` and `resolvable` are required on decode. An absent provenance or
+    // resolvability field once decoded to "indexed symbol" and "resolvable",
+    // which is the wrong direction for evidence: a truncated or older payload
+    // would have claimed parser-backed, followable evidence the producer never
+    // sent. A reader that did not receive the field must fail, not assume.
     pub origin: SearchHitOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SearchTargetDto>,
-    #[serde(default = "default_citation_resolvable")]
     pub resolvable: bool,
     #[serde(default)]
     pub subgraph_id: Option<String>,
@@ -2176,14 +2194,6 @@ pub struct AgentCitationDto {
     pub coverage_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
-}
-
-const fn default_search_hit_origin() -> SearchHitOrigin {
-    SearchHitOrigin::IndexedSymbol
-}
-
-const fn default_citation_resolvable() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2291,12 +2301,10 @@ pub struct RetrievalStageTimingDto {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
-    #[serde(default = "completed_stage_status")]
+    // Required on decode. Defaulting an absent status to "completed" claimed a
+    // finished stage beside a populated `cancel_reason`; a stage whose outcome
+    // was not transmitted has no known outcome.
     pub completion_status: String,
-}
-
-fn completed_stage_status() -> String {
-    "completed".into()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -3939,6 +3947,111 @@ mod packet_tests {
         let omitted = serde_json::to_value(omitted).expect("serialize omitted comment");
         assert!(omitted.get("comment").is_none());
         assert!(omitted.get("category_id").is_none());
+    }
+
+    fn citation_json() -> serde_json::Value {
+        serde_json::json!({
+            "node_id": "node-1",
+            "display_name": "handle_request",
+            "kind": "FUNCTION",
+            "file_path": "src/lib.rs",
+            "line": 10,
+            "score": 1.0,
+            "origin": "text_match",
+            "resolvable": false
+        })
+    }
+
+    #[test]
+    fn absent_citation_provenance_and_resolvability_fail_closed() {
+        // CR-055: the previous defaults decoded an absent field to
+        // "indexed symbol" and "resolvable", inventing parser-backed,
+        // followable evidence the producer never sent.
+        let complete: AgentCitationDto =
+            serde_json::from_value(citation_json()).expect("complete citation decodes");
+        assert_eq!(complete.origin, SearchHitOrigin::TextMatch);
+        assert!(!complete.resolvable);
+
+        for field in ["origin", "resolvable"] {
+            let mut partial = citation_json();
+            partial
+                .as_object_mut()
+                .expect("citation object")
+                .remove(field);
+            let error = serde_json::from_value::<AgentCitationDto>(partial)
+                .expect_err("an absent evidence field must not decode to a permissive default");
+            assert!(
+                error.to_string().contains(field),
+                "the decode failure must name the absent field: {error}"
+            );
+        }
+    }
+
+    fn stage_timing_json() -> serde_json::Value {
+        serde_json::json!({
+            "stage": "stage2_semantic",
+            "elapsed_ms": 40,
+            "cancel_reason": "deadline_exceeded",
+            "completion_status": "cancelled"
+        })
+    }
+
+    #[test]
+    fn absent_stage_completion_status_fails_closed() {
+        // CR-055: defaulting to "completed" claimed a finished stage beside a
+        // populated cancel_reason.
+        let complete: RetrievalStageTimingDto =
+            serde_json::from_value(stage_timing_json()).expect("complete stage decodes");
+        assert_eq!(complete.completion_status, "cancelled");
+
+        let mut partial = stage_timing_json();
+        partial
+            .as_object_mut()
+            .expect("stage object")
+            .remove("completion_status");
+        let error = serde_json::from_value::<RetrievalStageTimingDto>(partial)
+            .expect_err("an absent stage completion status must not decode as completed");
+        assert!(
+            error.to_string().contains("completion_status"),
+            "the decode failure must name the absent field: {error}"
+        );
+    }
+
+    #[test]
+    fn mirrored_publication_mode_accepts_both_casings_and_emits_one() {
+        // CR-032: the same vocabulary is spelled two ways across mirrored wire
+        // fields. Deserialize accepts both; emission is unchanged.
+        for spelling in ["semantic_projection", "SemanticProjection"] {
+            let parsed: IndexPublicationModeDto =
+                serde_json::from_value(serde_json::json!(spelling))
+                    .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, IndexPublicationModeDto::SemanticProjection);
+        }
+        assert_eq!(
+            serde_json::to_value(IndexPublicationModeDto::SemanticProjection)
+                .expect("serialize publication mode"),
+            serde_json::json!("semantic_projection"),
+            "emission must stay snake_case"
+        );
+
+        for spelling in ["protected", "Protected"] {
+            let parsed: CanonicalMemberVisibility =
+                serde_json::from_value(serde_json::json!(spelling))
+                    .unwrap_or_else(|error| panic!("decode {spelling}: {error}"));
+            assert_eq!(parsed, CanonicalMemberVisibility::Protected);
+        }
+        assert_eq!(
+            serde_json::to_value(CanonicalMemberVisibility::Protected)
+                .expect("serialize member visibility"),
+            serde_json::json!("protected"),
+            "emission must stay snake_case"
+        );
+
+        assert!(
+            serde_json::from_value::<IndexPublicationModeDto>(serde_json::json!("SEMANTIC"))
+                .is_err(),
+            "aliases add the mirrored spelling only, not arbitrary casing"
+        );
     }
 }
 
