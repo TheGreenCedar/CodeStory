@@ -516,11 +516,13 @@ fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
     project_dir
         .join(crate::scip_index::SCIP_SYMBOLS_FILE)
         .is_file()
-        && project_dir
-            .join(crate::scip_index::SCIP_INDEX_FILE)
-            .is_file()
+        // `index.scip` is parsed and bound to this generation's revision.
+        // Existence alone let a corrupt-but-present marker publish clean.
+        && crate::scip_index::parse_scip_index_marker(project_dir, &revision).is_ok()
         && project_dir.join("revision.txt").is_file()
-        && !project_dir.join("index.scip.stub").is_file()
+        && !project_dir
+            .join(crate::scip_index::SCIP_STUB_MARKER_FILE)
+            .is_file()
         && crate::scip_index::load_fresh_scip_symbols(project_dir, &revision, generation)
             .ok()
             .flatten()
