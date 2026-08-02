@@ -40,6 +40,7 @@ evidence.
 | --- | --- |
 | Local dev setup and verification lanes | [Contributor setup](contributors/getting-started.md) |
 | Which test proves a claim | [Testing matrix](contributors/testing-matrix.md) |
+| Freeze, promote, publish, and close out a release | [Release runbook](contributors/release-runbook.md) |
 | How CodeStory works internally | [Architecture overview](architecture/overview.md) |
 | How the installed plugin reaches native CodeStory | [Host integration](architecture/host-integration.md) |
 | How a request activates and reads a project | [Runtime execution path](architecture/runtime-execution-path.md) |
@@ -49,6 +50,7 @@ evidence.
 | Language support claims | [Language support](architecture/language-support.md) |
 | Timing and benchmark records | [E2E stats log](testing/codestory-e2e-stats-log.md), [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
 | Research comparisons | [Research handbook](research.md) |
+| Dated architecture and code-review evidence | [August 2026 architecture review](testing/architecture-review-2026-08.md), [August 2026 code review](testing/code-review-2026-08.md) |
 | Docs maintenance | [Documentation checklist](contributors/documentation-maintenance-checklist.md), [templates](templates/) |
 
 ## Common paths
