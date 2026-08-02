@@ -380,7 +380,7 @@ pub(crate) use support::{
     clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
     hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name, preferred_occurrence,
     query_has_symbol_or_literal_signal, read_file_text_limited, read_searchable_file_contents,
-    should_expand_symbol_query,
+    should_expand_symbol_query, source_freshness_telemetry_for_operation,
 };
 #[cfg(test)]
 pub(crate) use support::{apply_hybrid_limits, normalized_hybrid_weights};
@@ -569,6 +569,8 @@ fn clear_search_engine(state: &mut AppState) {
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
     sidecar_query_cache: Arc<Mutex<SidecarQueryCacheState>>,
+    pub(crate) canonical_symbol_names:
+        Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,

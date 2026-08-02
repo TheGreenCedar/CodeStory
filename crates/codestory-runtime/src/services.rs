@@ -1753,6 +1753,13 @@ impl PublicOperationService {
             "public-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
+        // One public operation derives source freshness at least twice (before
+        // and after the build) and the MCP transport wraps the same request in
+        // a second public operation. Scoping the freshness verdict memo to the
+        // operation makes those derivations share one content pass instead of
+        // re-hashing every unchanged file. Nested scopes share the outer memo;
+        // the memo never outlives the outermost operation.
+        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self.controller.index_freshness_uncached()?;
@@ -1845,6 +1852,10 @@ impl PublicOperationService {
             "resource-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
+        // Observational operations derive freshness through the same helpers;
+        // scope them the same way so an observational wrapper around a public
+        // one cannot reintroduce a second content pass.
+        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 if cancelled.load(Ordering::Acquire) {
@@ -2823,6 +2834,97 @@ mod activation_tests {
             .expect("activation coordinator");
         assert!(!state.running);
         assert_eq!(state.ready_lease.as_ref(), Some(&fixture.lease));
+    }
+
+    /// One public operation derives source freshness before and after the
+    /// build, and the MCP transport wraps the same request in a second public
+    /// operation. All four derivations answer the same question about the same
+    /// unchanged files, so the operation must read each file's content once.
+    #[test]
+    fn a_warm_public_operation_content_hashes_each_indexed_file_once() {
+        let fixture = ready_activation_fixture();
+        let indexed_files = fixture
+            .runtime
+            .activation_service()
+            .controller
+            .index_freshness_uncached()
+            .expect("observe indexed inventory")
+            .indexed_file_count;
+        assert!(
+            indexed_files > 0,
+            "the fixture must publish at least one indexed file"
+        );
+
+        let service = fixture.runtime.public_operation_service();
+        let mut observed = None;
+        let mut observed_telemetry = None;
+        service
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                fixture.runtime.public_operation_service().run_with_cancel(
+                    "ground",
+                    Arc::new(AtomicBool::new(false)),
+                    || Ok(()),
+                )?;
+                observed = codestory_workspace::source_freshness_counts();
+                observed_telemetry = crate::source_freshness_telemetry_for_operation();
+                Ok(())
+            })
+            .expect("warm public operation");
+
+        // Sampled where a response is assembled, so three of the operation's
+        // four freshness derivations have run: the outer pre-build check, and
+        // the nested operation's pre- and post-build checks. The outer
+        // post-build check runs after the response is built.
+        let counts = observed.expect("a public operation arms the source freshness scope");
+        assert_eq!(
+            counts.content_hash_reads,
+            u64::from(indexed_files),
+            "a warm operation must perform exactly one content pass over the indexed files"
+        );
+        assert_eq!(
+            counts.verdict_reuses,
+            u64::from(indexed_files) * 2,
+            "the other freshness derivations must reuse that pass"
+        );
+        let telemetry = observed_telemetry.expect("the operation publishes its pass counters");
+        assert_eq!(telemetry.content_hash_reads, indexed_files);
+        assert_eq!(telemetry.verdict_reuses, indexed_files * 2);
+    }
+
+    /// The memo is scoped to the operation, never to the process: the next
+    /// operation re-reads content rather than trusting the previous verdict.
+    #[test]
+    fn the_next_public_operation_reverifies_source_content() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let mut first = None;
+        service
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                first = codestory_workspace::source_freshness_counts();
+                Ok(())
+            })
+            .expect("first operation");
+        let mut second = None;
+        service
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                second = codestory_workspace::source_freshness_counts();
+                Ok(())
+            })
+            .expect("second operation");
+
+        let first = first.expect("first scope");
+        let second = second.expect("second scope");
+        assert!(first.content_hash_reads > 0);
+        assert_eq!(
+            second.content_hash_reads, first.content_hash_reads,
+            "a new operation must hash the same files again instead of inheriting verdicts"
+        );
+        assert_eq!(second.verdict_reuses, 0);
+        assert_eq!(
+            codestory_workspace::source_freshness_counts(),
+            None,
+            "no scope may outlive the operation that armed it"
+        );
     }
 
     #[test]

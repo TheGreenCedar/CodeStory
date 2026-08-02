@@ -144,6 +144,7 @@ impl TraceRecorder {
             semantic_fallbacks: Vec::new(),
             annotations: self.annotations,
             packet_claim_profile_telemetry: None,
+            source_freshness_telemetry: None,
             steps: self.steps,
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: self.retrieval_shadow,

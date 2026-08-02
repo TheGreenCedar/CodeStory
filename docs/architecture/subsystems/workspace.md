@@ -43,6 +43,18 @@ verified source hashes where available. They identify new, changed, retained,
 removable, and verified policy-excluded files without depending on a live store
 handle.
 
+A matching modification time never authorises reuse on its own: the content
+hash is the verification, because same-mtime drift is a defended invariant.
+`source_freshness.rs` therefore caches the *verdict*, not the metadata. A
+caller may arm a `SourceFreshnessScope` around one operation; inside it, a
+stored file's verdict is keyed by path, observed mtime, observed byte length,
+and the stored content hash it was compared against, so re-indexing or any
+metadata movement produces a new key. Only a torn-read-clean hash whose
+observed metadata still agrees with the key may be recorded, and the memo is
+inert with no scope armed. `source_freshness_counts` reports the content
+hashes, verdict reuses, and strict-readiness fingerprint passes one scope paid
+for.
+
 ## Filesystem safety
 
 - `atomic_file.rs` owns durable temporary-write and rename publication helpers.
@@ -55,6 +67,8 @@ than validating a pathname and later recursing through it.
 ## Entry points
 
 - `src/lib.rs`: manifests, inventories, relative paths, and refresh plans
+- `src/source_freshness.rs`: operation-scoped freshness verdict memo and its
+  pass counters
 - `src/repository_identity.rs`: repository/project/workspace identity
 - `src/atomic_file.rs`: atomic file publication
 - `src/owned_deletion.rs`: trusted-root deletion

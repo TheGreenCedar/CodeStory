@@ -66,6 +66,7 @@ impl AppController {
                 last_hybrid_instrumentation: None,
             })),
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
+            canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
             events_tx,
             events_rx,
             runtime_config: Arc::new(config),
@@ -278,6 +279,7 @@ impl AppController {
         s.node_names.clear();
         clear_search_engine(&mut s);
         self.sidecar_query_cache.lock().clear();
+        self.canonical_symbol_names.lock().clear();
     }
 
     pub(crate) fn ensure_consistent_read_state(&self, operation: &str) -> Result<(), ApiError> {

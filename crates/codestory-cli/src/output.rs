@@ -4934,6 +4934,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: vec!["semantic retrieval ready".to_string()],
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
                     status: AgentRetrievalStepStatusDto::Ok,
@@ -5077,6 +5078,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
                     status: AgentRetrievalStepStatusDto::Ok,
@@ -5533,6 +5535,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: vec!["weak hits after fallback".to_string()],
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: vec![
                     AgentRetrievalStepDto {
                         kind: AgentRetrievalStepKindDto::Search,

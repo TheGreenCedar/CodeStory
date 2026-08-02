@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
@@ -42,7 +43,7 @@ const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
 struct PinnedRetrievalRead {
     session: PinnedQuerySession,
     project_root: PathBuf,
-    node_names: HashMap<CoreNodeId, String>,
+    node_names: Arc<HashMap<CoreNodeId, String>>,
 }
 
 thread_local! {
@@ -155,6 +156,96 @@ pub(crate) fn active_pinned_retrieval_publication(
     active_pinned_retrieval_read(controller).map(|pinned| publication_dto(&pinned))
 }
 
+/// Canonical display names for exactly one published core generation.
+///
+/// The canonical node table cannot change inside a published core generation —
+/// publication is atomic old-or-new — so streaming the whole table on every
+/// pin re-reads it for an answer that could not have moved. The entry is keyed
+/// by the storage identity plus the full core publication identity, and it is
+/// revalidated against a live row count on every reuse: an in-place mutation
+/// of the table invalidates the entry instead of hiding behind it, which is
+/// the same consistency check the stream itself performs, at O(1).
+pub(crate) struct CachedCanonicalSymbolNames {
+    storage_path: PathBuf,
+    core_generation_id: String,
+    core_run_id: String,
+    row_count: u32,
+    node_names: Arc<HashMap<CoreNodeId, String>>,
+}
+
+impl CachedCanonicalSymbolNames {
+    /// The complete reuse condition. Every component is load-bearing: the
+    /// storage path binds the entry to one database, the core generation and
+    /// run bind it to one publication of that database, and the row count is
+    /// re-observed on every reuse so a canonical table that moved under a
+    /// stable publication cannot be answered from a stale map.
+    fn admits_reuse(
+        &self,
+        storage_path: &Path,
+        publication: &codestory_retrieval::RetrievalPublicationIdentity,
+        observed_rows: u32,
+    ) -> bool {
+        self.storage_path == storage_path
+            && self.core_generation_id == publication.core_generation_id
+            && self.core_run_id == publication.core_run_id
+            && self.row_count == observed_rows
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CanonicalSymbolNamesState {
+    cached: Option<CachedCanonicalSymbolNames>,
+    /// Full canonical-table streams performed by this controller. Publication-
+    /// keyed reuse is only meaningful if it can be observed.
+    stream_count: u64,
+}
+
+impl CanonicalSymbolNamesState {
+    #[cfg(test)]
+    pub(crate) fn stream_count(&self) -> u64 {
+        self.stream_count
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.cached = None;
+    }
+}
+
+fn canonical_symbol_names_for_session(
+    controller: &AppController,
+    storage_path: &Path,
+    session: &PinnedQuerySession,
+) -> Result<Arc<HashMap<CoreNodeId, String>>, ApiError> {
+    let publication = session.publication_identity();
+    let observed_rows = session
+        .storage()
+        .get_canonical_search_symbol_count()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+        })?;
+    {
+        let state = controller.canonical_symbol_names.lock();
+        if let Some(cached) = state.cached.as_ref()
+            && cached.admits_reuse(storage_path, publication, observed_rows)
+        {
+            return Ok(Arc::clone(&cached.node_names));
+        }
+    }
+    let node_names = Arc::new(
+        crate::load_canonical_search_symbols(session.storage(), 10_000, None, |_| Ok(()))?.0,
+    );
+    let mut state = controller.canonical_symbol_names.lock();
+    state.stream_count = state.stream_count.saturating_add(1);
+    state.cached = Some(CachedCanonicalSymbolNames {
+        storage_path: storage_path.to_path_buf(),
+        core_generation_id: publication.core_generation_id.clone(),
+        core_run_id: publication.core_run_id.clone(),
+        row_count: observed_rows,
+        node_names: Arc::clone(&node_names),
+    });
+    Ok(node_names)
+}
+
 impl PinnedRetrievalRead {
     fn begin(controller: &AppController) -> Result<Self, ApiError> {
         let project_root = controller.require_project_root()?;
@@ -162,8 +253,7 @@ impl PinnedRetrievalRead {
         let session =
             PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
                 .map_err(map_pinned_query_error)?;
-        let node_names =
-            crate::load_canonical_search_symbols(session.storage(), 10_000, None, |_| Ok(()))?.0;
+        let node_names = canonical_symbol_names_for_session(controller, &storage_path, &session)?;
         Ok(Self {
             session,
             project_root,
@@ -2151,6 +2241,116 @@ mod tests {
         assert!(active_pinned_retrieval_read(&fixture.controller).is_none());
     }
 
+    fn canonical_stream_count(controller: &AppController) -> u64 {
+        controller.canonical_symbol_names.lock().stream_count()
+    }
+
+    /// The canonical node table cannot move inside a published core
+    /// generation, so a second pin on the same publication must reuse the map
+    /// instead of streaming the whole table again.
+    #[test]
+    fn a_second_pin_on_one_publication_reuses_the_canonical_symbol_map() {
+        let fixture = pinned_operation_fixture();
+
+        let first = PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
+        let first_names = Arc::clone(&first.node_names);
+        drop(first);
+        assert_eq!(canonical_stream_count(&fixture.controller), 1);
+
+        let second = PinnedRetrievalRead::begin(&fixture.controller).expect("second pin");
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            1,
+            "a pin on an unchanged publication must not restream the canonical table"
+        );
+        assert_eq!(
+            *second.node_names, *first_names,
+            "the reused map must be the map the stream produced"
+        );
+        assert!(
+            Arc::ptr_eq(&second.node_names, &first_names),
+            "the reused map must be the cached allocation, not a fresh clone"
+        );
+    }
+
+    /// Publication-keyed means keyed by the publication: a new core generation
+    /// describes a different canonical table and must be streamed again.
+    #[test]
+    fn a_new_core_publication_restreams_the_canonical_symbol_map() {
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let fixture = pinned_operation_fixture();
+        PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
+        assert_eq!(canonical_stream_count(&fixture.controller), 1);
+
+        let writer = Store::open(&fixture.storage_path).expect("open publication writer");
+        writer
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 2,
+                generation_id: "22222222-2222-4222-8222-222222222222".into(),
+                run_id: "run-two".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("publish a second core generation");
+        drop(writer);
+        publish_zero_dense_pinned_query_fixture(
+            fixture
+                .controller
+                .require_project_root()
+                .expect("project root")
+                .as_path(),
+            &fixture.storage_path,
+            &fixture.controller.runtime_config,
+        )
+        .expect("republish the retrieval fixture for the new core generation");
+
+        PinnedRetrievalRead::begin(&fixture.controller).expect("pin the new publication");
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            2,
+            "a different core publication must not be answered from the previous map"
+        );
+    }
+
+    /// Fail closed: every component of the reuse condition must be able to
+    /// refuse on its own, including the live row count that makes an in-place
+    /// canonical-table mutation invalidate the entry instead of hiding behind
+    /// it.
+    #[test]
+    fn each_component_of_the_canonical_reuse_condition_can_refuse_on_its_own() {
+        let cached = CachedCanonicalSymbolNames {
+            storage_path: PathBuf::from("/cache/codestory.db"),
+            core_generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            core_run_id: "run-one".into(),
+            row_count: 12,
+            node_names: Arc::new(HashMap::new()),
+        };
+        let publication = codestory_retrieval::RetrievalPublicationIdentity {
+            core_generation_id: cached.core_generation_id.clone(),
+            core_run_id: cached.core_run_id.clone(),
+            sidecar_generation: "sidecar-one".into(),
+            sidecar_input_hash: "hash-one".into(),
+            semantic_generation: "codestory_one".into(),
+        };
+        assert!(cached.admits_reuse(&cached.storage_path.clone(), &publication, 12));
+
+        assert!(
+            !cached.admits_reuse(Path::new("/other/codestory.db"), &publication, 12),
+            "a map read from another database must never be reused"
+        );
+        let mut other_generation = publication.clone();
+        other_generation.core_generation_id = "22222222-2222-4222-8222-222222222222".into();
+        assert!(!cached.admits_reuse(&cached.storage_path.clone(), &other_generation, 12));
+        let mut other_run = publication.clone();
+        other_run.core_run_id = "run-two".into();
+        assert!(!cached.admits_reuse(&cached.storage_path.clone(), &other_run, 12));
+        assert!(
+            !cached.admits_reuse(&cached.storage_path.clone(), &publication, 13),
+            "a canonical table that gained or lost rows must be restreamed"
+        );
+    }
+
     #[test]
     fn nested_complete_operation_attaches_the_outer_pinned_publication() {
         let fixture = pinned_operation_fixture();
@@ -2168,6 +2368,44 @@ mod tests {
             .expect("nested operation");
 
         assert_eq!(response.publication, Some(expected));
+    }
+
+    /// ARCH-002's done-when: a warm operation over an unchanged repository
+    /// performs exactly one strict-readiness fingerprint pass, and the count is
+    /// observable rather than inferred. A nested response wrapper borrows the
+    /// operation's pin, so it must not buy a second whole-repository pass.
+    #[test]
+    fn a_warm_operation_performs_exactly_one_readiness_fingerprint_pass() {
+        let fixture = pinned_operation_fixture();
+        let scope = codestory_workspace::SourceFreshnessScope::enter();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller).expect("begin the operation pin"),
+        );
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            with_stable_retrieval_publication(&fixture.controller, "nested response", || {
+                Ok(TestPublicationResponse::default())
+            })
+        })
+        .expect("nested operation");
+
+        let counts = codestory_workspace::source_freshness_counts()
+            .expect("an armed operation scope reports counts");
+        assert_eq!(
+            counts.readiness_fingerprint_passes, 1,
+            "one warm operation must pay for exactly one readiness fingerprint pass"
+        );
+        assert_eq!(
+            crate::source_freshness_telemetry_for_operation()
+                .expect("telemetry")
+                .readiness_fingerprint_passes,
+            1
+        );
+        drop(scope);
+        assert_eq!(
+            codestory_workspace::source_freshness_counts(),
+            None,
+            "the pass counter must not outlive the operation"
+        );
     }
 
     #[test]

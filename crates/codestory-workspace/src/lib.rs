@@ -30,6 +30,11 @@ pub mod atomic_file;
 pub mod locking;
 pub mod owned_deletion;
 pub mod paths;
+pub mod source_freshness;
+pub use source_freshness::{
+    SourceFreshnessCounts, SourceFreshnessScope, record_readiness_fingerprint_pass,
+    source_freshness_counts,
+};
 mod repo_metadata;
 mod repository_hooks;
 mod repository_identity;
@@ -1599,36 +1604,82 @@ pub fn clamp_system_time_to_epoch_millis(time: std::time::SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-fn modification_time_millis(path: &Path) -> Result<i64> {
+/// The mtime and length one freshness observation was taken at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedFileMetadata {
+    modified_ms: i64,
+    len: u64,
+}
+
+fn observed_file_metadata(path: &Path) -> Result<ObservedFileMetadata> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified()?;
-    Ok(clamp_system_time_to_epoch_millis(modified))
+    Ok(ObservedFileMetadata {
+        modified_ms: clamp_system_time_to_epoch_millis(modified),
+        len: metadata.len(),
+    })
 }
 
 fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
     if !file.indexed || file.retry_required {
         return true;
     }
-    let Ok(mtime) = modification_time_millis(path) else {
+    let Ok(observed) = observed_file_metadata(path) else {
         return true;
     };
-    if mtime != file.modification_time {
+    if observed.modified_ms != file.modification_time {
         return true;
     }
     let Some(expected_hash) = file.content_hash.as_deref() else {
         return false;
     };
-    match current_content_hash(path) {
-        Ok(actual_hash) => actual_hash != expected_hash,
-        Err(_) => true,
+    // The hash below is the verification, never a redundant double-check: an
+    // mtime mismatch already short-circuited, so this is the only mechanism
+    // that sees same-mtime drift. The memo caches that verdict for one armed
+    // operation scope; it never substitutes metadata for content.
+    if let Some(verdict) =
+        source_freshness::memoized_verdict(path, observed.modified_ms, observed.len, expected_hash)
+    {
+        return verdict;
     }
+    source_freshness::record_content_hash_read();
+    let Ok(identity) = read_content_identity(path) else {
+        return true;
+    };
+    let verdict = identity.content_hash != expected_hash;
+    // Only a torn-read-clean observation whose metadata still agrees with the
+    // metadata the key was built from may be memoized. Anything that raced a
+    // writer is recomputed next time.
+    if identity.modified_ms == observed.modified_ms && identity.len == observed.len {
+        source_freshness::record_verdict(
+            path,
+            observed.modified_ms,
+            observed.len,
+            expected_hash,
+            verdict,
+        );
+    }
+    verdict
 }
 
+#[cfg(test)]
 fn current_content_hash(path: &Path) -> Result<String> {
     current_content_identity(path).map(|(content_hash, _)| content_hash)
 }
 
 fn current_content_identity(path: &Path) -> Result<(String, u64)> {
+    let identity = read_content_identity(path)?;
+    Ok((identity.content_hash, identity.len))
+}
+
+/// A content hash plus the metadata it was verified against.
+struct ContentIdentity {
+    content_hash: String,
+    len: u64,
+    modified_ms: i64,
+}
+
+fn read_content_identity(path: &Path) -> Result<ContentIdentity> {
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
     let mut hasher = Sha256::new();
@@ -1644,7 +1695,11 @@ fn current_content_identity(path: &Path) -> Result<(String, u64)> {
     if before.len() != after.len() || before.modified()? != after.modified()? {
         bail!("source metadata changed while hashing {}", path.display());
     }
-    Ok((format!("{:x}", hasher.finalize()), before.len()))
+    Ok(ContentIdentity {
+        content_hash: format!("{:x}", hasher.finalize()),
+        len: before.len(),
+        modified_ms: clamp_system_time_to_epoch_millis(before.modified()?),
+    })
 }
 
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
@@ -2673,6 +2728,137 @@ mod tests {
         )?;
 
         assert_eq!(plan.files_to_index, vec![file]);
+        Ok(())
+    }
+
+    fn indexed_inputs_for(files: &[PathBuf]) -> Result<RefreshInputs> {
+        let mut stored_files = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            stored_files.push(StoredFileState {
+                id: index as i64 + 1,
+                path: file.clone(),
+                modification_time: modification_time_millis(file)?,
+                content_hash: Some(current_content_hash(file)?),
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            });
+        }
+        Ok(RefreshInputs {
+            stored_files,
+            policy_exclusions: Vec::new(),
+            inventory: WorkspaceInventory::default(),
+        })
+    }
+
+    /// One public operation derives source freshness several times (before and
+    /// after the build, again for the second public-operation wrapper, again
+    /// for strict retrieval readiness). Without the operation-scoped verdict
+    /// memo each pass re-hashes every unchanged file.
+    #[test]
+    fn repeated_refresh_planning_in_one_scope_hashes_each_file_once() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let files = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(
+                    &path,
+                    format!("fn {}() {{}}\n", name.trim_end_matches(".rs")),
+                )?;
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = indexed_inputs_for(&files)?;
+        let manifest = WorkspaceManifest::open(root)?;
+
+        let scope = SourceFreshnessScope::enter();
+        for _ in 0..4 {
+            let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            assert!(
+                plan.files_to_index.is_empty(),
+                "unchanged files must stay clean across every pass"
+            );
+        }
+        let counts = source_freshness_counts().expect("an armed scope reports counts");
+        assert_eq!(
+            counts.content_hash_reads, 3,
+            "four freshness passes over three unchanged files must read content exactly once per file"
+        );
+        assert_eq!(counts.verdict_reuses, 9);
+        drop(scope);
+
+        Ok(())
+    }
+
+    /// The memo must not survive the operation that produced it: the next
+    /// operation re-verifies from content.
+    #[test]
+    fn a_new_scope_reverifies_content_instead_of_reusing_the_previous_verdict() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+
+        {
+            let _first = SourceFreshnessScope::enter();
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            assert_eq!(
+                source_freshness_counts()
+                    .expect("armed scope")
+                    .content_hash_reads,
+                1
+            );
+        }
+        {
+            let _second = SourceFreshnessScope::enter();
+            WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+            let counts = source_freshness_counts().expect("armed scope");
+            assert_eq!(
+                counts.content_hash_reads, 1,
+                "a new operation must hash the file again"
+            );
+            assert_eq!(counts.verdict_reuses, 0);
+        }
+        Ok(())
+    }
+
+    /// Same-mtime drift that changes the file's length is caught even inside a
+    /// single armed scope, because the observed length is part of the memo key.
+    #[test]
+    fn same_mtime_drift_that_changes_length_is_detected_inside_one_scope() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let inputs = indexed_inputs_for(std::slice::from_ref(&file))?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let original_mtime = fs::metadata(&file)?.modified()?;
+
+        let _scope = SourceFreshnessScope::enter();
+        let clean = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert!(clean.files_to_index.is_empty());
+
+        fs::write(&file, "fn main() { let drifted = 1; }\n")?;
+        fs::File::open(&file)?.set_modified(original_mtime)?;
+        assert_eq!(
+            fs::metadata(&file)?.modified()?,
+            original_mtime,
+            "the drift must preserve the modification time to exercise the guard"
+        );
+
+        let drifted = WorkspaceDiscovery.build_refresh_plan(&manifest, &inputs)?;
+        assert_eq!(
+            drifted.files_to_index,
+            vec![file],
+            "a length change is a positive drift signal the memo key must not absorb"
+        );
         Ok(())
     }
 

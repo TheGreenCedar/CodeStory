@@ -36,6 +36,16 @@ requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
 
+Work that one publication fixes is cached against that publication's identity
+rather than repeated per pin. The canonical symbol-name map is the example: it
+is keyed by storage path plus the full core publication identity, and its
+stored row count is re-observed on every reuse, so a canonical table that moved
+under a stable publication is restreamed instead of answered from a stale map.
+A public operation also arms a `codestory_workspace::SourceFreshnessScope`, so
+its pre-build check, nested wrappers, and post-build check share one source
+content pass; `AgentRetrievalTraceDto::source_freshness_telemetry` publishes
+the resulting pass counters.
+
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
 engine activation and hold publication leases, but cannot reconfigure the

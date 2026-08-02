@@ -104,6 +104,23 @@ pub(crate) fn clamp_usize_to_u32(v: usize) -> u32 {
     v.min(u32::MAX as usize) as u32
 }
 
+/// Publish the source-freshness counters for the public operation currently
+/// running on this thread.
+///
+/// Returns `None` when no public operation armed a scope, so a response built
+/// outside the runtime's operation boundary reports nothing rather than a
+/// misleading zero.
+pub(crate) fn source_freshness_telemetry_for_operation()
+-> Option<codestory_contracts::api::SourceFreshnessTelemetryDto> {
+    codestory_workspace::source_freshness_counts().map(|counts| {
+        codestory_contracts::api::SourceFreshnessTelemetryDto {
+            content_hash_reads: clamp_u64_to_u32(counts.content_hash_reads),
+            verdict_reuses: clamp_u64_to_u32(counts.verdict_reuses),
+            readiness_fingerprint_passes: clamp_u64_to_u32(counts.readiness_fingerprint_passes),
+        }
+    })
+}
+
 const NL_STOPWORDS: &[&str] = &[
     "a",
     "an",

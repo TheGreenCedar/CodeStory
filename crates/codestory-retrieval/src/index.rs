@@ -1880,6 +1880,11 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     embedding_dim: i32,
     producer_compatibility_identity: &str,
 ) -> Result<SidecarInputFingerprint> {
+    // This pass reads the repository's lexical source live off disk and
+    // streams both projection tables. Record it against the operation scope so
+    // a caller can see how many whole-repository readiness passes one request
+    // paid for.
+    codestory_workspace::record_readiness_fingerprint_pass();
     let lexical_source =
         lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
     let embedding_contract = SidecarEmbeddingContract {
