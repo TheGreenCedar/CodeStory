@@ -278,11 +278,17 @@ pub struct WorkspaceInventoryIssue {
 }
 
 /// Current source candidates plus proof of inventory completeness.
+///
+/// `issues` record inputs discovery could not account for and demote
+/// `outcome`. `warnings` record inputs that are present and indexed but whose
+/// discovery took a degraded route, so a warned inventory stays distinguishable
+/// from a pristine one without refusing service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileInventory {
     pub files: Vec<PathBuf>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
+    pub warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Complete discovery split into parser candidates and verified policy exclusions.
@@ -292,6 +298,7 @@ pub struct WorkspacePolicyFileInventory {
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
+    pub warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
@@ -300,6 +307,7 @@ pub struct WorkspaceRefreshOutcome {
     pub plan: RefreshPlan,
     pub inventory_outcome: WorkspaceInventoryOutcome,
     pub inventory_issues: Vec<WorkspaceInventoryIssue>,
+    pub inventory_warnings: Vec<WorkspaceInventoryIssue>,
 }
 
 /// Refresh plan paired with the complete exclusion set for the same discovery pass.
@@ -832,6 +840,7 @@ impl WorkspaceDiscovery {
                 policy_exclusions: Vec::new(),
                 outcome: inventory.outcome,
                 issues: inventory.issues,
+                warnings: inventory.warnings,
             });
         }
 
@@ -839,6 +848,7 @@ impl WorkspaceDiscovery {
         let mut files = Vec::with_capacity(inventory.files.len());
         let mut policy_exclusions = Vec::new();
         let mut issues = inventory.issues;
+        let warnings = inventory.warnings;
         for path in inventory.files {
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
@@ -902,6 +912,7 @@ impl WorkspaceDiscovery {
             policy_exclusions,
             outcome,
             issues,
+            warnings,
         })
     }
 
@@ -916,6 +927,7 @@ impl WorkspaceDiscovery {
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
         let mut issues = repository_metadata_issues;
+        let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
         let mut inspected_source_roots = 0usize;
         let discovery_exclusions = match observe_discovery_exclusions(manifest) {
             Ok(exclusions) => exclusions,
@@ -930,6 +942,7 @@ impl WorkspaceDiscovery {
                             error.error
                         ),
                     }],
+                    warnings: Vec::new(),
                 });
             }
         };
@@ -1003,6 +1016,7 @@ impl WorkspaceDiscovery {
                             files: all_files,
                             outcome: WorkspaceInventoryOutcome::Bounded,
                             issues,
+                            warnings,
                         });
                     }
                     continue;
@@ -1073,6 +1087,7 @@ impl WorkspaceDiscovery {
                                 files: all_files,
                                 outcome: WorkspaceInventoryOutcome::Bounded,
                                 issues,
+                                warnings,
                             });
                         }
                     }
@@ -1117,10 +1132,17 @@ impl WorkspaceDiscovery {
                                 files: all_files,
                                 outcome: WorkspaceInventoryOutcome::Bounded,
                                 issues,
+                                warnings,
                             });
                         }
                         if !walk_had_errors {
-                            issues.push(WorkspaceInventoryIssue {
+                            // The file is present and indexed; only its
+                            // discovery route was degraded. Recording this as a
+                            // warning keeps the inventory complete (a tracked
+                            // input that could NOT be restored still pushes an
+                            // issue and demotes the outcome) while leaving the
+                            // degradation visible to every inventory consumer.
+                            warnings.push(WorkspaceInventoryIssue {
                                 path: tracked_path.clone(),
                                 message: "repository ignore rules excluded a tracked source; the repository index restored it"
                                     .to_string(),
@@ -1143,6 +1165,7 @@ impl WorkspaceDiscovery {
             files: all_files,
             outcome,
             issues,
+            warnings,
         })
     }
 
@@ -1180,6 +1203,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
@@ -1208,6 +1232,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
@@ -1237,6 +1262,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
@@ -1266,6 +1292,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )?;
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
@@ -1353,6 +1380,7 @@ impl WorkspaceDiscovery {
             inventory.files,
             inventory.outcome,
             inventory.issues,
+            inventory.warnings,
         )
     }
 }
@@ -1363,6 +1391,7 @@ fn build_refresh_outcome_from_inventory(
     current_files: Vec<PathBuf>,
     inventory_outcome: WorkspaceInventoryOutcome,
     inventory_issues: Vec<WorkspaceInventoryIssue>,
+    inventory_warnings: Vec<WorkspaceInventoryIssue>,
 ) -> Result<WorkspaceRefreshOutcome> {
     let workspace_root = manifest.root_dir();
     let stored_map = inputs.inventory_map();
@@ -1411,6 +1440,7 @@ fn build_refresh_outcome_from_inventory(
         },
         inventory_outcome,
         inventory_issues,
+        inventory_warnings,
     })
 }
 
