@@ -2670,8 +2670,11 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
         files.policy_exclusions[0].observed_unit_count,
         codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
     );
-    let workspace_manifest =
-        WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+    let workspace_manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
     let freshness = index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
     assert_eq!(freshness.changed_file_count, 0);
@@ -3073,8 +3076,11 @@ fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_cover
             .iter()
             .any(|entry| entry.role == IndexedFileRoleDto::Vendor)
     );
-    let workspace_manifest =
-        WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+    let workspace_manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
     let freshness = index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
     storage
