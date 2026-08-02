@@ -673,9 +673,10 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
             if status.retrieval_mode == "full" && semantic_point_count.is_some() {
                 let mut manifest = previous.clone();
-                if let Some(generation) = manifest.sidecar_generation.as_deref() {
-                    let scip_dir = layout.scip_project_dir(generation);
-                    if update_precise_semantic_import_status(&scip_dir, &mut manifest)? {
+                if let Some(generation) = manifest.sidecar_generation.clone() {
+                    let scip_dir = layout.scip_project_dir(&generation);
+                    if update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?
+                    {
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
@@ -799,7 +800,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             &mut manifest,
         )
     })?;
-    update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
+    update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?;
 
     manifest.lexical_version = lexical_outcome.version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
@@ -1134,7 +1135,7 @@ fn ensure_scip_artifacts(
         info!(project_id = %project_id, sidecar_generation = %generation, "SCIP graph artifacts reused");
         return Ok(());
     }
-    match emit_scip_artifacts_from_store(storage_path, scip_dir) {
+    match emit_scip_artifacts_from_store(storage_path, scip_dir, generation) {
         Ok(Some(revision)) => {
             manifest.scip_revision = Some(revision.clone());
             info!(project_id = %project_id, sidecar_generation = %generation, %revision, "SCIP graph artifacts emitted from store");
@@ -1151,6 +1152,7 @@ fn ensure_scip_artifacts(
 
 fn update_precise_semantic_import_status(
     scip_dir: &Path,
+    generation: &str,
     manifest: &mut RetrievalIndexManifest,
 ) -> Result<bool> {
     let Some(artifact) = std::env::var_os("CODESTORY_PRECISE_SEMANTIC_SCIP_ARTIFACT") else {
@@ -1159,6 +1161,7 @@ fn update_precise_semantic_import_status(
     let status = import_precise_semantic_scip_artifact(
         Path::new(&artifact),
         &scip_dir.join(SCIP_PRECISE_SEMANTIC_IMPORT_DIR),
+        generation,
     )?;
     manifest.precise_semantic_import_status = Some(status.status);
     manifest.precise_semantic_import_reason = status.reason;
