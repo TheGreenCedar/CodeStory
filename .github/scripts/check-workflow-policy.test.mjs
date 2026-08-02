@@ -2262,6 +2262,39 @@ test("Windows packages one release graph into exact public and private artifacts
     ["the public package stable artifact stops replacing its same-run name", workflow => {
       step(workflow, "Upload release asset").with.overwrite = false;
     }, /public package artifact must contain exactly the archive and its two candidate-local checksum files|stable release artifact/u],
+    ["linker timing regresses to a substring count over the build log", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        /node \.github\/scripts\/windows-link-timing\.mjs select \\\n(?:.*\\\n)*.*\n/u,
+        "linker_rows=\"$(grep -Eic '(^|[[:space:]])time([[:space:](:]|$)' \"$linker_log\" || true)\"\n"
+          + "            echo \"- MSVC /TIME linker rows retained: ${linker_rows}\" >> \"$GITHUB_STEP_SUMMARY\"\n",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["linker timing is selected without the build boundary that bounds it", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        ' \\\n    --build-elapsed-ms "$build_elapsed_ms"',
+        "",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["the linker trace is read from an unwaited process substitution", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        '2> "$linker_log"',
+        '2> >(tee "$linker_log" >&2)',
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
+    ["the Rust compilation interval loses its distinct phase label", workflow => {
+      replaceRun(
+        workflow,
+        "Build package and qualification driver",
+        "- Exact release graph build (cargo_graph):",
+        "- Exact release graph build:",
+      );
+    }, /Windows linker timing must be selected from the explicit link boundary/u],
   ];
 
   for (const [name, mutate, expected] of mutations) {
@@ -2271,6 +2304,47 @@ test("Windows packages one release graph into exact public and private artifacts
       const violations = validateWorkflows(workflows);
       assert.notDeepEqual(violations, []);
       assert.match(violations.join("\n"), expected);
+    });
+  }
+});
+
+test("the declared Windows linker phase cannot drift from the selector it names", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const mutations = [
+    ["the phase is deleted from the claim graph", graph => {
+      delete graph.workflow_policy.windows_package_graph.link_timing;
+    }],
+    ["substring evidence is re-admitted", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.substring_match = true;
+    }],
+    ["the declared evidence stops being an explicit boundary", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.evidence = "build_log_substring";
+    }],
+    ["the declared selector names another script", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.selector =
+        ".github/scripts/cargo-cache-contract.mjs";
+    }],
+    ["the declared receipt schema drifts from the selector", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.record_schema =
+        "codestory.windows-link-timing/v2";
+    }],
+    ["missing timing is made able to invalidate a package", graph => {
+      graph.workflow_policy.windows_package_graph.link_timing.observational = false;
+    }],
+    ["a typed unavailable state disappears from the claim graph", graph => {
+      const timing = graph.workflow_policy.windows_package_graph.link_timing;
+      timing.unavailable_reasons = timing.unavailable_reasons
+        .filter(reason => reason !== "link-exceeds-build-interval");
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const graph = structuredClone(loadReleaseClaimGraph(root));
+      mutate(graph);
+      assert.match(
+        validateWorkflows(loadWorkflows(), graph).join("\n"),
+        /declared Windows linker timing must mirror the selector the workflow runs/u,
+      );
     });
   }
 });

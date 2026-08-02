@@ -460,8 +460,18 @@ node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
 node --test .github/scripts/check-workflow-policy.test.mjs
+node --test .github/scripts/windows-link-timing.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
+
+Windows package timing reports cache restore, native setup, `cargo_graph`,
+`msvc_link`, feature probe, packaging, and artifact transfer as separate
+intervals. `msvc_link` comes from `.github/scripts/windows-link-timing.mjs`,
+which selects explicit `link /TIME` boundaries out of the captured build trace
+and writes `windows-link-timing.json` beside it; a build log that only mentions
+the crate named `time` leaves the phase `unavailable`. Linker timing is
+observational, so an unavailable phase never invalidates an authenticated
+package.
 
 Exact source and package jobs keep dependency downloads, compiler objects, and
 release artifacts separate. Compiler keys end in the exact candidate SHA but

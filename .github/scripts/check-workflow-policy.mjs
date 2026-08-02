@@ -9,6 +9,11 @@ import {
   LOST_RUNNER_ANNOTATION,
   MAXIMUM_RUN_ATTEMPTS,
 } from "./lost-runner-recovery.mjs";
+import {
+  LINK_PHASE as WINDOWS_LINK_PHASE,
+  SCHEMA as WINDOWS_LINK_TIMING_SCHEMA,
+  UNAVAILABLE_REASONS as WINDOWS_LINK_TIMING_REASONS,
+} from "./windows-link-timing.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
 const retrievalFile = "retrieval-engine-smoke.yml";
@@ -987,7 +992,7 @@ const packagedPlatformCloseoutDigest =
 // parsed executable structure so an unreviewed earlier step cannot replace an
 // owner binary while leaving the locally digested finalizer unchanged.
 const packagedPlatformWorkflowDigest =
-  "3767898b5225ab53ffc7a0ebbfa7096c3fd833e33edacfe1d425fc00c2e53995";
+  "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa";
 // The frozen-candidate coordinator and protected GPU workflows are small
 // release-control programs, not loose collections of independently safe
 // fragments. Pin their complete parsed structure so a required check cannot be
@@ -2324,6 +2329,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ".github/scripts/check-workflow-policy.test.mjs",
       ".github/scripts/cargo-cache-contract.mjs",
       ".github/scripts/cargo-cache-contract.test.mjs",
+      ".github/scripts/windows-link-timing.mjs",
+      ".github/scripts/windows-link-timing.test.mjs",
       ".github/scripts/install-codestory-marketplace-proof.mjs",
       ".github/scripts/install-codestory-marketplace-proof.test.mjs",
       ".github/scripts/fixtures/workflow-policy-invalid.json",
@@ -2376,6 +2383,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "node .github/scripts/check-workflow-policy.mjs",
       "node --test .github/scripts/check-workflow-policy.test.mjs",
       "node --test .github/scripts/cargo-cache-contract.test.mjs",
+      // The Windows linker-timing selector is the only thing standing between a
+      // reported `msvc_link` duration and a substring match over the build log,
+      // so its hostile-fixture suite runs wherever the policy itself runs.
+      "node --test .github/scripts/windows-link-timing.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
@@ -4297,6 +4308,46 @@ function validatePackagedProof(workflows, violations, graph) {
       && !/(?:^|\s)--test(?:s)?(?:\s|$)/u.test(packageBuildRun)
       && !/(?:^|\s)--bins(?:\s|$)/u.test(packageBuildRun),
     `${file} host package must build only the production bins and optional qualification driver in one exact Cargo invocation`,
+  );
+  // Windows linker timing was a substring count over the build log, which the
+  // Cargo progress line `Compiling time v0.3.47` satisfied. The reported
+  // `msvc_link` interval must instead come from the explicit link /TIME
+  // boundaries in a captured trace the shell closed before reading it, and it
+  // stays a separate interval from the `cargo_graph` wall clock around it.
+  const linkTimingSelector = shellInvocationsContaining(
+    packageBuildRun,
+    "node .github/scripts/windows-link-timing.mjs select",
+  );
+  add(
+    violations,
+    linkTimingSelector.length === 1
+      && linkTimingSelector[0].includes("--input $linker_log")
+      && linkTimingSelector[0].includes("--out $timing_dir/windows-link-timing.json")
+      && linkTimingSelector[0].includes("--build-elapsed-ms $build_elapsed_ms")
+      && packageBuildRun.includes("2> $linker_log")
+      && !packageBuildRun.includes(">(tee $linker_log")
+      && !packageBuildRun.includes("linker_rows")
+      && shellInvocationsContaining(packageBuildRun, "grep").length === 0
+      && packageBuildRun.includes("- Exact release graph build (cargo_graph): ${build_elapsed_ms} ms"),
+    `${file} Windows linker timing must be selected from the explicit link boundary, not a substring search`,
+  );
+  // The claim graph publishes what a Windows package may say about linking. It
+  // is only a mirror if it matches the selector this workflow actually runs.
+  const declaredLinkTiming = object(
+    object(graph.workflow_policy.windows_package_graph).link_timing,
+  );
+  add(
+    violations,
+    declaredLinkTiming.phase === WINDOWS_LINK_PHASE
+      && declaredLinkTiming.selector === ".github/scripts/windows-link-timing.mjs"
+      && declaredLinkTiming.record_schema === WINDOWS_LINK_TIMING_SCHEMA
+      && declaredLinkTiming.record_file === "windows-link-timing.json"
+      && declaredLinkTiming.evidence === "explicit_link_time_boundary"
+      && declaredLinkTiming.substring_match === false
+      && declaredLinkTiming.observational === true
+      && JSON.stringify(list(declaredLinkTiming.unavailable_reasons))
+        === JSON.stringify(Object.values(WINDOWS_LINK_TIMING_REASONS).sort()),
+    `${file} declared Windows linker timing must mirror the selector the workflow runs`,
   );
   add(
     violations,
