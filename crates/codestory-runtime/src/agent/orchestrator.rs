@@ -110,15 +110,16 @@ use codestory_contracts::api::{
     ApiError, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketObligationPlanDto,
-    PacketPlanDto, PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
-    SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    PacketPlanDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
     AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetDto,
     PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketQueryCompletionDto,
     PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
-    RetrievalShadowDto, SearchMatchQualityDto,
+    RetrievalAnnotationKindDto, RetrievalShadowDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -244,7 +245,7 @@ pub(crate) fn agent_ask(
     )?;
     let freshness = match controller.index_freshness() {
         Ok(freshness) => {
-            trace.annotate(format!(
+            trace.observe(format!(
                 "index_freshness status={:?} duration_ms={} indexed_files={} changed={} new={} removed={}",
                 freshness.status,
                 freshness.duration_ms,
@@ -254,12 +255,14 @@ pub(crate) fn agent_ask(
                 freshness.removed_file_count,
             ));
             if let Some(annotation) = stale_freshness_annotation(&freshness) {
-                trace.annotate(annotation);
+                // A stale index means cited evidence may no longer match the working tree.
+                trace.annotate_gap(annotation);
             }
             Some(freshness)
         }
         Err(error) => {
-            trace.annotate(format!("Index freshness not checked: {}", error.message));
+            // Freshness could not be established, so index drift is unproven.
+            trace.annotate_gap(format!("Index freshness not checked: {}", error.message));
             None
         }
     };
@@ -288,7 +291,7 @@ pub(crate) fn agent_ask(
     bundle.graphs.extend(mermaid_graphs);
     let graph_cap_stats = cap_graph_artifacts(&mut bundle.graphs, GRAPH_ARTIFACT_BUNDLE_BYTE_CAP);
     if graph_cap_stats.truncated {
-        trace.annotate(format!(
+        trace.annotate_gap(format!(
             "Graph artifact bundle truncated at {} bytes; narrow focus or reduce trail depth for complete graph exports.",
             GRAPH_ARTIFACT_BUNDLE_BYTE_CAP
         ));
@@ -335,10 +338,13 @@ pub(crate) fn agent_ask(
         && trace_payload.sla_missed
         && let Some(target_ms) = trace_payload.sla_target_ms
     {
-        trace_payload.annotations.push(format!(
-            "Completeness-first run exceeded SLA target ({} ms > {} ms).",
-            trace_payload.total_latency_ms, target_ms
-        ));
+        // Latency, not evidence: `sla_missed` already carries the confidence consequence.
+        trace_payload
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "Completeness-first run exceeded SLA target ({} ms > {} ms).",
+                trace_payload.total_latency_ms, target_ms
+            )));
     }
 
     tracing::info!(
@@ -415,21 +421,30 @@ pub(crate) fn agent_packet(
         },
     )?;
     if !exact_probe_citations.is_empty() {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_exact_probe_citations appended={}",
-            exact_probe_citations.len()
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_exact_probe_citations appended={}",
+                exact_probe_citations.len()
+            )));
         answer.citations.extend(exact_probe_citations);
     }
+    // Plan telemetry echoes prompt-derived query text; it reports the run, not a gap.
     answer
         .retrieval_trace
         .annotations
-        .push(packet_plan_annotation(&plan));
+        .push(RetrievalAnnotationDto::observation(packet_plan_annotation(
+            &plan,
+        )));
     if retrieval_prompt != question {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_initial_retrieval raw_question_only=true deferred_planned_probe_chars={}",
-            retrieval_prompt.len().saturating_sub(question.len())
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_initial_retrieval raw_question_only=true deferred_planned_probe_chars={}",
+                retrieval_prompt.len().saturating_sub(question.len())
+            )));
     }
     let rank_terms = packet_rank_terms(&question);
     run_packet_anchor_expansion(
@@ -480,13 +495,16 @@ pub(crate) fn agent_packet(
         && let Some(shadow) =
             maybe_run_retrieval_shadow(controller, &question, req.latency_budget_ms)
     {
-        answer.retrieval_trace.annotations.push(format!(
-            "retrieval_shadow mode={} total_ms={} candidates={} would_rank={}",
-            shadow.retrieval_mode,
-            shadow.retrieval_total_ms,
-            shadow.candidates.len(),
-            shadow.would_rank.len()
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "retrieval_shadow mode={} total_ms={} candidates={} would_rank={}",
+                shadow.retrieval_mode,
+                shadow.retrieval_total_ms,
+                shadow.candidates.len(),
+                shadow.would_rank.len()
+            )));
         answer.retrieval_trace.retrieval_shadow = Some(shadow);
     }
     append_packet_step_trace_annotation(&mut answer);
@@ -555,7 +573,12 @@ pub(crate) fn agent_packet(
     enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
-        packet.answer.retrieval_trace.annotations.push(diagnostic);
+        // Failing to export the developer step-trace artifact says nothing about packet evidence.
+        packet
+            .answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(diagnostic));
         let phase_started = Instant::now();
         enforce_packet_output_budget(&project_root, &mut packet);
         append_packet_non_trace_phase(
@@ -573,9 +596,11 @@ fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, start
     answer
         .retrieval_trace
         .annotations
-        .push(packet_non_trace_phase_annotation(
-            label,
-            clamp_u128_to_u32(started_at.elapsed().as_millis()),
+        .push(RetrievalAnnotationDto::observation(
+            packet_non_trace_phase_annotation(
+                label,
+                clamp_u128_to_u32(started_at.elapsed().as_millis()),
+            ),
         ));
 }
 
@@ -654,11 +679,14 @@ fn push_packet_sufficiency_extra_probe(probes: &mut Vec<String>, probe: &str) {
 }
 
 fn append_packet_step_trace_annotation(answer: &mut AgentAnswerDto) {
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_step_trace search_total_ms={} step_count={}",
-        trace_export::search_step_total_ms(answer),
-        answer.retrieval_trace.steps.len()
-    ));
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "packet_step_trace search_total_ms={} step_count={}",
+            trace_export::search_step_total_ms(answer),
+            answer.retrieval_trace.steps.len()
+        )));
 }
 
 fn packet_retrieval_prompt(
@@ -778,14 +806,18 @@ fn maybe_annotate_packet_candidate_window(
             matches_filter,
         ));
     }
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_candidate_trace filter=`{}` candidates={} matched={} max_anchors={} rows={}",
-        filter.replace('`', "'"),
-        answer.citations.len(),
-        matched,
-        limits.max_anchors,
-        rows.join(" | ")
-    ));
+    // Rows echo citation display names and paths; ranking telemetry is never an evidence gap.
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "packet_candidate_trace filter=`{}` candidates={} matched={} max_anchors={} rows={}",
+            filter.replace('`', "'"),
+            answer.citations.len(),
+            matched,
+            limits.max_anchors,
+            rows.join(" | ")
+        )));
 }
 
 fn packet_candidate_matches_trace_terms(
@@ -1060,9 +1092,12 @@ fn maybe_append_sql_schema_file_citations(
     }
 
     if appended_files > 0 || appended_anchors > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
+            )));
     }
 }
 
@@ -1210,9 +1245,15 @@ fn maybe_append_generic_source_shape_citations(
     }
 
     if appended > 0 || skipped_existing > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_generic_source_shape_citations appended={appended} skipped_existing={skipped_existing}"
-        ));
+        // Counters, not evidence: `skipped_existing` here means "already cited", and the legacy
+        // prose heuristic read the word `skipped` as an evidence gap on every packet that
+        // appended generic source-shape citations.
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_generic_source_shape_citations appended={appended} skipped_existing={skipped_existing}"
+            )));
     }
 }
 
@@ -3040,9 +3081,12 @@ fn maybe_append_required_file_scoped_source_citations(
     }
 
     if appended > 0 || file_scoped > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_required_file_scoped_source_citations file_scoped={file_scoped} appended={appended} already_cited={already_cited} no_path={no_path} too_large={too_large} read_failed={read_failed} no_anchor={no_anchor}"
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_required_file_scoped_source_citations file_scoped={file_scoped} appended={appended} already_cited={already_cited} no_path={no_path} too_large={too_large} read_failed={read_failed} no_anchor={no_anchor}"
+            )));
     }
 }
 
@@ -3559,7 +3603,7 @@ fn execute_retrieval(
                 shadow,
             }) => {
                 trace.set_retrieval_shadow(shadow.clone());
-                trace.annotate(format!(
+                trace.observe(format!(
                     "retrieval_primary mode={} candidates={} resolved_hits={}",
                     shadow.retrieval_mode,
                     shadow.candidate_count,
@@ -3619,7 +3663,7 @@ fn execute_retrieval(
             }
             Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
                 trace.set_retrieval_shadow(shadow);
-                trace.annotate(format!(
+                trace.annotate_gap(format!(
                     "retrieval_primary rejected=true fail_closed=true reason={reason}"
                 ));
                 return Err(sidecar_retrieval_unavailable_error(
@@ -3628,7 +3672,7 @@ fn execute_retrieval(
                 ));
             }
             Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
-                trace.annotate(format!(
+                trace.annotate_gap(format!(
                     "retrieval_primary unavailable=true fail_closed=true reason={reason}"
                 ));
                 return Err(sidecar_retrieval_unavailable_error(controller, reason));
@@ -3651,7 +3695,7 @@ fn execute_retrieval(
     let block_nucleo_supplement =
         sidecar_retrieval_blocks_nucleo_supplement(controller, hits.len());
     if block_nucleo_supplement && weak_initial_hits(prompt, &hits) {
-        trace.annotate(
+        trace.annotate_gap(
             "retrieval_primary skipped local nucleo investigation supplement on weak hits",
         );
     }
@@ -3671,7 +3715,7 @@ fn execute_retrieval(
         ) {
             Ok(expanded) => expanded,
             Err(error) => {
-                trace.annotate(format!(
+                trace.annotate_gap(format!(
                     "Investigation query expansion failed; continuing with initial hits: {}",
                     error.message
                 ));
@@ -3691,40 +3735,40 @@ fn execute_retrieval(
         if initial_hit_count == 0 && expansion_added_hits && !literal_diagnostic_signal {
             hits.clear();
             scored_hits.clear();
-            trace.annotate(
+            trace.annotate_gap(
                 "Investigation discarded expansion-only hits for an unanchored natural-language query.",
             );
         }
 
         if weak_initial_hits(prompt, &hits) && literal_diagnostic_signal {
-            trace.annotate(
+            trace.annotate_gap(
                 "Investigation skipped repo-text diagnostics because packet evidence must come from sidecar-backed resolvable hits or direct source reads.",
             );
         } else if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
             if !hits.is_empty() {
                 hits.clear();
                 scored_hits.clear();
-                trace.annotate(
+                trace.annotate_gap(
                     "Investigation discarded low-confidence unanchored hits for a natural-language query.",
                 );
             }
-            trace.annotate(
+            trace.annotate_gap(
                 "Repo-text diagnostics are disabled for packet evidence; weak unanchored hits were not promoted.",
             );
         } else if weak_initial_hits(prompt, &hits) {
-            trace.annotate(
+            trace.observe(
                 "Investigation deferred a broad repo explanation prompt to sidecar evidence only.",
             );
         }
 
         if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
-            trace.annotate("Investigation low confidence gap after sidecar query expansion.");
+            trace.annotate_gap("Investigation low confidence gap after sidecar query expansion.");
         }
     } else if should_investigate(resolved_profile)
         && weak_initial_hits(prompt, &hits)
         && promotable_focus_available
     {
-        trace.annotate(
+        trace.observe(
             "Investigation kept an explicit or prompt-anchored focus instead of broad diagnostics.",
         );
     }
@@ -3747,7 +3791,7 @@ fn execute_retrieval(
             scored_hits.clear();
             bundle.diagnostic_supplement_used = true;
             bundle.repo_explanation_supplement_used = true;
-            trace.annotate(
+            trace.observe(
                 "Investigation used grounding snapshot diagnostic supplement for a broad repo explanation prompt.",
             );
         }
@@ -3756,7 +3800,7 @@ fn execute_retrieval(
         && is_repo_explanation_prompt(prompt)
         && block_nucleo_supplement
     {
-        trace.annotate(
+        trace.annotate_gap(
             "Grounding snapshot supplement skipped because sidecar-primary retrieval is mandatory.",
         );
     }
@@ -3780,8 +3824,9 @@ fn execute_retrieval(
         }
         Err(error) => {
             trace.finish_err(filter_step, error.message.clone());
-            trace
-                .annotate("Trail filter options unavailable; continuing with unsanitized filters.");
+            trace.annotate_gap(
+                "Trail filter options unavailable; continuing with unsanitized filters.",
+            );
             TrailFilterOptionsDto {
                 node_kinds: Vec::new(),
                 edge_kinds: Vec::new(),
@@ -3819,7 +3864,9 @@ fn execute_retrieval(
             }
             Err(error) => {
                 trace.finish_err(neighborhood_step, error.message.clone());
-                trace.annotate("Neighborhood retrieval failed; continuing with trail retrieval.");
+                trace.annotate_gap(
+                    "Neighborhood retrieval failed; continuing with trail retrieval.",
+                );
             }
         }
     } else {
@@ -3877,7 +3924,7 @@ fn execute_retrieval(
                             ),
                             trail_output,
                         );
-                        trace.annotate(trail_truncated_annotation(idx + 1, plan.max_nodes));
+                        trace.annotate_gap(trail_truncated_annotation(idx + 1, plan.max_nodes));
                     } else {
                         trace.finish_ok(trail_step, trail_output);
                     }
@@ -3889,7 +3936,7 @@ fn execute_retrieval(
                 }
                 Err(error) => {
                     trace.finish_err(trail_step, error.message.clone());
-                    trace.annotate(format!("Trail {} failed and was skipped.", idx + 1));
+                    trace.annotate_gap(format!("Trail {} failed and was skipped.", idx + 1));
                 }
             }
         }
@@ -3936,7 +3983,7 @@ fn execute_retrieval(
                 node_occurrence_deadline.to_string(),
             )],
         );
-        trace.annotate("Latency-first cutoff skipped node occurrence lookups.");
+        trace.annotate_gap("Latency-first cutoff skipped node occurrence lookups.");
     } else {
         let mut occurrence_count = 0usize;
         for hit in hits.iter().take(3) {
@@ -3947,7 +3994,7 @@ fn execute_retrieval(
                     occurrence_count += occurrences.len();
                 }
                 Err(error) => {
-                    trace.annotate(format!(
+                    trace.annotate_gap(format!(
                         "Node occurrence lookup failed for {}: {}",
                         hit.display_name, error.message
                     ));
@@ -3977,7 +4024,7 @@ fn execute_retrieval(
                 edge_occurrence_deadline.to_string(),
             )],
         );
-        trace.annotate("Latency-first cutoff skipped edge occurrence lookups.");
+        trace.annotate_gap("Latency-first cutoff skipped edge occurrence lookups.");
     } else if !resolved_profile.include_edge_occurrences {
         trace.finish_skipped(
             edge_occurrences_step,
@@ -4370,7 +4417,7 @@ fn investigate_query_expansion(
             "Skipped query expansion because latency budget was exceeded.",
             vec![field("phase_deadline_ms", expansion_deadline.to_string())],
         );
-        trace.annotate("Latency-first cutoff skipped investigation query expansion.");
+        trace.annotate_gap("Latency-first cutoff skipped investigation query expansion.");
         return Ok(Vec::new());
     }
 
@@ -4500,7 +4547,7 @@ fn maybe_read_source_context(
             "Skipped source read because latency-first phase budget was exceeded.",
             vec![field("phase_deadline_ms", source_deadline.to_string())],
         );
-        trace.annotate("Latency-first cutoff skipped source reads.");
+        trace.annotate_gap("Latency-first cutoff skipped source reads.");
         return None;
     }
 
@@ -4631,7 +4678,7 @@ fn build_mermaid_artifacts(
             "Skipped mermaid synthesis because latency budget was exceeded.",
             vec![field("phase_deadline_ms", mermaid_deadline.to_string())],
         );
-        trace.annotate("Latency-first cutoff skipped mermaid synthesis.");
+        trace.annotate_gap("Latency-first cutoff skipped mermaid synthesis.");
         return artifacts;
     }
 
@@ -8582,8 +8629,8 @@ mod tests {
     #[test]
     fn packet_claim_profile_telemetry_stays_out_of_the_evidence_annotation_channel() {
         // Regression: the fire-rate counters were appended to `retrieval_trace.annotations`,
-        // which packet consumers scan for evidence gaps. `codestory-cli`'s `is_gap_annotation`
-        // substring-matches this vocabulary, so the always-on telemetry lines
+        // which is the packet's evidence-gap channel. The CLI classifier of the day
+        // substring-matched this vocabulary, so the always-on telemetry lines
         // ("profiles_skipped_invalid=0", "skipped=0") were classified as gaps on every packet
         // and downgraded agent confidence from high/ready to medium/review universally.
         // Telemetry must therefore travel on its own typed field.
@@ -8628,12 +8675,16 @@ mod tests {
             answer.retrieval_trace.annotations, annotations_before,
             "assembling packet evidence must not add telemetry to the evidence annotation channel"
         );
+        // EV-6b retired prose classification, so wording alone no longer decides anything. This
+        // loop is retained wording hygiene; per-producer kinds are pinned where the producers
+        // actually run (see `packet_generic_source_shape_citations_are_observations_not_gaps`).
         for annotation in &answer.retrieval_trace.annotations {
-            let lowered = annotation.to_ascii_lowercase();
+            let lowered = annotation.text.to_ascii_lowercase();
             for marker in CLI_GAP_MARKERS {
                 assert!(
                     !lowered.contains(marker),
-                    "packet annotation `{annotation}` reads as evidence gap `{marker}`"
+                    "packet annotation `{}` reads as evidence gap `{marker}`",
+                    annotation.text
                 );
             }
         }
@@ -10403,9 +10454,12 @@ mod tests {
         answer.retrieval_trace.total_latency_ms = 42;
         answer.retrieval_trace.sla_target_ms = Some(1_000);
         answer.retrieval_trace.sla_missed = true;
-        answer.retrieval_trace.annotations.push(
-            "large trace annotation should stay only on the canonical answer trace".repeat(8),
-        );
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(
+                "large trace annotation should stay only on the canonical answer trace".repeat(8),
+            ));
         answer.retrieval_trace.steps = vec![
             AgentRetrievalStepDto {
                 kind: AgentRetrievalStepKindDto::Search,
@@ -10927,7 +10981,7 @@ mod tests {
                 .retrieval_trace
                 .annotations
                 .iter()
-                .any(|annotation| annotation.starts_with("packet_step_trace ")),
+                .any(|annotation| annotation.text.starts_with("packet_step_trace ")),
             "packet step trace annotation should be present before final budget measurement"
         );
         assert!(packet.budget.truncated);
@@ -13094,8 +13148,10 @@ mod tests {
             citation.display_name == "res.send" && citation.kind == NodeKind::METHOD
         });
         let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_required_file_scoped_source_citations ")
-                && annotation.contains("appended=8")
+            annotation
+                .text
+                .starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.text.contains("appended=8")
         });
 
         let _ = std::fs::remove_dir_all(&root);
@@ -13193,10 +13249,64 @@ mod tests {
             );
         }
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_generic_source_shape_citations appended=")
+            annotation
+                .text
+                .starts_with("packet_generic_source_shape_citations appended=")
         }));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_citation_counters_are_observations_not_evidence_gaps() {
+        // EV-6b (#1746). This counter always renders `skipped_existing=`, and the retired CLI
+        // classifier substring-matched "skipped", so every packet that appended generic
+        // source-shape citations reported a phantom evidence gap and fell from high/ready to
+        // medium/review. The counter is telemetry about the run; its kind must say so.
+        let root = packet_temp_root("generic-source-shape-annotation-kind");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/core/application.js",
+            r#"
+            service.init = function init() {
+              this.router = new Router();
+            };
+            service.handle = function handle(req, res, callback) {
+              this.router.handle(req, res, callback);
+            };
+            "#,
+        );
+
+        let prompt = "Trace how a server application registers middleware/routes and handles a request through router and response helpers.";
+        let mut answer = packet_answer_fixture(prompt, Vec::new());
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+
+        let annotation = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .find(|annotation| {
+                annotation
+                    .text
+                    .starts_with("packet_generic_source_shape_citations appended=")
+            })
+            .cloned()
+            .expect("generic source shape scan must record its counters");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            annotation.text.contains("skipped_existing="),
+            "counter must still carry the word the old classifier tripped on: {}",
+            annotation.text
+        );
+        assert_eq!(
+            annotation.kind,
+            RetrievalAnnotationKindDto::Observation,
+            "generic source-shape counters are telemetry, not an evidence gap: {}",
+            annotation.text
+        );
     }
 
     #[test]
@@ -14125,8 +14235,10 @@ mod tests {
                 })
         });
         let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_required_file_scoped_source_citations ")
-                && annotation.contains("appended=1")
+            annotation
+                .text
+                .starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.text.contains("appended=1")
         });
 
         let _ = std::fs::remove_dir_all(&root);
@@ -14195,8 +14307,10 @@ mod tests {
                     .is_some_and(|path| packet_display_path(path).ends_with("src/os.cc"))
         });
         let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_required_file_scoped_source_citations ")
-                && annotation.contains("appended=2")
+            annotation
+                .text
+                .starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.text.contains("appended=2")
         });
 
         let _ = std::fs::remove_dir_all(&root);
@@ -15062,9 +15176,9 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "resolveHandle");
         assert_eq!(answer.citations[1].display_name, "adapters.js");
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.contains("packet_fused_subquery")
-                && annotation.contains("hits=3")
-                && annotation.contains("citations_added=2")
+            annotation.text.contains("packet_fused_subquery")
+                && annotation.text.contains("hits=3")
+                && annotation.text.contains("citations_added=2")
         }));
 
         rank_packet_evidence(prompt, &mut answer);
@@ -15092,7 +15206,9 @@ mod tests {
             Some(path.as_str())
         );
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_required_probe_citations promoted=1")
+            annotation
+                .text
+                .starts_with("packet_required_probe_citations promoted=1")
         }));
 
         let _ = std::fs::remove_dir_all(&root);

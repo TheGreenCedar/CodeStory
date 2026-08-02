@@ -2495,6 +2495,62 @@ pub struct PacketClaimProfileTelemetryDto {
     pub claim_sources: Vec<PacketClaimSourceCountDto>,
 }
 
+/// How a retrieval annotation must be classified by packet consumers.
+///
+/// This discriminant — never the annotation prose — decides whether an annotation counts as an
+/// evidence gap. Classifying by wording made confidence depend on English word choice: a routine
+/// note containing `skipped`, `fallback`, or `weak` downgraded every packet that carried it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalAnnotationKindDto {
+    /// Evidence the packet needed is missing, capped, degraded, or unverified. Consumers treat
+    /// this as an evidence gap and downgrade reported confidence.
+    Gap,
+    /// A routine note about how retrieval ran. Never affects reported confidence, whatever
+    /// words the note happens to contain.
+    Observation,
+}
+
+/// One retrieval annotation carrying its own typed classification.
+///
+/// Producers state the kind at the push site; consumers read [`RetrievalAnnotationDto::kind`].
+/// No consumer may re-derive the classification from [`RetrievalAnnotationDto::text`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+pub struct RetrievalAnnotationDto {
+    /// Typed classification. The only input to gap decisions.
+    pub kind: RetrievalAnnotationKindDto,
+    /// Human-readable note. Diagnostic prose only — never classified.
+    pub text: String,
+}
+
+impl RetrievalAnnotationDto {
+    /// Build a gap annotation: evidence the packet needed is missing or degraded.
+    pub fn gap(text: impl Into<String>) -> Self {
+        Self {
+            kind: RetrievalAnnotationKindDto::Gap,
+            text: text.into(),
+        }
+    }
+
+    /// Build an observation annotation: a routine note that must not move confidence.
+    pub fn observation(text: impl Into<String>) -> Self {
+        Self {
+            kind: RetrievalAnnotationKindDto::Observation,
+            text: text.into(),
+        }
+    }
+
+    /// True when this annotation is an evidence gap.
+    pub fn is_gap(&self) -> bool {
+        self.kind == RetrievalAnnotationKindDto::Gap
+    }
+
+    /// Diagnostic text. Callers must not classify on it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
@@ -2522,10 +2578,12 @@ pub struct AgentRetrievalTraceDto {
     /// Retrieval queries whose semantic stage declined to run or returned only stub candidates.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub semantic_abstained_count: u32,
-    /// Free-text retrieval notes. This is an evidence channel: consumers scan it for gap
-    /// markers. Never publish always-on telemetry here — use a typed field instead.
+    /// Retrieval notes, each carrying a typed [`RetrievalAnnotationKindDto`]. This is an
+    /// evidence channel: consumers count `Gap`-kind entries against reported confidence and
+    /// ignore `Observation`-kind entries entirely. Never publish always-on telemetry here —
+    /// use a typed field instead.
     #[serde(default)]
-    pub annotations: Vec<String>,
+    pub annotations: Vec<RetrievalAnnotationDto>,
     /// Typed claim-profile fire-rate telemetry, kept out of `annotations` by design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packet_claim_profile_telemetry: Option<PacketClaimProfileTelemetryDto>,
@@ -3487,10 +3545,58 @@ mod packet_tests {
     }
 
     #[test]
+    fn retrieval_annotations_serialize_their_kind_alongside_their_text() {
+        // EV-6b (#1746). Gap classification is a wire-visible property of each annotation, not
+        // something a consumer re-derives from the prose. Pin both the shape and the casing:
+        // external MCP clients read this to decide whether an answer has evidence gaps.
+        let trace = AgentRetrievalTraceDto {
+            request_id: "r3".to_string(),
+            retrieval_publication: None,
+            resolved_profile: AgentRetrievalPresetDto::Architecture,
+            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+            total_latency_ms: 10,
+            sla_target_ms: None,
+            sla_missed: false,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
+            annotations: vec![
+                RetrievalAnnotationDto::observation("packet_anchor_probes reduced query_limit=2"),
+                RetrievalAnnotationDto::gap("Latency-first cutoff skipped source reads."),
+            ],
+            packet_claim_profile_telemetry: None,
+            steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
+            retrieval_shadow: None,
+        };
+
+        let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(
+            value["annotations"],
+            serde_json::json!([
+                {
+                    "kind": "observation",
+                    "text": "packet_anchor_probes reduced query_limit=2",
+                },
+                {
+                    "kind": "gap",
+                    "text": "Latency-first cutoff skipped source reads.",
+                },
+            ])
+        );
+
+        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.annotations, trace.annotations);
+        assert!(!parsed.annotations[0].is_gap());
+        assert!(parsed.annotations[1].is_gap());
+    }
+
+    #[test]
     fn packet_claim_profile_telemetry_is_a_typed_trace_field_separate_from_annotations() {
-        // Annotations are the packet's evidence channel; consumers scan the text for gap
-        // markers. Claim-profile counters are always present, so they get their own typed
-        // field and must never be serialized as annotation prose.
+        // Annotations are the packet's evidence channel; `Gap`-kind entries downgrade reported
+        // confidence. Claim-profile counters are always present, so they get their own typed
+        // field and must never be published as annotations at all.
         let telemetry = PacketClaimProfileTelemetryDto {
             contract_version: 1,
             registered_profiles: 20,

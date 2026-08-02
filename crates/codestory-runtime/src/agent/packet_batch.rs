@@ -17,8 +17,8 @@ use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto,
-    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, SearchHit,
-    SearchHitOrigin, SearchMatchQualityDto,
+    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto,
+    RetrievalAnnotationDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -81,10 +81,13 @@ pub(crate) fn run_packet_planned_subqueries(
 ) -> Result<(), ApiError> {
     let limit = packet_subquery_limit(budget);
     if limit == 0 {
+        // Planned subqueries never ran, so their evidence is genuinely absent.
         answer
             .retrieval_trace
             .annotations
-            .push("packet_subqueries skipped budget=tiny".to_string());
+            .push(RetrievalAnnotationDto::gap(
+                "packet_subqueries skipped budget=tiny",
+            ));
         return Ok(());
     }
 
@@ -99,20 +102,26 @@ pub(crate) fn run_packet_planned_subqueries(
         .iter()
         .map(|(_, query)| (query.query.clone(), per_query_limit))
         .collect::<Vec<_>>();
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_subqueries fused_batch={} total={}",
-        batch.len(),
-        pending.len()
-    ));
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "packet_subqueries fused_batch={} total={}",
+            batch.len(),
+            pending.len()
+        )));
 
     let started_at = Instant::now();
     let outcome =
         match controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms())) {
             Ok(outcome) => outcome,
             Err(error) => {
-                answer.retrieval_trace.annotations.push(format!(
-                    "packet_fused_subquery_batch_failed error={error:?}"
-                ));
+                answer
+                    .retrieval_trace
+                    .annotations
+                    .push(RetrievalAnnotationDto::gap(format!(
+                        "packet_fused_subquery_batch_failed error={error:?}"
+                    )));
                 return Err(error);
             }
         };
@@ -144,15 +153,22 @@ pub(crate) fn run_packet_planned_subqueries(
             ));
         }
         if packet_latency.exhausted() {
-            answer.retrieval_trace.annotations.push(format!(
-                "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
-                retry_pending.len()
-            ));
+            // The retry never ran, so those queries contributed no evidence.
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::gap(format!(
+                    "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
+                    retry_pending.len()
+                )));
         } else {
-            answer.retrieval_trace.annotations.push(format!(
-                "packet_fused_blocking_cancel_retry count={}",
-                retry_pending.len()
-            ));
+            answer
+                .retrieval_trace
+                .annotations
+                .push(RetrievalAnnotationDto::observation(format!(
+                    "packet_fused_blocking_cancel_retry count={}",
+                    retry_pending.len()
+                )));
             let retry_batch = retry_pending
                 .iter()
                 .map(|(_, query)| (query.query.clone(), per_query_limit))
@@ -161,9 +177,12 @@ pub(crate) fn run_packet_planned_subqueries(
             let retry_outcome = controller
                 .search_packet_fused_batch(&retry_batch, Some(packet_latency.remaining_ms()))
                 .map_err(|error| {
-                    answer.retrieval_trace.annotations.push(format!(
-                        "packet_fused_blocking_cancel_retry_failed error={error:?}"
-                    ));
+                    answer
+                        .retrieval_trace
+                        .annotations
+                        .push(RetrievalAnnotationDto::gap(format!(
+                            "packet_fused_blocking_cancel_retry_failed error={error:?}"
+                        )));
                     error
                 })?;
             let retry_duration_ms = clamp_u128_to_u32(retry_started_at.elapsed().as_millis());
@@ -188,10 +207,14 @@ pub(crate) fn run_packet_planned_subqueries(
                 retry_outcome.sidecar_diagnostics,
             );
             if !retry_outcome.retryable_queries.is_empty() {
-                answer.retrieval_trace.annotations.push(format!(
-                    "packet_fused_blocking_cancel_retry exhausted count={}",
-                    retry_outcome.retryable_queries.len()
-                ));
+                // Retries were exhausted with queries still unresolved: their evidence is missing.
+                answer
+                    .retrieval_trace
+                    .annotations
+                    .push(RetrievalAnnotationDto::gap(format!(
+                        "packet_fused_blocking_cancel_retry exhausted count={}",
+                        retry_outcome.retryable_queries.len()
+                    )));
             }
         }
     }
@@ -280,7 +303,10 @@ fn annotate_packet_batch_timing(
         diagnostics.len()
     );
     annotation.push_str(&batch_wall_note);
-    answer.retrieval_trace.annotations.push(annotation);
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(annotation));
 }
 
 fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
@@ -370,10 +396,13 @@ pub(crate) fn run_packet_anchor_expansion(
         } else {
             "reduced_probe_budget"
         };
+        // Anchor probes never dispatched, so their evidence is genuinely absent.
         answer
             .retrieval_trace
             .annotations
-            .push(format!("packet_anchor_probes skipped reason={reason}"));
+            .push(RetrievalAnnotationDto::gap(format!(
+                "packet_anchor_probes skipped reason={reason}"
+            )));
         if reason == "latency_budget_exhausted" {
             answer.retrieval_trace.sla_missed = true;
         }
@@ -400,10 +429,13 @@ pub(crate) fn run_packet_anchor_expansion(
         return Ok(());
     }
     if query_limit < packet_anchor_probe_limit(budget) {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_anchor_probes reduced query_limit={query_limit} usage_pct={}",
-            packet_latency.budget_usage_percent(consumed_ms)
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_anchor_probes reduced query_limit={query_limit} usage_pct={}",
+                packet_latency.budget_usage_percent(consumed_ms)
+            )));
     }
 
     let started_at = Instant::now();
@@ -467,13 +499,17 @@ pub(crate) fn run_packet_anchor_expansion(
                     message: Some("Packet symbol probe expanded broad task wording.".to_string()),
                 });
                 let timing_note = packet_anchor_timing_annotation(diagnostic);
-                answer.retrieval_trace.annotations.push(format!(
-                    "packet_anchor_probe query=`{}` hits={} added={}{}",
-                    query.replace('`', "'"),
-                    hits.len(),
-                    added,
-                    timing_note
-                ));
+                // Echoes prompt-derived probe text: telemetry about the run, not a gap.
+                answer
+                    .retrieval_trace
+                    .annotations
+                    .push(RetrievalAnnotationDto::observation(format!(
+                        "packet_anchor_probe query=`{}` hits={} added={}{}",
+                        query.replace('`', "'"),
+                        hits.len(),
+                        added,
+                        timing_note
+                    )));
             }
         }
         Err(error) => {
@@ -487,11 +523,14 @@ pub(crate) fn run_packet_anchor_expansion(
                     output: Vec::new(),
                     message: Some(message.clone()),
                 });
-                answer.retrieval_trace.annotations.push(format!(
-                    "packet_anchor_probe_failed query=`{}` error={}",
-                    query.replace('`', "'"),
-                    message
-                ));
+                answer
+                    .retrieval_trace
+                    .annotations
+                    .push(RetrievalAnnotationDto::gap(format!(
+                        "packet_anchor_probe_failed query=`{}` error={}",
+                        query.replace('`', "'"),
+                        message
+                    )));
             }
             return Err(error);
         }
