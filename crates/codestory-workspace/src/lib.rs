@@ -199,11 +199,7 @@ fn default_source_exclude_patterns() -> Vec<String> {
     .collect()
 }
 
-fn path_with_display_suffix(path: &Path, suffix: &str) -> PathBuf {
-    // Match the sibling naming used by the storage promotion owner.
-    PathBuf::from(format!("{}{}", path.display(), suffix))
-}
-
+#[cfg(test)]
 fn path_with_native_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut suffixed = path.as_os_str().to_os_string();
     suffixed.push(suffix);
@@ -218,55 +214,11 @@ fn storage_parent_for_observation(storage_path: &Path) -> &Path {
 }
 
 fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
-    let rollback_backup = storage_path.with_extension("sqlite.backup");
-    let legacy_search = legacy_search_directory_for_storage(storage_path);
-    let search_generations = search_generation_directory_for_storage(storage_path);
-    let cache_root = storage_parent_for_observation(storage_path);
-    vec![
-        storage_path.to_path_buf(),
-        path_with_native_suffix(storage_path, "-wal"),
-        path_with_native_suffix(storage_path, "-shm"),
-        path_with_native_suffix(storage_path, "-journal"),
-        storage_path.with_extension("index-writer.lock"),
-        path_with_display_suffix(storage_path, ".promotion.lock"),
-        path_with_display_suffix(storage_path, ".promotion.prepared.json"),
-        path_with_display_suffix(storage_path, ".promotion.committed.json"),
-        path_with_display_suffix(storage_path, ".promotion.cleanup-blocked"),
-        rollback_backup.clone(),
-        path_with_native_suffix(&rollback_backup, "-wal"),
-        path_with_native_suffix(&rollback_backup, "-shm"),
-        path_with_native_suffix(&rollback_backup, "-journal"),
-        path_with_native_suffix(&legacy_search, ".lock"),
-        path_with_native_suffix(&search_generations, ".lock"),
-        // The CLI serializes local refresh in the cache root that holds the
-        // storage file; its status, lock, and persistent guard files are
-        // CodeStory-owned state, and the status file is rewritten on a
-        // heartbeat while a refresh runs. Names mirror
-        // crates/codestory-cli/src/local_refresh_status.rs until one shared
-        // owned-artifact registry replaces this enumeration.
-        cache_root.join("local-refresh-status.json"),
-        cache_root.join("local-refresh.lock"),
-        cache_root.join("local-refresh-state.guard"),
-    ]
+    codestory_contracts::owned_artifacts::storage_owned_file_identities(storage_path)
 }
 
 fn storage_owned_staged_discovery_files(storage_path: &Path) -> io::Result<Vec<PathBuf>> {
     let parent = storage_parent_for_observation(storage_path);
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    let extension = storage_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("sqlite");
-    let prefix = format!("{stem}.staged.");
-    let suffixes = [
-        format!(".{extension}"),
-        format!(".{extension}-wal"),
-        format!(".{extension}-shm"),
-        format!(".{extension}-journal"),
-    ];
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -278,24 +230,7 @@ fn storage_owned_staged_discovery_files(storage_path: &Path) -> io::Result<Vec<P
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let Some(candidate) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(unique) = suffixes
-            .iter()
-            .find_map(|suffix| candidate.strip_suffix(suffix))
-        else {
-            continue;
-        };
-        let mut unique_parts = unique.split('-');
-        if unique_parts
-            .next()
-            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            && unique_parts.next().is_some_and(|part| {
-                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-            })
-            && unique_parts.next().is_none()
-        {
+        if codestory_contracts::owned_artifacts::is_staged_snapshot_name(storage_path, &name) {
             owned.push(entry.path());
         }
     }
@@ -764,21 +699,18 @@ impl WorkspaceManifest {
 
 /// Legacy mutable search directory associated with one core database.
 pub fn legacy_search_directory_for_storage(storage_path: &Path) -> PathBuf {
-    storage_owned_sibling_path(storage_path, "search")
+    codestory_contracts::owned_artifacts::search_directory_for_storage(
+        storage_path,
+        codestory_contracts::owned_artifacts::SEARCH_DIRECTORY_SUFFIXES[0],
+    )
 }
 
 /// Immutable search-generation directory associated with one core database.
 pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
-    storage_owned_sibling_path(storage_path, "search-generations")
-}
-
-fn storage_owned_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.{suffix}"))
+    codestory_contracts::owned_artifacts::search_directory_for_storage(
+        storage_path,
+        codestory_contracts::owned_artifacts::SEARCH_DIRECTORY_SUFFIXES[1],
+    )
 }
 
 impl WorkspaceDiscovery {

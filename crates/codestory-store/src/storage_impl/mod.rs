@@ -1,3 +1,5 @@
+use codestory_contracts::owned_artifacts;
+
 use codestory_contracts::graph::{
     AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
     EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
@@ -925,24 +927,29 @@ fn require_candidate_structural_text_identity(
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.lock", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_LOCK_SUFFIX)
 }
 
 fn promotion_prepared_journal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.prepared.json", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_PREPARED_JOURNAL_SUFFIX)
 }
 
 fn promotion_committed_journal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.committed.json", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_COMMITTED_JOURNAL_SUFFIX)
 }
 
 #[cfg(test)]
 fn promotion_cleanup_failure_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.promotion.cleanup-blocked", path.display()))
+    promotion_sibling_path(path, owned_artifacts::PROMOTION_CLEANUP_BLOCKED_SUFFIX)
+}
+
+fn promotion_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", path.display()))
 }
 
 fn promotion_artifacts_exist(path: &Path) -> bool {
-    path.with_extension("sqlite.backup").exists()
+    path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION)
+        .exists()
         || promotion_prepared_journal_path(path).exists()
         || promotion_committed_journal_path(path).exists()
 }
@@ -1230,7 +1237,7 @@ fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
 }
 
 fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError> {
-    let backup_path = path.with_extension("sqlite.backup");
+    let backup_path = path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     let prepared_path = promotion_prepared_journal_path(path);
     let committed_path = promotion_committed_journal_path(path);
 
@@ -1336,7 +1343,7 @@ fn rollback_prepared_promotion(
             live_path.display()
         )));
     }
-    let backup_path = live_path.with_extension("sqlite.backup");
+    let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     let prepared_path = promotion_prepared_journal_path(live_path);
     let recovery_contract = RecoveryDatabaseContract::Journal(prepared.version);
     let live_identity = read_recovery_database_identity(live_path, recovery_contract)?;
@@ -1609,7 +1616,7 @@ fn cleanup_committed_promotion_artifacts(live_path: &Path) -> Result<(), Storage
         ));
     }
 
-    let backup_path = live_path.with_extension("sqlite.backup");
+    let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
     cleanup_sqlite_sidecars(&backup_path)?;
     let committed_path = promotion_committed_journal_path(live_path);
     remove_promotion_file(&committed_path)
@@ -5411,7 +5418,7 @@ impl Storage {
                 live_path.display()
             )));
         }
-        let backup_path = live_path.with_extension("sqlite.backup");
+        let backup_path = live_path.with_extension(owned_artifacts::ROLLBACK_BACKUP_EXTENSION);
         let prepared_path = promotion_prepared_journal_path(live_path);
         let committed_path = promotion_committed_journal_path(live_path);
         durations.lock_recovery = lock_recovery_started.elapsed();

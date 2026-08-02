@@ -15,6 +15,7 @@ pub mod events;
 pub mod graph;
 pub mod grounding;
 pub mod language_support;
+pub mod owned_artifacts;
 pub mod query;
 pub mod trail;
 pub mod workspace;

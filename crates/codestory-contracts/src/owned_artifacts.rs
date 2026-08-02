@@ -1,0 +1,246 @@
+//! One registry of every file identity CodeStory writes beside its core
+//! storage file.
+//!
+//! Producers derive their artifact paths from these constants and functions,
+//! and the workspace discovery exclusion consumes the same registry, so an
+//! artifact name exists in exactly one place. The architecture contract test
+//! rejects production sources that spell these identities directly, which is
+//! what keeps a future owned artifact from silently entering source discovery
+//! the way an unregistered one would.
+
+use std::path::{Path, PathBuf};
+
+/// SQLite sidecar suffixes appended to a live database file name.
+pub const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Extension replacing the storage extension for the rollback backup.
+pub const ROLLBACK_BACKUP_EXTENSION: &str = "sqlite.backup";
+
+/// Extension replacing the storage extension for the index-writer lock.
+pub const INDEX_WRITER_LOCK_EXTENSION: &str = "index-writer.lock";
+
+/// Suffixes appended to the full storage file name by staged promotion.
+pub const PROMOTION_LOCK_SUFFIX: &str = ".promotion.lock";
+pub const PROMOTION_PREPARED_JOURNAL_SUFFIX: &str = ".promotion.prepared.json";
+pub const PROMOTION_COMMITTED_JOURNAL_SUFFIX: &str = ".promotion.committed.json";
+pub const PROMOTION_CLEANUP_BLOCKED_SUFFIX: &str = ".promotion.cleanup-blocked";
+
+/// Every promotion sibling suffix, in stable order.
+pub const PROMOTION_SIBLING_SUFFIXES: [&str; 4] = [
+    PROMOTION_LOCK_SUFFIX,
+    PROMOTION_PREPARED_JOURNAL_SUFFIX,
+    PROMOTION_COMMITTED_JOURNAL_SUFFIX,
+    PROMOTION_CLEANUP_BLOCKED_SUFFIX,
+];
+
+/// Infix between the storage stem and the `{pid}-{epoch}` unique part of a
+/// staged snapshot name.
+pub const STAGED_SNAPSHOT_INFIX: &str = ".staged.";
+
+/// Directory-name suffixes for the search trees owned by one storage file,
+/// applied to the storage stem. Each directory also owns a sibling
+/// `<directory>.lock` file.
+pub const SEARCH_DIRECTORY_SUFFIXES: [&str; 2] = ["search", "search-generations"];
+
+/// Local-refresh serialization files written by the CLI into the cache root
+/// that holds the storage file. The state guard is persistent by design.
+pub const LOCAL_REFRESH_STATUS_FILE: &str = "local-refresh-status.json";
+pub const LOCAL_REFRESH_LOCK_FILE: &str = "local-refresh.lock";
+pub const LOCAL_REFRESH_STATE_GUARD_FILE: &str = "local-refresh-state.guard";
+
+/// Annotations sidecar beside the storage file. Registered ahead of the
+/// sidecar cutover so discovery excludes it from the first write.
+pub const ANNOTATIONS_SIDECAR_FILE: &str = "annotations.sqlite3";
+
+/// Fixed file names CodeStory owns inside the cache root that holds the
+/// storage file, independent of the storage file's own name.
+pub const CACHE_ROOT_OWNED_FILE_NAMES: [&str; 3] = [
+    LOCAL_REFRESH_STATUS_FILE,
+    LOCAL_REFRESH_LOCK_FILE,
+    LOCAL_REFRESH_STATE_GUARD_FILE,
+];
+
+fn cache_root_for(storage_path: &Path) -> &Path {
+    storage_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn storage_stem(storage_path: &Path) -> &str {
+    storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory")
+}
+
+fn storage_extension(storage_path: &Path) -> &str {
+    storage_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlite")
+}
+
+fn path_with_display_suffix(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), suffix))
+}
+
+fn path_with_native_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(suffix);
+    PathBuf::from(suffixed)
+}
+
+/// The live file plus its SQLite sidecars.
+pub fn sqlite_file_with_sidecars(live_path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![live_path.to_path_buf()];
+    files.extend(
+        SQLITE_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| path_with_native_suffix(live_path, suffix)),
+    );
+    files
+}
+
+/// Search directory owned by one storage file for the given registry suffix.
+pub fn search_directory_for_storage(storage_path: &Path, suffix: &str) -> PathBuf {
+    cache_root_for(storage_path).join(format!("{}.{suffix}", storage_stem(storage_path)))
+}
+
+/// Exact owned file identities beside one storage file: the database and its
+/// sidecars, the index-writer lock, promotion siblings, the rollback backup
+/// and its sidecars, the search directory locks, the local-refresh files, and
+/// the annotations sidecar with its sidecars.
+pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
+    let cache_root = cache_root_for(storage_path);
+    let rollback_backup = storage_path.with_extension(ROLLBACK_BACKUP_EXTENSION);
+    let mut files = sqlite_file_with_sidecars(storage_path);
+    files.push(storage_path.with_extension(INDEX_WRITER_LOCK_EXTENSION));
+    files.extend(
+        PROMOTION_SIBLING_SUFFIXES
+            .iter()
+            .map(|suffix| path_with_display_suffix(storage_path, suffix)),
+    );
+    files.extend(sqlite_file_with_sidecars(&rollback_backup));
+    files.extend(SEARCH_DIRECTORY_SUFFIXES.iter().map(|suffix| {
+        path_with_native_suffix(&search_directory_for_storage(storage_path, suffix), ".lock")
+    }));
+    files.extend(
+        CACHE_ROOT_OWNED_FILE_NAMES
+            .iter()
+            .map(|name| cache_root.join(name)),
+    );
+    files.extend(sqlite_file_with_sidecars(
+        &cache_root.join(ANNOTATIONS_SIDECAR_FILE),
+    ));
+    files
+}
+
+/// Build the staged snapshot path for one live database and unique parts.
+pub fn staged_snapshot_path(live_path: &Path, pid: u32, epoch_ns: u128) -> PathBuf {
+    cache_root_for(live_path).join(format!(
+        "{}{}{pid}-{epoch_ns}.{}",
+        storage_stem(live_path),
+        STAGED_SNAPSHOT_INFIX,
+        storage_extension(live_path)
+    ))
+}
+
+/// Whether one file name belongs to the staged snapshot namespace of the
+/// given storage file: `{stem}.staged.{pid}-{epoch}.{ext}[-wal|-shm|-journal]`.
+pub fn is_staged_snapshot_name(storage_path: &Path, file_name: &str) -> bool {
+    let prefix = format!("{}{}", storage_stem(storage_path), STAGED_SNAPSHOT_INFIX);
+    let extension = storage_extension(storage_path);
+    let Some(candidate) = file_name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut suffixes = vec![format!(".{extension}")];
+    suffixes.extend(
+        SQLITE_SIDECAR_SUFFIXES
+            .iter()
+            .map(|sidecar| format!(".{extension}{sidecar}")),
+    );
+    let Some(unique) = suffixes
+        .iter()
+        .find_map(|suffix| candidate.strip_suffix(suffix.as_str()))
+    else {
+        return false;
+    };
+    let mut unique_parts = unique.split('-');
+    unique_parts
+        .next()
+        .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && unique_parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && unique_parts.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_identities_cover_every_registered_family() {
+        let storage = Path::new("/cache/custom-core.db");
+        let files = storage_owned_file_identities(storage);
+        let expect = |name: &str| {
+            assert!(
+                files.iter().any(|file| file == Path::new(name)),
+                "{name} must be registry-owned"
+            );
+        };
+        expect("/cache/custom-core.db");
+        expect("/cache/custom-core.db-wal");
+        expect("/cache/custom-core.index-writer.lock");
+        expect("/cache/custom-core.db.promotion.lock");
+        expect("/cache/custom-core.db.promotion.cleanup-blocked");
+        expect("/cache/custom-core.sqlite.backup");
+        expect("/cache/custom-core.sqlite.backup-journal");
+        expect("/cache/custom-core.search.lock");
+        expect("/cache/custom-core.search-generations.lock");
+        expect("/cache/local-refresh-status.json");
+        expect("/cache/local-refresh.lock");
+        expect("/cache/local-refresh-state.guard");
+        expect("/cache/annotations.sqlite3");
+        expect("/cache/annotations.sqlite3-shm");
+    }
+
+    #[test]
+    fn staged_namespace_matches_only_pid_epoch_names() {
+        let storage = Path::new("/cache/custom-core.db");
+        let staged = staged_snapshot_path(storage, 123, 456);
+        assert_eq!(staged, Path::new("/cache/custom-core.staged.123-456.db"));
+        assert!(is_staged_snapshot_name(
+            storage,
+            "custom-core.staged.123-456.db"
+        ));
+        assert!(is_staged_snapshot_name(
+            storage,
+            "custom-core.staged.123-456.db-wal"
+        ));
+        assert!(!is_staged_snapshot_name(
+            storage,
+            "custom-core.staged.notes.db"
+        ));
+        assert!(!is_staged_snapshot_name(
+            storage,
+            "custom-core.staged.123-456-789.db"
+        ));
+        assert!(!is_staged_snapshot_name(storage, "other.staged.123-456.db"));
+    }
+
+    #[test]
+    fn bare_storage_names_observe_the_current_directory() {
+        let files = storage_owned_file_identities(Path::new("codestory.db"));
+        assert!(
+            files
+                .iter()
+                .any(|file| file == Path::new("./local-refresh.lock"))
+        );
+        assert_eq!(
+            staged_snapshot_path(Path::new("codestory.db"), 1, 2),
+            Path::new("./codestory.staged.1-2.db")
+        );
+    }
+}

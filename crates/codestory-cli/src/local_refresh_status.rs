@@ -12,9 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codestory_retrieval::{ProcessOwnerState, ProcessStartProbe};
 
-const LOCAL_REFRESH_STATUS_FILE: &str = "local-refresh-status.json";
-const LOCAL_REFRESH_LOCK_FILE: &str = "local-refresh.lock";
-const LOCAL_REFRESH_STATE_GUARD_FILE: &str = "local-refresh-state.guard";
+use codestory_contracts::owned_artifacts::{
+    LOCAL_REFRESH_LOCK_FILE, LOCAL_REFRESH_STATE_GUARD_FILE, LOCAL_REFRESH_STATUS_FILE,
+};
 const LOCAL_REFRESH_STATUS_SCHEMA_VERSION: u32 = 1;
 const LOCAL_REFRESH_STATUS_TTL: Duration = Duration::from_secs(30);
 const LOCAL_REFRESH_LOCK_STALE_TTL: Duration = Duration::from_secs(120);

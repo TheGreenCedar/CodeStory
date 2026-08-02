@@ -63,7 +63,8 @@ pub(super) struct IndexWriterGuard {
 
 impl IndexWriterGuard {
     pub(super) fn try_acquire(storage_path: &Path) -> Result<Self, ApiError> {
-        let path = storage_path.with_extension("index-writer.lock");
+        let path = storage_path
+            .with_extension(codestory_contracts::owned_artifacts::INDEX_WRITER_LOCK_EXTENSION);
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

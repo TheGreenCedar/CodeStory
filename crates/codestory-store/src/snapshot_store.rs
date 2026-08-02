@@ -53,17 +53,15 @@ impl<'a> SnapshotStore<'a> {
 
     /// Build a unique SQLite path beside the intended live database.
     pub fn staged_path(live_path: &Path) -> PathBuf {
-        let parent = live_path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = live_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("codestory");
-        let extension = live_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("sqlite");
-        let unique = unique_staged_suffix();
-        parent.join(format!("{stem}.staged.{unique}.{extension}"))
+        let epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        codestory_contracts::owned_artifacts::staged_snapshot_path(
+            live_path,
+            std::process::id(),
+            epoch_ns,
+        )
     }
 
     /// Open a fresh staged database in build mode.
@@ -297,14 +295,6 @@ fn staged_snapshot_finalize_stats(
         deferred_indexes_ms: clamp_u128_to_u32(deferred_indexes_duration.as_millis()),
         summary_snapshot_ms: clamp_u128_to_u32(summary_snapshot_duration.as_millis()),
     }
-}
-
-fn unique_staged_suffix() -> String {
-    let epoch_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{}-{}", std::process::id(), epoch_ns)
 }
 
 #[cfg(test)]
