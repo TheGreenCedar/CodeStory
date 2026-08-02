@@ -67,6 +67,23 @@ struct Baseline {
     tolerances: Tolerances,
     overall: MetricSummary,
     categories: BTreeMap<String, MetricSummary>,
+    source_fixture_verdicts: VerdictBaseline,
+    live_verdict_calibration: LiveVerdictCalibration,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerdictBaseline {
+    sufficiency_counts: BTreeMap<String, usize>,
+    proof_status_counts: BTreeMap<String, usize>,
+    verdict_cause_table: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveVerdictCalibration {
+    status: String,
+    issue: String,
+    #[serde(default)]
+    expected: Option<VerdictBaseline>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +117,9 @@ struct EvalRun {
     ranked_symbols: Vec<String>,
     packet_text: String,
     anchor_offsets: BTreeMap<String, usize>,
+    sufficiency_status: String,
+    proof_statuses: Vec<String>,
+    verdict_causes: Vec<String>,
 }
 
 fn fixture_dir() -> PathBuf {
@@ -144,6 +164,9 @@ fn score_runs(fixtures: &[EvalFixture], runs: &[EvalRun], baseline: &Baseline) -
         .collect::<BTreeMap<_, _>>();
     let mut overall = Accumulator::default();
     let mut categories = BTreeMap::<String, Accumulator>::new();
+    let mut sufficiency_counts = BTreeMap::new();
+    let mut proof_status_counts = BTreeMap::new();
+    let mut verdict_cause_table = BTreeMap::<String, BTreeSet<String>>::new();
 
     for fixture in fixtures {
         let run = by_id
@@ -155,6 +178,35 @@ fn score_runs(fixtures: &[EvalFixture], runs: &[EvalRun], baseline: &Baseline) -
             .entry(fixture.category.clone())
             .or_default()
             .add(&row);
+        if row.full_mode {
+            match run.sufficiency_status.as_str() {
+                "sufficient" => assert!(
+                    run.verdict_causes.is_empty(),
+                    "sufficient fixture {} must not report blocking verdict causes: {:?}",
+                    fixture.id,
+                    run.verdict_causes
+                ),
+                "partial" | "blocked" => assert!(
+                    !run.verdict_causes.is_empty(),
+                    "non-sufficient fixture {} must report at least one typed verdict cause",
+                    fixture.id
+                ),
+                status => panic!(
+                    "full-mode fixture {} emitted unsupported sufficiency status {status:?}",
+                    fixture.id
+                ),
+            }
+            *sufficiency_counts
+                .entry(run.sufficiency_status.clone())
+                .or_insert(0) += 1;
+            for status in &run.proof_statuses {
+                *proof_status_counts.entry(status.clone()).or_insert(0) += 1;
+            }
+            verdict_cause_table
+                .entry(fixture.category.clone())
+                .or_default()
+                .extend(run.verdict_causes.iter().cloned());
+        }
     }
 
     EvalReport {
@@ -162,6 +214,12 @@ fn score_runs(fixtures: &[EvalFixture], runs: &[EvalRun], baseline: &Baseline) -
         categories: categories
             .into_iter()
             .map(|(category, accumulator)| (category, accumulator.finish()))
+            .collect(),
+        sufficiency_counts,
+        proof_status_counts,
+        verdict_cause_table: verdict_cause_table
+            .into_iter()
+            .map(|(category, causes)| (category, causes.into_iter().collect()))
             .collect(),
     }
 }
@@ -233,6 +291,9 @@ struct FixtureScore {
 struct EvalReport {
     overall: MetricSummary,
     categories: BTreeMap<String, MetricSummary>,
+    sufficiency_counts: BTreeMap<String, usize>,
+    proof_status_counts: BTreeMap<String, usize>,
+    verdict_cause_table: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -314,7 +375,7 @@ fn packet_search_eval_fixture_schema_is_owner_directed_and_complete() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     assert_eq!(fixtures.schema_version, 1);
-    assert_eq!(baseline.schema_version, 1);
+    assert_eq!(baseline.schema_version, 2);
     assert_eq!(baseline.fixture_file, FIXTURE_FILE);
     assert!(baseline.k > 0);
     assert!(baseline.packet_anchor_budget > 0);
@@ -359,7 +420,44 @@ fn packet_search_eval_fixture_schema_is_owner_directed_and_complete() {
             baseline.categories.contains_key(category),
             "baseline missing category {category}"
         );
+        assert!(
+            baseline
+                .source_fixture_verdicts
+                .verdict_cause_table
+                .contains_key(category),
+            "baseline missing verdict cause category {category}"
+        );
     }
+    assert_eq!(
+        baseline
+            .source_fixture_verdicts
+            .sufficiency_counts
+            .values()
+            .sum::<usize>(),
+        fixtures.fixtures.len(),
+        "every source fixture needs one accepted sufficiency verdict"
+    );
+    assert!(
+        !baseline
+            .source_fixture_verdicts
+            .proof_status_counts
+            .is_empty()
+    );
+    for causes in baseline
+        .source_fixture_verdicts
+        .verdict_cause_table
+        .values()
+    {
+        let sorted_unique = causes.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            causes,
+            &sorted_unique.into_iter().collect::<Vec<_>>(),
+            "verdict cause rows must remain sorted and deduplicated"
+        );
+    }
+    assert_eq!(baseline.live_verdict_calibration.status, "pending");
+    assert_eq!(baseline.live_verdict_calibration.issue, "#1351");
+    assert!(baseline.live_verdict_calibration.expected.is_none());
     let diagnostic_ids = fixtures
         .diagnostic_fixtures
         .iter()
@@ -417,6 +515,28 @@ fn packet_search_eval_preserves_broad_readiness_query_diagnostic() {
 fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
+    let readiness_verdict = packet_verdict_evidence(&serde_json::json!({
+        "sufficiency": { "status": "partial" },
+        "plan": { "obligations": { "claim_obligations": [
+            {
+                "material": true,
+                "proof_status": "reported",
+                "reason": "required_carrier_missing"
+            },
+            { "material": false, "proof_status": "reported" }
+        ] } }
+    }));
+    let placement_verdict = packet_verdict_evidence(&serde_json::json!({
+        "sufficiency": { "status": "partial" },
+        "plan": { "obligations": { "claim_obligations": [
+            {
+                "material": true,
+                "proof_status": "reported",
+                "reason": "required_carrier_missing"
+            },
+            { "material": false, "proof_status": "reported" }
+        ] } }
+    }));
     let runs = vec![
         EvalRun {
             fixture_id: "readiness-boundary".to_string(),
@@ -436,6 +556,9 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
                 ("LiveSidecarSearch::semantic_search".to_string(), 10),
                 ("sidecar_search".to_string(), 52),
             ]),
+            sufficiency_status: readiness_verdict.0,
+            proof_statuses: readiness_verdict.1,
+            verdict_causes: readiness_verdict.2,
         },
         EvalRun {
             fixture_id: "packet-anchor-placement".to_string(),
@@ -454,6 +577,9 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
                 ("decorate_search_hit_evidence".to_string(), 0),
                 ("evidence_tier_for_hit".to_string(), 34),
             ]),
+            sufficiency_status: placement_verdict.0,
+            proof_statuses: placement_verdict.1,
+            verdict_causes: placement_verdict.2,
         },
     ];
 
@@ -466,6 +592,143 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             .unwrap_or_else(|| panic!("missing category report {category}"));
         assert_summary(actual, expected, &baseline.tolerances);
     }
+    assert_eq!(
+        report.sufficiency_counts,
+        baseline.source_fixture_verdicts.sufficiency_counts
+    );
+    assert_eq!(
+        report.proof_status_counts,
+        baseline.source_fixture_verdicts.proof_status_counts
+    );
+    assert_eq!(
+        report.verdict_cause_table,
+        baseline.source_fixture_verdicts.verdict_cause_table
+    );
+}
+
+#[test]
+fn packet_search_eval_extracts_schema_v2_obligation_counts_and_causes() {
+    let packet = serde_json::json!({
+        "sufficiency": { "status": "partial" },
+        "plan": {
+            "obligations": {
+                "claim_obligations": [
+                    { "material": true, "proof_status": "proven" },
+                    {
+                        "material": true,
+                        "proof_status": "reported",
+                        "reason": "required_evidence_edge_missing"
+                    }
+                ],
+                "query_obligations": [
+                    {
+                        "material": true,
+                        "completion": { "status": "completed" }
+                    },
+                    {
+                        "material": true,
+                        "completion": {
+                            "status": "cancelled",
+                            "reason": "stage_deadline"
+                        }
+                    }
+                ]
+            }
+        }
+    });
+
+    let (status, proof_statuses, causes) = packet_verdict_evidence(&packet);
+    assert_eq!(status, "partial");
+    assert_eq!(proof_statuses, ["proven", "reported"]);
+    assert_eq!(causes, ["required_evidence_edge_missing", "stage_deadline"]);
+}
+
+#[test]
+fn packet_search_eval_causes_follow_only_final_sufficiency_blockers() {
+    let sufficient = serde_json::json!({
+        "sufficiency": {
+            "status": "sufficient",
+            "gaps": ["obligation guard_dispatch is reported: diagnostic lead"]
+        },
+        "budget": { "truncated": true },
+        "plan": { "obligations": {
+            "claim_obligations": [
+                { "material": true, "proof_status": "proven" },
+                {
+                    "material": false,
+                    "proof_status": "unsupported",
+                    "reason": "selected_claim_profile_carrier_missing"
+                }
+            ],
+            "query_obligations": [
+                {
+                    "material": false,
+                    "completion": { "status": "cancelled", "reason": "diagnostic_deadline" }
+                }
+            ]
+        } }
+    });
+    assert!(packet_verdict_evidence(&sufficient).2.is_empty());
+
+    let material_claim = serde_json::json!({
+        "sufficiency": {
+            "status": "partial",
+            "gaps": [
+                "obligation requested_claim:0 is reported: exact member missing",
+                "obligation guard_dispatch is reported: diagnostic lead"
+            ]
+        },
+        "plan": { "obligations": { "claim_obligations": [
+            {
+                "material": true,
+                "proof_status": "reported",
+                "reason": "exact_member_missing"
+            },
+            {
+                "material": false,
+                "proof_status": "reported",
+                "reason": "selected_claim_profile_carrier_missing"
+            }
+        ] } }
+    });
+    assert_eq!(
+        packet_verdict_evidence(&material_claim).2,
+        ["exact_member_missing"]
+    );
+
+    let material_query = serde_json::json!({
+        "sufficiency": { "status": "partial" },
+        "plan": { "obligations": { "query_obligations": [
+            {
+                "material": true,
+                "completion": { "status": "cancelled", "reason": "stage_deadline" }
+            },
+            {
+                "material": false,
+                "completion": { "status": "cancelled", "reason": "diagnostic_deadline" }
+            }
+        ] } }
+    });
+    assert_eq!(
+        packet_verdict_evidence(&material_query).2,
+        ["stage_deadline"]
+    );
+
+    let budget_and_gap = serde_json::json!({
+        "sufficiency": {
+            "status": "blocked",
+            "coverage_report": { "budget_omitted": ["citations"] },
+            "gaps": ["minimum claim-family coverage not met"]
+        },
+        "plan": { "obligations": {} }
+    });
+    assert_eq!(
+        packet_verdict_evidence(&budget_and_gap).2,
+        [
+            "budget_omitted:citations",
+            "sufficiency_gap:minimum claim-family coverage not met"
+        ]
+    );
 }
 
 #[test]
@@ -489,6 +752,9 @@ fn packet_search_eval_does_not_count_non_full_retrieval_as_full() {
                 .enumerate()
                 .map(|(index, anchor)| (anchor.clone(), index))
                 .collect(),
+            sufficiency_status: "partial".to_string(),
+            proof_statuses: vec!["reported".to_string()],
+            verdict_causes: vec!["non_full_mode".to_string()],
         })
         .collect::<Vec<_>>();
 
@@ -767,6 +1033,10 @@ fn packet_search_eval_live_runs_production_cli_path() {
             String::from_utf8_lossy(&packet.stderr)
         );
         let packet_text = String::from_utf8(packet.stdout).expect("packet stdout utf8");
+        let packet_json: Value =
+            serde_json::from_str(&packet_text).expect("parse packet verdict json");
+        let (sufficiency_status, proof_statuses, verdict_causes) =
+            packet_verdict_evidence(&packet_json);
         let anchor_offsets = fixture
             .expected
             .anchors
@@ -785,6 +1055,9 @@ fn packet_search_eval_live_runs_production_cli_path() {
             ranked_symbols: ranked_symbols(&search_json),
             packet_text,
             anchor_offsets,
+            sufficiency_status,
+            proof_statuses,
+            verdict_causes,
         });
         eprintln!(
             "packet_search_eval: fixture {}/{} `{}` finished in {:.1}s total_elapsed={:.1}s",
@@ -805,13 +1078,147 @@ fn packet_search_eval_live_runs_production_cli_path() {
             .unwrap_or_else(|| panic!("missing category report {category}"));
         assert_summary(actual, expected, &baseline.tolerances);
     }
+    assert_live_verdict_calibration(&report, &baseline, &fixtures.fixtures);
     println!(
-        "packet_search_eval recall_at_k={:.3} anchor_in_packet={:.3} anchor_before_budget={:.3} categories={:?}",
+        "packet_search_eval recall_at_k={:.3} anchor_in_packet={:.3} anchor_before_budget={:.3} categories={:?} sufficiency_counts={:?} proof_status_counts={:?} verdict_cause_table={:?}",
         report.overall.recall_at_k,
         report.overall.anchor_in_packet,
         report.overall.anchor_before_budget,
-        report.categories
+        report.categories,
+        report.sufficiency_counts,
+        report.proof_status_counts,
+        report.verdict_cause_table,
     );
+}
+
+fn assert_live_verdict_calibration(
+    report: &EvalReport,
+    baseline: &Baseline,
+    fixtures: &[EvalFixture],
+) {
+    match baseline.live_verdict_calibration.status.as_str() {
+        "calibrated" => {
+            let expected = baseline
+                .live_verdict_calibration
+                .expected
+                .as_ref()
+                .expect("calibrated live verdict baseline must define expected values");
+            assert_eq!(report.sufficiency_counts, expected.sufficiency_counts);
+            assert_eq!(report.proof_status_counts, expected.proof_status_counts);
+            assert_eq!(report.verdict_cause_table, expected.verdict_cause_table);
+        }
+        "pending" => {
+            assert_eq!(baseline.live_verdict_calibration.issue, "#1351");
+            assert!(
+                baseline.live_verdict_calibration.expected.is_none(),
+                "pending live calibration must not masquerade source-fixture values as observed truth"
+            );
+            assert_eq!(
+                report.sufficiency_counts.values().sum::<usize>(),
+                fixtures.len(),
+                "the live run must emit one sufficiency verdict per full-mode fixture"
+            );
+            assert!(
+                !report.proof_status_counts.is_empty(),
+                "the live run must expose obligation proof statuses"
+            );
+            let expected_categories = fixtures
+                .iter()
+                .map(|fixture| fixture.category.as_str())
+                .collect::<BTreeSet<_>>();
+            let actual_categories = report
+                .verdict_cause_table
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual_categories, expected_categories);
+        }
+        status => panic!("unsupported live verdict calibration status {status:?}"),
+    }
+}
+
+fn packet_verdict_evidence(packet: &Value) -> (String, Vec<String>, Vec<String>) {
+    let packet = packet.get("result").unwrap_or(packet);
+    let sufficiency_status = packet
+        .pointer("/sufficiency/status")
+        .and_then(Value::as_str)
+        .unwrap_or("missing")
+        .to_string();
+    let obligations = packet
+        .pointer("/plan/obligations/claim_obligations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let proof_statuses = obligations
+        .iter()
+        .filter_map(|obligation| obligation.get("proof_status").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if sufficiency_status == "sufficient" {
+        return (sufficiency_status, proof_statuses, Vec::new());
+    }
+
+    let mut causes = BTreeSet::new();
+    for obligation in &obligations {
+        if obligation.get("material").and_then(Value::as_bool) != Some(true)
+            || obligation.get("proof_status").and_then(Value::as_str) == Some("proven")
+        {
+            continue;
+        }
+        causes.insert(
+            obligation
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("claim_reason_missing")
+                .to_string(),
+        );
+    }
+    if let Some(query_obligations) = packet
+        .pointer("/plan/obligations/query_obligations")
+        .and_then(Value::as_array)
+    {
+        for obligation in query_obligations {
+            if obligation.get("material").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            if let Some(reason) = obligation
+                .pointer("/completion/reason")
+                .and_then(Value::as_str)
+            {
+                causes.insert(reason.to_string());
+            } else if obligation
+                .pointer("/completion/status")
+                .and_then(Value::as_str)
+                != Some("completed")
+            {
+                causes.insert("completion_missing".to_string());
+            }
+        }
+    }
+    if let Some(sections) = packet
+        .pointer("/sufficiency/coverage_report/budget_omitted")
+        .and_then(Value::as_array)
+    {
+        for section in sections.iter().filter_map(Value::as_str) {
+            causes.insert(format!("budget_omitted:{section}"));
+        }
+    }
+    if let Some(gaps) = packet
+        .pointer("/sufficiency/gaps")
+        .and_then(Value::as_array)
+    {
+        for gap in gaps.iter().filter_map(Value::as_str) {
+            if gap.starts_with("obligation ") || gap.starts_with("query obligation ") {
+                continue;
+            }
+            causes.insert(format!("sufficiency_gap:{gap}"));
+        }
+    }
+    (
+        sufficiency_status,
+        proof_statuses,
+        causes.into_iter().collect(),
+    )
 }
 
 fn live_eval_ready_args() -> [&'static str; 10] {

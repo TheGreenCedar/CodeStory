@@ -1,10 +1,15 @@
 use crate::agent::packet_capping::cap_packet_citations;
+use crate::agent::packet_claims::packet_flow_claims_markdown;
 use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
+use crate::agent::packet_obligations::{
+    bind_claims_to_packet_obligations, finalize_packet_obligation_plan,
+    packet_claims_with_obligation_receipts,
+};
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
 use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_probe_context,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
     quote_packet_command_value, quote_packet_project_arg,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
@@ -238,16 +243,26 @@ fn rebuild_packet_budget_dependents(
 ) {
     packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
     let exact_probe_paths = exact_packet_probe_paths(&packet.plan.probe_resolutions);
-    packet.sufficiency = build_packet_sufficiency_with_probe_context(
+    let task_class = packet
+        .task_class
+        .unwrap_or(PacketTaskClassDto::ArchitectureExplanation);
+    finalize_packet_obligation_plan(
+        &packet.question,
+        task_class,
+        &mut packet.plan.obligations,
+        &packet.answer,
+        &packet.budget,
+    );
+    refresh_packet_claim_markdown(packet);
+    packet.sufficiency = build_packet_sufficiency_with_obligation_context(
         project_root,
         &packet.question,
-        packet
-            .task_class
-            .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+        task_class,
         &packet.answer,
         &packet.budget,
         extra_probes,
         &exact_probe_paths,
+        &packet.plan.obligations,
     );
     let trim_avoid_opening = packet
         .budget
@@ -275,6 +290,42 @@ fn rebuild_packet_budget_dependents(
     if trim_trace_summary {
         let _ = trim_packet_retrieval_trace_summary(packet);
     }
+}
+
+fn refresh_packet_claim_markdown(packet: &mut AgentPacketDto) {
+    let mut claims =
+        packet_claims_with_obligation_receipts(&packet.answer, &packet.plan.obligations);
+    bind_claims_to_packet_obligations(&packet.plan.obligations, &mut claims);
+    let Some(markdown) = packet
+        .answer
+        .sections
+        .iter_mut()
+        .find(|section| section.id == "packet-flow-claims")
+        .and_then(|section| {
+            section.blocks.iter_mut().find_map(|block| match block {
+                AgentResponseBlockDto::Markdown { markdown } => Some(markdown),
+                AgentResponseBlockDto::Mermaid { .. } => None,
+            })
+        })
+    else {
+        return;
+    };
+
+    let retained_prefix_bytes = markdown
+        .strip_suffix(PACKET_MARKDOWN_TRUNCATION_SUFFIX)
+        .map(str::len);
+    let mut refreshed = packet_flow_claims_markdown(&claims);
+    if let Some(retained_prefix_bytes) = retained_prefix_bytes
+        && retained_prefix_bytes < refreshed.len()
+    {
+        let mut boundary = retained_prefix_bytes;
+        while boundary > 0 && !refreshed.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        refreshed.truncate(boundary);
+        refreshed.push_str(PACKET_MARKDOWN_TRUNCATION_SUFFIX);
+    }
+    *markdown = refreshed;
 }
 
 fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
@@ -532,13 +583,15 @@ pub(crate) fn next_deeper_packet_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_obligations::build_packet_obligation_plan;
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
-        AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, NodeId, NodeKind,
-        PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
-        PacketEvidenceTierDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
-        PacketProbeRejectionCodeDto, PacketProbeRejectionDto, PacketProbeResolutionDto,
-        PacketProbeResolutionStatusDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
+        AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, EdgeId, EdgeKind,
+        GraphEdgeDto, GraphNodeDto, NodeId, NodeKind, PacketClaimDto, PacketCoverageReportDto,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketPlanDto, PacketPlanQueryDto,
+        PacketProbeDto, PacketProbeRejectionCodeDto, PacketProbeRejectionDto,
+        PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketQueryCompletionDto,
+        PacketRetrievalTraceSummaryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
         PacketSufficiencyStatusDto, SearchHitOrigin,
     };
 
@@ -629,6 +682,156 @@ mod tests {
             "the final packet should provide a targeted follow-up for the uncovered path: {:?}",
             packet.sufficiency
         );
+    }
+
+    #[test]
+    fn post_budget_claim_markdown_tracks_the_final_obligation_status_without_growing() {
+        let question = "Explain RuntimeCoordinator::run.";
+        let mut packet = test_packet(question, 96 * 1024);
+        packet.task_class = Some(PacketTaskClassDto::ArchitectureExplanation);
+        packet.plan.task_class = PacketTaskClassDto::ArchitectureExplanation;
+        packet.answer.citations = vec![retained_graph_citation(
+            "RuntimeCoordinator::run",
+            "crates/core/src/runtime.rs",
+        )];
+        let edge_id = EdgeId("runtime-coordinator-call".to_string());
+        packet.answer.citations[0].evidence_edge_ids = vec![edge_id.clone()];
+        packet.answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "runtime-call".to_string(),
+            title: "Runtime call".to_string(),
+            graph: GraphResponse {
+                center_id: NodeId("RuntimeCoordinator::run".to_string()),
+                nodes: vec![
+                    GraphNodeDto {
+                        id: NodeId("RuntimeCoordinator::run".to_string()),
+                        label: "RuntimeCoordinator::run".to_string(),
+                        kind: NodeKind::FUNCTION,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some("crates/core/src/runtime.rs".to_string()),
+                        qualified_name: Some("RuntimeCoordinator::run".to_string()),
+                        member_access: None,
+                    },
+                    GraphNodeDto {
+                        id: NodeId("RuntimeService::finish".to_string()),
+                        label: "RuntimeService::finish".to_string(),
+                        kind: NodeKind::FUNCTION,
+                        depth: 1,
+                        label_policy: None,
+                        badge_visible_members: None,
+                        badge_total_members: None,
+                        merged_symbol_examples: Vec::new(),
+                        file_path: Some("crates/core/src/runtime_service.rs".to_string()),
+                        qualified_name: Some("RuntimeService::finish".to_string()),
+                        member_access: None,
+                    },
+                ],
+                edges: vec![GraphEdgeDto {
+                    id: edge_id,
+                    source: NodeId("RuntimeCoordinator::run".to_string()),
+                    target: NodeId("RuntimeService::finish".to_string()),
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".to_string()),
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+        packet.plan.obligations = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        packet
+            .answer
+            .retrieval_trace
+            .packet_sidecar_diagnostics
+            .extend(
+                packet
+                    .plan
+                    .obligations
+                    .query_obligations
+                    .iter()
+                    .filter(|query| query.material)
+                    .map(|query| PacketSidecarQueryDiagnosticDto {
+                        query: query.query.clone(),
+                        completion: PacketQueryCompletionDto::Completed,
+                        retrieval_mode: "full".to_string(),
+                        sidecar_query_ms: Some(1),
+                        candidate_resolution_ms: Some(0),
+                        total_elapsed_ms: Some(1),
+                        sidecar_stage_count: 1,
+                        sidecar_stage_total_ms: Some(1),
+                        batch_query_wall_ms: Some(1),
+                        candidate_count: 1,
+                        resolved_hit_count: 1,
+                        unresolved_candidate_count: 0,
+                        blocking_unresolved_candidate_count: 0,
+                        diagnostic: None,
+                    }),
+            );
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut packet.plan.obligations,
+            &packet.answer,
+            &packet.budget,
+        );
+        let mut initial_claims =
+            packet_claims_with_obligation_receipts(&packet.answer, &packet.plan.obligations);
+        bind_claims_to_packet_obligations(&packet.plan.obligations, &mut initial_claims);
+        let full_initial_markdown = packet_flow_claims_markdown(&initial_claims);
+        let proven_marker_end = full_initial_markdown
+            .find("[`P`]")
+            .map(|offset| offset + "[`P`]".len())
+            .expect("finalized CALL receipt should render as proven");
+        let initial_markdown = format!(
+            "{}{}",
+            &full_initial_markdown[..proven_marker_end],
+            PACKET_MARKDOWN_TRUNCATION_SUFFIX
+        );
+        assert!(initial_markdown.contains("[`P`]"), "{initial_markdown}");
+        packet.answer.sections.push(AgentResponseSectionDto {
+            id: "packet-flow-claims".to_string(),
+            title: "Packet Claims".to_string(),
+            blocks: vec![AgentResponseBlockDto::Markdown {
+                markdown: initial_markdown.clone(),
+            }],
+        });
+        packet.answer.graphs.clear();
+        packet.budget.truncated = true;
+        packet.budget.omitted_sections = vec!["trail_edges".to_string()];
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut packet.plan.obligations,
+            &packet.answer,
+            &packet.budget,
+        );
+
+        refresh_packet_claim_markdown(&mut packet);
+
+        let refreshed = packet
+            .answer
+            .sections
+            .iter()
+            .find(|section| section.id == "packet-flow-claims")
+            .and_then(|section| section.blocks.first())
+            .and_then(|block| match block {
+                AgentResponseBlockDto::Markdown { markdown } => Some(markdown),
+                AgentResponseBlockDto::Mermaid { .. } => None,
+            })
+            .expect("packet claim markdown");
+        assert!(refreshed.contains("[`R`]"), "{refreshed}");
+        assert!(!refreshed.contains("[`P`]"), "{refreshed}");
+        assert_eq!(refreshed.len(), initial_markdown.len());
     }
 
     #[test]
@@ -917,6 +1120,8 @@ mod tests {
             covered_claims: vec![PacketClaimDto {
                 claim: "Packet budget ownership is covered by cited runtime and contract anchors."
                     .to_string(),
+                required_obligation_ids: Vec::new(),
+                required_obligation_kinds: Vec::new(),
                 proof_status: None,
                 required_evidence_role: None,
                 citations: answer.citations.clone(),
@@ -949,6 +1154,7 @@ mod tests {
                     purpose: "fixture".to_string(),
                 }],
                 probe_resolutions: Vec::new(),
+                obligations: Default::default(),
                 trace: Vec::new(),
             },
             answer,

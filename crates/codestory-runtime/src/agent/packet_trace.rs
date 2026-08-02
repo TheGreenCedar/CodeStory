@@ -222,6 +222,7 @@ mod golden_tests {
         let results = vec![("exec_events".to_string(), vec![hit])];
         let diagnostics = vec![PacketSidecarQueryDiagnosticDto {
             query: "exec_events".to_string(),
+            completion: codestory_contracts::api::PacketQueryCompletionDto::Completed,
             retrieval_mode: "full".to_string(),
             sidecar_query_ms: Some(9),
             candidate_resolution_ms: Some(3),

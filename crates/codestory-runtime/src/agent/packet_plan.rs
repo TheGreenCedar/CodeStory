@@ -7,6 +7,7 @@ use crate::agent::packet_command_profiles::{
     packet_command_exact_probe_queries, packet_command_role_probe_queries,
 };
 use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
+use crate::agent::packet_obligations::build_packet_obligation_plan;
 use crate::agent::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
     packet_sufficiency_required_probe_queries_from_terms,
@@ -36,7 +37,10 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
-use crate::agent::planning::dedupe_packet_plan_queries;
+use crate::agent::planning::{
+    PACKET_EXACT_SYMBOL_QUERY_PURPOSE, dedupe_packet_plan_queries,
+    packet_plan_query_is_exact_symbol_identity,
+};
 use crate::{
     exact_symbol_query_terms, is_non_primary_source_term, looks_like_standalone_symbol_query,
     query_mentions_non_primary_source,
@@ -66,11 +70,18 @@ pub(crate) fn build_packet_plan_with_extra(
     let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
     let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
     let mut queries = Vec::new();
-    push_packet_query(
-        &mut queries,
-        question,
-        "original task phrasing for sidecar-primary source-backed retrieval",
-    );
+    if looks_like_standalone_symbol_query(question) {
+        push_exact_symbol_packet_query(&mut queries, question);
+    } else {
+        push_packet_query(
+            &mut queries,
+            question,
+            "original task phrasing for sidecar-primary source-backed retrieval",
+        );
+    }
+    for term in exact_symbol_query_terms(question) {
+        push_exact_symbol_packet_query(&mut queries, &term);
+    }
     for term in extract_packet_query_terms(question) {
         push_packet_query(
             &mut queries,
@@ -132,9 +143,11 @@ pub(crate) fn build_packet_plan_with_extra(
         inferred_task_class: requested.is_none(),
         queries,
         probe_resolutions: Vec::new(),
+        obligations: Default::default(),
         trace,
     };
     dedupe_packet_plan_queries(&mut plan);
+    plan.obligations = build_packet_obligation_plan(question, task_class, &plan.queries);
     #[cfg(test)]
     let eval_probes = eval_probes_enabled();
     #[cfg(not(test))]
@@ -142,6 +155,12 @@ pub(crate) fn build_packet_plan_with_extra(
     plan.trace.push(format!(
         "deduped_queries={} eval_probes={eval_probes}",
         plan.queries.len()
+    ));
+    plan.trace.push(format!(
+        "obligation_plan_version={} claim_obligations={} query_obligations={}",
+        plan.obligations.version,
+        plan.obligations.claim_obligations.len(),
+        plan.obligations.query_obligations.len()
     ));
     plan
 }
@@ -1505,7 +1524,8 @@ pub(crate) fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     if value.len() < 3 {
         return;
     }
-    if !terms.iter().any(|term| term.eq_ignore_ascii_case(value)) {
+    let duplicate = terms.iter().any(|term| term.eq_ignore_ascii_case(value));
+    if !duplicate {
         terms.push(value.to_string());
     }
 }
@@ -1559,15 +1579,30 @@ fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose
     if query.is_empty() {
         return;
     }
-    if queries
+    let duplicate = queries
         .iter()
-        .any(|existing| existing.query.eq_ignore_ascii_case(query))
-    {
+        .any(|existing| existing.query.eq_ignore_ascii_case(query));
+    if duplicate {
         return;
     }
     queries.push(PacketPlanQueryDto {
         query: query.to_string(),
         purpose: purpose.to_string(),
+    });
+}
+
+fn push_exact_symbol_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str) {
+    let query = query.trim();
+    if query.is_empty()
+        || queries.iter().any(|existing| {
+            packet_plan_query_is_exact_symbol_identity(existing) && existing.query == query
+        })
+    {
+        return;
+    }
+    queries.push(PacketPlanQueryDto {
+        query: query.to_string(),
+        purpose: PACKET_EXACT_SYMBOL_QUERY_PURPOSE.to_string(),
     });
 }
 

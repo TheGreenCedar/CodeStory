@@ -1171,6 +1171,51 @@ mod tests {
     }
 
     #[test]
+    fn bounded_logical_identity_is_stable_for_a_missing_project_root() {
+        let parent = tempdir().expect("project parent");
+        let project = parent.path().join("missing-project");
+
+        let first = observe_logical_project_identity_v3(&project);
+        let second = observe_logical_project_identity_v3(&project);
+
+        assert!(!project.exists());
+        assert_eq!(first, second);
+        assert_eq!(first.project_id, first.workspace_id);
+        assert!(matches!(
+            &first.repository_instance.0,
+            RepositoryInstanceIdentityKind::Absent
+        ));
+    }
+
+    #[test]
+    fn bounded_logical_identity_fails_closed_when_a_missing_root_appears() {
+        let parent = tempdir().expect("project parent");
+        let project = parent.path().join("appearing-project");
+        let appearing_project = project.clone();
+        crate::repo_metadata::set_after_bounded_identity_capture_hook_for_test(move || {
+            fs::create_dir(&appearing_project).expect("create project after bounded capture");
+        });
+
+        let raced = observe_logical_project_identity_v3(&project);
+        let stable = observe_logical_project_identity_v3(&project);
+        let converged = observe_logical_project_identity_v3(&project);
+
+        assert_eq!(raced.project_id, raced.workspace_id);
+        assert_ne!(raced.workspace_id, stable.workspace_id);
+        assert_ne!(raced.project_id, stable.project_id);
+        assert!(matches!(
+            &raced.repository_instance.0,
+            RepositoryInstanceIdentityKind::Indeterminate(_)
+        ));
+        assert!(matches!(
+            &stable.repository_instance.0,
+            RepositoryInstanceIdentityKind::Absent
+        ));
+        assert_ne!(raced.repository_instance, stable.repository_instance);
+        assert_eq!(stable, converged);
+    }
+
+    #[test]
     fn bounded_logical_identity_never_walks_metadata_and_ignores_dirty_or_commit_state() {
         let Some(project) = git_project() else {
             return;

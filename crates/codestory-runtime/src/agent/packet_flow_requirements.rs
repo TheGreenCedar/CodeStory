@@ -38,7 +38,17 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use codestory_contracts::api::{AgentCitationDto, PacketTaskClassDto};
+use codestory_contracts::api::{AgentCitationDto, NodeKind, PacketTaskClassDto};
+
+const CALLABLE_NODE_KINDS: &[NodeKind] = &[NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
+const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
+    NodeKind::FUNCTION,
+    NodeKind::METHOD,
+    NodeKind::MACRO,
+    NodeKind::STRUCT,
+    NodeKind::CLASS,
+];
+const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlowRole {
@@ -125,6 +135,33 @@ impl EvidencePredicate {
                     && role_survives_without_its_path(citation, roles)
             }
             Self::CitedCarrier(carrier) => carrier(citation),
+        }
+    }
+
+    /// Secondary node-kind policy for role-based predicates. Carrier predicates already encode
+    /// their own structural contract and return an empty list to mean "predicate-owned".
+    pub(crate) fn allowed_node_kinds(self) -> &'static [NodeKind] {
+        let Self::CitedRoles { roles, .. } = self else {
+            return &[];
+        };
+        if roles.iter().any(|role| {
+            matches!(
+                role,
+                PacketEvidenceRole::SqlTableDefinition
+                    | PacketEvidenceRole::SqlRelationshipConstraint
+                    | PacketEvidenceRole::SqlSchemaFile
+            )
+        }) {
+            SQL_SCHEMA_NODE_KINDS
+        } else if roles.iter().any(|role| {
+            matches!(
+                role,
+                PacketEvidenceRole::ClientFactory | PacketEvidenceRole::TransportAdapter
+            )
+        }) {
+            BEHAVIORAL_OWNER_NODE_KINDS
+        } else {
+            CALLABLE_NODE_KINDS
         }
     }
 }

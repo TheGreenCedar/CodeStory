@@ -528,9 +528,85 @@ impl RuntimeContext {
     }
 }
 
-/// Serialize one publication-backed response with the canonical adapter
-/// metadata envelope. HTTP and ordinary CLI JSON use this exact helper so the
-/// shape cannot drift between transports.
+/// Additive public response-envelope contract. Missing remains legacy v0 until W7.7 completes
+/// protocol negotiation and fail-closed defaults around this stamp.
+pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 = 1;
+
+pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value {
+    let active_cli_version = env!("CARGO_PKG_VERSION");
+    let plugin_cli_version = publication_env_nonempty("CODESTORY_PLUGIN_CLI_VERSION");
+    let plugin_version = publication_env_nonempty("CODESTORY_PLUGIN_VERSION");
+    let cli_source = publication_env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE")
+        .unwrap_or_else(|| "direct_cli_launch".to_string());
+    let override_configured =
+        publication_env_nonempty("CODESTORY_CLI").is_some() || cli_source == "local_dev_override";
+    codestory_publication_contract_runtime_meta_from(
+        active_cli_version,
+        plugin_version,
+        plugin_cli_version,
+        cli_source,
+        override_configured,
+    )
+}
+
+pub(crate) fn codestory_publication_contract_runtime_meta_from(
+    active_cli_version: &str,
+    plugin_version: Option<String>,
+    plugin_cli_version: Option<String>,
+    cli_source: String,
+    override_configured: bool,
+) -> serde_json::Value {
+    let pinned_pair_matches = plugin_cli_version
+        .as_deref()
+        .map(|version| version == active_cli_version);
+    serde_json::json!({
+        "cli_version": active_cli_version,
+        "plugin_version": plugin_version,
+        "plugin_cli_version": plugin_cli_version,
+        "cli_source": cli_source,
+        "pinned_pair_matches": pinned_pair_matches,
+        "known_override_skew_channel": override_configured,
+    })
+}
+
+fn publication_env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Build the canonical publication/contract stamp shared by CLI JSON, HTTP, and stdio.
+pub(crate) fn codestory_publication_meta(
+    core_publication: Option<serde_json::Value>,
+    retrieval_publication: Option<serde_json::Value>,
+    operation_id: Option<&str>,
+    attempt: Option<u32>,
+    refreshing: bool,
+) -> serde_json::Value {
+    let served_from = if core_publication.is_none() && retrieval_publication.is_none() {
+        "contract_only"
+    } else if refreshing {
+        "last_complete_publication"
+    } else {
+        "complete_publication"
+    };
+    serde_json::json!({
+        "schema_version": CODESTORY_PUBLICATION_META_SCHEMA_VERSION,
+        "served_from": served_from,
+        "publication": core_publication,
+        "core_publication": core_publication,
+        "retrieval_publication": retrieval_publication,
+        "contract_runtime": codestory_publication_contract_runtime_meta(),
+        "operation": {
+            "operation_id": operation_id,
+            "attempt": attempt,
+        }
+    })
+}
+
+/// Serialize one publication-backed response with the canonical adapter metadata envelope. HTTP,
+/// ordinary CLI JSON, and stdio share this contract so proof-status consumers see one schema stamp.
 pub(crate) fn public_operation_json_value<T, V: Serialize>(
     operation: &PublicOperation<T>,
     response: &V,
@@ -539,8 +615,16 @@ pub(crate) fn public_operation_json_value<T, V: Serialize>(
     if !value.is_object() {
         value = serde_json::json!({"result": value});
     }
-    let core_publication = &operation.core_publication;
-    let retrieval_publication = &operation.retrieval_publication;
+    let core_publication = operation
+        .core_publication
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    let retrieval_publication = operation
+        .retrieval_publication
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
     let object = value
         .as_object_mut()
         .expect("public operation payload is an object");
@@ -555,16 +639,13 @@ pub(crate) fn public_operation_json_value<T, V: Serialize>(
         .expect("public operation metadata is an object")
         .insert(
             "codestory_publication".to_string(),
-            serde_json::json!({
-                "served_from": "complete_publication",
-                "publication": core_publication,
-                "core_publication": core_publication,
-                "retrieval_publication": retrieval_publication,
-                "operation": {
-                    "operation_id": &operation.operation_id,
-                    "attempt": operation.attempt,
-                }
-            }),
+            codestory_publication_meta(
+                core_publication,
+                retrieval_publication,
+                Some(&operation.operation_id),
+                Some(operation.attempt),
+                false,
+            ),
         );
     Ok(value)
 }
@@ -1116,7 +1197,17 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/served_from"),
-            Some(&serde_json::json!("complete_publication"))
+            Some(&serde_json::json!("contract_only"))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/schema_version"),
+            Some(&serde_json::json!(
+                CODESTORY_PUBLICATION_META_SCHEMA_VERSION
+            ))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),
+            Some(&serde_json::json!(env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/operation/operation_id"),

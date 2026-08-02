@@ -1315,24 +1315,20 @@ fn stdio_served_publication_meta(
     operation_id: Option<&str>,
     attempt: Option<u32>,
 ) -> Option<serde_json::Value> {
-    if publication.is_none() && retrieval_publication.is_none() {
-        return None;
-    }
     let status = state.status_cache.as_ref().map(|cached| &cached.value);
     let refreshing = status
         .and_then(|status| status.pointer("/local_refresh/state"))
         .and_then(serde_json::Value::as_str)
         == Some("refreshing");
-    let mut meta = serde_json::json!({
-        "served_from": if refreshing { "last_complete_publication" } else { "complete_publication" },
-        "publication": publication,
-        "core_publication": publication,
-        "retrieval_publication": retrieval_publication,
-        "operation": {
-            "operation_id": operation_id,
-            "attempt": attempt,
-        },
-    });
+    let mut meta = crate::runtime::codestory_publication_meta(
+        publication.map(|publication| {
+            serde_json::to_value(publication).expect("index publication is JSON serializable")
+        }),
+        retrieval_publication.cloned(),
+        operation_id,
+        attempt,
+        refreshing,
+    );
     if refreshing {
         meta["refresh"] = serde_json::json!({
             "state": "refreshing",
@@ -6994,6 +6990,103 @@ version = "0.11.20"
             response.pointer("/result/_meta/codestory_publication/core_publication/generation_id"),
             Some(&json!(active.core_generation_id))
         );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/schema_version"),
+            Some(&json!(
+                crate::runtime::CODESTORY_PUBLICATION_META_SCHEMA_VERSION
+            ))
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/contract_runtime/cli_version"),
+            Some(&json!(env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[test]
+    fn stdio_degraded_packet_without_publication_still_carries_contract_stamp() {
+        let payload = json!({
+            "sufficiency": {
+                "status": "partial",
+                "covered_claims": [{"proof_status": "reported"}]
+            }
+        });
+        let meta = stdio_served_publication_meta(
+            &StdioServerState::default(),
+            None,
+            None,
+            Some("public-1"),
+            Some(1),
+        );
+        let response = stdio_jsonrpc_tool_call_from_legacy(
+            json!(1),
+            json!({"result": payload.clone()}),
+            meta,
+            "packet",
+        );
+        let canonical = crate::runtime::public_operation_json_value(
+            &codestory_runtime::PublicOperation {
+                value: (),
+                core_publication: None,
+                retrieval_publication: None,
+                operation_id: "public-1".to_string(),
+                attempt: 1,
+            },
+            &payload,
+        )
+        .expect("canonical CLI/HTTP envelope");
+
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/schema_version"),
+            Some(&json!(
+                crate::runtime::CODESTORY_PUBLICATION_META_SCHEMA_VERSION
+            ))
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/core_publication"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/retrieval_publication"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication/served_from"),
+            Some(&json!("contract_only"))
+        );
+        assert_eq!(
+            response.pointer("/result/_meta/codestory_publication"),
+            canonical.pointer("/_meta/codestory_publication"),
+            "stdio and canonical CLI/HTTP adapters must publish the same schema/runtime stamp"
+        );
+    }
+
+    #[test]
+    fn stdio_contract_pair_match_is_null_when_launcher_pair_is_absent() {
+        let direct = crate::runtime::codestory_publication_contract_runtime_meta_from(
+            "0.16.3",
+            None,
+            None,
+            "direct_cli_launch".to_string(),
+            false,
+        );
+        let mismatch = crate::runtime::codestory_publication_contract_runtime_meta_from(
+            "0.16.3",
+            Some("0.16.3".to_string()),
+            Some("0.16.2".to_string()),
+            "managed_cli".to_string(),
+            false,
+        );
+        let matched = crate::runtime::codestory_publication_contract_runtime_meta_from(
+            "0.16.3",
+            Some("0.16.3".to_string()),
+            Some("0.16.3".to_string()),
+            "managed_cli".to_string(),
+            false,
+        );
+
+        assert_eq!(direct["pinned_pair_matches"], serde_json::Value::Null);
+        assert_eq!(mismatch["pinned_pair_matches"], json!(false));
+        assert_eq!(matched["pinned_pair_matches"], json!(true));
     }
 
     #[test]

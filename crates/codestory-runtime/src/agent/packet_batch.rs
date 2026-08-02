@@ -764,6 +764,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -797,6 +798,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -850,6 +852,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -891,6 +894,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -926,6 +930,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -996,6 +1001,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 
@@ -1056,6 +1062,7 @@ mod tests {
             inferred_task_class: false,
             queries,
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
 

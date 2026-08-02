@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -184,8 +184,23 @@ pub(crate) enum BoundedRepositoryIdentityObservation {
 pub(crate) fn observe_bounded_repository_identity(
     project_root: &Path,
 ) -> Result<BoundedRepositoryIdentityObservation> {
-    let root = canonical_existing(project_root)
-        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let root = match fs::canonicalize(project_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            run_after_bounded_identity_capture_hook();
+            return match fs::symlink_metadata(project_root) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(BoundedRepositoryIdentityObservation::Absent)
+                }
+                _ => bail!("project root changed during bounded identity observation"),
+            };
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("canonicalize project root {}", project_root.display()));
+        }
+    };
     let dot_git = root.join(".git");
     match fs::symlink_metadata(&dot_git) {
         Ok(_) => {}

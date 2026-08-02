@@ -1,7 +1,14 @@
 //! Packet plan query normalization and deduplication.
 
-use codestory_contracts::api::PacketPlanDto;
+use codestory_contracts::api::{PacketPlanDto, PacketPlanQueryDto};
 use std::collections::HashSet;
+
+pub(crate) const PACKET_EXACT_SYMBOL_QUERY_PURPOSE: &str =
+    "case-sensitive exact symbol identity from task wording";
+
+pub(crate) fn packet_plan_query_is_exact_symbol_identity(query: &PacketPlanQueryDto) -> bool {
+    query.purpose == PACKET_EXACT_SYMBOL_QUERY_PURPOSE
+}
 
 pub(crate) fn normalize_packet_subquery(query: &str) -> String {
     query
@@ -21,7 +28,11 @@ pub(crate) fn dedupe_packet_plan_queries(plan: &mut PacketPlanDto) {
     let mut seen = HashSet::<String>::new();
     let mut deduped = Vec::with_capacity(plan.queries.len());
     for query in plan.queries.drain(..) {
-        let key = normalize_packet_subquery(&query.query);
+        let key = if packet_plan_query_is_exact_symbol_identity(&query) {
+            format!("exact-case:{}", query.query.trim())
+        } else {
+            normalize_packet_subquery(&query.query)
+        };
         if key.len() < 2 {
             deduped.push(query);
             continue;
@@ -54,6 +65,7 @@ mod tests {
                 },
             ],
             probe_resolutions: Vec::new(),
+            obligations: Default::default(),
             trace: Vec::new(),
         };
         dedupe_packet_plan_queries(&mut plan);
