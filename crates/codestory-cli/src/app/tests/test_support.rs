@@ -150,6 +150,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                     "codestory-cli retrieval index --project . --profile agent --refresh auto --format json"
                         .to_string(),
                 ],
+                follow_up_invocations: Vec::new(),
                 coverage_report: None,
             },
             retrieval_trace_summary: PacketRetrievalTraceSummaryDto {

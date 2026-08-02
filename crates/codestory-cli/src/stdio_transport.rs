@@ -77,6 +77,7 @@ const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// the ids kept to answer them, and refusals the transport already owes — is
 /// charged against it. Anything the queue cannot hold within both caps is
 /// refused instead of appended.
+const STDIO_MAX_REPORTED_VIOLATIONS: usize = 8;
 const STDIO_MAX_QUEUED_REQUESTS: usize = 32;
 const STDIO_MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 /// Longest client-supplied JSON-RPC id the transport retains and echoes back.
@@ -833,6 +834,37 @@ fn stdio_server_terminating_error(id: serde_json::Value) -> serde_json::Value {
     )
 }
 
+/// Reject a `tools/call` whose arguments contradict the published catalog.
+///
+/// The reported list is capped because a malformed frame can carry arbitrarily
+/// many violations; `violation_count` keeps the total honest.
+fn stdio_invalid_params_error(
+    id: serde_json::Value,
+    tool: &str,
+    violations: &[crate::stdio_arguments::ArgumentViolation],
+) -> serde_json::Value {
+    let reported = violations
+        .iter()
+        .take(STDIO_MAX_REPORTED_VIOLATIONS)
+        .map(crate::stdio_arguments::ArgumentViolation::to_json)
+        .collect::<Vec<_>>();
+    stdio_typed_protocol_error(
+        id,
+        -32602,
+        format!(
+            "invalid_params: tool `{tool}` rejected {} argument violation(s) declared by tools/list",
+            violations.len()
+        ),
+        serde_json::json!({
+            "code": "invalid_params",
+            "tool": tool,
+            "violation_count": violations.len(),
+            "violations": reported,
+            "next_action": "correct_arguments_from_tools_list",
+        }),
+    )
+}
+
 fn stdio_typed_protocol_error(
     id: serde_json::Value,
     code: i32,
@@ -1577,6 +1609,12 @@ fn handle_stdio_message(
                     -32602,
                     "Invalid params: tool arguments must be an object",
                 ));
+            }
+            if let Err(violations) = crate::stdio_arguments::validate_tool_arguments(
+                name,
+                request.pointer("/params/arguments"),
+            ) {
+                return Some(stdio_invalid_params_error(id, name, &violations));
             }
             let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
@@ -3670,7 +3708,7 @@ fn handle_stdio_symbol(runtime: &RuntimeContext, request: &serde_json::Value) ->
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3705,7 +3743,7 @@ fn handle_stdio_trail(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3735,7 +3773,7 @@ fn handle_stdio_definition(
                         false,
                         &[],
                     ))
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                    .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(ApiError::internal(error.to_string()))}));
                     add_stdio_links(&mut definition, links.clone());
                     serde_json::json!({
                         "resolution": build_query_resolution_output(&runtime.project_root, &target),
@@ -3747,7 +3785,7 @@ fn handle_stdio_definition(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3787,7 +3825,7 @@ fn handle_stdio_get_node(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3832,7 +3870,7 @@ fn handle_stdio_neighbors(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3840,11 +3878,13 @@ fn handle_stdio_shortest_path(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
 ) -> serde_json::Value {
+    // The catalog declares both ids required and non-empty; only an all-whitespace
+    // id survives that check, and it still has to fail with a machine code.
     let Some(from_id) = stdio_graph_string_arg(request, "from_id") else {
-        return serde_json::json!({"error": "shortest_path.from_id is required"});
+        return stdio_graph_argument_error("from_id");
     };
     let Some(to_id) = stdio_graph_string_arg(request, "to_id") else {
-        return serde_json::json!({"error": "shortest_path.to_id is required"});
+        return stdio_graph_argument_error("to_id");
     };
     let max_depth = stdio_graph_u32_arg(request, "max_depth", 6, 1, 10);
     let max_nodes = stdio_graph_u32_arg(request, "max_nodes", 80, 2, 120);
@@ -3913,7 +3953,7 @@ fn handle_stdio_references(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -3938,7 +3978,7 @@ fn handle_stdio_symbols(
             })
             .map(|symbols| {
                 serde_json::to_value(symbols)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+                    .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(ApiError::internal(error.to_string()))}))
             })
     } else {
         runtime
@@ -3948,7 +3988,7 @@ fn handle_stdio_symbols(
             })
             .map(|symbols| {
                 serde_json::to_value(symbols)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+                    .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(ApiError::internal(error.to_string()))}))
             })
     };
     result
@@ -3970,7 +4010,7 @@ fn handle_stdio_symbols(
                 }
             })
         })
-        .unwrap_or_else(|error| serde_json::json!({"error": map_api_error(error).to_string()}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
 fn handle_stdio_snippet(
@@ -3998,7 +4038,7 @@ fn handle_stdio_snippet(
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
-            |error| serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)}),
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
         )
 }
 
@@ -4009,7 +4049,7 @@ fn handle_stdio_context(
     let (target_label, focus_node_id) = match stdio_context_target(runtime, request) {
         Ok(target) => target,
         Err(error) => {
-            return serde_json::json!({"error": stdio_legacy_error_value(runtime, &error)});
+            return serde_json::json!({"error": stdio_typed_error_value(runtime, &error)});
         }
     };
     let max_results = request
@@ -4044,6 +4084,14 @@ fn handle_stdio_context(
             serde_json::json!({"result": context_packet_json(&result)})
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn stdio_graph_argument_error(argument: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": stdio_api_error_value(codestory_contracts::api::ApiError::invalid_argument(
+            format!("`{argument}` must be a non-empty stable node id")
+        ))
+    })
 }
 
 fn stdio_graph_direction(request: &serde_json::Value) -> TrailDirection {
@@ -4166,7 +4214,11 @@ fn stdio_context_target(
     let selector_count =
         usize::from(has_id) + usize::from(has_query) + usize::from(bookmark.is_some());
     if selector_count != 1 {
-        bail!("Pass exactly one of id, query, or bookmark for context.");
+        // The catalog's oneOf rejects the multi-selector frame before dispatch;
+        // an all-whitespace selector still lands here and needs a code.
+        return Err(crate::runtime::typed_api_error(ApiError::invalid_argument(
+            "Pass exactly one of id, query, or bookmark for context.",
+        )));
     }
     if let Some(bookmark_id) = bookmark {
         let bookmark = runtime
@@ -4175,12 +4227,18 @@ fn stdio_context_target(
             .map_err(map_api_error)?
             .into_iter()
             .find(|bookmark| bookmark.id == bookmark_id)
-            .with_context(|| format!("Bookmark not found: {bookmark_id}"))?;
+            .ok_or_else(|| {
+                crate::runtime::typed_api_error(ApiError::not_found(format!(
+                    "Bookmark not found: {bookmark_id}"
+                )))
+            })?;
         if bookmark.node_kind == NodeKind::UNKNOWN {
-            bail!(
-                "Bookmark {bookmark_id} is stale: node {} is no longer present after reindex.",
-                bookmark.node_id.0
-            );
+            return Err(crate::runtime::typed_api_error(ApiError::not_found(
+                format!(
+                    "Bookmark {bookmark_id} is stale: node {} is no longer present after reindex.",
+                    bookmark.node_id.0
+                ),
+            )));
         }
         return Ok((bookmark.node_label, bookmark.node_id));
     }
@@ -4214,7 +4272,14 @@ fn stdio_target_selection(request: &serde_json::Value) -> args::TargetSelection 
     }
 }
 
-fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> serde_json::Value {
+/// Render a graph-family failure as a typed error object.
+///
+/// Every graph tool answers through this seam so the machine classification the
+/// runtime produced survives the transport: callers read `code`, not a prefix of
+/// `message`. The `internal` fallback exists only for a failure that reached the
+/// boundary without a typed cause; `architecture_contracts` forbids adding new
+/// stringified paths beside it.
+fn stdio_typed_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> serde_json::Value {
     if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
         return serde_json::to_value(build_ambiguous_target_error_output(
             &runtime.project_root,
@@ -4222,10 +4287,19 @@ fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> 
         ))
         .ok()
         .and_then(|value| value.get("error").cloned())
-        .unwrap_or_else(|| serde_json::json!(ambiguous.to_string()));
+        .unwrap_or_else(|| {
+            stdio_api_error_value(codestory_contracts::api::ApiError::new(
+                "ambiguous_target",
+                ambiguous.to_string(),
+            ))
+        });
     }
-
-    serde_json::json!(error.to_string())
+    if let Some(api_error) = crate::runtime::api_error_in_chain(error) {
+        return stdio_api_error_value(api_error.clone());
+    }
+    stdio_api_error_value(codestory_contracts::api::ApiError::internal(
+        error.to_string(),
+    ))
 }
 
 fn read_stdio_resource(
@@ -6330,6 +6404,49 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    #[test]
+    fn published_guidance_calls_satisfy_the_generated_catalog() {
+        fn walk(value: &serde_json::Value, checked: &mut usize) {
+            match value {
+                serde_json::Value::Object(members) => {
+                    if members.get("method") == Some(&json!("tools/call"))
+                        && let Some(tool) = members.get("tool").and_then(serde_json::Value::as_str)
+                    {
+                        *checked += 1;
+                        assert_eq!(
+                            crate::stdio_arguments::validate_tool_arguments(
+                                tool,
+                                members.get("arguments")
+                            ),
+                            Ok(()),
+                            "published guidance for `{tool}` contradicts the generated catalog: {value}"
+                        );
+                    }
+                    for member in members.values() {
+                        walk(member, checked);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, checked);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut checked = 0;
+        walk(&read_stdio_agent_guide_resource(), &mut checked);
+        walk(
+            &stdio_status_recommended_next_calls(&[], &json!("/absolute/project")),
+            &mut checked,
+        );
+        assert!(
+            checked >= 15,
+            "expected the guidance surfaces to publish concrete tool calls, saw {checked}"
+        );
+    }
 
     #[test]
     fn plugin_runtime_reports_a_bounded_live_client_process_identity() {
@@ -9000,9 +9117,15 @@ version = "0.11.20"
             &Arc::new(AtomicBool::new(false)),
         )
         .expect("malformed affected response");
+        // Catalog validation rejects the empty path before any project is
+        // bound, so the malformed frame never reaches the session binder.
         assert_eq!(
-            malformed.pointer("/result/structuredContent/code"),
-            Some(&json!("invalid_argument"))
+            malformed.pointer("/error/data/code"),
+            Some(&json!("invalid_params"))
+        );
+        assert_eq!(
+            malformed.pointer("/error/data/violations/0/pointer"),
+            Some(&json!("/arguments/paths/0"))
         );
         assert_eq!(
             retained_state(&session),

@@ -24,6 +24,7 @@ mod report;
 mod retrieval;
 mod runtime;
 mod sidecar_runtime;
+mod stdio_arguments;
 mod stdio_catalog;
 mod stdio_transport;
 

@@ -2097,7 +2097,8 @@
       "description": "Resolve a symbol id or query and return details.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Resolve a symbol by query or stable node id.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2109,7 +2110,6 @@
             ]
           }
         ],
-        "description": "Resolve a symbol by query or stable node id.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -2395,7 +2395,8 @@
       "description": "Return a graph trail around a symbol.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a graph trail around a symbol id or query.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2407,7 +2408,6 @@
             ]
           }
         ],
-        "description": "Return a graph trail around a symbol id or query.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -2515,7 +2515,8 @@
       "description": "Return a bounded incoming caller graph around a symbol.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a bounded local graph alias around one node.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2527,7 +2528,6 @@
             ]
           }
         ],
-        "description": "Return a bounded local graph alias around one node.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -2661,7 +2661,8 @@
       "description": "Return a bounded outgoing callee graph around a symbol.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a bounded local graph alias around one node.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2673,7 +2674,6 @@
             ]
           }
         ],
-        "description": "Return a bounded local graph alias around one node.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -2807,7 +2807,8 @@
       "description": "Return a readable trace around a symbol.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a readable trace around a symbol id or query.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2819,7 +2820,6 @@
             ]
           }
         ],
-        "description": "Return a readable trace around a symbol id or query.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -2927,7 +2927,8 @@
       "description": "Return one stable graph node with file refs before requesting a packet.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Resolve a single indexed graph node by stable id or query.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -2939,7 +2940,6 @@
             ]
           }
         ],
-        "description": "Resolve a single indexed graph node by stable id or query.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3059,7 +3059,8 @@
       "description": "Return a bounded graph neighborhood around one node.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a bounded graph neighborhood around one node.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3071,7 +3072,6 @@
             ]
           }
         ],
-        "description": "Return a bounded graph neighborhood around one node.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3345,7 +3345,8 @@
       "description": "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Return a bounded graph subgraph around one resolved node.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3357,7 +3358,6 @@
             ]
           }
         ],
-        "description": "Return a bounded graph subgraph around one resolved node.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3501,7 +3501,8 @@
       "description": "Return definition metadata for a symbol id or query.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Resolve a symbol by query or stable node id.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3513,7 +3514,6 @@
             ]
           }
         ],
-        "description": "Resolve a symbol by query or stable node id.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3617,7 +3617,8 @@
       "description": "Return incoming references for a symbol id or query.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Resolve a symbol by query or stable node id.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3629,7 +3630,6 @@
             ]
           }
         ],
-        "description": "Resolve a symbol by query or stable node id.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3823,7 +3823,8 @@
       "description": "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Resolve a symbol and return bounded line or function-body source context.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3835,7 +3836,6 @@
             ]
           }
         ],
-        "description": "Resolve a symbol and return bounded line or function-body source context.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3981,7 +3981,8 @@
       "description": "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Build a deep evidence packet for one concrete retrieval target.",
+        "oneOf": [
           {
             "required": [
               "query"
@@ -3998,7 +3999,6 @@
             ]
           }
         ],
-        "description": "Build a deep evidence packet for one concrete retrieval target.",
         "properties": {
           "bookmark": {
             "description": "Saved bookmark id to build context around.",
