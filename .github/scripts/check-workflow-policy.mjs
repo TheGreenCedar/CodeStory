@@ -1387,6 +1387,36 @@ export function proofFloorPolicyViolations(
     `${architecture.workflow} architecture contract must complete before draft artifacts are seeded and saved`,
   );
 
+  const mergedLanes = object(policy.merged_suite_lanes);
+  add(
+    violations,
+    mergedLanes.workflow === retrievalFile
+      && mergedLanes.job === architecture.job,
+    `merged suite lanes must remain owned by the ${retrievalFile} universal job`,
+  );
+  const mergedLanesJob = object(at(
+    workflows.get(String(mergedLanes.workflow)),
+    "jobs",
+    mergedLanes.job,
+  ));
+  const mergedLanesStep = namedStep(mergedLanesJob, String(mergedLanes.step));
+  add(
+    violations,
+    sameStrings(
+      nonCommentLines(mergedLanesStep?.run),
+      list(mergedLanes.commands).map(String),
+    )
+      && mergedLanesStep?.if === undefined
+      && mergedLanesStep?.["continue-on-error"] === undefined,
+    `${mergedLanes.workflow} ${mergedLanes.job} must run the exact blocking merged suite lanes`,
+  );
+  add(
+    violations,
+    stepIndex(mergedLanesJob, String(mergedLanes.step))
+      < stepIndex(mergedLanesJob, "Seed draft proof test-profile artifacts"),
+    `${mergedLanes.workflow} merged suite lanes must complete before draft artifacts are seeded and saved`,
+  );
+
   const durability = object(policy.crate_durability);
   const file = String(durability.workflow ?? crateDurabilityFile);
   const workflow = workflows.get(file);

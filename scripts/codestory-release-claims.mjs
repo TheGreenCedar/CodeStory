@@ -831,7 +831,12 @@ function validateProofFloor(value) {
   if (
     floor.schema !== 1
     || JSON.stringify(Object.keys(floor).sort())
-      !== JSON.stringify(["architecture_contract", "crate_durability", "schema"])
+      !== JSON.stringify([
+        "architecture_contract",
+        "crate_durability",
+        "merged_suite_lanes",
+        "schema",
+      ])
   ) {
     fail("workflow_policy.proof_floor must use the exact schema 1 contract");
   }
@@ -911,6 +916,36 @@ function validateProofFloor(value) {
       "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
     ],
     "workflow_policy.proof_floor.crate_durability.commands",
+  );
+
+  const mergedLanes = object(
+    floor.merged_suite_lanes,
+    "workflow_policy.proof_floor.merged_suite_lanes",
+  );
+  nonEmptyText(
+    mergedLanes.workflow,
+    "workflow_policy.proof_floor.merged_suite_lanes.workflow",
+  );
+  if (
+    JSON.stringify(Object.keys(mergedLanes).sort())
+      !== JSON.stringify(["commands", "job", "step", "workflow"])
+    || mergedLanes.job !== "linux-contracts"
+    || mergedLanes.step !== "Evidence, readiness, hooks, and workspace contract tests"
+  ) {
+    fail("workflow_policy.proof_floor merged suite lanes must stay in the universal linux-contracts lane");
+  }
+  exactStringList(
+    mergedLanes.commands,
+    [
+      "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
+      "cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::",
+      "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
+      "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
+      "cargo test --locked -p codestory-runtime --lib services::",
+      "cargo test --locked -p codestory-cli --lib",
+      "cargo test --locked -p codestory-workspace",
+    ],
+    "workflow_policy.proof_floor.merged_suite_lanes.commands",
   );
 }
 

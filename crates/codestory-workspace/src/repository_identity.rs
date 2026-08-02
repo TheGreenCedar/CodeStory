@@ -1201,8 +1201,12 @@ mod tests {
         let converged = observe_logical_project_identity_v3(&project);
 
         assert_eq!(raced.project_id, raced.workspace_id);
-        assert_ne!(raced.workspace_id, stable.workspace_id);
-        assert_ne!(raced.project_id, stable.project_id);
+        // The workspace id hashes the raw path while the root is missing and
+        // the canonical path once it exists, so the two ids coincide whenever
+        // the temp parent is already canonical (Linux /tmp) and differ only
+        // behind a symlinked parent (macOS /var). The fail-closed guarantee is
+        // the per-observation-unique indeterminate instance below, not the
+        // workspace id.
         assert!(matches!(
             &raced.repository_instance.0,
             RepositoryInstanceIdentityKind::Indeterminate(_)

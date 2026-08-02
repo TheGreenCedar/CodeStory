@@ -1074,6 +1074,20 @@
           "cargo test --locked -p codestory-indexer --test fidelity_regression",
           "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage"
         ]
+      },
+      "merged_suite_lanes": {
+        "workflow": "retrieval-engine-smoke.yml",
+        "job": "linux-contracts",
+        "step": "Evidence, readiness, hooks, and workspace contract tests",
+        "commands": [
+          "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
+          "cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::",
+          "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
+          "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
+          "cargo test --locked -p codestory-runtime --lib services::",
+          "cargo test --locked -p codestory-cli --lib",
+          "cargo test --locked -p codestory-workspace"
+        ]
       }
     },
     "package_matrix": [
