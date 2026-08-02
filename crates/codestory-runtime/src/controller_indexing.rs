@@ -510,6 +510,13 @@ impl AppController {
         refresh_runtime_caches: bool,
         _cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        if summary.unchanged_publication {
+            // Nothing was staged or published, so the live publication and its
+            // completed search generation are still the ones already pinned.
+            // Rebuilding either would only reproduce what is on disk.
+            self.state.lock().is_indexing = false;
+            return Ok(summary.phase_timings);
+        }
         if refresh_runtime_caches {
             #[cfg(test)]
             let boundary_result =

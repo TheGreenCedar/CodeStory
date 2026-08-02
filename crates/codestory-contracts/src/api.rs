@@ -81,8 +81,9 @@ pub use errors::{
 };
 pub use events::{
     AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
-    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IndexingPhaseTimings,
-    ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
+    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalPlanProbeOutcomeDto,
+    IncrementalPlanProbeTimings, IndexingPhaseTimings, ProjectionPersistenceFamilyTimings,
+    ProjectionPersistenceTimings,
 };
 pub use ids::{EdgeId, NodeId};
 pub use types::{

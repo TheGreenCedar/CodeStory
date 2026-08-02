@@ -87,9 +87,10 @@ use crate::snippets::bounded_direct_markdown_snippet;
 use crate::snippets::bounded_markdown_snippet_from_path;
 use codestory_contracts::api::{
     ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
-    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest, IndexMode,
-    IndexedFilesRequest, ListRootSymbolsRequest, OpenProjectRequest, StartIndexingRequest,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileTextRequest,
+    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListRootSymbolsRequest,
+    OpenProjectRequest, StartIndexingRequest, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
@@ -1853,7 +1854,7 @@ fn run_indexing_without_runtime_refresh_populates_dense_anchor_inputs_in_storage
 }
 
 #[test]
-fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
+fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -1877,9 +1878,44 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
         .expect("first dense manifest");
     drop(first_storage);
 
+    // An empty refresh plan is short-circuited and publishes nothing: the
+    // carried dense anchors stay bound to the still-live publication.
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
         .expect("unchanged incremental index");
+    {
+        let storage = Storage::open(&storage_path).expect("unchanged incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("unchanged publication")
+            .expect("complete unchanged publication");
+        assert_eq!(publication, first_publication);
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("unchanged dense manifest");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_eq!(manifest.core_run_id, first_manifest.core_run_id);
+        let live_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        assert!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("carried dense anchors")
+                .iter()
+                .all(|anchor| anchor.source_identity == live_source),
+            "a short-circuited refresh must leave every dense anchor bound to the live publication"
+        );
+    }
+
+    // A refresh with real work rebinds the carried anchors onto the new
+    // publication identity.
+    fs::write(
+        workspace.path().join("dense_anchor_rebind_probe.md"),
+        "# rebind probe\n\nA documented change.\n",
+    )
+    .expect("write changed source");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("publishing incremental index");
     let storage = Storage::open(&storage_path).expect("incremental storage");
     let publication = storage
         .get_complete_index_publication()
@@ -1888,7 +1924,6 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
     let manifest = storage
         .validate_dense_anchor_publication(&publication)
         .expect("incremental dense manifest");
-    assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
     assert_ne!(manifest.core_run_id, first_manifest.core_run_id);
     let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
     assert!(
@@ -6073,6 +6108,7 @@ fn empty_indexing_run_summary() -> IndexingRunSummary {
             published_at_epoch_ms: 1,
         },
         prepared_search_state: None,
+        unchanged_publication: false,
     }
 }
 
@@ -7930,6 +7966,261 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
         baseline_publication.generation + 1
     );
     assert_eq!(retried_publication.mode, IndexPublicationMode::Incremental);
+}
+
+struct EmptyPlanShortCircuitFixture {
+    _workspace: tempfile::TempDir,
+    controller: AppController,
+    storage_path: PathBuf,
+    source_path: PathBuf,
+    baseline_publication: IndexPublicationRecord,
+    baseline_search_generations: Vec<String>,
+}
+
+fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    let workspace = tempdir().expect("workspace dir");
+    let source_path = workspace.path().join("lib.rs");
+    fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open short-circuit project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish short-circuit baseline");
+    let baseline_publication = Storage::open(&storage_path)
+        .expect("open baseline storage")
+        .get_complete_index_publication()
+        .expect("read baseline publication record")
+        .expect("complete baseline publication record");
+    let baseline_search_generations = persisted_search_generation_names(&storage_path);
+    assert_eq!(
+        baseline_search_generations.len(),
+        1,
+        "the baseline must publish exactly one completed search generation"
+    );
+    EmptyPlanShortCircuitFixture {
+        _workspace: workspace,
+        controller,
+        storage_path,
+        source_path,
+        baseline_publication,
+        baseline_search_generations,
+    }
+}
+
+#[test]
+fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding_search() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("unchanged incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::ShortCircuited,
+        "an unchanged workspace must resolve to the short-circuit outcome: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(
+        probe.skipped_database_copies, 3,
+        "skipping the staged pipeline avoids the staged clone, the rollback backup copy, and the staged-to-live restore"
+    );
+    assert!(probe.skipped_search_state_rebuild);
+    assert!(
+        probe.live_database_file_bytes > 0,
+        "the saved work must be measured against the published core size"
+    );
+    assert_eq!(
+        probe.skipped_database_copy_bytes,
+        probe.live_database_file_bytes * 3
+    );
+    assert_eq!(
+        timings.publish_ms, None,
+        "a short-circuited refresh must not record a publication"
+    );
+    assert_eq!(timings.staged_snapshot_copy, None);
+    assert_eq!(timings.core_promotion, None);
+    assert_eq!(
+        timings.cache_refresh_ms, None,
+        "a short-circuited refresh must not enter the runtime cache rebuild at all"
+    );
+    assert!(
+        !fixture.controller.state.lock().is_indexing,
+        "a short-circuited refresh must release the indexing state"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a short-circuited refresh must leave the published core generation in place"
+    );
+    assert!(
+        !storage
+            .has_incomplete_incremental_run()
+            .expect("read post-refresh incremental marker"),
+        "a short-circuited refresh must not leave a recovery marker behind"
+    );
+    drop(storage);
+    assert_eq!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a short-circuited refresh must not build a new search generation"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    fs::write(&fixture.source_path, "pub fn steady_state() -> i32 { 2 }\n").expect("change source");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("changed incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
+        "a changed workspace must not be reported as short-circuited: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 1);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert_eq!(probe.skipped_database_copy_bytes, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+    assert!(
+        timings.publish_ms.is_some(),
+        "a changed workspace must still publish"
+    );
+    assert!(
+        timings.cache_refresh_ms.is_some(),
+        "a changed workspace must still run the runtime cache rebuild"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let published = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        published.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    assert_eq!(published.mode, IndexPublicationMode::Incremental);
+    drop(storage);
+    assert_ne!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a changed workspace must build a new search generation"
+    );
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_completed_search_generation_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let generation_root = search_index_generation_root(&fixture.storage_path);
+    for name in &fixture.baseline_search_generations {
+        fs::remove_dir_all(generation_root.join(name)).expect("remove completed search generation");
+    }
+    assert!(persisted_search_generation_names(&fixture.storage_path).is_empty());
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a reusable search generation");
+
+    let rebuilt = persisted_search_generation_names(&fixture.storage_path);
+    assert_eq!(
+        rebuilt.len(),
+        1,
+        "the refresh must rebuild the missing search generation: {rebuilt:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete,
+        "an empty plan must not short-circuit when the published search generation is gone: {probe:?}"
+    );
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_dense_anchor_manifest_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch("DELETE FROM dense_anchor_publication;")
+        .expect("clear dense anchor manifest");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a dense anchor manifest");
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert!(
+        storage
+            .get_dense_anchor_publication_manifest()
+            .expect("read rebuilt dense anchor manifest")
+            .is_some(),
+        "the refresh must republish the dense anchor manifest it could not reuse"
+    );
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+        "an empty plan must not short-circuit while a complete dense anchor rebuild is owed: {probe:?}"
+    );
 }
 
 #[test]

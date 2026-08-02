@@ -571,5 +571,6 @@ pub(super) fn index_full_for_runtime(
         #[cfg(test)]
         publication: publication.clone(),
         prepared_search_state: Some(prepared_search_state),
+        unchanged_publication: false,
     })
 }
