@@ -297,6 +297,7 @@ pub mod benchmark_support {
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
 }
 
+mod activation_status;
 mod semantic_doc_text;
 mod services;
 mod support;
@@ -309,6 +310,9 @@ mod test_support;
 mod tests;
 mod trail_story;
 
+pub use activation_status::{
+    RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError, RetrievalEngineDiagnosticsStage,
+};
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
