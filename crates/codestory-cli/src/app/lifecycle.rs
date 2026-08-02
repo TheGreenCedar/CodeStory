@@ -256,8 +256,18 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
     );
     let _ = writeln!(
         markdown,
+        "invalidated_semantic_rows: `{}`",
+        output.invalidated_semantic_rows
+    );
+    let _ = writeln!(
+        markdown,
         "rebased_path_bound_rows: `{}`",
         output.rebased_path_bound_rows
+    );
+    let _ = writeln!(
+        markdown,
+        "carried_policy_exclusion_rows: `{}`",
+        output.carried_policy_exclusion_rows
     );
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
     let _ = writeln!(markdown, "retrieval_status: `{}`", output.retrieval_status);

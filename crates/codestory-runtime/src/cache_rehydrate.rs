@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
-use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
+use codestory_store::{CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store};
 use codestory_workspace::{
-    RefreshInputs, WorkspaceInventory, WorkspaceInventoryOutcome, WorkspaceManifest,
+    RefreshInputs, SourceIndexPolicy, WorkspaceInventory, WorkspaceInventoryOutcome,
+    WorkspaceManifest,
+    atomic_file::{create_unique_temp_file, publish_existing_file_atomic},
     read_repository_metadata,
 };
 use serde::Serialize;
@@ -25,9 +27,9 @@ pub struct CacheRehydrateRequest<'a> {
 #[derive(Debug, Clone, Serialize)]
 /// Machine-readable result of a cache rehydrate attempt.
 ///
-/// `preserved_scope` and `retrieval` explain the contract boundary: SQLite graph/search/doc rows
-/// may be reused after rebasing, but sidecar directories and retrieval manifests must be rebuilt
-/// or revalidated for the target worktree.
+/// `preserved_scope` and `retrieval` explain the contract boundary: only core graph/file inventory
+/// and verified policy exclusions cross the worktree boundary. Derived semantic state is discarded
+/// and a full refresh is required before the target can publish.
 pub struct CacheRehydrateOutput {
     pub status: String,
     pub reason: Option<String>,
@@ -45,7 +47,9 @@ pub struct CacheRehydrateOutput {
     pub dry_run: bool,
     pub invalidated_retrieval_manifests: usize,
     pub invalidated_index_artifact_rows: usize,
+    pub invalidated_semantic_rows: usize,
     pub rebased_path_bound_rows: usize,
+    pub carried_policy_exclusion_rows: usize,
     pub preserved_scope: String,
     pub retrieval_status: String,
     pub retrieval_reason: String,
@@ -212,30 +216,15 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         ));
     }
 
-    if !request.dry_run {
-        copy_dir_recursive(request.source_cache_dir, request.target_cache_dir).with_context(
-            || {
-                format!(
-                    "copy cache {} -> {}",
-                    request.source_cache_dir.display(),
-                    request.target_cache_dir.display()
-                )
-            },
-        )?;
-    }
     let mut invalidated_retrieval_manifests = 0;
-    let mut invalidated_index_artifact_rows = 0;
-    let mut rebased_path_bound_rows = 0;
+    let mut rebase_stats = RehydratedCacheRebaseStats::default();
     if !request.dry_run {
-        let mut storage = Store::open(&target_db).context("open copied target cache")?;
-        invalidated_retrieval_manifests = storage
-            .clear_retrieval_index_manifests()
-            .context("invalidate copied retrieval manifests")?;
-        let (rebased_rows, invalidated_artifacts) = storage
-            .rebase_rehydrated_path_bound_cache(request.source_project, request.target_project)
-            .context("rebase copied path-bound cache rows")?;
-        rebased_path_bound_rows = rebased_rows;
-        invalidated_index_artifact_rows = invalidated_artifacts;
+        (invalidated_retrieval_manifests, rebase_stats) = publish_rehydrated_database(
+            &source_db,
+            &target_db,
+            request.source_project,
+            request.target_project,
+        )?;
     }
 
     Ok(CacheRehydrateOutput {
@@ -258,10 +247,11 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         copied: !request.dry_run,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests,
-        invalidated_index_artifact_rows,
-        rebased_path_bound_rows,
-        preserved_scope:
-            "sqlite_graph_search_docs_dense_inputs_rebased_v2_index_artifacts_preserved".into(),
+        invalidated_index_artifact_rows: rebase_stats.invalidated_index_artifact_rows,
+        invalidated_semantic_rows: rebase_stats.invalidated_semantic_rows,
+        rebased_path_bound_rows: rebase_stats.rebased_path_bound_rows,
+        carried_policy_exclusion_rows: rebase_stats.carried_policy_exclusion_rows,
+        preserved_scope: "core_graph_file_inventory_and_policy_exclusions_only".into(),
         retrieval_status: retrieval_rehydrate_status(request.dry_run),
         retrieval_reason: retrieval_rehydrate_reason(),
         retrieval_next_command: Some(retrieval_next_command(request.target_project)),
@@ -293,20 +283,30 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     {
         bail!("source cache has an incomplete incremental index run");
     }
+    let policy = SourceIndexPolicy::default();
+    let stored_policy_exclusions = storage
+        .get_source_policy_exclusions()
+        .context("read source cache policy exclusions")?;
     let refresh = workspace
-        .build_execution_outcome(&RefreshInputs {
-            stored_files: storage.files().inventory()?,
-            policy_exclusions: Vec::new(),
-            inventory: WorkspaceInventory::default(),
-        })
+        .build_execution_outcome_with_policy(
+            &RefreshInputs {
+                stored_files: storage.files().inventory()?,
+                policy_exclusions: stored_policy_exclusions
+                    .iter()
+                    .map(super::source_policy_exclusion_candidate)
+                    .collect(),
+                inventory: WorkspaceInventory::default(),
+            },
+            &policy,
+        )
         .context("build source cache refresh plan")?;
-    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+    if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         bail!(
             "source workspace inventory is {:?}; cache freshness cannot be proven",
-            refresh.inventory_outcome
+            refresh.refresh.inventory_outcome
         );
     }
-    let plan = refresh.plan;
+    let plan = refresh.refresh.plan;
     Ok(SourceCacheFreshness {
         changed_or_new_files: plan.files_to_index.len(),
         removed_files: plan.files_to_remove.len(),
@@ -413,27 +413,165 @@ fn absolutize_lexical_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?;
-        } else if entry.file_name() == "codestory.db" {
-            Store::copy_database_snapshot(&source_path, &target_path)?;
-        } else if matches!(
-            entry.file_name().to_string_lossy().as_ref(),
-            "codestory.db-wal" | "codestory.db-shm" | "codestory.index-writer.lock"
-        ) {
-            // SQLite backup snapshots the DB; live sidecars and process locks are never portable.
-            continue;
-        } else {
-            fs::copy(&source_path, &target_path)?;
+fn publish_rehydrated_database(
+    source_db: &Path,
+    target_db: &Path,
+    source_project: &Path,
+    target_project: &Path,
+) -> Result<(usize, RehydratedCacheRebaseStats)> {
+    let (stage_path, stage_file) = create_unique_temp_file(target_db, "rehydrate-stage")?;
+    drop(stage_file);
+    let mut publish_path = None;
+    let result = (|| {
+        Store::copy_database_snapshot(source_db, &stage_path)
+            .context("copy source database into rehydrate stage")?;
+        let (invalidated_retrieval_manifests, rebase_stats) = {
+            let mut storage = Store::open(&stage_path).context("open rehydrate stage")?;
+            let invalidated_retrieval_manifests = storage
+                .clear_retrieval_index_manifests()
+                .context("invalidate copied retrieval manifests")?;
+            let rebase_stats = storage
+                .rebase_rehydrated_path_bound_cache(source_project, target_project)
+                .context("rebase and invalidate copied cache rows")?;
+            (invalidated_retrieval_manifests, rebase_stats)
+        };
+
+        let (candidate_path, candidate_file) =
+            create_unique_temp_file(target_db, "rehydrate-publish")?;
+        drop(candidate_file);
+        publish_path = Some(candidate_path.clone());
+        Store::copy_database_snapshot(&stage_path, &candidate_path)
+            .context("seal rehydrate stage into publish candidate")?;
+        remove_database_temp(&stage_path).context("remove rehydrate stage")?;
+        validate_rehydrated_database(&candidate_path)
+            .context("validate rehydrate publish candidate")?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&candidate_path)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("sync rehydrate candidate {}", candidate_path.display()))?;
+        publish_existing_file_atomic(&candidate_path, target_db)
+            .context("publish rehydrated database")?;
+        remove_database_sidecars(&candidate_path).context("remove rehydrate candidate sidecars")?;
+        Ok((invalidated_retrieval_manifests, rebase_stats))
+    })();
+
+    if result.is_err() {
+        remove_database_temp_best_effort(&stage_path);
+        if let Some(path) = publish_path.as_deref() {
+            remove_database_temp_best_effort(path);
+        }
+    }
+    result
+}
+
+fn validate_rehydrated_database(path: &Path) -> Result<()> {
+    let storage = Store::open_observational(path).context("open candidate observationally")?;
+    let conn = storage.get_connection();
+    for table in [
+        "index_publication",
+        "retrieval_index_manifest",
+        "index_artifact_cache",
+        "llm_symbol_doc",
+        "symbol_search_doc",
+        "symbol_summary",
+        "dense_anchor_input",
+        "dense_anchor_publication",
+        "structural_text_unit_publication",
+        "structural_text_unit",
+        "structural_text_projection",
+        "structural_text_artifact_cache",
+        "source_policy_exclusion_publication",
+        "grounding_repo_stats_snapshot",
+        "grounding_file_snapshot",
+        "grounding_node_snapshot",
+        "grounding_node_summary_snapshot",
+        "grounding_node_edge_digest_snapshot",
+    ] {
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        if count != 0 {
+            bail!("rehydrate candidate retained {count} rows in {table}");
+        }
+    }
+    let component_report_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node
+         WHERE serialized_name LIKE 'component_report:%'
+            OR canonical_id LIKE 'codestory:component_report:%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if component_report_nodes != 0 {
+        bail!("rehydrate candidate retained {component_report_nodes} component-report nodes");
+    }
+    let component_report_projections: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM search_symbol_projection AS projection
+         LEFT JOIN node ON node.id = projection.node_id
+         WHERE projection.display_name LIKE 'component_report:%'
+            OR projection.display_name LIKE 'codestory::component_report::%'
+            OR node.id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if component_report_projections != 0 {
+        bail!(
+            "rehydrate candidate retained {component_report_projections} component-report search projections"
+        );
+    }
+    let grounding_state: (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT summary_state, detail_state, summary_built_at_epoch_ms, detail_built_at_epoch_ms
+         FROM grounding_snapshot_meta WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if grounding_state != (0, 0, None, None) {
+        bail!("rehydrate candidate retained ready grounding snapshot state");
+    }
+    let resolution_state: (i64, Option<Vec<u8>>, Option<i64>) = conn.query_row(
+        "SELECT state, snapshot_blob, built_at_epoch_ms
+         FROM resolution_support_snapshot WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if resolution_state != (0, None, None) {
+        bail!("rehydrate candidate retained ready resolution support state");
+    }
+    Ok(())
+}
+
+fn remove_database_temp(path: &Path) -> Result<()> {
+    remove_database_sidecars(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn remove_database_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar_name = path
+            .file_name()
+            .context("database temporary path has no file name")?
+            .to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar = path.with_file_name(sidecar_name);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", sidecar.display()));
+            }
         }
     }
     Ok(())
+}
+
+fn remove_database_temp_best_effort(path: &Path) {
+    let _ = remove_database_temp(path);
 }
 
 fn skipped(
@@ -458,7 +596,9 @@ fn skipped(
         dry_run: request.dry_run,
         invalidated_retrieval_manifests: 0,
         invalidated_index_artifact_rows: 0,
+        invalidated_semantic_rows: 0,
         rebased_path_bound_rows: 0,
+        carried_policy_exclusion_rows: 0,
         preserved_scope: "none".into(),
         retrieval_status: "not_rehydrated".into(),
         retrieval_reason: "normal index and retrieval rebuild required".into(),
@@ -517,8 +657,7 @@ fn rebuild_commands(project: &Path) -> Vec<String> {
 fn rehydrate_next_commands(project: &Path) -> Vec<String> {
     let project = quote_path(project);
     vec![
-        format!("codestory-cli doctor --project {project}"),
-        format!("codestory-cli index --project {project} --refresh incremental"),
+        format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project}"),
     ]
@@ -540,7 +679,7 @@ fn retrieval_rehydrate_status(dry_run: bool) -> String {
 }
 
 fn retrieval_rehydrate_reason() -> String {
-    "cache rehydrate rebases portable SQLite graph/search/doc and dense-input state, invalidates the path-bound core dense manifest, and does not copy sidecar generations; core dense publication and Lexical/Semantic/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
+    "cache rehydrate carries only core graph/file inventory and verified policy exclusions; semantic docs, dense inputs, structural identities, retrieval manifests, and index artifacts are discarded, and the target remains unpublished until a full refresh".into()
 }
 
 fn retrieval_rehydrate_policy(dry_run: bool) -> String {
@@ -550,7 +689,7 @@ fn retrieval_rehydrate_policy(dry_run: bool) -> String {
         "invalidated"
     };
     format!(
-        "path-bound SQLite graph/search/doc and dense-input rows rebased; copied core dense publication {action}; portable v2 index artifact rows preserved; retrieval manifests {action} because Lexical/Semantic/SCIP sidecar directories live outside the copied cache; core incremental index must republish dense inputs before retrieval index revalidates sidecar reuse"
+        "derived semantic rows, structural identities, index artifacts, publications, and retrieval manifests {action}; only rebased core graph/file inventory and verified policy exclusions are carried; no sidecar directory is copied; a full core refresh must publish the target before retrieval is rebuilt"
     )
 }
 
@@ -572,14 +711,16 @@ mod tests {
     use super::*;
     use crate::test_support::{git, git_available};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
-    fn rehydrate_rebases_path_bound_rows_without_source_root_leakage() {
+    fn rehydrate_atomically_carries_only_core_inventory_and_policy_exclusions() {
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
+        add_matching_oversized_source(source_project.path(), target_project.path());
         let source_cache = tempdir().expect("source cache");
         let target_cache = tempdir().expect("target cache");
         let target_cache_path = target_cache.path().join("empty");
@@ -588,6 +729,10 @@ mod tests {
             .expect("seed persistent target lock");
         let source_db = source_cache.path().join("codestory.db");
         seed_cache(&source_db, source_project.path());
+        let source_sidecar_dir = source_cache.path().join("semantic-generation");
+        fs::create_dir_all(&source_sidecar_dir).expect("create source-only sidecar directory");
+        fs::write(source_sidecar_dir.join("vectors.bin"), b"source-only")
+            .expect("seed source-only sidecar");
 
         let output = rehydrate_cache(CacheRehydrateRequest {
             source_project: source_project.path(),
@@ -607,18 +752,20 @@ mod tests {
             "the target owns its persistent writer lock after rehydrate"
         );
         assert_eq!(output.invalidated_retrieval_manifests, 1);
-        assert_eq!(output.invalidated_index_artifact_rows, 1);
+        assert_eq!(output.invalidated_index_artifact_rows, 2);
+        assert!(output.invalidated_semantic_rows > 0);
         assert!(output.rebased_path_bound_rows > 0);
+        assert_eq!(output.carried_policy_exclusion_rows, 1);
         assert_eq!(
             output.preserved_scope,
-            "sqlite_graph_search_docs_dense_inputs_rebased_v2_index_artifacts_preserved"
+            "core_graph_file_inventory_and_policy_exclusions_only"
         );
         assert_eq!(output.retrieval_status, "invalidated_requires_rebuild");
         assert!(
             output
                 .retrieval_reason
-                .contains("invalidates the path-bound core dense manifest"),
-            "rehydrate output should distinguish SQLite reuse from sidecar readiness: {}",
+                .contains("target remains unpublished until a full refresh"),
+            "rehydrate output should expose the publication fence: {}",
             output.retrieval_reason
         );
         assert!(
@@ -630,18 +777,44 @@ mod tests {
             "rehydrate output should expose the sidecar rebuild command: {output:?}"
         );
         assert!(
-            output
-                .retrieval
-                .contains("copied core dense publication invalidated"),
-            "rehydrate output should name the fail-closed sidecar rebuild reason: {}",
+            output.retrieval.contains("no sidecar directory is copied"),
+            "rehydrate output should name the sidecar boundary: {}",
             output.retrieval
         );
         assert!(
-            output.next_commands.iter().any(|command| {
-                command.contains("index --project") && command.contains("--refresh incremental")
-            }),
-            "rehydrate output should republish core dense inputs before retrieval: {output:?}"
+            output.next_commands.first().is_some_and(|command| {
+                command.contains("index --project") && command.contains("--refresh full")
+            }) && output
+                .next_commands
+                .iter()
+                .all(|command| !command.contains("--refresh incremental")),
+            "rehydrate output must prescribe a full core refresh first: {output:?}"
         );
+        assert!(
+            !target_cache_path.join("semantic-generation").exists(),
+            "source cache sidecars are not portable rehydrate input"
+        );
+        let unexpected_files = fs::read_dir(&target_cache_path)
+            .expect("read target cache")
+            .map(|entry| entry.expect("target cache entry").file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.contains("rehydrate-stage") || name.contains("rehydrate-publish")
+            })
+            .collect::<Vec<_>>();
+        assert!(unexpected_files.is_empty(), "{unexpected_files:?}");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let database = target_cache_path.join("codestory.db");
+            let mut sidecar_name = database
+                .file_name()
+                .expect("database file name")
+                .to_os_string();
+            sidecar_name.push(suffix);
+            assert!(
+                !database.with_file_name(sidecar_name).exists(),
+                "the atomically published database must be self-contained before activation"
+            );
+        }
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
@@ -651,23 +824,46 @@ mod tests {
         );
         assert!(
             storage
+                .get_index_publication()
+                .expect("publication")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_complete_index_publication()
+                .expect("complete publication")
+                .is_none()
+        );
+        assert!(
+            storage
                 .get_dense_anchor_publication_manifest()
                 .expect("dense publication")
-                .is_none(),
-            "rehydrate must invalidate copied core dense publication identity"
+                .is_none()
         );
-        let dense_inputs = storage
-            .get_dense_anchor_inputs_batch_after(None, 10)
-            .expect("dense inputs");
-        assert_eq!(dense_inputs.len(), 1);
         assert!(
-            dense_inputs[0]
-                .text
-                .contains(target_project.path().to_string_lossy().as_ref())
-                && !dense_inputs[0]
-                    .text
-                    .contains(source_project.path().to_string_lossy().as_ref()),
-            "copied dense inputs must be rebound without source-worktree contamination"
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10)
+                .expect("dense inputs")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_structural_text_unit_publication_manifest()
+                .expect("structural publication")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_source_policy_exclusions()
+                .expect("carried policy exclusions")
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .get_source_policy_exclusion_manifest()
+                .expect("policy publication")
+                .is_none()
         );
         let source_root = source_project.path().to_string_lossy();
         assert_eq!(
@@ -687,11 +883,11 @@ mod tests {
         );
         assert_eq!(storage.get_stats().expect("stats").file_count, 1);
         let target_cache_key = test_artifact_cache_key();
-        assert_eq!(
+        assert!(
             storage
                 .get_index_artifact_cache(Path::new("src.rs"), &target_cache_key)
-                .expect("target artifact cache lookup"),
-            Some(b"portable artifact".to_vec())
+                .expect("target artifact cache lookup")
+                .is_none()
         );
         assert!(
             storage
@@ -699,6 +895,45 @@ mod tests {
                 .expect("legacy artifact cache lookup")
                 .is_none()
         );
+        for table in [
+            "llm_symbol_doc",
+            "symbol_search_doc",
+            "symbol_summary",
+            "dense_anchor_input",
+            "structural_text_unit",
+            "structural_text_projection",
+            "structural_text_artifact_cache",
+            "grounding_repo_stats_snapshot",
+            "grounding_file_snapshot",
+            "grounding_node_snapshot",
+            "grounding_node_summary_snapshot",
+            "grounding_node_edge_digest_snapshot",
+        ] {
+            assert_eq!(table_row_count(&storage, table), 0, "{table}");
+        }
+        let component_report_nodes: i64 = storage
+            .get_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM node
+                 WHERE serialized_name LIKE 'component_report:%'
+                    OR canonical_id LIKE 'codestory:component_report:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count component-report nodes");
+        assert_eq!(component_report_nodes, 0);
+        let component_report_projections: i64 = storage
+            .get_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM search_symbol_projection
+                 WHERE node_id = 3
+                    OR display_name LIKE 'component_report:%'
+                    OR display_name LIKE 'codestory::component_report::%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count component-report projections");
+        assert_eq!(component_report_projections, 0);
     }
 
     #[test]
@@ -1015,6 +1250,16 @@ mod tests {
         git(project, &["commit", "-m", "stale source change"]);
     }
 
+    fn add_matching_oversized_source(source: &Path, target: &Path) {
+        let content =
+            vec![b'x'; codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1];
+        for project in [source, target] {
+            fs::write(project.join("oversized.rs"), &content).expect("write oversized source");
+            git(project, &["add", "oversized.rs"]);
+            git(project, &["commit", "-m", "add oversized source"]);
+        }
+    }
+
     fn seed_cache(path: &Path, project: &Path) {
         let mut storage = Store::open(path).expect("open storage");
         let absolute_source = project.join("src.rs");
@@ -1045,6 +1290,14 @@ mod tests {
                     end_line: Some(1),
                     ..Default::default()
                 },
+                Node {
+                    id: NodeId(3),
+                    kind: NodeKind::MODULE,
+                    serialized_name: "component_report:workspace".into(),
+                    qualified_name: Some("codestory::component_report::workspace".into()),
+                    canonical_id: Some("codestory:component_report:workspace".into()),
+                    ..Default::default()
+                },
             ])
             .expect("node");
         storage
@@ -1062,6 +1315,17 @@ mod tests {
         storage
             .rebuild_search_symbol_projection_from_node_table()
             .expect("projection");
+        assert_eq!(
+            storage
+                .get_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_symbol_projection WHERE node_id = 3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("prove component-report projection fixture"),
+            1
+        );
         storage
             .upsert_symbol_search_docs_batch(&[codestory_store::SymbolSearchDoc {
                 node_id: NodeId(2),
@@ -1122,6 +1386,15 @@ mod tests {
                 updated_at_epoch_ms: 1,
             }])
             .expect("dense inputs");
+        storage
+            .upsert_symbol_summaries_batch(&[codestory_store::SymbolSummaryRecord {
+                node_id: NodeId(2),
+                content_hash: "a".repeat(64),
+                summary: "derived semantic summary".into(),
+                model: "test".into(),
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("symbol summary");
         let publication = codestory_store::IndexPublicationRecord {
             generation: 1,
             generation_id: "source-generation".into(),
@@ -1135,6 +1408,95 @@ mod tests {
         storage
             .put_index_publication(&publication)
             .expect("core publication");
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE file SET content_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id = 1;
+                 INSERT INTO structural_text_unit (
+                    node_id, file_id, placement_id, content_hash, source_content_hash,
+                    descriptor_version, producer, evidence_tier, resolution, language, kind,
+                    start_line, start_col, end_line, end_col, file_role
+                 ) VALUES (
+                    2, 1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    1, 'test', 'structural_text', 'source_range_only', 'rust', 3,
+                    1, 1, 1, 10, 'source'
+                 );
+                 INSERT INTO structural_text_projection (
+                    file_id, source_content_hash, descriptor_version, producer, language,
+                    file_role, unit_count, unit_digest
+                 ) VALUES (
+                    1,
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    1, 'test', 'rust', 'source', 1,
+                    'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+                 );
+                 INSERT INTO structural_text_artifact_cache (
+                    file_path, file_id, cache_key, source_content_hash, descriptor_version,
+                    producer, artifact_digest, artifact_blob, updated_at_epoch_ms
+                 ) VALUES (
+                    'src.rs', 1, 'test',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    1, 'test',
+                    'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                    X'01', 1
+                 );
+                 INSERT INTO structural_text_unit_publication (
+                    id, schema_version, complete, core_generation_id, core_run_id,
+                    unit_count, unit_digest, projection_count, projection_digest,
+                    descriptor_version, migration_state, published_at_epoch_ms
+                 ) VALUES (
+                    1, 1, 1, 'source-generation', 'source-run', 1,
+                    'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                    1,
+                    'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                    1, 'native_v1', 1
+                 );
+                 ;",
+            )
+            .expect("seed structural and policy state");
+        let source_content_hash = format!(
+            "{:x}",
+            Sha256::digest(fs::read(&absolute_source).expect("read source for hash"))
+        );
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = 1",
+                [&source_content_hash],
+            )
+            .expect("bind stored source content hash");
+        let oversized = project.join("oversized.rs");
+        if oversized.is_file() {
+            let policy = SourceIndexPolicy::default();
+            let oversized_bytes = fs::read(&oversized).expect("read oversized source");
+            let oversized_hash = format!("{:x}", Sha256::digest(&oversized_bytes));
+            storage
+                .publish_source_policy_exclusion_generation(
+                    &publication,
+                    "source-project",
+                    "source-workspace",
+                    codestory_store::SourcePolicyExclusionPolicyIdentity::new(
+                        &policy.policy_version,
+                        policy.byte_cap,
+                        policy.structural_unit_cap,
+                    ),
+                    &[
+                        codestory_contracts::workspace::OversizedSourceExclusionCandidate {
+                            normalized_path: "oversized.rs".into(),
+                            content_hash: oversized_hash,
+                            observed_size: oversized_bytes.len() as u64,
+                            observed_unit_count: 0,
+                            policy_version: policy.policy_version.clone(),
+                            byte_cap: policy.byte_cap,
+                            structural_unit_cap: policy.structural_unit_cap,
+                        },
+                    ],
+                )
+                .expect("publish real oversized source exclusion");
+        }
         storage
             .upsert_index_artifact_cache(
                 Path::new("src.rs"),
@@ -1175,6 +1537,18 @@ mod tests {
                 precise_semantic_import_producer: None,
             })
             .expect("manifest");
+        storage
+            .refresh_grounding_snapshots()
+            .expect("seed ready grounding snapshots");
+    }
+
+    fn table_row_count(storage: &Store, table: &str) -> i64 {
+        storage
+            .get_connection()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count test table")
     }
 
     fn test_artifact_cache_key() -> String {
