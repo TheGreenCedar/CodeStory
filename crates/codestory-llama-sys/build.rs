@@ -472,12 +472,15 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) -> Option<S
             .iter()
             .map(|(source, destination)| (*source, destination.as_path()))
             .collect::<Vec<_>>();
-        stage_windows_runtime_files(&entries).unwrap_or_else(|error| {
+        let recovered = stage_windows_runtime_files(&entries).unwrap_or_else(|error| {
             panic!(
                 "failed to stage native runtime artifacts from {}: {error}",
                 native_out.display()
             )
         });
+        for recovery in &recovered {
+            println!("cargo:warning={recovery}");
+        }
     } else {
         let build_support_source = core_dir.join("libllama-common.so");
         stage_linux_shared_libraries(
