@@ -1165,21 +1165,21 @@ fn canonical_existing(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
 }
 
 #[cfg(windows)]
-fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
     Ok(PathBuf::from(
         std::str::from_utf8(bytes).context("repository alternate path is not UTF-8")?,
     ))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf> {
     Ok(PathBuf::from(
         std::str::from_utf8(bytes).context("repository alternate path is not UTF-8")?,
     ))
@@ -1935,6 +1935,152 @@ mod tests {
         assert_eq!(changes[0].kind, RepositoryChangeKind::Renamed);
         assert_eq!(changes[0].path, b"renamed.rs".to_vec());
         assert_eq!(changes[0].previous_path, Some(b"lib.rs".to_vec()));
+    }
+
+    #[test]
+    fn tracked_sources_excluded_by_repo_rules_are_restored_without_flagging_untracked_output() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        fs::write(project.path().join(".gitignore"), "lib.rs\nscratch.rs\n")
+            .expect("write repository ignores");
+        fs::write(project.path().join("scratch.rs"), "pub fn generated() {}\n")
+            .expect("write ignored untracked output");
+        git(project.path(), &["add", ".gitignore"]);
+        git(
+            project.path(),
+            &["commit", "-m", "ignore tracked and generated sources"],
+        );
+
+        let manifest =
+            crate::WorkspaceManifest::open(project.path().to_path_buf()).expect("open workspace");
+        let inventory = manifest.source_inventory().expect("discover sources");
+
+        assert!(inventory.files.contains(&project.path().join("lib.rs")));
+        assert!(!inventory.files.contains(&project.path().join("scratch.rs")));
+        assert_eq!(inventory.outcome, crate::WorkspaceInventoryOutcome::Partial);
+        assert_eq!(inventory.issues.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.issues[0].path, project.path().join("lib.rs"));
+        assert!(
+            inventory.issues[0]
+                .message
+                .contains("ignore rules excluded a tracked source")
+        );
+    }
+
+    #[test]
+    fn unavailable_repository_metadata_cannot_yield_a_complete_inventory() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        fs::write(project.path().join(".gitignore"), "lib.rs\n").expect("write repository ignores");
+        git(project.path(), &["add", ".gitignore"]);
+        git(project.path(), &["commit", "-m", "ignore tracked source"]);
+        fs::write(project.path().join(".git/config"), "[invalid\n")
+            .expect("corrupt local config deterministically");
+
+        let manifest =
+            crate::WorkspaceManifest::open(project.path().to_path_buf()).expect("open workspace");
+        let inventory = manifest.source_inventory().expect("discover sources");
+
+        assert_eq!(inventory.outcome, crate::WorkspaceInventoryOutcome::Partial);
+        assert!(
+            inventory.issues.iter().any(|issue| {
+                issue
+                    .message
+                    .contains("repository metadata observation repository_open_failed")
+            }),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_head_tree_does_not_poison_a_complete_tracked_inventory() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        fs::write(
+            project.path().join(".git/HEAD"),
+            "ref: refs/heads/missing\n",
+        )
+        .expect("make head-tree observation partial");
+
+        let manifest =
+            crate::WorkspaceManifest::open(project.path().to_path_buf()).expect("open workspace");
+        let inventory = manifest.source_inventory().expect("discover sources");
+
+        assert!(inventory.files.contains(&project.path().join("lib.rs")));
+        assert_eq!(
+            inventory.outcome,
+            crate::WorkspaceInventoryOutcome::Complete
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+    }
+
+    #[test]
+    fn unavailable_submodule_status_does_not_poison_a_complete_tracked_inventory() {
+        let Some(submodule_source) = git_project() else {
+            return;
+        };
+        let Some(parent) = git_project() else {
+            return;
+        };
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule_source.path().to_str().expect("UTF-8 submodule"),
+                "nested",
+            ],
+        );
+        git(parent.path(), &["commit", "-am", "add submodule"]);
+
+        let manifest =
+            crate::WorkspaceManifest::open(parent.path().to_path_buf()).expect("open workspace");
+        let inventory = manifest.source_inventory().expect("discover sources");
+
+        assert!(inventory.files.contains(&parent.path().join("lib.rs")));
+        assert_eq!(
+            inventory.outcome,
+            crate::WorkspaceInventoryOutcome::Complete
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+    }
+
+    #[test]
+    fn ancestor_ignore_rules_do_not_hide_the_selected_workspace() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let parent = tempdir().expect("workspace parent");
+        let project = parent.path().join("repo");
+        fs::create_dir_all(project.join("src")).expect("create project");
+        git(&project, &["init"]);
+        git(
+            &project,
+            &["config", "user.email", "codestory@example.invalid"],
+        );
+        git(&project, &["config", "user.name", "CodeStory Test"]);
+        fs::write(project.join("src/lib.rs"), "pub fn visible() {}\n")
+            .expect("write tracked source");
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-m", "init"]);
+        fs::write(parent.path().join(".gitignore"), "repo/src/lib.rs\n")
+            .expect("write ancestor ignore");
+
+        let manifest =
+            crate::WorkspaceManifest::open(project.clone()).expect("open selected workspace");
+        let inventory = manifest.source_inventory().expect("discover sources");
+
+        assert_eq!(
+            inventory.outcome,
+            crate::WorkspaceInventoryOutcome::Complete
+        );
+        assert!(inventory.issues.is_empty(), "{:?}", inventory.issues);
+        assert!(inventory.files.contains(&project.join("src/lib.rs")));
     }
 
     fn paths(changes: Result<Vec<RepositoryChange>>) -> Vec<Vec<u8>> {

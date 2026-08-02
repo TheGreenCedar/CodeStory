@@ -411,11 +411,7 @@ fn structural_extension(path: &Path) -> Option<String> {
 fn file_modification_time(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
-        .map(|time| {
-            time.duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64
-        })
+        .map(codestory_workspace::clamp_system_time_to_epoch_millis)
         .unwrap_or(0)
 }
 

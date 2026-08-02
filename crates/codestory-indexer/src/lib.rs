@@ -3826,11 +3826,9 @@ fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
     if actual_hash != expected_hash {
         return Err(anyhow!("content changed after the indexing read"));
     }
-    Ok(after
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64)
+    Ok(codestory_workspace::clamp_system_time_to_epoch_millis(
+        after.modified()?,
+    ))
 }
 
 fn workspace_structural_source_exclusion(
@@ -3909,12 +3907,7 @@ fn incremental_resolution_target_node_kinds() -> &'static [NodeKind] {
 fn file_modification_time(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
-        .map(|system_time| {
-            system_time
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64
-        })
+        .map(codestory_workspace::clamp_system_time_to_epoch_millis)
         .unwrap_or(0)
 }
 
@@ -20317,12 +20310,7 @@ pub fn index_file(
 
     let modification_time = std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .map(|systime| {
-            systime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64
-        })
+        .map(codestory_workspace::clamp_system_time_to_epoch_millis)
         .unwrap_or(0);
 
     result_files.push(codestory_store::FileInfo {

@@ -959,9 +959,11 @@ impl WorkspaceDiscovery {
         max_files: Option<usize>,
     ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
+        let (repository_tracked_paths, repository_metadata_issues) =
+            repository_tracked_paths(&manifest.root_dir());
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
-        let mut issues = Vec::new();
+        let mut issues = repository_metadata_issues;
         let mut inspected_source_roots = 0usize;
         let discovery_exclusions = match observe_discovery_exclusions(manifest) {
             Ok(exclusions) => exclusions,
@@ -1057,12 +1059,14 @@ impl WorkspaceDiscovery {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
                     builder.follow_links(true);
                     builder.require_git(false);
+                    builder.parents(false);
+                    builder.git_global(false);
                     // Hidden source trees such as .github are product input. The
                     // manifest's explicit excludes still prune repository metadata.
                     builder.hidden(false);
                     let workspace_root_for_filter = workspace_root.clone();
                     let source_root_for_filter = source_root.clone();
-                    let exclude_patterns = exclude_patterns.clone();
+                    let exclude_patterns_for_filter = exclude_patterns.clone();
                     let filter_discovery_exclusions = discovery_exclusions.clone();
                     let language = group.language.clone();
                     builder.filter_entry(move |entry| {
@@ -1072,11 +1076,12 @@ impl WorkspaceDiscovery {
                             source_root: &source_root_for_filter,
                             filter_by_language,
                             language: &language,
-                            exclude_patterns: &exclude_patterns,
+                            exclude_patterns: &exclude_patterns_for_filter,
                             discovery_exclusions: &filter_discovery_exclusions,
                         };
                         should_include_discovered_path(entry.path(), is_dir, &path_filter)
                     });
+                    let issue_count_before_walk = issues.len();
                     for entry in builder.build() {
                         let entry = match entry {
                             Ok(entry) => entry,
@@ -1116,6 +1121,57 @@ impl WorkspaceDiscovery {
                                 files: all_files,
                                 outcome: WorkspaceInventoryOutcome::Bounded,
                                 issues,
+                            });
+                        }
+                    }
+                    let walk_had_errors = issues.len() != issue_count_before_walk;
+                    let path_filter = DiscoveryPathFilter {
+                        workspace_root: &workspace_root,
+                        source_root: &source_root,
+                        filter_by_language,
+                        language: &group.language,
+                        exclude_patterns: &exclude_patterns,
+                        discovery_exclusions: &discovery_exclusions,
+                    };
+                    for tracked_path in &repository_tracked_paths {
+                        if seen.contains(&normalized_compare_key(&workspace_root, tracked_path))
+                            || !fs::metadata(tracked_path).is_ok_and(|metadata| metadata.is_file())
+                            || !should_include_discovered_path(tracked_path, false, &path_filter)
+                        {
+                            continue;
+                        }
+                        match discovery_exclusions.file_is_excluded(tracked_path) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                issues.push(WorkspaceInventoryIssue {
+                                    path: tracked_path.clone(),
+                                    message: format!(
+                                        "failed to observe tracked source identity against caller-owned exclusions: {error}"
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                        if !push_discovered_file_within_limit(
+                            &mut all_files,
+                            &mut seen,
+                            tracked_path.clone(),
+                            &workspace_root,
+                            max_files,
+                        ) {
+                            all_files.sort();
+                            return Ok(WorkspaceFileInventory {
+                                files: all_files,
+                                outcome: WorkspaceInventoryOutcome::Bounded,
+                                issues,
+                            });
+                        }
+                        if !walk_had_errors {
+                            issues.push(WorkspaceInventoryIssue {
+                                path: tracked_path.clone(),
+                                message: "repository ignore rules excluded a tracked source; the repository index restored it"
+                                    .to_string(),
                             });
                         }
                     }
@@ -1460,11 +1516,111 @@ fn push_discovered_file_within_limit(
     !source_file_limit_exceeded(files, max_files)
 }
 
+fn repository_tracked_paths(
+    repository_root: &Path,
+) -> (Vec<PathBuf>, Vec<WorkspaceInventoryIssue>) {
+    let dot_git = repository_root.join(".git");
+    let dot_git_metadata = match fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![WorkspaceInventoryIssue {
+                    path: dot_git,
+                    message: format!("repository metadata boundary could not be observed: {error}"),
+                }],
+            );
+        }
+    };
+    if dot_git_metadata.is_dir() {
+        let mut has_repository_marker = false;
+        for marker in ["HEAD", "config", "index"] {
+            match fs::symlink_metadata(dot_git.join(marker)) {
+                Ok(_) => has_repository_marker = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return (
+                        Vec::new(),
+                        vec![WorkspaceInventoryIssue {
+                            path: dot_git.join(marker),
+                            message: format!(
+                                "repository metadata marker could not be observed: {error}"
+                            ),
+                        }],
+                    );
+                }
+            }
+        }
+        if !has_repository_marker {
+            return (Vec::new(), Vec::new());
+        }
+    }
+    let metadata = read_repository_metadata(repository_root);
+    let mut issues = metadata
+        .issues
+        .into_iter()
+        .filter(|issue| {
+            matches!(
+                issue.code.as_str(),
+                "repository_open_failed" | "index_unavailable" | "repository_metadata_changed"
+            )
+        })
+        .map(|issue| WorkspaceInventoryIssue {
+            path: issue.path,
+            message: format!(
+                "repository metadata observation {} was incomplete: {}",
+                issue.code, issue.message
+            ),
+        })
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for encoded_path in metadata.tracked_paths {
+        let path = match repo_metadata::bytes_to_path(&encoded_path) {
+            Ok(path) => path,
+            Err(error) => {
+                issues.push(WorkspaceInventoryIssue {
+                    path: repository_root.to_path_buf(),
+                    message: format!("repository index path could not be decoded: {error}"),
+                });
+                continue;
+            }
+        };
+        if path.is_absolute()
+            || !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            issues.push(WorkspaceInventoryIssue {
+                path: repository_root.to_path_buf(),
+                message: "repository index contained a path outside the workspace boundary"
+                    .to_string(),
+            });
+            continue;
+        }
+        paths.push(repository_root.join(path));
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, issues)
+}
+
+/// Clamp one filesystem timestamp to CodeStory's signed Unix-millisecond contract.
+///
+/// Filesystems that can represent pre-epoch timestamps map them to zero. Large
+/// future timestamps saturate instead of wrapping the persisted `i64` value.
+pub fn clamp_system_time_to_epoch_millis(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 fn modification_time_millis(path: &Path) -> Result<i64> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified()?;
-    let duration = modified.duration_since(std::time::UNIX_EPOCH)?;
-    Ok(duration.as_millis().min(i64::MAX as u128) as i64)
+    Ok(clamp_system_time_to_epoch_millis(modified))
 }
 
 fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
@@ -3580,5 +3736,19 @@ mod tests {
         let modified = metadata.modified()?;
         let duration = modified.duration_since(std::time::UNIX_EPOCH)?;
         Ok(duration.as_millis().min(i64::MAX as u128) as i64)
+    }
+
+    #[test]
+    fn filesystem_epoch_millis_clamps_pre_epoch_and_saturates() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("represent pre-epoch timestamp");
+        assert_eq!(clamp_system_time_to_epoch_millis(before_epoch), 0);
+        assert_eq!(
+            clamp_system_time_to_epoch_millis(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234),
+            ),
+            1_234
+        );
     }
 }
