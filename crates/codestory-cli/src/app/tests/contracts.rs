@@ -2,6 +2,7 @@ use super::test_support::{
     sample_graph_edge, sample_graph_node, sample_node_details, test_search_hit_defaults,
 };
 use crate::app::artifacts::ensure_dot_only_for_trail;
+use crate::app::diagnostics::redact_urls_in_text;
 use crate::app::rendering::hide_speculative_trail_edges;
 use crate::app::resolution::{quote_command_path, quote_command_value};
 use crate::app::source_commands::render_affected_invocation;
@@ -381,6 +382,21 @@ fn embedding_preflight_preserves_typed_capacity_for_json_failures() {
             .and_then(|details| details.embedding_capacity.as_ref())
             .map(|pressure| pressure.retry_condition.as_str()),
         Some("a query slot becomes available")
+    );
+}
+
+#[test]
+fn doctor_redaction_survives_multi_byte_text_before_a_url_scheme() {
+    // `build_doctor_output` runs every sidecar `fallback_message` through
+    // `redact_urls_in_text`, and that message is arbitrary UTF-8 the sidecar
+    // wrote. Finding the scheme start with `byte_index + 1` landed inside a
+    // multi-byte character and panicked the whole `doctor` command instead of
+    // redacting. The credential must be gone and the surrounding text intact.
+    let message = "semantic fallback: endpoint »http://user:secret@embed.internal:9000/v1« refused";
+
+    assert_eq!(
+        redact_urls_in_text(message),
+        "semantic fallback: endpoint »http://embed.internal:9000/v1« refused"
     );
 }
 

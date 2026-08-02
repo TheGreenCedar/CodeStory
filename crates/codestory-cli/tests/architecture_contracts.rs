@@ -1293,3 +1293,147 @@ fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation
         );
     }
 }
+
+/// `[workspace.dependencies]` is a shared version register, not a parking lot.
+///
+/// An entry no member consumes still reads as a supported, version-pinned
+/// dependency of this workspace while pinning nothing: `proptest` sat there
+/// consumed by zero crates, and `ring` outlived the one crate that used it. The
+/// dead entry is the debt; this is the ratchet that keeps it retired.
+#[test]
+fn every_workspace_dependency_is_consumed_by_a_member() {
+    fn consumes(table: &Value, name: &str) -> bool {
+        let Some(table) = table.as_table() else {
+            return false;
+        };
+        table.iter().any(|(key, value)| {
+            (key == name
+                && value
+                    .get("workspace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false))
+                || consumes(value, name)
+        })
+    }
+
+    let workspace = manifest("Cargo.toml");
+    let declared = workspace
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(Value::as_table)
+        .expect("workspace dependencies");
+    let members = workspace_members()
+        .into_iter()
+        .map(|member| manifest(&format!("{member}/Cargo.toml")))
+        .collect::<Vec<_>>();
+
+    let unconsumed = declared
+        .keys()
+        .filter(|name| !members.iter().any(|member| consumes(member, name)))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert!(
+        unconsumed.is_empty(),
+        "workspace dependencies no member declares with `workspace = true`: {}",
+        unconsumed.join(", ")
+    );
+}
+
+/// Every constant `codestory-llama-sys`'s build script compiles into the crate
+/// must be read by workspace code.
+///
+/// The frozen constant set is calibrated evidence, and emitting values from it
+/// that nothing reads presents unread numbers as shipped runtime behaviour —
+/// the election-backoff and bulk-replay-budget constants were exactly that, and
+/// three model/native identity constants sat beside them. Deleting the emission
+/// changes no calibrated value: the constant-set JSON is untouched and the
+/// build script still enforces the invariants those values exist for.
+#[test]
+fn generated_embedding_constants_are_all_read_by_workspace_code() {
+    let build_script = read("crates/codestory-llama-sys/build.rs");
+    let emitted = build_script
+        .match_indices("pub const ")
+        .chain(build_script.match_indices("pub static "))
+        .filter_map(|(index, keyword)| {
+            build_script[index + keyword.len()..]
+                .split(|ch: char| !(ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'))
+                .next()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<String>>();
+    assert!(
+        emitted.contains("PER_USER_EMBEDDING_CONNECT_TIMEOUT_MS")
+            && emitted.contains("MODEL_SHA256"),
+        "the emitted-constant scan must actually find the generated constants: {emitted:?}"
+    );
+
+    let mut corpus = String::new();
+    for member in workspace_members() {
+        for directory in ["src", "tests", "benches", "examples"] {
+            if repo_root().join(&member).join(directory).is_dir() {
+                corpus.push_str(&read_source_tree(&format!("{member}/{directory}")));
+                corpus.push('\n');
+            }
+        }
+    }
+
+    let unread = emitted
+        .iter()
+        .filter(|name| !corpus.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        unread.is_empty(),
+        "generated constants no workspace source reads: {}",
+        unread.join(", ")
+    );
+}
+
+// The build-script decision itself, compiled from the same file `build.rs`
+// includes. A build script is reachable from no test target, which is how this
+// gate came to read Cargo's `DEBUG` (debug info) instead of `PROFILE` (profile
+// identity) with nothing failing.
+mod model_source_gate {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../codestory-llama-sys/model_source_gate.rs"
+    ));
+
+    pub(super) fn requires_embedded_model(profile: Option<&str>) -> bool {
+        profile_requires_embedded_model(profile)
+    }
+}
+
+/// A release build with no embedded model must fail, and must keep failing when
+/// somebody turns on release debug info.
+///
+/// `[profile.release] debug = 1` for symbolication sets `DEBUG` to a
+/// non-`"false"` value while `PROFILE` stays `release`. Keying the gate on
+/// `DEBUG` therefore let a release build produce a binary with no embedded
+/// model and say nothing.
+#[test]
+fn the_release_model_embedding_gate_keys_on_the_profile_not_debug_info() {
+    assert!(model_source_gate::requires_embedded_model(Some("release")));
+    for permitted in [Some("debug"), Some("test"), Some("bench"), None] {
+        assert!(
+            !model_source_gate::requires_embedded_model(permitted),
+            "{permitted:?} is not a shipping profile"
+        );
+    }
+
+    let build_script = read("crates/codestory-llama-sys/build.rs");
+    assert!(
+        build_script.contains("env::var(\"PROFILE\")"),
+        "the gate must read the profile identity"
+    );
+    assert!(
+        !build_script.contains("\"DEBUG\""),
+        "the gate must not read the debug-info setting"
+    );
+    assert!(
+        build_script.contains("profile_requires_embedded_model(profile.as_deref())"),
+        "the gate must route the profile through the shared decision this test compiles"
+    );
+}

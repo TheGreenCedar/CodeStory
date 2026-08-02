@@ -25,6 +25,21 @@ use codestory_contracts::api::{
 use std::collections::HashSet;
 use std::time::Instant;
 
+/// The deprecation notice `drill --jobs` carries for its final release.
+///
+/// The flag never scheduled anything — the evidence packet owns drill batching
+/// — so the honest statement is that it is ignored, said once, on the error
+/// stream, without changing the report or the exit status.
+pub(super) const DEPRECATED_DRILL_JOBS_WARNING: &str = "[drill] --jobs is deprecated and ignored: the evidence packet owns drill scheduling. \
+     It is removed next release; drop it from pinned invocations. \
+     `drill-suite --jobs` is unaffected.";
+
+fn warn_on_deprecated_drill_jobs(jobs: Option<usize>) {
+    if jobs.is_some() {
+        eprintln!("{DEPRECATED_DRILL_JOBS_WARNING}");
+    }
+}
+
 pub(in crate::app) fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
     let operation = execute_drill(&cmd)?;
@@ -96,7 +111,7 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
 pub(super) fn execute_drill(
     cmd: &DrillCommand,
 ) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
-    let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
+    warn_on_deprecated_drill_jobs(cmd.jobs);
     let total_timer = Instant::now();
     let PreparedDrill {
         runtime,

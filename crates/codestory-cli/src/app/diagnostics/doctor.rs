@@ -291,7 +291,7 @@ pub(in crate::app::diagnostics) fn doctor_env_check_message(name: &str, value: &
     format!("set to `{trimmed}`")
 }
 
-pub(in crate::app::diagnostics) fn redact_urls_in_text(text: &str) -> String {
+pub(in crate::app) fn redact_urls_in_text(text: &str) -> String {
     text.split_whitespace()
         .map(redact_url_token)
         .collect::<Vec<_>>()
@@ -299,12 +299,19 @@ pub(in crate::app::diagnostics) fn redact_urls_in_text(text: &str) -> String {
 }
 
 pub(in crate::app::diagnostics) fn redact_url_token(token: &str) -> String {
+    // The scheme boundary is the byte *after* the last non-scheme character,
+    // which is `index + ch.len_utf8()`, not `index + 1`: a multi-byte
+    // character before `://` (a fallback message can carry any UTF-8 the
+    // sidecar produced) made the old arithmetic land inside that character and
+    // panic on the `token[..prefix_len]` slice below.
     let prefix_len = token
         .find("://")
         .and_then(|scheme_end| {
             token[..scheme_end]
-                .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
-                .map(|index| index + 1)
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
+                .map(|(index, ch)| index + ch.len_utf8())
                 .or(Some(0))
         })
         .unwrap_or(token.len());

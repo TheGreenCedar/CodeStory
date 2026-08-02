@@ -1620,11 +1620,30 @@ fn path_supports_brace_balanced_function_fallback(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// String state the brace scanner has to carry across a newline.
+///
+/// Only the two forms that legally span lines in the languages this fallback
+/// accepts. A `'`-delimited literal stays line-local because Rust lifetimes
+/// (`&'a str`) open one that never closes, and persisting that would swallow
+/// the rest of the file; a `"`-delimited literal stays line-local for the same
+/// containment reason.
+#[derive(Clone, Copy)]
+enum MultilineStringState {
+    None,
+    /// A JavaScript/TypeScript template literal or a Go raw string literal.
+    Backtick,
+    /// A Rust raw string literal, closed by `"` followed by `hashes` `#`.
+    RustRaw {
+        hashes: usize,
+    },
+}
+
 fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
     let start_index = start_line.checked_sub(1)? as usize;
     let mut depth = 0usize;
     let mut saw_opening_brace = false;
     let mut in_block_comment = false;
+    let mut multiline_string = MultilineStringState::None;
 
     for (offset, line) in source
         .lines()
@@ -1637,6 +1656,7 @@ fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
             &mut depth,
             &mut saw_opening_brace,
             &mut in_block_comment,
+            &mut multiline_string,
         );
         if saw_opening_brace && depth == 0 {
             return Some((offset + 1) as u32);
@@ -1650,23 +1670,56 @@ fn brace_balanced_body_end_line(source: &str, start_line: u32) -> Option<u32> {
     None
 }
 
+/// Scan one line for braces, carrying block-comment and multiline-string state.
+///
+/// `multiline_string` is why this takes state rather than rediscovering it:
+/// string state used to be line-local, so a `}` inside a JavaScript template
+/// literal or a Rust raw string that spans lines was counted as real, closed
+/// the inferred function early, and the snippet was still reported as
+/// `scope=function_body` with a `brace_balanced_fallback` range — a truncated
+/// body presented as a whole one.
 fn scan_braces_in_line(
     line: &str,
     depth: &mut usize,
     saw_opening_brace: &mut bool,
     in_block_comment: &mut bool,
+    multiline_string: &mut MultilineStringState,
 ) {
-    let mut chars = line.chars().peekable();
+    let chars: Vec<char> = line.chars().collect();
+    let mut index = 0usize;
     let mut string_delimiter: Option<char> = None;
     let mut escaped = false;
 
-    while let Some(ch) = chars.next() {
+    while index < chars.len() {
+        let ch = chars[index];
+        index += 1;
+
         if *in_block_comment {
-            if ch == '*' && chars.peek() == Some(&'/') {
-                chars.next();
+            if ch == '*' && chars.get(index) == Some(&'/') {
+                index += 1;
                 *in_block_comment = false;
             }
             continue;
+        }
+        match *multiline_string {
+            MultilineStringState::Backtick => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '`' {
+                    *multiline_string = MultilineStringState::None;
+                }
+                continue;
+            }
+            MultilineStringState::RustRaw { hashes } => {
+                if ch == '"' && chars[index..].iter().take_while(|c| **c == '#').count() >= hashes {
+                    index += hashes;
+                    *multiline_string = MultilineStringState::None;
+                }
+                continue;
+            }
+            MultilineStringState::None => {}
         }
         if let Some(delimiter) = string_delimiter {
             if escaped {
@@ -1683,17 +1736,28 @@ fn scan_braces_in_line(
             continue;
         }
         if ch == '/' {
-            match chars.peek() {
+            match chars.get(index) {
                 Some('/') => break,
                 Some('*') => {
-                    chars.next();
+                    index += 1;
                     *in_block_comment = true;
                     continue;
                 }
                 _ => {}
             }
         }
-        if matches!(ch, '"' | '\'' | '`') {
+        if ch == '`' {
+            *multiline_string = MultilineStringState::Backtick;
+            escaped = false;
+            continue;
+        }
+        if let Some(hashes) = rust_raw_string_open_hashes(&chars, index - 1) {
+            // Skip `r`, the opening hashes, and the quote.
+            index += hashes + 1;
+            *multiline_string = MultilineStringState::RustRaw { hashes };
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
             string_delimiter = Some(ch);
             continue;
         }
@@ -1708,6 +1772,34 @@ fn scan_braces_in_line(
     }
 }
 
+/// The `#` count of a Rust raw string literal opening at `index`, if one does.
+///
+/// Accepts `r"`, `r#"`, `r##"`, and the byte-string forms `br"`/`br#"`, and
+/// only at an identifier boundary so an ordinary `r` inside a word (`for`,
+/// `error`) never opens a literal.
+fn rust_raw_string_open_hashes(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'r') {
+        return None;
+    }
+    let boundary = match index.checked_sub(1).map(|previous| chars[previous]) {
+        None => true,
+        // `br"..."` is the byte-string spelling of the same literal.
+        Some('b') => index
+            .checked_sub(2)
+            .is_none_or(|previous| !is_rust_identifier_char(chars[previous])),
+        Some(previous) => !is_rust_identifier_char(previous),
+    };
+    if !boundary {
+        return None;
+    }
+    let hashes = chars[index + 1..].iter().take_while(|c| **c == '#').count();
+    (chars.get(index + 1 + hashes) == Some(&'"')).then_some(hashes)
+}
+
+fn is_rust_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,6 +1808,50 @@ mod tests {
         SourceLocation,
     };
     use tempfile::tempdir;
+
+    /// The inferred function body must end at the real closing brace, not at
+    /// the first `}` that happens to sit inside a string spanning lines.
+    ///
+    /// `snippet_function_body_context` publishes this end line as a
+    /// `brace_balanced_fallback` range under `scope=function_body`, so an early
+    /// end is a truncated body presented as a whole one — with no truncation
+    /// flag, because nothing was truncated: the range itself was wrong.
+    #[test]
+    fn brace_balanced_body_end_ignores_braces_inside_multiline_strings() {
+        let template_literal = concat!(
+            "export function render(rows) {\n",
+            "  const markup = `\n",
+            "}\n",
+            "`;\n",
+            "  return markup;\n",
+            "}\n",
+        );
+        assert_eq!(brace_balanced_body_end_line(template_literal, 1), Some(6));
+
+        let rust_raw_string = concat!(
+            "fn render() -> String {\n",
+            "    let markup = r#\"\n",
+            "}\n",
+            "\"#;\n",
+            "    markup.to_string()\n",
+            "}\n",
+        );
+        assert_eq!(brace_balanced_body_end_line(rust_raw_string, 1), Some(6));
+
+        // Positive control: nothing about ordinary bodies moved, including the
+        // single-line strings, char literals, and lifetimes that must stay
+        // line-local.
+        let ordinary = concat!(
+            "fn render<'a>(rows: &'a [Row]) -> String {\n",
+            "    let separator = \"}\";\n",
+            "    if rows.is_empty() {\n",
+            "        return separator.to_string();\n",
+            "    }\n",
+            "    rows.len().to_string()\n",
+            "}\n",
+        );
+        assert_eq!(brace_balanced_body_end_line(ordinary, 1), Some(7));
+    }
 
     fn insert_file_node(
         storage: &mut Storage,

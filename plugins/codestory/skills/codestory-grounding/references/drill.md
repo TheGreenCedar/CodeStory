@@ -35,9 +35,6 @@ The report includes:
 
 # JSON-first run for automation, while still writing Markdown too
 <codestory-cli> drill --project <target-workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json
-
-# Optional read-only anchor and bridge workers against an already-fresh local index
-<codestory-cli> drill --project <target-workspace> --refresh none --anchors EntryPoint,Coordinator,BackingStore --output-dir target/drill/entrypoint-flow --format json --jobs 4
 ```
 
 ## Interpretation
@@ -54,10 +51,10 @@ Consumer summaries inspect direct incoming production consumers for the selected
 
 If `drill-summary.json` reports stale freshness, refresh the index before promoting claims. If retrieval is not full or semantic diagnostics report degraded state, wait for a complete publication or run the maintainer-directed rebuild before trusting broad natural-language recall; use symbol, trail, snippet, and source-truth files deliberately while broad retrieval is unavailable.
 
-`--jobs` is default-off and read-only. Use it only with `--refresh none` after
-the index is fresh, and measure the run: multi-case suites can benefit from
-parallel case execution, while single-case anchor resolution and bridge checks
-may be limited by storage and graph traversal contention on some repos.
+`drill --jobs` is deprecated, hidden, and ignored: the evidence packet owns
+drill scheduling, so a single drill has no worker pool to size. Supplying it
+prints a notice and changes nothing, and it is removed next release. Case-level
+parallelism lives on `drill-suite --jobs`.
 
 The optional `question_search` artifact and any `question_supplemental_searches` are intentionally partial discovery evidence. They can add public page, component, collection, and store files to the source-truth checklist when the broad question points there, but they do not prove the architecture by themselves. Use them to avoid missing verification files, then rely on each anchor's symbol/trail/explore/snippet artifacts and focused source reads before promoting claims.
 

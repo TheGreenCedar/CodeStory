@@ -591,16 +591,18 @@ function calleeInputSpecifications(workflow) {
   return specifications;
 }
 
-const dispatchForwardedPattern
-  = /^\$\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*''\s*\}\}$/u;
-
 // Classify what a caller can make each callee input be. A literal is fixed for
-// every run of that caller; a dispatch input forwarded verbatim is chosen by
-// whoever dispatches; anything else is treated as free so this check never
+// every run of that caller; ANY interpolated value is free, so this check never
 // invents reachability the caller cannot actually deliver.
-function callerInputBindings(callerWorkflow, callerJob, specifications) {
+//
+// There used to be a `${{ inputs.x || '' }}` regex here that separated a
+// verbatim-forwarded dispatch input from every other expression -- and then set
+// both to the same free binding. The two branches were identical, so the regex
+// decided nothing while the comment above it claimed a distinction the code did
+// not make. Freeness is the conservative answer for every expression, which is
+// what this now says once.
+export function callerInputBindings(callerJob, specifications) {
   const supplied = object(callerJob.with);
-  const dispatchInputs = object(at(callerWorkflow, "on", "workflow_dispatch", "inputs"));
   const bindings = new Map();
   for (const [name, specification] of specifications) {
     const domain = specification.boolean ? [true, false] : ["", "supplied-by-dispatch"];
@@ -609,17 +611,8 @@ function callerInputBindings(callerWorkflow, callerJob, specifications) {
       continue;
     }
     const value = supplied[name];
-    if (typeof value !== "string") {
+    if (typeof value !== "string" || !value.includes("${{")) {
       bindings.set(name, { fixed: true, values: [value] });
-      continue;
-    }
-    if (!value.includes("${{")) {
-      bindings.set(name, { fixed: true, values: [value] });
-      continue;
-    }
-    const forwarded = value.match(dispatchForwardedPattern);
-    if (forwarded !== null && forwarded[1] in dispatchInputs) {
-      bindings.set(name, { fixed: false, values: domain });
       continue;
     }
     bindings.set(name, { fixed: false, values: domain });
@@ -4614,7 +4607,6 @@ function validatePackagedProof(workflows, violations, graph) {
   const coordinator = workflows.get(coordinatorFile);
   const coordinatorPackaged = object(at(coordinator, "jobs", "packaged-proof"));
   const bindings = callerInputBindings(
-    object(coordinator),
     coordinatorPackaged,
     calleeInputSpecifications(workflow),
   );
@@ -9843,6 +9835,19 @@ export function shellDependentBindingViolations(workflows) {
 /// Scoped to `run:` steps. The optional cache restores are `uses:` steps whose miss is the normal
 /// path and carries no outcome to require -- their non-blocking-ness is separately required, and
 /// this rule must not contradict that.
+/// Every `if:` removed, at any depth. A condition decides whether something
+/// runs; it can never make a run fail, which is why neither the job-level nor
+/// the step-level successor may be found in one.
+function withoutConditions(value) {
+  if (Array.isArray(value)) return value.map(withoutConditions);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "if")
+      .map(([key, nested]) => [key, withoutConditions(nested)]),
+  );
+}
+
 export function absorbedFailureViolations(workflows) {
   const violations = [];
   const absorbs = value => value !== undefined && value !== false;
@@ -9862,12 +9867,26 @@ export function absorbedFailureViolations(workflows) {
             frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
           )
           && jobId === "quality";
+        // Reading the outcome is not requiring it one level up either, and the
+        // job-level rule used to accept exactly the `if:`-only read the
+        // step-level rule below deliberately refuses -- it scanned every string
+        // under `jobs`, including the absorbing job's own text and every
+        // condition. A successor is a *downstream, blocking* job that receives
+        // `needs.<id>.result` somewhere other than a condition, where a script
+        // can still test it and exit non-zero.
+        const requiredDownstream = Object.entries(object(workflow.jobs)).some(
+          ([otherId, rawOther]) => {
+            if (otherId === jobId) return false;
+            const other = object(rawOther);
+            if (absorbs(other["continue-on-error"])) return false;
+            return scalarStrings(withoutConditions(other)).some(
+              text => text.includes(`needs.${jobId}.result`),
+            );
+          },
+        );
         add(
           violations,
-          isOptionalFrozenCandidateQuality
-            || scalarStrings(workflow.jobs).some(
-              text => text.includes(`needs.${jobId}.result`),
-            ),
+          isOptionalFrozenCandidateQuality || requiredDownstream,
           `${file} jobs.${jobId} absorbs its own failure and must have needs.${jobId}.result required`,
         );
       }
