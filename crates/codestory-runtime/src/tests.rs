@@ -8224,6 +8224,247 @@ fn incremental_refresh_republishes_when_the_dense_anchor_manifest_is_missing() {
 }
 
 #[test]
+fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let workspace_root = fixture
+        .source_path
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    // The whole point of the regression: a repository with no oversized files
+    // has an empty exclusion set under both the old and the new policy, so a
+    // row-only comparison is trivially satisfied.
+    assert!(
+        Storage::open(&fixture.storage_path)
+            .expect("open baseline storage")
+            .get_source_policy_exclusions()
+            .expect("read baseline exclusions")
+            .is_empty(),
+        "the fixture must carry no oversized-source exclusions"
+    );
+
+    let changed_policy = SourceIndexPolicy::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP / 2);
+    assert_ne!(
+        changed_policy.byte_cap,
+        SourceIndexPolicy::default().byte_cap
+    );
+    let controller = AppController::new_with_source_index_policy(
+        codestory_retrieval::SidecarRuntimeConfig::local(),
+        changed_policy,
+    );
+    controller
+        .open_project_summary_with_storage_path(workspace_root, fixture.storage_path.clone())
+        .expect("open the published core under the changed policy");
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness under the changed policy"),
+        "a policy change must leave the published exclusion manifest owing a repair"
+    );
+
+    let timings = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh under the changed policy");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
+        "an empty plan must not short-circuit while the exclusion manifest is bound to a superseded policy: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(timings.publish_ms.is_some());
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refresh storage")
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1,
+        "the prescribed `index --refresh incremental` repair must republish"
+    );
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness after the repair"),
+        "the repair must leave the published core readable under the current policy"
+    );
+}
+
+#[test]
+fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // An indexed file published without verified content and without completion
+    // is a stored `CollectorFailure` gap. It does not schedule any work, so only
+    // the coverage check stands between it and a successful refresh.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+        )
+        .expect("stage a stored coverage gap");
+
+    let error = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect_err("an incremental refresh must refuse a stored coverage gap");
+
+    assert_eq!(error.code, "source_collector_failure");
+    let coverage_gaps = error
+        .details
+        .as_ref()
+        .map(|details| details.coverage_gaps.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        coverage_gaps.len(),
+        1,
+        "the refusal must carry the gap it could not verify: {coverage_gaps:?}"
+    );
+    assert_eq!(
+        coverage_gaps[0].reason,
+        FileCoverageReason::CollectorFailure
+    );
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refusal storage")
+            .get_complete_index_publication()
+            .expect("read post-refusal publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a refused refresh must preserve the previous complete publication"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn incremental_refresh_rebinds_a_dense_anchor_carrying_a_stale_source_identity() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let live_source = format!(
+        "core:{}:{}",
+        fixture.baseline_publication.generation_id, fixture.baseline_publication.run_id
+    );
+    {
+        let storage = Storage::open(&fixture.storage_path).expect("open live storage");
+        assert!(
+            !storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("read baseline dense anchors")
+                .is_empty(),
+            "the fixture must publish at least one dense anchor to drift"
+        );
+        // Per-row source identity is outside the manifest digest, so count and
+        // digest still match: only the strict publication validation sees this.
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE dense_anchor_input SET source_identity = 'core:stale-generation:stale-run'
+                 WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+            )
+            .expect("stage a stale dense anchor source identity");
+        assert!(
+            storage
+                .validate_dense_anchor_publication(&fixture.baseline_publication)
+                .is_err(),
+            "the staged drift must be visible to the strict publication validation"
+        );
+    }
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over drifted dense anchors");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a dense anchor publication readers refuse: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the repair must leave a dense anchor publication readers accept");
+    let repaired_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+    assert_ne!(repaired_source, live_source);
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read repaired dense anchors")
+            .iter()
+            .all(|anchor| anchor.source_identity == repaired_source),
+        "the repair must rebind every anchor onto the republished identity"
+    );
+}
+
+#[test]
+fn incremental_refresh_adjudicates_mixed_dense_anchor_policy_versions() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // `publish_dense_anchor_generation` refuses a mixed anchor policy set. That
+    // refusal is unreachable on a short-circuited run, so the mixed set must at
+    // minimum reach the staged pipeline that owns it.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE dense_anchor_input SET policy_version = 'superseded-anchor-policy'
+             WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+        )
+        .expect("stage a mixed dense anchor policy version");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over a mixed anchor policy set");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a mixed anchor policy set: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the staged pipeline must leave one accepted anchor policy behind");
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read post-refresh dense anchors")
+            .iter()
+            .all(|anchor| anchor.policy_version == SEMANTIC_POLICY_VERSION),
+        "no anchor may keep the superseded policy version"
+    );
+}
+
+#[test]
 fn incremental_boundaries_preserve_live_state_and_retry_atomically() {
     for boundary in [
         IncrementalFailureBoundary::Projection,

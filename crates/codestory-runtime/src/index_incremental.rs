@@ -2,6 +2,7 @@ use crate::index_commit::{
     CoreCommitMode, PreparedCoreCommit, StagedPreparation, next_index_publication,
     stage_core_publication_identity,
 };
+use crate::index_coverage::validate_source_policy_exclusions;
 use crate::index_timings::{
     IndexingRunSummary, core_indexing_phase_timings, incremental_plan_probe_timings,
 };
@@ -320,22 +321,47 @@ fn evaluate_incremental_plan_probe(
     if probe.files_to_index != 0 || probe.files_to_remove != 0 {
         return IncrementalPlanProbeOutcomeDto::PlanNotEmpty;
     }
+    // A blocking stored coverage gap is adjudicated by
+    // `validate_incremental_refresh_coverage` on the staged path. An empty plan
+    // does not clear it, so short-circuiting here would keep serving a core the
+    // staged pipeline refuses.
+    let Ok(stored_coverage) = stored_file_coverage_diagnostics(root, &storage) else {
+        return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
+    };
+    if stored_coverage
+        .iter()
+        .any(|entry| entry.reason != FileCoverageReason::ParserPartial)
+    {
+        return IncrementalPlanProbeOutcomeDto::StoredCoverageGap;
+    }
+    // Readers validate the published exclusion manifest against the *current*
+    // policy identity, not against the exclusion rows alone. A repository with
+    // no oversized files has an empty set on both sides, so comparing rows is
+    // trivially satisfied and would let a policy change leave the manifest
+    // bound to the superseded identity forever.
+    if validate_source_policy_exclusions(&storage, root, &publication, source_index_policy).is_err()
+    {
+        return IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale;
+    }
     let Ok(stored_exclusions) = storage.get_source_policy_exclusions() else {
         return IncrementalPlanProbeOutcomeDto::ProbeUnavailable;
     };
     if !source_policy_exclusions_unchanged(&stored_exclusions, &policy_refresh.policy_exclusions) {
         return IncrementalPlanProbeOutcomeDto::PolicyExclusionsChanged;
     }
-    let dense_anchor_policy_version = match storage.get_dense_anchor_publication_manifest() {
-        Ok(Some(manifest))
-            if manifest.complete
-                && manifest.core_generation_id == publication.generation_id
-                && manifest.core_run_id == publication.run_id =>
-        {
-            manifest.policy_version
-        }
-        Ok(_) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+    match storage.get_dense_anchor_publication_manifest() {
+        Ok(Some(_)) => {}
+        Ok(None) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
         Err(_) => return IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+    }
+    // Use the same strict validation the readiness probe
+    // (`complete_core_requires_publication_repair`) applies. Accepting a weaker
+    // condition here makes anchor-count, digest, per-row source-identity, and
+    // mixed-policy drift unrepairable through the incremental path.
+    let dense_anchor_policy_version = match storage.validate_dense_anchor_publication(&publication)
+    {
+        Ok(manifest) => manifest.policy_version,
+        Err(_) => return IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
     };
     // Mirror `effective_incremental_file_scope`: stored semantic docs built
     // under a previous contract expand an empty scope into a full repair, so

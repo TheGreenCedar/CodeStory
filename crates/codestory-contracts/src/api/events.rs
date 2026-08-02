@@ -65,8 +65,16 @@ pub enum IncrementalPlanProbeOutcomeDto {
     InventoryIncomplete,
     /// Verified oversized-source exclusions drifted from the published set.
     PolicyExclusionsChanged,
+    /// The published exclusion manifest does not validate against the current
+    /// source-index policy identity, so readers refuse it until it is rewritten.
+    SourcePolicyPublicationStale,
+    /// The published core carries a stored coverage gap the staged refresh owns.
+    StoredCoverageGap,
     /// The published core has no complete dense-anchor manifest to reuse.
     DenseAnchorManifestMissing,
+    /// The dense-anchor manifest exists but fails its strict publication
+    /// validation (row count, digest, per-row source identity, or policy).
+    DenseAnchorPublicationStale,
     /// Stored semantic documents were built under a previous contract and owe a repair.
     SemanticDocContractDrift,
     /// The published core has no completed lexical search generation to reuse.
@@ -915,8 +923,20 @@ mod tests {
                 "policy_exclusions_changed",
             ),
             (
+                IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
+                "source_policy_publication_stale",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::StoredCoverageGap,
+                "stored_coverage_gap",
+            ),
+            (
                 IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
                 "dense_anchor_manifest_missing",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+                "dense_anchor_publication_stale",
             ),
             (
                 IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
