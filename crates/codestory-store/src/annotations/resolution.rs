@@ -9,6 +9,28 @@
 //! normalized-signature evidence, and a unique candidate. Uniqueness alone is
 //! never enough, and an ambiguous match never guesses: it becomes a visible,
 //! user-owned orphan carrying its last known evidence.
+//!
+//! The two inferences are looked up from opposite ends, because a rename and a
+//! move change opposite halves of the anchor:
+//!
+//! - a *move* keeps the qualified name and changes the file, so it is found by
+//!   name in another file and then checked against the normalized signature.
+//!   A unique candidate whose signature disagrees is not the annotated code,
+//!   which is a visible `SignatureChanged` orphan;
+//! - a *rename* keeps the file and changes the name, so it is found by
+//!   normalized signature within the same file and kind.
+//!
+//! Both depend on the normalized signature being independent of position and
+//! of the symbol's own name. `callable_projection_state.signature_hash` is
+//! not: it is an incremental-projection change detector that binds both, so a
+//! ladder built on it can never fire.
+//!
+//! The two probes ask different things of that signature, because they rest on
+//! different evidence. The move probe already knows *which* symbol it is
+//! looking at — the qualified name identifies it — so the signature only has
+//! to agree. The rename probe has nothing but the signature, so the signature
+//! has to identify code on its own, and an `outline` signature (a callable
+//! whose body projected nothing, leaving only kind and line count) cannot.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +109,29 @@ pub struct BookmarkAnchorEvidence {
     pub kind: Option<i64>,
     pub normalized_signature: Option<String>,
     pub start_line: Option<i64>,
+    /// How well this evidence separated the annotated symbol from its
+    /// neighbours when it was last proven. Absent evidence refuses inference.
+    #[serde(default)]
+    pub discrimination: Option<AnchorDiscrimination>,
+}
+
+/// Whether an anchor's evidence identified exactly one symbol at bind time.
+///
+/// A rebind is an inference *from the last proven state*, so the question that
+/// matters is not whether a candidate is unique now but whether the evidence
+/// was ever discriminating. Normalized signatures collide by design — two
+/// same-shaped callables share one — and a bookmark whose signature already
+/// matched a sibling cannot become a rename witness merely because that
+/// sibling was deleted. Recording the answer at bind time is the only way to
+/// ask it, because the previous generation is gone by the time the next one
+/// resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorDiscrimination {
+    /// The normalized signature matched exactly one symbol of this kind in the
+    /// anchor's own file.
+    pub signature_unique_in_file: bool,
+    /// The qualified name matched exactly one symbol of this kind anywhere.
+    pub qualified_name_unique: bool,
 }
 
 /// Outcome of resolving one bookmark against the live core.
@@ -158,12 +203,25 @@ pub trait CoreAnchorIndex {
         kind: i64,
     ) -> Vec<CoreAnchorCandidate>;
 
-    /// Candidates carrying this normalized signature, optionally restricted to
-    /// one file identity.
+    /// Candidates carrying this `(qualified_name, kind)` pair in any file.
+    ///
+    /// A move keeps the qualified name and changes the file, so this is the
+    /// lookup the move probe needs; the anchor tuple cannot see it.
+    fn candidates_by_qualified_name(
+        &self,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Vec<CoreAnchorCandidate>;
+
+    /// Candidates carrying this normalized signature inside one file and kind.
+    ///
+    /// Always scoped: an unscoped signature probe would be a workspace scan,
+    /// and no rebind decision needs one.
     fn candidates_by_normalized_signature(
         &self,
         normalized_signature: &str,
-        file_identity: Option<&str>,
+        file_identity: &str,
+        kind: i64,
     ) -> Vec<CoreAnchorCandidate>;
 }
 
@@ -176,7 +234,7 @@ pub fn resolve_bookmark(
 
     if let Some(canonical_id) = bookmark.canonical_id.as_deref() {
         match unique_candidate(index.candidates_by_canonical_id(canonical_id)) {
-            CandidateSet::Unique(candidate) => return bound(candidate, generation),
+            CandidateSet::Unique(candidate) => return bound(candidate, generation, index),
             CandidateSet::Ambiguous => {
                 return orphaned(OrphanReason::AmbiguousMatch);
             }
@@ -198,7 +256,7 @@ pub fn resolve_bookmark(
     };
 
     match unique_candidate(index.candidates_by_anchor_tuple(file_identity, qualified_name, kind)) {
-        CandidateSet::Unique(candidate) => return bound(candidate, generation),
+        CandidateSet::Unique(candidate) => return bound(candidate, generation, index),
         CandidateSet::Ambiguous => return orphaned(OrphanReason::AmbiguousMatch),
         CandidateSet::Empty => {}
     }
@@ -211,31 +269,118 @@ pub fn resolve_bookmark(
     if !is_adjacent_generation(bookmark, generation) {
         return orphaned(OrphanReason::GenerationGap);
     }
+    let discrimination = bookmark
+        .last_known_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.discrimination);
 
-    let renamed_in_place = index
-        .candidates_by_normalized_signature(signature, Some(file_identity))
+    // A move keeps the qualified name and changes the file, so it is found by
+    // name and then *checked* against the normalized signature. Finding the
+    // name somewhere else is not on its own evidence of a move — a signature
+    // that disagrees means the code there is not the code the user annotated,
+    // and that is a visible `SignatureChanged` orphan rather than a guess.
+    let moved = index
+        .candidates_by_qualified_name(qualified_name, kind)
         .into_iter()
-        .filter(|candidate| candidate.kind == Some(kind))
+        .filter(|candidate| candidate.file_identity.as_deref() != Some(file_identity))
         .collect::<Vec<_>>();
-    match unique_candidate(renamed_in_place) {
-        CandidateSet::Unique(candidate) => return bound(candidate, generation),
+    match unique_candidate(moved) {
+        CandidateSet::Unique(candidate) => {
+            return if !discrimination.is_some_and(|it| it.qualified_name_unique) {
+                // The name already named more than one symbol when the anchor
+                // was last proven, so "the name turned up elsewhere" is not
+                // evidence that this symbol went there.
+                orphaned(OrphanReason::AmbiguousMatch)
+            } else if candidate.normalized_signature.as_deref() == Some(signature) {
+                bound(candidate, generation, index)
+            } else {
+                orphaned(OrphanReason::SignatureChanged)
+            };
+        }
         CandidateSet::Ambiguous => return orphaned(OrphanReason::AmbiguousMatch),
         CandidateSet::Empty => {}
     }
 
-    let moved = index
-        .candidates_by_normalized_signature(signature, None)
-        .into_iter()
-        .filter(|candidate| {
-            candidate.kind == Some(kind)
-                && candidate.qualified_name.as_deref() == Some(qualified_name)
-        })
-        .collect::<Vec<_>>();
-    match unique_candidate(moved) {
-        CandidateSet::Unique(candidate) => bound(candidate, generation),
+    // A rename keeps the file and changes the name, so the signature is the
+    // *only* evidence left — which means it has to be evidence. An outline
+    // signature says "a callable of this kind, this many lines long" and
+    // nothing else, so every stub of the same length shares it; inferring a
+    // rename from one would hand a bookmark on a deleted stub to whichever
+    // stub happened to survive.
+    if !is_shape_signature(signature) {
+        return orphaned(OrphanReason::TargetDeleted);
+    }
+    let renamed_in_place = index.candidates_by_normalized_signature(signature, file_identity, kind);
+    match unique_candidate(renamed_in_place) {
+        CandidateSet::Unique(candidate) => {
+            // A signature that already matched a sibling when the anchor was
+            // last proven cannot become a rename witness just because the
+            // annotated symbol disappeared: the surviving sibling would be a
+            // guess, not an inference.
+            if discrimination.is_some_and(|it| it.signature_unique_in_file) {
+                bound(candidate, generation, index)
+            } else {
+                orphaned(OrphanReason::AmbiguousMatch)
+            }
+        }
         CandidateSet::Ambiguous => orphaned(OrphanReason::AmbiguousMatch),
         CandidateSet::Empty => orphaned(OrphanReason::TargetDeleted),
     }
+}
+
+/// Evidence to record for a candidate that is about to become an anchor.
+///
+/// Shared by the rebind pass and by annotation creation so both record the
+/// same discrimination, which is what a later rename or move inference is
+/// allowed to rely on.
+pub fn anchor_evidence(
+    candidate: &CoreAnchorCandidate,
+    generation: Option<i64>,
+    index: &dyn CoreAnchorIndex,
+) -> BookmarkAnchorEvidence {
+    BookmarkAnchorEvidence {
+        generation,
+        node_id: Some(candidate.node_id),
+        canonical_id: candidate.canonical_id.clone(),
+        file_identity: candidate.file_identity.clone(),
+        qualified_name: candidate.qualified_name.clone(),
+        kind: candidate.kind,
+        normalized_signature: candidate.normalized_signature.clone(),
+        start_line: candidate.start_line,
+        discrimination: anchor_discrimination(candidate, index),
+    }
+}
+
+fn anchor_discrimination(
+    candidate: &CoreAnchorCandidate,
+    index: &dyn CoreAnchorIndex,
+) -> Option<AnchorDiscrimination> {
+    let kind = candidate.kind?;
+    let signature_unique_in_file = match (
+        candidate.normalized_signature.as_deref(),
+        candidate.file_identity.as_deref(),
+    ) {
+        (Some(signature), Some(file_identity)) => {
+            index
+                .candidates_by_normalized_signature(signature, file_identity, kind)
+                .len()
+                == 1
+        }
+        _ => false,
+    };
+    let qualified_name_unique = candidate
+        .qualified_name
+        .as_deref()
+        .is_some_and(|qualified_name| {
+            index
+                .candidates_by_qualified_name(qualified_name, kind)
+                .len()
+                == 1
+        });
+    Some(AnchorDiscrimination {
+        signature_unique_in_file,
+        qualified_name_unique,
+    })
 }
 
 /// Whether the recorded evidence is close enough for an inferred rebind.
@@ -257,6 +402,17 @@ fn is_adjacent_generation(bookmark: &AnnotationBookmark, generation: Option<i64>
     current == recorded || current == recorded + 1
 }
 
+/// Tag prefix for a normalized signature that actually projected a body.
+///
+/// Mirrors `codestory_indexer::CALLABLE_SHAPE_SIGNATURE_TAG`; the store cannot
+/// depend on the indexer, so the tag is part of the durable anchor contract.
+const SHAPE_SIGNATURE_PREFIX: &str = "shape:";
+
+/// Whether a normalized signature is strong enough to identify code by itself.
+fn is_shape_signature(signature: &str) -> bool {
+    signature.starts_with(SHAPE_SIGNATURE_PREFIX)
+}
+
 enum CandidateSet {
     Empty,
     Unique(CoreAnchorCandidate),
@@ -271,19 +427,14 @@ fn unique_candidate(mut candidates: Vec<CoreAnchorCandidate>) -> CandidateSet {
     }
 }
 
-fn bound(candidate: CoreAnchorCandidate, generation: Option<i64>) -> AnnotationResolution {
+fn bound(
+    candidate: CoreAnchorCandidate,
+    generation: Option<i64>,
+    index: &dyn CoreAnchorIndex,
+) -> AnnotationResolution {
     AnnotationResolution::Bound {
         node_id: candidate.node_id,
-        evidence: BookmarkAnchorEvidence {
-            generation,
-            node_id: Some(candidate.node_id),
-            canonical_id: candidate.canonical_id,
-            file_identity: candidate.file_identity,
-            qualified_name: candidate.qualified_name,
-            kind: candidate.kind,
-            normalized_signature: candidate.normalized_signature,
-            start_line: candidate.start_line,
-        },
+        evidence: anchor_evidence(&candidate, generation, index),
     }
 }
 

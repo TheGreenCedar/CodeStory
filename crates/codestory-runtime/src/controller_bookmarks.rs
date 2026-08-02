@@ -20,6 +20,25 @@ use codestory_store::{
     ResolutionStatus, Store, resolve_bookmark,
 };
 
+/// Proof that user annotations already moved out of the core database.
+///
+/// The private field is the point: only
+/// [`AppController::ensure_annotations_owned_before_core_replacement`] can
+/// mint one, and every function that replaces core projections takes one by
+/// reference. A future entry point that forgets the cutover therefore does not
+/// compile, instead of silently publishing a from-scratch database over the
+/// retained legacy annotation tables.
+#[derive(Debug)]
+pub(crate) struct AnnotationsOwned(());
+
+impl AnnotationsOwned {
+    /// Mint the proof for a test that drives indexing without a controller.
+    #[cfg(test)]
+    pub(crate) fn assume_owned_for_test() -> Self {
+        Self(())
+    }
+}
+
 fn parse_db_id(raw: &str, field_name: &str) -> Result<i64, ApiError> {
     raw.trim()
         .parse::<i64>()
@@ -69,13 +88,24 @@ impl CoreAnchorIndex for CoreAnchors<'_> {
             .unwrap_or_default()
     }
 
+    fn candidates_by_qualified_name(
+        &self,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Vec<CoreAnchorCandidate> {
+        self.storage
+            .annotation_anchors_by_qualified_name(qualified_name, kind)
+            .unwrap_or_default()
+    }
+
     fn candidates_by_normalized_signature(
         &self,
         normalized_signature: &str,
-        file_identity: Option<&str>,
+        file_identity: &str,
+        kind: i64,
     ) -> Vec<CoreAnchorCandidate> {
         self.storage
-            .annotation_anchors_by_normalized_signature(normalized_signature, file_identity)
+            .annotation_anchors_by_normalized_signature(normalized_signature, file_identity, kind)
             .unwrap_or_default()
     }
 }
@@ -139,17 +169,45 @@ impl AppController {
             .map_err(|error| annotation_error("Failed to open the annotations sidecar", error))
     }
 
+    /// Open the sidecar for reading, or `None` while core still owns
+    /// annotations.
+    ///
+    /// Ownership switches when the import *commits*, not when the file
+    /// appears. `open_annotations_for_write` creates and binds the sidecar
+    /// before it imports, so any failure in between — a backup write onto a
+    /// full disk, an unreadable core, a process kill — leaves an empty sidecar
+    /// sitting on top of intact legacy rows. Switching reads on file existence
+    /// would report zero annotations for a user whose annotations are all
+    /// still there. The journal row is the only durable statement that the
+    /// sidecar has become the source of truth, so it is what reads switch on.
+    fn open_annotations_for_read(&self) -> Result<Option<AnnotationStore>, ApiError> {
+        let Some(annotations) = self.open_annotations_observational()? else {
+            return Ok(None);
+        };
+        let imported = annotations
+            .core_import_completed()
+            .map_err(|error| annotation_error("Failed to read the annotation journal", error))?;
+        Ok(imported.then_some(annotations))
+    }
+
     /// Move annotations into the sidecar before core projections are replaced.
     ///
     /// A full refresh installs a freshly built database that never carried the
     /// legacy annotation tables, so the cutover has to happen *before* the
     /// operation that replaces core, not after it. A project with no
     /// annotations gets no sidecar: publication is not a reason to create one.
-    pub(crate) fn ensure_annotations_owned_before_core_replacement(&self) -> Result<(), ApiError> {
+    ///
+    /// The returned [`AnnotationsOwned`] is the proof every core-replacing
+    /// entry point demands, which is what makes the ordering structural rather
+    /// than a convention two adjacent call sites happen to follow.
+    pub(crate) fn ensure_annotations_owned_before_core_replacement(
+        &self,
+    ) -> Result<AnnotationsOwned, ApiError> {
         if !self.annotations_sidecar_path()?.is_file() && !self.core_owns_legacy_annotations()? {
-            return Ok(());
+            return Ok(AnnotationsOwned(()));
         }
-        self.open_annotations_for_write().map(|_| ())
+        self.open_annotations_for_write()
+            .map(|_| AnnotationsOwned(()))
     }
 
     fn core_owns_legacy_annotations(&self) -> Result<bool, ApiError> {
@@ -265,7 +323,7 @@ impl AppController {
     }
 
     pub fn list_bookmark_categories(&self) -> Result<Vec<BookmarkCategoryDto>, ApiError> {
-        let Some(annotations) = self.open_annotations_observational()? else {
+        let Some(annotations) = self.open_annotations_for_read()? else {
             return self.legacy_bookmark_categories();
         };
         Ok(annotations
@@ -343,7 +401,7 @@ impl AppController {
     }
 
     pub fn list_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<BookmarkDto>, ApiError> {
-        let Some(annotations) = self.open_annotations_observational()? else {
+        let Some(annotations) = self.open_annotations_for_read()? else {
             return self.legacy_bookmarks(category_id);
         };
         // Annotations outlive the core they point at. When core is absent or
@@ -429,28 +487,27 @@ impl AppController {
             .annotation_anchor_for_node(node_id)
             .map_err(|e| ApiError::internal(format!("Failed to read bookmark anchor: {e}")))?
             .ok_or_else(|| ApiError::not_found(format!("Node not found: {}", req.node_id.0)))?;
-        let generation = Self::core_generation(&storage);
+        let anchors = CoreAnchors {
+            storage: &storage,
+            generation: Self::core_generation(&storage),
+        };
+        // The same evidence the rebind pass records, including how well this
+        // anchor separated its symbol from its neighbours: a later rename or
+        // move may only be inferred from evidence that was discriminating when
+        // it was proven.
+        let evidence = codestory_store::anchor_evidence(&anchor, anchors.generation, &anchors);
         let bookmark = annotations
             .create_bookmark(
                 category_id,
                 &BookmarkAnchorInput {
-                    canonical_id: anchor.canonical_id.clone(),
-                    file_identity: anchor.file_identity.clone(),
-                    qualified_name: anchor.qualified_name.clone(),
+                    canonical_id: anchor.canonical_id,
+                    file_identity: anchor.file_identity,
+                    qualified_name: anchor.qualified_name,
                     kind: anchor.kind,
-                    normalized_signature: anchor.normalized_signature.clone(),
+                    normalized_signature: anchor.normalized_signature,
                     start_line: anchor.start_line,
                     comment: req.comment.clone(),
-                    evidence: Some(codestory_store::BookmarkAnchorEvidence {
-                        generation,
-                        node_id: Some(anchor.node_id),
-                        canonical_id: anchor.canonical_id,
-                        file_identity: anchor.file_identity,
-                        qualified_name: anchor.qualified_name,
-                        kind: anchor.kind,
-                        normalized_signature: anchor.normalized_signature,
-                        start_line: anchor.start_line,
-                    }),
+                    evidence: Some(evidence),
                 },
             )
             .map_err(|error| annotation_error("Failed to create bookmark", error))?;
@@ -476,12 +533,35 @@ impl AppController {
         })
     }
 
+    /// Address a bookmark by the id the API last handed out.
+    ///
+    /// A pre-cutover read returns retained legacy row ids, and the next call
+    /// on one of those ids is often the write that performs the cutover. The
+    /// import derives each imported uuid from its legacy row id, so a legacy
+    /// id keeps addressing the same annotation across that boundary. Sidecar
+    /// uuids are unaffected: they are only translated when they are not
+    /// present and they parse as a legacy row id.
+    fn addressed_bookmark_id(annotations: &AnnotationStore, id: &str) -> Result<String, ApiError> {
+        let known = annotations
+            .bookmark(id)
+            .map_err(|error| annotation_error("Failed to load bookmark", error))?
+            .is_some();
+        if known {
+            return Ok(id.to_string());
+        }
+        match id.trim().parse::<i64>() {
+            Ok(legacy_id) => Ok(codestory_store::legacy_bookmark_uuid(legacy_id)),
+            Err(_) => Ok(id.to_string()),
+        }
+    }
+
     pub fn update_bookmark(
         &self,
         id: &str,
         req: UpdateBookmarkRequest,
     ) -> Result<BookmarkDto, ApiError> {
         let annotations = self.open_annotations_for_write()?;
+        let id = &Self::addressed_bookmark_id(&annotations, id)?;
         let category_id = req
             .category_id
             .as_deref()
@@ -505,8 +585,9 @@ impl AppController {
 
     pub fn delete_bookmark(&self, id: &str) -> Result<(), ApiError> {
         let annotations = self.open_annotations_for_write()?;
+        let id = Self::addressed_bookmark_id(&annotations, id)?;
         annotations
-            .delete_bookmark(id)
+            .delete_bookmark(&id)
             .map_err(|error| annotation_error("Failed to delete bookmark", error))
     }
 

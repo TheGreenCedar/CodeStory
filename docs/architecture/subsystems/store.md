@@ -111,10 +111,44 @@ unique candidate. Ambiguity never guesses: the annotation becomes a visible,
 user-owned orphan carrying `orphan_reason` and its last known evidence until an
 explicit relink or delete.
 
+The two inferences are looked up from opposite ends, because a rename and a move
+change opposite halves of the anchor. A move keeps the qualified name and
+changes the file, so it is found by name in another file and then checked
+against the normalized signature; a unique candidate whose signature disagrees
+is a visible `signature_changed` orphan. A rename keeps the file and changes the
+name, so it is found by normalized signature within the same file and kind.
+
+The normalized signature backing both is
+`callable_projection_state.normalized_signature`, computed by the indexer from
+the callable's kind, line extent, and body projection expressed relative to its
+own start. It is deliberately not `signature_hash`, which is an
+incremental-projection change detector over the symbol's own name and exact
+start position and therefore changes on every rename and every move. The value
+is tagged: `shape:` when the body projected at least one edge or occurrence,
+`outline:` when it projected nothing and only the kind and line count remain. A
+rename may only be inferred from a `shape:` signature, because it has no other
+evidence and an outline is shared by every stub of the same length. A move
+accepts either, because the qualified name has already identified the symbol and
+the signature only has to agree.
+
+Each bind also records how well its evidence separated the symbol at the time —
+whether the signature matched exactly one symbol of that kind in the file, and
+whether the qualified name matched exactly one symbol anywhere. An inference may
+only rest on evidence that was discriminating when it was proven, so a surviving
+same-shaped sibling never inherits a deleted symbol's annotation.
+
 The migration is paired with the schema-31 core writer barrier. Forward-only
 migration already refuses a newer schema, so a 0.16.3 CLI opening a migrated
 database fails closed on the whole database instead of silently writing the
 retained legacy tables and forking annotation truth.
+
+Reads switch source of truth on the migration journal row, not on the sidecar
+file existing. The cutover creates and binds the sidecar before it imports, so
+gating on the file would report zero annotations for the whole window between
+those two steps — and permanently, if the import never completed. Annotations
+imported from the retained tables take a uuid derived from their legacy row id,
+so an id a pre-cutover read already handed out still addresses the same
+annotation afterwards.
 
 **Downgrade path.** Export annotations first
 (`AppController::export_annotations`, written to the retained

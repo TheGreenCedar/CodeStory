@@ -140,13 +140,20 @@
   their own file beside the cache, and each one remembers the symbol it points
   at rather than a row number — so it survives edits that move the code down the
   file, a full re-index, a cache reset, and the symbol disappearing and coming
-  back. A bookmark whose target was renamed or moved is only followed when the
-  evidence is unambiguous; anything less leaves it visible and yours, labelled
-  with why it could not be followed, until you relink or delete it. Copying a
+  back. A bookmark now really does follow a function that is renamed in place or
+  moved to another file, as long as the evidence points at one symbol and only
+  one; anything less leaves it visible and yours, labelled with why it could not
+  be followed, until you relink or delete it. In particular, deleting a small
+  function never hands its bookmark to a similar-looking neighbour. Copying a
   project to another machine or volume no longer silently adopts someone else's
   bookmarks — export and import them explicitly. Opening this release's cache
   with 0.16.3 now refuses the whole database instead of quietly writing
   bookmarks the new release will not read.
+- A bookmark you just listed can still be edited or deleted by the id you were
+  given, even when that first edit is what moves bookmarks to their new home.
+- If moving bookmarks to their new home is interrupted — a full disk, a closed
+  laptop — the bookmarks you already had stay visible instead of appearing to
+  have vanished, and the move finishes the next time you make a change.
 
 ## 0.16.3
 

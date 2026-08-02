@@ -14,11 +14,12 @@ mod sqlite_path;
 mod storage_impl;
 
 pub use annotations::{
-    ANNOTATION_SCHEMA_VERSION, AnnotationBookmark, AnnotationCategory, AnnotationError,
-    AnnotationExport, AnnotationExportBookmark, AnnotationExportCategory, AnnotationResolution,
-    AnnotationStore, BookmarkAnchorEvidence, BookmarkAnchorInput, CoreAnchorCandidate,
-    CoreAnchorIndex, LegacyAnnotationSnapshot, LegacyBookmarkRow, NativeRootBinding, OrphanReason,
-    ResolutionStatus, resolve_bookmark,
+    ANNOTATION_SCHEMA_VERSION, AnchorDiscrimination, AnnotationBookmark, AnnotationCategory,
+    AnnotationError, AnnotationExport, AnnotationExportBookmark, AnnotationExportCategory,
+    AnnotationResolution, AnnotationStore, BookmarkAnchorEvidence, BookmarkAnchorInput,
+    CoreAnchorCandidate, CoreAnchorIndex, LegacyAnnotationSnapshot, LegacyBookmarkRow,
+    NativeRootBinding, OrphanReason, ResolutionStatus, anchor_evidence, legacy_bookmark_uuid,
+    resolve_bookmark,
 };
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};

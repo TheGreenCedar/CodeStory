@@ -37,6 +37,13 @@ requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
 
+Every path that replaces core projections moves user annotations into the store
+sidecar first, and the ordering is enforced by the type system rather than by
+convention: `index_full_for_runtime` and `index_incremental_for_runtime` demand
+an `AnnotationsOwned`, which only
+`ensure_annotations_owned_before_core_replacement` can mint. A future refresh
+entry point that forgets the cutover does not compile.
+
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
 engine activation and hold publication leases, but cannot reconfigure the

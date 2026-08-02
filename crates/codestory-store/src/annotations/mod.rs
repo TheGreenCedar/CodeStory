@@ -24,8 +24,8 @@ mod resolution;
 mod tests;
 
 pub use resolution::{
-    AnnotationResolution, BookmarkAnchorEvidence, CoreAnchorCandidate, CoreAnchorIndex,
-    OrphanReason, ResolutionStatus, resolve_bookmark,
+    AnchorDiscrimination, AnnotationResolution, BookmarkAnchorEvidence, CoreAnchorCandidate,
+    CoreAnchorIndex, OrphanReason, ResolutionStatus, anchor_evidence, resolve_bookmark,
 };
 
 /// Sidecar schema version, independent of the core database schema.
@@ -33,6 +33,25 @@ pub const ANNOTATION_SCHEMA_VERSION: u32 = 1;
 
 /// Journal step recorded once the core annotation tables have been imported.
 const CORE_IMPORT_JOURNAL_STEP: &str = "core-bookmark-import-v1";
+
+/// Namespace for uuids derived from retained legacy `bookmark_node` row ids.
+///
+/// A pre-cutover read hands out the legacy integer id, and the very next call
+/// on that id can be the write that performs the cutover. Deriving the
+/// imported uuid from the legacy id keeps the id the API just returned usable
+/// across that boundary instead of failing with `not_found`.
+const LEGACY_BOOKMARK_UUID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x1e, 0x9a, 0x47, 0x2c, 0x5b, 0x30, 0x4d, 0x88, 0x9c, 0x41, 0x0a, 0x77, 0x63, 0xd2, 0xe5, 0x14,
+]);
+
+/// Stable sidecar uuid for one retained legacy `bookmark_node` row id.
+pub fn legacy_bookmark_uuid(legacy_id: i64) -> String {
+    Uuid::new_v5(
+        &LEGACY_BOOKMARK_UUID_NAMESPACE,
+        format!("bookmark_node:{legacy_id}").as_bytes(),
+    )
+    .to_string()
+}
 
 const SIDECAR_BUSY_TIMEOUT: Duration = Duration::from_millis(2_500);
 
@@ -417,6 +436,10 @@ impl AnnotationStore {
     /// the untouched legacy tables. The caller retains the backup export before
     /// calling; core rows are never deleted here, and after this step the
     /// sidecar is the only annotation writer.
+    ///
+    /// Imported rows take a uuid derived from their legacy row id, so an id a
+    /// pre-cutover read already handed to a caller still addresses the same
+    /// annotation once the cutover has run.
     pub fn import_core_annotations(
         &mut self,
         snapshot: &LegacyAnnotationSnapshot,
@@ -470,7 +493,7 @@ impl AnnotationStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
                 ),
                 params![
-                    Uuid::new_v4().to_string(),
+                    legacy_bookmark_uuid(bookmark.id),
                     category_id,
                     bookmark.canonical_id,
                     bookmark.file_identity,

@@ -56,9 +56,14 @@ pub(super) fn index_incremental(
         cancel_token,
         &test_sidecar_runtime_from_env(),
         &SourceIndexPolicy::default(),
+        &crate::controller_bookmarks::AnnotationsOwned::assume_owned_for_test(),
     )
 }
 
+/// Refresh and republish core projections.
+///
+/// `_annotations_owned` is unused at runtime and load-bearing at compile time:
+/// see [`crate::index_full::index_full_for_runtime`].
 pub(super) fn index_incremental_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -66,6 +71,7 @@ pub(super) fn index_incremental_for_runtime(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
 ) -> Result<IndexingRunSummary, ApiError> {
     run_incremental_indexing_common(
         root,

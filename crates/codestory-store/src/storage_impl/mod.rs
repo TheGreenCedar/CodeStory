@@ -487,11 +487,18 @@ fn uniform_optional_u32_with_count(
 
 /// Selective anchor projection shared by every annotation lookup.
 ///
-/// `callable_projection_state` carries the only normalized-signature evidence
-/// core owns today, and it is joined rather than scanned so a rebind probe
-/// stays a keyed lookup.
+/// `callable_projection_state.normalized_signature` carries the only
+/// position-and-name-independent evidence core owns, and it is joined rather
+/// than scanned so a rebind probe stays a keyed lookup. It is deliberately not
+/// `signature_hash`: that column binds the symbol's own name and its exact
+/// start position, so a rename or a move always changes it and a ladder built
+/// on it could never rebind either.
+/// Rows an annotation uniqueness probe needs: one candidate, plus one more to
+/// prove it was not the only one.
+const ANNOTATION_UNIQUENESS_PROBE_LIMIT: usize = 2;
+
 const ANNOTATION_ANCHOR_SELECT: &str = "SELECT n.id, n.canonical_id, f.path, n.qualified_name,
-            n.kind, cps.signature_hash, n.start_line
+            n.kind, cps.normalized_signature, n.start_line
      FROM node n
      LEFT JOIN file f ON f.id = n.file_node_id
      LEFT JOIN callable_projection_state cps ON cps.node_id = n.id";
@@ -499,14 +506,13 @@ const ANNOTATION_ANCHOR_SELECT: &str = "SELECT n.id, n.canonical_id, f.path, n.q
 fn annotation_anchor_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<CoreAnchorCandidate, StorageError> {
-    let signature_hash: Option<i64> = row.get(5)?;
     Ok(CoreAnchorCandidate {
         node_id: row.get(0)?,
         canonical_id: row.get(1)?,
         file_identity: row.get(2)?,
         qualified_name: row.get(3)?,
         kind: row.get(4)?,
-        normalized_signature: signature_hash.map(|hash| hash.to_string()),
+        normalized_signature: row.get(5)?,
         start_line: row.get(6)?,
     })
 }
@@ -6760,7 +6766,8 @@ impl Storage {
         file_id: i64,
     ) -> Result<Vec<CallableProjectionState>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
+            "SELECT file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
              FROM callable_projection_state
              WHERE file_id = ?1
              ORDER BY start_line, symbol_key",
@@ -6771,9 +6778,10 @@ impl Storage {
                 symbol_key: row.get(1)?,
                 node_id: NodeId(row.get(2)?),
                 signature_hash: row.get(3)?,
-                body_hash: row.get(4)?,
-                start_line: row.get(5)?,
-                end_line: row.get(6)?,
+                normalized_signature: row.get(4)?,
+                body_hash: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
             })
         })?;
 
@@ -6796,11 +6804,13 @@ impl Storage {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO callable_projection_state (
-                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(file_id, symbol_key) DO UPDATE SET
                     node_id = excluded.node_id,
                     signature_hash = excluded.signature_hash,
+                    normalized_signature = excluded.normalized_signature,
                     body_hash = excluded.body_hash,
                     start_line = excluded.start_line,
                     end_line = excluded.end_line",
@@ -6811,6 +6821,7 @@ impl Storage {
                     state.symbol_key,
                     state.node_id.0,
                     state.signature_hash,
+                    state.normalized_signature,
                     state.body_hash,
                     state.start_line,
                     state.end_line
@@ -7308,11 +7319,13 @@ impl Storage {
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
                 "INSERT INTO callable_projection_state (
-                    file_id, symbol_key, node_id, signature_hash, body_hash, start_line, end_line
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    file_id, symbol_key, node_id, signature_hash, normalized_signature,
+                    body_hash, start_line, end_line
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(file_id, symbol_key) DO UPDATE SET
                     node_id = excluded.node_id,
                     signature_hash = excluded.signature_hash,
+                    normalized_signature = excluded.normalized_signature,
                     body_hash = excluded.body_hash,
                     start_line = excluded.start_line,
                     end_line = excluded.end_line",
@@ -7323,6 +7336,7 @@ impl Storage {
                     state.symbol_key,
                     state.node_id.0,
                     state.signature_hash,
+                    state.normalized_signature,
                     state.body_hash,
                     state.start_line,
                     state.end_line,
@@ -7340,7 +7354,7 @@ impl Storage {
                 record_projection_statement(
                     &mut breakdown.persistence.callable_projection,
                     1,
-                    projection_scalar_binds(6)
+                    projection_scalar_binds(7)
                         .saturating_add(projection_text_bind_bytes(&state.symbol_key)),
                 );
             }
@@ -11817,7 +11831,7 @@ impl Storage {
             .collect();
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.category_id, b.comment, n.canonical_id, f.path, n.qualified_name,
-                    n.kind, cps.signature_hash, n.start_line
+                    n.kind, cps.normalized_signature, n.start_line
              FROM bookmark_node b
              LEFT JOIN node n ON n.id = b.node_id
              LEFT JOIN file f ON f.id = n.file_node_id
@@ -11827,7 +11841,6 @@ impl Storage {
         let mut rows = stmt.query([])?;
         let mut bookmarks = Vec::new();
         while let Some(row) = rows.next()? {
-            let signature_hash: Option<i64> = row.get(7)?;
             bookmarks.push(LegacyBookmarkRow {
                 id: row.get(0)?,
                 category_id: row.get(1)?,
@@ -11836,7 +11849,7 @@ impl Storage {
                 file_identity: row.get(4)?,
                 qualified_name: row.get(5)?,
                 kind: row.get(6)?,
-                normalized_signature: signature_hash.map(|hash| hash.to_string()),
+                normalized_signature: row.get(7)?,
                 start_line: row.get(8)?,
             });
         }
@@ -11889,36 +11902,54 @@ impl Storage {
         )
     }
 
-    /// Every anchor candidate carrying one normalized signature.
+    /// Anchor candidates carrying one qualified name and kind.
     ///
-    /// The lookup is selective on `callable_projection_state`, so a rename or
-    /// move probe never scans the workspace graph.
+    /// This is the move probe's keyed lookup: a moved symbol keeps its
+    /// qualified name and changes its file, so the anchor-tuple lookup misses
+    /// it and this one finds it. `idx_node_qualified_name` keeps it selective.
+    ///
+    /// A workspace-wide name lookup is unbounded by nature — thousands of types
+    /// declare a `new` — and every caller only asks whether the name names one
+    /// symbol or several, so the row set is capped at the two rows needed to
+    /// answer that.
+    pub fn annotation_anchors_by_qualified_name(
+        &self,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE n.qualified_name = ?1 AND n.kind = ?2
+                 ORDER BY n.id ASC
+                 LIMIT {ANNOTATION_UNIQUENESS_PROBE_LIMIT}"
+            ),
+            params![qualified_name, kind],
+        )
+    }
+
+    /// Anchor candidates carrying one normalized signature inside one file.
+    ///
+    /// The lookup is selective on
+    /// `idx_callable_projection_state_normalized_signature` and is always
+    /// scoped to a single file and kind, so a rename probe never scans the
+    /// workspace graph. Like the name probe it is capped at the two rows that
+    /// decide uniqueness.
     pub fn annotation_anchors_by_normalized_signature(
         &self,
         normalized_signature: &str,
-        file_identity: Option<&str>,
+        file_identity: &str,
+        kind: i64,
     ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
-        let Ok(signature_hash) = normalized_signature.parse::<i64>() else {
-            return Ok(Vec::new());
-        };
-        match file_identity {
-            Some(file_identity) => self.annotation_anchors(
-                &format!(
-                    "{ANNOTATION_ANCHOR_SELECT}
-                     WHERE cps.signature_hash = ?1 AND f.path = ?2
-                     ORDER BY n.id ASC"
-                ),
-                params![signature_hash, file_identity],
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE cps.normalized_signature = ?1 AND f.path = ?2 AND n.kind = ?3
+                 ORDER BY n.id ASC
+                 LIMIT {ANNOTATION_UNIQUENESS_PROBE_LIMIT}"
             ),
-            None => self.annotation_anchors(
-                &format!(
-                    "{ANNOTATION_ANCHOR_SELECT}
-                     WHERE cps.signature_hash = ?1
-                     ORDER BY n.id ASC"
-                ),
-                params![signature_hash],
-            ),
-        }
+            params![normalized_signature, file_identity, kind],
+        )
     }
 
     fn annotation_anchors(

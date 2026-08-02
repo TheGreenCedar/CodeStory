@@ -2973,6 +2973,7 @@ fn flush_projection_persistence_fixture(
         symbol_key: "a::run".to_string(),
         node_id: NodeId(2),
         signature_hash: 11,
+        normalized_signature: None,
         body_hash: 12,
         start_line: 2,
         end_line: 3,
@@ -4547,6 +4548,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::main:FUNCTION".to_string(),
         node_id: function_node.id,
         signature_hash: 101,
+        normalized_signature: None,
         body_hash: 202,
         start_line: 1,
         end_line: 1,
@@ -4642,6 +4644,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4651,6 +4654,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4666,6 +4670,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
         symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
         node_id: NodeId(101),
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 299,
         start_line: 12,
         end_line: 22,
@@ -4745,6 +4750,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4754,6 +4760,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4763,6 +4770,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/other.rs::keep:FUNCTION".to_string(),
             node_id: NodeId(201),
             signature_hash: 311,
+            normalized_signature: None,
             body_hash: 411,
             start_line: 1,
             end_line: 5,
@@ -4908,6 +4916,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: caller_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 3,
@@ -4917,6 +4926,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::keep:FUNCTION".to_string(),
             node_id: caller_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 10,
             end_line: 12,
@@ -8247,6 +8257,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::foo:FUNCTION".to_string(),
         node_id: func_node.id,
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 211,
         start_line: 1,
         end_line: 1,
@@ -8377,6 +8388,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::caller:FUNCTION".to_string(),
             node_id: caller_in_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 2,
@@ -8386,6 +8398,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::stale-callee:FUNCTION".to_string(),
             node_id: callee_in_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 3,
             end_line: 4,
@@ -9971,25 +9984,35 @@ fn seed_annotation_anchor(
     node_id: i64,
     path: &str,
     qualified_name: &str,
-    signature_hash: i64,
+    normalized_signature: &str,
 ) -> Result<(), StorageError> {
-    let file_node_id = node_id - 1;
-    storage.insert_file(&FileInfo {
-        id: file_node_id,
-        path: PathBuf::from(path),
-        language: "rust".to_string(),
-        modification_time: 1,
-        indexed: true,
-        complete: true,
-        line_count: 10,
-        file_role: FileRole::Source,
-    })?;
-    storage.insert_node(&Node {
-        id: NodeId(file_node_id),
-        kind: NodeKind::FILE,
-        serialized_name: path.to_string(),
-        ..Default::default()
-    })?;
+    let existing_file_node_id: Option<i64> = storage
+        .get_connection()
+        .query_row(
+            "SELECT id FROM file WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let file_node_id = existing_file_node_id.unwrap_or(node_id - 1);
+    if existing_file_node_id.is_none() {
+        storage.insert_file(&FileInfo {
+            id: file_node_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        })?;
+        storage.insert_node(&Node {
+            id: NodeId(file_node_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        })?;
+    }
     storage.insert_node(&Node {
         id: NodeId(node_id),
         kind: NodeKind::FUNCTION,
@@ -10004,7 +10027,10 @@ fn seed_annotation_anchor(
         file_id: file_node_id,
         symbol_key: qualified_name.to_string(),
         node_id: NodeId(node_id),
-        signature_hash,
+        // A change detector that deliberately disagrees with the normalized
+        // signature, so a lookup that reads the wrong column finds nothing.
+        signature_hash: 0x5a5a_5a5a,
+        normalized_signature: Some(normalized_signature.to_string()),
         body_hash: 1,
         start_line: 7,
         end_line: 9,
@@ -10046,7 +10072,7 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
 #[test]
 fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
-    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", 4242)?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
     let category_id = storage.create_bookmark_category("Favorites")?;
     let _ = storage.add_bookmark(category_id, NodeId(100), Some("keep"))?;
 
@@ -10061,7 +10087,11 @@ fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result
     assert_eq!(bookmark.file_identity.as_deref(), Some("/repo/src/lib.rs"));
     assert_eq!(bookmark.qualified_name.as_deref(), Some("alpha"));
     assert_eq!(bookmark.kind, Some(NodeKind::FUNCTION as i64));
-    assert_eq!(bookmark.normalized_signature.as_deref(), Some("4242"));
+    assert_eq!(
+        bookmark.normalized_signature.as_deref(),
+        Some("shape:4242"),
+        "the anchor must carry the normalized signature, not the change detector"
+    );
     assert_eq!(bookmark.comment.as_deref(), Some("keep"));
     assert!(storage.annotation_sidecar_cutover()?.is_some());
     Ok(())
@@ -10070,14 +10100,20 @@ fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result
 #[test]
 fn annotation_anchor_lookups_stay_selective_and_report_ambiguity() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
-    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", 4242)?;
-    seed_annotation_anchor(&mut storage, 200, "/repo/src/other.rs", "alpha", 4242)?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
+    seed_annotation_anchor(
+        &mut storage,
+        200,
+        "/repo/src/other.rs",
+        "alpha",
+        "shape:4242",
+    )?;
 
     let anchor = storage
         .annotation_anchor_for_node(NodeId(100))?
         .expect("anchor for node");
     assert_eq!(anchor.file_identity.as_deref(), Some("/repo/src/lib.rs"));
-    assert_eq!(anchor.normalized_signature.as_deref(), Some("4242"));
+    assert_eq!(anchor.normalized_signature.as_deref(), Some("shape:4242"));
 
     let unique = storage.annotation_anchors_by_anchor_tuple(
         "/repo/src/lib.rs",
@@ -10087,25 +10123,83 @@ fn annotation_anchor_lookups_stay_selective_and_report_ambiguity() -> Result<(),
     assert_eq!(unique.len(), 1);
     assert_eq!(unique[0].node_id, 100);
 
-    let scoped =
-        storage.annotation_anchors_by_normalized_signature("4242", Some("/repo/src/other.rs"))?;
-    assert_eq!(scoped.len(), 1);
+    let by_name =
+        storage.annotation_anchors_by_qualified_name("alpha", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![100, 200],
+        "the move probe must see the name in every file that carries it"
+    );
+
+    let scoped = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(
+        scoped.len(),
+        1,
+        "the signature probe is scoped to one file, so the other file's twin is invisible"
+    );
     assert_eq!(scoped[0].node_id, 200);
 
-    let ambiguous = storage.annotation_anchors_by_normalized_signature("4242", None)?;
+    seed_annotation_anchor(
+        &mut storage,
+        300,
+        "/repo/src/other.rs",
+        "twin",
+        "shape:4242",
+    )?;
+    let ambiguous = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
     assert_eq!(
         ambiguous
             .iter()
             .map(|anchor| anchor.node_id)
             .collect::<Vec<_>>(),
-        vec![100, 200],
-        "an ambiguous signature must surface every candidate rather than pick one"
+        vec![200, 300],
+        "an ambiguous signature must surface a second candidate rather than pick one"
     );
 
     assert!(
         storage
-            .annotation_anchors_by_normalized_signature("not-a-hash", None)?
+            .annotation_anchors_by_normalized_signature(
+                "shape:no-such-hash",
+                "/repo/src/lib.rs",
+                NodeKind::FUNCTION as i64,
+            )?
             .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn annotation_uniqueness_probes_never_read_more_rows_than_the_decision_needs()
+-> Result<(), StorageError> {
+    // A workspace-wide name probe is unbounded by nature. Every caller only
+    // asks "one, or more than one", so the read has to stop at two.
+    let mut storage = Storage::new_in_memory()?;
+    for index in 0..8 {
+        seed_annotation_anchor(
+            &mut storage,
+            100 + index * 10,
+            &format!("/repo/src/file{index}.rs"),
+            "new",
+            "shape:4242",
+        )?;
+    }
+
+    let by_name = storage.annotation_anchors_by_qualified_name("new", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name.len(),
+        2,
+        "a crowded name must not stream the whole workspace into the rebind ladder"
     );
     Ok(())
 }

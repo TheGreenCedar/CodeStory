@@ -1,6 +1,5 @@
 use super::resolution::{CoreAnchorCandidate, resolve_bookmark};
 use super::*;
-use std::collections::HashMap;
 use tempfile::TempDir;
 
 fn binding(root: &Path, token: &str) -> NativeRootBinding {
@@ -26,7 +25,7 @@ fn legacy_snapshot() -> LegacyAnnotationSnapshot {
             file_identity: Some("/repo/src/lib.rs".to_string()),
             qualified_name: Some("alpha".to_string()),
             kind: Some(3),
-            normalized_signature: Some("111".to_string()),
+            normalized_signature: Some("shape:111".to_string()),
             start_line: Some(10),
         }],
     }
@@ -129,12 +128,72 @@ fn core_import_is_journaled_idempotent_and_retains_a_backup() {
 }
 
 #[test]
-fn a_crash_before_the_import_commit_reimports_on_restart() {
+fn an_import_that_dies_part_way_through_leaves_no_journal_row_and_reimports() {
+    // The journal row and the imported rows have to reach disk together. If
+    // the journal commits first, a death before the rows land leaves a sidecar
+    // that says "already imported" and holds nothing, and every annotation the
+    // user ever made is gone while the legacy tables still hold them.
+    //
+    // Merely reopening a fresh sidecar cannot see that: it is indistinguishable
+    // from a brand-new one. So this kills the import *between* the two writes,
+    // with a trigger that aborts the first row insert, and then asserts the
+    // journal did not survive on its own.
     let dir = TempDir::new().expect("temp dir");
     let backup = dir.path().join("annotations.pre-migration.json");
     let path = dir.path().join("annotations.sqlite3");
-    // A crash before the single import transaction commits leaves the schema
-    // in place with neither journal row nor imported rows.
+    {
+        let mut store = open_store(&dir, "unix:1:1");
+        store
+            .conn
+            .execute(
+                "CREATE TRIGGER die_part_way_through BEFORE INSERT ON bookmark
+                 BEGIN SELECT RAISE(ABORT, 'simulated death during the import'); END",
+                [],
+            )
+            .expect("install the failure");
+
+        let error = store
+            .import_core_annotations(&legacy_snapshot(), &backup)
+            .expect_err("the import must fail");
+        assert!(
+            error.to_string().contains("simulated death"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !store.core_import_completed().expect("journal"),
+            "a journal row must not outlive the rows it claims were imported"
+        );
+        assert!(
+            store.bookmarks(None).expect("bookmarks").is_empty(),
+            "the failed import must leave nothing behind"
+        );
+    }
+
+    // Restart against untouched legacy tables: the import has to run again and
+    // restore every annotation.
+    let mut restarted = AnnotationStore::open_for_write(&path, &binding(dir.path(), "unix:1:1"))
+        .expect("restart sidecar");
+    restarted
+        .conn
+        .execute("DROP TRIGGER die_part_way_through", [])
+        .expect("clear the failure");
+    assert!(
+        restarted
+            .import_core_annotations(&legacy_snapshot(), &backup)
+            .expect("import after restart"),
+        "a restart must re-run an import that never committed"
+    );
+    let restored = restarted.bookmarks(None).expect("bookmarks");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].comment.as_deref(), Some("keep"));
+    assert_eq!(restarted.categories().expect("categories").len(), 1);
+}
+
+#[test]
+fn a_restart_before_any_import_still_imports() {
+    let dir = TempDir::new().expect("temp dir");
+    let backup = dir.path().join("annotations.pre-migration.json");
+    let path = dir.path().join("annotations.sqlite3");
     {
         let store = open_store(&dir, "unix:1:1");
         assert!(!store.core_import_completed().expect("journal"));
@@ -149,6 +208,30 @@ fn a_crash_before_the_import_commit_reimports_on_restart() {
             .expect("import after restart")
     );
     assert_eq!(restarted.bookmarks(None).expect("bookmarks").len(), 1);
+}
+
+#[test]
+fn an_imported_annotation_keeps_addressing_its_legacy_row_id() {
+    // A pre-cutover read hands out legacy row ids, and the write that follows
+    // is often the one that performs the cutover. The imported uuid is derived
+    // from the legacy id so that id still addresses the same annotation.
+    let dir = TempDir::new().expect("temp dir");
+    let backup = dir.path().join("annotations.pre-migration.json");
+    let mut store = open_store(&dir, "unix:1:1");
+    let snapshot = legacy_snapshot();
+    let legacy_id = snapshot.bookmarks[0].id;
+
+    assert!(
+        store
+            .import_core_annotations(&snapshot, &backup)
+            .expect("import")
+    );
+
+    let addressed = store
+        .bookmark(&legacy_bookmark_uuid(legacy_id))
+        .expect("lookup")
+        .expect("the legacy id still addresses the imported annotation");
+    assert_eq!(addressed.comment.as_deref(), Some("keep"));
 }
 
 #[test]
@@ -285,12 +368,31 @@ fn export_and_import_round_trip_preserves_annotations() {
     assert_eq!(target.categories().expect("categories").len(), 1);
 }
 
+/// One workspace's worth of anchor candidates.
+///
+/// The fake holds *symbols*, not per-lookup answer lists, and derives every
+/// lookup from them the way core does. Hand-keying each lookup separately made
+/// it possible to describe a workspace no indexer could ever produce — for
+/// instance one where a symbol answers a signature probe under a name it does
+/// not have — which is exactly how a dead rebind ladder passed its unit tests.
 #[derive(Default)]
 struct FakeCore {
     generation: Option<i64>,
-    by_canonical_id: HashMap<String, Vec<CoreAnchorCandidate>>,
-    by_tuple: HashMap<(String, String, i64), Vec<CoreAnchorCandidate>>,
-    by_signature: HashMap<(String, Option<String>), Vec<CoreAnchorCandidate>>,
+    symbols: Vec<CoreAnchorCandidate>,
+}
+
+impl FakeCore {
+    fn at_generation(generation: i64) -> Self {
+        Self {
+            generation: Some(generation),
+            symbols: Vec::new(),
+        }
+    }
+
+    fn with(mut self, candidate: CoreAnchorCandidate) -> Self {
+        self.symbols.push(candidate);
+        self
+    }
 }
 
 impl CoreAnchorIndex for FakeCore {
@@ -299,10 +401,11 @@ impl CoreAnchorIndex for FakeCore {
     }
 
     fn candidates_by_canonical_id(&self, canonical_id: &str) -> Vec<CoreAnchorCandidate> {
-        self.by_canonical_id
-            .get(canonical_id)
+        self.symbols
+            .iter()
+            .filter(|candidate| candidate.canonical_id.as_deref() == Some(canonical_id))
             .cloned()
-            .unwrap_or_default()
+            .collect()
     }
 
     fn candidates_by_anchor_tuple(
@@ -311,24 +414,47 @@ impl CoreAnchorIndex for FakeCore {
         qualified_name: &str,
         kind: i64,
     ) -> Vec<CoreAnchorCandidate> {
-        self.by_tuple
-            .get(&(file_identity.to_string(), qualified_name.to_string(), kind))
+        self.symbols
+            .iter()
+            .filter(|candidate| {
+                candidate.file_identity.as_deref() == Some(file_identity)
+                    && candidate.qualified_name.as_deref() == Some(qualified_name)
+                    && candidate.kind == Some(kind)
+            })
             .cloned()
-            .unwrap_or_default()
+            .collect()
+    }
+
+    fn candidates_by_qualified_name(
+        &self,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Vec<CoreAnchorCandidate> {
+        self.symbols
+            .iter()
+            .filter(|candidate| {
+                candidate.qualified_name.as_deref() == Some(qualified_name)
+                    && candidate.kind == Some(kind)
+            })
+            .cloned()
+            .collect()
     }
 
     fn candidates_by_normalized_signature(
         &self,
         normalized_signature: &str,
-        file_identity: Option<&str>,
+        file_identity: &str,
+        kind: i64,
     ) -> Vec<CoreAnchorCandidate> {
-        self.by_signature
-            .get(&(
-                normalized_signature.to_string(),
-                file_identity.map(str::to_string),
-            ))
+        self.symbols
+            .iter()
+            .filter(|candidate| {
+                candidate.normalized_signature.as_deref() == Some(normalized_signature)
+                    && candidate.file_identity.as_deref() == Some(file_identity)
+                    && candidate.kind == Some(kind)
+            })
             .cloned()
-            .unwrap_or_default()
+            .collect()
     }
 }
 
@@ -339,12 +465,53 @@ fn candidate(node_id: i64, file: &str, qualified_name: &str) -> CoreAnchorCandid
         file_identity: Some(file.to_string()),
         qualified_name: Some(qualified_name.to_string()),
         kind: Some(3),
-        normalized_signature: Some("111".to_string()),
+        normalized_signature: Some(ALPHA_SIGNATURE.to_string()),
         start_line: Some(40),
     }
 }
 
+fn candidate_with_signature(
+    node_id: i64,
+    file: &str,
+    qualified_name: &str,
+    signature: &str,
+) -> CoreAnchorCandidate {
+    CoreAnchorCandidate {
+        normalized_signature: Some(signature.to_string()),
+        ..candidate(node_id, file, qualified_name)
+    }
+}
+
+const ALPHA_SIGNATURE: &str = "shape:111";
+const OTHER_SIGNATURE: &str = "shape:222";
+/// A signature with no body evidence behind it: only a kind and a line count.
+const OUTLINE_SIGNATURE: &str = "outline:111";
+
+fn discriminating() -> AnchorDiscrimination {
+    AnchorDiscrimination {
+        signature_unique_in_file: true,
+        qualified_name_unique: true,
+    }
+}
+
 fn anchored_bookmark(store: &AnnotationStore, generation: Option<i64>) -> AnnotationBookmark {
+    anchored_bookmark_with(store, generation, Some(discriminating()), ALPHA_SIGNATURE)
+}
+
+fn anchored_bookmark_with_discrimination(
+    store: &AnnotationStore,
+    generation: Option<i64>,
+    discrimination: Option<AnchorDiscrimination>,
+) -> AnnotationBookmark {
+    anchored_bookmark_with(store, generation, discrimination, ALPHA_SIGNATURE)
+}
+
+fn anchored_bookmark_with(
+    store: &AnnotationStore,
+    generation: Option<i64>,
+    discrimination: Option<AnchorDiscrimination>,
+    signature: &str,
+) -> AnnotationBookmark {
     let name = format!(
         "Favorites-{}",
         store.categories().expect("categories").len()
@@ -358,7 +525,7 @@ fn anchored_bookmark(store: &AnnotationStore, generation: Option<i64>) -> Annota
                 file_identity: Some("/repo/src/lib.rs".to_string()),
                 qualified_name: Some("alpha".to_string()),
                 kind: Some(3),
-                normalized_signature: Some("111".to_string()),
+                normalized_signature: Some(signature.to_string()),
                 start_line: Some(10),
                 comment: None,
                 evidence: Some(BookmarkAnchorEvidence {
@@ -368,8 +535,9 @@ fn anchored_bookmark(store: &AnnotationStore, generation: Option<i64>) -> Annota
                     file_identity: Some("/repo/src/lib.rs".to_string()),
                     qualified_name: Some("alpha".to_string()),
                     kind: Some(3),
-                    normalized_signature: Some("111".to_string()),
+                    normalized_signature: Some(signature.to_string()),
                     start_line: Some(10),
+                    discrimination,
                 }),
             },
         )
@@ -381,14 +549,7 @@ fn a_position_shifting_edit_re_resolves_the_unchanged_anchor() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
     let bookmark = anchored_bookmark(&store, Some(4));
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
-    core.by_tuple.insert(
-        ("/repo/src/lib.rs".to_string(), "alpha".to_string(), 3),
-        vec![candidate(99, "/repo/src/lib.rs", "alpha")],
-    );
+    let core = FakeCore::at_generation(5).with(candidate(99, "/repo/src/lib.rs", "alpha"));
 
     let resolution = resolve_bookmark(&bookmark, &core);
 
@@ -397,21 +558,52 @@ fn a_position_shifting_edit_re_resolves_the_unchanged_anchor() {
 }
 
 #[test]
+fn a_bind_records_how_well_its_evidence_separated_the_symbol() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let bookmark = anchored_bookmark(&store, Some(4));
+    let crowded = FakeCore::at_generation(5)
+        .with(candidate(99, "/repo/src/lib.rs", "alpha"))
+        // A same-shaped sibling in the same file: the signature does not
+        // separate the annotated symbol from it.
+        .with(candidate(100, "/repo/src/lib.rs", "sibling"))
+        // The same name in another file: the name does not separate it either.
+        .with(candidate(101, "/repo/src/other.rs", "alpha"));
+
+    let AnnotationResolution::Bound { evidence, .. } = resolve_bookmark(&bookmark, &crowded) else {
+        panic!("the exact anchor tuple still binds");
+    };
+    assert_eq!(
+        evidence.discrimination,
+        Some(AnchorDiscrimination {
+            signature_unique_in_file: false,
+            qualified_name_unique: false,
+        })
+    );
+
+    let uncrowded = FakeCore::at_generation(5)
+        .with(candidate(99, "/repo/src/lib.rs", "alpha"))
+        .with(candidate_with_signature(
+            100,
+            "/repo/src/lib.rs",
+            "sibling",
+            OTHER_SIGNATURE,
+        ));
+    let AnnotationResolution::Bound { evidence, .. } = resolve_bookmark(&bookmark, &uncrowded)
+    else {
+        panic!("the exact anchor tuple still binds");
+    };
+    assert_eq!(evidence.discrimination, Some(discriminating()));
+}
+
+#[test]
 fn an_ambiguous_match_never_guesses() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
     let bookmark = anchored_bookmark(&store, Some(4));
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
-    core.by_tuple.insert(
-        ("/repo/src/lib.rs".to_string(), "alpha".to_string(), 3),
-        vec![
-            candidate(99, "/repo/src/lib.rs", "alpha"),
-            candidate(100, "/repo/src/lib.rs", "alpha"),
-        ],
-    );
+    let core = FakeCore::at_generation(5)
+        .with(candidate(99, "/repo/src/lib.rs", "alpha"))
+        .with(candidate(100, "/repo/src/lib.rs", "alpha"));
 
     let resolution = resolve_bookmark(&bookmark, &core);
 
@@ -426,14 +618,17 @@ fn an_ambiguous_match_never_guesses() {
 fn a_unique_rename_rebinds_only_with_adjacent_generation_evidence() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
-    core.by_signature.insert(
-        ("111".to_string(), Some("/repo/src/lib.rs".to_string())),
-        vec![candidate(99, "/repo/src/lib.rs", "renamed")],
-    );
+    // `alpha` is gone and a same-shaped symbol under a new name stands in the
+    // same file: that is a rename, and nothing else in the file shares the
+    // shape.
+    let core = FakeCore::at_generation(5)
+        .with(candidate(99, "/repo/src/lib.rs", "renamed"))
+        .with(candidate_with_signature(
+            100,
+            "/repo/src/lib.rs",
+            "bystander",
+            OTHER_SIGNATURE,
+        ));
 
     let adjacent = anchored_bookmark(&store, Some(4));
     let resolution = resolve_bookmark(&adjacent, &core);
@@ -449,30 +644,136 @@ fn a_unique_rename_rebinds_only_with_adjacent_generation_evidence() {
 }
 
 #[test]
+fn a_rename_is_never_inferred_from_evidence_that_already_matched_a_sibling() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    // The anchor's signature already matched a sibling when it was proven, so
+    // the sibling surviving the anchor's deletion is not a rename. Deleting
+    // `alpha` leaves exactly one same-shaped candidate, which is precisely the
+    // shape of a wrong rebind.
+    let bookmark = anchored_bookmark_with_discrimination(
+        &store,
+        Some(4),
+        Some(AnchorDiscrimination {
+            signature_unique_in_file: false,
+            qualified_name_unique: true,
+        }),
+    );
+    let core = FakeCore::at_generation(5).with(candidate(100, "/repo/src/lib.rs", "sibling"));
+
+    let resolution = resolve_bookmark(&bookmark, &core);
+
+    assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
+    assert_eq!(
+        resolution.orphan_reason(),
+        Some(OrphanReason::AmbiguousMatch),
+        "a surviving same-shaped sibling must never inherit the annotation"
+    );
+}
+
+#[test]
+fn a_rename_is_never_inferred_from_a_signature_with_no_body_behind_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    // A stub: kind and line count are all its signature has. Every other stub
+    // of the same length carries the same one, so it cannot say that the
+    // survivor in the file used to be the annotated symbol.
+    let bookmark =
+        anchored_bookmark_with(&store, Some(4), Some(discriminating()), OUTLINE_SIGNATURE);
+    let core = FakeCore::at_generation(5).with(candidate_with_signature(
+        99,
+        "/repo/src/lib.rs",
+        "some_other_stub",
+        OUTLINE_SIGNATURE,
+    ));
+
+    let resolution = resolve_bookmark(&bookmark, &core);
+
+    assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
+    assert_eq!(
+        resolution.orphan_reason(),
+        Some(OrphanReason::TargetDeleted),
+        "a signature with no body behind it must not identify a rename"
+    );
+}
+
+#[test]
+fn a_move_still_rebinds_from_a_signature_with_no_body_behind_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    // The move probe already knows which symbol it is looking at, because the
+    // qualified name identified it and was unique. The signature only has to
+    // agree, so a stub still moves.
+    let bookmark =
+        anchored_bookmark_with(&store, Some(4), Some(discriminating()), OUTLINE_SIGNATURE);
+    let core = FakeCore::at_generation(5).with(candidate_with_signature(
+        99,
+        "/repo/src/moved.rs",
+        "alpha",
+        OUTLINE_SIGNATURE,
+    ));
+
+    assert_eq!(resolve_bookmark(&bookmark, &core).node_id(), Some(99));
+}
+
+#[test]
 fn a_unique_move_rebinds_and_an_ambiguous_move_orphans() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
     let bookmark = anchored_bookmark(&store, Some(4));
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
-    core.by_signature.insert(
-        ("111".to_string(), None),
-        vec![candidate(99, "/repo/src/moved.rs", "alpha")],
-    );
-    assert_eq!(resolve_bookmark(&bookmark, &core).node_id(), Some(99));
+    let moved = FakeCore::at_generation(5).with(candidate(99, "/repo/src/moved.rs", "alpha"));
+    assert_eq!(resolve_bookmark(&bookmark, &moved).node_id(), Some(99));
 
-    core.by_signature.insert(
-        ("111".to_string(), None),
-        vec![
-            candidate(99, "/repo/src/moved.rs", "alpha"),
-            candidate(100, "/repo/src/other.rs", "alpha"),
-        ],
+    let ambiguous = FakeCore::at_generation(5)
+        .with(candidate(99, "/repo/src/moved.rs", "alpha"))
+        .with(candidate(100, "/repo/src/other.rs", "alpha"));
+    assert_eq!(
+        resolve_bookmark(&bookmark, &ambiguous).orphan_reason(),
+        Some(OrphanReason::AmbiguousMatch)
     );
+}
+
+#[test]
+fn a_moved_name_whose_shape_disagrees_is_a_visible_signature_changed_orphan() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let bookmark = anchored_bookmark(&store, Some(4));
+    // The name turns up in one other file, but the code there is not the code
+    // the user annotated. Sharing a name is not evidence of a move.
+    let core = FakeCore::at_generation(5).with(candidate_with_signature(
+        99,
+        "/repo/src/moved.rs",
+        "alpha",
+        OTHER_SIGNATURE,
+    ));
+
+    let resolution = resolve_bookmark(&bookmark, &core);
+
+    assert_eq!(resolution.status(), ResolutionStatus::Orphaned);
+    assert_eq!(
+        resolution.orphan_reason(),
+        Some(OrphanReason::SignatureChanged)
+    );
+}
+
+#[test]
+fn a_move_is_never_inferred_from_a_name_that_already_named_two_symbols() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let bookmark = anchored_bookmark_with_discrimination(
+        &store,
+        Some(4),
+        Some(AnchorDiscrimination {
+            signature_unique_in_file: true,
+            qualified_name_unique: false,
+        }),
+    );
+    let core = FakeCore::at_generation(5).with(candidate(99, "/repo/src/other.rs", "alpha"));
+
     assert_eq!(
         resolve_bookmark(&bookmark, &core).orphan_reason(),
-        Some(OrphanReason::AmbiguousMatch)
+        Some(OrphanReason::AmbiguousMatch),
+        "a name that was never unique cannot prove where its symbol went"
     );
 }
 
@@ -481,10 +782,7 @@ fn a_deleted_target_orphans_and_reappearance_rebinds() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
     let bookmark = anchored_bookmark(&store, Some(4));
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
+    let core = FakeCore::at_generation(5);
 
     let orphaned = resolve_bookmark(&bookmark, &core);
     assert_eq!(orphaned.orphan_reason(), Some(OrphanReason::TargetDeleted));
@@ -503,10 +801,7 @@ fn a_deleted_target_orphans_and_reappearance_rebinds() {
         "an orphan stays a visible, user-owned annotation with its anchor intact"
     );
 
-    core.by_tuple.insert(
-        ("/repo/src/lib.rs".to_string(), "alpha".to_string(), 3),
-        vec![candidate(99, "/repo/src/lib.rs", "alpha")],
-    );
+    let core = core.with(candidate(99, "/repo/src/lib.rs", "alpha"));
     let rebound = resolve_bookmark(&stored, &core);
     assert_eq!(rebound.node_id(), Some(99));
     store
@@ -538,18 +833,12 @@ fn a_canonical_id_resolves_before_the_anchor_tuple() {
             },
         )
         .expect("create bookmark");
-    let mut core = FakeCore {
-        generation: Some(5),
-        ..FakeCore::default()
-    };
-    core.by_canonical_id.insert(
-        "route_endpoint:GET:/users".to_string(),
-        vec![candidate(11, "/repo/src/routes.rs", "users_handler")],
-    );
-    core.by_tuple.insert(
-        ("/repo/src/lib.rs".to_string(), "alpha".to_string(), 3),
-        vec![candidate(99, "/repo/src/lib.rs", "alpha")],
-    );
+    let core = FakeCore::at_generation(5)
+        .with(CoreAnchorCandidate {
+            canonical_id: Some("route_endpoint:GET:/users".to_string()),
+            ..candidate(11, "/repo/src/routes.rs", "users_handler")
+        })
+        .with(candidate(99, "/repo/src/lib.rs", "alpha"));
 
     assert_eq!(resolve_bookmark(&bookmark, &core).node_id(), Some(11));
 }

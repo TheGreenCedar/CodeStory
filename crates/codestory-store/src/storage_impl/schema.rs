@@ -277,6 +277,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         symbol_key TEXT NOT NULL,
         node_id INTEGER NOT NULL,
         signature_hash INTEGER NOT NULL,
+        normalized_signature TEXT,
         body_hash INTEGER NOT NULL,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
@@ -443,6 +444,9 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_search_symbol_projection_display_name
      ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
+    // Keeps the annotation rename probe a keyed lookup instead of a graph scan.
+    "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_normalized_signature
+        ON callable_projection_state(normalized_signature)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
@@ -1254,6 +1258,17 @@ pub(super) fn migrate_v30_semantic_projection_publication_mode(
 pub(super) fn migrate_v31_annotation_sidecar_cutover(
     conn: &Connection,
 ) -> Result<(), StorageError> {
+    // Annotation rebinding needs evidence that survives a rename and a move,
+    // which `signature_hash` cannot supply: it is a change detector that binds
+    // the symbol's own name and its exact start position. The column is left
+    // NULL on an upgraded database until the next indexing run recomputes it,
+    // and a NULL never satisfies a rebind probe, so an un-recomputed row is
+    // conservatively unrebindable rather than wrongly rebindable.
+    try_add_column(
+        conn,
+        "callable_projection_state",
+        "normalized_signature TEXT",
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS annotation_sidecar_cutover (
             id INTEGER PRIMARY KEY CHECK(id = 1),

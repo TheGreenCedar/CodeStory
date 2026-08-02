@@ -86,9 +86,9 @@ use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
 use crate::snippets::bounded_markdown_snippet_from_path;
 use codestory_contracts::api::{
-    ArtifactCachePolicyDto, BookmarkResolutionStatusDto, CorePromotionTimings,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, IndexMode, IndexedFilesRequest,
-    ListRootSymbolsRequest, OpenProjectRequest, StartIndexingRequest,
+    ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
+    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest, IndexMode,
+    IndexedFilesRequest, ListRootSymbolsRequest, OpenProjectRequest, StartIndexingRequest,
     UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
@@ -9448,6 +9448,47 @@ impl AnnotationProject {
             .expect("reopen annotation project");
     }
 
+    /// Drive the sibling asynchronous entry point rather than the blocking one.
+    fn index_async(&self) {
+        let events = self.controller.events();
+        self.controller
+            .start_indexing(StartIndexingRequest {
+                mode: IndexMode::Full,
+            })
+            .expect("start asynchronous full refresh");
+        loop {
+            match events
+                .recv_timeout(Duration::from_secs(120))
+                .expect("asynchronous indexing terminal event")
+            {
+                AppEventPayload::IndexingComplete { .. } => break,
+                AppEventPayload::IndexingFailed { error } => {
+                    panic!("asynchronous full refresh failed: {error}")
+                }
+                _ => {}
+            }
+        }
+        self.controller
+            .open_project_summary_with_storage_path(self.root.clone(), self.storage_path.clone())
+            .expect("reopen annotation project");
+    }
+
+    fn write(&self, relative: &str, source: &str) {
+        fs::write(self.root.join(relative), source).expect("write source");
+    }
+
+    /// Seed the retained core tables the way a pre-cutover release would have.
+    fn seed_legacy_bookmark(&self, symbol: &str, comment: &str) -> i64 {
+        let node_id = self.node_id_for(symbol).to_core().expect("core node id");
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some(comment))
+            .expect("legacy bookmark")
+    }
+
     fn sidecar_path(&self) -> PathBuf {
         codestory_contracts::owned_artifacts::annotations_sidecar_path(&self.storage_path)
     }
@@ -9855,5 +9896,287 @@ fn a_foreign_native_root_fails_closed_and_requires_export_import() {
     assert_ne!(
         imported[0].id, bookmark.id,
         "an import creates new annotation identities rather than replacing them"
+    );
+}
+
+/// Two callables whose shapes differ, so the annotated one has a normalized
+/// signature that separates it from its neighbours. `alpha` calls `helper`;
+/// `gamma` calls nothing.
+const RENAMEABLE_SOURCE: &str = "pub fn alpha(value: i32) -> i32 {\n    helper(value) + 1\n}\n\npub fn helper(value: i32) -> i32 {\n    value * 2\n}\n\npub fn gamma() -> i32 {\n    7\n}\n";
+
+#[test]
+fn a_unique_rename_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(RENAMEABLE_SOURCE);
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    assert_eq!(
+        bookmark.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+
+    // The symbol keeps its file and its code and takes a new name. Nothing
+    // about the old anchor tuple still matches, so only real normalized
+    // signature evidence can carry the annotation across.
+    project.write(
+        "lib.rs",
+        &RENAMEABLE_SOURCE.replace("pub fn alpha(", "pub fn renamed_alpha("),
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after rename");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique rename must rebind rather than orphan"
+    );
+    assert_eq!(
+        after[0].node_label, "renamed_alpha",
+        "the annotation must follow the symbol to its new name"
+    );
+    assert_eq!(after[0].comment.as_deref(), Some("keep"));
+}
+
+#[test]
+fn a_unique_move_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // The symbol keeps its name and its code and lands in another file, at a
+    // different line. Position and file both changed.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "// a new leading comment\npub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after move");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique move must rebind rather than orphan"
+    );
+    assert!(
+        after[0]
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("moved.rs")),
+        "the annotation must follow the symbol to its new file: {:?}",
+        after[0].file_path
+    );
+}
+
+#[test]
+fn a_moved_name_whose_code_changed_is_a_visible_signature_changed_orphan() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    project.bookmark("alpha");
+
+    // The name turns up in another file, but the code there is not the code
+    // the user annotated. Sharing a name is not evidence of a move.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "pub fn alpha(value: i32) -> i32 {\n    let doubled = gamma() + value;\n    doubled * 9\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the name reappeared elsewhere");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned
+    );
+    assert_eq!(
+        after[0].orphan_reason,
+        Some(BookmarkOrphanReasonDto::SignatureChanged),
+        "a disagreeing shape must be reported as such, not silently rebound"
+    );
+}
+
+#[test]
+fn a_deleted_symbol_never_hands_its_annotation_to_a_same_shaped_sibling() {
+    // `alpha` and `gamma` have the same normalized signature, which is exactly
+    // what a shape hash is allowed to do. Deleting `alpha` leaves `gamma` as
+    // the sole same-shaped candidate in the file, so a rename probe that only
+    // asked "is there exactly one" would hand the annotation to `gamma`.
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    project.write(
+        "lib.rs",
+        "pub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after deletion");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned,
+        "a surviving same-shaped sibling must never inherit the annotation"
+    );
+    assert_ne!(after[0].node_label, "gamma");
+}
+
+#[test]
+fn a_partially_completed_cutover_still_reports_every_annotation() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("pre-cutover read")
+            .len(),
+        1
+    );
+
+    // The cutover creates and binds the sidecar first and imports afterwards.
+    // Anything that fails in between — a backup write onto a full disk, an
+    // unreadable core, a process kill — leaves exactly this state: a schema'd,
+    // bound, empty sidecar sitting on top of intact legacy rows.
+    {
+        let root = project.root.clone();
+        let token = codestory_workspace::workspace_path_identity_token(&root)
+            .expect("observe the native root");
+        let partial = codestory_store::AnnotationStore::open_for_write(
+            &project.sidecar_path(),
+            &codestory_store::NativeRootBinding::new(token, root),
+        )
+        .expect("create the sidecar without importing");
+        assert!(
+            !partial.core_import_completed().expect("journal"),
+            "the import must not have completed"
+        );
+    }
+    assert!(project.sidecar_path().is_file());
+
+    let during = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read during a partial cutover");
+    assert_eq!(
+        during.len(),
+        1,
+        "an unfinished cutover must not hide annotations that core still owns"
+    );
+    assert_eq!(during[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories during a partial cutover")
+            .len(),
+        1
+    );
+
+    // Finishing the cutover moves the same annotation across exactly once.
+    project
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Favorites".to_string(),
+        })
+        .expect("finish the cutover");
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the cutover finished");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].comment.as_deref(), Some("legacy note"));
+}
+
+#[test]
+fn the_asynchronous_refresh_entry_point_also_rescues_legacy_annotations() {
+    // `start_indexing` is public on the controller and re-exported on both
+    // index-service facades. It publishes a from-scratch database, so it has
+    // to move annotations out of core first, exactly like its blocking
+    // sibling.
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert!(!project.sidecar_path().exists());
+
+    project.index_async();
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the asynchronous full refresh");
+    assert_eq!(
+        surviving.len(),
+        1,
+        "an asynchronous full refresh must not be able to destroy user annotations"
+    );
+    assert_eq!(surviving[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        surviving[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+}
+
+#[test]
+fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+
+    // The id a caller holds is the one the last read handed it, and that read
+    // happened before any write triggered the cutover.
+    let listed = project
+        .controller
+        .list_bookmarks(None)
+        .expect("pre-cutover read");
+    assert_eq!(listed.len(), 1);
+    let id = listed[0].id.clone();
+
+    let updated = project
+        .controller
+        .update_bookmark(
+            &id,
+            UpdateBookmarkRequest {
+                category_id: None,
+                comment: Some(Some("edited".to_string())),
+            },
+        )
+        .expect("the id the API just returned must stay usable");
+    assert_eq!(updated.comment.as_deref(), Some("edited"));
+
+    project
+        .controller
+        .delete_bookmark(&id)
+        .expect("the id the API just returned must stay usable");
+    assert!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("read after delete")
+            .is_empty()
     );
 }

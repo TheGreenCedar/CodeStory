@@ -369,8 +369,9 @@ impl AppController {
         std::thread::spawn(move || {
             let indexing_started = std::time::Instant::now();
             let result = match IndexWriterGuard::try_acquire(&storage_path) {
-                Ok(_writer_guard) => {
-                    let result = match req.mode {
+                Ok(_writer_guard) => controller
+                    .ensure_annotations_owned_before_core_replacement()
+                    .and_then(|annotations_owned| match req.mode {
                         IndexMode::Full => index_full_for_runtime(
                             &root,
                             &storage_path,
@@ -378,6 +379,7 @@ impl AppController {
                             None,
                             &controller.runtime_config,
                             &controller.source_index_policy,
+                            &annotations_owned,
                         ),
                         IndexMode::Incremental => index_incremental_for_runtime(
                             &root,
@@ -386,12 +388,12 @@ impl AppController {
                             None,
                             &controller.runtime_config,
                             &controller.source_index_policy,
+                            &annotations_owned,
                         ),
-                    };
-                    result.and_then(|summary| {
-                        controller.finish_successful_indexing(summary, &storage_path, true, None)
                     })
-                }
+                    .and_then(|summary| {
+                        controller.finish_successful_indexing(summary, &storage_path, true, None)
+                    }),
                 Err(error) => Err(error),
             };
 
@@ -458,10 +460,13 @@ impl AppController {
         // A refresh can install a database that never carried the legacy
         // annotation tables, so annotations move to the sidecar before the run
         // starts rather than after it publishes.
-        if let Err(error) = self.ensure_annotations_owned_before_core_replacement() {
-            self.state.lock().is_indexing = false;
-            return Err(error);
-        }
+        let annotations_owned = match self.ensure_annotations_owned_before_core_replacement() {
+            Ok(annotations_owned) => annotations_owned,
+            Err(error) => {
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
+        };
 
         let result = match mode {
             IndexMode::Full => index_full_for_runtime(
@@ -471,6 +476,7 @@ impl AppController {
                 cancel_token,
                 &self.runtime_config,
                 &self.source_index_policy,
+                &annotations_owned,
             ),
             IndexMode::Incremental => index_incremental_for_runtime(
                 &root,
@@ -479,6 +485,7 @@ impl AppController {
                 cancel_token,
                 &self.runtime_config,
                 &self.source_index_policy,
+                &annotations_owned,
             ),
         };
 
