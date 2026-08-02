@@ -1,5 +1,4 @@
-//! Proof-owned cleanup for cache-root state no live workspace or running
-//! executable can still claim.
+//! Proof-owned cleanup for cache-root state no live workspace can still claim.
 //!
 //! Generation retention already reclaims superseded generations inside one
 //! project's sidecar tree. Two things sit outside it and were never reclaimed:
@@ -9,10 +8,24 @@
 //!
 //! Both are removed only against positive proof, never against a heuristic.
 //! A project cache is removable only when a schema-2 retention marker
-//! registered a project root that is now provably gone; a model tree is
+//! registered a project root that is now provably gone *and* the directory was
+//! read end to end without finding one authored annotation; a model tree is
 //! removable only when its digest differs from the digest compiled into this
-//! binary. Everything else is reported as retained with a typed reason, so the
-//! plan reads as an audit rather than as a list of guesses.
+//! binary and no peer holds its materialization lock. Everything else is
+//! reported as retained with a typed reason, so the plan reads as an audit
+//! rather than as a list of guesses.
+//!
+//! Two proof limits are deliberate and named rather than implied:
+//!
+//! - A model tree proves "not the revision this executable was built with" and
+//!   "not being materialized right now". It does not prove that no separately
+//!   installed CodeStory executable is running with that revision mapped.
+//!   Reclamation is still safe on POSIX, where unlinking an open file leaves
+//!   the mapping intact, and fails loudly on Windows, where the open handle
+//!   refuses the delete; a peer never observes a truncated model.
+//! - Absence of authored annotations must be *read*, never inferred from a
+//!   missing file. Anything this reader cannot open, parse, or enumerate
+//!   leaves the cache in place.
 
 use crate::config::{SidecarRuntimeConfig, user_cache_root};
 use crate::retention::{
@@ -20,11 +33,17 @@ use crate::retention::{
     classify_retention_entry, directory_size, global_generation_gc_state_file, read_marker_path,
     retention_dir,
 };
-use anyhow::{Context, Result};
-use codestory_contracts::owned_artifacts::{ANNOTATIONS_SIDECAR_FILE, embedded_model_digest_root};
+use anyhow::{Context, Result, anyhow};
+use codestory_contracts::bounded_locks::{self, FileLockKind};
+use codestory_contracts::owned_artifacts::{
+    ANNOTATIONS_SIDECAR_FILE, EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE, ROLLBACK_BACKUP_EXTENSION,
+    SQLITE_SIDECAR_SUFFIXES, embedded_model_digest_root,
+};
+use codestory_store::Store;
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Wire version of the plan and report documents.
@@ -63,10 +82,17 @@ pub enum CacheCleanRefusal {
     CurrentModelDigest,
     /// Inside a CodeStory-owned tree but not a shape this planner recognizes.
     UnrecognizedEntry,
-    /// A proven-abandoned cache still holds the annotations sidecar. Its
-    /// contents are authored, not derived, so a lost workspace cannot
-    /// regenerate them and cleanup will not take them.
+    /// A proven-abandoned cache holds authored annotations, in the versioned
+    /// sidecar or in the core store's own `bookmark_category` /
+    /// `bookmark_node` tables. Their contents are authored, not derived, so a
+    /// lost workspace cannot regenerate them and cleanup will not take them.
     AnnotationsPresent,
+    /// A proven-abandoned cache could not be *read* well enough to prove it
+    /// holds no authored annotation. Absence is never inferred from a missing
+    /// file, so an unreadable or unopenable cache is refused.
+    AnnotationsUnproven,
+    /// A model tree whose materialization lock a peer currently holds.
+    ModelTreeInUse,
     /// The entry could not be measured or inspected safely.
     UnsafeEntry,
 }
@@ -80,6 +106,8 @@ impl CacheCleanRefusal {
             Self::CurrentModelDigest => "current_model_digest",
             Self::UnrecognizedEntry => "unrecognized_entry",
             Self::AnnotationsPresent => "annotations_present",
+            Self::AnnotationsUnproven => "annotations_unproven",
+            Self::ModelTreeInUse => "model_tree_in_use",
             Self::UnsafeEntry => "unsafe_entry",
         }
     }
@@ -396,14 +424,26 @@ fn plan_project_caches(
 
         // Authored annotations are the one artifact in a cache directory that
         // a vanished workspace cannot reproduce, so proven abandonment is not
-        // enough to take them.
-        if path.join(ANNOTATIONS_SIDECAR_FILE).exists() {
-            retained.push(CacheCleanRetained {
-                relative_path: name,
-                reason: CacheCleanRefusal::AnnotationsPresent,
-                detail: "abandoned cache still holds authored annotations".into(),
-            });
-            continue;
+        // enough to take them. Presence is read out of the directory, never
+        // inferred from one file name, and anything unreadable refuses.
+        match observe_authored_annotations(&path) {
+            AnnotationEvidence::ProvenAbsent => {}
+            AnnotationEvidence::Present(detail) => {
+                retained.push(CacheCleanRetained {
+                    relative_path: name,
+                    reason: CacheCleanRefusal::AnnotationsPresent,
+                    detail,
+                });
+                continue;
+            }
+            AnnotationEvidence::Unproven(detail) => {
+                retained.push(CacheCleanRetained {
+                    relative_path: name,
+                    reason: CacheCleanRefusal::AnnotationsUnproven,
+                    detail,
+                });
+                continue;
+            }
         }
 
         match directory_size(&path) {
@@ -425,6 +465,247 @@ fn plan_project_caches(
                 });
             }
         }
+    }
+}
+
+/// What one cache directory proves about authored annotations.
+///
+/// Annotations live in two places at once during the sidecar cutover: the
+/// versioned annotations sidecar, and the core store's own `bookmark_category`
+/// and `bookmark_node` tables for every cache that has not cut over yet. The
+/// cutover is lazy -- it happens on an annotation write or a core-replacing
+/// operation -- and an abandoned worktree is by definition never re-opened, so
+/// its cache is the one population that can *never* have cut over. Testing for
+/// the sidecar file therefore proves nothing about exactly the caches this
+/// planner is allowed to delete.
+#[derive(Debug)]
+enum AnnotationEvidence {
+    /// Every annotation-bearing artifact under the directory was read and
+    /// holds no authored row.
+    ProvenAbsent,
+    /// Authored annotations exist here.
+    Present(String),
+    /// Absence could not be proven, so the cache stays.
+    Unproven(String),
+}
+
+/// Read one cache directory end to end for authored annotations.
+///
+/// Observation only: stores are opened through the non-mutating observer, so
+/// planning cannot migrate, recover, or create a sidecar in a cache this
+/// process does not own.
+fn observe_authored_annotations(cache_dir: &Path) -> AnnotationEvidence {
+    let mut unproven = None;
+    if let Some(present) = scan_annotation_evidence(cache_dir, &mut unproven) {
+        return AnnotationEvidence::Present(present);
+    }
+    match unproven {
+        Some(detail) => AnnotationEvidence::Unproven(detail),
+        None => AnnotationEvidence::ProvenAbsent,
+    }
+}
+
+/// Walk one directory, returning `Some(detail)` as soon as authored
+/// annotations are found.
+///
+/// Every entry this reader cannot interpret is recorded in `unproven` instead
+/// of being skipped, so a directory it could not fully read never reads as
+/// empty. The walk is the same shape the byte measurement already performs, so
+/// it costs one extra pass over metadata the planner reads anyway.
+fn scan_annotation_evidence(dir: &Path, unproven: &mut Option<String>) -> Option<String> {
+    let mut paths = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => paths.push(entry.path()),
+                    Err(error) => record_unproven(
+                        unproven,
+                        format!("read entry under {}: {error}", dir.display()),
+                    ),
+                }
+            }
+        }
+        Err(error) => {
+            record_unproven(
+                unproven,
+                format!("read directory {}: {error}", dir.display()),
+            );
+            return None;
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_unproven(unproven, format!("inspect {}: {error}", path.display()));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            record_unproven(
+                unproven,
+                format!("cache holds a linked entry {}", path.display()),
+            );
+            continue;
+        }
+        if metadata.is_dir() {
+            if let Some(found) = scan_annotation_evidence(&path, unproven) {
+                return Some(found);
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            record_unproven(
+                unproven,
+                format!("cache holds an unsupported entry {}", path.display()),
+            );
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            record_unproven(
+                unproven,
+                format!("cache holds an unreadable entry name in {}", dir.display()),
+            );
+            continue;
+        };
+        if is_annotations_sidecar_name(name) {
+            // This binary does not own the sidecar schema, so its rows cannot
+            // be counted here. Refusing on presence is the fail-closed
+            // direction: it can only keep a cache, never take one.
+            return Some(format!(
+                "the authored annotations sidecar {} is present",
+                path.display()
+            ));
+        }
+        if let Some(main) = orphaned_sqlite_sidecar_owner(&path, name) {
+            record_unproven(
+                unproven,
+                format!(
+                    "{} is a SQLite sidecar whose database {} is missing",
+                    path.display(),
+                    main.display()
+                ),
+            );
+            continue;
+        }
+        if !is_core_store_name(name) {
+            continue;
+        }
+        match observe_legacy_annotation_rows(&path) {
+            Ok(0) => {}
+            Ok(rows) => {
+                return Some(format!(
+                    "{} holds {rows} authored annotation rows in the core bookmark tables",
+                    path.display()
+                ));
+            }
+            Err(error) => record_unproven(
+                unproven,
+                format!(
+                    "core store {} could not be read for authored annotations: {error:#}",
+                    path.display()
+                ),
+            ),
+        }
+    }
+    None
+}
+
+/// Keep the first reason absence could not be proven. One is enough to refuse,
+/// and the first entry in a sorted walk is stable across platforms.
+fn record_unproven(slot: &mut Option<String>, detail: String) {
+    if slot.is_none() {
+        *slot = Some(detail);
+    }
+}
+
+/// Count the authored rows in the core store's legacy annotation tables.
+fn observe_legacy_annotation_rows(path: &Path) -> Result<u64> {
+    let store = Store::open_observational(path)
+        .map_err(|error| anyhow!("open observationally: {error}"))?;
+    let categories = store
+        .get_bookmark_categories()
+        .map_err(|error| anyhow!("read bookmark categories: {error}"))?;
+    let bookmarks = store
+        .get_bookmarks(None)
+        .map_err(|error| anyhow!("read bookmarks: {error}"))?;
+    Ok(categories.len() as u64 + bookmarks.len() as u64)
+}
+
+fn is_annotations_sidecar_name(name: &str) -> bool {
+    name == ANNOTATIONS_SIDECAR_FILE
+        || SQLITE_SIDECAR_SUFFIXES
+            .iter()
+            .any(|suffix| name.strip_suffix(suffix) == Some(ANNOTATIONS_SIDECAR_FILE))
+}
+
+/// The database a `-wal`, `-shm`, or `-journal` file belongs to, when that
+/// database is not present. Orphaned sidecars are evidence this reader cannot
+/// interpret rather than derived bytes it may drop.
+fn orphaned_sqlite_sidecar_owner(path: &Path, name: &str) -> Option<PathBuf> {
+    let base = SQLITE_SIDECAR_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    let main = path.with_file_name(base);
+    (!main.is_file()).then_some(main)
+}
+
+/// Whether one file name in a cache directory can carry the core schema, and
+/// with it the legacy `bookmark_category` and `bookmark_node` tables. The
+/// rollback backup counts: it is a whole core database, and deleting the
+/// directory takes it too.
+fn is_core_store_name(name: &str) -> bool {
+    if name.ends_with(&format!(".{ROLLBACK_BACKUP_EXTENSION}")) {
+        return true;
+    }
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| CORE_STORE_EXTENSIONS.contains(&extension))
+}
+
+/// Extensions a core SQLite database is written with anywhere in the cache
+/// root: the live store, staged snapshots, and rehydration copies.
+const CORE_STORE_EXTENSIONS: [&str; 3] = ["db", "sqlite", "sqlite3"];
+
+/// Whether a peer currently holds one model tree's materialization lock.
+enum ModelTreeLock {
+    Free,
+    Held,
+    Unobservable(String),
+}
+
+/// Observe the materialization lock beside one model tree without creating it.
+///
+/// A dry-run plan must not be the reason the lock file first exists, so the
+/// file is opened read-only and a missing file reads as "no holder".
+fn observe_model_tree_lock(directory: &Path) -> ModelTreeLock {
+    let lock_path = directory.join(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE);
+    let file = match File::open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ModelTreeLock::Free,
+        Err(error) => {
+            return ModelTreeLock::Unobservable(format!(
+                "open materialization lock {}: {error}",
+                lock_path.display()
+            ));
+        }
+    };
+    match bounded_locks::try_acquire(&file, FileLockKind::Shared) {
+        Ok(true) => match bounded_locks::release(&file) {
+            Ok(()) => ModelTreeLock::Free,
+            Err(error) => ModelTreeLock::Unobservable(format!(
+                "release materialization lock {}: {error}",
+                lock_path.display()
+            )),
+        },
+        Ok(false) => ModelTreeLock::Held,
+        Err(error) => ModelTreeLock::Unobservable(format!(
+            "observe materialization lock {}: {error}",
+            lock_path.display()
+        )),
     }
 }
 
@@ -507,12 +788,33 @@ fn plan_model_digests(
             });
             continue;
         }
+        match observe_model_tree_lock(&path) {
+            ModelTreeLock::Free => {}
+            ModelTreeLock::Held => {
+                retained.push(CacheCleanRetained {
+                    relative_path: relative,
+                    reason: CacheCleanRefusal::ModelTreeInUse,
+                    detail: "a peer holds this model tree's materialization lock".into(),
+                });
+                continue;
+            }
+            ModelTreeLock::Unobservable(detail) => {
+                retained.push(CacheCleanRetained {
+                    relative_path: relative,
+                    reason: CacheCleanRefusal::UnsafeEntry,
+                    detail,
+                });
+                continue;
+            }
+        }
         match directory_size(&path) {
             Ok(bytes) => candidates.push(CacheCleanCandidate {
                 kind: CacheCleanKind::SupersededModelDigest,
                 relative_path: relative,
                 bytes,
-                proof: format!("digest differs from the compiled model digest {current}"),
+                proof: format!(
+                    "digest differs from the compiled model digest {current} and no peer holds its materialization lock"
+                ),
             }),
             Err(error) => {
                 errors.push(format!(
@@ -546,6 +848,7 @@ mod tests {
     use super::*;
     use crate::config::{SidecarLayout, with_test_cache_root};
     use crate::retention::{GenerationRetentionMarker, write_retention_marker};
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::RetrievalIndexManifest;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -613,7 +916,47 @@ mod tests {
         local_state_file(cache_root)
     }
 
-    /// A per-project cache with a byte of content, registered to `worktree`.
+    /// A real, current-schema core store holding no authored annotation. The
+    /// planner reads this database, so a stand-in byte blob would prove
+    /// nothing about the guard under test.
+    fn write_derived_core_store(path: &Path) {
+        let store = Store::open(path).expect("create core store");
+        drop(store);
+        assert_eq!(
+            observe_legacy_annotation_rows(path).expect("observe a freshly created core store"),
+            0
+        );
+    }
+
+    /// The same core store with a user-authored bookmark in it: a category and
+    /// a bookmark on a node, in `bookmark_category` and `bookmark_node`.
+    fn author_bookmark_in_core_store(path: &Path) {
+        let store = Store::open(path).expect("open core store");
+        store
+            .insert_node(&Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "n:auth.rs:login".into(),
+                qualified_name: Some("auth::login".into()),
+                canonical_id: Some("auth::login".into()),
+                file_node_id: None,
+                start_line: Some(1),
+                start_col: Some(0),
+                end_line: Some(9),
+                end_col: Some(1),
+            })
+            .expect("insert bookmarked node");
+        let category = store
+            .create_bookmark_category("Onboarding")
+            .expect("authored bookmark category");
+        store
+            .add_bookmark(category, NodeId(1), Some("start here"))
+            .expect("authored bookmark");
+        drop(store);
+    }
+
+    /// A per-project cache holding a real core store, registered to
+    /// `worktree`.
     fn register_project_cache(
         cache_root: &Path,
         workspace_id: &str,
@@ -622,7 +965,7 @@ mod tests {
     ) {
         let dir = cache_root.join(workspace_id);
         std::fs::create_dir_all(&dir).expect("project cache dir");
-        std::fs::write(dir.join("codestory.db"), vec![b'x'; 16]).expect("project cache store");
+        write_derived_core_store(&dir.join("codestory.db"));
         let marker = GenerationRetentionMarker::next(
             workspace_id,
             worktree,
@@ -838,6 +1181,186 @@ mod tests {
                 .map(|removal| removal.relative_path.as_str())
                 .collect::<Vec<_>>(),
             vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+        );
+    }
+
+    /// The regression this guard exists for. Bookmarks are authored in the
+    /// core store's own `bookmark_category` and `bookmark_node` tables, and
+    /// the annotations sidecar only appears once a cache cuts over. An
+    /// abandoned worktree is never re-opened, so it can never cut over: its
+    /// cache is exactly the population where the sidecar file is guaranteed
+    /// absent while authored bookmarks are present. Testing for the file
+    /// deleted them.
+    #[test]
+    fn a_retired_cache_with_authored_bookmarks_in_core_legacy_tables_is_not_removed() {
+        let fixture = fixture();
+        let cache_root = fixture.cache.path().to_path_buf();
+        let dead_cache = cache_root.join(&fixture.dead_workspace);
+        author_bookmark_in_core_store(&dead_cache.join("codestory.db"));
+        assert!(
+            !dead_cache.join(ANNOTATIONS_SIDECAR_FILE).exists(),
+            "the population under test is precisely the one with no sidecar"
+        );
+
+        let report = with_test_cache_root(&cache_root, || {
+            apply_cache_clean().expect("cache clean apply")
+        });
+
+        assert!(
+            dead_cache.join("codestory.db").is_file(),
+            "cleanup must never take a cache holding authored bookmarks"
+        );
+        let surviving = Store::open_observational(dead_cache.join("codestory.db"))
+            .expect("re-observe the surviving core store");
+        assert_eq!(
+            surviving
+                .get_bookmark_categories()
+                .expect("surviving categories")
+                .len(),
+            1
+        );
+        assert_eq!(
+            surviving.get_bookmarks(None).expect("surviving bookmarks")[0]
+                .comment
+                .as_deref(),
+            Some("start here")
+        );
+        assert_eq!(
+            retained_reason(&report.plan, &fixture.dead_workspace),
+            Some(CacheCleanRefusal::AnnotationsPresent)
+        );
+        assert_eq!(
+            report
+                .removals
+                .iter()
+                .map(|removal| removal.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+        );
+    }
+
+    /// Absence of authored annotations must be read, never inferred. A core
+    /// store this binary cannot open proves nothing, so the cache stays.
+    #[test]
+    fn a_retired_cache_whose_core_store_cannot_be_observed_is_not_removed() {
+        let fixture = fixture();
+        let cache_root = fixture.cache.path().to_path_buf();
+        let dead_cache = cache_root.join(&fixture.dead_workspace);
+        std::fs::write(dead_cache.join("codestory.db"), vec![b'x'; 16])
+            .expect("unopenable core store");
+
+        let report = with_test_cache_root(&cache_root, || {
+            apply_cache_clean().expect("cache clean apply")
+        });
+
+        assert!(
+            dead_cache.is_dir(),
+            "an unreadable cache must never be deleted"
+        );
+        assert_eq!(
+            retained_reason(&report.plan, &fixture.dead_workspace),
+            Some(CacheCleanRefusal::AnnotationsUnproven)
+        );
+        assert_eq!(
+            report
+                .removals
+                .iter()
+                .map(|removal| removal.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("embedded-models/sha256/{OTHER_DIGEST}").as_str()]
+        );
+    }
+
+    /// An orphaned WAL is evidence this reader cannot interpret, not derived
+    /// bytes it may drop.
+    #[test]
+    fn a_retired_cache_holding_an_orphaned_sqlite_sidecar_is_not_removed() {
+        let fixture = fixture();
+        let cache_root = fixture.cache.path().to_path_buf();
+        let dead_cache = cache_root.join(&fixture.dead_workspace);
+        std::fs::remove_file(dead_cache.join("codestory.db")).expect("drop the core store");
+        std::fs::write(dead_cache.join("codestory.db-wal"), b"orphan frames")
+            .expect("orphaned write-ahead log");
+
+        let plan = with_test_cache_root(&cache_root, || {
+            plan_cache_clean().expect("cache clean plan")
+        });
+
+        assert_eq!(
+            retained_reason(&plan, &fixture.dead_workspace),
+            Some(CacheCleanRefusal::AnnotationsUnproven)
+        );
+    }
+
+    /// A model tree a peer is materializing right now is not reclaimable, and
+    /// observing that must not create the lock file.
+    #[test]
+    fn a_superseded_model_tree_whose_materialization_lock_is_held_is_not_removed() {
+        let fixture = fixture();
+        let cache_root = fixture.cache.path().to_path_buf();
+        let superseded = embedded_model_digest_root(&cache_root).join(OTHER_DIGEST);
+        let lock_path = superseded.join(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE);
+        std::fs::write(&lock_path, b"").expect("materialization lock file");
+        let holder = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the materialization lock");
+        assert!(
+            bounded_locks::try_acquire(&holder, FileLockKind::Exclusive)
+                .expect("hold the materialization lock"),
+            "the peer must actually hold the lock"
+        );
+
+        let report = with_test_cache_root(&cache_root, || {
+            apply_cache_clean().expect("cache clean apply")
+        });
+
+        assert!(
+            superseded.is_dir(),
+            "a model tree a peer is materializing must not be reclaimed"
+        );
+        assert_eq!(
+            retained_reason(
+                &report.plan,
+                &format!("embedded-models/sha256/{OTHER_DIGEST}")
+            ),
+            Some(CacheCleanRefusal::ModelTreeInUse)
+        );
+        assert_eq!(
+            report
+                .removals
+                .iter()
+                .map(|removal| removal.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![fixture.dead_workspace.as_str()]
+        );
+        bounded_locks::release(&holder).expect("release the materialization lock");
+    }
+
+    /// Observation never creates the lock file a dry run only wanted to read.
+    #[test]
+    fn planning_does_not_create_a_model_materialization_lock() {
+        let cache = tempdir().expect("cache root");
+        write_model_digest(cache.path(), OTHER_DIGEST, 12);
+        let lock_path = embedded_model_digest_root(cache.path())
+            .join(OTHER_DIGEST)
+            .join(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE);
+
+        let plan = with_test_cache_root(cache.path(), || {
+            plan_cache_clean().expect("cache clean plan")
+        });
+
+        assert!(
+            !lock_path.exists(),
+            "a dry-run plan must not be the reason the lock file exists"
+        );
+        assert_eq!(
+            candidate_kinds(&plan),
+            vec![(
+                format!("embedded-models/sha256/{OTHER_DIGEST}"),
+                CacheCleanKind::SupersededModelDigest
+            )]
         );
     }
 
