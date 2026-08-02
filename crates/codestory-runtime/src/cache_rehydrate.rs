@@ -711,7 +711,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{git, git_available};
+    use crate::test_support::{git, git_available, git_output};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -1006,6 +1006,122 @@ mod tests {
 
         assert_eq!(output.status, "skipped");
         assert_eq!(output.reason.as_deref(), Some("git tree mismatch"));
+        assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn rehydrate_skips_when_target_worktree_is_dirty() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        fs::write(target_project.path().join("src.rs"), "pub fn dirty() {}\n")
+            .expect("dirty target");
+
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        seed_cache(
+            &source_cache.path().join("codestory.db"),
+            source_project.path(),
+        );
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        let reason = output.reason.as_deref().expect("skip reason");
+        assert!(
+            reason.contains("git worktree is dirty"),
+            "dirty target must refuse reuse: {reason}"
+        );
+        assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn rehydrate_skips_when_target_metadata_reports_issues() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        // A gitlink index entry makes the target a submodule parent; the
+        // confined reader conservatively refuses worktree status for it.
+        let head = git_output(target_project.path(), &["rev-parse", "HEAD"]);
+        git(
+            target_project.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},nested"),
+            ],
+        );
+
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        seed_cache(
+            &source_cache.path().join("codestory.db"),
+            source_project.path(),
+        );
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        let reason = output.reason.as_deref().expect("skip reason");
+        assert!(
+            reason.contains("git metadata inspection failed")
+                || reason.contains("git worktree is dirty"),
+            "metadata issues must refuse reuse: {reason}"
+        );
+        assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn rehydrate_skips_when_a_tracked_source_is_repo_ignored() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        // A committed file later covered by the repository's own ignore rules
+        // makes the source inventory Partial, so freshness cannot be proven.
+        for project in [source_project.path(), target_project.path()] {
+            fs::write(project.join("ignored.rs"), "pub fn hidden() {}\n").expect("ignored source");
+            fs::write(project.join(".gitignore"), "ignored.rs\n").expect("gitignore");
+            git(project, &["add", "-f", "ignored.rs", ".gitignore"]);
+            git(project, &["commit", "-m", "track ignored"]);
+        }
+
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        seed_cache(
+            &source_cache.path().join("codestory.db"),
+            source_project.path(),
+        );
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        let reason = output.reason.as_deref().expect("skip reason");
+        assert!(
+            reason.contains("source cache freshness check failed") && reason.contains("Partial"),
+            "a Partial source inventory must refuse reuse: {reason}"
+        );
         assert!(!target_cache.path().join("codestory.db").exists());
     }
 
