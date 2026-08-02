@@ -73,6 +73,8 @@ const managedCliProbeStderrMaxBytes = 4 * 1024;
 const managedCliProbeTerminationGraceMs = 500;
 const managedCliProbeForceKillGraceMs = 1000;
 const managedCliMcpProtocolVersion = '2024-11-05';
+const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
+const runtimeStderrObservedChunksCap = 65_535;
 
 function isWindowsBatchCli(cliPath, platform = process.platform) {
   return platform === 'win32' && /\.(?:cmd|bat)$/iu.test(String(cliPath || ''));
@@ -3262,6 +3264,81 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
 
 const shuttingDownHandoffs = new WeakSet();
 
+function runtimeCorrelationId() {
+  return randomBytes(16).toString('hex');
+}
+
+function sanitizeRuntimeDiagnosticText(value) {
+  return String(value || '') ? '[redacted]' : '';
+}
+
+function appendRuntimeStderrTail(current, chunk) {
+  const previousBytes = Number.isSafeInteger(current?.observedBytes)
+    ? current.observedBytes
+    : 0;
+  const previousChunks = Number.isSafeInteger(current?.observedChunks)
+    ? current.observedChunks
+    : 0;
+  const incomingBytes = Buffer.byteLength(String(chunk || ''), 'utf8');
+  const nextBytes = Math.min(runtimeStderrObservedBytesCap, previousBytes + incomingBytes);
+  const nextChunks = Math.min(runtimeStderrObservedChunksCap, previousChunks + 1);
+  return {
+    observedBytes: nextBytes,
+    observedChunks: nextChunks,
+    bytesCapped: Boolean(current?.bytesCapped) || nextBytes < previousBytes + incomingBytes,
+    chunksCapped: Boolean(current?.chunksCapped) || nextChunks < previousChunks + 1,
+  };
+}
+
+function renderRuntimeStderrTail(current) {
+  return {
+    stderrBytes: Number.isSafeInteger(current?.observedBytes) ? current.observedBytes : 0,
+    stderrChunks: Number.isSafeInteger(current?.observedChunks) ? current.observedChunks : 0,
+    stderrBytesCapped: Boolean(current?.bytesCapped),
+    stderrChunksCapped: Boolean(current?.chunksCapped),
+  };
+}
+
+const runtimeFailureReasons = new Map([
+  ['runtime_stdio_child_exit', 'CodeStory stdio handoff exited before completing the request.'],
+  ['runtime_stdio_child_spawn', 'CodeStory stdio handoff failed to start.'],
+  ['runtime_stdio_child_stdin', 'CodeStory stdio handoff stdin failed.'],
+]);
+
+function runtimeFailureCode(value) {
+  return runtimeFailureReasons.has(value) ? value : 'unknown_runtime_failure';
+}
+
+function safeRuntimeDiagnosticToken(value, fallback = 'unknown') {
+  const candidate = String(value || '');
+  return /^[A-Za-z0-9_.-]{1,128}$/u.test(candidate) ? candidate : fallback;
+}
+
+function optionalSafeRuntimeDiagnosticToken(value) {
+  return value == null || value === '' ? null : safeRuntimeDiagnosticToken(value);
+}
+
+function runtimeFailureDetail(reasonCode, details = {}) {
+  const typedReasonCode = runtimeFailureCode(reasonCode);
+  const reason = runtimeFailureReasons.get(typedReasonCode)
+    || 'CodeStory stdio handoff failed.';
+  const fields = [
+    `reason_code=${typedReasonCode}`,
+    `exit_code=${Number.isSafeInteger(details.code) ? details.code : 'none'}`,
+    `signal=${optionalSafeRuntimeDiagnosticToken(details.signal) || 'none'}`,
+    `correlation_id=${optionalSafeRuntimeDiagnosticToken(details.correlationId) || 'unavailable'}`,
+  ];
+  const errorCode = optionalSafeRuntimeDiagnosticToken(details.errorCode);
+  if (errorCode) fields.push(`error_code=${errorCode}`);
+  if (Number.isSafeInteger(details.stderrBytes) && details.stderrBytes > 0) {
+    fields.push(`stderr_bytes=${details.stderrBytes}`);
+    fields.push(`stderr_chunks=${details.stderrChunks}`);
+    fields.push(`stderr_bytes_capped=${Boolean(details.stderrBytesCapped)}`);
+    fields.push(`stderr_chunks_capped=${Boolean(details.stderrChunksCapped)}`);
+  }
+  return `${reason} (${fields.join(' ')})`;
+}
+
 function shutdownHandoffChild(child, options = {}) {
   if (!child || typeof child !== 'object' || shuttingDownHandoffs.has(child)) return;
   shuttingDownHandoffs.add(child);
@@ -3308,6 +3385,7 @@ function runFailOpenMcp(status, options = {}) {
   let initializedNotification = null;
   let runtimeReadyNotified = false;
   let stdinEnded = false;
+  let handoffStderrObservation = null;
   const delegatedRequestIds = new Set();
   let handoffFailureHandled = false;
   const notifyRuntimeReady = () => {
@@ -3333,22 +3411,49 @@ function runFailOpenMcp(status, options = {}) {
       return null;
     }
     handoff = options.startRuntime(liveStatus);
+    handoffStderrObservation = null;
     handoffFailureHandled = false;
-    const failHandoff = (reason, details = {}) => {
+    const failHandoff = (reasonCode, details = {}) => {
       if (handoffFailureHandled) return;
       handoffFailureHandled = true;
       const failedHandoff = handoff;
+      const stderrObservation = renderRuntimeStderrTail(handoffStderrObservation);
+      const failureDetails = {
+        code: Number.isSafeInteger(details.code) ? details.code : null,
+        signal: optionalSafeRuntimeDiagnosticToken(details.signal),
+        errorCode: optionalSafeRuntimeDiagnosticToken(details.errorCode),
+        spawnError: Boolean(details.spawnError),
+        stdinError: Boolean(details.stdinError),
+        correlationId: optionalSafeRuntimeDiagnosticToken(failedHandoff?.codestoryCorrelationId),
+        stderrBytes: Number.isSafeInteger(stderrObservation.stderrBytes)
+          ? Math.min(runtimeStderrObservedBytesCap, Math.max(0, stderrObservation.stderrBytes))
+          : 0,
+        stderrChunks: Number.isSafeInteger(stderrObservation.stderrChunks)
+          ? Math.min(runtimeStderrObservedChunksCap, Math.max(0, stderrObservation.stderrChunks))
+          : 0,
+        stderrBytesCapped: Boolean(stderrObservation.stderrBytesCapped),
+        stderrChunksCapped: Boolean(stderrObservation.stderrChunksCapped),
+      };
+      const detailedReason = runtimeFailureDetail(reasonCode, failureDetails);
       handoff = null;
       shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
-        process.exit(details.code || 1);
+        process.exit(failureDetails.code || 1);
         return;
       }
       for (const id of delegatedRequestIds) {
-        process.stdout.write(`${JSON.stringify(jsonrpcError(JSON.parse(id), -32000, reason))}\n`);
+        process.stdout.write(`${JSON.stringify(jsonrpcError(
+          JSON.parse(id),
+          -32000,
+          detailedReason,
+        ))}\n`);
       }
       delegatedRequestIds.clear();
-      options.onRuntimeFailure({ reason, ...details });
+      options.onRuntimeFailure({
+        reason: detailedReason,
+        reasonCode: runtimeFailureCode(reasonCode),
+        ...failureDetails,
+      });
     };
     if (handoff.stdout) {
       let stdout = '';
@@ -3375,16 +3480,26 @@ function runFailOpenMcp(status, options = {}) {
         }
       });
     }
-    handoff.stderr?.pipe(process.stderr);
+    if (handoff.stderr) {
+      handoff.stderr.setEncoding?.('utf8');
+      handoff.stderr.on('data', (chunk) => {
+        // Drain child stderr without retaining its free-form bytes. Only
+        // saturating byte/chunk counts cross the diagnostic boundary.
+        handoffStderrObservation = appendRuntimeStderrTail(handoffStderrObservation, chunk);
+      });
+    }
     handoff.on('close', (code, signal) => {
       if (signal || code) {
-        failHandoff('CodeStory stdio handoff exited before completing the request.', { code, signal });
+        failHandoff('runtime_stdio_child_exit', { code, signal });
         return;
       }
       process.exit(0);
     });
     handoff.on('error', (error) => {
-      failHandoff(`CodeStory stdio handoff failed: ${error.message}`, { error });
+      failHandoff('runtime_stdio_child_spawn', {
+        errorCode: error?.code,
+        spawnError: true,
+      });
     });
     if (initializeRequest) {
       handoff.stdin.write(`${JSON.stringify(initializeRequest)}\n`);
@@ -3579,12 +3694,18 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
 }
 
 function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
-  return spawnCodeStoryCli(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
+  const correlationId = runtimeCorrelationId();
+  const child = spawnCodeStoryCli(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
     cwd: runtimeCwd,
     stdio,
     windowsHide: true,
-    env: stdioRuntimeEnv(resolved, runtimeCwd),
+    env: {
+      ...stdioRuntimeEnv(resolved, runtimeCwd),
+      CODESTORY_LOG_CORRELATION_ID: correlationId,
+    },
   });
+  child.codestoryCorrelationId = correlationId;
+  return child;
 }
 
 async function main() {
@@ -3629,10 +3750,10 @@ async function main() {
       onRuntimeFailure: (failure) => {
         const failed = ready;
         ready = null;
-        const reason = failure.error ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
+        const reason = failure.spawnError ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
         status = fallbackDiagnostic(failed, {
           status: failure.code ?? null,
-          error: failure.error?.message || failure.reason,
+          error: failure.reason,
           version: failed.cliVersion || failed.version,
           stdout: '',
           stderr: '',
@@ -3640,6 +3761,15 @@ async function main() {
           projectRoot: null,
           projectRootSource: 'request_argument',
           summary: 'CodeStory managed CLI provisioning completed, but the stdio runtime failed during handoff.',
+          setup: {
+            runtime_exit_code: failure.code ?? null,
+            runtime_exit_signal: failure.signal || null,
+            runtime_correlation_id: failure.correlationId || null,
+            runtime_stderr_bytes: failure.stderrBytes || 0,
+            runtime_stderr_chunks: failure.stderrChunks || 0,
+            runtime_stderr_bytes_capped: Boolean(failure.stderrBytesCapped),
+            runtime_stderr_chunks_capped: Boolean(failure.stderrChunksCapped),
+          },
         });
       },
     });
@@ -3670,20 +3800,28 @@ async function main() {
     startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
     onRuntimeFailure: (failure) => {
       handoffReady = false;
-      const reason = failure.error ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
-      const error = failure.error?.message
-        || (failure.code != null
-          ? `codestory-cli serve --stdio exited with status ${failure.code}`
-          : failure.reason);
+      const reason = failure.spawnError ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
+      const error = failure.code != null
+        ? `codestory-cli serve --stdio exited with status ${failure.code}`
+        : failure.reason;
       status = fallbackDiagnostic(resolved, {
         ...probe,
         status: failure.code ?? null,
         error,
-        stderr: probe.stderr || '',
+        stderr: '',
       }, reason, {
         projectRoot: null,
         projectRootSource: 'request_argument',
         summary: 'CodeStory launched its verified CLI, but the stdio runtime failed during handoff.',
+        setup: {
+          runtime_exit_code: failure.code ?? null,
+          runtime_exit_signal: failure.signal || null,
+          runtime_correlation_id: failure.correlationId || null,
+          runtime_stderr_bytes: failure.stderrBytes || 0,
+          runtime_stderr_chunks: failure.stderrChunks || 0,
+          runtime_stderr_bytes_capped: Boolean(failure.stderrBytesCapped),
+          runtime_stderr_chunks_capped: Boolean(failure.stderrChunksCapped),
+        },
       });
     },
   });
@@ -3737,6 +3875,13 @@ if (require.main === module) {
       provisioningRetryHintMaxMs,
       provisioningRetryHintFallbackMs,
       sanitizeDownloadFailure,
+      appendRuntimeStderrTail,
+      renderRuntimeStderrTail,
+      sanitizeRuntimeDiagnosticText,
+      runtimeFailureDetail,
+      runtimeCorrelationId,
+      runtimeStderrObservedBytesCap,
+      runtimeStderrObservedChunksCap,
       releaseDownloadStallTimeoutMs,
       releaseArchiveTotalTimeoutMs,
       releaseChecksumTotalTimeoutMs,

@@ -676,9 +676,11 @@ impl codestory_retrieval::EmbeddingServerTransport for NativeEmbeddingServerTran
     }
 }
 
-fn fail_stop_process(_reason_code: &str) -> ! {
+fn fail_stop_process(reason_code: &str) -> ! {
     // A spawned server can outlive the process that owns its stderr reader.
-    // Fail-stop must not perform fallible I/O before terminating the process.
+    // The marker is best-effort, but the attempt is unconditional and abort is
+    // never contingent on a live stderr reader or a successful filesystem write.
+    crate::diagnostics::record_fail_stop(reason_code);
     std::process::abort()
 }
 

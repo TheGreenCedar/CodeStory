@@ -189,6 +189,24 @@ Check:
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
 
+## Runtime Failure Evidence
+
+WARN-and-higher process diagnostics are JSONL under
+`<process-cache-root>/diagnostics/codestory.jsonl`. The sink retains three
+bounded rotations plus fixed emergency slots, uses private directory and file
+permissions, and fails closed on free-form text: string, debug, error, panic,
+and child-stderr content is never retained or hashed. Each row carries the
+process ID and the correlation ID passed by the plugin launcher. A panic keeps
+only typed payload metadata and its code location. An embedding-server
+fail-stop makes one best-effort marker attempt in a fixed bounded slot and
+aborts after a short fixed deadline even if the cache filesystem stalls.
+
+`CODESTORY_LOG=error` narrows tracing records to errors.
+`CODESTORY_LOG=off` suppresses ordinary tracing records, but command failures,
+panics, and fail-stop markers remain available. Launcher status diagnostics
+record only saturating stderr byte/chunk counts together with the child exit
+code, signal, and matching correlation ID.
+
 ## If A Release Build Cannot Find The Embedded Model
 
 Release Cargo builds deliberately perform no acquisition or process launch. If
