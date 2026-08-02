@@ -2933,19 +2933,9 @@ fn handle_stdio_search(
         .map(|value| value.clamp(1, 50) as u32)
         .unwrap_or(10);
     let publication = stdio_active_product_publication(runtime);
-    let cache_key = publication
-        .clone()
-        .map(|publication| StdioSearchFragmentCacheKey {
-            publication,
-            query: query.trim().to_ascii_lowercase(),
-            repo_text: match repo_text {
-                SearchRepoTextMode::On => "on",
-                SearchRepoTextMode::Off => "off",
-                SearchRepoTextMode::Auto => "auto",
-            }
-            .to_string(),
-            limit_per_source,
-        });
+    let cache_key = publication.clone().map(|publication| {
+        stdio_search_fragment_cache_key(publication, &query, repo_text, limit_per_source)
+    });
     if let (Some(cache_key), Some(publication)) = (cache_key.as_ref(), publication.as_ref())
         && let Some(cached) = state.search_cache.get(cache_key)
         && let Some(cached) =
@@ -2985,6 +2975,31 @@ fn handle_stdio_search(
 }
 
 const STDIO_SEARCH_FRAGMENT_CACHE_CAPACITY: usize = 64;
+
+/// Cache identity for one search fragment.
+///
+/// The query is trimmed but never case-folded: retrieval embeds and
+/// fingerprints the exact string, shape classification observes case, and
+/// search exactness is case-sensitive, so a case-folded key would serve one
+/// casing's hits, echoed query, and exactness metadata to the other.
+fn stdio_search_fragment_cache_key(
+    publication: StdioProductPublicationKey,
+    query: &str,
+    repo_text: SearchRepoTextMode,
+    limit_per_source: u32,
+) -> StdioSearchFragmentCacheKey {
+    StdioSearchFragmentCacheKey {
+        publication,
+        query: query.trim().to_string(),
+        repo_text: match repo_text {
+            SearchRepoTextMode::On => "on",
+            SearchRepoTextMode::Off => "off",
+            SearchRepoTextMode::Auto => "auto",
+        }
+        .to_string(),
+        limit_per_source,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StdioSearchFragmentCacheKey {
@@ -6731,6 +6746,41 @@ version = "0.11.20"
                 ..key.clone()
             }),
             None
+        );
+    }
+
+    #[test]
+    fn stdio_search_fragment_cache_separates_case_distinct_queries() {
+        let mut cache = StdioSearchFragmentCache::default();
+        let upper = stdio_search_fragment_cache_key(
+            product_publication(1),
+            "  SearchWorker  ",
+            SearchRepoTextMode::Auto,
+            10,
+        );
+        let lower = stdio_search_fragment_cache_key(
+            product_publication(1),
+            "searchworker",
+            SearchRepoTextMode::Auto,
+            10,
+        );
+        assert_eq!(upper.query, "SearchWorker", "the key must stay trimmed");
+
+        cache.insert(upper.clone(), json!({"result": {"hits": ["exact"]}}));
+
+        assert_eq!(
+            cache.get(&lower),
+            None,
+            "a case-distinct query must not be served another casing's answer"
+        );
+        assert_eq!(
+            cache.get(&stdio_search_fragment_cache_key(
+                product_publication(1),
+                "SearchWorker",
+                SearchRepoTextMode::Auto,
+                10,
+            )),
+            Some(json!({"result": {"hits": ["exact"]}}))
         );
     }
 

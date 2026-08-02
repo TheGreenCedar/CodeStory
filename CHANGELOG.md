@@ -91,6 +91,24 @@
 - When a question names more files than fit in the follow-up list, the missing
   parts of the flow are no longer pushed out of it. Follow-ups for requested
   files and for unproven steps now alternate, so both survive the limit.
+- Meaning-based search now says nothing rather than something unrelated. It
+  always returned a full page of results, so a question with no close match got
+  the least-distant files in the codebase, ranked as though they were relevant —
+  and those crowded out the exact matches. Results it cannot claim are related
+  are left out, and a result's reported meaning score is now the similarity that
+  was actually measured instead of a minimum every result was given.
+- Two functions with the same name in one file are both returned. One of them
+  used to absorb the other, keeping the higher score and the wrong line number,
+  so overloads and repeated local names went missing from results.
+- Searching for `Foo` and then `foo` no longer returns the first search's
+  results for the second. Answers are remembered per exact query, so the hits,
+  the echoed query, and the exact-match labels match what you typed.
+- Questions are routed by how they are written, not by their punctuation. A
+  capitalised first word or a closing full stop made an ordinary question look
+  like a symbol name and halved how much of the codebase was searched, and a
+  bare filename was only recognised for three languages. Every language
+  CodeStory supports is now recognised, and only a genuine mid-word capital or
+  qualifier marks a query as a symbol.
 
 ## 0.16.3
 

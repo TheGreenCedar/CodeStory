@@ -166,8 +166,12 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         candidate.score * 0.6
     };
 
+    // No floor: a dense lane that retained a weakly related vector must report
+    // the similarity it actually measured. Flooring it made an irrelevant
+    // neighbour outscore the minimum rank score on the strength of the floor
+    // alone.
     let semantic = if has_semantic {
-        candidate.score.max(0.4)
+        candidate.score
     } else {
         candidate.score * 0.25
     };
@@ -179,11 +183,7 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
     };
 
     let file_role_prior = file_role_prior(effective_file_role(candidate));
-    let definition_quality = if candidate.symbol_name.is_some() {
-        0.85
-    } else {
-        0.45
-    };
+    let definition_quality = definition_quality(candidate);
     let token_overlap = token_overlap_score(query_tokens, &path_lower, &symbol_lower);
 
     RankFeatures {
@@ -194,6 +194,18 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         definition_quality,
         token_overlap,
     }
+}
+
+/// Definition quality claims a definition, so a bare display name cannot earn
+/// it: only a candidate resolved to an indexed node or anchored to a line has
+/// a definition site to report.
+fn definition_quality(candidate: &CandidateHit) -> f32 {
+    let named = candidate
+        .symbol_name
+        .as_deref()
+        .is_some_and(|symbol_name| !symbol_name.trim().is_empty());
+    let anchored = candidate.node_id.is_some() || candidate.start_line.is_some();
+    if named && anchored { 0.85 } else { 0.45 }
 }
 
 fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
@@ -693,6 +705,10 @@ mod tests {
         let features = classify_query("primary button layout css class");
         let mut structural = CandidateHit::lexical_stub("src/ui/primary.css", 0.7);
         structural.symbol_name = Some("primary".to_string());
+        // A lexical symbol document always resolves to an indexed node, which is
+        // what earns the candidate its definition-quality feature.
+        structural.node_id = Some("41".to_string());
+        structural.start_line = Some(12);
         structural.source = CandidateSource::Lexical;
         let mut graph = CandidateHit::lexical_stub("src/ui/components.rs", 0.72);
         graph.source = CandidateSource::Lexical;
@@ -942,6 +958,68 @@ mod tests {
         assert_eq!(rank_features.lexical, 0.85);
         assert_eq!(rank_features.semantic, 0.85);
         assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
+    fn ranker_reports_the_measured_dense_similarity_without_a_floor() {
+        let features = classify_query("how does the request deadline reach a worker");
+        let mut weak_dense = CandidateHit::with_source(
+            "docs/notes/glossary.md",
+            Some("glossary".into()),
+            0.02,
+            CandidateSource::Semantic,
+        );
+        weak_dense.node_id = Some("91".into());
+        weak_dense.provenance = vec!["dense_anchor".into()];
+        let strong_lexical = CandidateHit::lexical_stub("src/worker/deadline.rs", 0.81);
+
+        let ranked = rank_candidates(&features, vec![weak_dense, strong_lexical]);
+
+        let dense = ranked
+            .iter()
+            .find(|hit| hit.file_path == "docs/notes/glossary.md");
+        assert!(
+            dense.is_none_or(
+                |hit| hit.rank_features.as_ref().expect("rank features").semantic < 0.4
+            ),
+            "a barely related vector must not report a floored dense feature: {ranked:#?}"
+        );
+        assert_eq!(
+            ranked.first().map(|hit| hit.file_path.as_str()),
+            Some("src/worker/deadline.rs"),
+            "measured lexical evidence must outrank an unrelated vector: {ranked:#?}"
+        );
+    }
+
+    #[test]
+    fn ranker_reserves_definition_quality_for_anchored_definitions() {
+        let features = classify_query("how does the worker drain requests");
+        let unanchored = CandidateHit::with_source(
+            "src/worker/pool.rs",
+            Some("worker pool overview".into()),
+            0.6,
+            CandidateSource::Semantic,
+        );
+        let mut anchored = unanchored.clone();
+        anchored.node_id = Some("77".into());
+        anchored.start_line = Some(31);
+
+        let unanchored_quality = rank_candidates(&features, vec![unanchored])[0]
+            .rank_features
+            .as_ref()
+            .expect("rank features")
+            .definition_quality;
+        let anchored_quality = rank_candidates(&features, vec![anchored])[0]
+            .rank_features
+            .as_ref()
+            .expect("rank features")
+            .definition_quality;
+
+        assert_eq!(anchored_quality, 0.85);
+        assert_eq!(
+            unanchored_quality, 0.45,
+            "a display name with no definition site is not definition evidence"
+        );
     }
 
     #[test]

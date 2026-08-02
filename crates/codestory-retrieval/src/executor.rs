@@ -1,7 +1,7 @@
 use crate::cache::RetrievalCache;
 #[cfg(test)]
 use crate::cache::RetrievalCacheKey;
-use crate::candidate::CandidateHit;
+use crate::candidate::{CandidateHit, fused_candidate_identity_matches};
 use crate::health::{
     probe_sidecar_health, probe_sidecar_health_for_runtime,
     probe_sidecar_health_with_embedding_device,
@@ -930,9 +930,9 @@ fn stage_stub_metadata(hits: &[CandidateHit]) -> (Option<String>, bool) {
 fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) -> usize {
     let mut added = 0usize;
     for hit in incoming {
-        let duplicate = acc.iter_mut().find(|existing| {
-            existing.file_path == hit.file_path && existing.symbol_name == hit.symbol_name
-        });
+        let duplicate = acc
+            .iter_mut()
+            .find(|existing| fused_candidate_identity_matches(existing, &hit));
         if let Some(existing) = duplicate {
             existing.score = existing.score.max(hit.score);
             if existing.node_id.is_none() {
@@ -2178,6 +2178,56 @@ mod tests {
         assert!(rank_features.lexical >= 0.85);
         assert!(rank_features.semantic >= 0.85);
         assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
+    fn executor_keeps_distinct_same_name_nodes_from_one_file() {
+        let query = "resolve";
+        let mut first = CandidateHit::with_source(
+            "src/store/resolve.rs",
+            Some("resolve".into()),
+            0.80,
+            CandidateSource::Lexical,
+        );
+        first.node_id = Some("11".into());
+        first.start_line = Some(40);
+        let mut second = CandidateHit::with_source(
+            "src/store/resolve.rs",
+            Some("resolve".into()),
+            0.62,
+            CandidateSource::Lexical,
+        );
+        second.node_id = Some("12".into());
+        second.start_line = Some(120);
+        let mock = MockSidecarSearch {
+            lexical: Mutex::new(HashMap::from([(query.into(), vec![first, second])])),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(mock),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor.execute(query, Some(800)).expect("query");
+
+        let mut recalled: Vec<(&str, Option<u32>)> = result
+            .hits
+            .iter()
+            .filter(|hit| hit.file_path == "src/store/resolve.rs")
+            .map(|hit| (hit.node_id.as_deref().unwrap_or_default(), hit.start_line))
+            .collect();
+        recalled.sort_unstable();
+        assert_eq!(
+            recalled,
+            vec![("11", Some(40)), ("12", Some(120))],
+            "overloads must stay distinct evidence instead of collapsing onto one line: {:?}",
+            result.hits
+        );
     }
 
     #[test]
