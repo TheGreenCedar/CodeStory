@@ -387,6 +387,7 @@ const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrence_unique
      ON occurrence(element_id, file_node_id, start_line, start_col, end_line, end_col)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_error_file ON error(file_id)",
 ];
 
 const SEMANTIC_CONTEXT_ENDPOINT_INDEX_STATEMENTS: &[&str] = &[
@@ -406,6 +407,7 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_node_file ON node(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_line ON node(file_node_id, kind, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_node_file_kind_name ON node(file_node_id, kind, qualified_name, serialized_name)",
+    "CREATE INDEX IF NOT EXISTS idx_node_canonical_id ON node(canonical_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_qualified_name ON node(qualified_name)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",

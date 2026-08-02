@@ -6227,6 +6227,103 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Return every node ID for each requested durable canonical symbol ID.
+    ///
+    /// Missing IDs remain present with an empty match set, and duplicate rows
+    /// are returned in node-ID order so annotation rebinding can treat
+    /// ambiguity explicitly instead of selecting an arbitrary row.
+    pub fn node_ids_by_canonical_ids(
+        &self,
+        canonical_ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<NodeId>>, StorageError> {
+        if canonical_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for canonical-ID lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support canonical-ID lookup".to_string(),
+            ));
+        }
+
+        let mut unique_canonical_ids = canonical_ids.to_vec();
+        unique_canonical_ids.sort();
+        unique_canonical_ids.dedup();
+        let mut node_ids_by_canonical_id = unique_canonical_ids
+            .iter()
+            .cloned()
+            .map(|canonical_id| (canonical_id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+
+        for batch in unique_canonical_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            let query = format!(
+                "SELECT canonical_id, id
+                 FROM node
+                 WHERE canonical_id IN ({placeholders})
+                 ORDER BY canonical_id ASC, id ASC"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter()))?;
+            while let Some(row) = rows.next()? {
+                let canonical_id: String = row.get(0)?;
+                let node_id = NodeId(row.get(1)?);
+                if let Some(node_ids) = node_ids_by_canonical_id.get_mut(&canonical_id) {
+                    node_ids.push(node_id);
+                }
+            }
+        }
+
+        Ok(node_ids_by_canonical_id)
+    }
+
+    /// Resolve a legacy annotation anchor without guessing between matches.
+    ///
+    /// `file_identity` is the exact path stored in the core `file` row. The
+    /// complete `(file_identity, qualified_name, kind)` tuple is required, and
+    /// every match is returned in node-ID order for the caller to classify as
+    /// unique, missing, or ambiguous.
+    pub fn node_ids_by_file_identity_qualified_name_and_kind(
+        &self,
+        file_identity: &str,
+        qualified_name: &str,
+        kind: NodeKind,
+    ) -> Result<Vec<NodeId>, StorageError> {
+        let Some(file_id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM file WHERE path = ?1",
+                params![file_identity],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id
+             FROM node
+             WHERE file_node_id = ?1
+               AND kind = ?2
+               AND qualified_name = ?3
+             ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![file_id, kind as i32, qualified_name])?;
+        let mut node_ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            node_ids.push(NodeId(row.get(0)?));
+        }
+        Ok(node_ids)
+    }
+
     /// Reads one deterministic page of accepted node kinds from a staged build.
     ///
     /// `NOT INDEXED` keeps the keyset traversal on the node table's integer
@@ -11445,20 +11542,36 @@ impl Storage {
             return Ok(());
         }
 
-        let file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for file-error replacement"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support file-error replacement".to_string(),
+            ));
+        }
+
+        let mut file_ids = file_ids.to_vec();
+        file_ids.sort_unstable();
+        file_ids.dedup();
         debug_assert!(errors.iter().all(|error| {
             error
                 .file_id
-                .is_some_and(|file_id| file_ids.contains(&file_id.0))
+                .is_some_and(|file_id| file_ids.binary_search(&file_id.0).is_ok())
         }));
 
         let tx = self.conn.transaction()?;
         let mut removed_error_count = 0;
-        {
-            let mut delete = tx.prepare("DELETE FROM error WHERE file_id = ?1")?;
-            for file_id in &file_ids {
-                removed_error_count += delete.execute(params![file_id])?;
-            }
+        for batch in file_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            removed_error_count += tx.execute(
+                &format!("DELETE FROM error WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.iter()),
+            )?;
         }
         {
             let mut insert = tx.prepare(
