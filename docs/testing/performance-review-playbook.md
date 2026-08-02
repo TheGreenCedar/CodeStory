@@ -320,11 +320,18 @@ lint counts the declarations in the registry, so a new uncontracted profile
 cannot land without raising a stated number and migrating one cannot land
 without lowering it and the matching
 `PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. Every packet also
-publishes `packet_claim_profile_contract`, `packet_claim_profile_fire_rates`, and
-`packet_claim_sources` into its retrieval trace, so which profiles fired — and
-whether the packet fell back to name-derived templates — is observable in the
-field. Those annotations carry static profile ids and integers only; no citation
-name, path, or source text enters them.
+publishes the contract version, per-profile fire rates, and per-layer claim
+counts on the typed `retrieval_trace.packet_claim_profile_telemetry` field, so
+which profiles fired — and whether the packet fell back to name-derived
+templates — is observable in the field. Those counters carry static profile ids
+and integers only; no citation name, path, or source text enters them.
+
+The telemetry deliberately does not travel in `retrieval_trace.annotations`.
+Annotations are the packet's evidence channel: consumers scan the free text for
+gap markers and downgrade packet confidence when one matches. Always-on
+telemetry published there is read as a permanent evidence gap on every packet,
+so counters get a typed field rather than wording chosen to dodge a substring
+heuristic.
 
 The inventory is executable rather than documentation-only. Supported text and
 configuration files under `scripts/`, `.github/scripts/`,
