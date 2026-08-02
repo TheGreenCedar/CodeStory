@@ -578,6 +578,62 @@ pub enum IndexFreshnessNotCheckedCauseDto {
     InventoryUnavailable,
 }
 
+/// Why a consumer of a freshness observation must treat drift as unknown.
+///
+/// [`IndexFreshnessNotCheckedCauseDto`] describes what the *check* did. This describes what a
+/// consumer may conclude from it, and it exists because those are not the same judgement. A
+/// bounded check still leaves the publication complete and servable — the serving waiver in the
+/// runtime deliberately admits it — but it never establishes that the publication matches the
+/// working tree. Broad evidence assembled over an unknown-freshness publication therefore cannot
+/// be reported as proven, even while local navigation over that same publication stays available.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessUnknownCauseDto {
+    /// Discovery stopped at a deliberate inventory bound; drift past the bound was never compared.
+    BoundedInventory,
+    /// The freshness check could not run, so nothing about drift was established.
+    InventoryUnavailable,
+    /// The observation reported `NotChecked` without naming a cause.
+    CauseUnreported,
+    /// No freshness observation reached this consumer at all.
+    ObservationUnavailable,
+}
+
+impl FreshnessUnknownCauseDto {
+    /// Stable machine-readable identity for gap text and typed output fields.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::BoundedInventory => "bounded_inventory",
+            Self::InventoryUnavailable => "inventory_unavailable",
+            Self::CauseUnreported => "cause_unreported",
+            Self::ObservationUnavailable => "observation_unavailable",
+        }
+    }
+
+    /// The unknown cause an observation carries, or `None` when it reached a verdict.
+    ///
+    /// Both `Fresh` and `Stale` are verdicts: they say drift is absent or present. Everything
+    /// else — including the missing observation, which on the production path means the check
+    /// itself failed — is unknown, and defaulting a failed check to fresh is the exposure this
+    /// type exists to close. Readiness and packet sufficiency share this one mapping so an
+    /// operator never has to reconcile two different readings of the same observation.
+    pub fn for_observation(freshness: Option<&IndexFreshnessDto>) -> Option<Self> {
+        let Some(freshness) = freshness else {
+            return Some(Self::ObservationUnavailable);
+        };
+        match freshness.status {
+            IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::Stale => None,
+            IndexFreshnessStatusDto::NotChecked => Some(match freshness.not_checked_cause {
+                Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory) => Self::BoundedInventory,
+                Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable) => {
+                    Self::InventoryUnavailable
+                }
+                None => Self::CauseUnreported,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexFreshnessChangeKindDto {
@@ -657,6 +713,15 @@ pub struct ReadinessIndexSnapshotDto {
     pub removed_file_count: u32,
     pub checked_file_count: u32,
     pub indexed_file_count: u32,
+    /// Whether drift against the working tree is unknown for this publication.
+    ///
+    /// This is read-only evidence, not a repair signal: a bounded check leaves the surface
+    /// available while making broad evidence unprovable, so the flag has to be visible even on a
+    /// `Ready` verdict. Callers that need the reason branch on `freshness_unknown_cause`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub freshness_unknown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_unknown_cause: Option<FreshnessUnknownCauseDto>,
 }
 
 /// Sidecar state snapshot used inside readiness verdicts.
@@ -2334,6 +2399,15 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub unresolved_candidate_count: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub blocking_unresolved_candidate_count: u32,
+    /// This query's semantic stage lost its budget and contributed no candidate.
+    ///
+    /// Kept per query rather than only as a total because a required query obligation is demoted
+    /// by *its own* dense lane going dark, not by some other query's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub semantic_stage_timeout_zero_hits: bool,
+    /// This query's semantic stage declined to run, or returned only stub candidates.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub semantic_abstained: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
 }
@@ -2438,6 +2512,16 @@ pub struct AgentRetrievalTraceDto {
     pub semantic_fallback_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_fallbacks: Vec<SemanticFallbackRecordDto>,
+    /// Retrieval queries whose semantic stage ran out of budget and contributed no candidate.
+    ///
+    /// The dense lane silently returning nothing is indistinguishable, in the ranked output, from
+    /// a repository that genuinely has no semantic neighbours. Counting it keeps the difference
+    /// visible without pushing telemetry through the annotation evidence channel.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub semantic_stage_timeout_zero_hits: u32,
+    /// Retrieval queries whose semantic stage declined to run or returned only stub candidates.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub semantic_abstained_count: u32,
     /// Free-text retrieval notes. This is an evidence channel: consumers scan it for gap
     /// markers. Never publish always-on telemetry here — use a typed field instead.
     #[serde(default)]
@@ -3301,6 +3385,8 @@ mod packet_tests {
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: Some("sidecar candidates did not all resolve".to_string()),
         };
 
@@ -3337,6 +3423,8 @@ mod packet_tests {
             sla_missed: false,
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
             annotations: Vec::new(),
             packet_claim_profile_telemetry: None,
             steps: Vec::new(),
@@ -3419,6 +3507,8 @@ mod packet_tests {
             sla_missed: false,
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
             annotations: Vec::new(),
             packet_claim_profile_telemetry: Some(telemetry.clone()),
             steps: Vec::new(),

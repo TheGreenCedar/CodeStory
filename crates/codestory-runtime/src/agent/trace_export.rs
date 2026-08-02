@@ -280,6 +280,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 steps,
                 packet_sidecar_diagnostics: Vec::new(),
                 annotations: Vec::new(),

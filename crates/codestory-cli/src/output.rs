@@ -4932,6 +4932,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: vec!["semantic retrieval ready".to_string()],
                 packet_claim_profile_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
@@ -5075,6 +5077,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
@@ -5531,6 +5535,8 @@ mod tests {
                 sla_missed: true,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: vec!["weak hits after fallback".to_string()],
                 packet_claim_profile_telemetry: None,
                 steps: vec![

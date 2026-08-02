@@ -1,7 +1,7 @@
 use codestory_contracts::api::{
-    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, ReadinessGoalDto,
-    ReadinessIndexSnapshotDto, ReadinessSidecarSnapshotDto, ReadinessStatusDto,
-    ReadinessVerdictDto, StorageStatsDto,
+    FreshnessUnknownCauseDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
+    IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessIndexSnapshotDto,
+    ReadinessSidecarSnapshotDto, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
 };
 use serde::Serialize;
 
@@ -303,33 +303,38 @@ fn verdict_state(
                 project_arg,
             );
         }
+    }
 
-        match freshness {
-            Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
-                return index_repair_state(
-                    goal,
-                    "The index has changed, new, or removed files.",
-                    project_arg,
-                );
-            }
-            Some(freshness)
-                if freshness.status == IndexFreshnessStatusDto::NotChecked
-                    && freshness_requires_refresh(freshness) =>
-            {
-                let command =
-                    format!("codestory-cli index --project {project_arg} --refresh incremental");
-                return (
-                    ReadinessStatusDto::CheckIndex,
-                    "Index drift was not checked for this cache view.".to_string(),
-                    vec![command.clone()],
-                    vec![
-                        command,
-                        format!("codestory-cli doctor --project {project_arg}"),
-                    ],
-                );
-            }
-            Some(_) | None => {}
+    // EV-7: freshness is a property of the publication, not of one caller goal. Nesting this
+    // match inside the LocalNavigation branch let `agent_packet_search` report `ready` over an
+    // index the runtime serving gate already refuses, so the readiness surface disagreed with
+    // what the next call would actually do. The bounded-inventory waiver is unaffected:
+    // `freshness_requires_refresh` still admits it, and the unknown state travels on the typed
+    // `freshness_unknown` field instead of demoting the lane.
+    match freshness {
+        Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
+            return index_repair_state(
+                goal,
+                "The index has changed, new, or removed files.",
+                project_arg,
+            );
         }
+        Some(freshness)
+            if freshness.status == IndexFreshnessStatusDto::NotChecked
+                && freshness_requires_refresh(freshness) =>
+        {
+            let command = check_index_command(goal, project_arg);
+            return (
+                ReadinessStatusDto::CheckIndex,
+                "Index drift was not checked for this cache view.".to_string(),
+                vec![command.clone()],
+                vec![
+                    command,
+                    format!("codestory-cli doctor --project {project_arg}"),
+                ],
+            );
+        }
+        Some(_) | None => {}
     }
 
     if goal == ReadinessGoalDto::AgentPacketSearch {
@@ -423,6 +428,22 @@ fn agent_packet_search_activation_commands(project_arg: &str, run_id: Option<&st
     ]
 }
 
+/// The one command that re-establishes drift for a goal whose freshness was never checked.
+///
+/// Local navigation repairs through the core index; agent packet/search repairs through the
+/// retrieval publication it actually reads. Pointing both at the core command left the agent lane
+/// with a command that could not clear its own verdict.
+fn check_index_command(goal: ReadinessGoalDto, project_arg: &str) -> String {
+    match goal {
+        ReadinessGoalDto::LocalNavigation => {
+            format!("codestory-cli index --project {project_arg} --refresh incremental")
+        }
+        ReadinessGoalDto::AgentPacketSearch => format!(
+            "codestory-cli retrieval index --project {project_arg} --profile agent --refresh incremental --format json"
+        ),
+    }
+}
+
 fn index_repair_state(
     goal: ReadinessGoalDto,
     reason: &str,
@@ -455,8 +476,15 @@ fn readiness_index_snapshot(
     stats: &StorageStatsDto,
     freshness: Option<&IndexFreshnessDto>,
 ) -> ReadinessIndexSnapshotDto {
+    // EV-7: unknown freshness is reported on every verdict, including a `Ready` one. A bounded
+    // check leaves the surface available on purpose, so status alone can never carry the fact
+    // that drift was never established — the flag is what explains a `Ready` lane sitting beside
+    // a `partial` packet.
+    let freshness_unknown_cause = FreshnessUnknownCauseDto::for_observation(freshness);
     ReadinessIndexSnapshotDto {
         status: freshness.map(|freshness| freshness.status),
+        freshness_unknown: freshness_unknown_cause.is_some(),
+        freshness_unknown_cause,
         error_count: stats.error_count,
         fatal_error_count: stats.fatal_error_count,
         changed_file_count: freshness
@@ -771,6 +799,136 @@ mod tests {
         );
     }
 
+    fn agent_sidecar() -> ReadinessSidecarInput<'static> {
+        ReadinessSidecarInput {
+            profile: Some("agent"),
+            run_id: Some("run"),
+            retrieval_mode: "full",
+            degraded_reason: None,
+            embedding_device_policy: Some("accelerator_required"),
+            embedding_device_state: Some("accelerated"),
+            embedding_device_observation_source: Some("manual_env"),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: false,
+            manifest_generation: Some("generation"),
+            manifest_input_hash: Some("hash"),
+        }
+    }
+
+    /// EV-7. The runtime serving gate refuses packet and search over a stale publication, so a
+    /// readiness surface reporting `ready` for that lane is telling the caller to make a call
+    /// that will be rejected.
+    #[test]
+    fn stale_index_stops_agent_packet_search_from_reporting_ready() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Stale);
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(&stats, Some(&freshness), Some(agent_sidecar())),
+        );
+
+        assert_eq!(
+            verdict.status,
+            ReadinessStatusDto::RepairIndex,
+            "a stale publication cannot serve broad retrieval: {verdict:?}"
+        );
+        assert!(
+            verdict.minimum_next[0].contains("retrieval index --project"),
+            "the agent lane repairs through its own retrieval publication: {verdict:?}"
+        );
+    }
+
+    /// A check that could not run establishes nothing, so the agent lane must ask for one rather
+    /// than report readiness — and it must ask through the retrieval publication it reads.
+    #[test]
+    fn unchecked_freshness_sends_agent_packet_search_to_check_index() {
+        let stats = stats(3);
+        let mut freshness = freshness(IndexFreshnessStatusDto::NotChecked);
+        freshness.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable);
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(&stats, Some(&freshness), Some(agent_sidecar())),
+        );
+
+        assert_eq!(verdict.status, ReadinessStatusDto::CheckIndex);
+        assert_eq!(
+            verdict.minimum_next[0],
+            format!(
+                "codestory-cli retrieval index --project {} --profile agent --refresh incremental --format json",
+                project_arg(&clean_path_string("C:/workspace/project"))
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    /// CR-001's availability tradeoff, stated as a test: the bounded lane stays usable, and the
+    /// reason broad evidence over it cannot be proven travels as typed readiness output.
+    #[test]
+    fn bounded_inventory_stays_ready_while_reporting_typed_unknown_freshness() {
+        let stats = stats(3);
+        let mut freshness = freshness(IndexFreshnessStatusDto::NotChecked);
+        freshness.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+
+        let verdicts =
+            build_readiness_verdicts(inputs(&stats, Some(&freshness), Some(agent_sidecar())));
+
+        for verdict in &verdicts {
+            assert_eq!(
+                verdict.status,
+                ReadinessStatusDto::Ready,
+                "the bounded-inventory serving waiver is unchanged: {verdict:?}"
+            );
+            let index = verdict.index.as_ref().expect("index snapshot");
+            assert!(index.freshness_unknown, "{index:?}");
+            assert_eq!(
+                index.freshness_unknown_cause,
+                Some(FreshnessUnknownCauseDto::BoundedInventory),
+                "{index:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_observed_fresh_index_reports_no_unknown_freshness() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::LocalNavigation,
+            inputs(&stats, Some(&freshness), Some(agent_sidecar())),
+        );
+
+        let index = verdict.index.as_ref().expect("index snapshot");
+        assert!(!index.freshness_unknown, "{index:?}");
+        assert_eq!(index.freshness_unknown_cause, None, "{index:?}");
+    }
+
+    /// A readiness surface built without any freshness observation knows nothing about drift; it
+    /// must say so rather than let the absent field read as fresh.
+    #[test]
+    fn a_missing_freshness_observation_reports_unknown_freshness() {
+        let stats = stats(3);
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::LocalNavigation,
+            inputs(&stats, None, Some(agent_sidecar())),
+        );
+
+        let index = verdict.index.as_ref().expect("index snapshot");
+        assert!(index.freshness_unknown, "{index:?}");
+        assert_eq!(
+            index.freshness_unknown_cause,
+            Some(FreshnessUnknownCauseDto::ObservationUnavailable),
+            "{index:?}"
+        );
+    }
+
     #[test]
     fn stale_index_requires_incremental_repair() {
         let stats = stats(3);
@@ -815,10 +973,14 @@ mod tests {
                 }),
             ),
         );
+        // EV-7 reversed the previous expectation here. A healthy sidecar was treated as enough to
+        // call the agent lane ready over a stale core publication, but the runtime serving gate
+        // refuses `packet` and `search` on exactly that state, so the surface was advertising a
+        // call it would then reject. Drift is a property of the publication both lanes read.
         assert_eq!(
             agent.status,
-            ReadinessStatusDto::Ready,
-            "stale local graph should not block full sidecar packet/search readiness: {agent:?}"
+            ReadinessStatusDto::RepairIndex,
+            "a stale publication blocks broad retrieval even behind a healthy sidecar: {agent:?}"
         );
     }
 

@@ -234,6 +234,8 @@ mod golden_tests {
             resolved_hit_count: 1,
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: None,
         }];
         let rank_terms = vec!["exec".to_string(), "events".to_string()];
@@ -257,6 +259,8 @@ mod golden_tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
