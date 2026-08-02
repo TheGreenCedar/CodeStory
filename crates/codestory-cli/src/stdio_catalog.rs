@@ -844,6 +844,23 @@ static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
     &["rel", "uri"],
 );
 
+static SEARCH_TARGET_SCHEMA: SchemaObject = SchemaObject::object(
+    "Explicit file or half-open UTF-8 byte range matched by whole-file lexical retrieval.",
+    &[
+        SchemaProperty::string("kind", "Target kind.").with_enum(&["file", "file_range"]),
+        SchemaProperty::string("file_path", "Project-relative file path."),
+        SchemaProperty::integer(
+            "start_byte",
+            "Zero-based inclusive UTF-8 byte offset for file_range targets.",
+        ),
+        SchemaProperty::integer(
+            "end_byte",
+            "Zero-based exclusive UTF-8 byte offset for file_range targets.",
+        ),
+    ],
+    &["kind", "file_path"],
+);
+
 static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory search hit DTO.",
     &[
@@ -854,6 +871,11 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("line", "One-based line number.").nullable(),
         SchemaProperty::number("score", "Ranking score."),
         SchemaProperty::string("origin", "Hit source.").with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::object(
+            "target",
+            "Typed file or file-range target for a whole-file text match.",
+        )
+        .with_object_schema(&SEARCH_TARGET_SCHEMA),
         SchemaProperty::string(
             "match_quality",
             "How exactly the hit matched the query: exact, normalized_exact, prefix, fuzzy, semantic_suggestion, or repo_text.",
@@ -1489,6 +1511,11 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
             "Citation origin, such as indexed_symbol or text_match.",
         )
         .with_enum(TEXT_HIT_ORIGINS),
+        SchemaProperty::object(
+            "target",
+            "Typed file or file-range target for a whole-file text match.",
+        )
+        .with_object_schema(&SEARCH_TARGET_SCHEMA),
         SchemaProperty::boolean(
             "resolvable",
             "Whether the citation can be resolved as a symbol.",

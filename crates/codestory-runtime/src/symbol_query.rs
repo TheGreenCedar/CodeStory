@@ -1170,6 +1170,7 @@ mod tests {
             line: None,
             score,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,

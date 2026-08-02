@@ -301,6 +301,7 @@ impl AppController {
             line: Some(line),
             score,
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
+            target: None,
             match_quality: Some(SearchMatchQualityDto::RepoText),
             resolvable: false,
             evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),

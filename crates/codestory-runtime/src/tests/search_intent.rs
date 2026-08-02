@@ -42,6 +42,7 @@ fn search_intent_filters_hits_by_kind_path_name_and_language() {
             line: Some(1),
             score: 1.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,

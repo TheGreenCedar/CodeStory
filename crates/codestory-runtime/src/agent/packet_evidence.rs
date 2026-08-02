@@ -43,6 +43,7 @@ pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
 }
 
 pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
+    citation.target = hit.target.clone();
     citation.evidence_tier = hit
         .evidence_tier
         .or_else(|| Some(evidence_tier_for_hit(hit)));
@@ -287,6 +288,7 @@ mod tests {
             line: Some(5),
             score: 1.0,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: Some(PacketEvidenceTier::StructuralText),
@@ -429,6 +431,7 @@ mod tests {
             line: hit.line,
             score: hit.score,
             origin: hit.origin,
+            target: hit.target.clone(),
             resolvable: hit.resolvable,
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),
@@ -484,6 +487,7 @@ mod tests {
             line: hit.line,
             score: hit.score,
             origin: hit.origin,
+            target: hit.target.clone(),
             resolvable: hit.resolvable,
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),

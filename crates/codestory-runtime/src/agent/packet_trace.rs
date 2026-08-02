@@ -291,6 +291,7 @@ mod golden_tests {
             line: Some(10),
             score: 0.8,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             resolvable: true,
             match_quality: None,
             evidence_tier: None,

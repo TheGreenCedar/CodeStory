@@ -388,6 +388,7 @@ mod tests {
             line: Some(1),
             score: 1.0,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,

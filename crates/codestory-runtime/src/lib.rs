@@ -4,7 +4,6 @@
 //! retrieval sidecar coordination. Packet/search methods are sidecar-primary: degraded retrieval
 //! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
 
-use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use codestory_contracts::api::{
     AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,

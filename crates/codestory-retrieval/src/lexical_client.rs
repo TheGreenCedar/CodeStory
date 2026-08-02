@@ -53,6 +53,8 @@ impl LexicalClient {
             );
             candidate.node_id = hit.node_id;
             candidate.start_line = hit.start_line;
+            candidate.target = hit.target;
+            candidate.source_excerpt = hit.source_excerpt;
             candidate.add_provenance(hit.source.provenance_label());
             Ok(candidate)
         })

@@ -954,6 +954,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         line: candidate.symbol.line,
         score: 1.0,
         origin: SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: Some(evidence_tier),

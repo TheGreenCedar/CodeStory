@@ -967,6 +967,7 @@ mod tests {
             line: Some(10),
             score: 0.9,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             resolvable: true,
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),

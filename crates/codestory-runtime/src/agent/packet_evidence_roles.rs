@@ -2,7 +2,7 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_display_name_is_test_like, packet_display_path,
 };
 use crate::retrieval_file_role_from_path;
-use codestory_contracts::api::{AgentCitationDto, NodeKind};
+use codestory_contracts::api::{AgentCitationDto, NodeKind, SearchHitOrigin};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PacketEvidenceRole {
@@ -141,6 +141,9 @@ impl PacketEvidenceRole {
 }
 
 pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenceRole> {
+    if citation.kind == NodeKind::FILE && citation.origin == SearchHitOrigin::TextMatch {
+        return None;
+    }
     let display = citation.display_name.to_ascii_lowercase();
     let normalized_display = normalize_identifier(&citation.display_name);
     let path = citation
@@ -460,6 +463,7 @@ mod tests {
             line: Some(1),
             score: 1.0,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             resolvable: true,
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),
@@ -500,6 +504,15 @@ mod tests {
             packet_evidence_role(&citation("Source", "src/io/source.kt")),
             Some(PacketEvidenceRole::BufferedIo)
         );
+    }
+
+    #[test]
+    fn whole_file_text_match_cannot_claim_a_symbol_role() {
+        let mut citation = citation("request_dispatch", "src/request_dispatch.rs");
+        citation.kind = NodeKind::FILE;
+        citation.origin = SearchHitOrigin::TextMatch;
+
+        assert_eq!(packet_evidence_role(&citation), None);
     }
 
     #[test]

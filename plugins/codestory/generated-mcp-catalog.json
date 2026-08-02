@@ -881,6 +881,37 @@
                 "score_breakdown": {
                   "description": "Optional retrieval score breakdown.",
                   "type": "object"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "description": "Typed file or file-range target for a whole-file text match.",
+                  "properties": {
+                    "end_byte": {
+                      "description": "Zero-based exclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    },
+                    "file_path": {
+                      "description": "Project-relative file path.",
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Target kind.",
+                      "enum": [
+                        "file",
+                        "file_range"
+                      ],
+                      "type": "string"
+                    },
+                    "start_byte": {
+                      "description": "Zero-based inclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "file_path"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -2279,6 +2310,37 @@
                 },
                 "score_breakdown": {
                   "description": "Optional retrieval score breakdown.",
+                  "type": "object"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "description": "Typed file or file-range target for a whole-file text match.",
+                  "properties": {
+                    "end_byte": {
+                      "description": "Zero-based exclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    },
+                    "file_path": {
+                      "description": "Project-relative file path.",
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Target kind.",
+                      "enum": [
+                        "file",
+                        "file_range"
+                      ],
+                      "type": "string"
+                    },
+                    "start_byte": {
+                      "description": "Zero-based inclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "file_path"
+                  ],
                   "type": "object"
                 }
               },
@@ -4083,6 +4145,37 @@
                     "string",
                     "null"
                   ]
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "description": "Typed file or file-range target for a whole-file text match.",
+                  "properties": {
+                    "end_byte": {
+                      "description": "Zero-based exclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    },
+                    "file_path": {
+                      "description": "Project-relative file path.",
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Target kind.",
+                      "enum": [
+                        "file",
+                        "file_range"
+                      ],
+                      "type": "string"
+                    },
+                    "start_byte": {
+                      "description": "Zero-based inclusive UTF-8 byte offset for file_range targets.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "file_path"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [

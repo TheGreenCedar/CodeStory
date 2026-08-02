@@ -134,16 +134,22 @@ impl ScipClient {
         Ok(hits)
     }
 
-    pub fn expand_graph(
+    pub fn expand_same_file_name_affinity(
         layout: &SidecarLayout,
         project_id: &str,
         anchors: &[super::CandidateHit],
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
-        Self::expand_graph_with_cancel(layout, project_id, anchors, limit, &|| false)
+        Self::expand_same_file_name_affinity_with_cancel(
+            layout,
+            project_id,
+            anchors,
+            limit,
+            &|| false,
+        )
     }
 
-    pub fn expand_graph_with_cancel(
+    pub fn expand_same_file_name_affinity_with_cancel(
         layout: &SidecarLayout,
         project_id: &str,
         anchors: &[super::CandidateHit],
@@ -151,7 +157,7 @@ impl ScipClient {
         cancelled: &dyn Fn() -> bool,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
         if cancelled() {
-            anyhow::bail!("SCIP graph expansion cancelled");
+            anyhow::bail!("SCIP same-file name affinity cancelled");
         }
         let probe = Self::health_probe(layout, project_id);
         let ScipAvailability::Ready { revision } = probe.availability else {
@@ -169,7 +175,7 @@ impl ScipClient {
             let anchor_symbol = anchor.symbol_name.as_deref().unwrap_or("");
             for (index, symbol) in index.symbols.iter().enumerate() {
                 if index % 64 == 0 && cancelled() {
-                    anyhow::bail!("SCIP graph expansion cancelled");
+                    anyhow::bail!("SCIP same-file name affinity cancelled");
                 }
                 if hits.len() >= limit {
                     break;
@@ -191,7 +197,7 @@ impl ScipClient {
             }
         }
         if cancelled() {
-            anyhow::bail!("SCIP graph expansion cancelled");
+            anyhow::bail!("SCIP same-file name affinity cancelled");
         }
         hits.truncate(limit);
         Ok(hits)
@@ -214,6 +220,8 @@ fn symbol_to_hit(
         file_path: symbol.path.clone(),
         symbol_name: Some(symbol.symbol.clone()),
         start_line: Some(symbol.start_line),
+        target: None,
+        source_excerpt: None,
         score,
         source: CandidateSource::Scip,
         provenance: vec![provenance.into()],
