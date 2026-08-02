@@ -259,6 +259,149 @@ fn file_identity_lookup_rejects_runtime_limit_below_two_bindings() -> Result<(),
 }
 
 #[test]
+fn canonical_annotation_anchor_lookup_is_batched_deterministic_and_ambiguity_preserving()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "late".to_string(),
+            canonical_id: Some("rust:function:shared".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "early".to_string(),
+            canonical_id: Some("rust:function:shared".to_string()),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            canonical_id: Some("rust:function:other".to_string()),
+            ..Default::default()
+        },
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)?;
+    assert!(previous_limit >= 1);
+    let lookup = storage.node_ids_by_canonical_ids(&[
+        "rust:function:shared".to_string(),
+        "rust:function:missing".to_string(),
+        "rust:function:other".to_string(),
+        "rust:function:shared".to_string(),
+    ])?;
+
+    assert_eq!(
+        lookup,
+        BTreeMap::from([
+            ("rust:function:missing".to_string(), Vec::new()),
+            ("rust:function:other".to_string(), vec![NodeId(20)]),
+            (
+                "rust:function:shared".to_string(),
+                vec![NodeId(10), NodeId(30)]
+            ),
+        ])
+    );
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_annotation_anchor_lookup_rejects_zero_bind_limit() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 0)?;
+
+    let error = storage
+        .node_ids_by_canonical_ids(&["rust:function:shared".to_string()])
+        .expect_err("canonical-ID lookup must reject a zero-variable runtime limit");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot support canonical-ID lookup"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_annotation_anchor_fallback_returns_every_match_in_node_id_order()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let file_identity = "/repo/src/lib.rs";
+    storage.insert_file(&FileInfo {
+        id: 100,
+        path: PathBuf::from(file_identity),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 20,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(100),
+        kind: NodeKind::FILE,
+        serialized_name: file_identity.to_string(),
+        ..Default::default()
+    }])?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "later".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "earlier".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::METHOD,
+            serialized_name: "wrong_kind".to_string(),
+            qualified_name: Some("crate::shared".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ])?;
+
+    assert_eq!(
+        storage.node_ids_by_file_identity_qualified_name_and_kind(
+            file_identity,
+            "crate::shared",
+            NodeKind::FUNCTION,
+        )?,
+        vec![NodeId(10), NodeId(30)]
+    );
+    assert!(
+        storage
+            .node_ids_by_file_identity_qualified_name_and_kind(
+                "/repo/src/missing.rs",
+                "crate::shared",
+                NodeKind::FUNCTION,
+            )?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn observational_open_preserves_current_database_bytes_without_sidecars() {
     let path = unique_temp_db_path("observational-current");
     create_versioned_observation_fixture(&path, SCHEMA_VERSION);
@@ -1778,6 +1921,79 @@ fn test_resolution_indexes_are_created() -> Result<(), StorageError> {
             .any(|name| name == "idx_callable_projection_state_file_node")
     );
 
+    Ok(())
+}
+
+#[test]
+fn annotation_anchor_and_error_indexes_are_created_and_used() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    assert!(sqlite_index_exists(&storage, "idx_error_file")?);
+
+    let canonical_plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT canonical_id, id
+             FROM node
+             WHERE canonical_id IN ('rust:function:shared')
+             ORDER BY canonical_id ASC, id ASC",
+        )?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        canonical_plan
+            .iter()
+            .any(|line| line.contains("idx_node_canonical_id")),
+        "canonical lookup plan was {canonical_plan:?}"
+    );
+
+    let fallback_plan = storage
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id
+             FROM node
+             WHERE file_node_id = 1
+               AND kind = 3
+               AND qualified_name = 'crate::shared'
+             ORDER BY id ASC",
+        )?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        fallback_plan
+            .iter()
+            .any(|line| line.contains("USING INDEX idx_node_file")),
+        "fallback lookup plan was {fallback_plan:?}"
+    );
+
+    let error_delete_plan = storage
+        .conn
+        .prepare("EXPLAIN QUERY PLAN DELETE FROM error WHERE file_id IN (1, 2)")?
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        error_delete_plan
+            .iter()
+            .any(|line| line.contains("idx_error_file")),
+        "file-error delete plan was {error_delete_plan:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn error_file_index_is_available_before_deferred_build_indexes() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("error-load-index");
+    let storage = Storage::open_build(&path)?;
+
+    assert!(sqlite_index_exists(&storage, "idx_error_file")?);
+    assert!(!sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+    storage.create_deferred_secondary_indexes()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_canonical_id")?);
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
     Ok(())
 }
 
@@ -7694,6 +7910,137 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn file_error_replacement_deletes_the_unique_file_set_with_a_batched_predicate()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let files = (1..=8)
+        .map(|id| FileInfo {
+            id,
+            path: PathBuf::from(format!("src/{id}.rs")),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        })
+        .collect::<Vec<_>>();
+    storage.insert_files_batch(&files)?;
+    let error = |message: &str, file_id: i64| ErrorInfo {
+        message: message.to_string(),
+        file_id: Some(NodeId(file_id)),
+        line: None,
+        column: None,
+        is_fatal: false,
+        index_step: IndexStep::Indexing,
+        coverage_reason: None,
+    };
+    let old_errors = (1..=8)
+        .map(|file_id| error(&format!("old-{file_id}"), file_id))
+        .collect::<Vec<_>>();
+    storage.insert_errors_batch(&old_errors)?;
+
+    let delete_statements = Arc::new(AtomicUsize::new(0));
+    let observed_delete_statements = Arc::clone(&delete_statements);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Delete {
+                    table_name: "error"
+                }
+            ) {
+                observed_delete_statements.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            Authorization::Allow
+        }))?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 7)?;
+    assert!(previous_limit >= 7);
+    storage.replace_errors_for_files_batch(
+        &[7, 1, 3, 2, 5, 4, 6, 7],
+        &[error("new-one", 1), error("new-seven", 7)],
+    )?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+
+    assert_eq!(delete_statements.load(AtomicOrdering::SeqCst), 1);
+
+    let mut errors = storage
+        .get_errors(None)?
+        .into_iter()
+        .map(|error| (error.file_id.expect("file-scoped error").0, error.message))
+        .collect::<Vec<_>>();
+    errors.sort();
+    assert_eq!(
+        errors,
+        vec![
+            (1, "new-one".to_string()),
+            (7, "new-seven".to_string()),
+            (8, "old-8".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn file_error_replacement_rolls_back_batched_delete_when_insertion_fails()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 1,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    })?;
+    let old_error = ErrorInfo {
+        message: "old".to_string(),
+        file_id: Some(NodeId(1)),
+        line: None,
+        column: None,
+        is_fatal: false,
+        index_step: IndexStep::Indexing,
+        coverage_reason: None,
+    };
+    storage.insert_error(&old_error)?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Insert {
+                table_name: "error",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+
+    let replacement = ErrorInfo {
+        message: "new".to_string(),
+        ..old_error
+    };
+    storage
+        .replace_errors_for_files_batch(&[1], &[replacement])
+        .expect_err("denied insertion must roll back the batched delete");
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+
+    let errors = storage.get_errors(None)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].message, "old");
     Ok(())
 }
 
