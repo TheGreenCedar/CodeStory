@@ -118,14 +118,8 @@ impl RuntimeContextConfiguration {
         let logical_identity = retained_logical_identity.cloned().unwrap_or_else(|| {
             codestory_workspace::observe_logical_project_identity_v3(&project_root)
         });
-        // Non-fatal configuration problems go to stderr, the stream the CLI
-        // already uses for them: stdout stays reserved for the command's own
-        // output, including `--format json`.
-        let config = crate::config::load_config_with_startup(
-            &project_root,
-            startup,
-            &mut std::io::stderr().lock(),
-        )?;
+        let config = crate::config::load_config_with_startup(&project_root, startup)
+            .map_err(|error| map_api_error(error.into_api_error()))?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
         let process_cache_root = canonicalize_configuration_path(
             startup

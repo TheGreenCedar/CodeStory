@@ -124,11 +124,9 @@ rewrites nor re-reads them when requests switch repositories.
 registry the code reads, so a key that is absent there does nothing. Embedding
 query and document prefixes are compile-time constants of the pinned model and
 are not configurable. A file may declare `schema_version`: version 1 (the
-default when the key is absent) prints a warning to standard error naming the
-unknown keys and then ignores them, version 2 rejects them, and a higher
-version fails with `unsupported_config_schema`. The warning names keys only;
-it never repeats a configured value, and `--format json` output on standard
-output is unaffected.
+default when the key is absent) warns about unknown keys by name and ignores
+them, version 2 rejects them, and a higher version fails with
+`unsupported_config_schema`.
 
 Project `.codestory.toml` cannot choose cache roots. It also cannot choose
 network egress settings by default. A trusted operator may set

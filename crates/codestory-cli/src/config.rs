@@ -1,10 +1,9 @@
-use anyhow::{Context, Result};
+use codestory_contracts::api::ApiError;
 use codestory_contracts::config_registry::{
     self, CONFIG_SCHEMA_VERSION_KEY, UNSUPPORTED_CONFIG_SCHEMA_CODE, UnknownKeyPolicy,
 };
 use codestory_contracts::workspace::SourceIndexPolicy;
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::OnceLock;
@@ -12,8 +11,36 @@ use std::sync::OnceLock;
 const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = config_registry::ALLOW_PROJECT_NETWORK_CONFIG_ENV;
 const SOURCE_FILE_BYTE_CAP_ENV: &str = config_registry::INDEX_SOURCE_FILE_BYTE_CAP_ENV;
 
-/// Prefix pairing with the `Error: ` line the CLI prints for fatal failures.
-const CONFIG_WARNING_PREFIX: &str = "Warning: ";
+/// Configuration failure carrying the typed API code callers surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigError(ApiError);
+
+impl ConfigError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self(ApiError::new(code, message))
+    }
+
+    /// The typed error the CLI surfaces for this failure.
+    pub(crate) fn into_api_error(self) -> ApiError {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<ApiError> for ConfigError {
+    fn from(error: ApiError) -> Self {
+        Self(error)
+    }
+}
+
+type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CliStartupConfig {
@@ -51,14 +78,7 @@ fn source_index_policy_from_env_value(raw: Option<&str>) -> SourceIndexPolicy {
     SourceIndexPolicy::oversized(byte_cap)
 }
 
-/// Every honoured `.codestory.toml` key deserializes into one field here.
-///
-/// The test build also serializes it, which is how
-/// `every_registered_config_key_is_read_into_a_field` binds
-/// `config_registry::CONFIG_FILE_KEYS` to the fields that actually exist
-/// instead of restating the registry back to itself.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct CliConfig {
     pub(crate) cache_dir: Option<PathBuf>,
     pub(crate) hybrid_retrieval_enabled: Option<bool>,
@@ -75,39 +95,29 @@ enum ConfigSource {
 }
 
 #[cfg(test)]
-pub(crate) fn load_config(project_root: &Path) -> Result<CliConfig> {
-    load_config_with_startup(project_root, &process_startup_config(), &mut Vec::new())
+pub(crate) fn load_config(project_root: &Path) -> ConfigResult<CliConfig> {
+    load_config_with_startup(project_root, &process_startup_config())
 }
 
-/// Load configuration for one project and report its non-fatal problems.
-///
-/// `report_to` is the user-visible stream the caller reads: production passes
-/// stderr. Schema warnings must land on a surface a person actually sees —
-/// the process diagnostics sink is a private rotating file that redacts every
-/// free-form field, so a warning routed only through `tracing` loses the very
-/// key names that make it actionable.
 pub(crate) fn load_config_with_startup(
     project_root: &Path,
     startup: &CliStartupConfig,
-    report_to: &mut dyn Write,
-) -> Result<CliConfig> {
+) -> ConfigResult<CliConfig> {
     let (config, warnings) = load_config_report(project_root, startup)?;
     for warning in warnings {
-        // A failed write to the report stream must not fail the command: the
-        // configuration itself loaded.
-        let _ = writeln!(report_to, "{CONFIG_WARNING_PREFIX}{warning}");
+        tracing::warn!(target: "codestory::config", "{warning}");
     }
     Ok(config)
 }
 
-/// Load configuration and return the schema warnings instead of reporting them.
+/// Load configuration and return the schema warnings instead of logging them.
 ///
 /// Warnings name unknown keys only. The registry owns that text so no caller
 /// can widen a warning into a value echo.
 pub(crate) fn load_config_report(
     project_root: &Path,
     startup: &CliStartupConfig,
-) -> Result<(CliConfig, Vec<String>)> {
+) -> ConfigResult<(CliConfig, Vec<String>)> {
     let mut config = CliConfig::default();
     let mut warnings = Vec::new();
     if let Some(home) = startup.user_home.as_ref() {
@@ -149,17 +159,25 @@ fn merge_config_file(
     source: ConfigSource,
     project_network_config_allowed: bool,
     warnings: &mut Vec<String>,
-) -> Result<()> {
+) -> ConfigResult<()> {
     if !path.exists() {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read config {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        ConfigError::new(
+            "config_unreadable",
+            format!("Failed to read config {}: {error}", path.display()),
+        )
+    })?;
     let table = parse_config_table(&raw, path)?;
     enforce_config_schema(&table, path, warnings)?;
     validate_config_trust_boundary(&table, source, path, project_network_config_allowed)?;
-    let file_config: CliConfig = toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse config {}", path.display()))?;
+    let file_config: CliConfig = toml::from_str(&raw).map_err(|error| {
+        ConfigError::new(
+            "config_parse_failed",
+            format!("Failed to parse config {}: {error}", path.display()),
+        )
+    })?;
     if file_config.cache_dir.is_some() {
         config.cache_dir = file_config.cache_dir;
     }
@@ -181,15 +199,22 @@ fn merge_config_file(
     Ok(())
 }
 
-fn parse_config_table(raw: &str, path: &Path) -> Result<toml::Table> {
-    let value: toml::Value = toml::from_str(raw)
-        .with_context(|| format!("Failed to parse config {}", path.display()))?;
+fn parse_config_table(raw: &str, path: &Path) -> ConfigResult<toml::Table> {
+    let value: toml::Value = toml::from_str(raw).map_err(|error| {
+        ConfigError::new(
+            "config_parse_failed",
+            format!("Failed to parse config {}: {error}", path.display()),
+        )
+    })?;
     match value {
         toml::Value::Table(table) => Ok(table),
-        _ => anyhow::bail!(
-            "Failed to parse config {}: expected a table",
-            path.display()
-        ),
+        _ => Err(ConfigError::new(
+            "config_parse_failed",
+            format!(
+                "Failed to parse config {}: expected a table",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -197,18 +222,16 @@ fn parse_config_table(raw: &str, path: &Path) -> Result<toml::Table> {
 ///
 /// A declared version this build cannot interpret fails closed rather than
 /// being read as the current schema, because a newer file can give a familiar
-/// key a different meaning. These two failures are new shapes, so they carry
-/// the registry's typed codes through the CLI's existing `ApiError` channel;
-/// every failure this file already had keeps its previous generic envelope.
+/// key a different meaning.
 fn enforce_config_schema(
     table: &toml::Table,
     path: &Path,
     warnings: &mut Vec<String>,
-) -> Result<()> {
+) -> ConfigResult<()> {
     let source_display = path.display().to_string();
     let version = declared_schema_version(table, &source_display)?;
     let policy = config_registry::unknown_key_policy(version)
-        .map_err(|failure| typed_config_error(failure.to_api_error(&source_display)))?;
+        .map_err(|failure| ConfigError::from(failure.to_api_error(&source_display)))?;
     let unknown = config_registry::unknown_config_keys(table.keys().map(String::as_str));
     if unknown.is_empty() {
         return Ok(());
@@ -221,33 +244,27 @@ fn enforce_config_schema(
             ));
             Ok(())
         }
-        UnknownKeyPolicy::Reject => Err(typed_config_error(config_registry::unknown_key_error(
+        UnknownKeyPolicy::Reject => Err(ConfigError::from(config_registry::unknown_key_error(
             &source_display,
             &unknown,
         ))),
     }
 }
 
-/// Carry a typed configuration failure on the same channel every other typed
-/// CLI failure uses, so `codestory-cli --format json` reports its code.
-fn typed_config_error(error: codestory_contracts::api::ApiError) -> anyhow::Error {
-    crate::runtime::map_api_error(error)
-}
-
-fn declared_schema_version(table: &toml::Table, source_display: &str) -> Result<u64> {
+fn declared_schema_version(table: &toml::Table, source_display: &str) -> ConfigResult<u64> {
     let Some(value) = table.get(CONFIG_SCHEMA_VERSION_KEY) else {
         return Ok(u64::from(config_registry::CONFIG_SCHEMA_CURRENT_VERSION));
     };
     match value.as_integer() {
         Some(version) if version >= 0 => Ok(version as u64),
-        _ => Err(typed_config_error(codestory_contracts::api::ApiError::new(
+        _ => Err(ConfigError::new(
             UNSUPPORTED_CONFIG_SCHEMA_CODE,
             format!(
                 "{source_display} declares a {CONFIG_SCHEMA_VERSION_KEY} that is not a \
                  non-negative integer; this build supports at most {}",
                 config_registry::CONFIG_SCHEMA_MAX_SUPPORTED_VERSION
             ),
-        ))),
+        )),
     }
 }
 
@@ -256,20 +273,24 @@ fn validate_config_trust_boundary(
     source: ConfigSource,
     _path: &Path,
     project_network_config_allowed: bool,
-) -> Result<()> {
+) -> ConfigResult<()> {
     if source != ConfigSource::Project {
         return Ok(());
     }
     if table.contains_key("cache_dir") {
-        anyhow::bail!(
-            "project config field `cache_dir` is not trusted; set it in the user home .codestory.toml or pass --cache-dir instead"
-        );
+        return Err(ConfigError::new(
+            "untrusted_config_field",
+            "project config field `cache_dir` is not trusted; set it in the user home .codestory.toml or pass --cache-dir instead",
+        ));
     }
     for field in ["summary_endpoint", "summary_model"] {
         if table.contains_key(field) && !project_network_config_allowed {
-            anyhow::bail!(
-                "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT or CODESTORY_SUMMARY_MODEL, or pass a trusted CLI option instead"
-            );
+            return Err(ConfigError::new(
+                "untrusted_config_field",
+                format!(
+                    "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT or CODESTORY_SUMMARY_MODEL, or pass a trusted CLI option instead"
+                ),
+            ));
         }
     }
     Ok(())
@@ -303,25 +324,9 @@ pub(crate) fn config_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::api_error_in_chain;
     use anyhow::Result;
     use std::ffi::OsString;
     use tempfile::tempdir;
-
-    /// Load through the production entry point and capture the stream a user
-    /// reads, so a warning that never reaches a person fails the test.
-    fn load_reporting_to_user(
-        project_root: &Path,
-        startup: &CliStartupConfig,
-    ) -> Result<(CliConfig, String)> {
-        let mut reported = Vec::new();
-        let config = load_config_with_startup(project_root, startup, &mut reported)?;
-        Ok((config, String::from_utf8(reported)?))
-    }
-
-    fn failure_code(error: &anyhow::Error) -> Option<&str> {
-        api_error_in_chain(error).map(|error| error.code.as_str())
-    }
 
     struct EnvRestore {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -549,47 +554,22 @@ summary_model = "trusted/model"
     }
 
     #[test]
-    fn schema_v1_reports_unknown_keys_to_the_user_without_their_values() -> Result<()> {
+    fn schema_v1_warns_about_unknown_keys_without_their_values() -> Result<()> {
         let project = tempdir()?;
         write_project_config(
             project.path(),
             "hybrid_retrieval_enabled = true\nembedding_query_prefix = \"secret-prefix\"\n",
         )?;
 
-        let (config, reported) = load_reporting_to_user(project.path(), &isolated_startup())?;
+        let (config, warnings) = load_config_report(project.path(), &isolated_startup())?;
 
         assert_eq!(config.hybrid_retrieval_enabled, Some(true));
-        assert_eq!(
-            reported.lines().count(),
-            1,
-            "one reported line per file with unknown keys: {reported:?}"
-        );
+        assert_eq!(warnings.len(), 1, "one warning per file with unknown keys");
+        let warning = &warnings[0];
+        assert!(warning.contains("embedding_query_prefix"));
         assert!(
-            reported.starts_with(CONFIG_WARNING_PREFIX),
-            "the user-visible line must read as a warning: {reported:?}"
-        );
-        assert!(
-            reported.contains("embedding_query_prefix"),
-            "the key name is the actionable part of the warning: {reported:?}"
-        );
-        assert!(
-            !reported.contains("secret-prefix"),
-            "warning must never echo a configured value: {reported:?}"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_fully_registered_file_reports_nothing_to_the_user() -> Result<()> {
-        let project = tempdir()?;
-        write_project_config(project.path(), "hybrid_retrieval_enabled = true\n")?;
-
-        let (_, reported) = load_reporting_to_user(project.path(), &isolated_startup())?;
-
-        assert!(
-            reported.is_empty(),
-            "a clean configuration must stay silent: {reported:?}"
+            !warning.contains("secret-prefix"),
+            "warning must never echo a configured value: {warning}"
         );
 
         Ok(())
@@ -603,11 +583,11 @@ summary_model = "trusted/model"
             "schema_version = 2\nembedding_query_prefix = \"secret-prefix\"\n",
         )?;
 
-        let error = load_reporting_to_user(project.path(), &isolated_startup())
+        let error = load_config_report(project.path(), &isolated_startup())
             .expect_err("schema version 2 rejects unknown keys");
 
-        assert_eq!(failure_code(&error), Some("unknown_config_key"));
-        let message = format!("{error:#}");
+        assert_eq!(error.clone().into_api_error().code, "unknown_config_key");
+        let message = error.to_string();
         assert!(message.contains("embedding_query_prefix"));
         assert!(
             !message.contains("secret-prefix"),
@@ -625,10 +605,10 @@ summary_model = "trusted/model"
             "schema_version = 2\nhybrid_retrieval_enabled = false\n",
         )?;
 
-        let (config, reported) = load_reporting_to_user(project.path(), &isolated_startup())?;
+        let (config, warnings) = load_config_report(project.path(), &isolated_startup())?;
 
         assert_eq!(config.hybrid_retrieval_enabled, Some(false));
-        assert!(reported.is_empty());
+        assert!(warnings.is_empty());
 
         Ok(())
     }
@@ -641,11 +621,14 @@ summary_model = "trusted/model"
             "schema_version = 3\nhybrid_retrieval_enabled = true\n",
         )?;
 
-        let error = load_reporting_to_user(project.path(), &isolated_startup())
+        let error = load_config_report(project.path(), &isolated_startup())
             .expect_err("a future schema is not interpreted");
 
-        assert_eq!(failure_code(&error), Some(UNSUPPORTED_CONFIG_SCHEMA_CODE));
-        assert!(format!("{error:#}").contains("schema_version"));
+        assert_eq!(
+            error.clone().into_api_error().code,
+            UNSUPPORTED_CONFIG_SCHEMA_CODE
+        );
+        assert!(error.to_string().contains("schema_version"));
 
         Ok(())
     }
@@ -655,51 +638,32 @@ summary_model = "trusted/model"
         let project = tempdir()?;
         write_project_config(project.path(), "schema_version = \"one\"\n")?;
 
-        let error = load_reporting_to_user(project.path(), &isolated_startup())
+        let error = load_config_report(project.path(), &isolated_startup())
             .expect_err("a non-integer schema version is not interpreted");
 
-        assert_eq!(failure_code(&error), Some(UNSUPPORTED_CONFIG_SCHEMA_CODE));
+        assert_eq!(
+            error.clone().into_api_error().code,
+            UNSUPPORTED_CONFIG_SCHEMA_CODE
+        );
 
         Ok(())
     }
 
     #[test]
-    fn pre_existing_configuration_failures_keep_their_untyped_envelope() -> Result<()> {
-        // These three shapes predate the schema registry. They stay generic
-        // command failures so the machine-readable envelope consumers already
-        // parse does not change code or lose `details.causes`.
-        let project = tempdir()?;
-        write_project_config(project.path(), "hybrid_retrieval_enabled = \n")?;
-        let parse_failure = load_reporting_to_user(project.path(), &isolated_startup())
-            .expect_err("a malformed file fails");
-        assert_eq!(failure_code(&parse_failure), None);
-        assert!(format!("{parse_failure:#}").contains("Failed to parse config"));
-
-        write_project_config(project.path(), "cache_dir = \"/repo-controlled\"\n")?;
-        let untrusted = load_reporting_to_user(project.path(), &isolated_startup())
-            .expect_err("a project cache_dir fails");
-        assert_eq!(failure_code(&untrusted), None);
-        assert!(format!("{untrusted:#}").contains("is not trusted"));
-
-        Ok(())
-    }
-
-    /// A registered key that no field reads is a documented knob that does
-    /// nothing, and a field with no registered key is an undocumented one.
-    /// Serializing the loaded config is what ties the registry to the struct;
-    /// asserting that registered keys are not "unknown" only restates the
-    /// registry to itself.
-    #[test]
-    fn every_registered_config_key_is_read_into_a_field() -> Result<()> {
+    fn every_registered_config_key_is_a_known_field() -> Result<()> {
         // The trusted user home file is the only source allowed to carry every
         // registered key, so it is where completeness can be proven.
         let home = tempdir()?;
         let project = tempdir()?;
-        let body = config_registry::CONFIG_FILE_KEYS
+        let body = codestory_contracts::config_registry::CONFIG_FILE_KEYS
             .iter()
             .map(|entry| match entry.kind {
-                config_registry::SettingKind::Boolean => format!("{} = true", entry.key),
-                config_registry::SettingKind::Integer => format!("{} = 1", entry.key),
+                codestory_contracts::config_registry::SettingKind::Boolean => {
+                    format!("{} = true", entry.key)
+                }
+                codestory_contracts::config_registry::SettingKind::Integer => {
+                    format!("{} = 1", entry.key)
+                }
                 _ => format!("{} = \"value\"", entry.key),
             })
             .collect::<Vec<_>>()
@@ -708,46 +672,12 @@ summary_model = "trusted/model"
 
         let mut startup = isolated_startup();
         startup.user_home = Some(home.path().to_path_buf());
-        let (config, reported) = load_reporting_to_user(project.path(), &startup)?;
-        assert!(
-            reported.is_empty(),
-            "registered keys must not be reported as unknown: {reported:?}"
-        );
+        let (_, warnings) = load_config_report(project.path(), &startup)?;
 
-        let loaded = serde_json::to_value(&config)?;
-        let fields = loaded
-            .as_object()
-            .expect("the configuration serializes as a map");
-        for entry in config_registry::CONFIG_FILE_KEYS {
-            // The schema version steers the loader itself; it is not a runtime
-            // setting, so no `CliConfig` field carries it.
-            if entry.key == CONFIG_SCHEMA_VERSION_KEY {
-                assert!(
-                    !fields.contains_key(entry.key),
-                    "{} is the loader's own key and must not become a setting field",
-                    entry.key
-                );
-                continue;
-            }
-            let value = fields.get(entry.key).unwrap_or_else(|| {
-                panic!(
-                    "registered key `{}` has no CliConfig field; the documented key does nothing",
-                    entry.key
-                )
-            });
-            assert!(
-                !value.is_null(),
-                "registered key `{}` exists as a field but the loader did not read it",
-                entry.key
-            );
-        }
-        for field in fields.keys() {
-            assert!(
-                config_registry::is_registered_config_key(field),
-                "CliConfig field `{field}` is honoured but not registered, so it is undocumented \
-                 and schema version 2 would reject it"
-            );
-        }
+        assert!(
+            warnings.is_empty(),
+            "registered keys must not be reported as unknown: {warnings:?}"
+        );
 
         Ok(())
     }

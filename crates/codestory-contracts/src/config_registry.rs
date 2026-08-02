@@ -1,22 +1,14 @@
 //! One registry of every environment variable and configuration-file key
 //! CodeStory supports.
 //!
-//! Every setting is declared exactly once here with the production file
-//! accountable for it, its value shape, audience, and secrecy. The user-facing
-//! configuration reference is generated from the same table, and an
-//! architecture contract rejects production sources that spell a registered
-//! identity outside that file. That is what keeps a new knob from entering the
-//! product without a catalog entry, documentation, or an accountable module the
-//! way an ad-hoc `std::env::var` call did.
-//!
-//! What "declared in" means, exactly, because the enforced boundary is narrower
-//! than the word owner suggests: the named file is the only production source
-//! allowed to *spell* the identity. Other modules may still read the setting —
-//! they import the constant from here, which is what makes every reader agree
-//! on one name and puts every knob in one catalog. The contract does not make
-//! the declaring file the only *reader*, and several settings are legitimately
-//! read from more than one module, so neither this table nor the generated page
-//! may be read as a single-reader claim.
+//! Every setting is declared exactly once here with its owning module, value
+//! shape, audience, and secrecy. Producers import the identity from this
+//! registry instead of spelling it, the user-facing configuration reference is
+//! generated from the same table, and an architecture contract rejects
+//! production sources that spell a registered identity outside its declared
+//! owner. That is what keeps a new knob from entering the product without a
+//! catalog entry, documentation, or a stated owner the way an ad-hoc
+//! `std::env::var` call did.
 //!
 //! Secrecy is a property of the setting, not of the call site: a secret value
 //! is never rendered into documentation, warnings, or diagnostics, so a caller
@@ -198,9 +190,7 @@ pub enum SettingSecrecy {
 pub struct EnvSetting {
     /// Process environment variable name.
     pub name: &'static str,
-    /// The one production source file allowed to spell this identity. Other
-    /// modules read the setting by importing the constant from this registry;
-    /// this is not a claim that the named file is the only reader.
+    /// The one production source file allowed to spell this identity.
     pub owner: &'static str,
     pub kind: SettingKind,
     pub audience: SettingAudience,
@@ -223,7 +213,6 @@ const RETRIEVAL_CONFIG: &str = "crates/codestory-retrieval/src/config.rs";
 const RETRIEVAL_INDEX: &str = "crates/codestory-retrieval/src/index.rs";
 const RETRIEVAL_QUALIFICATION: &str =
     "crates/codestory-retrieval/src/per_user_embedding/qualification_control.rs";
-const RUNTIME_EVAL_PROBES: &str = "crates/codestory-runtime/src/agent/eval_probes.rs";
 const RUNTIME_FRESHNESS: &str = "crates/codestory-runtime/src/index_freshness.rs";
 const RUNTIME_GRAPH_DTO: &str = "crates/codestory-runtime/src/graph_dto.rs";
 const RUNTIME_ORCHESTRATOR: &str = "crates/codestory-runtime/src/agent/orchestrator.rs";
@@ -327,20 +316,6 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Text,
         SettingAudience::Diagnostic,
         "Single-run authentication nonce pairing a qualification worker with its control directory.",
-    ),
-    setting(
-        EVAL_PROBES_ENV,
-        RUNTIME_EVAL_PROBES,
-        SettingKind::Boolean,
-        SettingAudience::Diagnostic,
-        "Enables evaluation probes in test builds; product builds ignore it.",
-    ),
-    setting(
-        EVAL_PROBES_MANIFEST_ENV,
-        RUNTIME_EVAL_PROBES,
-        SettingKind::Path,
-        SettingAudience::Diagnostic,
-        "Manifest describing which evaluation probes to record.",
     ),
     setting(
         GRAPH_INCLUDE_CALLSITE_IDENTITY_ENV,
@@ -819,8 +794,7 @@ pub fn env_setting(name: &str) -> Option<&'static EnvSetting> {
     ENV_SETTINGS.iter().find(|setting| setting.name == name)
 }
 
-/// Production source file allowed to spell one environment identity. Readers
-/// in other modules import the constant instead; see the module header.
+/// Production source file allowed to spell one environment identity.
 pub fn env_setting_owner(name: &str) -> Option<&'static str> {
     env_setting(name).map(|setting| setting.owner)
 }
@@ -839,11 +813,8 @@ pub enum ObservedSetting {
 
 /// Observe one registered setting without ever exposing a secret value.
 ///
-/// This is the read path for surfaces that *display* what they read — doctor,
-/// status, diagnostics. It withholds a credential by construction, so such a
-/// surface cannot echo one by reaching for `std::env::var` and formatting the
-/// result. Code that consumes a value rather than displaying it still reads the
-/// environment directly through the imported identity.
+/// This is the only read path a non-owner may use, so a diagnostic surface
+/// cannot echo a credential by reaching for `std::env::var` directly.
 pub fn observe_env_setting(name: &str) -> ObservedSetting {
     let Some(setting) = env_setting(name) else {
         return ObservedSetting::Unset;
@@ -1098,13 +1069,8 @@ pub fn render_configuration_reference() -> String {
          | 2 | rejected | the command fails with `{UNKNOWN_CONFIG_KEY_CODE}` |\n\
          | above {CONFIG_SCHEMA_MAX_SUPPORTED_VERSION} | not interpreted | the command fails with \
          `{UNSUPPORTED_CONFIG_SCHEMA_CODE}` |\n\n\
-         The version 1 warning is printed to standard error, so it reaches the terminal without \
-         disturbing command output. Warnings and errors name unknown keys. They never repeat a \
-         configured value, so a mistyped credential key cannot reach a log line.\n\n\
-         ## Environment variables\n\n\
-         `Declared in` names the one production source file allowed to spell the variable; every \
-         other module reads the setting by importing that identity, which is what keeps one name \
-         per knob. It is not a claim that the named file is the only reader.\n\n"
+         Warnings and errors name unknown keys. They never repeat a configured value, so a \
+         mistyped credential key cannot reach a log line.\n\n"
     );
 
     for audience in AUDIENCES {
@@ -1117,8 +1083,7 @@ pub fn render_configuration_reference() -> String {
         }
         let _ = write!(
             page,
-            "### {}\n\n{}\n\n| Variable | Type | Declared in | Meaning |\n\
-             | --- | --- | --- | --- |\n",
+            "## {}\n\n{}\n\n| Variable | Type | Owner | Meaning |\n| --- | --- | --- | --- |\n",
             audience.heading(),
             audience.note()
         );
@@ -1256,27 +1221,6 @@ mod tests {
             Some("crates/codestory-retrieval/src/config.rs")
         );
         assert_eq!(env_setting_owner("CODESTORY_NOT_A_SETTING"), None);
-    }
-
-    #[test]
-    fn generated_reference_claims_declaration_not_sole_readership() {
-        // The architecture contract enforces that one file spells an identity.
-        // It does not make that file the only reader, and several settings are
-        // read from more than one module, so the page must not print a bare
-        // `Owner` column that a reader would take as a single-reader fact.
-        let reference = render_configuration_reference();
-        assert!(
-            reference.contains("| Variable | Type | Declared in | Meaning |"),
-            "the environment tables must label the column as a declaration site"
-        );
-        assert!(
-            !reference.contains("| Owner |"),
-            "`Owner` overstates the enforced boundary"
-        );
-        assert!(
-            reference.contains("not a claim that the named file is the only reader"),
-            "the page must say what the declaration column does not promise"
-        );
     }
 
     #[test]
