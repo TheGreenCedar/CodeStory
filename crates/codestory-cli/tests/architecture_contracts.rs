@@ -1187,6 +1187,8 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         "local-refresh-state.guard",
         "annotations.sqlite3",
         "annotations.pre-migration.json",
+        "embedded-models",
+        ".materialize.lock",
     ];
     let producer_crates = [
         "crates/codestory-workspace/src",
@@ -1195,6 +1197,7 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         "crates/codestory-cli/src",
         "crates/codestory-retrieval/src",
         "crates/codestory-indexer/src",
+        "crates/codestory-llama-sys/src",
     ];
     for dir in producer_crates {
         let mut files = Vec::new();

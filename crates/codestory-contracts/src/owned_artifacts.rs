@@ -64,6 +64,30 @@ pub const CACHE_ROOT_OWNED_FILE_NAMES: [&str; 3] = [
     LOCAL_REFRESH_STATE_GUARD_FILE,
 ];
 
+/// Content-addressed materialization tree for the embedded embedding model,
+/// rooted at the process cache root rather than beside any storage file.
+///
+/// The digest segment names one immutable model revision, so a cleanup pass
+/// can only prove a sibling superseded by comparing it against the digest the
+/// running executable was compiled with. Both segments live here so the
+/// producer and the cleanup planner cannot drift.
+pub const EMBEDDED_MODEL_CACHE_DIR: &str = "embedded-models";
+pub const EMBEDDED_MODEL_DIGEST_DIR: &str = "sha256";
+/// Advisory lock beside one materialized model revision.
+pub const EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE: &str = ".materialize.lock";
+
+/// Root holding one directory per content-addressed model digest.
+pub fn embedded_model_digest_root(cache_root: &Path) -> PathBuf {
+    cache_root
+        .join(EMBEDDED_MODEL_CACHE_DIR)
+        .join(EMBEDDED_MODEL_DIGEST_DIR)
+}
+
+/// Directory holding the materialized model for one digest.
+pub fn embedded_model_directory(cache_root: &Path, digest: &str) -> PathBuf {
+    embedded_model_digest_root(cache_root).join(digest)
+}
+
 fn cache_root_for(storage_path: &Path) -> &Path {
     storage_path
         .parent()

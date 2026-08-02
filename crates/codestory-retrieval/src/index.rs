@@ -1422,6 +1422,7 @@ fn persist_finalized_manifest(
         &storage,
         retention_context.layout,
         retention_context.workspace_id,
+        project_root,
         &project_id,
     ) {
         Ok(()) => None,
@@ -1527,6 +1528,7 @@ fn publish_derived_retention_marker(
     storage: &Store,
     layout: &SidecarLayout,
     workspace_id: &str,
+    project_root: &Path,
     project_id: &str,
 ) -> Result<()> {
     let (active, rollback) = storage
@@ -1535,6 +1537,7 @@ fn publish_derived_retention_marker(
         .context("committed retrieval publication is missing")?;
     let marker = GenerationRetentionMarker::next(
         workspace_id,
+        project_root,
         active,
         rollback,
         Utc::now().timestamp_millis(),
@@ -3386,6 +3389,7 @@ mod tests {
         let state_file = storage_dir.path().join("state/retrieval-sidecars.json");
         let marker = GenerationRetentionMarker::next(
             "workspace",
+            storage_dir.path(),
             old_manifest.clone(),
             Some(RetrievalIndexRollbackRecord {
                 manifest: rollback_manifest,
@@ -3621,8 +3625,14 @@ mod tests {
         std::fs::write(&marker_blocker, b"not a directory").expect("marker blocker");
         let mut blocked_layout = runtime.layout.clone();
         blocked_layout.state_file = marker_blocker.join("retrieval.state");
-        publish_derived_retention_marker(&storage, &blocked_layout, "workspace", "proj")
-            .expect_err("derived marker failure happens after SQLite commit");
+        publish_derived_retention_marker(
+            &storage,
+            &blocked_layout,
+            "workspace",
+            storage_dir.path(),
+            "proj",
+        )
+        .expect_err("derived marker failure happens after SQLite commit");
         assert_eq!(
             storage
                 .get_retrieval_index_publication("proj")

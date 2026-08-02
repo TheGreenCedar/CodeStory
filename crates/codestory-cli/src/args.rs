@@ -716,6 +716,27 @@ pub(crate) enum CacheAction {
     Identity(CacheIdentityCommand),
     #[command(about = "Rehydrate a compatible cache from another worktree.")]
     Rehydrate(CacheRehydrateCommand),
+    #[command(
+        about = "Report, and optionally reclaim, cache state no live workspace or model can claim."
+    )]
+    Clean(CacheCleanCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheCleanCommand {
+    #[arg(
+        long,
+        help = "Reclaim the proven candidates in the plan. Omit for a dry-run plan that leaves the cache tree untouched."
+    )]
+    pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2528,6 +2549,31 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    /// Reclaiming cache state is opt-in. A `cache clean` invocation that
+    /// forgets `--apply` must produce a plan, never a deletion.
+    #[test]
+    fn cache_clean_reclaims_nothing_without_an_explicit_apply() {
+        let planned = Cli::try_parse_from(["codestory-cli", "cache", "clean"])
+            .expect("cache clean should parse without flags");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(planned),
+        }) = planned.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(!planned.apply, "cache clean must default to a dry-run plan");
+
+        let applied = Cli::try_parse_from(["codestory-cli", "cache", "clean", "--apply"])
+            .expect("cache clean --apply should parse");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(applied),
+        }) = applied.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(applied.apply);
     }
 
     #[test]
