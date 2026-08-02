@@ -641,3 +641,55 @@ fn legacy_crates_are_removed_from_the_workspace() {
         );
     }
 }
+
+#[test]
+fn owned_artifact_identities_are_declared_only_in_the_registry() {
+    // Every file identity CodeStory writes beside its storage file lives in
+    // codestory_contracts::owned_artifacts. A producer or the discovery
+    // exclusion spelling one of these names directly recreates the split
+    // naming that let owned artifacts leak into source discovery.
+    let literals = [
+        ".promotion.lock",
+        ".promotion.prepared.json",
+        ".promotion.committed.json",
+        ".promotion.cleanup-blocked",
+        "index-writer.lock",
+        "sqlite.backup",
+        "local-refresh-status.json",
+        "local-refresh.lock",
+        "local-refresh-state.guard",
+        "annotations.sqlite3",
+    ];
+    let producer_crates = [
+        "crates/codestory-workspace/src",
+        "crates/codestory-store/src",
+        "crates/codestory-runtime/src",
+        "crates/codestory-cli/src",
+        "crates/codestory-retrieval/src",
+        "crates/codestory-indexer/src",
+    ];
+    for dir in producer_crates {
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root().join(dir), &mut files);
+        files.sort();
+        for path in files {
+            if path.components().any(|part| part.as_os_str() == "tests") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read producer source");
+            // Inline test modules pin these names on purpose; production code
+            // above the crate's trailing test module must not spell them.
+            let production = source
+                .split("\n#[cfg(test)]\n")
+                .next()
+                .expect("split returns at least the full source");
+            for literal in literals {
+                assert!(
+                    !production.contains(literal),
+                    "{} spells owned artifact identity {literal:?}; derive it from codestory_contracts::owned_artifacts instead",
+                    path.display()
+                );
+            }
+        }
+    }
+}

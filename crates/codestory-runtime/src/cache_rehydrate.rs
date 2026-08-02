@@ -343,7 +343,9 @@ fn target_cache_has_contents(path: &Path) -> Result<bool> {
     for entry in
         fs::read_dir(path).with_context(|| format!("read target cache dir {}", path.display()))?
     {
-        if entry?.file_name() != "codestory.index-writer.lock" {
+        let writer_lock = Path::new("codestory.db")
+            .with_extension(codestory_contracts::owned_artifacts::INDEX_WRITER_LOCK_EXTENSION);
+        if entry?.file_name() != writer_lock.as_os_str() {
             return Ok(true);
         }
     }
