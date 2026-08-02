@@ -115,6 +115,373 @@ function draftStep(job, name) {
   return matches[0];
 }
 
+function runCloseDevIssuesFixture(fixture) {
+  const workflow = loadWorkflows().get("close-dev-issues.yml");
+  const run = draftStep(
+    workflow.jobs["close-linked-issues"],
+    "Close issues referenced by the merged PR",
+  ).run;
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-close-dev-"));
+  const fixturePath = path.join(directory, "fixture.json");
+  const eventPath = path.join(directory, "event.json");
+  const closedLog = path.join(directory, "closed.log");
+  const fakeGh = path.join(directory, "gh");
+  writeFileSync(fixturePath, JSON.stringify(fixture));
+  writeFileSync(eventPath, JSON.stringify({
+    after: fixture.commit,
+    repository: { full_name: "TheGreenCedar/CodeStory" },
+  }));
+  writeFileSync(closedLog, "");
+  writeFileSync(fakeGh, `#!/usr/bin/env node
+const fs = require("node:fs");
+const fixture = JSON.parse(fs.readFileSync(process.env.CLOSE_DEV_FIXTURE, "utf8"));
+const args = process.argv.slice(2);
+const respond = value => process.stdout.write(JSON.stringify(value));
+
+if (args[0] !== "api") process.exit(2);
+if (args[1] === "graphql") {
+  const field = args.find(argument => argument.startsWith("number="));
+  const number = field ? field.slice("number=".length) : "";
+  if ((fixture.graphqlFailures ?? []).includes(Number(number))) process.exit(9);
+  const cursorField = args.find(argument => argument.startsWith("cursor="));
+  const cursor = cursorField ? cursorField.slice("cursor=".length) : null;
+  let response = fixture.graphql[number] ?? {
+    data: { repository: { pullRequest: { stack: null } } },
+  };
+  if (Array.isArray(response)) {
+    const page = cursor === null ? 0 : Number(cursor);
+    response = response[page];
+  }
+  respond(response);
+  process.exit(0);
+}
+
+const endpoint = args.find(argument => argument.startsWith("repos/"));
+if (endpoint && endpoint.includes("/commits/") && endpoint.endsWith("/pulls")) {
+  respond(fixture.associatedPullRequests);
+  process.exit(0);
+}
+
+const issueMatch = endpoint?.match(/\\/issues\\/(\\d+)$/u);
+if (issueMatch && args.includes("--method")) {
+  fs.appendFileSync(process.env.CLOSE_DEV_CLOSED_LOG, issueMatch[1] + "\\n");
+  respond({ state: "closed" });
+  process.exit(0);
+}
+if (issueMatch) {
+  respond(fixture.issues[issueMatch[1]] ?? { state: "open" });
+  process.exit(0);
+}
+process.exit(3);
+`);
+  chmodSync(fakeGh, 0o755);
+  const result = spawnSync("python", ["-c", run], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      GH_TOKEN: "test-token",
+      GITHUB_EVENT_PATH: eventPath,
+      CLOSE_DEV_FIXTURE: fixturePath,
+      CLOSE_DEV_CLOSED_LOG: closedLog,
+    },
+  });
+  const closedIssues = readFileSync(closedLog, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map(Number);
+  rmSync(directory, { recursive: true, force: true });
+  return { result, closedIssues };
+}
+
+function mergedPullRequest(number, body, commit, base = "dev/codestory-next") {
+  return {
+    number,
+    body,
+    merged_at: "2026-08-01T00:00:00Z",
+    merge_commit_sha: commit,
+    base: { ref: base },
+  };
+}
+
+function stackQueryResponse(
+  baseRefName,
+  pullRequests,
+  size = pullRequests.length,
+  options = {},
+) {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          stack: {
+            id: options.id ?? "stack-id",
+            baseRefName,
+            size,
+            entries: {
+              totalCount: options.totalCount ?? size,
+              pageInfo: {
+                hasNextPage: options.hasNextPage ?? false,
+                endCursor: options.endCursor ?? null,
+              },
+              nodes: pullRequests.map((pullRequest, index) => ({
+                position: options.positions?.[index] ?? index + 1,
+                pullRequest: {
+                  mergedAt: pullRequest.merged
+                    ? "2026-08-01T00:00:00Z"
+                    : null,
+                  repository: { nameWithOwner: "TheGreenCedar/CodeStory" },
+                  ...pullRequest,
+                },
+              })),
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+test("dev issue closeout follows every exact native-stack layer once", () => {
+  const commit = "a".repeat(40);
+  const otherCommit = "b".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(41, "Closes #101", commit)],
+    graphql: {
+      41: stackQueryResponse("dev/codestory-next", [
+        { number: 41, body: "Closes #101", merged: true, mergeCommit: { oid: commit } },
+        { number: 42, body: "Fixes #102", merged: true, mergeCommit: { oid: commit } },
+        { number: 43, body: "Closes #103", merged: true, mergeCommit: { oid: otherCommit } },
+        { number: 44, body: "Closes #104", merged: false, mergeCommit: null },
+      ]),
+    },
+    issues: {
+      101: { state: "open" },
+      102: { state: "open" },
+      103: { state: "open" },
+      104: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [101, 102]);
+});
+
+test("dev issue closeout preserves direct non-stack merges", () => {
+  const commit = "c".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(51, "Resolves #105", commit)],
+    graphql: {},
+    issues: { 105: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [105]);
+});
+
+test("dev issue closeout rejects entries from a stack on another trunk", () => {
+  const commit = "d".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(61, "Closes #106", commit)],
+    graphql: {
+      61: stackQueryResponse("main", [
+        { number: 61, body: "Closes #106", merged: true, mergeCommit: { oid: commit } },
+        { number: 62, body: "Closes #106", merged: true, mergeCommit: { oid: commit } },
+      ]),
+    },
+    issues: { 106: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout fails closed on a truncated stack query", () => {
+  const commit = "e".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(71, "Closes #107", commit)],
+    graphql: {
+      71: stackQueryResponse(
+        "dev/codestory-next",
+        [{ number: 71, body: "Closes #107", merged: true, mergeCommit: { oid: commit } }],
+        2,
+      ),
+    },
+    issues: { 107: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /native pull request stack query was incomplete/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout enumerates every native-stack page", () => {
+  const commit = "f".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(81, "Closes #108", commit)],
+    graphql: {
+      81: [
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 81, body: "Closes #108", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [1] },
+        ),
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 82, body: "Fixes #109", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { positions: [2] },
+        ),
+      ],
+    },
+    issues: {
+      108: { state: "open" },
+      109: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, [108, 109]);
+});
+
+test("dev issue closeout fails closed when a stack crosses repositories", () => {
+  const commit = "1".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(91, "Closes #110", commit)],
+    graphql: {
+      91: stackQueryResponse("dev/codestory-next", [
+        { number: 91, body: "Closes #110", merged: true, mergeCommit: { oid: commit } },
+        {
+          number: 92,
+          body: "Closes #111",
+          merged: true,
+          repository: { nameWithOwner: "another/repository" },
+          mergeCommit: { oid: commit },
+        },
+      ]),
+    },
+    issues: {
+      110: { state: "open" },
+      111: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /crossed repository boundaries/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout fails closed on a repeated pagination cursor", () => {
+  const commit = "2".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(101, "Closes #112", commit)],
+    graphql: {
+      101: [
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 101, body: "Closes #112", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [1] },
+        ),
+        stackQueryResponse(
+          "dev/codestory-next",
+          [{ number: 102, body: "Closes #113", merged: true, mergeCommit: { oid: commit } }],
+          2,
+          { hasNextPage: true, endCursor: "1", positions: [2] },
+        ),
+      ],
+    },
+    issues: {
+      112: { state: "open" },
+      113: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /repeated a cursor/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout finishes stack discovery before issue mutation", () => {
+  const commit = "3".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [
+      mergedPullRequest(111, "Closes #114", commit),
+      mergedPullRequest(112, "Closes #115", commit),
+    ],
+    graphql: {},
+    graphqlFailures: [112],
+    issues: {
+      114: { state: "open" },
+      115: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout ignores associated PRs outside the dev trunk", () => {
+  const commit = "4".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [
+      mergedPullRequest(121, "Closes #116", commit, "codex/dependent-layer"),
+    ],
+    graphql: {},
+    issues: { 116: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout rejects a malformed missing stack field", () => {
+  const commit = "5".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(131, "Closes #117", commit)],
+    graphql: {
+      131: { data: { repository: { pullRequest: {} } } },
+    },
+    issues: { 117: { state: "open" } },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stack query was malformed/u);
+  assert.deepEqual(closedIssues, []);
+});
+
+test("dev issue closeout rejects stack and REST anchor drift", () => {
+  const commit = "6".repeat(40);
+  const fixture = {
+    commit,
+    associatedPullRequests: [mergedPullRequest(141, "Closes #118", commit)],
+    graphql: {
+      141: stackQueryResponse("dev/codestory-next", [
+        { number: 141, body: "Closes #119", merged: true, mergeCommit: { oid: commit } },
+      ]),
+    },
+    issues: {
+      118: { state: "open" },
+      119: { state: "open" },
+    },
+  };
+  const { result, closedIssues } = runCloseDevIssuesFixture(fixture);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /anchor did not match REST/u);
+  assert.deepEqual(closedIssues, []);
+});
+
 function moveNamedStepAfter(job, movedName, afterName) {
   const movedIndex = job.steps.findIndex(step => step.name === movedName);
   assert.notEqual(movedIndex, -1, `missing ${movedName}`);

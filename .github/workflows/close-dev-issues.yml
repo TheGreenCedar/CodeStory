@@ -37,7 +37,7 @@ jobs:
                   text=True,
               )
           )
-          merged_pull_requests = [
+          direct_merge_pull_requests = [
               pull_request
               for pull_request in pull_requests
               if pull_request.get("merged_at")
@@ -45,8 +45,211 @@ jobs:
               and pull_request.get("base", {}).get("ref") == "dev/codestory-next"
           ]
 
-          if not merged_pull_requests:
+          if not direct_merge_pull_requests:
               print("Push was not a pull request merge into dev/codestory-next.")
+
+          owner, name = repository.split("/", 1)
+          stack_query = """
+          query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                stack {
+                  id
+                  baseRefName
+                  size
+                  entries(first: 100, after: $cursor) {
+                    totalCount
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      position
+                      pullRequest {
+                        number
+                        body
+                        merged
+                        mergedAt
+                        repository { nameWithOwner }
+                        mergeCommit { oid }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
+
+          merged_pull_requests_by_number = {}
+
+          def accept_pull_request(pull_request):
+              number = pull_request.get("number")
+              if not isinstance(number, int):
+                  raise RuntimeError("native pull request stack returned an invalid PR")
+              existing = merged_pull_requests_by_number.get(number)
+              if existing and existing.get("body") != pull_request.get("body"):
+                  raise RuntimeError(
+                      f"native pull request stack returned conflicting bodies for PR #{number}"
+                  )
+              merged_pull_requests_by_number[number] = pull_request
+
+          for pull_request in direct_merge_pull_requests:
+              cursor = None
+              seen_cursors = set()
+              expected_stack = None
+              entries = []
+              rejected_stack = False
+              while True:
+                  command = [
+                      "gh",
+                      "api",
+                      "graphql",
+                      "-f",
+                      f"query={stack_query}",
+                      "-F",
+                      f"owner={owner}",
+                      "-F",
+                      f"name={name}",
+                      "-F",
+                      f"number={pull_request['number']}",
+                  ]
+                  if cursor is not None:
+                      command.extend(["-F", f"cursor={cursor}"])
+                  stack_response = json.loads(
+                      subprocess.check_output(command, text=True)
+                  )
+                  if stack_response.get("errors"):
+                      raise RuntimeError("native pull request stack query failed")
+                  pull_request_node = (
+                      stack_response.get("data", {})
+                      .get("repository", {})
+                      .get("pullRequest")
+                  )
+                  if not isinstance(pull_request_node, dict):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  if "stack" not in pull_request_node:
+                      raise RuntimeError("native pull request stack query was malformed")
+                  stack = pull_request_node.get("stack")
+                  if stack is None:
+                      if cursor is not None:
+                          raise RuntimeError(
+                              "native pull request stack changed during pagination"
+                          )
+                      accept_pull_request(pull_request)
+                      break
+                  if not isinstance(stack, dict):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  if stack.get("baseRefName") != "dev/codestory-next":
+                      rejected_stack = True
+                      break
+
+                  connection = stack.get("entries")
+                  if not isinstance(connection, dict):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  metadata = (
+                      stack.get("id"),
+                      stack.get("baseRefName"),
+                      stack.get("size"),
+                      connection.get("totalCount"),
+                  )
+                  if (
+                      not isinstance(metadata[0], str)
+                      or not isinstance(metadata[2], int)
+                      or not isinstance(metadata[3], int)
+                      or metadata[2] != metadata[3]
+                  ):
+                      raise RuntimeError(
+                          "native pull request stack query was incomplete"
+                      )
+                  if expected_stack is None:
+                      expected_stack = metadata
+                  elif metadata != expected_stack:
+                      raise RuntimeError(
+                          "native pull request stack changed during pagination"
+                      )
+
+                  page_entries = connection.get("nodes")
+                  page_info = connection.get("pageInfo")
+                  if not isinstance(page_entries, list) or not isinstance(page_info, dict):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  has_next_page = page_info.get("hasNextPage")
+                  if not isinstance(has_next_page, bool):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  entries.extend(page_entries)
+
+                  if not has_next_page:
+                      break
+                  next_cursor = page_info.get("endCursor")
+                  if not isinstance(next_cursor, str) or not next_cursor:
+                      raise RuntimeError(
+                          "native pull request stack query omitted its next cursor"
+                      )
+                  if next_cursor == cursor or next_cursor in seen_cursors:
+                      raise RuntimeError(
+                          "native pull request stack query repeated a cursor"
+                      )
+                  seen_cursors.add(next_cursor)
+                  cursor = next_cursor
+
+              if rejected_stack or stack is None:
+                  continue
+
+              if expected_stack[2] != len(entries):
+                  raise RuntimeError("native pull request stack query was incomplete")
+              if any(not isinstance(entry, dict) for entry in entries):
+                  raise RuntimeError("native pull request stack query was malformed")
+              positions = [entry.get("position") for entry in entries]
+              if (
+                  any(not isinstance(position, int) for position in positions)
+                  or set(positions) != set(range(1, expected_stack[2] + 1))
+              ):
+                  raise RuntimeError("native pull request stack query was incomplete")
+              entry_numbers = []
+              for entry in entries:
+                  stacked_pull_request = entry.get("pullRequest")
+                  if not isinstance(stacked_pull_request, dict):
+                      raise RuntimeError("native pull request stack query was malformed")
+                  entry_numbers.append(stacked_pull_request.get("number"))
+                  stack_repository = stacked_pull_request.get("repository", {}).get(
+                      "nameWithOwner"
+                  )
+                  if stack_repository != repository:
+                      raise RuntimeError(
+                          "native pull request stack crossed repository boundaries"
+                      )
+                  merge_commit = stacked_pull_request.get("mergeCommit") or {}
+                  if (
+                      stacked_pull_request.get("merged")
+                      and stacked_pull_request.get("mergedAt")
+                      and merge_commit.get("oid") == commit
+                  ):
+                      accept_pull_request(stacked_pull_request)
+              if (
+                  any(not isinstance(number, int) for number in entry_numbers)
+                  or len(set(entry_numbers)) != len(entry_numbers)
+              ):
+                  raise RuntimeError("native pull request stack entries were duplicated")
+              anchor_entries = [
+                  entry["pullRequest"]
+                  for entry in entries
+                  if entry["pullRequest"].get("number") == pull_request["number"]
+              ]
+              if len(anchor_entries) != 1:
+                  raise RuntimeError("native pull request stack omitted its anchor PR")
+              anchor = anchor_entries[0]
+              if (
+                  anchor.get("body") != pull_request.get("body")
+                  or not anchor.get("merged")
+                  or not anchor.get("mergedAt")
+                  or (anchor.get("mergeCommit") or {}).get("oid") != commit
+              ):
+                  raise RuntimeError("native pull request stack anchor did not match REST")
+
+          merged_pull_requests = sorted(
+              merged_pull_requests_by_number.values(),
+              key=lambda pull_request: pull_request["number"],
+          )
 
           closing_keyword = re.compile(
               r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
