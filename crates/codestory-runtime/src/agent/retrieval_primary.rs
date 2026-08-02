@@ -28,7 +28,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
-const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
+const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 1_500;
+const MIN_PACKET_BATCH_BUDGET_MS: u64 = 1_000;
 const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
@@ -584,7 +585,7 @@ fn sidecar_packet_batch_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
     latency_budget_ms
         .map(u64::from)
         .unwrap_or(DEFAULT_PACKET_BATCH_BUDGET_MS)
-        .clamp(100, MAX_PACKET_BATCH_BUDGET_MS)
+        .clamp(MIN_PACKET_BATCH_BUDGET_MS, MAX_PACKET_BATCH_BUDGET_MS)
 }
 
 fn with_detached_sidecar_query_cache<T>(
@@ -820,8 +821,10 @@ pub(crate) fn search_sidecar_packet_batch(
     })
 }
 
+#[derive(Debug)]
 pub(crate) struct SidecarPacketBatchOutcome {
     pub results: Vec<(String, Vec<SearchHit>)>,
+    pub retryable_queries: Vec<String>,
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
@@ -973,6 +976,7 @@ fn build_sidecar_packet_batch_outcome(
         ));
     }
     let mut results = Vec::with_capacity(queries.len());
+    let mut retryable_queries = Vec::new();
     let mut diagnostics = Vec::with_capacity(queries.len());
     for ((query, max_results), query_result) in queries.iter().zip(query_results) {
         if query_result.query != *query {
@@ -982,6 +986,12 @@ fn build_sidecar_packet_batch_outcome(
                     "sidecar retrieval batch query mismatch expected `{}` got `{}`",
                     query, query_result.query
                 ),
+            ));
+        }
+        if sidecar_blocking_cancel_reason(&query_result) == Some("cancelled") {
+            return Err(ApiError::new(
+                "cancelled",
+                format!("packet fused batch query `{query}` was cancelled"),
             ));
         }
         let sidecar_query_ms = u32::try_from(query_result.trace.elapsed_ms).unwrap_or(u32::MAX);
@@ -1006,7 +1016,10 @@ fn build_sidecar_packet_batch_outcome(
         ));
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
-            if sidecar_blocking_cancel_reason(&query_result).is_some() {
+            if let Some("deadline" | "stage_deadline") =
+                sidecar_blocking_cancel_reason(&query_result)
+            {
+                retryable_queries.push(query.clone());
                 results.push((query.clone(), Vec::new()));
                 continue;
             }
@@ -1023,6 +1036,7 @@ fn build_sidecar_packet_batch_outcome(
     }
     Ok(SidecarPacketBatchOutcome {
         results,
+        retryable_queries,
         diagnostics,
     })
 }
@@ -3079,11 +3093,75 @@ mod tests {
         );
         assert_eq!(sidecar_packet_batch_budget_ms(Some(18_000)), 18_000);
         assert_eq!(sidecar_packet_batch_budget_ms(Some(5_000)), 5_000);
-        assert_eq!(sidecar_packet_batch_budget_ms(Some(5)), 100);
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(5)), 1_000);
         assert_eq!(
             sidecar_packet_batch_budget_ms(Some(250_000)),
             MAX_PACKET_BATCH_BUDGET_MS
         );
+    }
+
+    #[test]
+    fn packet_batch_marks_only_deadlines_retryable_and_rejects_cancellation() {
+        use codestory_retrieval::classify_query;
+
+        let query_result = |cancel_reason: Option<&str>| QueryResult {
+            publication_identity: None,
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: Vec::new(),
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 1_000,
+                elapsed_ms: 1,
+                cancel_reason: cancel_reason.map(str::to_string),
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let empty_resolution = |_: &QueryResult, _: usize| {
+            Ok(SidecarCandidateResolutionOutcome {
+                resolved_hits: Vec::new(),
+                unresolved_candidate_count: 0,
+                blocking_unresolved_candidate_count: 0,
+                attempted_candidate_indices: HashSet::new(),
+            })
+        };
+        let controller = AppController::new();
+        let queries = vec![("handler".to_string(), 5)];
+
+        let empty = build_sidecar_packet_batch_outcome(
+            &controller,
+            &queries,
+            vec![query_result(None)],
+            1,
+            empty_resolution,
+        )
+        .expect("ordinary empty result");
+        assert!(empty.retryable_queries.is_empty());
+
+        for reason in ["deadline", "stage_deadline"] {
+            let deadline = build_sidecar_packet_batch_outcome(
+                &controller,
+                &queries,
+                vec![query_result(Some(reason))],
+                1,
+                empty_resolution,
+            )
+            .expect("deadline result");
+            assert_eq!(deadline.retryable_queries, ["handler"]);
+            assert!(deadline.results[0].1.is_empty());
+        }
+
+        let cancelled = build_sidecar_packet_batch_outcome(
+            &controller,
+            &queries,
+            vec![query_result(Some("cancelled"))],
+            1,
+            empty_resolution,
+        )
+        .expect_err("public cancellation must not become an empty successful batch");
+        assert_eq!(cancelled.code, "cancelled");
     }
 
     #[test]
@@ -3845,7 +3923,7 @@ mod tests {
             &queries,
             Some(500),
             |_, batch| {
-                assert_eq!(batch, &[("helpers".to_string(), 500)]);
+                assert_eq!(batch, &[("helpers".to_string(), 1_000)]);
                 Ok(vec![QueryResult {
                     publication_identity: None,
                     query: "helpers".into(),
@@ -3859,7 +3937,7 @@ mod tests {
                     trace: QueryTrace {
                         retrieval_mode: "full".into(),
                         degraded_reason: None,
-                        total_budget_ms: 500,
+                        total_budget_ms: 1_000,
                         elapsed_ms: 1,
                         cancel_reason: None,
                         cache_hit: false,
@@ -3966,7 +4044,7 @@ mod tests {
             &queries,
             Some(500),
             |_, batch| {
-                assert_eq!(batch, &[("handler".to_string(), 500)]);
+                assert_eq!(batch, &[("handler".to_string(), 1_000)]);
                 Ok(vec![QueryResult {
                     publication_identity: None,
                     query: "handler".into(),
@@ -3980,7 +4058,7 @@ mod tests {
                     trace: QueryTrace {
                         retrieval_mode: "full".into(),
                         degraded_reason: None,
-                        total_budget_ms: 500,
+                        total_budget_ms: 1_000,
                         elapsed_ms: 1,
                         cancel_reason: None,
                         cache_hit: false,

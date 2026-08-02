@@ -4,13 +4,11 @@
 
 use super::citation::to_citation_from_hit;
 use super::packet_scoring::{packet_citation_key, packet_citation_rank};
-use super::planning::packet_subquery_hybrid_weights;
 use super::trace::field;
-use crate::HybridSearchScoredHit;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
-    PacketBudgetModeDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
+    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -32,7 +30,7 @@ fn sanitize_section_id(value: &str) -> String {
     id.trim_matches('-').chars().take(48).collect()
 }
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn merge_packet_lexical_subquery_batch(
+pub(crate) fn merge_packet_fused_subquery_batch(
     answer: &mut AgentAnswerDto,
     pending: &[(usize, &PacketPlanQueryDto)],
     results: &[(String, Vec<SearchHit>)],
@@ -74,7 +72,7 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
         let mut output = vec![
             field("hits", hits.len().to_string()),
             field("citations_added", added.to_string()),
-            field("mode", "packet_lexical_batch".to_string()),
+            field("mode", "packet_fused_batch".to_string()),
         ];
         append_packet_query_timing_fields(&mut output, diagnostic);
         answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
@@ -87,7 +85,7 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
         });
         let timing_note = packet_query_timing_annotation(diagnostic);
         answer.retrieval_trace.annotations.push(format!(
-            "packet_lexical_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}{}",
+            "packet_fused_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}{}",
             plan_index,
             query.query.replace('`', "'"),
             query.purpose.replace('`', "'"),
@@ -100,92 +98,9 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
             title: format!("Planned query: {}", query.query),
             blocks: vec![AgentResponseBlockDto::Markdown {
                 markdown: format!(
-                    "Purpose: {}\n\nLexical batch retrieval found {} candidate hits. Use packet citations for exact files and symbols.",
+                    "Purpose: {}\n\nFused packet retrieval found {} candidate hits. Use packet citations for exact files and symbols.",
                     query.purpose,
                     hits.len()
-                ),
-            }],
-        });
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn merge_packet_semantic_subquery_batch(
-    answer: &mut AgentAnswerDto,
-    pending: &[(usize, &PacketPlanQueryDto)],
-    results: &[(String, Vec<HybridSearchScoredHit>)],
-    duration_ms: u32,
-    diagnostics: &[PacketSidecarQueryDiagnosticDto],
-    include_evidence: bool,
-    rank_terms: &[String],
-    budget: PacketBudgetModeDto,
-    stage_carry_limit: usize,
-) {
-    let mut citation_keys = answer
-        .citations
-        .iter()
-        .map(packet_citation_key)
-        .collect::<HashSet<_>>();
-
-    for (diagnostic_index, ((plan_index, query), (result_query, scored_hits))) in
-        pending.iter().zip(results.iter()).enumerate()
-    {
-        debug_assert_eq!(query.query, *result_query);
-        let diagnostic = packet_query_diagnostic(diagnostics, diagnostic_index, result_query);
-        let step_duration = packet_query_duration_ms(diagnostic)
-            .unwrap_or(duration_ms / pending.len().max(1) as u32);
-        let mut added = 0usize;
-        let mut citations = scored_hits
-            .iter()
-            .map(|scored| to_citation_from_hit(&scored.hit, None, None, include_evidence))
-            .collect::<Vec<_>>();
-        citations.sort_by(|left, right| {
-            packet_citation_rank(right, rank_terms, true)
-                .partial_cmp(&packet_citation_rank(left, rank_terms, true))
-                .unwrap_or(Ordering::Equal)
-        });
-        for citation in citations.into_iter().take(stage_carry_limit) {
-            if citation_keys.insert(packet_citation_key(&citation)) {
-                answer.citations.push(citation);
-                added = added.saturating_add(1);
-            }
-        }
-        let mut output = vec![
-            field("hits", scored_hits.len().to_string()),
-            field("citations_added", added.to_string()),
-            field("mode", "packet_semantic_batch".to_string()),
-        ];
-        append_packet_query_timing_fields(&mut output, diagnostic);
-        answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
-            kind: AgentRetrievalStepKindDto::Search,
-            status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: step_duration,
-            input: vec![field("query", query.query.clone())],
-            output,
-            message: Some(format!("packet semantic subquery `{}`", query.purpose)),
-        });
-        let timing_note = packet_query_timing_annotation(diagnostic);
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_semantic_subquery index={} query=`{}` hits={} citations_added={}{}",
-            plan_index,
-            query.query.replace('`', "'"),
-            scored_hits.len(),
-            added,
-            timing_note
-        ));
-        let hybrid_weights = packet_subquery_hybrid_weights(budget, query);
-        let semantic_note = hybrid_weights
-            .and_then(|weights| weights.semantic)
-            .map(|semantic| format!(" semantic_weight={semantic:.2}"))
-            .unwrap_or_default();
-        answer.sections.push(AgentResponseSectionDto {
-            id: format!("packet-subquery-{}", sanitize_section_id(&query.query)),
-            title: format!("Planned query: {}", query.query),
-            blocks: vec![AgentResponseBlockDto::Markdown {
-                markdown: format!(
-                    "Purpose: {}\n\nHybrid batch retrieval found {} candidate hits with warmed embeddings.{semantic_note}",
-                    query.purpose,
-                    scored_hits.len()
                 ),
             }],
         });
@@ -277,7 +192,7 @@ mod golden_tests {
     };
 
     #[test]
-    fn merge_lexical_batch_golden_trace_shape() {
+    fn merge_fused_batch_golden_trace_shape() {
         let query = PacketPlanQueryDto {
             query: "exec_events".to_string(),
             purpose: "symbol probe".to_string(),
@@ -348,7 +263,7 @@ mod golden_tests {
             },
         };
 
-        merge_packet_lexical_subquery_batch(
+        merge_packet_fused_subquery_batch(
             &mut answer,
             &pending,
             &results,
@@ -367,7 +282,7 @@ mod golden_tests {
                 .iter()
                 .find(|field| field.key == "mode")
                 .map(|field| field.value.as_str()),
-            Some("packet_lexical_batch")
+            Some("packet_fused_batch")
         );
         assert_eq!(answer.retrieval_trace.steps[0].duration_ms, 12);
         assert_eq!(

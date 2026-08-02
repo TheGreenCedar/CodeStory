@@ -386,13 +386,7 @@ pub(crate) fn agent_packet(
     let limits = packet_budget_limits(req.budget);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
-    let initial_hybrid_weights = packet_initial_hybrid_weights(&plan, req.budget);
-    let retrieval_prompt = packet_retrieval_prompt(
-        &question,
-        &plan,
-        initial_hybrid_weights.as_ref(),
-        req.budget,
-    );
+    let retrieval_prompt = packet_retrieval_prompt(&question, &plan, req.budget);
     let mut answer = agent_ask(
         controller,
         AgentAskRequest {
@@ -403,7 +397,7 @@ pub(crate) fn agent_packet(
             response_mode: AgentResponseModeDto::Structured,
             latency_budget_ms: req.latency_budget_ms,
             include_evidence: req.include_evidence,
-            hybrid_weights: initial_hybrid_weights.clone(),
+            hybrid_weights: None,
         },
     )?;
     if !exact_probe_citations.is_empty() {
@@ -412,12 +406,6 @@ pub(crate) fn agent_packet(
             exact_probe_citations.len()
         ));
         answer.citations.extend(exact_probe_citations);
-    }
-    if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights.as_ref()) {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_initial_retrieval semantic_skipped=true reason=compact_exact_anchor_probes probe_count={}",
-            packet_anchor_probe_queries(&plan).len()
-        ));
     }
     answer
         .retrieval_trace
@@ -648,14 +636,9 @@ fn append_packet_step_trace_annotation(answer: &mut AgentAnswerDto) {
 fn packet_retrieval_prompt(
     question: &str,
     plan: &PacketPlanDto,
-    initial_hybrid_weights: Option<&AgentHybridWeightsDto>,
     budget: PacketBudgetModeDto,
 ) -> String {
     let anchor_probes = packet_anchor_probe_queries(plan);
-    if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights) && anchor_probes.is_empty()
-    {
-        return question.to_string();
-    }
     if plan.queries.len() <= 1 {
         return question.to_string();
     }
@@ -665,39 +648,31 @@ fn packet_retrieval_prompt(
         budget,
         PacketBudgetModeDto::Compact | PacketBudgetModeDto::Tiny
     );
-    let planned_lines =
-        if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights) || compact {
-            let mut lines = packet_compact_retrieval_prompt_lines(anchor_probes)
-                .into_iter()
-                .map(|query| format!("- {query} (symbol probe)"))
-                .collect::<Vec<_>>();
-            if lines.is_empty() {
-                lines = plan
-                    .queries
-                    .iter()
-                    .take(8)
-                    .map(|query| format!("- {} ({})", query.query, query.purpose))
-                    .collect();
-            }
-            lines
-        } else {
-            plan.queries
+    let planned_lines = if compact {
+        let mut lines = packet_compact_retrieval_prompt_lines(anchor_probes)
+            .into_iter()
+            .map(|query| format!("- {query} (symbol probe)"))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines = plan
+                .queries
                 .iter()
+                .take(8)
                 .map(|query| format!("- {} ({})", query.query, query.purpose))
-                .collect()
-        };
+                .collect();
+        }
+        lines
+    } else {
+        plan.queries
+            .iter()
+            .map(|query| format!("- {} ({})", query.query, query.purpose))
+            .collect()
+    };
     for line in planned_lines {
         prompt.push('\n');
         prompt.push_str(&line);
     }
     prompt
-}
-
-fn packet_initial_hybrid_weights(
-    _plan: &PacketPlanDto,
-    _budget: PacketBudgetModeDto,
-) -> Option<AgentHybridWeightsDto> {
-    None
 }
 
 fn packet_compact_retrieval_prompt_lines(mut anchor_probes: Vec<String>) -> Vec<String> {
@@ -720,7 +695,7 @@ fn packet_compact_retrieval_prompt_lines(mut anchor_probes: Vec<String>) -> Vec<
     selected
 }
 
-fn packet_initial_retrieval_is_lexical_only(weights: Option<&AgentHybridWeightsDto>) -> bool {
+fn hybrid_weights_are_lexical_only(weights: Option<&AgentHybridWeightsDto>) -> bool {
     weights
         .and_then(|weights| weights.semantic)
         .is_some_and(|semantic| semantic <= f32::EPSILON)
@@ -3529,8 +3504,8 @@ fn execute_retrieval(
     trace: &mut TraceRecorder,
 ) -> Result<RetrievalBundle, ApiError> {
     let mut bundle = RetrievalBundle::default();
-    let semantic_required = hybrid_retrieval_enabled()
-        && !packet_initial_retrieval_is_lexical_only(req.hybrid_weights.as_ref());
+    let semantic_required =
+        hybrid_retrieval_enabled() && !hybrid_weights_are_lexical_only(req.hybrid_weights.as_ref());
 
     let max_results = req
         .max_results
@@ -7825,23 +7800,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_packet_initial_retrieval_keeps_semantic_hybrid_and_anchor_prompt() {
+    fn compact_packet_retrieval_keeps_anchor_prompt() {
         let plan = build_packet_plan(
             "Explain how VS Code workbench startup reaches ExtensionService, ExtensionHostManager, AbstractExtHostExtensionService, and ExtHostCommands.executeCommand.",
             Some(PacketTaskClassDto::ArchitectureExplanation),
             PacketBudgetModeDto::Compact,
         );
 
-        assert!(
-            packet_initial_hybrid_weights(&plan, PacketBudgetModeDto::Compact).is_none(),
-            "compact packets should not collapse initial retrieval to lexical-only"
-        );
-        let prompt = packet_retrieval_prompt(
-            "Explain startup.",
-            &plan,
-            None,
-            PacketBudgetModeDto::Compact,
-        );
+        let prompt =
+            packet_retrieval_prompt("Explain startup.", &plan, PacketBudgetModeDto::Compact);
         assert!(prompt.starts_with("Explain startup."));
         assert!(prompt.contains("Planned CodeStory queries:"));
         assert!(prompt.contains("ExtensionService"));
@@ -14443,7 +14410,7 @@ mod tests {
         )];
         let prompt = "Explain how the client chooses adapters for request transport.";
         let mut answer = packet_answer_fixture(prompt, Vec::new());
-        crate::agent::packet_trace::merge_packet_lexical_subquery_batch(
+        crate::agent::packet_trace::merge_packet_fused_subquery_batch(
             &mut answer,
             &pending,
             &results,
@@ -14457,7 +14424,7 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "resolveHandle");
         assert_eq!(answer.citations[1].display_name, "adapters.js");
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.contains("packet_lexical_subquery")
+            annotation.contains("packet_fused_subquery")
                 && annotation.contains("hits=3")
                 && annotation.contains("citations_added=2")
         }));
