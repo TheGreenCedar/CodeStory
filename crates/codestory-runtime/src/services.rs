@@ -1102,6 +1102,45 @@ impl ActivationService {
         }
     }
 
+    /// Cancel the running activation and wait at most `budget` for it to stop.
+    ///
+    /// Returns `true` once no activation is running. Callers that are already
+    /// recovering from a failure use this instead of [`Self::cancel_and_wait`]:
+    /// an unbounded wait would hold the recovering request for as long as the
+    /// activation takes, and a poisoned coordinator — exactly the state a
+    /// panicking request leaves behind — would turn the recovery itself into a
+    /// second panic. Poison is therefore read through rather than asserted on:
+    /// the only fields touched are the cancellation flag and the `running`
+    /// bit, and both stay meaningful after an unrelated unwind.
+    pub fn cancel_and_wait_timeout(&self, budget: Duration) -> bool {
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now);
+        let mut state = match self.coordinator.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cancelled) = state.current_cancel.as_ref() {
+            cancelled.store(true, Ordering::Release);
+        }
+        while state.running {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            state = match self
+                .coordinator
+                .changed
+                .wait_timeout(state, remaining.min(ACTIVATION_WAIT_SLICE))
+            {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        true
+    }
+
     fn activate_once(
         &self,
         operation: &ActivationOperation,
@@ -3141,6 +3180,92 @@ mod activation_tests {
         service.cancel_and_wait();
         let terminal = service.snapshot().expect("terminal snapshot");
         assert_ne!(terminal.state, ActivationState::Ready);
+    }
+
+    #[test]
+    fn bounded_cancel_returns_on_a_running_activation_it_cannot_stop() {
+        let service = Runtime::new().activation_service();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            // An activation that will not notice cancellation: the recovery
+            // path must not be held by it.
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+
+        // The wait runs off the test thread so a wait that never returns fails
+        // the assertion instead of hanging the suite.
+        let waiting = service.clone();
+        let (report, waited_for) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stopped = waiting.cancel_and_wait_timeout(Duration::from_millis(50));
+            let _ = report.send(stopped);
+        });
+        let stopped = waited_for
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wait must end at its own deadline, not when the activation does");
+
+        assert!(
+            !stopped,
+            "an activation still running at the deadline must be reported as still running"
+        );
+        assert!(
+            cancelled.load(Ordering::Acquire),
+            "the bounded wait must still ask the activation to stop"
+        );
+
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.running = false;
+            state.current_cancel = None;
+        }
+        service.coordinator.changed.notify_all();
+        assert!(
+            service.cancel_and_wait_timeout(Duration::from_millis(50)),
+            "a coordinator with nothing running reports the activation stopped"
+        );
+    }
+
+    #[test]
+    fn bounded_cancel_reads_through_a_poisoned_coordinator() {
+        let service = Runtime::new().activation_service();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+        // A request that panics while holding the coordinator leaves it
+        // poisoned; panic recovery runs straight into that state.
+        let poisoning = service.clone();
+        std::thread::spawn(move || {
+            let _state = poisoning.coordinator.state.lock().expect("coordinator");
+            panic!("poison the activation coordinator");
+        })
+        .join()
+        .expect_err("the poisoning thread must panic");
+        assert!(service.coordinator.state.is_poisoned());
+
+        assert!(
+            service.cancel_and_wait_timeout(Duration::from_millis(50)),
+            "a poisoned coordinator must not turn recovery into a second panic"
+        );
+        assert!(
+            cancelled.load(Ordering::Acquire),
+            "the cancellation flag stays meaningful across an unrelated unwind"
+        );
     }
 
     #[test]

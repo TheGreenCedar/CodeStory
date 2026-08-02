@@ -5805,7 +5805,8 @@ fn sigterm_drains_the_stdio_serve_loop_instead_of_killing_the_process() {
         .expect("send SIGTERM");
     assert!(delivered.success(), "SIGTERM delivery failed for pid {pid}");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let signalled = Instant::now();
+    let deadline = signalled + Duration::from_secs(30);
     let status = loop {
         match server.child.try_wait().expect("poll stdio server") {
             Some(status) => break status,
@@ -5816,9 +5817,20 @@ fn sigterm_drains_the_stdio_serve_loop_instead_of_killing_the_process() {
         }
     };
 
+    // The drain is bounded, so the server stops on its own well inside the
+    // grace window a host allows between SIGTERM and SIGKILL.
+    let drained_in = signalled.elapsed();
     assert!(
-        status.success(),
-        "SIGTERM should drain the serve loop, not terminate the process: {status:?}"
+        drained_in < Duration::from_secs(10),
+        "the terminating drain must be bounded, not open-ended: took {drained_in:?}"
+    );
+    // Exit code 0: the host asked the server to stop and it stopped after
+    // answering everything it owed. A completed shutdown must not look like a
+    // crash to a supervisor or to a restart policy.
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM should drain the serve loop and report a completed shutdown: {status:?}"
     );
     let mut trailing = String::new();
     let bytes = server

@@ -71,11 +71,39 @@ const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Admission caps for frames read but not yet executed.
 ///
 /// One request runs at a time, so a client that pipelines faster than the
-/// worker drains would otherwise pin unbounded memory in the queue. The caps
-/// cover admitted requests only: responses the transport already owes leave the
-/// queue as soon as they reach its front.
+/// worker drains would otherwise pin unbounded memory in the queue.
+/// `STDIO_MAX_QUEUED_BYTES` is a cap on *total retained queue memory*, not on
+/// admitted request lines alone: every entry the queue holds — request lines,
+/// the ids kept to answer them, and refusals the transport already owes — is
+/// charged against it. Anything the queue cannot hold within both caps is
+/// refused instead of appended.
 const STDIO_MAX_QUEUED_REQUESTS: usize = 32;
 const STDIO_MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+/// Longest client-supplied JSON-RPC id the transport retains and echoes back.
+///
+/// An id is client-controlled and a frame may carry up to
+/// `STDIO_MAX_FRAME_BYTES` of it, so echoing it verbatim would let one refusal
+/// retain a megabyte. Ids this long are not real correlation handles — MCP ids
+/// are short strings or integers — so a longer one is dropped and the frame is
+/// answered under a null id that names the limit it crossed.
+const STDIO_MAX_ECHOED_ID_BYTES: usize = 512;
+/// Longest a terminating server keeps draining before it stops.
+///
+/// Hosts follow SIGTERM with SIGKILL after a grace window, so the drain has to
+/// end on its own well inside that window even when the in-flight request will
+/// not stop and the host has stopped reading stdout.
+const STDIO_TERMINATION_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+/// Longest panic recovery waits for the evicted context's activation to stop.
+///
+/// Recovery runs on the request path, so it cannot wait for an indexing run to
+/// notice cancellation; anything still running past the budget is torn down off
+/// the request path instead.
+const STDIO_PANIC_EVICTION_BUDGET: Duration = Duration::from_millis(250);
+/// Longest the detached teardown waits before it drops the context regardless.
+///
+/// Off the request path the wait can be generous, but not unbounded: a thread
+/// that never returns is a leak for the life of the session.
+const STDIO_DETACHED_EVICTION_BUDGET: Duration = Duration::from_secs(30);
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Run the stdio server until stdin closes or the host asks it to stop.
@@ -92,14 +120,24 @@ pub(crate) async fn run_stdio_server(
         tokio::io::stdout(),
         stdio_termination_signal(),
         handle_stdio_message,
+        STDIO_TERMINATION_DRAIN_BUDGET,
     )
     .await?;
     if matches!(outcome, StdioServeOutcome::Terminated) {
-        // Every project context has been released and every owed response
-        // flushed, but the stdin reader is still parked in a mandatory blocking
-        // read that only returns when the host closes the pipe. Dropping the
-        // runtime would wait for it, so termination ends the process here
-        // rather than hanging past the host's kill deadline.
+        // The drain above is bounded by `STDIO_TERMINATION_DRAIN_BUDGET`: the
+        // in-flight request was told to stop, waited for only inside that
+        // budget, and every owed response was written under the same deadline.
+        // What remains is `tokio::io::stdin`, which parks a dedicated thread in
+        // a blocking read that returns only when the host closes the pipe.
+        // Dropping the runtime joins that thread, so a normal return would hang
+        // for exactly as long as the host keeps the pipe open — past its own
+        // kill deadline. Exiting here bounds shutdown at the drain budget.
+        //
+        // The code is 0 because this is a completed shutdown, not a failure:
+        // the host asked the server to stop and it stopped, having answered
+        // everything it owed. Reporting 128+SIGTERM here would make an ordinary
+        // editor shutdown look like a crash to supervisors and restart
+        // policies, which is the one thing a clean drain exists to avoid.
         std::process::exit(0);
     }
     Ok(())
@@ -127,6 +165,7 @@ async fn serve_stdio_requests<R, W, S>(
     mut writer: W,
     terminate: S,
     handler: StdioRequestHandler,
+    drain_budget: Duration,
 ) -> Result<StdioServeOutcome>
 where
     R: AsyncBufRead + Unpin,
@@ -137,20 +176,31 @@ where
     let mut queued = StdioAdmissionQueue::default();
     let mut active: Option<ActiveStdioRequest> = None;
     let mut stdin_closed = false;
-    let mut terminating = false;
+    let mut terminating_since: Option<Instant> = None;
     let mut terminate = std::pin::pin!(terminate);
 
     loop {
+        let drain_deadline = terminating_since.map(|since| since + drain_budget);
         // Responses the transport already owes leave the queue before anything
-        // else runs, so pipelined invalid frames cannot pin a response backlog
-        // behind one long request.
-        while let Some(response) = queued.pop_front_response() {
-            write_stdio_response(&mut writer, &response).await?;
+        // else runs, and they leave it from wherever they sit rather than only
+        // from its front: a refusal queued behind a full batch of admitted
+        // requests would otherwise stay resident for as long as those requests
+        // take to run, which is exactly the backlog the admission cap exists to
+        // prevent. Draining here also supplies the backpressure — a host that
+        // stops reading stdout stalls this write, and no further frame is read
+        // while it is stalled.
+        //
+        // Once terminating, the bounded drain below owns every remaining write
+        // so a stalled host cannot hold the process past its kill deadline.
+        if drain_deadline.is_none() {
+            while let Some(response) = queued.pop_next_response() {
+                write_stdio_response(&mut writer, &response).await?;
+            }
         }
 
         if active.is_none() {
-            if terminating {
-                drain_terminating_stdio_queue(&mut queued, &mut writer).await?;
+            if let Some(deadline) = drain_deadline {
+                drain_terminating_stdio_queue(&mut queued, &mut writer, deadline).await;
                 break;
             }
             if let Some(message) = queued.pop_front_message() {
@@ -161,6 +211,7 @@ where
                 active = Some(ActiveStdioRequest {
                     id: message.id,
                     cancelled,
+                    client_cancelled: Arc::new(AtomicBool::new(false)),
                     task: tokio::task::spawn_blocking(move || {
                         let outcome = run_stdio_request(
                             &mut request_session,
@@ -183,16 +234,19 @@ where
                         None => stdin_closed = true,
                     }
                 }
-                () = &mut terminate, if !terminating => terminating = true,
+                () = &mut terminate, if terminating_since.is_none() => {
+                    terminating_since = Some(Instant::now());
+                }
             }
             continue;
         }
 
-        if stdin_closed || terminating {
+        if stdin_closed || drain_deadline.is_some() {
             finish_active_stdio_request(
                 active.take().expect("active stdio request"),
                 &mut session,
                 &mut writer,
+                drain_deadline,
             )
             .await?;
             continue;
@@ -206,12 +260,14 @@ where
                     None => stdin_closed = true,
                 }
             }
-            () = &mut terminate, if !terminating => terminating = true,
+            () = &mut terminate, if terminating_since.is_none() => {
+                terminating_since = Some(Instant::now());
+            }
             completed = &mut active_request.task => {
                 let completed = completed.context("stdio request worker failed")?;
                 let active_request = active.take().expect("completed stdio request");
                 session = Some(completed.0);
-                if !active_request.cancelled.load(Ordering::Acquire)
+                if !active_request.client_cancelled.load(Ordering::Acquire)
                     && let Some(response) =
                         stdio_request_response(completed.1, active_request.id.as_ref())
                 {
@@ -220,12 +276,27 @@ where
             }
         }
     }
-    writer.flush().await?;
-    Ok(if terminating {
-        StdioServeOutcome::Terminated
-    } else {
-        StdioServeOutcome::StdinClosed
-    })
+    let Some(since) = terminating_since else {
+        writer.flush().await?;
+        return Ok(StdioServeOutcome::StdinClosed);
+    };
+    // The same budget covers the final flush: a host that stopped reading
+    // stdout must not be able to keep this process alive by never draining it.
+    let _ = stdio_before(since + drain_budget, writer.flush()).await;
+    Ok(StdioServeOutcome::Terminated)
+}
+
+/// Run `future` until `deadline`, yielding `None` when the deadline passes.
+///
+/// Termination paths use this so every remaining wait — the in-flight request,
+/// each owed write, the final flush — is bounded by one shared deadline rather
+/// than by the host's willingness to keep reading.
+async fn stdio_before<F: std::future::Future>(
+    deadline: Instant,
+    future: F,
+) -> Option<<F as std::future::Future>::Output> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    tokio::time::timeout(remaining, future).await.ok()
 }
 
 /// Resolve when the host asks this server to stop.
@@ -262,36 +333,76 @@ async fn stdio_termination_signal() {
 ///
 /// Termination is not a protocol error for the client, so every admitted
 /// request gets a typed refusal instead of silence the host would wait on.
+/// The whole drain is bounded by `deadline`: the queue is emptied first so no
+/// entry survives the drain regardless of how far the writes get, and a host
+/// that has stopped reading stdout simply loses the tail of its refusals rather
+/// than holding the process open.
 async fn drain_terminating_stdio_queue<W: AsyncWrite + Unpin>(
     queued: &mut StdioAdmissionQueue,
     writer: &mut W,
-) -> Result<()> {
+    deadline: Instant,
+) {
     for work in queued.drain() {
         let response = match work {
-            StdioQueuedWork::Response(response) => Some(response),
+            StdioQueuedWork::Response(response) => Some(response.response),
             StdioQueuedWork::Message(message) => message.id.map(stdio_server_terminating_error),
         };
-        if let Some(response) = response {
-            write_stdio_response(writer, &response).await?;
+        let Some(response) = response else {
+            continue;
+        };
+        match stdio_before(deadline, write_stdio_response(writer, &response)).await {
+            Some(Ok(())) => {}
+            // A write that failed or ran out of budget ends the drain: the
+            // remaining refusals would go to the same unreadable stdout.
+            Some(Err(_)) | None => return,
         }
     }
-    Ok(())
 }
 
 struct ActiveStdioRequest {
     id: Option<serde_json::Value>,
+    /// Cooperative stop signal handed to the running handler.
+    ///
+    /// Both an explicit client cancellation and server termination raise it:
+    /// in either case the handler should stop the work it is doing.
     cancelled: Arc<AtomicBool>,
+    /// Raised only when the *client* cancelled this id.
+    ///
+    /// A cancelled id is owed nothing, so its response is dropped. Termination
+    /// raises `cancelled` without raising this one, because the client is still
+    /// waiting and has to be told the server is stopping.
+    client_cancelled: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<(StdioServerSession, StdioRequestOutcome)>,
 }
 
 struct StdioQueuedMessage {
     line: String,
     id: Option<serde_json::Value>,
+    /// Bytes this entry retains, charged against the queue's memory cap.
+    bytes: usize,
+}
+
+struct StdioQueuedResponse {
+    response: serde_json::Value,
+    /// Bytes this entry retains, charged against the queue's memory cap.
+    bytes: usize,
 }
 
 enum StdioQueuedWork {
     Message(StdioQueuedMessage),
-    Response(serde_json::Value),
+    Response(StdioQueuedResponse),
+}
+
+impl StdioQueuedWork {
+    /// Bytes this entry retains, so a test can total the queue independently of
+    /// the counter the queue keeps.
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        match self {
+            StdioQueuedWork::Message(message) => message.bytes,
+            StdioQueuedWork::Response(response) => response.bytes,
+        }
+    }
 }
 
 enum StdioRequestOutcome {
@@ -319,7 +430,18 @@ fn run_stdio_request(
     match executed {
         Ok(response) => StdioRequestOutcome::Completed(response),
         Err(_) => {
-            session.evict_panicked_project();
+            // Recovery runs *inside* the boundary, not after it. It touches the
+            // same runtime the handler was unwinding through — a coordinator
+            // the panic may have poisoned, services whose teardown can fail —
+            // so an unguarded recovery would let a second panic escape the
+            // worker task, fail its join, and end the session for every project
+            // the containment boundary exists to keep alive. A recovery that
+            // fails still leaves the session safe: the context is detached and
+            // marked for rebuild before any fallible teardown begins, so
+            // nothing can reach the poisoned context afterwards.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.evict_panicked_project();
+            }));
             StdioRequestOutcome::Panicked
         }
     }
@@ -349,20 +471,16 @@ impl StdioAdmissionQueue {
             StdioFrame::Line(line) => match String::from_utf8(line) {
                 Ok(line) => line.trim_end_matches(['\r', '\n']).to_string(),
                 Err(error) => {
-                    self.entries
-                        .push_back(StdioQueuedWork::Response(stdio_jsonrpc_error(
-                            serde_json::Value::Null,
-                            -32700,
-                            format!("Parse error: {error}"),
-                        )));
+                    self.push_response(stdio_jsonrpc_error(
+                        serde_json::Value::Null,
+                        -32700,
+                        format!("Parse error: {error}"),
+                    ));
                     return;
                 }
             },
             StdioFrame::TooLarge(line_bytes) => {
-                self.entries
-                    .push_back(StdioQueuedWork::Response(stdio_frame_too_large_error(
-                        line_bytes,
-                    )));
+                self.push_response(stdio_frame_too_large_error(line_bytes));
                 return;
             }
         };
@@ -374,22 +492,44 @@ impl StdioAdmissionQueue {
             return;
         }
         let id = stdio_message_id(&line);
+        // Both the line and the id it is answered under stay resident, so both
+        // are charged. Charging the line alone would let a frame that is mostly
+        // id retain roughly twice what the cap admits.
+        let bytes = line.len() + id.as_ref().map_or(0, stdio_json_retained_bytes);
         if self.queued_requests >= STDIO_MAX_QUEUED_REQUESTS
-            || self.queued_bytes.saturating_add(line.len()) > STDIO_MAX_QUEUED_BYTES
+            || self.queued_bytes.saturating_add(bytes) > STDIO_MAX_QUEUED_BYTES
         {
-            let overload = stdio_queue_overloaded_error(
+            self.push_response(stdio_queue_overloaded_error(
                 id,
                 self.queued_requests,
                 self.queued_bytes,
                 line.len(),
-            );
-            self.entries.push_back(StdioQueuedWork::Response(overload));
+            ));
             return;
         }
         self.queued_requests += 1;
-        self.queued_bytes += line.len();
+        self.queued_bytes += bytes;
         self.entries
-            .push_back(StdioQueuedWork::Message(StdioQueuedMessage { line, id }));
+            .push_back(StdioQueuedWork::Message(StdioQueuedMessage {
+                line,
+                id,
+                bytes,
+            }));
+    }
+
+    /// Queue a response the transport now owes and charge what it retains.
+    ///
+    /// Refusals are queue entries like any other. Leaving them uncharged is
+    /// what let the cap be reached and then exceeded indefinitely: each frame
+    /// past the cap produced another entry that counted against nothing.
+    fn push_response(&mut self, response: serde_json::Value) {
+        let bytes = stdio_json_retained_bytes(&response);
+        self.queued_bytes = self.queued_bytes.saturating_add(bytes);
+        self.entries
+            .push_back(StdioQueuedWork::Response(StdioQueuedResponse {
+                response,
+                bytes,
+            }));
     }
 
     /// Cancel one request identity.
@@ -401,13 +541,14 @@ impl StdioAdmissionQueue {
             && active.id.as_ref() == Some(target)
         {
             active.cancelled.store(true, Ordering::Release);
+            active.client_cancelled.store(true, Ordering::Release);
         }
-        let mut removed_requests = 0;
         let mut removed_bytes = 0;
+        let mut removed_requests = 0;
         self.entries.retain(|work| match work {
             StdioQueuedWork::Message(message) if message.id.as_ref() == Some(target) => {
                 removed_requests += 1;
-                removed_bytes += message.line.len();
+                removed_bytes += message.bytes;
                 false
             }
             _ => true,
@@ -416,13 +557,27 @@ impl StdioAdmissionQueue {
         self.queued_bytes -= removed_bytes;
     }
 
-    fn pop_front_response(&mut self) -> Option<serde_json::Value> {
-        match self.entries.front() {
-            Some(StdioQueuedWork::Response(_)) => match self.entries.pop_front() {
-                Some(StdioQueuedWork::Response(response)) => Some(response),
-                _ => None,
-            },
-            _ => None,
+    /// Take the next response the transport owes, wherever it sits.
+    ///
+    /// Responses are not ordered against queued requests: a request still in
+    /// the queue has not run, so nothing it will say has been written yet.
+    /// Taking refusals from the middle is what lets them reach the client while
+    /// a long request holds the worker, instead of accumulating behind a full
+    /// queue that cannot dispatch.
+    fn pop_next_response(&mut self) -> Option<serde_json::Value> {
+        let position = self
+            .entries
+            .iter()
+            .position(|work| matches!(work, StdioQueuedWork::Response(_)))?;
+        match self.entries.remove(position) {
+            Some(StdioQueuedWork::Response(response)) => {
+                self.queued_bytes -= response.bytes;
+                Some(response.response)
+            }
+            other => {
+                debug_assert!(other.is_none(), "response position must hold a response");
+                None
+            }
         }
     }
 
@@ -431,7 +586,7 @@ impl StdioAdmissionQueue {
             Some(StdioQueuedWork::Message(_)) => match self.entries.pop_front() {
                 Some(StdioQueuedWork::Message(message)) => {
                     self.queued_requests -= 1;
-                    self.queued_bytes -= message.line.len();
+                    self.queued_bytes -= message.bytes;
                     Some(message)
                 }
                 _ => None,
@@ -447,30 +602,95 @@ impl StdioAdmissionQueue {
     }
 }
 
-fn stdio_message_id(line: &str) -> Option<serde_json::Value> {
-    let message: serde_json::Value = serde_json::from_str(line).ok()?;
-    message.get("id").cloned()
+/// Bytes a retained JSON value costs, measured as its serialized length.
+///
+/// The queue charges every entry with this so the byte cap bounds what the
+/// process is actually holding rather than only the request lines it counted.
+fn stdio_json_retained_bytes(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
+/// The id a frame is answered under, dropped when it is too large to retain.
+///
+/// `None` means the frame is a notification and owes no response. A frame whose
+/// id exceeds `STDIO_MAX_ECHOED_ID_BYTES` still owes one, so it answers under
+/// `Value::Null` rather than pinning a client-sized string in the queue and in
+/// every refusal built from it.
+fn stdio_message_id(line: &str) -> Option<serde_json::Value> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = message.get("id")?;
+    if stdio_json_retained_bytes(id) > STDIO_MAX_ECHOED_ID_BYTES {
+        return Some(serde_json::Value::Null);
+    }
+    Some(id.clone())
+}
+
+/// The request identity a cancellation names, if it names a usable one.
+///
+/// JSON-RPC ids are strings or numbers; anything else cannot match a request
+/// this transport admitted. An id past `STDIO_MAX_ECHOED_ID_BYTES` is not
+/// retained either, and is rejected rather than folded to null: a null target
+/// would cancel every frame whose oversized id was already folded to null.
 fn stdio_cancellation_target_id(line: &str) -> Option<serde_json::Value> {
     let message: serde_json::Value = serde_json::from_str(line).ok()?;
     if message.get("method")?.as_str()? != "notifications/cancelled" {
         return None;
     }
-    message.pointer("/params/requestId").cloned()
+    let target = message.pointer("/params/requestId")?;
+    if !target.is_string() && !target.is_number() {
+        return None;
+    }
+    if stdio_json_retained_bytes(target) > STDIO_MAX_ECHOED_ID_BYTES {
+        return None;
+    }
+    Some(target.clone())
 }
 
+/// Wait for the in-flight request to finish and answer whoever is still owed.
+///
+/// With no `deadline` (stdin closed on its own) the wait is unbounded: nothing
+/// is pressing and the client asked for the answer. With one, the server is
+/// terminating: the handler is told to stop first, the wait ends at the
+/// deadline whether or not it did, and a request that outlived the budget is
+/// answered with the same typed refusal the queued ones get. The abandoned
+/// worker holds the session, but the caller exits the process immediately
+/// after the drain, so nothing observes it again.
 async fn finish_active_stdio_request<W: AsyncWrite + Unpin>(
-    active: ActiveStdioRequest,
+    mut active: ActiveStdioRequest,
     session: &mut Option<StdioServerSession>,
     stdout: &mut W,
+    deadline: Option<Instant>,
 ) -> Result<()> {
-    let completed = active.task.await.context("stdio request worker failed")?;
+    let completed = match deadline {
+        None => Some(active.task.await.context("stdio request worker failed")?),
+        Some(deadline) => {
+            active.cancelled.store(true, Ordering::Release);
+            match stdio_before(deadline, &mut active.task).await {
+                Some(completed) => Some(completed.context("stdio request worker failed")?),
+                None => None,
+            }
+        }
+    };
+    let Some(completed) = completed else {
+        if let Some(id) = active.id.clone()
+            && !active.client_cancelled.load(Ordering::Acquire)
+        {
+            let refusal = stdio_server_terminating_error(id);
+            let deadline = deadline.expect("an unbounded wait always completes");
+            let _ = stdio_before(deadline, write_stdio_response(stdout, &refusal)).await;
+        }
+        return Ok(());
+    };
     *session = Some(completed.0);
-    if !active.cancelled.load(Ordering::Acquire)
+    if !active.client_cancelled.load(Ordering::Acquire)
         && let Some(response) = stdio_request_response(completed.1, active.id.as_ref())
     {
-        write_stdio_response(stdout, &response).await?;
+        match deadline {
+            None => write_stdio_response(stdout, &response).await?,
+            Some(deadline) => {
+                let _ = stdio_before(deadline, write_stdio_response(stdout, &response)).await;
+            }
+        }
     }
     Ok(())
 }
@@ -573,6 +793,10 @@ fn stdio_queue_overloaded_error(
             "code": "stdio_queue_overloaded",
             "max_queued_requests": STDIO_MAX_QUEUED_REQUESTS,
             "max_queued_bytes": STDIO_MAX_QUEUED_BYTES,
+            // A refused frame whose id was longer than this is answered under a
+            // null id: the transport will not retain a client-sized id per
+            // refusal, so the client cannot correlate one by id alone.
+            "max_echoed_id_bytes": STDIO_MAX_ECHOED_ID_BYTES,
             "queued_requests": queued_requests,
             "queued_bytes": queued_bytes,
             "request_bytes": request_bytes,
@@ -913,12 +1137,19 @@ impl StdioServerSession {
     /// is cancelled and dropped rather than reused; its seed is kept so the
     /// next request that selects the project rebuilds it. Retained projects are
     /// untouched.
+    ///
+    /// Order matters: the context leaves the session and the seed is recorded
+    /// *before* any teardown runs. Teardown is the fallible part — it waits on
+    /// a coordinator the panic may have poisoned and drops services that can
+    /// fail — and doing it first would risk unwinding out of here with the
+    /// poisoned context still reachable.
     fn evict_panicked_project(&mut self) {
         let Some(active) = self.active_project.take() else {
             return;
         };
-        active.runtime.activation.cancel_and_wait();
-        self.tainted_project = Some(active.seed);
+        let StdioProjectSession { runtime, seed, .. } = active;
+        self.tainted_project = Some(seed);
+        release_panicked_stdio_context(runtime);
     }
 
     fn select_tool_project(&mut self, request: &serde_json::Value) -> Result<()> {
@@ -1045,6 +1276,66 @@ impl StdioServerSession {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Force the next panic recovery on this thread to fail.
+    ///
+    /// Recovery reaches into the runtime the panicking request was unwinding
+    /// through — a coordinator it may have poisoned, services whose teardown
+    /// can fail. Only a test can stage that, so the failure is staged here
+    /// rather than left unproven.
+    static STDIO_PANIC_RECOVERY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_staged_stdio_panic_recovery() {
+    assert!(
+        !STDIO_PANIC_RECOVERY_FAULT.with(|staged| staged.replace(false)),
+        "staged stdio panic-recovery fault"
+    );
+}
+
+#[cfg(not(test))]
+#[inline]
+fn fail_staged_stdio_panic_recovery() {}
+
+/// Tear down a context that panic recovery released.
+///
+/// On the request path the wait is bounded and cannot panic: the activation is
+/// cancelled and awaited only inside `STDIO_PANIC_EVICTION_BUDGET`, through a
+/// wait that reads a poisoned coordinator rather than asserting on it. Waiting
+/// at all keeps the common case ordered — the released context has let go of
+/// the project's storage before the next request rebuilds it there.
+///
+/// An activation still running past the budget (an indexing pass that has not
+/// yet noticed cancellation) is handed to a detached thread, so the recovering
+/// request returns now and a teardown that blocks or panics ends only that
+/// thread. If the thread cannot be spawned the context is dropped here instead,
+/// which is what the closure's own drop does; the recovery boundary in
+/// `run_stdio_request` covers that last case.
+fn release_panicked_stdio_context(runtime: RuntimeContext) {
+    fail_staged_stdio_panic_recovery();
+    if runtime
+        .activation
+        .cancel_and_wait_timeout(STDIO_PANIC_EVICTION_BUDGET)
+    {
+        return;
+    }
+    if let Err(error) = thread::Builder::new()
+        .name("codestory-stdio-release".to_string())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                runtime
+                    .activation
+                    .cancel_and_wait_timeout(STDIO_DETACHED_EVICTION_BUDGET);
+                drop(runtime);
+            }));
+        })
+    {
+        eprintln!("stdio_panic_recovery detached_teardown_unavailable error={error}");
     }
 }
 
@@ -6320,10 +6611,17 @@ mod tests {
         let mut queued = StdioAdmissionQueue::default();
         let first = r#"{"jsonrpc":"2.0","id":"request-1","method":"tools/call"}"#;
         let second = r#"{"jsonrpc":"2.0","id":"request-2","method":"tools/call"}"#;
+        // A queued request retains its line and the id it will be answered
+        // under, and is charged for both.
+        let charge = |line: &str, id: &str| line.len() + stdio_json_retained_bytes(&json!(id));
         queued.admit(stdio_request_line(first), None);
         queued.admit(stdio_request_line(second), None);
         assert_eq!(queued.queued_requests, 2);
-        assert_eq!(queued.queued_bytes, first.len() + second.len());
+        assert_eq!(
+            queued.queued_bytes,
+            charge(first, "request-1") + charge(second, "request-2")
+        );
+        assert_eq!(queued.queued_bytes, queued_retained_bytes(&queued));
 
         queued.admit(stdio_cancellation_line(r#""request-1""#), None);
 
@@ -6336,7 +6634,7 @@ mod tests {
         assert_eq!(queued.queued_requests, 1);
         assert_eq!(
             queued.queued_bytes,
-            second.len(),
+            charge(second, "request-2"),
             "removing a cancelled request must return its admission budget"
         );
     }
@@ -6345,9 +6643,11 @@ mod tests {
     async fn stdio_cancellation_marks_the_active_request() {
         let mut queued = StdioAdmissionQueue::default();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let client_cancelled = Arc::new(AtomicBool::new(false));
         let active = ActiveStdioRequest {
             id: Some(json!("request-1")),
             cancelled: Arc::clone(&cancelled),
+            client_cancelled: Arc::clone(&client_cancelled),
             task: tokio::task::spawn_blocking(|| {
                 (
                     StdioServerSession::new(None),
@@ -6363,6 +6663,10 @@ mod tests {
             cancelled.load(Ordering::Acquire),
             "the running request must observe its own cancellation"
         );
+        assert!(
+            client_cancelled.load(Ordering::Acquire),
+            "a client-cancelled request is owed no response"
+        );
         active.task.await.expect("worker");
     }
 
@@ -6376,6 +6680,20 @@ mod tests {
             Some(json!("7")),
             "a string request id must not cancel the numeric request with the same digits"
         );
+    }
+
+    fn queued_rejection(queued: &StdioAdmissionQueue) -> serde_json::Value {
+        match queued.entries.back().expect("rejection queued") {
+            StdioQueuedWork::Response(response) => response.response.clone(),
+            StdioQueuedWork::Message(message) => {
+                panic!("unexpected admitted message: {}", message.line)
+            }
+        }
+    }
+
+    /// Bytes the queue holds, summed from the entries rather than the counter.
+    fn queued_retained_bytes(queued: &StdioAdmissionQueue) -> usize {
+        queued.entries.iter().map(StdioQueuedWork::bytes).sum()
     }
 
     #[test]
@@ -6401,12 +6719,7 @@ mod tests {
             queued.queued_requests, STDIO_MAX_QUEUED_REQUESTS,
             "an overloaded queue must not admit more work"
         );
-        let rejection = match queued.entries.back().expect("rejection queued") {
-            StdioQueuedWork::Response(response) => response.clone(),
-            StdioQueuedWork::Message(message) => {
-                panic!("unexpected admitted message: {}", message.line)
-            }
-        };
+        let rejection = queued_rejection(&queued);
         assert_eq!(rejection["id"], json!("over"));
         assert_eq!(rejection["error"]["code"], json!(-32000));
         assert_eq!(
@@ -6429,19 +6742,15 @@ mod tests {
         }
         assert_eq!(queued.queued_requests, 8);
         assert_eq!(queued.queued_bytes, STDIO_MAX_QUEUED_BYTES);
+        let admitted_bytes = queued.queued_bytes;
 
         queued.admit(StdioFrame::Line(vec![b'x'; 1]), None);
 
         assert_eq!(
-            queued.queued_bytes, STDIO_MAX_QUEUED_BYTES,
+            queued.queued_requests, 8,
             "the byte cap must hold even when the request cap has room"
         );
-        let rejection = match queued.entries.back().expect("rejection queued") {
-            StdioQueuedWork::Response(response) => response.clone(),
-            StdioQueuedWork::Message(message) => {
-                panic!("unexpected admitted message: {}", message.line)
-            }
-        };
+        let rejection = queued_rejection(&queued);
         assert_eq!(
             rejection["error"]["data"]["code"],
             json!("stdio_queue_overloaded")
@@ -6450,6 +6759,161 @@ mod tests {
             rejection["error"]["data"]["queued_bytes"],
             json!(STDIO_MAX_QUEUED_BYTES)
         );
+        // The refused line was not admitted; the only growth is the refusal the
+        // transport now owes, and that refusal is charged like any other entry.
+        assert_eq!(
+            queued.queued_bytes,
+            queued_retained_bytes(&queued),
+            "the byte counter must match what the entries actually hold"
+        );
+        assert_eq!(
+            queued.queued_bytes - admitted_bytes,
+            stdio_json_retained_bytes(&rejection),
+            "a refusal costs its own size and nothing more"
+        );
+    }
+
+    #[test]
+    fn stdio_admission_does_not_retain_an_oversized_client_id() {
+        let oversized = "z".repeat(STDIO_MAX_ECHOED_ID_BYTES + 1);
+        assert_eq!(
+            stdio_message_id(&format!(
+                r#"{{"jsonrpc":"2.0","id":"{oversized}","method":"tools/call"}}"#
+            )),
+            Some(json!(null)),
+            "an id larger than the transport will retain must be dropped, not echoed"
+        );
+        assert_eq!(
+            stdio_message_id(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#),
+            Some(json!(7)),
+            "an ordinary id is still answered under itself"
+        );
+        assert_eq!(
+            stdio_message_id(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            None,
+            "a notification still owes no response"
+        );
+        assert_eq!(
+            stdio_cancellation_target_id(&format!(
+                r#"{{"method":"notifications/cancelled","params":{{"requestId":"{oversized}"}}}}"#
+            )),
+            None,
+            "an oversized cancellation target must not collapse onto every dropped id"
+        );
+        assert_eq!(
+            stdio_cancellation_target_id(
+                r#"{"method":"notifications/cancelled","params":{"requestId":null}}"#
+            ),
+            None,
+            "a null target is not a request identity this transport ever admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_admission_bounds_retained_memory_under_pipelined_overload() {
+        // The reachable state the cap exists for: one long request holds the
+        // single worker, the queue is already at its request cap so nothing can
+        // dispatch, and the client keeps pipelining frames whose ids are as
+        // large as a frame allows.
+        let released = Arc::new(AtomicBool::new(false));
+        let worker_released = Arc::clone(&released);
+        let active = ActiveStdioRequest {
+            id: Some(json!("long-running")),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            client_cancelled: Arc::new(AtomicBool::new(false)),
+            task: tokio::task::spawn_blocking(move || {
+                while !worker_released.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (
+                    StdioServerSession::new(None),
+                    StdioRequestOutcome::Completed(None),
+                )
+            }),
+        };
+        let mut queued = StdioAdmissionQueue::default();
+        // Everything is observed first and asserted after the worker is freed:
+        // a failing assertion must not strand a blocking task the test runtime
+        // would then wait on forever.
+        for index in 0..STDIO_MAX_QUEUED_REQUESTS {
+            queued.admit(
+                stdio_request_line(&format!(
+                    r#"{{"jsonrpc":"2.0","id":{index},"method":"tools/call"}}"#
+                )),
+                Some(&active),
+            );
+        }
+        let filled_requests = queued.queued_requests;
+        let capped_bytes = queued.queued_bytes;
+
+        const REFUSED_FRAMES: usize = 64;
+        let oversized_id = "i".repeat(STDIO_MAX_FRAME_BYTES / 2);
+        let mut flushed = Vec::new();
+        for _ in 0..REFUSED_FRAMES {
+            queued.admit(
+                stdio_request_line(&format!(
+                    r#"{{"jsonrpc":"2.0","id":"{oversized_id}","method":"tools/call"}}"#
+                )),
+                Some(&active),
+            );
+            // The serve loop writes everything it owes before it reads the next
+            // frame, so the queue is exercised the way the loop drives it.
+            while let Some(response) = queued.pop_next_response() {
+                write_stdio_response(&mut flushed, &response)
+                    .await
+                    .expect("flush refusal");
+            }
+        }
+
+        let final_requests = queued.queued_requests;
+        let final_entries = queued.entries.len();
+        let final_bytes = queued.queued_bytes;
+        let summed_bytes = queued_retained_bytes(&queued);
+        let refusals = stdio_written_responses(&flushed);
+        released.store(true, Ordering::Release);
+        active.task.await.expect("worker");
+
+        assert_eq!(
+            filled_requests, STDIO_MAX_QUEUED_REQUESTS,
+            "the queue must reach its request cap before the overload starts"
+        );
+        assert_eq!(
+            final_requests, STDIO_MAX_QUEUED_REQUESTS,
+            "an overloaded queue must not admit more work"
+        );
+        assert_eq!(
+            final_entries, STDIO_MAX_QUEUED_REQUESTS,
+            "a refusal must not stay resident behind a queue that cannot dispatch"
+        );
+        assert_eq!(
+            final_bytes, capped_bytes,
+            "{REFUSED_FRAMES} refused frames must leave the queue exactly as large as the cap allows"
+        );
+        assert_eq!(
+            final_bytes, summed_bytes,
+            "the byte counter must match what the entries actually hold"
+        );
+        assert_eq!(
+            refusals.len(),
+            REFUSED_FRAMES,
+            "every refused frame must reach the client while the long request is still running"
+        );
+        for refusal in &refusals {
+            assert_eq!(
+                refusal["error"]["data"]["code"],
+                json!("stdio_queue_overloaded")
+            );
+            assert_eq!(
+                refusal["id"],
+                json!(null),
+                "an id too large to retain must not be echoed back"
+            );
+            let refusal_bytes = stdio_json_retained_bytes(refusal);
+            assert!(
+                refusal_bytes <= 4 * STDIO_MAX_ECHOED_ID_BYTES,
+                "a refusal must stay small, not scale with the client's id: {refusal_bytes} bytes"
+            );
+        }
     }
 
     fn stdio_multi_project_startup(cache: &Path) -> crate::config::CliStartupConfig {
@@ -6593,6 +7057,114 @@ mod tests {
         assert!(session.tainted_project.is_none());
     }
 
+    #[test]
+    fn stdio_panic_recovery_failure_stays_inside_the_containment_boundary() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("inspect runtime");
+        let mut session = StdioServerSession::new(Some(runtime));
+        // Recovery touches the runtime the handler was unwinding through, so it
+        // can fail the same way the handler did.
+        STDIO_PANIC_RECOVERY_FAULT.with(|staged| staged.set(true));
+
+        let outcome = run_stdio_request(
+            &mut session,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+            &Arc::new(AtomicBool::new(false)),
+            panicking_stdio_handler,
+        );
+
+        assert!(
+            !STDIO_PANIC_RECOVERY_FAULT.with(std::cell::Cell::get),
+            "the staged recovery failure must have been reached"
+        );
+        assert!(
+            matches!(outcome, StdioRequestOutcome::Panicked),
+            "a recovery that fails must still answer the request it contained"
+        );
+        assert!(
+            session.active_project.is_none(),
+            "the context must leave the session before any teardown that can fail"
+        );
+        assert!(
+            session.tainted_project.is_some(),
+            "a context released by a failed recovery must still be rebuilt before reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_termination_cancels_and_bounds_a_request_that_will_not_stop() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static OBSERVED_CANCELLATION: AtomicBool = AtomicBool::new(false);
+        fn handler(
+            _: &mut StdioServerSession,
+            _: &str,
+            cancelled: &Arc<AtomicBool>,
+        ) -> Option<serde_json::Value> {
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) {
+                    OBSERVED_CANCELLATION.store(true, Ordering::Release);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Some(json!({"unreachable": true}))
+        }
+
+        let (mut client, server) = tokio::io::duplex(256);
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"stuck\",\"method\":\"tools/call\"}\n")
+            .await
+            .expect("write request");
+        client.flush().await.expect("flush request");
+        let mut output = Vec::new();
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(20),
+            serve_stdio_requests(
+                StdioServerSession::new(None),
+                BufReader::new(server),
+                &mut output,
+                async {
+                    while !ENTERED.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                },
+                handler,
+                Duration::from_millis(200),
+            ),
+        )
+        .await;
+        // Read the flag and free the worker before asserting, so a failing
+        // assertion cannot leave a blocking task the runtime will wait on.
+        let observed_cancellation = OBSERVED_CANCELLATION.load(Ordering::Acquire);
+        RELEASE.store(true, Ordering::Release);
+
+        let outcome = served
+            .expect("a terminating drain must end inside its budget, not wait on the request")
+            .expect("termination ends the serve loop cleanly");
+        assert_eq!(outcome, StdioServeOutcome::Terminated);
+        assert!(
+            observed_cancellation,
+            "termination must tell the in-flight request to stop before it gives up on it"
+        );
+
+        let responses = stdio_written_responses(&output);
+        assert_eq!(responses.len(), 1, "{responses:?}");
+        assert_eq!(responses[0]["id"], json!("stuck"));
+        assert_eq!(
+            responses[0]["error"]["data"]["code"],
+            json!("stdio_server_terminating"),
+            "a request abandoned at the deadline is still owed an answer"
+        );
+        drop(client);
+    }
+
     #[tokio::test]
     async fn stdio_serve_loop_answers_a_panicked_request_and_keeps_serving() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -6624,6 +7196,7 @@ mod tests {
             &mut output,
             std::future::pending::<()>(),
             handler,
+            STDIO_TERMINATION_DRAIN_BUDGET,
         )
         .await
         .expect("a panicking request must not end the serve loop");
@@ -6659,6 +7232,7 @@ mod tests {
             &mut output,
             std::future::ready(()),
             handler,
+            STDIO_TERMINATION_DRAIN_BUDGET,
         )
         .await
         .expect("termination ends the serve loop cleanly");
@@ -6705,6 +7279,7 @@ mod tests {
                 }
             },
             handler,
+            STDIO_TERMINATION_DRAIN_BUDGET,
         )
         .await
         .expect("termination drains the running request");
@@ -6736,9 +7311,12 @@ mod tests {
         queued.admit(StdioFrame::TooLarge(STDIO_MAX_FRAME_BYTES + 1), None);
         let mut output = Vec::new();
 
-        drain_terminating_stdio_queue(&mut queued, &mut output)
-            .await
-            .expect("drain admitted work");
+        drain_terminating_stdio_queue(
+            &mut queued,
+            &mut output,
+            Instant::now() + STDIO_TERMINATION_DRAIN_BUDGET,
+        )
+        .await;
 
         let responses = stdio_written_responses(&output);
         assert_eq!(

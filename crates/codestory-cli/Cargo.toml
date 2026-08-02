@@ -30,8 +30,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `signal` lets the stdio serve loop drain on SIGTERM instead of relying on a
-# stdin EOF the host may never send.
-tokio = { workspace = true, features = ["signal"] }
+# stdin EOF the host may never send; `time` bounds that drain so a host which
+# stops reading stdout cannot hold the process past its own kill deadline.
+tokio = { workspace = true, features = ["signal", "time"] }
 toml = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }
