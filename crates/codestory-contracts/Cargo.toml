@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
+fs4 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -13,3 +14,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 serde_with = { workspace = true }
 specta = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

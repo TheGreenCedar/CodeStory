@@ -7,7 +7,7 @@
 //! launcher.
 
 use anyhow::{Context, Result, bail};
-use fs4::fs_std::FileExt;
+use codestory_contracts::bounded_locks::{self, FileLockKind};
 use serde_json::{Map, Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -55,6 +55,18 @@ pub(crate) fn install_process_diagnostics() {
         let _ = Registry::default().with(layer).try_init();
     }
     install_panic_hook();
+    install_activation_fail_stop_hook();
+}
+
+/// A cancelled activation worker that never reaches a quiescent boundary may
+/// still hold a publication or store lock. Detaching it and serving on would
+/// let owned mutation continue behind an evicted context, so the hosting
+/// process records evidence and stops.
+fn install_activation_fail_stop_hook() {
+    codestory_runtime::set_activation_fail_stop_hook(Some(Arc::new(|reason_code: &str| {
+        record_fail_stop(reason_code);
+        std::process::abort();
+    })));
 }
 
 pub(crate) fn record_command_failure(error: &anyhow::Error) {
@@ -236,11 +248,13 @@ impl DiagnosticSink {
         ensure_private_directory(&directory)?;
         let lock_path = directory.join(LOCK_FILE);
         let lock = open_private_file(&lock_path, false, false)?;
-        if !FileExt::try_lock_exclusive(&lock).context("lock diagnostic log")? {
+        if !bounded_locks::try_acquire(&lock, FileLockKind::Exclusive)
+            .context("lock diagnostic log")?
+        {
             return self.append_emergency_line(encoded);
         }
         let result = self.append_locked_line(encoded);
-        let _ = FileExt::unlock(&lock);
+        let _ = bounded_locks::release(&lock);
         result
     }
 
@@ -298,7 +312,7 @@ fn write_bounded_slot(
     let slot_lock_path = directory.join(format!(".{stem}-{slot:02}.lock"));
     refuse_symlink(&slot_lock_path)?;
     let slot_lock = open_private_file(&slot_lock_path, false, false)?;
-    if !FileExt::try_lock_exclusive(&slot_lock)
+    if !bounded_locks::try_acquire(&slot_lock, FileLockKind::Exclusive)
         .with_context(|| format!("lock bounded {stem} evidence slot"))?
     {
         bail!("bounded {stem} evidence slot is busy");
@@ -318,7 +332,7 @@ fn write_bounded_slot(
         sync_directory(directory)?;
         Ok(destination)
     })();
-    let _ = FileExt::unlock(&slot_lock);
+    let _ = bounded_locks::release(&slot_lock);
     result
 }
 
@@ -467,7 +481,9 @@ fn bounded_text(value: &str) -> String {
 
 fn safe_reason_code(value: &str) -> String {
     match value {
-        "embedding_engine_stalled" | "embedding_qualification_crash" => value.to_string(),
+        "embedding_engine_stalled"
+        | "embedding_qualification_crash"
+        | codestory_runtime::ACTIVATION_QUIESCENCE_FAIL_STOP => value.to_string(),
         _ => "unknown_fail_stop".into(),
     }
 }
@@ -802,7 +818,12 @@ mod tests {
         ensure_private_directory(&sink.diagnostics_dir())?;
         let lock_path = sink.diagnostics_dir().join(LOCK_FILE);
         let lock = open_private_file(&lock_path, false, false)?;
-        FileExt::lock_exclusive(&lock)?;
+        bounded_locks::acquire_with_deadline(
+            &lock,
+            FileLockKind::Exclusive,
+            bounded_locks::LockDeadline::immediate(),
+            None,
+        )?;
         for index in 0..(EMERGENCY_LOG_SLOTS * 3) {
             sink.write_record(json!({
                 "event": "lock_contention",
@@ -810,7 +831,7 @@ mod tests {
                 "index": index,
             }))?;
         }
-        FileExt::unlock(&lock)?;
+        bounded_locks::release(&lock)?;
 
         let files = evidence_files(&sink.diagnostics_dir(), "emergency-", ".jsonl")?;
         assert!(files.len() <= EMERGENCY_LOG_SLOTS);
@@ -849,6 +870,10 @@ mod tests {
             "embedding_qualification_crash"
         );
         assert_eq!(
+            safe_reason_code(codestory_runtime::ACTIVATION_QUIESCENCE_FAIL_STOP),
+            "activation_quiescence_timeout"
+        );
+        assert_eq!(
             safe_reason_code("unlabeled_private_query"),
             "unknown_fail_stop"
         );
@@ -859,7 +884,12 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let lock_path = directory.path().join(".emergency-00.lock");
         let lock = open_private_file(&lock_path, false, false)?;
-        FileExt::lock_exclusive(&lock)?;
+        bounded_locks::acquire_with_deadline(
+            &lock,
+            FileLockKind::Exclusive,
+            bounded_locks::LockDeadline::immediate(),
+            None,
+        )?;
 
         let error = write_bounded_slot(
             directory.path(),
@@ -872,7 +902,7 @@ mod tests {
         assert!(error.to_string().contains("slot is busy"));
         assert!(!directory.path().join("emergency-00.jsonl").exists());
         assert!(!directory.path().join(".emergency-00.tmp").exists());
-        FileExt::unlock(&lock)?;
+        bounded_locks::release(&lock)?;
         Ok(())
     }
 

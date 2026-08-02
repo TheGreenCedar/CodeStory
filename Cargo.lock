@@ -580,10 +580,12 @@ version = "0.16.3"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "fs4",
  "serde",
  "serde_json",
  "serde_with",
  "specta",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "uuid",
@@ -635,6 +637,7 @@ dependencies = [
 name = "codestory-llama-sys"
 version = "0.16.3"
 dependencies = [
+ "codestory-contracts",
  "crossbeam-channel",
  "fs4",
  "llama-cpp-2",
@@ -657,7 +660,6 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "directories",
- "fs4",
  "libc",
  "rusqlite",
  "serde",
@@ -702,7 +704,6 @@ version = "0.16.3"
 dependencies = [
  "anyhow",
  "codestory-contracts",
- "fs4",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -719,7 +720,6 @@ version = "0.16.3"
 dependencies = [
  "anyhow",
  "codestory-contracts",
- "fs4",
  "fs_at",
  "gix",
  "glob",

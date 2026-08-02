@@ -1,5 +1,5 @@
 use super::{
-    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, EnvGuard, FileExt,
+    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, EnvGuard,
     GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
     IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
@@ -22,6 +22,7 @@ use super::{
     test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
+use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
 fn semantic_doc_text_alias_modes_are_switchable_for_research() {
@@ -1752,14 +1753,21 @@ fn search_generation_retention_keeps_active_and_one_verified_rollback() {
         .write(true)
         .open(&partial_lock_path)
         .expect("open second durable lock handle");
-    assert!(FileExt::try_lock_exclusive(&first_lock).expect("lock first handle"));
     assert!(
-        !FileExt::try_lock_exclusive(&second_lock).expect("contend second handle"),
+        bounded_locks::try_acquire(&first_lock, FileLockKind::Exclusive)
+            .expect("lock first handle")
+    );
+    assert!(
+        !bounded_locks::try_acquire(&second_lock, FileLockKind::Exclusive)
+            .expect("contend second handle"),
         "both handles must coordinate through the same durable lock file"
     );
-    FileExt::unlock(&first_lock).expect("unlock first handle");
-    assert!(FileExt::try_lock_exclusive(&second_lock).expect("lock second handle after release"));
-    FileExt::unlock(&second_lock).expect("unlock second handle");
+    bounded_locks::release(&first_lock).expect("unlock first handle");
+    assert!(
+        bounded_locks::try_acquire(&second_lock, FileLockKind::Exclusive)
+            .expect("lock second handle after release")
+    );
+    bounded_locks::release(&second_lock).expect("unlock second handle");
     assert!(
         search_index_generation_root(&storage_path)
             .join(ids[0])

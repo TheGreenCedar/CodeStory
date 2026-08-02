@@ -29,6 +29,9 @@ use codestory_contracts::api::{
     StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
     WorkspaceMemberIndexDto,
 };
+use codestory_contracts::bounded_locks::{
+    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+};
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
     LanguageSupportProfile, language_support_profile_for_ext,
@@ -52,7 +55,6 @@ use codestory_workspace::{
     WorkspaceManifest, WorkspacePathIdentity,
 };
 use crossbeam_channel::{Receiver, Sender};
-use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -354,11 +356,12 @@ use semantic_doc_text::{
 #[doc(hidden)]
 pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
-    ActivationCapabilities, ActivationCapabilityState, ActivationOperation, ActivationRun,
+    ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
+    ActivationFailStopHook, ActivationOperation, ActivationQuiescence, ActivationRun,
     ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
-    TrailService, embedding_api_error,
+    TrailService, embedding_api_error, set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -370,6 +373,7 @@ pub use target_resolution::{
     prefer_function_body_target,
 };
 
+pub(crate) use services::active_public_operation_cancellation;
 pub(crate) use support::{
     FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
     SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches, clamp_i64_to_u32, clamp_u64_to_u32,

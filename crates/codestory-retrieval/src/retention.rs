@@ -2,13 +2,17 @@
 
 use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
+use codestory_contracts::bounded_locks::{
+    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT,
+    acquire_with_deadline,
+};
 use codestory_store::{RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 const RETENTION_SCHEMA_VERSION: u32 = 1;
 const RETENTION_DIR: &str = "retention";
@@ -67,39 +71,68 @@ impl GenerationRetentionMarker {
     }
 }
 
+#[derive(Debug)]
 pub struct GenerationRetentionLock {
     file: File,
 }
 
 impl GenerationRetentionLock {
+    /// Exclusive retention lock for a publication or cleanup pass. Only
+    /// background workers take it, so it carries the longer publication
+    /// budget rather than the foreground one.
     pub fn acquire(state_file: &Path, scope_id: &str) -> Result<Self> {
-        Self::acquire_with_mode(state_file, scope_id, false)
+        Self::acquire_bounded(
+            state_file,
+            scope_id,
+            FileLockKind::Exclusive,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            None,
+        )
     }
 
     pub fn acquire_shared(state_file: &Path, scope_id: &str) -> Result<Self> {
-        Self::acquire_with_mode(state_file, scope_id, true)
+        Self::acquire_bounded(
+            state_file,
+            scope_id,
+            FileLockKind::Shared,
+            LockDeadline::after(DEFAULT_LOCK_WAIT),
+            None,
+        )
     }
 
     pub fn try_acquire_shared(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
-        let path = retention_lock_path(state_file, scope_id)?;
-        ensure_retention_dir(state_file)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("open generation retention lock {}", path.display()))?;
-        match FileExt::try_lock_shared(&file) {
+        let (path, file) = Self::open_lock_file(state_file, scope_id)?;
+        match bounded_locks::try_acquire(&file, FileLockKind::Shared) {
             Ok(true) => Ok(Some(Self { file })),
             Ok(false) => Ok(None),
-            Err(error) => Err(error).with_context(|| {
+            Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
                 format!("try lock shared generation retention {}", path.display())
             }),
         }
     }
 
-    fn acquire_with_mode(state_file: &Path, scope_id: &str, shared: bool) -> Result<Self> {
+    /// Every blocking retention acquisition goes through one absolute deadline:
+    /// a sibling publication holding this lock must never be able to stall an
+    /// unrelated query, eviction, or shutdown for longer than the caller's
+    /// budget.
+    pub fn acquire_bounded(
+        state_file: &Path,
+        scope_id: &str,
+        kind: FileLockKind,
+        deadline: LockDeadline,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self> {
+        let (path, file) = Self::open_lock_file(state_file, scope_id)?;
+        acquire_with_deadline(&file, kind, deadline, cancel).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "acquire {kind} generation retention {}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+
+    fn open_lock_file(state_file: &Path, scope_id: &str) -> Result<(PathBuf, File)> {
         let path = retention_lock_path(state_file, scope_id)?;
         ensure_retention_dir(state_file)?;
         let file = OpenOptions::new()
@@ -109,20 +142,13 @@ impl GenerationRetentionLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open generation retention lock {}", path.display()))?;
-        if shared {
-            FileExt::lock_shared(&file)
-                .with_context(|| format!("lock shared generation retention {}", path.display()))?;
-        } else {
-            FileExt::lock_exclusive(&file)
-                .with_context(|| format!("lock generation retention {}", path.display()))?;
-        }
-        Ok(Self { file })
+        Ok((path, file))
     }
 }
 
 impl Drop for GenerationRetentionLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = bounded_locks::release(&self.file);
     }
 }
 
@@ -1219,6 +1245,7 @@ fn directory_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn manifest(project_id: &str, suffix: &str, built_at_epoch_ms: i64) -> RetrievalIndexManifest {
@@ -1742,5 +1769,85 @@ mod tests {
         assert_eq!(scan.active.len(), 1);
         assert_eq!(scan.errors.len(), 1);
         assert!(scan.errors[0].contains("bad.json"));
+    }
+
+    /// A second OS process holds the retention lock for longer than the
+    /// caller's budget. Before bounded acquisition the caller blocked in
+    /// `flock` for the holder's whole lifetime, so an eviction or shutdown
+    /// waiting behind a routine sibling publication never returned.
+    #[test]
+    fn a_second_process_holding_the_retention_lock_cannot_outlive_the_caller_budget() {
+        const HOLD_ENV: &str = "CODESTORY_TEST_HOLD_RETENTION_LOCK";
+        const HOLD_MS_ENV: &str = "CODESTORY_TEST_HOLD_RETENTION_LOCK_MS";
+        const READY_ENV: &str = "CODESTORY_TEST_HOLD_RETENTION_LOCK_READY";
+
+        if let Some(state_file) = std::env::var_os(HOLD_ENV) {
+            let state_file = PathBuf::from(state_file);
+            let lock = GenerationRetentionLock::acquire(&state_file, "held_scope")
+                .expect("child acquires the retention lock");
+            std::fs::write(
+                PathBuf::from(std::env::var_os(READY_ENV).expect("ready marker path")),
+                b"held",
+            )
+            .expect("publish holder readiness");
+            let hold_ms: u64 = std::env::var(HOLD_MS_ENV)
+                .expect("hold budget")
+                .parse()
+                .expect("numeric hold budget");
+            std::thread::sleep(Duration::from_millis(hold_ms));
+            drop(lock);
+            return;
+        }
+
+        let root = tempdir().expect("root");
+        let state_file = root.path().join("retrieval-sidecars.json");
+        let ready = root.path().join("holder.ready");
+        let mut holder = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        )
+        .arg("--exact")
+        .arg("retention::tests::a_second_process_holding_the_retention_lock_cannot_outlive_the_caller_budget")
+        .arg("--nocapture")
+        .env(HOLD_ENV, &state_file)
+        .env(READY_ENV, &ready)
+        .env(HOLD_MS_ENV, "5000")
+        .spawn()
+        .expect("spawn holder process");
+
+        let holder_deadline = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && Instant::now() < holder_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the holder process never took the lock");
+
+        let started = Instant::now();
+        let error = GenerationRetentionLock::acquire_bounded(
+            &state_file,
+            "held_scope",
+            FileLockKind::Exclusive,
+            LockDeadline::after(Duration::from_millis(250)),
+            None,
+        )
+        .expect_err("a cross-process holder must not block the caller");
+        let waited = started.elapsed();
+
+        assert!(
+            error
+                .to_string()
+                .contains("acquire exclusive generation retention"),
+            "the refusal must name the contended lock: {error:#}"
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("lock_wait_timeout")),
+            "the refusal must carry the typed timeout code: {error:#}"
+        );
+        assert!(
+            waited < Duration::from_secs(3),
+            "acquisition waited {waited:?}, far past its 250 ms budget"
+        );
+
+        holder.wait().expect("holder process exits");
     }
 }

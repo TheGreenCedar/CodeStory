@@ -10,7 +10,6 @@ test-support = []
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
 fs_at = { workspace = true }
-fs4 = { workspace = true }
 glob = { workspace = true }
 gix = { workspace = true }
 ignore = { workspace = true }

@@ -19,7 +19,7 @@ use identities::{
     test_transport_identity,
 };
 use server_fixtures::{PollingStream, WatchdogTransport};
-use transport_fixtures::{MemoryStream, TestClock};
+use transport_fixtures::{MemoryStream, TestClock, TricklePeerStream};
 
 mod lazy_transport {
     use super::super::client::LazyClientTransport;

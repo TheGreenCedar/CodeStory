@@ -165,6 +165,90 @@ impl EmbeddingServerStream for MemoryStream {
     }
 }
 
+/// A peer that answers every read with one byte after stalling just short of
+/// the armed socket timeout.
+///
+/// Socket timeouts restart per syscall, so this peer used to hold the caller
+/// for as long as it liked: no single `read` ever timed out. It exists to
+/// prove the exchange as a whole is bounded by one absolute deadline.
+pub(super) struct TricklePeerStream {
+    pub(super) identity: EmbeddingTransportIdentity,
+    pub(super) input: Cursor<Vec<u8>>,
+    pub(super) clock: Arc<TestClock>,
+    pub(super) stall: Duration,
+    pub(super) output: Arc<Mutex<Vec<u8>>>,
+    pub(super) read_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+}
+
+impl TricklePeerStream {
+    pub(super) fn new(input: Vec<u8>, clock: Arc<TestClock>, stall: Duration) -> Self {
+        Self {
+            identity: test_transport_identity(),
+            input: Cursor::new(input),
+            clock,
+            stall,
+            output: Arc::new(Mutex::new(Vec::new())),
+            read_timeouts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(super) fn read_timeouts(&self) -> Arc<Mutex<Vec<Option<Duration>>>> {
+        Arc::clone(&self.read_timeouts)
+    }
+}
+
+impl Read for TricklePeerStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        // The peer waits, then delivers exactly one byte, so the armed socket
+        // timeout is never reached by any single syscall.
+        self.clock.sleep(self.stall);
+        self.input.read(&mut buffer[..1])
+    }
+}
+
+impl Write for TricklePeerStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl EmbeddingServerStream for TricklePeerStream {
+    fn transport_identity(&self) -> &EmbeddingTransportIdentity {
+        &self.identity
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.read_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(timeout);
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn peer_is_alive(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The raw Win32 code a named-pipe writer observes when the peer end closed:
 /// ERROR_NO_DATA, "the pipe is being closed".
 pub(super) const WINDOWS_PIPE_CLOSING_RAW_CODE: i32 = 232;

@@ -2,9 +2,11 @@ use crate::symbol_query::RetrievalFileRole;
 #[cfg(test)]
 use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
+use codestory_contracts::bounded_locks::{
+    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+};
 use codestory_contracts::graph::NodeId;
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
-use fs4::fs_std::FileExt;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
 use rayon::prelude::*;
@@ -499,23 +501,17 @@ impl PersistedSearchIndexGuard {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("Failed to open search index lock {}", lock_path.display()))?;
-        match mode {
-            PersistedSearchIndexLockMode::Shared => {
-                FileExt::lock_shared(&file).with_context(|| {
-                    format!(
-                        "Failed to take shared search index lock {}",
-                        search_dir.display()
-                    )
-                })?
-            }
-            PersistedSearchIndexLockMode::Exclusive => FileExt::lock_exclusive(&file)
-                .with_context(|| {
-                    format!(
-                        "Failed to take exclusive search index lock {}",
-                        search_dir.display()
-                    )
-                })?,
-        }
+        let kind = match mode {
+            PersistedSearchIndexLockMode::Shared => FileLockKind::Shared,
+            PersistedSearchIndexLockMode::Exclusive => FileLockKind::Exclusive,
+        };
+        acquire_with_deadline(&file, kind, LockDeadline::after(DEFAULT_LOCK_WAIT), None)
+            .with_context(|| {
+                format!(
+                    "Failed to take {kind} search index lock {}",
+                    search_dir.display()
+                )
+            })?;
         Ok(Self {
             file,
             path: lock_path,
@@ -555,21 +551,13 @@ impl PersistedSearchIndexGuard {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("Failed to open search index lock {}", lock_path.display()))?;
-        let acquired = match mode {
-            PersistedSearchIndexLockMode::Shared => FileExt::try_lock_shared(&file),
-            PersistedSearchIndexLockMode::Exclusive => FileExt::try_lock_exclusive(&file),
-        }
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                Ok(false)
-            } else {
-                Err(error)
-            }
-        })
-        .with_context(|| {
+        let kind = match mode {
+            PersistedSearchIndexLockMode::Shared => FileLockKind::Shared,
+            PersistedSearchIndexLockMode::Exclusive => FileLockKind::Exclusive,
+        };
+        let acquired = bounded_locks::try_acquire(&file, kind).with_context(|| {
             format!(
-                "Failed to take {:?} search index lock {}",
-                mode,
+                "Failed to take {kind} search index lock {}",
                 search_dir.display()
             )
         })?;
@@ -595,28 +583,13 @@ impl PersistedSearchIndexGuard {
         if !self.is_exclusive() {
             return Ok(());
         }
-        #[cfg(unix)]
-        FileExt::lock_shared(&self.file).with_context(|| {
-            format!(
-                "Failed to downgrade persisted search index lock {} to shared",
-                self.path.display()
-            )
-        })?;
-        #[cfg(not(unix))]
-        {
-            FileExt::unlock(&self.file).with_context(|| {
+        bounded_locks::downgrade_to_shared(&self.file, LockDeadline::after(DEFAULT_LOCK_WAIT))
+            .with_context(|| {
                 format!(
-                    "Failed to unlock persisted search index {} before shared reopen",
+                    "Failed to downgrade persisted search index lock {} to shared",
                     self.path.display()
                 )
             })?;
-            FileExt::lock_shared(&self.file).with_context(|| {
-                format!(
-                    "Failed to reacquire persisted search index lock {} as shared",
-                    self.path.display()
-                )
-            })?;
-        }
         self.mode = PersistedSearchIndexLockMode::Shared;
         Ok(())
     }
@@ -624,7 +597,7 @@ impl PersistedSearchIndexGuard {
 
 impl Drop for PersistedSearchIndexGuard {
     fn drop(&mut self) {
-        if let Err(error) = FileExt::unlock(&self.file) {
+        if let Err(error) = bounded_locks::release(&self.file) {
             tracing::warn!(
                 path = %self.path.display(),
                 "Failed to unlock persisted search index lock: {error}"

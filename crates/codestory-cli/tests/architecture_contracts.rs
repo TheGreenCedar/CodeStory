@@ -479,6 +479,73 @@ fn production_source_never_spawns_git() {
 }
 
 #[test]
+fn advisory_file_locks_have_exactly_one_bounded_entry_point() {
+    // A blocking `flock` observes neither a deadline nor a cancellation flag,
+    // so a stalled sibling could hold an unrelated request, an eviction, or
+    // shutdown for as long as it liked. Acquisition lives behind one bounded
+    // module; nothing else in production source may reach `fs4` directly.
+    let owner = repo_root().join("crates/codestory-contracts/src/bounded_locks.rs");
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join("crates"), &mut files);
+    files.sort();
+    let mut violations = Vec::new();
+    for path in files {
+        if !path
+            .components()
+            .any(|component| component.as_os_str() == "src")
+            || path == owner
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read Rust source");
+        // Inline test modules may still drive raw locks to build fixtures;
+        // production code above the trailing test module may not.
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("split returns at least the full source");
+        if production.contains("fs4::") {
+            violations.push(path.display().to_string());
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "advisory locks must be taken through codestory_contracts::bounded_locks:\n{}",
+        violations.join("\n")
+    );
+
+    let bounded = read("crates/codestory-contracts/src/bounded_locks.rs");
+    assert!(
+        bounded.contains("pub fn acquire_with_deadline(")
+            && bounded.contains("deadline: LockDeadline")
+            && bounded.contains("cancel: Option<&AtomicBool>"),
+        "the bounded entry point must take an absolute deadline and a cancellation flag"
+    );
+    for blocking in ["FileExt::lock_exclusive", "FileExt::lock_shared"] {
+        assert!(
+            !bounded.contains(blocking),
+            "the bounded entry point must never call the uninterruptible {blocking}"
+        );
+    }
+}
+
+#[test]
+fn evicting_a_context_never_detaches_an_unquiesced_activation_worker() {
+    let services = read("crates/codestory-runtime/src/services.rs");
+    assert!(
+        services.contains("pub fn cancel_and_wait_within(&self, budget: Duration)")
+            && services.contains("ActivationQuiescence::FailStopRequired")
+            && services.contains("run_activation_fail_stop(ACTIVATION_QUIESCENCE_FAIL_STOP)"),
+        "eviction must join with a deadline and fail-stop instead of detaching a worker that may hold a publication or store lock"
+    );
+    let diagnostics = read("crates/codestory-cli/src/diagnostics.rs");
+    assert!(
+        diagnostics.contains("set_activation_fail_stop_hook"),
+        "the hosting binary must install the activation fail-stop evidence path"
+    );
+}
+
+#[test]
 fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
     let cli_args = read("crates/codestory-cli/src/args.rs");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
