@@ -2046,7 +2046,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .with_default(ValueLiteral::Boolean(true)),
         SchemaProperty::integer(
             "latency_budget_ms",
-            "Optional retrieval latency budget in milliseconds.",
+            "Optional retrieval latency budget in milliseconds; defaults to 1500 when omitted.",
         )
         .with_bounds(1000, 120000)
         .nullable(),

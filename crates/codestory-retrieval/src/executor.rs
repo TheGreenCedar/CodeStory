@@ -228,7 +228,7 @@ impl<'a> QueryExecutor<'a> {
             cancel_reason = Some("deadline".into());
         }
 
-        if cancel_reason.is_none()
+        if query_completion_is_cacheable(cancel_reason.as_deref())
             && !self.cancelled.load(Ordering::Acquire)
             && Instant::now() < deadline
             && let Some(manifest) = self.manifest.as_ref()
@@ -557,6 +557,10 @@ impl<'a> QueryExecutor<'a> {
         }
         Ok(cancel_reason)
     }
+}
+
+fn query_completion_is_cacheable(cancel_reason: Option<&str>) -> bool {
+    matches!(cancel_reason, None | Some("marginal_gain"))
 }
 
 fn cancelled_query_result(
@@ -1148,6 +1152,41 @@ mod tests {
             "cancelled requests must not serve cache"
         );
         assert_eq!(cancelled_cache.len(), 1);
+    }
+
+    #[test]
+    fn executor_caches_successful_marginal_gain_stop() {
+        let query = "explain startup request flow";
+        let mock = Arc::new(MockSidecarSearch {
+            lexical: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/startup.rs",
+                    Some("startup".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                )],
+            )])),
+            ..Default::default()
+        });
+        let mut cache = RetrievalCache::new();
+        let manifest = sample_manifest();
+
+        let mut executor = QueryExecutor {
+            sidecars: mock,
+            cache: &mut cache,
+            manifest: Some(manifest),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let first = executor.execute(query, Some(1_000)).expect("first query");
+        assert_eq!(first.trace.cancel_reason.as_deref(), Some("marginal_gain"));
+        assert!(!first.trace.cache_hit);
+
+        let cached = executor.execute(query, Some(1_000)).expect("cached query");
+        assert!(cached.trace.cache_hit);
+        assert_eq!(cached.hits, first.hits);
     }
 
     #[test]

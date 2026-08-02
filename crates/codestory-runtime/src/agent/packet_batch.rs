@@ -4,36 +4,28 @@
 use super::citation::to_citation_from_hit;
 use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
-    normalize_identifier, packet_adjacent_query_stop_term, packet_citation_key,
-    packet_citation_rank, packet_query_stop_term, packet_stage_citation_carry_limit,
-    packet_subquery_hit_limit,
+    normalize_identifier, packet_citation_key, packet_citation_rank,
+    packet_stage_citation_carry_limit, packet_subquery_hit_limit,
 };
 use super::packet_terms::packet_probe_terms;
 use super::packet_trace::{
-    append_packet_query_timing_fields, merge_packet_lexical_subquery_batch,
-    merge_packet_semantic_subquery_batch, packet_query_diagnostic, packet_query_duration_ms,
+    append_packet_query_timing_fields, merge_packet_fused_subquery_batch, packet_query_diagnostic,
+    packet_query_duration_ms,
 };
-use super::planning::packet_subquery_hybrid_weights;
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentHybridWeightsDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto,
-    SearchHit, SearchHitOrigin, SearchMatchQualityDto, SemanticFallbackRecordDto,
+    AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
+    ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto,
+    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, SearchHit,
+    SearchHitOrigin, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
-const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
-
-/// Hybrid weights for lexical-only subqueries that returned no indexed hits.
-const PACKET_LEXICAL_MISS_HYBRID_RETRY_WEIGHTS: AgentHybridWeightsDto = AgentHybridWeightsDto {
-    lexical: Some(0.35),
-    semantic: Some(0.55),
-    graph: Some(0.10),
-};
+const DEFAULT_SLA_TARGET_MS: u32 = 1_500;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -59,7 +51,7 @@ impl PacketLatencyBudget {
     }
 
     pub(crate) fn remaining_ms(&self) -> u32 {
-        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(100))
+        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(1_000))
     }
 
     pub(crate) fn budget_usage_percent(&self, consumed_trace_ms: u32) -> u128 {
@@ -104,239 +96,163 @@ pub(crate) fn run_packet_planned_subqueries(
 
     let per_query_limit = packet_subquery_hit_limit(limits);
     let stage_carry_limit = packet_stage_citation_carry_limit(limits);
-    let mut lexical_pending = Vec::new();
-    let mut semantic_pending = Vec::new();
-    for entry in &pending {
-        if packet_subquery_is_lexical_only(budget, entry.1) {
-            lexical_pending.push(*entry);
-        } else {
-            semantic_pending.push(*entry);
-        }
-    }
-
-    let warm_queries = pending
+    let batch = pending
         .iter()
-        .map(|(_, query)| query.query.clone())
+        .map(|(_, query)| (query.query.clone(), per_query_limit))
         .collect::<Vec<_>>();
-    if let Err(error) = controller.warm_packet_subquery_embeddings(&warm_queries) {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_subquery_embedding_warmup_failed error={:?}",
-            error
-        ));
-    }
-
     answer.retrieval_trace.annotations.push(format!(
-        "packet_subqueries lexical_batch={} semantic={} total={}",
-        lexical_pending.len(),
-        semantic_pending.len(),
+        "packet_subqueries fused_batch={} total={}",
+        batch.len(),
         pending.len()
     ));
 
-    if !lexical_pending.is_empty() {
-        let batch = lexical_pending
-            .iter()
-            .map(|(_, query)| (query.query.clone(), per_query_limit))
-            .collect::<Vec<_>>();
-        let started_at = Instant::now();
-        match controller.search_lexical_hybrid_batch(&batch, Some(packet_latency.remaining_ms())) {
-            Ok(outcome) => {
-                let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
-                answer.retrieval_trace.total_latency_ms = answer
-                    .retrieval_trace
-                    .total_latency_ms
-                    .saturating_add(duration_ms);
-                answer
-                    .retrieval_trace
-                    .packet_sidecar_diagnostics
-                    .extend(outcome.sidecar_diagnostics.clone());
-                let results = outcome.results;
-                let diagnostics = outcome.sidecar_diagnostics;
-                annotate_packet_batch_timing(
-                    answer,
-                    "packet_lexical_subquery_batch",
-                    duration_ms,
-                    &diagnostics,
-                );
-                merge_packet_lexical_subquery_batch(
-                    answer,
-                    &lexical_pending,
-                    &results,
-                    duration_ms,
-                    &diagnostics,
-                    include_evidence,
-                    rank_terms,
-                    stage_carry_limit,
-                );
-
-                let hybrid_retry_pending: Vec<(usize, &PacketPlanQueryDto)> = lexical_pending
-                    .iter()
-                    .zip(results.iter())
-                    .filter(|((_, query), (_, hits))| {
-                        packet_lexical_subquery_needs_hybrid_retry(query, hits.len())
-                    })
-                    .map(|(entry, _)| *entry)
-                    .collect();
-                if !hybrid_retry_pending.is_empty() && !packet_latency.exhausted() {
-                    answer.retrieval_trace.annotations.push(format!(
-                        "packet_lexical_subquery_hybrid_retry count={}",
-                        hybrid_retry_pending.len()
-                    ));
-                    let retry_batch = hybrid_retry_pending
-                        .iter()
-                        .map(|(_, query)| {
-                            (
-                                query.query.clone(),
-                                per_query_limit,
-                                Some(PACKET_LEXICAL_MISS_HYBRID_RETRY_WEIGHTS),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let retry_started = Instant::now();
-                    match controller.search_semantic_hybrid_batch(
-                        &retry_batch,
-                        Some(packet_latency.remaining_ms()),
-                    ) {
-                        Ok(outcome) => {
-                            let retry_duration_ms =
-                                clamp_u128_to_u32(retry_started.elapsed().as_millis());
-                            answer.retrieval_trace.total_latency_ms = answer
-                                .retrieval_trace
-                                .total_latency_ms
-                                .saturating_add(retry_duration_ms);
-                            answer
-                                .retrieval_trace
-                                .packet_sidecar_diagnostics
-                                .extend(outcome.sidecar_diagnostics.clone());
-                            let diagnostics = outcome.sidecar_diagnostics;
-                            record_semantic_fallbacks(answer, &outcome.fallbacks);
-                            annotate_packet_batch_timing(
-                                answer,
-                                "packet_lexical_subquery_hybrid_retry_batch",
-                                retry_duration_ms,
-                                &diagnostics,
-                            );
-                            merge_packet_semantic_subquery_batch(
-                                answer,
-                                &hybrid_retry_pending,
-                                &outcome.results,
-                                retry_duration_ms,
-                                &diagnostics,
-                                include_evidence,
-                                rank_terms,
-                                budget,
-                                stage_carry_limit,
-                            );
-                        }
-                        Err(error) => {
-                            answer.retrieval_trace.annotations.push(format!(
-                                "packet_lexical_subquery_hybrid_retry_failed error={:?}",
-                                error
-                            ));
-                            return Err(error);
-                        }
-                    }
-                }
-            }
+    let started_at = Instant::now();
+    let outcome =
+        match controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms())) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 answer.retrieval_trace.annotations.push(format!(
-                    "packet_lexical_subquery_batch_failed error={:?}",
-                    error
+                    "packet_fused_subquery_batch_failed error={error:?}"
                 ));
                 return Err(error);
             }
-        }
-    }
+        };
+    let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
+    answer.retrieval_trace.total_latency_ms = answer
+        .retrieval_trace
+        .total_latency_ms
+        .saturating_add(duration_ms);
+    answer
+        .retrieval_trace
+        .packet_sidecar_diagnostics
+        .extend(outcome.sidecar_diagnostics.clone());
+    annotate_packet_batch_timing(
+        answer,
+        "packet_fused_subquery_batch",
+        duration_ms,
+        &outcome.sidecar_diagnostics,
+    );
 
-    if !semantic_pending.is_empty() {
+    let mut total_duration_ms = duration_ms;
+    let mut results = outcome.results;
+    let mut effective_diagnostics = outcome.sidecar_diagnostics;
+    let retry_pending = packet_fused_retry_pending(&pending, &outcome.retryable_queries);
+    if !retry_pending.is_empty() {
+        if !packet_fused_retry_is_live() {
+            return Err(ApiError::new(
+                "cancelled",
+                "packet fused retry was cancelled before dispatch",
+            ));
+        }
         if packet_latency.exhausted() {
-            answer.retrieval_trace.annotations.push(
-                "packet_semantic_subqueries skipped reason=latency_budget_exhausted".to_string(),
-            );
+            answer.retrieval_trace.annotations.push(format!(
+                "packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}",
+                retry_pending.len()
+            ));
         } else {
-            let batch = semantic_pending
+            answer.retrieval_trace.annotations.push(format!(
+                "packet_fused_blocking_cancel_retry count={}",
+                retry_pending.len()
+            ));
+            let retry_batch = retry_pending
                 .iter()
-                .map(|(_, query)| {
-                    (
-                        query.query.clone(),
-                        per_query_limit,
-                        packet_subquery_hybrid_weights(budget, query),
-                    )
-                })
+                .map(|(_, query)| (query.query.clone(), per_query_limit))
                 .collect::<Vec<_>>();
-            let started_at = Instant::now();
-            match controller
-                .search_semantic_hybrid_batch(&batch, Some(packet_latency.remaining_ms()))
-            {
-                Ok(outcome) => {
-                    let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
-                    answer.retrieval_trace.total_latency_ms = answer
-                        .retrieval_trace
-                        .total_latency_ms
-                        .saturating_add(duration_ms);
-                    answer
-                        .retrieval_trace
-                        .packet_sidecar_diagnostics
-                        .extend(outcome.sidecar_diagnostics.clone());
-                    let diagnostics = outcome.sidecar_diagnostics;
-                    record_semantic_fallbacks(answer, &outcome.fallbacks);
-                    annotate_packet_batch_timing(
-                        answer,
-                        "packet_semantic_subquery_batch",
-                        duration_ms,
-                        &diagnostics,
-                    );
-                    merge_packet_semantic_subquery_batch(
-                        answer,
-                        &semantic_pending,
-                        &outcome.results,
-                        duration_ms,
-                        &diagnostics,
-                        include_evidence,
-                        rank_terms,
-                        budget,
-                        stage_carry_limit,
-                    );
-                }
-                Err(error) => {
-                    for (plan_index, query) in &semantic_pending {
-                        answer.retrieval_trace.annotations.push(format!(
-                            "packet_semantic_subquery_batch_failed index={} query=`{}` error={:?}",
-                            plan_index,
-                            query.query.replace('`', "'"),
-                            error
-                        ));
-                    }
-                    return Err(error);
-                }
+            let retry_started_at = Instant::now();
+            let retry_outcome = controller
+                .search_packet_fused_batch(&retry_batch, Some(packet_latency.remaining_ms()))
+                .map_err(|error| {
+                    answer.retrieval_trace.annotations.push(format!(
+                        "packet_fused_blocking_cancel_retry_failed error={error:?}"
+                    ));
+                    error
+                })?;
+            let retry_duration_ms = clamp_u128_to_u32(retry_started_at.elapsed().as_millis());
+            total_duration_ms = total_duration_ms.saturating_add(retry_duration_ms);
+            answer.retrieval_trace.total_latency_ms = answer
+                .retrieval_trace
+                .total_latency_ms
+                .saturating_add(retry_duration_ms);
+            answer
+                .retrieval_trace
+                .packet_sidecar_diagnostics
+                .extend(retry_outcome.sidecar_diagnostics.clone());
+            annotate_packet_batch_timing(
+                answer,
+                "packet_fused_blocking_cancel_retry_batch",
+                retry_duration_ms,
+                &retry_outcome.sidecar_diagnostics,
+            );
+            replace_packet_fused_results(&mut results, retry_outcome.results);
+            replace_packet_fused_diagnostics(
+                &mut effective_diagnostics,
+                retry_outcome.sidecar_diagnostics,
+            );
+            if !retry_outcome.retryable_queries.is_empty() {
+                answer.retrieval_trace.annotations.push(format!(
+                    "packet_fused_blocking_cancel_retry exhausted count={}",
+                    retry_outcome.retryable_queries.len()
+                ));
             }
         }
     }
+
+    merge_packet_fused_subquery_batch(
+        answer,
+        &pending,
+        &results,
+        total_duration_ms,
+        &effective_diagnostics,
+        include_evidence,
+        rank_terms,
+        stage_carry_limit,
+    );
     packet_latency.apply_to_trace(answer);
     Ok(())
 }
 
-pub(crate) fn record_semantic_fallbacks(
-    answer: &mut AgentAnswerDto,
-    fallbacks: &[SemanticFallbackRecordDto],
+fn packet_fused_retry_pending<'a>(
+    pending: &[(usize, &'a PacketPlanQueryDto)],
+    retryable_queries: &[String],
+) -> Vec<(usize, &'a PacketPlanQueryDto)> {
+    let retryable = retryable_queries
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    pending
+        .iter()
+        .copied()
+        .filter(|(_, query)| retryable.contains(query.query.as_str()))
+        .collect()
+}
+
+fn packet_fused_retry_is_live() -> bool {
+    !crate::services::active_public_operation_cancellation()
+        .is_some_and(|cancelled| cancelled.load(AtomicOrdering::Acquire))
+}
+
+fn replace_packet_fused_results(
+    results: &mut [(String, Vec<SearchHit>)],
+    retry_results: Vec<(String, Vec<SearchHit>)>,
 ) {
-    for fallback in fallbacks {
-        answer
-            .retrieval_trace
-            .semantic_fallbacks
-            .push(fallback.clone());
-        answer.retrieval_trace.annotations.push(format!(
-            "semantic_fallback query=`{}` reason={}",
-            fallback.query.replace('`', "'"),
-            fallback.reason
-        ));
+    for (retry_query, retry_hits) in retry_results {
+        if let Some((_, hits)) = results.iter_mut().find(|(query, _)| *query == retry_query) {
+            *hits = retry_hits;
+        }
     }
-    answer.retrieval_trace.semantic_fallback_count =
-        answer.retrieval_trace.semantic_fallbacks.len() as u32;
-    if !fallbacks.is_empty() {
-        answer.retrieval_trace.annotations.push(format!(
-            "semantic_fallback_summary count={} degraded_runtime=true",
-            fallbacks.len()
-        ));
+}
+
+fn replace_packet_fused_diagnostics(
+    diagnostics: &mut [PacketSidecarQueryDiagnosticDto],
+    retry_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+) {
+    for retry in retry_diagnostics {
+        if let Some(diagnostic) = diagnostics
+            .iter_mut()
+            .find(|diagnostic| diagnostic.query == retry.query)
+        {
+            *diagnostic = retry;
+        }
     }
 }
 
@@ -421,10 +337,10 @@ fn packet_planned_subquery_should_run(
     budget: PacketBudgetModeDto,
     query: &PacketPlanQueryDto,
 ) -> bool {
-    if !packet_subquery_is_lexical_only(budget, query) {
-        return true;
-    }
-    if !query
+    if !matches!(
+        budget,
+        PacketBudgetModeDto::Compact | PacketBudgetModeDto::Standard
+    ) || !query
         .purpose
         .contains("concrete symbol, file, route, or code term")
     {
@@ -492,11 +408,11 @@ pub(crate) fn run_packet_anchor_expansion(
     }
 
     let started_at = Instant::now();
-    let result = controller.search_symbolic_packet_anchor_batch(
-        &queries,
-        per_query_limit,
-        Some(packet_latency.remaining_ms()),
-    );
+    let batch = queries
+        .iter()
+        .map(|query| (query.clone(), per_query_limit))
+        .collect::<Vec<_>>();
+    let result = controller.search_packet_fused_batch(&batch, Some(packet_latency.remaining_ms()));
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace
@@ -790,44 +706,6 @@ pub(crate) fn packet_file_stem_matches_query(query: &str, path: Option<&str>) ->
     normalize_identifier(stem) == normalized_query
 }
 
-fn packet_subquery_is_lexical_only(
-    budget: PacketBudgetModeDto,
-    query: &PacketPlanQueryDto,
-) -> bool {
-    packet_subquery_hybrid_weights(budget, query)
-        .and_then(|weights| weights.semantic)
-        .is_some_and(|semantic| semantic <= f32::EPSILON)
-}
-
-fn packet_lexical_subquery_needs_hybrid_retry(
-    query: &PacketPlanQueryDto,
-    hit_count: usize,
-) -> bool {
-    if hit_count > 0 {
-        return false;
-    }
-    let trimmed = query.query.trim();
-    let lowered = trimmed.to_ascii_lowercase();
-    if packet_query_stop_term(&lowered) || packet_adjacent_query_stop_term(&lowered) {
-        return false;
-    }
-    if trimmed.len() <= 3 {
-        return false;
-    }
-    if query_has_symbol_or_literal_signal(trimmed) {
-        return true;
-    }
-    if is_packet_code_like_term(trimmed) {
-        return true;
-    }
-    if query.purpose.contains("symbol") || query.purpose.contains("flow anchor") {
-        return trimmed.len() >= 5
-            && !packet_query_stop_term(&lowered)
-            && !packet_adjacent_query_stop_term(&lowered);
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,42 +713,30 @@ mod tests {
     use codestory_contracts::api::{PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto};
 
     #[test]
-    fn packet_lexical_subquery_hybrid_retry_for_empty_symbol_probe() {
-        let query = PacketPlanQueryDto {
-            query: "dispatchRequest".to_string(),
-            purpose: "concrete symbol, file, route, or code term".to_string(),
-        };
-        assert!(packet_lexical_subquery_needs_hybrid_retry(&query, 0));
-        assert!(!packet_lexical_subquery_needs_hybrid_retry(&query, 1));
+    fn packet_latency_budget_preserves_advertised_range_and_default() {
+        assert_eq!(PacketLatencyBudget::new(None).target_ms, 1_500);
+        assert_eq!(PacketLatencyBudget::new(Some(10)).target_ms, 1_000);
+        assert_eq!(PacketLatencyBudget::new(Some(120_001)).target_ms, 120_000);
+        assert!(PacketLatencyBudget::new(Some(1_000)).remaining_ms() >= 1_000);
     }
 
     #[test]
-    fn packet_lexical_subquery_hybrid_retry_for_short_concrete_term() {
-        let query = PacketPlanQueryDto {
-            query: "HTTP".to_string(),
-            purpose: "concrete symbol, file, route, or code term".to_string(),
+    fn packet_fused_retry_uses_only_reported_blocking_deadlines() {
+        let first = PacketPlanQueryDto {
+            query: "ordinary empty".to_string(),
+            purpose: "supplemental".to_string(),
         };
-        assert!(packet_lexical_subquery_needs_hybrid_retry(&query, 0));
-    }
+        let second = PacketPlanQueryDto {
+            query: "timed out".to_string(),
+            purpose: "required flow anchor".to_string(),
+        };
+        let pending = vec![(1, &first), (2, &second)];
 
-    #[test]
-    fn packet_lexical_subquery_skips_hybrid_retry_for_generic_concrete_terms() {
-        for query in [
-            PacketPlanQueryDto {
-                query: "Explain".to_string(),
-                purpose: "concrete symbol, file, route, or code term".to_string(),
-            },
-            PacketPlanQueryDto {
-                query: "CLI".to_string(),
-                purpose: "concrete symbol, file, route, or code term".to_string(),
-            },
-        ] {
-            assert!(
-                !packet_lexical_subquery_needs_hybrid_retry(&query, 0),
-                "generic term `{}` should not trigger hybrid retry",
-                query.query
-            );
-        }
+        assert!(packet_fused_retry_pending(&pending, &[]).is_empty());
+        let retry = packet_fused_retry_pending(&pending, &["timed out".to_string()]);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].0, 2);
+        assert_eq!(retry[0].1.query, "timed out");
     }
 
     #[test]
