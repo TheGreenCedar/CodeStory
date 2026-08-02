@@ -673,9 +673,10 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
             if status.retrieval_mode == "full" && semantic_point_count.is_some() {
                 let mut manifest = previous.clone();
-                if let Some(generation) = manifest.sidecar_generation.as_deref() {
-                    let scip_dir = layout.scip_project_dir(generation);
-                    if update_precise_semantic_import_status(&scip_dir, &mut manifest)? {
+                if let Some(generation) = manifest.sidecar_generation.clone() {
+                    let scip_dir = layout.scip_project_dir(&generation);
+                    if update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?
+                    {
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
@@ -799,7 +800,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             &mut manifest,
         )
     })?;
-    update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
+    update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?;
 
     manifest.lexical_version = lexical_outcome.version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
@@ -1134,7 +1135,7 @@ fn ensure_scip_artifacts(
         info!(project_id = %project_id, sidecar_generation = %generation, "SCIP graph artifacts reused");
         return Ok(());
     }
-    match emit_scip_artifacts_from_store(storage_path, scip_dir) {
+    match emit_scip_artifacts_from_store(storage_path, scip_dir, generation) {
         Ok(Some(revision)) => {
             manifest.scip_revision = Some(revision.clone());
             info!(project_id = %project_id, sidecar_generation = %generation, %revision, "SCIP graph artifacts emitted from store");
@@ -1151,6 +1152,7 @@ fn ensure_scip_artifacts(
 
 fn update_precise_semantic_import_status(
     scip_dir: &Path,
+    generation: &str,
     manifest: &mut RetrievalIndexManifest,
 ) -> Result<bool> {
     let Some(artifact) = std::env::var_os("CODESTORY_PRECISE_SEMANTIC_SCIP_ARTIFACT") else {
@@ -1159,6 +1161,7 @@ fn update_precise_semantic_import_status(
     let status = import_precise_semantic_scip_artifact(
         Path::new(&artifact),
         &scip_dir.join(SCIP_PRECISE_SEMANTIC_IMPORT_DIR),
+        generation,
     )?;
     manifest.precise_semantic_import_status = Some(status.status);
     manifest.precise_semantic_import_reason = status.reason;
@@ -1419,6 +1422,7 @@ fn persist_finalized_manifest(
         &storage,
         retention_context.layout,
         retention_context.workspace_id,
+        project_root,
         &project_id,
     ) {
         Ok(()) => None,
@@ -1520,10 +1524,11 @@ fn promote_retrieval_manifest_with_cancel<T>(
     Ok(prepared)
 }
 
-fn publish_derived_retention_marker(
+pub(crate) fn publish_derived_retention_marker(
     storage: &Store,
     layout: &SidecarLayout,
     workspace_id: &str,
+    project_root: &Path,
     project_id: &str,
 ) -> Result<()> {
     let (active, rollback) = storage
@@ -1532,6 +1537,7 @@ fn publish_derived_retention_marker(
         .context("committed retrieval publication is missing")?;
     let marker = GenerationRetentionMarker::next(
         workspace_id,
+        project_root,
         active,
         rollback,
         Utc::now().timestamp_millis(),
@@ -3388,6 +3394,7 @@ mod tests {
         let state_file = storage_dir.path().join("state/retrieval-sidecars.json");
         let marker = GenerationRetentionMarker::next(
             "workspace",
+            storage_dir.path(),
             old_manifest.clone(),
             Some(RetrievalIndexRollbackRecord {
                 manifest: rollback_manifest,
@@ -3623,8 +3630,14 @@ mod tests {
         std::fs::write(&marker_blocker, b"not a directory").expect("marker blocker");
         let mut blocked_layout = runtime.layout.clone();
         blocked_layout.state_file = marker_blocker.join("retrieval.state");
-        publish_derived_retention_marker(&storage, &blocked_layout, "workspace", "proj")
-            .expect_err("derived marker failure happens after SQLite commit");
+        publish_derived_retention_marker(
+            &storage,
+            &blocked_layout,
+            "workspace",
+            storage_dir.path(),
+            "proj",
+        )
+        .expect_err("derived marker failure happens after SQLite commit");
         assert_eq!(
             storage
                 .get_retrieval_index_publication("proj")

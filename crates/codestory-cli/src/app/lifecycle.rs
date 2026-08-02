@@ -109,7 +109,83 @@ pub(super) fn run_cache(cmd: CacheCommand) -> Result<()> {
     match cmd.action {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
         CacheAction::Rehydrate(cmd) => run_cache_rehydrate(cmd),
+        CacheAction::Clean(cmd) => run_cache_clean(cmd),
+
+        CacheAction::Reset(cmd) => crate::cache_reset::run_cache_reset(cmd),
     }
+}
+
+fn run_cache_clean(cmd: args::CacheCleanCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "cache clean")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    crate::sidecar_runtime::prepare_cache_access();
+    if cmd.apply {
+        let report = codestory_retrieval::apply_cache_clean().context("cache clean apply")?;
+        let markdown = render_cache_clean_report_markdown(&report);
+        return emit(cmd.format, &report, markdown, cmd.output_file.as_deref());
+    }
+    let plan = codestory_retrieval::plan_cache_clean().context("cache clean plan")?;
+    let markdown = render_cache_clean_plan_markdown(&plan);
+    emit(cmd.format, &plan, markdown, cmd.output_file.as_deref())
+}
+
+fn render_cache_clean_plan_markdown(plan: &codestory_retrieval::CacheCleanPlan) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Cache Clean");
+    let _ = writeln!(markdown, "dry_run: `{}`", plan.dry_run);
+    let _ = writeln!(markdown, "cache_root: `{}`", plan.cache_root);
+    let _ = writeln!(
+        markdown,
+        "current_model_digest: `{}`",
+        plan.current_model_digest
+    );
+    let _ = writeln!(markdown, "reclaimable_bytes: {}", plan.reclaimable_bytes);
+    let _ = writeln!(markdown, "\n## Candidates");
+    for candidate in &plan.candidates {
+        let _ = writeln!(
+            markdown,
+            "- `{}` ({} bytes): {}",
+            candidate.relative_path, candidate.bytes, candidate.proof
+        );
+    }
+    let _ = writeln!(markdown, "\n## Retained");
+    for retained in &plan.retained {
+        let _ = writeln!(
+            markdown,
+            "- `{}` [{}]: {}",
+            retained.relative_path,
+            retained.reason.as_str(),
+            retained.detail
+        );
+    }
+    if !plan.errors.is_empty() {
+        let _ = writeln!(markdown, "\n## Errors");
+        for error in &plan.errors {
+            let _ = writeln!(markdown, "- {error}");
+        }
+    }
+    markdown
+}
+
+fn render_cache_clean_report_markdown(report: &codestory_retrieval::CacheCleanReport) -> String {
+    let mut markdown = render_cache_clean_plan_markdown(&report.plan);
+    let _ = writeln!(markdown, "\n## Removed");
+    let _ = writeln!(markdown, "removed_bytes: {}", report.removed_bytes);
+    for removal in &report.removals {
+        let _ = writeln!(
+            markdown,
+            "- `{}` removed={} bytes={}{}",
+            removal.relative_path,
+            removal.removed,
+            removal.bytes,
+            removal
+                .error
+                .as_deref()
+                .map(|error| format!(" error={error}"))
+                .unwrap_or_default()
+        );
+    }
+    markdown
 }
 
 fn run_cache_identity(cmd: args::CacheIdentityCommand) -> Result<()> {

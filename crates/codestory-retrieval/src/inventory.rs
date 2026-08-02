@@ -5,7 +5,7 @@ use crate::generation::{
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
     GenerationRetentionLock, GenerationRetentionPlan, GenerationRetentionState,
-    apply_generation_retention, global_generation_gc_state_file,
+    ObservedRetentionLock, apply_generation_retention, global_generation_gc_state_file,
     plan_generation_retention_with_unrooted_state, scan_retention_protection,
 };
 use anyhow::{Context, Result};
@@ -86,10 +86,12 @@ fn generation_retention_plan_for_storage(
 fn inventory_retention_view(
     runtime: &SidecarRuntimeConfig,
     project_id: &str,
-) -> Result<(Option<GenerationRetentionLock>, GenerationRetentionState)> {
-    let lock = GenerationRetentionLock::try_acquire_shared(&runtime.layout.state_file, project_id)
+) -> Result<(ObservedRetentionLock, GenerationRetentionState)> {
+    // Observation only: a dry-run inventory must not be the reason the
+    // retention directory or its lock file first exists.
+    let lock = GenerationRetentionLock::observe_shared(&runtime.layout.state_file, project_id)
         .context("observe retrieval generation inventory lock")?;
-    let state = if lock.is_some() {
+    let state = if lock.is_quiescent() {
         GenerationRetentionState::Reclaimable
     } else {
         GenerationRetentionState::Building
@@ -128,7 +130,10 @@ fn build_generation_retention_plan(
     let mut protection =
         scan_retention_protection(cache_root, Some(storage_path), &layout.state_file);
     let manifest = if storage_path.is_file() {
-        match Store::open(storage_path) {
+        // Planning retention is observation, including of the caller's own
+        // store: a plan must never be the thing that migrates or recovers the
+        // database it is reasoning about.
+        match Store::open_observational(storage_path) {
             Ok(store) => match store.get_retrieval_index_manifest(project_id) {
                 Ok(Some(manifest)) => {
                     record_manifest_freshness(
@@ -149,9 +154,10 @@ fn build_generation_retention_plan(
                 }
             },
             Err(error) => {
+                protection.protection_incomplete = true;
                 protection
                     .errors
-                    .push(format!("open active storage for retention: {error:#}"));
+                    .push(format!("observe active storage for retention: {error:#}"));
                 None
             }
         }
@@ -202,5 +208,146 @@ fn record_manifest_freshness(
         errors.push(format!(
             "active retrieval manifest is stale; pruning suppressed: {reason}"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::with_test_cache_root;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    /// Every path below `root`, mapped to the exact bytes it holds. A missing
+    /// entry, an added entry, or one changed byte all show up as an inequality.
+    fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
+        let mut entries = BTreeMap::new();
+        collect_tree(root, root, &mut entries);
+        entries
+    }
+
+    fn collect_tree(root: &Path, dir: &Path, entries: &mut BTreeMap<String, String>) {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("entry is below the snapshot root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = std::fs::symlink_metadata(&path).expect("inspect snapshot entry");
+            if metadata.is_dir() {
+                entries.insert(format!("{relative}/"), "<dir>".to_string());
+                collect_tree(root, &path, entries);
+            } else {
+                let bytes = std::fs::read(&path).expect("read snapshot entry");
+                let digest = Sha256::digest(&bytes);
+                entries.insert(relative, format!("{}:{digest:x}", bytes.len()));
+            }
+        }
+    }
+
+    fn create_store(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let store = Store::open(path).expect("create store");
+        drop(store);
+    }
+
+    fn schema_version(path: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(path).expect("open sqlite");
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        drop(connection);
+        version
+    }
+
+    fn set_schema_version(path: &Path, version: i64) {
+        let connection = rusqlite::Connection::open(path).expect("open sqlite");
+        connection
+            .pragma_update(None, "user_version", version)
+            .expect("write user_version");
+        drop(connection);
+    }
+
+    /// A version-skewed neighbour: another project's cache left at the schema
+    /// an older binary wrote. The activating open path would migrate it in
+    /// place; an inventory has no right to.
+    fn skewed_neighbour_cache(cache_root: &Path, name: &str) -> PathBuf {
+        let storage = cache_root.join(name).join("codestory.db");
+        create_store(&storage);
+        let current = schema_version(&storage);
+        set_schema_version(&storage, current - 1);
+        storage
+    }
+
+    #[test]
+    fn dry_run_inventory_leaves_the_cache_tree_byte_identical() {
+        let cache = tempdir().expect("cache root");
+        let project = tempdir().expect("project root");
+        let workspace_id = codestory_workspace::workspace_id_v3_for_root(project.path());
+        let active_storage = cache.path().join(&workspace_id).join("codestory.db");
+        create_store(&active_storage);
+        let neighbour = skewed_neighbour_cache(cache.path(), "00112233445566aa");
+        let active_schema = schema_version(&active_storage);
+
+        let before = snapshot_tree(cache.path());
+        let report = with_test_cache_root(cache.path(), || {
+            sidecar_inventory_with_storage(project.path(), &active_storage)
+                .expect("dry-run inventory")
+        });
+        let after = snapshot_tree(cache.path());
+
+        assert_eq!(
+            before, after,
+            "a dry-run inventory must not add, remove, or rewrite one byte of the cache tree"
+        );
+        assert_eq!(
+            schema_version(&neighbour),
+            active_schema - 1,
+            "the neighbour cache must still be at the schema its owner left it on"
+        );
+        let plan = report
+            .generation_retention
+            .as_ref()
+            .expect("inventory reports a retention plan");
+        assert!(
+            plan.pruning_suppressed,
+            "a cache holding an unobservable neighbour must not prune"
+        );
+        assert!(
+            plan.errors
+                .iter()
+                .any(|error| error.contains("observe retrieval manifests in")
+                    && error.contains("00112233445566aa")),
+            "the skewed neighbour must be reported as unobservable, got {:?}",
+            plan.errors
+        );
+    }
+
+    #[test]
+    fn dry_run_inventory_does_not_create_the_retention_lock_it_observes() {
+        let cache = tempdir().expect("cache root");
+        let project = tempdir().expect("project root");
+        let workspace_id = codestory_workspace::workspace_id_v3_for_root(project.path());
+        let active_storage = cache.path().join(&workspace_id).join("codestory.db");
+        create_store(&active_storage);
+        let retention_dir = cache.path().join("retention");
+
+        with_test_cache_root(cache.path(), || {
+            sidecar_inventory_with_storage(project.path(), &active_storage)
+                .expect("dry-run inventory")
+        });
+
+        assert!(
+            !retention_dir.exists(),
+            "observing the retention lock must not be what creates {}",
+            retention_dir.display()
+        );
     }
 }

@@ -87,18 +87,6 @@ pub(super) fn get_bookmarks(
     Ok(bookmarks)
 }
 
-pub(super) fn update_bookmark_comment(
-    conn: &Connection,
-    id: i64,
-    comment: &str,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "UPDATE bookmark_node SET comment = ?1 WHERE id = ?2",
-        params![comment, id],
-    )?;
-    Ok(())
-}
-
 pub(super) fn update_bookmark(
     conn: &Connection,
     id: i64,

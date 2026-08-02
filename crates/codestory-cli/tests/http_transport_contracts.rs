@@ -680,8 +680,17 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     );
     assert_eq!(
         search.body.pointer("/error/code").and_then(Value::as_str),
-        Some("search_unavailable"),
-        "HTTP /search should return a structured mandatory-sidecar error: {}",
+        Some("retrieval_unavailable"),
+        "HTTP /search must preserve the runtime's machine classification: {}",
+        search.body
+    );
+    assert_eq!(
+        search
+            .body
+            .pointer("/error/details/failed_layer")
+            .and_then(Value::as_str),
+        Some("retrieval_engine"),
+        "HTTP /search must preserve the typed repair details: {}",
         search.body
     );
     assert!(

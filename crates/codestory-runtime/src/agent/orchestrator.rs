@@ -9,7 +9,7 @@ use crate::agent::packet_batch::{
 };
 #[cfg(test)]
 use crate::agent::packet_budget::{
-    apply_packet_budget, next_deeper_packet_command, packet_budget_usage,
+    apply_packet_budget, next_deeper_packet_argv, next_deeper_packet_command, packet_budget_usage,
     truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
@@ -33,6 +33,7 @@ use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
+use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
@@ -64,13 +65,13 @@ use crate::agent::packet_required_probes::{
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
-    normalize_identifier, packet_citation_rank, packet_display_path,
+    normalize_identifier, packet_citation_rank, packet_display_path, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
@@ -489,6 +490,7 @@ pub(crate) fn agent_packet(
         answer.retrieval_trace.retrieval_shadow = Some(shadow);
     }
     append_packet_step_trace_annotation(&mut answer);
+    apply_packet_semantic_degradation_counters(&mut answer);
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
@@ -737,10 +739,8 @@ fn hybrid_weights_are_lexical_only(weights: Option<&AgentHybridWeightsDto>) -> b
 fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     let terms = packet_rank_terms(question);
     let prefer_primary_sources = !query_mentions_non_primary_source(question);
-    answer.citations.sort_by(|left, right| {
-        packet_citation_rank(right, &terms, prefer_primary_sources)
-            .partial_cmp(&packet_citation_rank(left, &terms, prefer_primary_sources))
-            .unwrap_or(Ordering::Equal)
+    sort_by_cached_rank_desc(&mut answer.citations, |citation| {
+        packet_citation_rank(citation, &terms, prefer_primary_sources)
     });
 }
 
@@ -5129,7 +5129,7 @@ mod tests {
             answer_id: "packet-fixture".to_string(),
             prompt: question.to_string(),
             summary: "Fixture packet is covered by cited anchors.".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -5151,6 +5151,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -5301,6 +5303,8 @@ mod tests {
                     resolved_hit_count: 1,
                     unresolved_candidate_count: 0,
                     blocking_unresolved_candidate_count: 0,
+                    semantic_stage_timeout_zero_hits: false,
+                    semantic_abstained: false,
                     diagnostic: None,
                 }),
         );
@@ -8449,6 +8453,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -8875,6 +8881,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -8961,6 +8969,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9038,6 +9048,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9260,6 +9272,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9336,6 +9350,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9406,6 +9422,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9459,6 +9477,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9509,6 +9529,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9561,6 +9583,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9615,6 +9639,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -9654,6 +9680,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -10220,6 +10248,44 @@ mod tests {
                     && !command.contains("--repo-text on")),
             "insufficient packets should recommend sidecar-primary search diagnostics: {insufficient:?}"
         );
+
+        // CR-050: the invocation is the executable contract; the shell strings
+        // are only its rendering, so a caller never re-parses a quoted command.
+        assert_eq!(
+            insufficient.follow_up_invocations.len(),
+            insufficient.follow_up_commands.len(),
+            "every published follow-up must carry an executable invocation: {insufficient:?}"
+        );
+        assert_eq!(
+            insufficient
+                .follow_up_invocations
+                .iter()
+                .map(|invocation| {
+                    let mut argv = vec![invocation.program.clone()];
+                    argv.extend(invocation.args.iter().cloned());
+                    render_packet_command(&argv)
+                })
+                .collect::<Vec<_>>(),
+            insufficient.follow_up_commands,
+            "the displayed follow-up must be the rendering of its invocation: {insufficient:?}"
+        );
+        assert!(
+            insufficient.follow_up_invocations.iter().all(|invocation| {
+                invocation.program == "codestory-cli"
+                    && invocation
+                        .args
+                        .iter()
+                        .all(|argument| !argument.starts_with('\'') && !argument.is_empty())
+            }),
+            "invocation arguments must be unquoted: {insufficient:?}"
+        );
+        assert!(
+            insufficient
+                .follow_up_invocations
+                .iter()
+                .any(|invocation| invocation.args.contains(&question.to_string())),
+            "the question must reach the invocation verbatim: {insufficient:?}"
+        );
     }
 
     #[test]
@@ -10227,10 +10293,33 @@ mod tests {
         let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
         let quoted = quote_packet_command_value(question);
 
+        // Doubling the apostrophe is the PowerShell convention; `sh` joins the
+        // adjacent quoted runs and deletes the character outright.
         assert_eq!(
             quoted,
-            "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+            r#"'Inspect $env:SECRET and $(Get-ChildItem) and '\''literal'\'''"#
         );
+        let argv = next_deeper_packet_argv(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+        )
+        .expect("tiny packet should have deeper argv");
+        assert_eq!(
+            argv,
+            vec![
+                "codestory-cli".to_string(),
+                "packet".to_string(),
+                "--project".to_string(),
+                "C:/workspace/project root".to_string(),
+                "--question".to_string(),
+                question.to_string(),
+                "--budget".to_string(),
+                "compact".to_string(),
+            ],
+            "the follow-up must be typed argv, with the question carried verbatim"
+        );
+
         let command = next_deeper_packet_command(
             packet_fixture_project_root(),
             question,
@@ -10238,8 +10327,12 @@ mod tests {
         )
         .expect("tiny packet should have deeper command");
         assert!(
-            command.contains("--question 'Inspect $env:SECRET and $(Get-ChildItem)"),
+            command.contains(r#"--question 'Inspect $env:SECRET and $(Get-ChildItem)"#),
             "packet command should single-quote shell-sensitive question text: {command}"
+        );
+        assert!(
+            command.contains(r#"and '\''literal'\'''"#),
+            "packet command must escape apostrophes so a POSIX shell preserves them: {command}"
         );
         assert!(
             command.contains("--project 'C:/workspace/project root'"),

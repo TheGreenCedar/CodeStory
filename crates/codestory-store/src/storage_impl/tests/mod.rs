@@ -2973,6 +2973,7 @@ fn flush_projection_persistence_fixture(
         symbol_key: "a::run".to_string(),
         node_id: NodeId(2),
         signature_hash: 11,
+        normalized_signature: None,
         body_hash: 12,
         start_line: 2,
         end_line: 3,
@@ -4547,6 +4548,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::main:FUNCTION".to_string(),
         node_id: function_node.id,
         signature_hash: 101,
+        normalized_signature: None,
         body_hash: 202,
         start_line: 1,
         end_line: 1,
@@ -4642,6 +4644,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4651,6 +4654,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4666,6 +4670,7 @@ fn test_callable_projection_state_round_trip() -> Result<(), StorageError> {
         symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
         node_id: NodeId(101),
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 299,
         start_line: 12,
         end_line: 22,
@@ -4745,6 +4750,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: NodeId(101),
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 10,
             end_line: 20,
@@ -4754,6 +4760,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/lib.rs::helper:FUNCTION".to_string(),
             node_id: NodeId(102),
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 30,
             end_line: 35,
@@ -4763,6 +4770,7 @@ fn test_delete_callable_projection_states_for_file() -> Result<(), StorageError>
             symbol_key: "src/other.rs::keep:FUNCTION".to_string(),
             node_id: NodeId(201),
             signature_hash: 311,
+            normalized_signature: None,
             body_hash: 411,
             start_line: 1,
             end_line: 5,
@@ -4908,6 +4916,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
             node_id: caller_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 3,
@@ -4917,6 +4926,7 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
             symbol_key: "src/lib.rs::keep:FUNCTION".to_string(),
             node_id: caller_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 10,
             end_line: 12,
@@ -8247,6 +8257,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         symbol_key: "src/main.rs::foo:FUNCTION".to_string(),
         node_id: func_node.id,
         signature_hash: 111,
+        normalized_signature: None,
         body_hash: 211,
         start_line: 1,
         end_line: 1,
@@ -8377,6 +8388,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::caller:FUNCTION".to_string(),
             node_id: caller_in_a.id,
             signature_hash: 111,
+            normalized_signature: None,
             body_hash: 211,
             start_line: 1,
             end_line: 2,
@@ -8386,6 +8398,7 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
             symbol_key: "src/a.rs::stale-callee:FUNCTION".to_string(),
             node_id: callee_in_b.id,
             signature_hash: 112,
+            normalized_signature: None,
             body_hash: 212,
             start_line: 3,
             end_line: 4,
@@ -8452,7 +8465,7 @@ fn test_bookmark_crud() -> Result<(), StorageError> {
     assert_eq!(bookmarks[0].comment, Some("Important function".to_string()));
 
     // Update comment
-    storage.update_bookmark_comment(bm_id, "Updated comment")?;
+    storage.update_bookmark(bm_id, None, Some(Some("Updated comment")))?;
     let bookmarks = storage.get_bookmarks(Some(cat_id))?;
     assert_eq!(bookmarks[0].comment, Some("Updated comment".to_string()));
 
@@ -9563,4 +9576,1097 @@ fn test_grounding_edge_digests_ignore_ambiguous_resolved_targets() -> Result<(),
     assert!(!counts.iter().any(|entry| entry.node_id == NodeId(3)));
 
     Ok(())
+}
+
+#[test]
+fn raw_call_edges_by_effective_source_match_the_broad_edge_filter() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/routes.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "route".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(11),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "raw_caller".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            // A very common unqualified call name, so trail policy clears any
+            // resolution below `Certain`.
+            id: NodeId(20),
+            kind: NodeKind::METHOD,
+            serialized_name: "insert".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(21),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "handler".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(22),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        // Unresolved source, so the effective source is the raw source.
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(7),
+            resolved_target: Some(NodeId(21)),
+            confidence: Some(0.42),
+            callsite_identity: Some("routes.rs:7:handler".to_string()),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            candidate_targets: vec![NodeId(21), NodeId(22)],
+            ..Default::default()
+        },
+        // A resolved source rewrites the effective source onto the route node.
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(11),
+            target: NodeId(20),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(10)),
+            resolved_target: Some(NodeId(20)),
+            confidence: Some(0.8),
+            certainty: Some(ResolutionCertainty::Probable),
+            ..Default::default()
+        },
+        // Same raw source, but the resolved source moves it elsewhere.
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(11)),
+            ..Default::default()
+        },
+        // Right source, wrong kind.
+        Edge {
+            id: EdgeId(4),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        // A later unresolved-branch edge, so the two branches interleave by id.
+        Edge {
+            id: EdgeId(5),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(21)),
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(0.99),
+            ..Default::default()
+        },
+    ])?;
+
+    let expected = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(10))
+        .collect::<Vec<_>>();
+    let selective = storage.get_raw_call_edges_by_effective_source(NodeId(10))?;
+    assert_eq!(
+        selective, expected,
+        "selective route lookup diverged from the broad edge filter"
+    );
+    assert_eq!(
+        selective.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2), EdgeId(5)],
+        "selective route lookup lost deterministic edge-id order across branches"
+    );
+
+    // The trail accessor is not a substitute: its policy clears exactly the
+    // resolution fields the route-handler DTO reports, for both the uncertain
+    // call and the probable common-name call.
+    let trail_edges = storage.get_edges_for_node_id(NodeId(10))?;
+    for edge_id in [EdgeId(1), EdgeId(2)] {
+        let policied = trail_edges
+            .iter()
+            .find(|edge| edge.id == edge_id)
+            .unwrap_or_else(|| panic!("trail lookup returns {edge_id:?}"));
+        assert_eq!(policied.resolved_target, None, "{edge_id:?}");
+        assert_eq!(policied.certainty, None, "{edge_id:?}");
+        assert_eq!(policied.confidence, None, "{edge_id:?}");
+    }
+    let raw_uncertain = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(1))
+        .expect("raw lookup returns the uncertain call");
+    assert_eq!(raw_uncertain.resolved_target, Some(NodeId(21)));
+    assert_eq!(
+        raw_uncertain.certainty,
+        Some(ResolutionCertainty::Uncertain)
+    );
+    assert_eq!(raw_uncertain.confidence, Some(0.42));
+    let raw_common = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(2))
+        .expect("raw lookup returns the resolved-source call");
+    assert_eq!(raw_common.resolved_target, Some(NodeId(20)));
+    assert_eq!(raw_common.certainty, Some(ResolutionCertainty::Probable));
+    assert_eq!(raw_common.confidence, Some(0.8));
+
+    assert!(
+        storage
+            .get_raw_call_edges_by_effective_source(NodeId(22))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_route_edge_lookup_costs_less_vm_work_than_the_broad_edge_scan() -> Result<(), StorageError> {
+    const REPRESENTATIVE_NODE_COUNT: i64 = 12_000;
+    const REPRESENTATIVE_EDGE_COUNT: i64 = 48_000;
+    const ROUTE_NODE_ID: i64 = 7;
+
+    let storage = Storage::new_in_memory()?;
+    let call_kind = EdgeKind::CALL as i32;
+    storage.conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_NODE_COUNT}
+         )
+         INSERT INTO node(id, kind, serialized_name)
+         SELECT value, 3, printf('node-%d', value) FROM sequence;
+         WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_EDGE_COUNT}
+         )
+         INSERT INTO edge(
+             id,
+             source_node_id,
+             target_node_id,
+             kind,
+             resolved_source_node_id
+         )
+         SELECT
+             value,
+             (value % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             ((value * 17) % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             {call_kind},
+             CASE WHEN value % 3 = 0 THEN ((value * 19) % {REPRESENTATIVE_NODE_COUNT}) + 1 END
+         FROM sequence;"
+    ))?;
+
+    let plan = storage
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL}"
+        ))?
+        .query_map(rusqlite::params![ROUTE_NODE_ID, call_kind], |row| {
+            row.get::<_, String>(3)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_resolved_source")),
+        "route lookup lost the resolved-source index: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_kind_source")),
+        "route lookup lost the kind/source index: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|line| !line.contains("SCAN e")),
+        "route lookup still scans the edge table: {plan:?}"
+    );
+
+    let count_vm_steps = |run: &dyn Fn() -> Result<Vec<Edge>, StorageError>| {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&callbacks);
+        storage.conn.progress_handler(
+            100,
+            Some(move || {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+                false
+            }),
+        )?;
+        let edges = run()?;
+        storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+        Ok::<_, StorageError>((edges, callbacks.load(AtomicOrdering::Relaxed)))
+    };
+
+    let (broad_edges, broad_callbacks) = count_vm_steps(&|| {
+        Ok(storage
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(ROUTE_NODE_ID)
+            })
+            .collect())
+    })?;
+    let (selective_edges, selective_callbacks) =
+        count_vm_steps(&|| storage.get_raw_call_edges_by_effective_source(NodeId(ROUTE_NODE_ID)))?;
+
+    assert!(
+        !selective_edges.is_empty(),
+        "representative fixture produced no route edges"
+    );
+    assert_eq!(
+        selective_edges, broad_edges,
+        "selective route lookup diverged from the broad scan on the representative fixture"
+    );
+    assert!(
+        broad_callbacks > selective_callbacks.saturating_mul(5),
+        "representative route lookup VM work did not improve enough: broad={broad_callbacks}, selective={selective_callbacks}"
+    );
+    eprintln!(
+        "raw route edge representative proof: nodes={REPRESENTATIVE_NODE_COUNT} edges={REPRESENTATIVE_EDGE_COUNT} broad_callbacks={broad_callbacks} selective_callbacks={selective_callbacks}"
+    );
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_matches_per_node_children() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::CLASS,
+            serialized_name: "WithChild".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::CLASS,
+            serialized_name: "Childless".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "child".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::CLASS,
+            serialized_name: "OnlyCalls".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(4),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+    ])?;
+
+    let candidates = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(1)];
+    let batched = storage.node_ids_with_child_symbols(&candidates)?;
+    for node_id in candidates {
+        assert_eq!(
+            batched.contains(&node_id),
+            !storage.get_children_symbols(node_id)?.is_empty(),
+            "batched child presence diverged from per-node children for {node_id:?}"
+        );
+    }
+    assert!(storage.node_ids_with_child_symbols(&[])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_runs_one_statement_per_bind_limit_chunk() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    let parents = (1..=5_i64).collect::<Vec<_>>();
+    storage.insert_nodes_batch(
+        &parents
+            .iter()
+            .map(|id| Node {
+                id: NodeId(*id),
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Parent{id}"),
+                ..Default::default()
+            })
+            .chain(std::iter::once(Node {
+                id: NodeId(100),
+                kind: NodeKind::METHOD,
+                serialized_name: "member".to_string(),
+                ..Default::default()
+            }))
+            .collect::<Vec<_>>(),
+    )?;
+    storage.insert_edges_batch(
+        &parents
+            .iter()
+            .filter(|id| **id % 2 == 1)
+            .map(|id| Edge {
+                id: EdgeId(*id),
+                source: NodeId(*id),
+                target: NodeId(100),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    let node_ids = parents.iter().map(|id| NodeId(*id)).collect::<Vec<_>>();
+    let unchunked = storage.node_ids_with_child_symbols(&node_ids)?;
+    assert_eq!(
+        unchunked,
+        [NodeId(1), NodeId(3), NodeId(5)].into_iter().collect()
+    );
+
+    let previous_limit = storage.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 2)?;
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&prepares);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Select) {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Authorization::Allow
+        }))?;
+    let chunked = storage.node_ids_with_child_symbols(&node_ids);
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    let chunked = chunked?;
+
+    assert_eq!(chunked, unchunked);
+    assert_eq!(
+        prepares.load(AtomicOrdering::Relaxed),
+        3,
+        "five candidates at a bind limit of two must run exactly three statements"
+    );
+    Ok(())
+}
+
+fn seed_annotation_anchor(
+    storage: &mut Storage,
+    node_id: i64,
+    path: &str,
+    qualified_name: &str,
+    normalized_signature: &str,
+) -> Result<(), StorageError> {
+    let existing_file_node_id: Option<i64> = storage
+        .get_connection()
+        .query_row(
+            "SELECT id FROM file WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let file_node_id = existing_file_node_id.unwrap_or(node_id - 1);
+    if existing_file_node_id.is_none() {
+        storage.insert_file(&FileInfo {
+            id: file_node_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        })?;
+        storage.insert_node(&Node {
+            id: NodeId(file_node_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        })?;
+    }
+    storage.insert_node(&Node {
+        id: NodeId(node_id),
+        kind: NodeKind::FUNCTION,
+        serialized_name: qualified_name.to_string(),
+        qualified_name: Some(qualified_name.to_string()),
+        file_node_id: Some(NodeId(file_node_id)),
+        start_line: Some(7),
+        end_line: Some(9),
+        ..Default::default()
+    })?;
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: file_node_id,
+        symbol_key: qualified_name.to_string(),
+        node_id: NodeId(node_id),
+        // A change detector that deliberately disagrees with the normalized
+        // signature, so a lookup that reads the wrong column finds nothing.
+        signature_hash: 0x5a5a_5a5a,
+        normalized_signature: Some(normalized_signature.to_string()),
+        body_hash: 1,
+        start_line: 7,
+        end_line: 9,
+    }])?;
+    Ok(())
+}
+
+#[test]
+fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Result<(), StorageError>
+{
+    // The schema bump is the writer barrier: forward-only migration already
+    // refuses a newer schema, so an older CLI fails closed on the whole
+    // database instead of writing the retained legacy annotation tables.
+    let storage = Storage::new_in_memory()?;
+
+    assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+    let (sidecar_version, cutover_at) = storage
+        .annotation_sidecar_cutover()?
+        .expect("a current-schema database is stamped with the cutover marker");
+    assert_eq!(
+        sidecar_version,
+        crate::annotations::ANNOTATION_SCHEMA_VERSION
+    );
+    assert!(cutover_at >= 0);
+
+    storage.set_schema_version(CURRENT_SCHEMA_VERSION + 1)?;
+    let error = storage
+        .apply_schema_migrations()
+        .expect_err("a newer schema must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported database schema version"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
+    let category_id = storage.create_bookmark_category("Favorites")?;
+    let _ = storage.add_bookmark(category_id, NodeId(100), Some("keep"))?;
+
+    // A schema-30 database re-migrating must find the same legacy rows.
+    storage.set_schema_version(30)?;
+    storage.apply_schema_migrations()?;
+
+    let snapshot = storage.legacy_annotation_snapshot()?;
+    assert_eq!(snapshot.categories.len(), 1);
+    assert_eq!(snapshot.bookmarks.len(), 1);
+    let bookmark = &snapshot.bookmarks[0];
+    assert_eq!(bookmark.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(bookmark.qualified_name.as_deref(), Some("alpha"));
+    assert_eq!(bookmark.kind, Some(NodeKind::FUNCTION as i64));
+    assert_eq!(
+        bookmark.normalized_signature.as_deref(),
+        Some("shape:4242"),
+        "the anchor must carry the normalized signature, not the change detector"
+    );
+    assert_eq!(bookmark.comment.as_deref(), Some("keep"));
+    assert!(storage.annotation_sidecar_cutover()?.is_some());
+    Ok(())
+}
+
+#[test]
+fn annotation_anchor_lookups_stay_selective_and_report_ambiguity() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", "shape:4242")?;
+    seed_annotation_anchor(
+        &mut storage,
+        200,
+        "/repo/src/other.rs",
+        "alpha",
+        "shape:4242",
+    )?;
+
+    let anchor = storage
+        .annotation_anchor_for_node(NodeId(100))?
+        .expect("anchor for node");
+    assert_eq!(anchor.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(anchor.normalized_signature.as_deref(), Some("shape:4242"));
+
+    let unique = storage.annotation_anchors_by_anchor_tuple(
+        "/repo/src/lib.rs",
+        "alpha",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(unique.len(), 1);
+    assert_eq!(unique[0].node_id, 100);
+
+    let by_name =
+        storage.annotation_anchors_by_qualified_name("alpha", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![100, 200],
+        "the move probe must see the name in every file that carries it"
+    );
+
+    let scoped = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(
+        scoped.len(),
+        1,
+        "the signature probe is scoped to one file, so the other file's twin is invisible"
+    );
+    assert_eq!(scoped[0].node_id, 200);
+
+    seed_annotation_anchor(
+        &mut storage,
+        300,
+        "/repo/src/other.rs",
+        "twin",
+        "shape:4242",
+    )?;
+    let ambiguous = storage.annotation_anchors_by_normalized_signature(
+        "shape:4242",
+        "/repo/src/other.rs",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(
+        ambiguous
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![200, 300],
+        "an ambiguous signature must surface a second candidate rather than pick one"
+    );
+
+    assert!(
+        storage
+            .annotation_anchors_by_normalized_signature(
+                "shape:no-such-hash",
+                "/repo/src/lib.rs",
+                NodeKind::FUNCTION as i64,
+            )?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn annotation_uniqueness_probes_never_read_more_rows_than_the_decision_needs()
+-> Result<(), StorageError> {
+    // A workspace-wide name probe is unbounded by nature. Every caller only
+    // asks "one, or more than one", so the read has to stop at two.
+    let mut storage = Storage::new_in_memory()?;
+    for index in 0..8 {
+        seed_annotation_anchor(
+            &mut storage,
+            100 + index * 10,
+            &format!("/repo/src/file{index}.rs"),
+            "new",
+            "shape:4242",
+        )?;
+    }
+
+    let by_name = storage.annotation_anchors_by_qualified_name("new", NodeKind::FUNCTION as i64)?;
+    assert_eq!(
+        by_name.len(),
+        2,
+        "a crowded name must not stream the whole workspace into the rebind ladder"
+    );
+
+    Ok(())
+}
+
+/// Seed one promotion-ready database whose structural evidence spans several
+/// files, each with several units, one projection, and one bound cache row.
+fn seed_structural_promotion_corpus(path: &Path, generation: i64) -> Result<(), StorageError> {
+    const FILE_COUNT: i64 = 4;
+    const UNITS_PER_FILE: i64 = 3;
+
+    let mut storage = Storage::open(path)?;
+    let mut files = Vec::new();
+    let mut file_content_hashes = Vec::new();
+    let mut nodes = Vec::new();
+    let mut units = Vec::new();
+    let mut projections = Vec::new();
+    for index in 0..FILE_COUNT {
+        let file_id = generation * 100 + index + 1;
+        let source_hash = format!("{file_id:064x}");
+        files.push(FileInfo {
+            id: file_id,
+            path: PathBuf::from(format!("src/module_{file_id}.rs")),
+            language: "rust".to_string(),
+            modification_time: file_id,
+            indexed: true,
+            complete: true,
+            line_count: 64,
+            file_role: FileRole::Source,
+        });
+        file_content_hashes.push(FileContentHash {
+            file_id,
+            content_hash: source_hash.clone(),
+        });
+        let first_unit = units.len();
+        for offset in 0..UNITS_PER_FILE {
+            let node_id = file_id * 10 + offset;
+            nodes.push(Node {
+                id: NodeId(node_id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("module_{file_id}::f{offset}"),
+                ..Default::default()
+            });
+            units.push(structural_unit_fixture(node_id, file_id, &source_hash));
+        }
+        projections.push(StructuralTextProjection {
+            file_id,
+            source_content_hash: source_hash,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "fixture".to_string(),
+            language: "rust".to_string(),
+            file_role: FileRole::Source,
+            unit_count: UNITS_PER_FILE as u64,
+            unit_digest: structural_text_unit_digest(&units[first_unit..]),
+        });
+    }
+    let cache_writes = files
+        .iter()
+        .map(|file| StructuralTextArtifactCacheWrite {
+            path: &file.path,
+            file_id: file.id,
+            cache_key: "v1:fixture",
+            artifact_blob: b"verified structural artifact",
+        })
+        .collect::<Vec<_>>();
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &file_content_hashes,
+        nodes: &nodes,
+        structural_text_units: &units,
+        structural_text_projections: &projections,
+        structural_text_cache_writes: &cache_writes,
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    })?;
+    let publication = IndexPublicationRecord {
+        generation: generation.max(0) as u64,
+        generation_id: format!("generation-{generation}"),
+        run_id: format!("run-{generation}"),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: generation.max(0),
+    };
+    storage.put_index_publication(&publication)?;
+    storage.publish_structural_text_unit_generation(&publication)?;
+    storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "test-project",
+        "test-workspace",
+        source_policy_identity(
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        ),
+        &[],
+    )?;
+    storage.finalize_staged_snapshot()
+}
+
+#[test]
+fn structural_content_scan_reproduces_the_separate_summaries_and_per_file_digests()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-equivalence");
+    seed_structural_promotion_corpus(&path, 7)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+
+    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(conn)?;
+    let (projection_count, projection_digest, projection_versions) =
+        structural_text_projection_content_summary(conn)?;
+    validate_structural_text_projection_rows(conn)?;
+
+    let scan = scan_structural_text_content(conn)?;
+
+    assert_eq!(scan.unit_count, unit_count);
+    assert_eq!(scan.unit_digest, unit_digest);
+    assert_eq!(scan.unit_versions, unit_versions);
+    assert_eq!(scan.projection_count, projection_count);
+    assert_eq!(scan.projection_digest, projection_digest);
+    assert_eq!(scan.projection_versions, projection_versions);
+    assert_eq!(scan.unit_count, 12, "the fixture publishes twelve units");
+    assert_eq!(
+        scan.projection_count, 4,
+        "the fixture publishes four projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_a_projection_that_no_longer_owns_its_units()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-lost-unit");
+    seed_structural_promotion_corpus(&path, 8)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let (file_id, node_id) = conn.query_row(
+        "SELECT file_id, node_id FROM structural_text_unit ORDER BY node_id ASC LIMIT 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_unit WHERE node_id = ?1",
+        params![node_id],
+    )?;
+
+    let error = scan_structural_text_content(conn)
+        .expect_err("a projection that lost a unit must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        format!("Other error: structural text projection {file_id} does not match its unit set"),
+        "the merged scan must report the same defect the separate pass reported"
+    );
+    assert_eq!(
+        validate_structural_text_projection_rows(conn)
+            .expect_err("the separate pass agrees")
+            .to_string(),
+        error.to_string()
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_units_without_an_owning_projection() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("structural-content-scan-orphan-units");
+    seed_structural_promotion_corpus(&path, 9)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let file_id = conn.query_row(
+        "SELECT file_id FROM structural_text_projection ORDER BY file_id ASC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_projection WHERE file_id = ?1",
+        params![file_id],
+    )?;
+
+    let error = scan_structural_text_content(conn).expect_err("orphaned units must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        "Other error: structural text units exist without owning projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_covers_content_and_ignores_only_sqlite_bookkeeping()
+-> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promotion-image-source");
+    let live_path = unique_temp_db_path("promotion-image-destination");
+    seed_structural_promotion_corpus(&staged_path, 11)?;
+    seed_structural_promotion_corpus(&live_path, 12)?;
+
+    let staged_image = promotion_database_image(&staged_path)?.expect("staged image is provable");
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("live image is provable"),
+        staged_image,
+        "two different databases must not share an image"
+    );
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_ne!(
+        fs::read(&staged_path).expect("read staged bytes"),
+        fs::read(&live_path).expect("read live bytes"),
+        "a restore leaves SQLite's own header counters different, which is why \
+         the image masks exactly those slots"
+    );
+    assert_eq!(
+        promotion_database_image(&live_path)?.expect("restored image is provable"),
+        staged_image,
+        "a faithful page-level restore carries the candidate's content"
+    );
+
+    let restored = fs::read(&live_path).expect("read live bytes");
+    let reimage = |mutate: &dyn Fn(&mut Vec<u8>)| -> Result<PromotionDatabaseImage, StorageError> {
+        let mut bytes = restored.clone();
+        mutate(&mut bytes);
+        fs::write(&live_path, &bytes).expect("write mutated live bytes");
+        Ok(promotion_database_image(&live_path)?.expect("mutated image is provable"))
+    };
+
+    // Only the three bookkeeping slots are outside the image.
+    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
+        assert_eq!(
+            reimage(&|bytes| bytes[start..end].iter_mut().for_each(|byte| *byte ^= 0xff))?,
+            staged_image,
+            "header slot {start}..{end} is SQLite bookkeeping, not content"
+        );
+    }
+    // Every other header byte is content: the page size, the text encoding, the
+    // freelist head, the user version and the application id all participate.
+    for offset in [16, 28, 32, 44, 56, 60, 68, 96] {
+        assert_ne!(
+            reimage(&|bytes| bytes[offset] ^= 0xff)?,
+            staged_image,
+            "header byte {offset} must participate in the image"
+        );
+    }
+    // And so does one byte of page content well past the header.
+    let content_offset = restored.len() / 2;
+    assert_ne!(
+        reimage(&|bytes| bytes[content_offset] ^= 0xff)?,
+        staged_image,
+        "byte drift in the pages must break the image"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_is_unprovable_when_content_sits_outside_the_main_file()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("promotion-image-hot-sidecar");
+    seed_structural_promotion_corpus(&path, 13)?;
+    let sealed = promotion_database_image(&path)?.expect("sealed image is provable");
+
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = sqlite_sidecar_path(&path, suffix);
+        fs::write(&sidecar, b"pending frames").expect("stage a hot sidecar");
+        assert_eq!(
+            promotion_database_image(&path)?,
+            None,
+            "{suffix} content outside the main file must leave the image unprovable"
+        );
+        fs::remove_file(&sidecar).expect("remove the hot sidecar");
+    }
+    assert_eq!(
+        promotion_database_image(&path)?,
+        Some(sealed),
+        "removing the sidecars restores the same image"
+    );
+
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promoted-receipt-staged");
+    let live_path = unique_temp_db_path("promoted-receipt-live");
+    seed_structural_promotion_corpus(&staged_path, 21)?;
+    seed_structural_promotion_corpus(&live_path, 22)?;
+
+    let candidate =
+        require_complete_promotion_database_identity(&staged_path, "Staged promotion candidate")?;
+    let candidate_source_policy =
+        read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
+    let candidate_structural_text =
+        read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
+    let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            Some(candidate_image),
+        )?,
+        PromotedValidation::ReusedCandidateReceipt,
+        "a restore proven byte-identical to the validated candidate reuses its receipt"
+    );
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            None,
+        )?,
+        PromotedValidation::Revalidated,
+        "without a candidate image the promoted copy is validated in full"
+    );
+
+    // In-place corruption after the restore leaves the publication identity
+    // untouched, so only the deep validation can catch it. The receipt must not
+    // be reusable here.
+    corrupt_test_structural_cache(&live_path, "blob")?;
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("corrupted image"),
+        candidate_image,
+        "in-place corruption must break the seal"
+    );
+    let error = validate_promoted_live_database(
+        &live_path,
+        &staged_path,
+        &candidate,
+        &candidate_source_policy,
+        &candidate_structural_text,
+        Some(candidate_image),
+    )
+    .expect_err("a corrupted restore must fail the post-restore fence");
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("structural artifact cache"),
+        "unexpected fence error: {error}"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
+    Ok(())
+}
+
+/// Read the durable schema shape a connection currently has.
+///
+/// `sqlite_master` is the only place both construction paths converge, so it
+/// is the only honest comparison surface for schema drift. Autoindexes are
+/// derived from the table SQL already present in the same dump, so including
+/// them would double-count rather than add signal.
+///
+/// Runs of whitespace are collapsed. SQLite stores the DDL text verbatim, and
+/// `create_tables` and the migration ladder indent the same table differently;
+/// that is layout, not shape. Everything that decides whether two caches are
+/// interchangeable — table set, index set, column names, types, defaults,
+/// constraints, and their order — survives the collapse.
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sqlite_master_shape(conn: &rusqlite::Connection) -> Vec<(String, String, String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '')
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY type, name, tbl_name",
+        )
+        .expect("prepare sqlite_master read");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                normalize_schema_sql(&row.get::<_, String>(3)?),
+            ))
+        })
+        .expect("query sqlite_master");
+    rows.map(|row| row.expect("read sqlite_master row"))
+        .collect()
+}
+
+#[test]
+fn a_replayed_migration_ladder_produces_the_same_schema_as_a_fresh_create() {
+    // ARCH-020: the CREATE TABLE definitions in `schema.rs` and the migration
+    // ladder are two sources of truth for one schema, and they have already
+    // drifted once. `init` stamps `user_version` to the current version before
+    // migrations run, so a freshly created database executes *no* migration —
+    // the ladder is only ever exercised on an upgraded cache, which is exactly
+    // where nothing was comparing the two shapes.
+    //
+    // This pins the drift direction that strands a rolled-back CLI: a
+    // conditional migration that changes the schema beyond what CREATE TABLE
+    // produces. Rewinding `user_version` replays the whole ladder over a
+    // freshly created database; the resulting `sqlite_master` must equal the
+    // fresh one, which also proves every migration is idempotent against the
+    // shape `schema.rs` ships.
+    //
+    // Scope, stated honestly: the tail of the ladder runs unconditionally on
+    // every open, so those steps already shape a fresh database and cannot
+    // drift from it. What this covers is the version-gated body — the steps a
+    // fresh create skips and only an upgraded cache ever runs.
+    let fresh_dir = tempfile::tempdir().expect("fresh schema directory");
+    let fresh_path = fresh_dir.path().join("codestory.db");
+    let fresh = Storage::open(&fresh_path).expect("create a fresh database");
+    let fresh_shape = sqlite_master_shape(fresh.get_connection());
+    drop(fresh);
+    assert!(
+        !fresh_shape.is_empty(),
+        "a fresh database must define a schema to compare"
+    );
+
+    let replay_dir = tempfile::tempdir().expect("replay schema directory");
+    let replay_path = replay_dir.path().join("codestory.db");
+    drop(Storage::open(&replay_path).expect("create the database to replay onto"));
+    let rewind = rusqlite::Connection::open(&replay_path).expect("open for version rewind");
+    rewind
+        .pragma_update(None, "user_version", 1i64)
+        .expect("rewind the recorded schema version");
+    drop(rewind);
+
+    let replayed = Storage::open(&replay_path).expect("replay the full migration ladder");
+    let replayed_shape = sqlite_master_shape(replayed.get_connection());
+    drop(replayed);
+
+    assert_eq!(
+        Storage::database_schema_version(&replay_path).expect("read replayed schema version"),
+        CURRENT_SCHEMA_VERSION,
+        "the replayed ladder must land on the current schema version"
+    );
+    assert_eq!(
+        replayed_shape, fresh_shape,
+        "the migration ladder and the CREATE TABLE definitions must agree; a fresh cache and a migrated cache have drifted"
+    );
 }

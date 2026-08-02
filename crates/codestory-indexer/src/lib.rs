@@ -21137,11 +21137,20 @@ pub(crate) fn build_callable_projection_states(
             end_line,
         ));
 
+        let normalized_signature = callable_normalized_signature(
+            node,
+            start_line,
+            end_line,
+            edges_by_source.get(&node.id),
+            occurrences_by_file.get(&file_id),
+        );
+
         states.push(CallableProjectionState {
             file_id: file_id.0,
             symbol_key,
             node_id: node.id,
             signature_hash,
+            normalized_signature: Some(normalized_signature),
             body_hash: hash_parts(body_parts.iter().map(String::as_str)),
             start_line,
             end_line,
@@ -21154,6 +21163,9 @@ pub(crate) fn build_callable_projection_states(
             symbol_key: FILE_STRUCTURAL_SYMBOL_KEY.to_string(),
             node_id: file_node.id,
             signature_hash: hash_parts([FILE_STRUCTURAL_SYMBOL_KEY]),
+            // The file structural row is not a callable, so it carries no
+            // normalized signature and can never satisfy a rebind probe.
+            normalized_signature: None,
             body_hash: structural_projection_hash(file_node.id, nodes, edges, &node_by_id),
             start_line: 1,
             end_line: file_node.end_line.unwrap_or(1),
@@ -21162,6 +21174,123 @@ pub(crate) fn build_callable_projection_states(
 
     states.sort_by(|lhs, rhs| lhs.symbol_key.cmp(&rhs.symbol_key));
     states
+}
+
+/// Tag for a normalized signature whose body projected at least one part.
+pub const CALLABLE_SHAPE_SIGNATURE_TAG: &str = "shape";
+/// Tag for a normalized signature with no body evidence behind it.
+pub const CALLABLE_OUTLINE_SIGNATURE_TAG: &str = "outline";
+
+/// Position- and name-independent shape of one callable.
+///
+/// `signature_hash` is a *change detector*: it binds the symbol's own name and
+/// its exact start position, which is exactly what incremental projection
+/// wants and exactly what annotation rebinding must not use. Rebinding has to
+/// recognise the same code under a new name, or in a new file, so this hash
+/// deliberately drops three things:
+///
+/// - the symbol's own name, so a pure rename keeps its signature;
+/// - the owning file, so a pure move keeps its signature;
+/// - every absolute position, so a position-shifting edit keeps its signature.
+///
+/// What remains is the callable's shape: its kind, its line extent, and its
+/// body projection expressed relative to its own start.
+///
+/// The result is tagged, because those two ingredients are not equally strong.
+/// A callable whose body projects no edges and no occurrences — a one-line
+/// accessor, a constant-returning stub — has only its kind and its line count
+/// left, and every other stub of the same length shares them. That is an
+/// `outline`: honest as a *consistency check* against evidence that already
+/// identifies the symbol, worthless as an identifier on its own. A body that
+/// projected something is a `shape`. Consumers that infer identity purely from
+/// the signature must insist on a `shape`; the alternative is handing a
+/// bookmark on a deleted stub to whichever stub happens to survive.
+///
+/// Distinct callables with identical shapes still collide, which is correct:
+/// the rebind ladder treats a collision as an ambiguous match and refuses to
+/// guess.
+fn callable_normalized_signature(
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+    source_edges: Option<&Vec<&Edge>>,
+    file_occurrences: Option<&Vec<&Occurrence>>,
+) -> String {
+    let mut body_parts = callable_relative_edge_parts(source_edges, start_line);
+    body_parts.extend(callable_relative_occurrence_parts(
+        file_occurrences,
+        node,
+        start_line,
+        end_line,
+    ));
+    let tag = if body_parts.is_empty() {
+        CALLABLE_OUTLINE_SIGNATURE_TAG
+    } else {
+        CALLABLE_SHAPE_SIGNATURE_TAG
+    };
+    let mut parts = vec![
+        format!("kind={}", node.kind as i32),
+        format!("extent={}", end_line.saturating_sub(start_line)),
+    ];
+    parts.extend(body_parts);
+    let hash = hash_parts(parts.iter().map(String::as_str));
+    format!("{tag}:{hash}")
+}
+
+/// Outgoing body edges keyed by callee identity and by line *within* the body.
+///
+/// `callsite_identity` is deliberately excluded: it embeds the owning file node
+/// id and the absolute line, so including it would reintroduce exactly the
+/// position and file dependence this hash exists to shed.
+fn callable_relative_edge_parts(source_edges: Option<&Vec<&Edge>>, start_line: u32) -> Vec<String> {
+    let Some(source_edges) = source_edges else {
+        return Vec::new();
+    };
+    let mut edge_parts = source_edges
+        .iter()
+        .filter(|edge| !is_structural_projection_edge(edge.kind))
+        .map(|edge| {
+            format!(
+                "e:{}:{}:{}",
+                edge.kind as i32,
+                edge.target.0,
+                edge.line.unwrap_or(start_line).saturating_sub(start_line)
+            )
+        })
+        .collect::<Vec<_>>();
+    edge_parts.sort();
+    edge_parts
+}
+
+/// Body occurrences expressed relative to the callable's own start line.
+fn callable_relative_occurrence_parts(
+    file_occurrences: Option<&Vec<&Occurrence>>,
+    node: &Node,
+    start_line: u32,
+    end_line: u32,
+) -> Vec<String> {
+    let Some(file_occurrences) = file_occurrences else {
+        return Vec::new();
+    };
+    let mut occurrence_parts = file_occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence_belongs_to_callable_body(occurrence, node, start_line, end_line)
+        })
+        .map(|occurrence| {
+            format!(
+                "o:{}:{}:{}:{}:{}:{}",
+                occurrence.element_id,
+                occurrence.kind as i32,
+                occurrence.location.start_line.saturating_sub(start_line),
+                occurrence.location.start_col,
+                occurrence.location.end_line.saturating_sub(start_line),
+                occurrence.location.end_col
+            )
+        })
+        .collect::<Vec<_>>();
+    occurrence_parts.sort();
+    occurrence_parts
 }
 
 fn callable_edge_projection_parts(source_edges: Option<&Vec<&Edge>>) -> Vec<String> {

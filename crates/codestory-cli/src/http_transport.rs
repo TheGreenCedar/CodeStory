@@ -122,12 +122,7 @@ pub(crate) fn handle_http_request(
             }) {
                 Ok(operation) => operation,
                 Err(error) => {
-                    return write_http_error_json(
-                        &mut stream,
-                        400,
-                        "search_unavailable",
-                        error.to_string(),
-                    );
+                    return write_http_typed_error(&mut stream, 400, "search_unavailable", &error);
                 }
             };
             write_http_json(
@@ -466,9 +461,26 @@ fn write_http_target_error(
 ) -> Result<()> {
     if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
         let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-        write_http_json(stream, 400, &output)
-    } else {
-        write_http_error_json(stream, 400, "target_resolution_failed", error.to_string())
+        return write_http_json(stream, 400, &output);
+    }
+    write_http_typed_error(stream, 400, "target_resolution_failed", &error)
+}
+
+/// Emit the typed runtime classification when the adapter still holds one.
+///
+/// The HTTP surface answers the same graph operations as MCP, so a caller must
+/// be able to branch on `error.code` here too instead of matching message text.
+fn write_http_typed_error(
+    stream: &mut TcpStream,
+    status: u16,
+    fallback_code: &'static str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    match runtime::api_error_in_chain(error) {
+        Some(api_error) => {
+            write_http_json(stream, status, &serde_json::json!({"error": api_error}))
+        }
+        None => write_http_error_json(stream, status, fallback_code, error.to_string()),
     }
 }
 

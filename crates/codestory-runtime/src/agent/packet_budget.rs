@@ -10,7 +10,7 @@ use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
-    quote_packet_command_value, quote_packet_project_arg,
+    packet_argv, packet_display_project_arg, render_packet_command,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
 use codestory_contracts::api::{
@@ -567,17 +567,33 @@ pub(crate) fn next_deeper_packet_command(
     question: &str,
     requested: PacketBudgetModeDto,
 ) -> Option<String> {
+    next_deeper_packet_argv(project_root, question, requested)
+        .map(|argv| render_packet_command(&argv))
+}
+
+/// The deeper-budget retry as executable argv; the displayed command renders
+/// from this, never the other way round.
+pub(crate) fn next_deeper_packet_argv(
+    project_root: &Path,
+    question: &str,
+    requested: PacketBudgetModeDto,
+) -> Option<Vec<String>> {
     let next = match requested {
         PacketBudgetModeDto::Tiny => "compact",
         PacketBudgetModeDto::Compact => "standard",
         PacketBudgetModeDto::Standard => "deep",
         PacketBudgetModeDto::Deep => return None,
     };
-    let project = quote_packet_project_arg(project_root);
-    Some(format!(
-        "codestory-cli packet --project {project} --question {} --budget {next}",
-        quote_packet_command_value(question)
-    ))
+    let project = packet_display_project_arg(project_root);
+    Some(packet_argv(&[
+        "packet",
+        "--project",
+        project.as_str(),
+        "--question",
+        question,
+        "--budget",
+        next,
+    ]))
 }
 
 #[cfg(test)]
@@ -774,6 +790,8 @@ mod tests {
                         resolved_hit_count: 1,
                         unresolved_candidate_count: 0,
                         blocking_unresolved_candidate_count: 0,
+                        semantic_stage_timeout_zero_hits: false,
+                        semantic_abstained: false,
                         diagnostic: None,
                     }),
             );
@@ -1058,7 +1076,7 @@ mod tests {
             answer_id: "packet-budget-test".to_string(),
             prompt: question.to_string(),
             summary: "Packet budget test answer.".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -1089,6 +1107,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -1135,6 +1155,7 @@ mod tests {
             avoid_opening_paths: Vec::new(),
             gaps: Vec::new(),
             follow_up_commands: Vec::new(),
+            follow_up_invocations: Vec::new(),
             coverage_report: Some(PacketCoverageReportDto::default()),
         };
         let retrieval_trace_summary = PacketRetrievalTraceSummaryDto {

@@ -716,6 +716,82 @@ pub(crate) enum CacheAction {
     Identity(CacheIdentityCommand),
     #[command(about = "Rehydrate a compatible cache from another worktree.")]
     Rehydrate(CacheRehydrateCommand),
+    #[command(
+        about = "Report, and optionally reclaim, cache state no live workspace or model can claim."
+    )]
+    Clean(CacheCleanCommand),
+    #[command(
+        about = "Quarantine this project's derived cache so it can be rebuilt.",
+        long_about = "Quarantine this project's derived cache so it can be rebuilt.\n\nDerived state is moved into a quarantine directory beside the cache, never deleted, and user-authored annotations are preserved in place. Use this after rolling a CodeStory release back onto a cache written by a newer schema; the reindex step is printed on completion."
+    )]
+    Reset(CacheResetCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheCleanCommand {
+    #[arg(
+        long,
+        help = "Reclaim the proven candidates in the plan. Omit for a dry-run plan that leaves the cache tree untouched."
+    )]
+    pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("cache_reset_intent")
+        .args(["confirm", "dry_run"])
+        .required(true)
+))]
+pub(crate) struct CacheResetCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        required = true,
+        help = "Required scope acknowledgement. Only derived cache state is reset; user-authored annotations are preserved."
+    )]
+    pub(crate) derived_only: bool,
+    #[arg(
+        long,
+        help = "Move the derived cache into quarantine. Exactly one of --confirm or --dry-run is required."
+    )]
+    pub(crate) confirm: bool,
+    #[arg(
+        long,
+        help = "Print the quarantine plan without moving anything. Exactly one of --confirm or --dry-run is required."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// JSON contract for `cache reset`.
+pub(crate) struct CacheResetOutput {
+    pub(crate) project: String,
+    pub(crate) storage_path: String,
+    /// Only `derived_only` exists. The field is emitted so a later scope can
+    /// be told apart by machine readers without a schema guess.
+    pub(crate) scope: &'static str,
+    pub(crate) applied: bool,
+    pub(crate) quarantine_dir: String,
+    pub(crate) quarantined: Vec<String>,
+    pub(crate) preserved: Vec<String>,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -796,6 +872,39 @@ pub(crate) enum RetrievalAction {
     RepublishProjections(RetrievalRepublishProjectionsCommand),
     /// Execute a standalone query against published retrieval artifacts.
     Query(RetrievalQueryCommand),
+    /// Validate the retained rollback generation and make it current.
+    ///
+    /// Retention keeps one deeply verified previous generation. Activation
+    /// re-proves it against live state before moving the pointer and refuses
+    /// with a typed code when it no longer proves out.
+    ActivateRollback(RetrievalActivateRollbackCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalActivateRollbackCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Validate the retained rollback generation without changing the current pointer."
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// JSON contract for `retrieval activate-rollback`.
+pub(crate) struct RetrievalActivateRollbackOutput {
+    pub(crate) project: String,
+    pub(crate) outcome: codestory_retrieval::RollbackActivationOutcome,
+    pub(crate) next_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2528,6 +2637,123 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    /// Reclaiming cache state is opt-in. A `cache clean` invocation that
+    /// forgets `--apply` must produce a plan, never a deletion.
+    #[test]
+    fn cache_clean_reclaims_nothing_without_an_explicit_apply() {
+        let planned = Cli::try_parse_from(["codestory-cli", "cache", "clean"])
+            .expect("cache clean should parse without flags");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(planned),
+        }) = planned.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(!planned.apply, "cache clean must default to a dry-run plan");
+
+        let applied = Cli::try_parse_from(["codestory-cli", "cache", "clean", "--apply"])
+            .expect("cache clean --apply should parse");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Clean(applied),
+        }) = applied.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert!(applied.apply);
+    }
+
+    #[test]
+    fn cache_reset_refuses_to_parse_without_an_explicit_scope_and_intent() {
+        // Quarantining a cache is destructive-looking even though it only
+        // moves files, so neither the scope nor the intent may be implicit.
+        let missing_everything = Cli::try_parse_from(["codestory-cli", "cache", "reset"])
+            .expect_err("cache reset must not parse bare");
+        assert!(
+            missing_everything.to_string().contains("--derived-only"),
+            "the scope acknowledgement must be named: {missing_everything}"
+        );
+
+        let missing_intent =
+            Cli::try_parse_from(["codestory-cli", "cache", "reset", "--derived-only"])
+                .expect_err("cache reset must not parse without an intent");
+        let rendered = missing_intent.to_string();
+        assert!(
+            rendered.contains("--confirm") && rendered.contains("--dry-run"),
+            "the required intent flags must be named: {rendered}"
+        );
+
+        let both = Cli::try_parse_from([
+            "codestory-cli",
+            "cache",
+            "reset",
+            "--derived-only",
+            "--confirm",
+            "--dry-run",
+        ])
+        .expect_err("cache reset must not accept both intents at once");
+        assert!(
+            both.to_string().contains("cannot be used with"),
+            "confirm and dry-run must be mutually exclusive: {both}"
+        );
+
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "cache",
+            "reset",
+            "--derived-only",
+            "--confirm",
+        ])
+        .expect("an explicit scope and intent must parse");
+        let Command::Cache(cache) = parsed.command else {
+            panic!("expected the cache command");
+        };
+        let CacheAction::Reset(reset) = cache.action else {
+            panic!("expected the reset action");
+        };
+        assert!(reset.derived_only);
+        assert!(reset.confirm);
+        assert!(!reset.dry_run);
+    }
+
+    #[test]
+    fn retrieval_activate_rollback_defaults_to_applying_and_accepts_dry_run() {
+        let applied = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "activate-rollback",
+            "--project",
+            "/repo",
+        ])
+        .expect("activate-rollback must parse");
+        let Command::Retrieval(retrieval) = applied.command else {
+            panic!("expected the retrieval command");
+        };
+        let RetrievalAction::ActivateRollback(activate) = retrieval.action else {
+            panic!("expected the activate-rollback action");
+        };
+        assert!(
+            !activate.dry_run,
+            "activation applies unless validation-only is requested"
+        );
+
+        let validated = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "activate-rollback",
+            "--project",
+            "/repo",
+            "--dry-run",
+        ])
+        .expect("activate-rollback --dry-run must parse");
+        let Command::Retrieval(retrieval) = validated.command else {
+            panic!("expected the retrieval command");
+        };
+        let RetrievalAction::ActivateRollback(activate) = retrieval.action else {
+            panic!("expected the activate-rollback action");
+        };
+        assert!(activate.dry_run);
     }
 
     #[test]

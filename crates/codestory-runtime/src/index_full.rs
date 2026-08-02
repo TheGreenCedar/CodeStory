@@ -466,6 +466,12 @@ fn prepare_full_refresh(
     })
 }
 
+/// Build and publish a from-scratch core database.
+///
+/// `_annotations_owned` is unused at runtime and load-bearing at compile time:
+/// the published database never carried the retained legacy annotation tables,
+/// so this function may only be reached from a path that already moved user
+/// annotations into the sidecar.
 pub(super) fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -473,6 +479,7 @@ pub(super) fn index_full_for_runtime(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
 ) -> Result<IndexingRunSummary, ApiError> {
     let PreparedFullRefresh {
         mut staged,
@@ -564,5 +571,6 @@ pub(super) fn index_full_for_runtime(
         #[cfg(test)]
         publication: publication.clone(),
         prepared_search_state: Some(prepared_search_state),
+        unchanged_publication: false,
     })
 }

@@ -1118,13 +1118,12 @@ mod tests {
         })
         .expect("rehydrate");
 
-        assert_ne!(
-            output
+        assert!(
+            !output
                 .reason
                 .as_deref()
                 .unwrap_or_default()
                 .contains("Partial"),
-            true,
             "a restored tracked source must not make the inventory partial: {output:?}"
         );
         let manifest =

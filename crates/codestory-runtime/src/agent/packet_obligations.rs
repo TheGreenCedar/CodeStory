@@ -1590,7 +1590,7 @@ mod tests {
             answer_id: "obligation-test".to_string(),
             prompt: INDEXING_QUESTION.to_string(),
             summary: "test".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: Vec::new(),
             citations,
             subgraph_ids: Vec::new(),
@@ -1606,6 +1606,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -1687,6 +1689,8 @@ mod tests {
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: None,
         }
     }
@@ -1999,6 +2003,104 @@ mod tests {
                 .as_ref()
                 .is_some_and(|coverage| coverage.unresolved == ["shell completion"]),
             "diagnostic cancellation stays visible without changing the verdict: {sufficiency:?}"
+        );
+    }
+
+    /// EV-8. A required query whose semantic stage timed out with zero hits reaches the ledger as
+    /// a typed cancellation, and the ledger is what demotes the verdict. The demotion lands on
+    /// the obligation that lost its evidence rather than on the packet as an undifferentiated
+    /// whole, so the caller is told which query to re-run.
+    #[test]
+    fn a_required_query_whose_semantic_stage_timed_out_demotes_through_its_obligation() {
+        let question = "Explain shell installer function dispatch and completion.";
+        let mut plan = build_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &[],
+        );
+        let mut answer = answer(vec![
+            lexical_citation("nvm_download", "install.sh", NodeKind::FUNCTION),
+            lexical_citation("nvm_use", "nvm.sh", NodeKind::FUNCTION),
+            citation("Helper::noop", "src/helper.rs", NodeKind::METHOD),
+        ]);
+        answer.prompt = question.to_string();
+        let material_queries = plan
+            .query_obligations
+            .iter()
+            .filter(|obligation| obligation.material)
+            .map(|obligation| obligation.query.clone())
+            .collect::<Vec<_>>();
+        let (timed_out_query, completed_queries) = material_queries
+            .split_first()
+            .expect("architecture explanation plans at least one material query");
+        for query in completed_queries {
+            answer
+                .retrieval_trace
+                .packet_sidecar_diagnostics
+                .push(query_diagnostic(query, PacketQueryCompletionDto::Completed));
+        }
+        let mut timed_out = query_diagnostic(
+            timed_out_query,
+            PacketQueryCompletionDto::Cancelled {
+                reason: "semantic_stage_timeout_zero_hits".to_string(),
+            },
+        );
+        timed_out.semantic_stage_timeout_zero_hits = true;
+        answer
+            .retrieval_trace
+            .packet_sidecar_diagnostics
+            .push(timed_out);
+
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &mut plan,
+            &answer,
+            &budget(),
+        );
+
+        assert!(
+            plan.query_obligations.iter().any(|obligation| {
+                obligation.material
+                    && &obligation.query == timed_out_query
+                    && matches!(
+                        obligation.completion,
+                        Some(PacketQueryCompletionDto::Cancelled { ref reason })
+                            if reason == "semantic_stage_timeout_zero_hits"
+                    )
+            }),
+            "the typed cancellation must reach the ledger: {plan:#?}"
+        );
+
+        let sufficiency = build_packet_sufficiency_with_obligation_context(
+            Path::new("/workspace/example"),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget(),
+            &[],
+            &[],
+            &plan,
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{sufficiency:?}"
+        );
+        assert!(
+            sufficiency.gaps.iter().any(|gap| {
+                gap.contains("query obligation") && gap.contains("semantic_stage_timeout_zero_hits")
+            }),
+            "the gap must name the query obligation that lost its lane: {:?}",
+            sufficiency.gaps
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains(timed_out_query.as_str())),
+            "the caller is told which query to re-run: {sufficiency:?}"
         );
     }
 

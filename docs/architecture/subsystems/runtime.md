@@ -27,6 +27,7 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: packet, retrieval-primary, planning, and evidence workflows
+- `src/controller_bookmarks.rs`: annotation CRUD against the store's sidecar
 
 ## Publication contract
 
@@ -43,8 +44,18 @@ stored row count is re-observed on every reuse, so a canonical table that moved
 under a stable publication is restreamed instead of answered from a stale map.
 A public operation also arms a `codestory_workspace::SourceFreshnessScope`, so
 its pre-build check, nested wrappers, and post-build check share one source
-content pass; `AgentRetrievalTraceDto::source_freshness_telemetry` publishes
-the resulting pass counters.
+content pass over files whose recorded content hash is already known;
+`AgentRetrievalTraceDto::source_freshness_telemetry` publishes the resulting
+pass counters. The scope never answers the post-build "source inputs changed
+while running {operation}" check from the memo: that check re-derives every
+verdict from content.
+
+Every path that replaces core projections moves user annotations into the store
+sidecar first, and the ordering is enforced by the type system rather than by
+convention: `index_full_for_runtime` and `index_incremental_for_runtime` demand
+an `AnnotationsOwned`, which only
+`ensure_annotations_owned_before_core_replacement` can mint. A future refresh
+entry point that forgets the cutover does not compile.
 
 The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and

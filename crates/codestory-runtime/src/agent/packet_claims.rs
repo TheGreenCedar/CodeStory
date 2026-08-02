@@ -18,7 +18,7 @@ use crate::agent::packet_plan::packet_rank_terms;
 use crate::agent::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
-    packet_display_path, packet_query_stop_term,
+    packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::query_mentions_non_primary_source;
@@ -26,7 +26,6 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketEvidenceResolutionDto,
     PacketEvidenceTierDto, PacketProofStatusDto,
 };
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
@@ -686,14 +685,8 @@ pub(crate) fn append_ranked_citation_claims(
     seen_claims: &mut HashSet<String>,
 ) {
     let mut ordered_citations = citations.to_vec();
-    ordered_citations.sort_by(|left, right| {
-        packet_claim_carry_rank(right, rank_terms, prefer_primary_sources)
-            .partial_cmp(&packet_claim_carry_rank(
-                left,
-                rank_terms,
-                prefer_primary_sources,
-            ))
-            .unwrap_or(Ordering::Equal)
+    sort_by_cached_rank_desc(&mut ordered_citations, |citation| {
+        packet_claim_carry_rank(citation, rank_terms, prefer_primary_sources)
     });
     for citation in &ordered_citations {
         if let Some(shaped) = packet_citation_shaped_claim(citation, prompt) {
@@ -1185,6 +1178,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,

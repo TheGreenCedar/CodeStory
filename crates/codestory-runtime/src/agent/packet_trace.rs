@@ -3,14 +3,13 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::citation::to_citation_from_hit;
-use super::packet_scoring::{packet_citation_key, packet_citation_rank};
+use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
 use super::trace::field;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
     PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
 };
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 fn sanitize_section_id(value: &str) -> String {
@@ -58,10 +57,8 @@ pub(crate) fn merge_packet_fused_subquery_batch(
             .iter()
             .map(|hit| to_citation_from_hit(hit, None, None, include_evidence))
             .collect::<Vec<_>>();
-        citations.sort_by(|left, right| {
-            packet_citation_rank(right, rank_terms, true)
-                .partial_cmp(&packet_citation_rank(left, rank_terms, true))
-                .unwrap_or(Ordering::Equal)
+        sort_by_cached_rank_desc(&mut citations, |citation| {
+            packet_citation_rank(citation, rank_terms, true)
         });
         for citation in citations.into_iter().take(stage_carry_limit) {
             if citation_keys.insert(packet_citation_key(&citation)) {
@@ -234,6 +231,8 @@ mod golden_tests {
             resolved_hit_count: 1,
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: None,
         }];
         let rank_terms = vec!["exec".to_string(), "events".to_string()];
@@ -257,6 +256,8 @@ mod golden_tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,

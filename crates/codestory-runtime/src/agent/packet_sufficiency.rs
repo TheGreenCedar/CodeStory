@@ -1,4 +1,6 @@
+use crate::agent::packet_budget::next_deeper_packet_argv;
 use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
+use crate::agent::packet_degradation::packet_primary_retrieval_truncated;
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::packet_evidence_role;
 #[cfg(test)]
@@ -6,6 +8,7 @@ use crate::agent::packet_flow_requirements::FlowRole;
 use crate::agent::packet_flow_requirements::{
     CoverageMode, FlowRequirement, packet_flow_requirements_for_terms,
 };
+use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_obligations::{
     PACKET_OBLIGATION_RECEIPT_COVERAGE_ROLE, bind_claims_to_packet_obligations,
     material_packet_obligations_are_proven, packet_claims_with_obligation_receipts,
@@ -22,9 +25,9 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphArtifactDto,
     GraphResponse, NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
     PacketClaimObligationDto, PacketCoverageReportDto, PacketEvidenceTierDto,
-    PacketObligationPlanDto, PacketObligationProofStatusDto, PacketProbeDto,
-    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketFollowUpInvocationDto, PacketObligationPlanDto, PacketObligationProofStatusDto,
+    PacketProbeDto, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
@@ -303,6 +306,10 @@ fn assemble_packet_sufficiency_with_probe_context(
             &blocking_route_probe_queries,
         )
     };
+    // EV-7/EV-8: two facts about how this packet was collected, both of which bound what its
+    // evidence can be reported as regardless of how well the claims themselves scored.
+    let freshness = PacketFreshnessInput::from_observation(answer.freshness.as_ref());
+    let primary_retrieval_truncated = packet_primary_retrieval_truncated(answer);
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
         budget,
         eligible_citation_count,
@@ -316,6 +323,8 @@ fn assemble_packet_sufficiency_with_probe_context(
         has_sufficiency_blocking_budget_omission,
         missing_required_probe_queries: &blocking_missing_probe_queries,
         unresolved_sidecar_queries: &blocking_unresolved_sidecar_queries,
+        freshness,
+        primary_retrieval_truncated,
     });
 
     let mut gaps = packet_sufficiency_gaps(
@@ -340,6 +349,8 @@ fn assemble_packet_sufficiency_with_probe_context(
         &blocking_missing_probe_queries,
         &missing_required_flow_requirements,
         &blocking_unresolved_sidecar_queries,
+        freshness,
+        primary_retrieval_truncated,
     );
     if let Some(obligations) = obligations {
         append_packet_obligation_gaps(&mut gaps, obligations);
@@ -444,10 +455,10 @@ fn assemble_packet_sufficiency_with_probe_context(
                     .any(|blocking| blocking == query)
         })
         .collect::<Vec<_>>();
-    let follow_up_commands = if terminally_sufficient {
+    let follow_up_argv = if terminally_sufficient {
         Vec::new()
     } else {
-        packet_follow_up_commands(
+        packet_follow_up_argv(
             project_root,
             question,
             status,
@@ -457,6 +468,14 @@ fn assemble_packet_sufficiency_with_probe_context(
             packet_full_retrieval_available(answer),
         )
     };
+    let follow_up_commands = follow_up_argv
+        .iter()
+        .map(|argv| render_packet_command(argv))
+        .collect::<Vec<_>>();
+    let follow_up_invocations = follow_up_argv
+        .iter()
+        .map(|argv| packet_follow_up_invocation(argv))
+        .collect::<Vec<_>>();
     let coverage_report = packet_coverage_report(PacketCoverageReportInput {
         supported_claims: &supported_claims,
         proven_claims: &proven_claims,
@@ -473,14 +492,14 @@ fn assemble_packet_sufficiency_with_probe_context(
         follow_up_commands.clone()
     };
     if !terminally_sufficient && !open_next_paths.is_empty() {
-        let quoted_project = quote_packet_project_arg(project_root);
+        let project = packet_display_project_arg(project_root);
         let candidate_commands = if packet_full_retrieval_available(answer) {
-            packet_follow_up_search_commands(&quoted_project, &open_next_paths)
+            packet_follow_up_search_argv(&project, &open_next_paths)
         } else {
-            packet_follow_up_trail_commands(&quoted_project, &open_next_paths)
+            packet_follow_up_trail_argv(&project, &open_next_paths)
         };
         for command in candidate_commands {
-            push_unique_term(&mut open_next, &command);
+            push_unique_term(&mut open_next, &render_packet_command(&command));
         }
         open_next.truncate(12);
     }
@@ -537,6 +556,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         avoid_opening_paths,
         gaps,
         follow_up_commands,
+        follow_up_invocations,
         coverage_report: Some(coverage_report),
     }
 }
@@ -584,6 +604,10 @@ struct PacketSufficiencyStatusInput<'a> {
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &'a [String],
     unresolved_sidecar_queries: &'a [String],
+    /// EV-7: how well this packet's publication was known to match the working tree.
+    freshness: PacketFreshnessInput,
+    /// EV-8: whether the primary retrieval run lost evidence it planned to collect.
+    primary_retrieval_truncated: bool,
 }
 
 fn packet_sufficiency_status(
@@ -601,6 +625,11 @@ fn packet_sufficiency_status(
         || !input.missing_required_probe_queries.is_empty()
         || !input.unresolved_sidecar_queries.is_empty()
         || input.has_sufficiency_blocking_budget_omission
+        // Both of these are caps, not floors: they can only stop a packet that would otherwise be
+        // Sufficient from claiming it. A packet with no eligible citation stays Insufficient
+        // above, and everything that was already Partial stays Partial.
+        || input.freshness.caps_sufficiency()
+        || input.primary_retrieval_truncated
         || packet_budget_exceeded_hard_output_cap(input.budget)
     {
         PacketSufficiencyStatusDto::Partial
@@ -1260,8 +1289,23 @@ fn packet_sufficiency_gaps(
     missing_required_probe_queries: &[String],
     missing_required_flow_requirements: &[FlowRequirement],
     unresolved_sidecar_queries: &[String],
+    freshness: PacketFreshnessInput,
+    primary_retrieval_truncated: bool,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
+    // The collection-condition gaps lead: they explain why an otherwise complete packet is still
+    // capped, and a caller that only reads the first gap needs that fact before the claim counts.
+    if let Some(gap) = freshness.gap() {
+        gaps.push(gap);
+    }
+    if primary_retrieval_truncated {
+        gaps.push(
+            "primary retrieval truncated: the primary retrieval run ended before collecting the \
+             evidence it planned to collect, so absence of a result here is not evidence of \
+             absence."
+                .to_string(),
+        );
+    }
     if answer.citations.is_empty() {
         gaps.push("No cited anchors were found for the question.".to_string());
     } else if eligible_citation_count == 0 {
@@ -2508,10 +2552,11 @@ mod tests {
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, EdgeId,
-        GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphResponse, NodeId, NodeKind,
+        GraphArtifactDto, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexFreshnessDto,
+        IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, NodeId, NodeKind,
         PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
         PacketEvidenceTierDto, PacketProofStatusDto, PacketSidecarQueryDiagnosticDto,
-        RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHitOrigin,
+        RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStageTimingDto, SearchHitOrigin,
     };
     use std::path::Path;
 
@@ -2626,7 +2671,7 @@ mod tests {
             answer_id: "packet-sufficiency-test".to_string(),
             prompt: question.to_string(),
             summary: "Covered by cited anchors.".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -2652,6 +2697,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -2949,6 +2996,8 @@ mod tests {
                     resolved_hit_count: 1,
                     unresolved_candidate_count: 0,
                     blocking_unresolved_candidate_count: 0,
+                    semantic_stage_timeout_zero_hits: false,
+                    semantic_abstained: false,
                     diagnostic: None,
                 }),
         );
@@ -3046,6 +3095,8 @@ mod tests {
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
             blocking_unresolved_candidate_count: 1,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: Some("unresolved test candidate".to_string()),
         }
     }
@@ -3067,6 +3118,8 @@ mod tests {
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
             blocking_unresolved_candidate_count: 0,
+            semantic_stage_timeout_zero_hits: false,
+            semantic_abstained: false,
             diagnostic: Some(
                 "sidecar query has blocking cancel reason `stage_deadline`".to_string(),
             ),
@@ -4556,6 +4609,271 @@ mod tests {
             report.ineligible.is_empty(),
             "role-backed log-record source claims should be sufficiency-eligible: {report:?}"
         );
+    }
+
+    /// The exact packet that `log_record_handler_source_claims_make_data_flow_sufficient` proves
+    /// reaches `Sufficient`, assembled over a caller-supplied answer.
+    ///
+    /// EV-7/EV-8 are about the *collection conditions* of a packet, not its claims. Reusing a
+    /// packet whose claim side is independently proven sufficient is what makes the resulting
+    /// `Partial` attributable to the condition under test and nothing else.
+    fn data_flow_sufficient_packet(answer: &AgentAnswerDto) -> PacketSufficiencyDto {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let budget = compact_truncated_budget(question, vec!["citations"]);
+        let claims = vec![
+            cited_claim(
+                "addRecord creates a log record before passing it to handlers.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::addRecord",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+            cited_claim(
+                "The processing handler handles records by processing and writing them.",
+                None,
+                cited_anchor_with_tier(
+                    "LogProcessingHandler::handle",
+                    "src/logging/ProcessingHandler.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+        ];
+
+        assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        })
+    }
+
+    fn not_checked_observation(
+        cause: Option<IndexFreshnessNotCheckedCauseDto>,
+    ) -> IndexFreshnessDto {
+        IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 8,
+            duration_ms: 1,
+            reason: Some("indexed file inventory exceeds bounded freshness cap".to_string()),
+            not_checked_cause: cause,
+            samples: Vec::new(),
+        }
+    }
+
+    /// CR-001. The serving waiver deliberately keeps a bounded-inventory repository usable, and
+    /// the same packet that is sufficient over an observed publication must not claim proof over
+    /// one whose drift was never compared.
+    #[test]
+    fn bounded_inventory_freshness_caps_an_otherwise_sufficient_packet_at_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        answer.freshness = Some(not_checked_observation(Some(
+            IndexFreshnessNotCheckedCauseDto::BoundedInventory,
+        )));
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "a packet over an unobserved publication cannot report proof: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("freshness unknown (bounded_inventory)")),
+            "the cap must name its typed cause: {:?}",
+            sufficiency.gaps
+        );
+    }
+
+    /// A check that could not run establishes even less than a bounded one, and must be reported
+    /// under its own cause rather than collapsed into the bounded case.
+    #[test]
+    fn unavailable_freshness_check_caps_with_its_own_typed_cause() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        answer.freshness = Some(not_checked_observation(Some(
+            IndexFreshnessNotCheckedCauseDto::InventoryUnavailable,
+        )));
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("freshness unknown (inventory_unavailable)")),
+            "{:?}",
+            sufficiency.gaps
+        );
+    }
+
+    /// On the production path a missing observation means `controller.index_freshness()` itself
+    /// failed. Reading that as fresh is the CR-001 exposure in its purest form.
+    #[test]
+    fn a_packet_with_no_freshness_observation_at_all_caps_at_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        answer.freshness = None;
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("freshness unknown (observation_unavailable)")),
+            "{:?}",
+            sufficiency.gaps
+        );
+    }
+
+    #[test]
+    fn stale_freshness_caps_an_otherwise_sufficient_packet_at_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        let mut stale = crate::agent::packet_freshness::fresh_index_observation();
+        stale.status = IndexFreshnessStatusDto::Stale;
+        stale.changed_file_count = 2;
+        answer.freshness = Some(stale);
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("freshness stale:")),
+            "{:?}",
+            sufficiency.gaps
+        );
+    }
+
+    /// The freshness input is a cap, never a floor. A packet with no eligible citation stays
+    /// `Insufficient`; observing the index does not upgrade it.
+    #[test]
+    fn fresh_freshness_does_not_promote_a_packet_with_no_eligible_citation() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        answer.citations.clear();
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Insufficient,
+            "{sufficiency:?}"
+        );
+        assert!(
+            !sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("freshness")),
+            "an observed publication publishes no freshness gap: {:?}",
+            sufficiency.gaps
+        );
+    }
+
+    /// EV-8. A primary run that lost a stage to its deadline collected less evidence than it
+    /// planned to, so the absence of a result is not evidence of absence and the packet cannot
+    /// report proof.
+    #[test]
+    fn truncated_primary_retrieval_caps_an_otherwise_sufficient_packet_at_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        let mut shadow = sufficiency_test_shadow();
+        shadow.stage_timings[0].completion_status = "pending_after_deadline".to_string();
+        answer.retrieval_trace.retrieval_shadow = Some(shadow);
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("primary retrieval truncated:")),
+            "{:?}",
+            sufficiency.gaps
+        );
+    }
+
+    /// The planner stops deliberately once marginal gain flattens. Treating that as truncation
+    /// would demote every healthy packet, so the cap must stay off for it.
+    #[test]
+    fn the_planned_marginal_gain_stop_leaves_a_sufficient_packet_sufficient() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let mut answer = answer_fixture(question);
+        let mut shadow = sufficiency_test_shadow();
+        shadow.cancel_reason = Some("marginal_gain".to_string());
+        answer.retrieval_trace.retrieval_shadow = Some(shadow);
+
+        let sufficiency = data_flow_sufficient_packet(&answer);
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "{sufficiency:?}"
+        );
+        assert!(sufficiency.gaps.is_empty(), "{:?}", sufficiency.gaps);
+    }
+
+    fn sufficiency_test_shadow() -> RetrievalShadowDto {
+        RetrievalShadowDto {
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            retrieval_total_ms: 12,
+            total_budget_ms: Some(200),
+            cancel_reason: None,
+            cache_hit: false,
+            stage_timings: vec![RetrievalStageTimingDto {
+                stage: "stage1_lexical".to_string(),
+                deadline_ms: Some(80),
+                elapsed_ms: 20,
+                admission_wait_ms: None,
+                queue_wait_ms: None,
+                execution_ms: Some(20),
+                candidates_added: 4,
+                marginal_gain: 0.4,
+                cancel_reason: None,
+                cache_hit: false,
+                sidecar_latency_ms: None,
+                degraded: false,
+                stub_reason: None,
+                completion_status: "completed".to_string(),
+            }],
+            candidates: Vec::new(),
+            would_rank: Vec::new(),
+            error: None,
+            candidate_count: 4,
+            resolved_hit_count: 4,
+            unresolved_candidate_count: 0,
+            diagnostic_only: false,
+            candidate_resolution_counts: Vec::new(),
+        }
     }
 
     #[test]
@@ -7933,7 +8251,14 @@ pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -
     budget.used.output_bytes > budget.limits.max_output_bytes
 }
 
-fn packet_follow_up_commands(
+/// Build the follow-up contract as typed argv.
+///
+/// Argv is the product, not a rendering of one. Composing shell text first is
+/// exactly what let a PowerShell-style quote doubling ship: on a POSIX shell it
+/// silently deleted apostrophes from the suggested query. Callers that execute
+/// a follow-up read `follow_up_argv`; `follow_up_commands` is the display
+/// projection of the same argv through one correct quoter.
+fn packet_follow_up_argv(
     project_root: &Path,
     question: &str,
     status: PacketSufficiencyStatusDto,
@@ -7941,8 +8266,8 @@ fn packet_follow_up_commands(
     missing_required_probe_queries: &[String],
     targeted_follow_up_queries: Vec<String>,
     full_retrieval_available: bool,
-) -> Vec<String> {
-    let project = quote_packet_project_arg(project_root);
+) -> Vec<Vec<String>> {
+    let project = packet_display_project_arg(project_root);
     match status {
         PacketSufficiencyStatusDto::Sufficient => Vec::new(),
         PacketSufficiencyStatusDto::Partial => {
@@ -7952,39 +8277,81 @@ fn packet_follow_up_commands(
                 missing_required_probe_queries.to_vec()
             };
             if !full_retrieval_available {
-                let mut commands = vec![packet_retrieval_activation_command(project.as_str())];
-                commands.extend(packet_follow_up_trail_commands(project.as_str(), &queries));
+                let mut commands = vec![packet_retrieval_activation_argv(&project)];
+                commands.extend(packet_follow_up_trail_argv(&project, &queries));
                 commands.truncate(8);
                 return commands;
             }
-            let mut commands = packet_follow_up_search_commands(project.as_str(), &queries);
+            let mut commands = packet_follow_up_search_argv(&project, &queries);
             commands.truncate(8);
             commands
                 .into_iter()
-                .chain(budget.next_deeper_command.clone())
-                .chain(std::iter::once(format!(
-                    "codestory-cli search --project {project} --query {} --why",
-                    quote_packet_command_value(question)
-                )))
+                .chain(next_deeper_packet_argv(
+                    project_root,
+                    question,
+                    budget.requested,
+                ))
+                .chain(std::iter::once(packet_search_argv(&project, question)))
                 .collect()
         }
         PacketSufficiencyStatusDto::Insufficient => {
             if full_retrieval_available {
                 vec![
-                    format!("codestory-cli index --project {project} --refresh full"),
-                    format!(
-                        "codestory-cli search --project {project} --query {} --why",
-                        quote_packet_command_value(question)
-                    ),
+                    packet_argv(&["index", "--project", project.as_str(), "--refresh", "full"]),
+                    packet_search_argv(&project, question),
                 ]
             } else {
                 vec![
-                    packet_retrieval_activation_command(project.as_str()),
-                    format!("codestory-cli ground --project {project} --why"),
+                    packet_retrieval_activation_argv(&project),
+                    packet_argv(&["ground", "--project", project.as_str(), "--why"]),
                 ]
             }
         }
     }
+}
+
+pub(crate) fn packet_argv(arguments: &[&str]) -> Vec<String> {
+    std::iter::once("codestory-cli".to_string())
+        .chain(arguments.iter().map(|argument| (*argument).to_string()))
+        .collect()
+}
+
+fn packet_search_argv(project: &str, query: &str) -> Vec<String> {
+    packet_argv(&["search", "--project", project, "--query", query, "--why"])
+}
+
+/// Split argv into the published `{program, args}` invocation.
+pub(crate) fn packet_follow_up_invocation(argv: &[String]) -> PacketFollowUpInvocationDto {
+    let (program, args) = argv.split_first().expect("packet argv carries a program");
+    PacketFollowUpInvocationDto {
+        program: program.clone(),
+        args: args.to_vec(),
+    }
+}
+
+/// Render argv as one copy-pasteable POSIX shell command.
+///
+/// Arguments made only of characters a shell passes through untouched stay
+/// bare so the suggestion reads like something a person would type; everything
+/// else is single-quoted.
+pub(crate) fn render_packet_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| {
+            if packet_command_argument_is_shell_safe(argument) {
+                argument.clone()
+            } else {
+                quote_packet_command_value(argument)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn packet_command_argument_is_shell_safe(argument: &str) -> bool {
+    !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character))
 }
 
 fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
@@ -7995,21 +8362,35 @@ fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
         .is_some_and(|shadow| shadow.retrieval_mode == "full")
 }
 
-fn packet_retrieval_activation_command(quoted_project: &str) -> String {
-    format!(
-        "codestory-cli retrieval index --profile agent --refresh auto --project {quoted_project} --format json"
-    )
+fn packet_retrieval_activation_argv(project: &str) -> Vec<String> {
+    packet_argv(&[
+        "retrieval",
+        "index",
+        "--profile",
+        "agent",
+        "--refresh",
+        "auto",
+        "--project",
+        project,
+        "--format",
+        "json",
+    ])
 }
 
-fn packet_follow_up_trail_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
+fn packet_follow_up_trail_argv(project: &str, queries: &[String]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for query in queries {
-        push_unique_term(
+        push_unique_argv(
             &mut commands,
-            &format!(
-                "codestory-cli trail --project {quoted_project} --query {} --story --hide-speculative",
-                quote_packet_command_value(query)
-            ),
+            packet_argv(&[
+                "trail",
+                "--project",
+                project,
+                "--query",
+                query,
+                "--story",
+                "--hide-speculative",
+            ]),
         );
     }
     commands
@@ -8039,26 +8420,26 @@ fn packet_interleave_follow_up_queries(paths: &[String], probes: &[String]) -> V
     merged
 }
 
-fn packet_follow_up_search_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
+fn packet_follow_up_search_argv(project: &str, queries: &[String]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for query in queries {
-        push_unique_term(
-            &mut commands,
-            &format!(
-                "codestory-cli search --project {quoted_project} --query {} --why",
-                quote_packet_command_value(query)
-            ),
-        );
+        push_unique_argv(&mut commands, packet_search_argv(project, query));
     }
     commands
 }
 
-pub(crate) fn quote_packet_project_arg(project_root: &Path) -> String {
-    quote_packet_command_value(project_root.to_string_lossy().as_ref())
+/// The project argument as the caller would type it, before any quoting.
+pub(crate) fn packet_display_project_arg(project_root: &Path) -> String {
+    project_root.to_string_lossy().into_owned()
 }
 
+/// Quote one argv element for a POSIX shell.
+///
+/// Doubling the apostrophe is the PowerShell/SQL convention; `sh` concatenates
+/// the adjacent quoted runs and drops the character, so an argument has to end
+/// the quoted run, escape the apostrophe, and reopen it.
 pub(crate) fn quote_packet_command_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -8067,6 +8448,12 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 fn contains_all(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| haystack.contains(needle))
+}
+
+fn push_unique_argv(commands: &mut Vec<Vec<String>>, argv: Vec<String>) {
+    if !commands.contains(&argv) {
+        commands.push(argv);
+    }
 }
 
 fn push_unique_term(terms: &mut Vec<String>, value: &str) {

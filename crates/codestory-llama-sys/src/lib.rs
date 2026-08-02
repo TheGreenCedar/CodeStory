@@ -10,6 +10,9 @@ pub use admission::{
 
 use admission::EmbeddingAdmissionTracker;
 use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline, acquire_with_deadline};
+use codestory_contracts::owned_artifacts::{
+    EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE, embedded_model_directory,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, bounded, select_biased, unbounded};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
@@ -1934,17 +1937,14 @@ pub fn materialize_embedded_model(cache_root: &Path) -> Result<MaterializedModel
         )));
     }
 
-    let directory = cache_root
-        .join("embedded-models")
-        .join("sha256")
-        .join(MODEL_SHA256);
+    let directory = embedded_model_directory(cache_root, MODEL_SHA256);
     fs::create_dir_all(&directory).map_err(cache_error)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(directory.join(".materialize.lock"))
+        .open(directory.join(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE))
         .map_err(cache_error)?;
     acquire_with_deadline(
         &lock,
@@ -2206,19 +2206,175 @@ fn tokenize(
     Ok(tokens)
 }
 
-fn verified_model_file(path: &Path) -> Result<bool, EngineError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(cache_error(error)),
-    };
-    if !metadata.file_type().is_file() || metadata.len() != MODEL_SIZE {
-        return Ok(false);
-    }
-    Ok(sha256_file(path)? == MODEL_SHA256)
+/// Native filesystem identity of one materialized artifact.
+///
+/// Replacement moves the device/inode pair, truncation or growth moves the
+/// length, and an in-place rewrite moves the modification and inode-change
+/// timestamps. A verdict sealed to this value therefore cannot outlive the
+/// bytes it was issued for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeArtifactIdentity {
+    length: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    /// Portable stand-in for the inode pair where no inode is exposed: a
+    /// replaced file carries a new creation time, and a rewritten one carries a
+    /// new modification time.
+    #[cfg(not(unix))]
+    created: SystemTime,
+    #[cfg(not(unix))]
+    modified: SystemTime,
 }
 
+/// Observe the native identity of an already-stat'ed artifact.
+///
+/// A platform or filesystem that cannot supply a complete identity yields
+/// `None`, which denies every receipt and falls back to re-hashing.
+fn native_artifact_identity(metadata: &fs::Metadata) -> Option<NativeArtifactIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(NativeArtifactIdentity {
+            length: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(NativeArtifactIdentity {
+            length: metadata.len(),
+            created: metadata.created().ok()?,
+            modified: metadata.modified().ok()?,
+        })
+    }
+}
+
+/// One process-local integrity verdict sealed to a native artifact identity.
+///
+/// Only successful verifications are ever sealed; a mismatch clears the seal so
+/// a failed verdict is never reused. The seal is advisory: honoring it skips a
+/// digest pass, and every path that cannot honor it re-hashes.
+#[derive(Debug)]
+struct SealedIntegrityReceipt {
+    path: PathBuf,
+    identity: NativeArtifactIdentity,
+}
+
+#[derive(Debug)]
+struct IntegrityReceiptCell(Mutex<Option<SealedIntegrityReceipt>>);
+
+impl IntegrityReceiptCell {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Whether the sealed verdict still covers this exact path and identity.
+    ///
+    /// A poisoned cell honors nothing, so a panic under the lock degrades to
+    /// re-hashing rather than to trusting an unknown verdict.
+    fn honors(&self, path: &Path, identity: &NativeArtifactIdentity) -> bool {
+        self.0.lock().is_ok_and(|sealed| {
+            sealed
+                .as_ref()
+                .is_some_and(|sealed| sealed.path == path && &sealed.identity == identity)
+        })
+    }
+
+    fn seal(&self, path: &Path, identity: NativeArtifactIdentity) {
+        if let Ok(mut cell) = self.0.lock() {
+            *cell = Some(SealedIntegrityReceipt {
+                path: path.to_path_buf(),
+                identity,
+            });
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut cell) = self.0.lock() {
+            *cell = None;
+        }
+    }
+}
+
+static MATERIALIZED_MODEL_RECEIPT: IntegrityReceiptCell = IntegrityReceiptCell::new();
+
+fn verified_model_file(path: &Path) -> Result<bool, EngineError> {
+    verified_sealed_artifact(path, MODEL_SIZE, MODEL_SHA256, &MATERIALIZED_MODEL_RECEIPT)
+}
+
+/// Verify one artifact against its expected length and digest, reusing a
+/// process-local receipt when the file's native identity has not moved.
+///
+/// The steady-state cost of a honored receipt is one `stat`. Every other
+/// outcome — a missing file, a length change, a replaced inode, an in-place
+/// rewrite, a file that moved under the digest pass, or an unavailable native
+/// identity — re-hashes and reseals only on success.
+fn verified_sealed_artifact(
+    path: &Path,
+    expected_length: u64,
+    expected_digest: &str,
+    receipt: &IntegrityReceiptCell,
+) -> Result<bool, EngineError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            receipt.clear();
+            return Ok(false);
+        }
+        Err(error) => return Err(cache_error(error)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() != expected_length {
+        receipt.clear();
+        return Ok(false);
+    }
+    let before = native_artifact_identity(&metadata);
+    if let Some(identity) = before.as_ref()
+        && receipt.honors(path, identity)
+    {
+        return Ok(true);
+    }
+    receipt.clear();
+    if sha256_file(path)? != expected_digest {
+        return Ok(false);
+    }
+    // Seal only an identity that held still across the digest pass: bytes read
+    // from a file that moved underneath the read were never proven.
+    let after = fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .as_ref()
+        .and_then(native_artifact_identity);
+    if let Some(identity) = after
+        && before.as_ref() == Some(&identity)
+    {
+        receipt.seal(path, identity);
+    }
+    Ok(true)
+}
+
+/// Whole-file digest passes performed by this process, so a receipt test can
+/// prove the pass it claims to have skipped was in fact skipped.
+#[cfg(test)]
+static ARTIFACT_DIGEST_PASSES: AtomicU64 = AtomicU64::new(0);
+
 fn sha256_file(path: &Path) -> Result<String, EngineError> {
+    #[cfg(test)]
+    ARTIFACT_DIGEST_PASSES.fetch_add(1, Ordering::Relaxed);
     let mut reader = BufReader::new(File::open(path).map_err(cache_error)?);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -2898,5 +3054,176 @@ mod tests {
             worker_alive: true,
             load_error: None,
         }
+    }
+
+    /// `ARTIFACT_DIGEST_PASSES` is process-wide, so digest-pass observations
+    /// run one at a time.
+    static DIGEST_PASS_OBSERVATION: Mutex<()> = Mutex::new(());
+
+    struct SealedArtifactFixture {
+        _observation: std::sync::MutexGuard<'static, ()>,
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        digest: String,
+        receipt: IntegrityReceiptCell,
+    }
+
+    impl SealedArtifactFixture {
+        fn new(name: &str) -> Self {
+            let observation = DIGEST_PASS_OBSERVATION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let directory = tempfile::tempdir().expect("sealed artifact fixture directory");
+            let path = directory.path().join(name);
+            let bytes = (0..64_u32)
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>();
+            fs::write(&path, &bytes).expect("write sealed artifact fixture");
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            Self {
+                _observation: observation,
+                _directory: directory,
+                path,
+                bytes,
+                digest,
+                receipt: IntegrityReceiptCell::new(),
+            }
+        }
+
+        fn verify(&self) -> Result<bool, EngineError> {
+            verified_sealed_artifact(
+                &self.path,
+                self.bytes.len() as u64,
+                &self.digest,
+                &self.receipt,
+            )
+        }
+
+        /// Run one verification and report how many whole-file digest passes it
+        /// performed.
+        fn verify_counting_digest_passes(&self) -> (bool, u64) {
+            let before = ARTIFACT_DIGEST_PASSES.load(Ordering::Relaxed);
+            let verified = self.verify().expect("verify sealed artifact");
+            (
+                verified,
+                ARTIFACT_DIGEST_PASSES
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(before),
+            )
+        }
+
+        /// Rewrite the artifact in place, keeping its length and inode.
+        fn rewrite_in_place(&self, bytes: &[u8]) {
+            assert_eq!(
+                bytes.len(),
+                self.bytes.len(),
+                "in-place rewrite keeps length"
+            );
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .expect("open sealed artifact for in-place rewrite");
+            file.write_all(bytes).expect("rewrite sealed artifact");
+            file.sync_all().expect("sync in-place rewrite");
+        }
+    }
+
+    #[test]
+    fn model_integrity_receipt_skips_the_digest_pass_until_native_identity_moves() {
+        let fixture = SealedArtifactFixture::new("receipt-reuse.gguf");
+
+        let (first, first_passes) = fixture.verify_counting_digest_passes();
+        assert!(first, "an intact artifact verifies");
+        assert_eq!(first_passes, 1, "the first verification hashes the file");
+
+        let (second, second_passes) = fixture.verify_counting_digest_passes();
+        assert!(second, "the sealed receipt still verifies");
+        assert_eq!(
+            second_passes, 0,
+            "a receipt sealed to an unmoved native identity costs one stat"
+        );
+
+        // Native replacement: identical bytes, new inode.
+        let replacement = fixture.path.with_extension("replacement");
+        fs::write(&replacement, &fixture.bytes).expect("stage replacement artifact");
+        fs::rename(&replacement, &fixture.path).expect("replace sealed artifact");
+
+        let (third, third_passes) = fixture.verify_counting_digest_passes();
+        assert!(third, "the replacement carries the same verified bytes");
+        assert_eq!(
+            third_passes, 1,
+            "a replaced artifact is re-hashed even when the bytes match"
+        );
+    }
+
+    #[test]
+    fn model_integrity_receipt_never_survives_in_place_corruption_or_caches_failure() {
+        let fixture = SealedArtifactFixture::new("receipt-corruption.gguf");
+        assert!(fixture.verify().expect("seal the intact artifact"));
+
+        let mut corrupted = fixture.bytes.clone();
+        corrupted[7] ^= 0xff;
+        fixture.rewrite_in_place(&corrupted);
+
+        let (verified, passes) = fixture.verify_counting_digest_passes();
+        assert!(
+            !verified,
+            "an in-place rewrite must not be served by the sealed receipt"
+        );
+        assert_eq!(passes, 1, "the moved identity forces a fresh digest pass");
+
+        let (repeated, repeated_passes) = fixture.verify_counting_digest_passes();
+        assert!(!repeated, "the corrupt artifact still fails");
+        assert_eq!(
+            repeated_passes, 1,
+            "a failed verdict is never sealed, so it is re-proven every time"
+        );
+
+        fixture.rewrite_in_place(&fixture.bytes);
+        let (repaired, repaired_passes) = fixture.verify_counting_digest_passes();
+        assert!(repaired, "restored bytes verify again");
+        assert_eq!(
+            repaired_passes, 1,
+            "repair is proven by hashing, not assumed"
+        );
+    }
+
+    #[test]
+    fn model_integrity_receipt_is_cleared_when_the_artifact_disappears_or_changes_length() {
+        let fixture = SealedArtifactFixture::new("receipt-length.gguf");
+        assert!(fixture.verify().expect("seal the intact artifact"));
+
+        let mut longer = fixture.bytes.clone();
+        longer.push(0);
+        fs::write(&fixture.path, &longer).expect("grow sealed artifact");
+        assert!(
+            !fixture.verify().expect("length drift is observable"),
+            "a length change fails the verification"
+        );
+
+        fs::write(&fixture.path, &fixture.bytes).expect("shrink sealed artifact back");
+        let (recovered, recovered_passes) = fixture.verify_counting_digest_passes();
+        assert!(recovered, "the original bytes verify again");
+        assert_eq!(
+            recovered_passes, 1,
+            "a length that moved and returned is re-proven, never served from the seal"
+        );
+
+        fs::remove_file(&fixture.path).expect("remove sealed artifact");
+        assert!(
+            !fixture
+                .verify()
+                .expect("a missing artifact is not an error"),
+            "a missing artifact fails the verification"
+        );
+
+        fs::write(&fixture.path, &fixture.bytes).expect("restore sealed artifact");
+        let (restored, restored_passes) = fixture.verify_counting_digest_passes();
+        assert!(restored, "the restored artifact verifies");
+        assert_eq!(
+            restored_passes, 1,
+            "the cleared receipt cannot admit the restored file without hashing"
+        );
     }
 }

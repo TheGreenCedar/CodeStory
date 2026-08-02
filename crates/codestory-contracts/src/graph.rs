@@ -378,7 +378,22 @@ pub struct CallableProjectionState {
     pub file_id: i64,
     pub symbol_key: String,
     pub node_id: NodeId,
+    /// Change detector for incremental projection: binds the symbol's own name
+    /// and its exact start position, so it changes whenever either changes.
     pub signature_hash: i64,
+    /// Position- and name-independent shape of the callable.
+    ///
+    /// Unlike `signature_hash` this deliberately survives a pure rename and a
+    /// pure move, which is what lets annotation rebinding tell "the same code
+    /// under a new name" from "a different symbol". `None` for rows that are
+    /// not callables.
+    ///
+    /// The value is tagged with how much evidence it carries — see
+    /// `codestory_indexer::callable_normalized_signature` — because a shape
+    /// derived from an empty body identifies nothing and consumers must be
+    /// able to tell the difference.
+    #[serde(default)]
+    pub normalized_signature: Option<String>,
     pub body_hash: i64,
     pub start_line: u32,
     pub end_line: u32,

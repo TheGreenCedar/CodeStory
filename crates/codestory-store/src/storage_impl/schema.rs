@@ -143,6 +143,9 @@ const TABLE_STATEMENTS: &[&str] = &[
         coverage_reason TEXT,
         FOREIGN KEY(file_id) REFERENCES file(id)
     )",
+    // Retained for one release behind the schema-31 writer barrier. The
+    // annotations sidecar owns user annotations; these tables receive no writes
+    // after the cutover and are dropped in the next release.
     "CREATE TABLE IF NOT EXISTS bookmark_category (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL
@@ -274,6 +277,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         symbol_key TEXT NOT NULL,
         node_id INTEGER NOT NULL,
         signature_hash INTEGER NOT NULL,
+        normalized_signature TEXT,
         body_hash INTEGER NOT NULL,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
@@ -381,6 +385,11 @@ const TABLE_STATEMENTS: &[&str] = &[
         precise_semantic_import_producer TEXT,
         rollback_record_json TEXT
     )",
+    "CREATE TABLE IF NOT EXISTS annotation_sidecar_cutover (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        sidecar_schema_version INTEGER NOT NULL CHECK(sidecar_schema_version > 0),
+        cutover_at_epoch_ms INTEGER NOT NULL CHECK(cutover_at_epoch_ms >= 0)
+    )",
 ];
 
 const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
@@ -435,6 +444,9 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_search_symbol_projection_display_name
      ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
+    // Keeps the annotation rename probe a keyed lookup instead of a graph scan.
+    "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_normalized_signature
+        ON callable_projection_state(normalized_signature)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
@@ -700,6 +712,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v30_semantic_projection_publication_mode(&storage.conn)?;
     if stored_version < 30 {
         storage.set_schema_version(30)?;
+    }
+    migrate_v31_annotation_sidecar_cutover(&storage.conn)?;
+    if stored_version < 31 {
+        storage.set_schema_version(31)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -1228,6 +1244,48 @@ pub(super) fn migrate_v30_semantic_projection_publication_mode(
     )?;
     tx.execute("DROP TABLE index_publication_v29", [])?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Stamp the annotation-sidecar cutover, which is the schema-31 writer barrier.
+///
+/// The barrier is the whole point of the bump: forward-only migration already
+/// refuses a newer schema, so a 0.16.3 writer that opens this database fails
+/// closed on the database as a whole instead of silently writing the retained
+/// legacy `bookmark_category`/`bookmark_node` tables and forking annotation
+/// truth away from the sidecar. The marker row is what status and doctor read
+/// to report which side owns annotations.
+pub(super) fn migrate_v31_annotation_sidecar_cutover(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    // Annotation rebinding needs evidence that survives a rename and a move,
+    // which `signature_hash` cannot supply: it is a change detector that binds
+    // the symbol's own name and its exact start position. The column is left
+    // NULL on an upgraded database until the next indexing run recomputes it,
+    // and a NULL never satisfies a rebind probe, so an un-recomputed row is
+    // conservatively unrebindable rather than wrongly rebindable.
+    try_add_column(
+        conn,
+        "callable_projection_state",
+        "normalized_signature TEXT",
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS annotation_sidecar_cutover (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            sidecar_schema_version INTEGER NOT NULL CHECK(sidecar_schema_version > 0),
+            cutover_at_epoch_ms INTEGER NOT NULL CHECK(cutover_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO annotation_sidecar_cutover (id, sidecar_schema_version, cutover_at_epoch_ms)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            crate::annotations::ANNOTATION_SCHEMA_VERSION,
+            current_epoch_ms()
+        ],
+    )?;
     Ok(())
 }
 

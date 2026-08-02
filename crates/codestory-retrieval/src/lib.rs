@@ -10,6 +10,7 @@
 //! checks and revalidate generations before serving cached retrieval results.
 
 mod cache;
+mod cache_clean;
 mod candidate;
 mod capabilities;
 mod config;
@@ -33,6 +34,7 @@ mod query;
 mod query_features;
 mod ranker;
 mod retention;
+mod rollback;
 mod scip_client;
 mod scip_index;
 mod sidecar;
@@ -42,6 +44,11 @@ mod sidecar_search;
 pub mod test_support;
 
 pub use cache::{RetrievalCache, RetrievalCacheKey};
+pub use cache_clean::{
+    CACHE_CLEAN_SCHEMA_VERSION, CacheCleanCandidate, CacheCleanKind, CacheCleanPlan,
+    CacheCleanRefusal, CacheCleanRemoval, CacheCleanReport, CacheCleanRetained, apply_cache_clean,
+    plan_cache_clean,
+};
 pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
@@ -148,7 +155,13 @@ pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
 pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
-    GenerationRetentionPlan, global_generation_gc_state_file,
+    GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, RETENTION_MARKER_SCHEMA_V1,
+    RETENTION_MARKER_SCHEMA_V2, global_generation_gc_state_file,
+};
+pub use rollback::{
+    RetainedRollbackObservation, RollbackActivationError, RollbackActivationOutcome,
+    RollbackActivationRefusal, activate_retained_rollback_generation,
+    observe_retained_rollback_generation,
 };
 pub use scip_client::ScipClient;
 pub use sidecar::{

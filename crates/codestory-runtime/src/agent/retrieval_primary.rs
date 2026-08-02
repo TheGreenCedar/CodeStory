@@ -1,6 +1,7 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
+use crate::agent::packet_degradation::semantic_stage_degradation;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
@@ -36,6 +37,8 @@ const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
 const RETRIEVAL_PUBLICATION_ATTEMPTS: usize = 2;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
+/// Typed cancel reason for a query whose semantic stage timed out and resolved nothing.
+pub(crate) const SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL: &str = "semantic_stage_timeout_zero_hits";
 
 const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
@@ -938,14 +941,25 @@ fn packet_sidecar_query_diagnostic(
         .iter()
         .map(|stage| stage.elapsed_ms)
         .fold(0_u32, u32::saturating_add);
+    let semantic = semantic_stage_degradation(&stage_timings);
+    // EV-8: a required query whose dense lane went dark and then resolved nothing produced no
+    // evidence, but the sidecar itself reports no blocking cancel — the stage budget, not the
+    // query, ran out. Left as `Completed` it would satisfy its query obligation on an empty
+    // result. Naming the cancel here is what lets the obligation ledger demote it.
+    let semantic_timeout_without_hits =
+        semantic.timed_out_zero_hits && resolution.resolved_hits.is_empty();
+    let cancel_reason = sidecar_blocking_cancel_reason(query_result)
+        .map(str::to_string)
+        .or_else(|| {
+            semantic_timeout_without_hits.then(|| SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL.to_string())
+        });
     PacketSidecarQueryDiagnosticDto {
         query: query_result.query.clone(),
-        completion: sidecar_blocking_cancel_reason(query_result).map_or(
-            PacketQueryCompletionDto::Completed,
-            |reason| PacketQueryCompletionDto::Cancelled {
-                reason: reason.to_string(),
-            },
-        ),
+        completion: cancel_reason
+            .clone()
+            .map_or(PacketQueryCompletionDto::Completed, |reason| {
+                PacketQueryCompletionDto::Cancelled { reason }
+            }),
         retrieval_mode: query_result.trace.retrieval_mode.clone(),
         sidecar_query_ms: Some(sidecar_query_ms),
         candidate_resolution_ms: Some(candidate_resolution_ms),
@@ -962,7 +976,9 @@ fn packet_sidecar_query_diagnostic(
             resolution.blocking_unresolved_candidate_count,
         )
         .unwrap_or(u32::MAX),
-        diagnostic: sidecar_blocking_cancel_reason(query_result)
+        semantic_stage_timeout_zero_hits: semantic.timed_out_zero_hits,
+        semantic_abstained: semantic.abstained,
+        diagnostic: cancel_reason
             .map(|reason| format!("sidecar query has blocking cancel reason `{reason}`"))
             .or_else(|| {
                 (resolution.unresolved_candidate_count > 0).then(|| {
@@ -1714,6 +1730,39 @@ fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
             .any(|path| path.exists())
 }
 
+/// Order the resolvable candidates ahead of the unresolvable ones, by score.
+///
+/// `path_resolvable` stats the filesystem, so it is decorated once per surviving
+/// candidate instead of once per comparison, and the resolved verdict is handed
+/// back for the unresolved-candidate label. The comparator is unchanged, so a
+/// NaN score still compares equal and stable sorting keeps input order for ties.
+fn ordered_sidecar_candidates<F>(
+    candidates: &[CandidateHit],
+    mut path_resolvable: F,
+) -> Vec<(usize, &CandidateHit, bool)>
+where
+    F: FnMut(&CandidateHit) -> bool,
+{
+    let mut ordered = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
+        .map(|(index, candidate)| {
+            let resolvable = path_resolvable(candidate);
+            (index, candidate, resolvable)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(_, left, left_resolvable), (_, right, right_resolvable)| {
+        right_resolvable.cmp(left_resolvable).then(
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    ordered
+}
+
 fn candidate_path_text_is_path_like(path: &str) -> bool {
     let trimmed = path.trim();
     !trimmed.is_empty()
@@ -1908,23 +1957,11 @@ fn resolve_sidecar_candidates_in_storage(
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashSet::new();
-    let mut ordered: Vec<(usize, &CandidateHit)> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
-        .collect();
-    ordered.sort_by(|(_, left), (_, right)| {
-        let left_resolvable = candidate_path_resolvable(project_root, &left.file_path);
-        let right_resolvable = candidate_path_resolvable(project_root, &right.file_path);
-        right_resolvable.cmp(&left_resolvable).then(
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+    let ordered = ordered_sidecar_candidates(candidates, |candidate| {
+        candidate_path_resolvable(project_root, &candidate.file_path)
     });
 
-    for (candidate_index, candidate) in ordered {
+    for (candidate_index, candidate, path_resolvable) in ordered {
         if hits.len() >= max_results {
             break;
         }
@@ -1933,7 +1970,7 @@ fn resolve_sidecar_candidates_in_storage(
         let Some(node_id) =
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         else {
-            let label = if candidate_path_resolvable(project_root, &candidate.file_path) {
+            let label = if path_resolvable {
                 "node_unresolved"
             } else {
                 "path_unresolvable"
@@ -2601,6 +2638,111 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_candidate_order_evaluates_path_resolution_once_per_candidate() {
+        let candidates = vec![
+            CandidateHit::lexical_stub("ok/equal-a.rs", 1.0),
+            CandidateHit::lexical_stub("ok/equal-b.rs", 1.0),
+            CandidateHit::lexical_stub("missing/high.rs", 100.0),
+            CandidateHit::lexical_stub("lexical:phantom", 500.0),
+        ];
+        let mut evaluations = 0usize;
+        let ordered = ordered_sidecar_candidates(&candidates, |candidate| {
+            evaluations += 1;
+            candidate.file_path.starts_with("ok/")
+        });
+        assert_eq!(
+            evaluations, 3,
+            "path resolution must run once per surviving candidate"
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(index, candidate, resolvable)| (
+                    *index,
+                    candidate.file_path.as_str(),
+                    *resolvable
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "ok/equal-a.rs", true),
+                (1, "ok/equal-b.rs", true),
+                (2, "missing/high.rs", false),
+            ],
+            "resolvability stays the primary key and equal scores keep input order"
+        );
+
+        let nan_candidates = vec![
+            CandidateHit::lexical_stub("ok/nan.rs", f32::NAN),
+            CandidateHit::lexical_stub("ok/finite.rs", 2.0),
+        ];
+        let ordered = ordered_sidecar_candidates(&nan_candidates, |_| true);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, candidate, _)| candidate.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok/nan.rs", "ok/finite.rs"],
+            "a NaN score must stay comparator-equal and stable"
+        );
+    }
+
+    #[test]
+    fn sidecar_candidate_order_matches_the_recomputing_comparator() {
+        // The zero-movement claim rests on this: decorating the resolvable
+        // verdict must be a permutation-for-permutation replacement of the
+        // comparator that stat'ed the filesystem on every comparison.
+        let scores = [
+            1.0_f32,
+            f32::NAN,
+            1.0,
+            50.0,
+            -3.0,
+            f32::NAN,
+            0.0,
+            50.0,
+            f32::INFINITY,
+        ];
+        let resolvable = |path: &str| path.starts_with("ok/");
+        for window in 1..=scores.len() {
+            for offset in 0..=(scores.len() - window) {
+                let candidates = scores[offset..offset + window]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, score)| {
+                        let prefix = if index.is_multiple_of(3) { "ok" } else { "no" };
+                        CandidateHit::lexical_stub(format!("{prefix}/candidate-{index}.rs"), *score)
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut previous = candidates.iter().enumerate().collect::<Vec<_>>();
+                previous.sort_by(|(_, left), (_, right)| {
+                    let left_resolvable = resolvable(&left.file_path);
+                    let right_resolvable = resolvable(&right.file_path);
+                    right_resolvable.cmp(&left_resolvable).then(
+                        right
+                            .score
+                            .partial_cmp(&left.score)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                });
+
+                let current = ordered_sidecar_candidates(&candidates, |candidate| {
+                    resolvable(&candidate.file_path)
+                });
+
+                assert_eq!(
+                    current
+                        .iter()
+                        .map(|(index, _, _)| *index)
+                        .collect::<Vec<_>>(),
+                    previous.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                    "candidate order moved for window={window} offset={offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn symbol_candidate_skips_unknown_callsite_and_resolves_definition() {
         use codestory_contracts::graph::{Occurrence, OccurrenceKind, SourceLocation};
         use codestory_store::{FileInfo, FileRole};
@@ -2793,6 +2935,129 @@ mod tests {
         assert_eq!(diagnostic.unresolved_candidate_count, 1);
         assert_eq!(diagnostic.total_elapsed_ms, Some(3));
         assert!(diagnostic.diagnostic.is_some());
+    }
+
+    fn semantic_stage_trace(
+        completion_status: codestory_retrieval::StageCompletionStatus,
+        candidates_added: usize,
+    ) -> codestory_retrieval::StageTrace {
+        codestory_retrieval::StageTrace {
+            stage: codestory_retrieval::RetrievalStageKind::Stage1bSemantic,
+            budget_ms: 40,
+            elapsed_ms: 40,
+            admission_wait_ms: 0,
+            queue_wait_ms: None,
+            execution_ms: None,
+            candidates_added,
+            marginal_gain: 0.0,
+            cancel_reason: Some("stage_deadline".into()),
+            cache_hit: false,
+            degraded: false,
+            stub_reason: None,
+            completion_status,
+        }
+    }
+
+    fn query_result_with_stages(stages: Vec<codestory_retrieval::StageTrace>) -> QueryResult {
+        QueryResult {
+            publication_identity: None,
+            query: "how does activation admit a lease".into(),
+            features: classify_query("how does activation admit a lease"),
+            hits: Vec::new(),
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 100,
+                elapsed_ms: 40,
+                cancel_reason: None,
+                cache_hit: false,
+                stages,
+            },
+        }
+    }
+
+    fn empty_resolution() -> SidecarCandidateResolutionOutcome {
+        SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::new(),
+        }
+    }
+
+    /// EV-8. The sidecar reports no blocking cancel when only a *stage* runs out of budget, so a
+    /// query whose dense lane went dark and then resolved nothing used to arrive as `Completed`
+    /// and satisfy its query obligation on an empty result.
+    #[test]
+    fn a_semantic_stage_timeout_with_no_resolved_hits_cancels_the_query() {
+        let result = query_result_with_stages(vec![semantic_stage_trace(
+            codestory_retrieval::StageCompletionStatus::PendingAfterDeadline,
+            0,
+        )]);
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &empty_resolution(), 40, 1, 41);
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Cancelled {
+                reason: SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL.to_string()
+            },
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic.semantic_stage_timeout_zero_hits,
+            "{diagnostic:?}"
+        );
+    }
+
+    /// The demotion is about lost evidence, not about the stage clock. A query that still
+    /// resolved hits produced evidence and must stay `Completed`.
+    #[test]
+    fn a_semantic_stage_timeout_that_still_resolved_hits_stays_completed() {
+        let result = query_result_with_stages(vec![semantic_stage_trace(
+            codestory_retrieval::StageCompletionStatus::PendingAfterDeadline,
+            0,
+        )]);
+        let mut resolution = empty_resolution();
+        resolution.resolved_hits = vec![undecorated_search_hit_for_candidate(
+            &CandidateHit::with_source(
+                "crates/codestory-runtime/src/services.rs",
+                Some("activate_once".to_string()),
+                0.9,
+                CandidateSource::Lexical,
+            ),
+        )];
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 40, 1, 41);
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Completed,
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic.semantic_stage_timeout_zero_hits,
+            "the lost stage is still counted even when the query recovered: {diagnostic:?}"
+        );
+    }
+
+    /// A deliberately skipped dense lane on a repository with no dense anchors is correct
+    /// behavior. It is counted, not cancelled.
+    #[test]
+    fn a_skipped_semantic_stage_abstains_without_cancelling_the_query() {
+        let mut skipped =
+            semantic_stage_trace(codestory_retrieval::StageCompletionStatus::Skipped, 0);
+        skipped.cancel_reason = Some("zero_dense_anchors".into());
+        let result = query_result_with_stages(vec![skipped]);
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &empty_resolution(), 1, 1, 2);
+
+        assert_eq!(diagnostic.completion, PacketQueryCompletionDto::Completed);
+        assert!(diagnostic.semantic_abstained, "{diagnostic:?}");
+        assert!(
+            !diagnostic.semantic_stage_timeout_zero_hits,
+            "{diagnostic:?}"
+        );
     }
 
     #[test]
@@ -3023,6 +3288,47 @@ mod tests {
         assert_ne!(
             affinity_hit.evidence_tier,
             Some(PacketEvidenceTier::ResolvedGraph)
+        );
+    }
+
+    #[test]
+    fn stage_two_reference_adjacency_is_published_as_resolved_graph_evidence() {
+        let mut adjacency = CandidateHit::with_source(
+            "src/client.rs",
+            Some("parse_client".into()),
+            0.65,
+            CandidateSource::Scip,
+        );
+        adjacency.node_id = Some("4".into());
+        adjacency.start_line = Some(50);
+        adjacency.scip_hop_distance = Some(1);
+        // Exactly what the sidecar stage stamps: the artifact's evidence source
+        // plus the stage's own public provenance label.
+        adjacency.provenance = vec![
+            "scip_graph_projection".into(),
+            RetrievalStageKind::Stage2ScipExpand
+                .provenance_label()
+                .expect("stage 2 publishes a provenance label")
+                .to_string(),
+        ];
+        let adjacency = rank_candidates(&classify_query("parse_client"), vec![adjacency])
+            .into_iter()
+            .next()
+            .expect("ranked adjacency candidate");
+
+        let hit = search_hit_for_candidate(&adjacency);
+
+        assert_eq!(
+            hit.score_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.graph),
+            Some(0.5),
+            "validated hop-1 reference adjacency publishes the graph feature: {hit:?}"
+        );
+        assert_eq!(
+            hit.evidence_tier,
+            Some(PacketEvidenceTier::ResolvedGraph),
+            "stage-2 adjacency is graph evidence again: {hit:?}"
         );
     }
 

@@ -1141,7 +1141,23 @@
         "feature_probe",
         "packaging",
         "artifact_transfer"
-      ]
+      ],
+      "link_timing": {
+        "phase": "msvc_link",
+        "selector": ".github/scripts/windows-link-timing.mjs",
+        "record_schema": "codestory.windows-link-timing/v1",
+        "record_file": "windows-link-timing.json",
+        "evidence": "explicit_link_time_boundary",
+        "substring_match": false,
+        "observational": true,
+        "unavailable_reasons": [
+          "incoherent-linker-report",
+          "link-exceeds-build-interval",
+          "linker-log-empty",
+          "linker-log-missing",
+          "no-explicit-linker-report"
+        ]
+      }
     },
     "candidate_archive_cache": {
       "record_schema": "codestory-candidate-archive-store/v1",

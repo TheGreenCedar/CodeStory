@@ -557,6 +557,54 @@ pub fn workspace_path_lexical_identity(path: &Path) -> io::Result<WorkspacePathL
     }
 }
 
+/// Durable text form of an existing path's native filesystem identity.
+///
+/// Unlike [`workspace_path_identity`], this observation is meant to be written
+/// to a registry and compared across processes, so only existing paths produce
+/// a token: a missing path's lexical spelling is not an identity and would let
+/// a copy inherit the original's binding. A same-filesystem rename keeps the
+/// token; a clone or a cross-volume copy does not.
+pub fn workspace_path_identity_token(path: &Path) -> io::Result<Option<String>> {
+    match fs::metadata(path) {
+        Ok(metadata) => existing_workspace_path_identity_token(path, &metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn existing_workspace_path_identity_token(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn existing_workspace_path_identity_token(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<String> {
+    let (volume_serial_number, file_id) = windows_file_identity(path)?;
+    let mut rendered = String::with_capacity(file_id.len() * 2);
+    for byte in file_id {
+        rendered.push_str(&format!("{byte:02x}"));
+    }
+    Ok(format!("windows:{volume_serial_number}:{rendered}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn existing_workspace_path_identity_token(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native workspace path identity is unsupported on this platform",
+    ))
+}
+
 /// Observe one already-open file using native filesystem identity.
 pub fn workspace_file_identity(file: &fs::File) -> io::Result<WorkspacePathIdentity> {
     let metadata = file.metadata()?;
@@ -1410,6 +1458,42 @@ mod tests {
 
         assert_eq!(raced.project_id, raced.workspace_id);
         assert_ne!(raced.repository_instance, original.repository_instance);
+    }
+
+    #[test]
+    fn a_durable_identity_token_survives_a_rename_but_not_a_copy() {
+        let parent = tempdir().expect("token parent");
+        let original = parent.path().join("root");
+        fs::create_dir(&original).expect("create root");
+        let before = workspace_path_identity_token(&original)
+            .expect("observe root")
+            .expect("an existing root has a durable identity");
+
+        let renamed = parent.path().join("renamed-root");
+        fs::rename(&original, &renamed).expect("rename root");
+        assert_eq!(
+            workspace_path_identity_token(&renamed)
+                .expect("observe renamed root")
+                .as_deref(),
+            Some(before.as_str()),
+            "a same-filesystem rename keeps the durable identity"
+        );
+
+        let copy = parent.path().join("copied-root");
+        fs::create_dir(&copy).expect("create copy");
+        assert_ne!(
+            workspace_path_identity_token(&copy)
+                .expect("observe copied root")
+                .as_deref(),
+            Some(before.as_str()),
+            "a separate directory must not inherit the original identity"
+        );
+
+        assert_eq!(
+            workspace_path_identity_token(&parent.path().join("missing")).expect("observe missing"),
+            None,
+            "a missing path has no durable identity to bind to"
+        );
     }
 
     #[test]

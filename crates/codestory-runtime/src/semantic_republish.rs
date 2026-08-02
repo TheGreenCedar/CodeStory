@@ -496,6 +496,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
                 #[cfg(test)]
                 publication: publication.clone(),
                 prepared_search_state: Some(prepared_search_state),
+                unchanged_publication: false,
             },
             publication,
             prepared.stats.symbol_search_docs_written,

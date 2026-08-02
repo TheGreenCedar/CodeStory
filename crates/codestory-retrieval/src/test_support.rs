@@ -118,17 +118,30 @@ pub fn publish_zero_dense_pinned_query_fixture(
     let scip_dir = runtime.layout.scip_project_dir(generation);
     std::fs::create_dir_all(&scip_dir).context("create pinned query fixture SCIP directory")?;
     let symbol = crate::scip_index::ScipSymbolRecord {
-        node_id: None,
+        node_id: Some("1".into()),
         path: "fixture.rs".into(),
         symbol: "fixture::symbol".into(),
         start_line: 1,
         end_line: 1,
     };
+    let definition = crate::scip_index::ScipProofRecord {
+        role: crate::scip_index::SCIP_DEFINITION_ROLE.into(),
+        path: symbol.path.clone(),
+        symbol: symbol.symbol.clone(),
+        start_line: symbol.start_line,
+        start_character_utf16: 0,
+        end_line: symbol.end_line,
+        end_character_utf16: 0,
+        target_symbol: None,
+        node_id: symbol.node_id.clone(),
+        target_node_id: None,
+    };
     let index = crate::scip_index::ScipSymbolsIndex {
+        generation: generation.to_string(),
         revision: revision.clone(),
         contract: crate::scip_index::ScipProofAdapterContract::graph_projection(&revision),
         symbols: vec![symbol],
-        proofs: Vec::new(),
+        proofs: vec![definition],
     };
     std::fs::write(
         scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE),

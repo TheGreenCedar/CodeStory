@@ -12,7 +12,7 @@ pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
 
 const LOCAL_RETRIEVAL_NAMESPACE: &str = "codestory-v3";
 const AGENT_RETRIEVAL_NAMESPACE_PREFIX: &str = "codestory-agent-v3-";
-const RETRIEVAL_STATE_FILE: &str = "retrieval-generations-v1.state";
+pub(crate) const RETRIEVAL_STATE_FILE: &str = "retrieval-generations-v1.state";
 const RETRIEVAL_ARTIFACTS_DIR: &str = "retrieval";
 const RUNTIME_ENV_KEYS: &[&str] = &[
     "CODESTORY_RETRIEVAL_PROFILE",

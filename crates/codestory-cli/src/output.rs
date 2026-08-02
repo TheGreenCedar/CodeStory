@@ -326,8 +326,31 @@ fn append_readiness_verdicts(
             crate::readiness::status_label(verdict.status),
             verdict.summary
         );
+        append_verdict_freshness_unknown(markdown, verdict.index.as_ref());
         append_verdict_commands(markdown, "minimum_next", &verdict.minimum_next);
     }
+}
+
+/// EV-7's typed unknown-freshness fact, rendered where a human reads readiness.
+///
+/// A `ready` lane over an inventory whose drift was never compared is the exact state that
+/// explains a `partial` packet, and the status word alone cannot carry it. Emitting the cause
+/// only when the flag is set keeps every already-proven verdict line byte-identical.
+fn append_verdict_freshness_unknown(
+    markdown: &mut String,
+    index: Option<&codestory_contracts::api::ReadinessIndexSnapshotDto>,
+) {
+    let Some(index) = index else {
+        return;
+    };
+    if !index.freshness_unknown {
+        return;
+    }
+    let cause = index
+        .freshness_unknown_cause
+        .map(|cause| cause.id())
+        .unwrap_or("unspecified");
+    let _ = writeln!(markdown, "  freshness_unknown: {cause}");
 }
 
 fn append_verdict_commands(markdown: &mut String, label: &str, commands: &[String]) {
@@ -4466,6 +4489,69 @@ mod tests {
         );
     }
 
+    fn readiness_verdict_with_index_snapshot(
+        freshness_unknown_cause: Option<codestory_contracts::api::FreshnessUnknownCauseDto>,
+    ) -> codestory_contracts::api::ReadinessVerdictDto {
+        codestory_contracts::api::ReadinessVerdictDto {
+            goal: codestory_contracts::api::ReadinessGoalDto::LocalNavigation,
+            status: codestory_contracts::api::ReadinessStatusDto::Ready,
+            summary: "Local navigation can use the current index.".to_string(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            setup: None,
+            index: Some(codestory_contracts::api::ReadinessIndexSnapshotDto {
+                status: Some(IndexFreshnessStatusDto::NotChecked),
+                error_count: 0,
+                fatal_error_count: 0,
+                changed_file_count: 0,
+                new_file_count: 0,
+                removed_file_count: 0,
+                checked_file_count: 0,
+                indexed_file_count: 1,
+                freshness_unknown: freshness_unknown_cause.is_some(),
+                freshness_unknown_cause,
+            }),
+            sidecar: None,
+        }
+    }
+
+    /// EV-7's contract names doctor output, not only the JSON DTO. A `ready` lane whose drift was
+    /// never compared is precisely the state that explains a `partial` packet, so the human
+    /// surface has to name the cause rather than leave it on the wire only.
+    #[test]
+    fn doctor_markdown_reports_typed_unknown_freshness_on_a_ready_lane() {
+        let mut output = sample_doctor_output();
+        output.readiness = vec![readiness_verdict_with_index_snapshot(Some(
+            codestory_contracts::api::FreshnessUnknownCauseDto::BoundedInventory,
+        ))];
+
+        let markdown = render_doctor_markdown(&output);
+
+        assert!(
+            markdown.contains("readiness: local_navigation=ready"),
+            "the bounded-inventory serving waiver keeps the lane ready:\n{markdown}"
+        );
+        assert!(
+            markdown.contains("freshness_unknown: bounded_inventory"),
+            "doctor markdown must name why a ready lane cannot prove drift:\n{markdown}"
+        );
+    }
+
+    /// The flag is evidence, not decoration: a lane that did reach a freshness verdict must not
+    /// grow the line, or the surface stops meaning anything.
+    #[test]
+    fn doctor_markdown_omits_unknown_freshness_when_drift_was_established() {
+        let mut output = sample_doctor_output();
+        output.readiness = vec![readiness_verdict_with_index_snapshot(None)];
+
+        let markdown = render_doctor_markdown(&output);
+
+        assert!(
+            !markdown.contains("freshness_unknown"),
+            "an established freshness verdict must leave the rendered line untouched:\n{markdown}"
+        );
+    }
+
     fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
         GraphNodeDto {
             id: NodeId(id.to_string()),
@@ -4932,6 +5018,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: vec!["semantic retrieval ready".to_string()],
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -5076,6 +5164,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,
@@ -5533,6 +5623,8 @@ mod tests {
                 sla_missed: true,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: vec!["weak hits after fallback".to_string()],
                 packet_claim_profile_telemetry: None,
                 source_freshness_telemetry: None,

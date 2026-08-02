@@ -58,7 +58,7 @@ pub use repository_identity::{
     WorkspacePathIdentity, WorkspacePathLexicalIdentity, inspect_repository_identity_v2,
     observe_logical_project_identity_v3, project_identity_v3, project_identity_v3_from_repository,
     same_workspace_path, workspace_file_identity, workspace_id_v3_for_root,
-    workspace_path_identity, workspace_path_lexical_identity,
+    workspace_path_identity, workspace_path_identity_token, workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -220,6 +220,20 @@ fn storage_parent_for_observation(storage_path: &Path) -> &Path {
 
 fn storage_owned_discovery_files(storage_path: &Path) -> Vec<PathBuf> {
     codestory_contracts::owned_artifacts::storage_owned_file_identities(storage_path)
+}
+
+/// Owned directory trees discovery must never walk into as user source.
+///
+/// The quarantine tree belongs here for the same reason the search trees do:
+/// the guided derived-cache reset moves owned artifacts into it rather than
+/// deleting them, so every one of those files stays on disk inside the cache
+/// root under a name discovery has never seen.
+fn storage_owned_discovery_directory_roots(storage_path: &Path) -> Vec<PathBuf> {
+    vec![
+        legacy_search_directory_for_storage(storage_path),
+        search_generation_directory_for_storage(storage_path),
+        codestory_contracts::owned_artifacts::derived_reset_quarantine_root(storage_path),
+    ]
 }
 
 fn storage_owned_staged_discovery_files(storage_path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -464,8 +478,8 @@ impl WorkspaceManifest {
         }
     }
 
-    /// Open a workspace while excluding the exact CodeStory core/search
-    /// artifacts owned by `storage_path`.
+    /// Open a workspace while excluding the exact CodeStory core, search, and
+    /// quarantined-reset artifacts owned by `storage_path`.
     pub fn open_with_storage_owned_exclusions(
         root_path: PathBuf,
         storage_path: &Path,
@@ -475,10 +489,9 @@ impl WorkspaceManifest {
         manifest
             .discovery_owned_storage_paths
             .push(storage_path.to_path_buf());
-        manifest.exclude_discovery_directory_roots([
-            legacy_search_directory_for_storage(storage_path),
-            search_generation_directory_for_storage(storage_path),
-        ]);
+        manifest.exclude_discovery_directory_roots(storage_owned_discovery_directory_roots(
+            storage_path,
+        ));
         Ok(manifest)
     }
 
@@ -3348,7 +3361,8 @@ mod tests {
         assert_eq!(files.len(), 256);
         assert_eq!(
             manifest.discovery_exclusion_observation_count(),
-            storage_owned_discovery_files(&storage_path).len() + 2
+            storage_owned_discovery_files(&storage_path).len()
+                + storage_owned_discovery_directory_roots(&storage_path).len()
         );
         Ok(())
     }
@@ -3396,6 +3410,49 @@ mod tests {
                 .iter()
                 .all(|owned| !inventory.files.contains(owned))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_derived_reset_state_stays_out_of_source_discovery() -> Result<()> {
+        // The guided derived-cache reset moves owned artifacts into a
+        // quarantine tree inside the cache root instead of deleting them, so
+        // every file it reclaimed is still on disk under a name discovery has
+        // never seen. Unless the quarantine root is an owned directory
+        // identity, the next inventory adopts the whole reclaimed cache as
+        // user source.
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let storage_path = root.join(".cache/custom-core.db");
+        let quarantine =
+            codestory_contracts::owned_artifacts::derived_reset_quarantine_root(&storage_path)
+                .join("0001700000000");
+        fs::create_dir_all(quarantine.join("custom-core.search"))?;
+        let quarantined = [
+            quarantine.join("custom-core.db"),
+            quarantine.join("custom-core.db-wal"),
+            quarantine.join("local-refresh-status.json"),
+            quarantine.join("custom-core.search").join("meta.json"),
+        ];
+        for path in &quarantined {
+            fs::write(path, b"quarantined derived state\n")?;
+        }
+        let user_source = root.join("src/lib.rs");
+        fs::create_dir_all(user_source.parent().expect("user source parent"))?;
+        fs::write(&user_source, "pub fn keep() {}\n")?;
+
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(root, &storage_path)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&user_source));
+        for path in &quarantined {
+            assert!(
+                !inventory.files.contains(path),
+                "{} was quarantined by the derived-cache reset and must never be discovered as user source",
+                path.display()
+            );
+        }
         Ok(())
     }
 

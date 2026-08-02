@@ -9,7 +9,7 @@ use codestory_contracts::api::{
     ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenProjectRequest,
     ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
     SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto,
+    SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto, UpdateBookmarkRequest,
 };
 
 use crate::AppController;
@@ -2525,7 +2525,15 @@ impl BookmarkService {
         self.controller.create_bookmark(req)
     }
 
-    pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
+    pub fn update_bookmark(
+        &self,
+        id: &str,
+        req: UpdateBookmarkRequest,
+    ) -> Result<BookmarkDto, ApiError> {
+        self.controller.update_bookmark(id, req)
+    }
+
+    pub fn delete_bookmark(&self, id: &str) -> Result<(), ApiError> {
         self.controller.delete_bookmark(id)
     }
 }

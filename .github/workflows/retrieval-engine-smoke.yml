@@ -183,7 +183,12 @@ jobs:
         run: cargo test --locked -p codestory-cli --test packet_search_eval
 
       - name: Retrieval crate unit tests
-        run: cargo test --locked -p codestory-retrieval
+        run: |
+          cargo test --locked -p codestory-retrieval
+          # Rollback activation fixtures need an admissible embedding device,
+          # which only exists under test-support (EV-9, #1652). Without this
+          # invocation the whole module is compiled out of the PR lane.
+          cargo test --locked -p codestory-retrieval --features test-support --lib rollback::
 
       - name: Architecture ownership contract tests
         run: cargo test --locked -p codestory-cli --test architecture_contracts

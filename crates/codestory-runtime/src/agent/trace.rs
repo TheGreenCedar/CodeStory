@@ -142,6 +142,8 @@ impl TraceRecorder {
             sla_missed,
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
+            semantic_stage_timeout_zero_hits: 0,
+            semantic_abstained_count: 0,
             annotations: self.annotations,
             packet_claim_profile_telemetry: None,
             source_freshness_telemetry: None,

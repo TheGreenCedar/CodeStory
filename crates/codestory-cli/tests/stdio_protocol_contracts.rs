@@ -475,6 +475,40 @@ fn assert_error_envelope(response: &Value, id: Value) -> &Value {
     error
 }
 
+/// Assert a `tools/call` was rejected by catalog argument validation and that
+/// the typed data names the offending member and the violated rule.
+fn assert_invalid_params(
+    response: &Value,
+    id: Value,
+    tool: &str,
+    pointer: &str,
+    violation_code: &str,
+) {
+    let error = assert_error_envelope(response, id);
+    assert_error_code(error, -32602);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("invalid_params"),
+        "catalog rejections must carry the typed invalid_params code: {response}"
+    );
+    assert_eq!(
+        error.pointer("/data/tool").and_then(Value::as_str),
+        Some(tool),
+        "catalog rejections must name the tool: {response}"
+    );
+    let violations = error
+        .pointer("/data/violations")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("catalog rejection should list violations: {response}"));
+    assert!(
+        violations.iter().any(|violation| {
+            violation.get("pointer").and_then(Value::as_str) == Some(pointer)
+                && violation.get("code").and_then(Value::as_str) == Some(violation_code)
+        }),
+        "expected {violation_code} at {pointer}: {response}"
+    );
+}
+
 fn assert_error_code(error: &Value, code: i64) {
     assert_eq!(
         error.get("code").and_then(Value::as_i64),
@@ -2733,12 +2767,12 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_response, json!("ground-bad-budget"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("ground.budget")),
-        "ground tool should fail closed on unknown budgets: {bad_response}"
+    assert_invalid_params(
+        &bad_response,
+        json!("ground-bad-budget"),
+        "ground",
+        "/arguments/budget",
+        "invalid_enum_value",
     );
 }
 
@@ -2878,12 +2912,12 @@ fn files_tool_lists_indexed_files_without_sidecars() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_role, json!("files-bad-role"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("files.role")),
-        "files tool should fail closed on unknown roles: {bad_role}"
+    assert_invalid_params(
+        &bad_role,
+        json!("files-bad-role"),
+        "files",
+        "/arguments/role",
+        "invalid_enum_value",
     );
 }
 
@@ -3418,12 +3452,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_paths, json!("affected-bad-paths"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("affected.changed_paths")),
-        "affected should fail closed on malformed path input: {bad_paths}"
+    assert_invalid_params(
+        &bad_paths,
+        json!("affected-bad-paths"),
+        "affected",
+        "/arguments/changed_paths",
+        "invalid_type",
     );
 
     let conflict = send_json(
@@ -3441,8 +3475,13 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&conflict, json!("affected-input-conflict"));
-    assert_eq!(error["code"], json!("affected_input_conflict"));
+    assert_invalid_params(
+        &conflict,
+        json!("affected-input-conflict"),
+        "affected",
+        "/arguments",
+        "invalid_selector",
+    );
 
     let empty_property_conflict = send_json(
         &mut server,
@@ -3459,14 +3498,13 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(
+    // Input exclusivity is decided on property presence, not on non-empty arrays.
+    assert_invalid_params(
         &empty_property_conflict,
         json!("affected-empty-property-conflict"),
-    );
-    assert_eq!(
-        error["code"],
-        json!("affected_input_conflict"),
-        "input exclusivity must use property presence, not non-empty arrays"
+        "affected",
+        "/arguments",
+        "invalid_selector",
     );
 
     let empty_input = send_json(
@@ -3481,13 +3519,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&empty_input, json!("affected-empty-input"));
-    assert_eq!(error["code"], json!("invalid_argument"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("at least one")),
-        "empty affected input should fail the adapter minimum: {empty_input}"
+    assert_invalid_params(
+        &empty_input,
+        json!("affected-empty-input"),
+        "affected",
+        "/arguments/paths",
+        "below_min_items",
     );
 
     let too_many_paths = vec!["src/runtime.rs"; 201];
@@ -3503,13 +3540,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&oversized_input, json!("affected-oversized-input"));
-    assert_eq!(error["code"], json!("invalid_argument"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("at most 200")),
-        "oversized affected input should fail the adapter maximum: {oversized_input}"
+    assert_invalid_params(
+        &oversized_input,
+        json!("affected-oversized-input"),
+        "affected",
+        "/arguments/paths",
+        "above_max_items",
     );
 
     let bad_record = send_json(
@@ -3528,12 +3564,12 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             }
         }),
     );
-    let error = assert_tool_error(&bad_record, json!("affected-bad-record"));
-    assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("affected.change_records")),
-        "affected should fail closed on malformed change records: {bad_record}"
+    assert_invalid_params(
+        &bad_record,
+        json!("affected-bad-record"),
+        "affected",
+        "/arguments/change_records/0/kind",
+        "invalid_enum_value",
     );
 }
 
@@ -3554,8 +3590,13 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
             }
         }),
     );
-    let error = assert_tool_error(&malformed, json!("affected-cold-malformed"));
-    assert_eq!(error["code"], json!("invalid_argument"));
+    assert_invalid_params(
+        &malformed,
+        json!("affected-cold-malformed"),
+        "affected",
+        "/arguments/paths/0",
+        "below_min_length",
+    );
 
     let cold_status = send_json(
         &mut server,
@@ -3991,6 +4032,15 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
         }),
     );
     thread::sleep(Duration::from_millis(1200));
+    // An incremental refresh with an empty plan is short-circuited and writes
+    // no publication, so it cannot advance storage state past the marker. The
+    // marker-versus-index freshness contract is exercised by a refresh that
+    // actually republishes.
+    fs::write(
+        fixture.workspace.path().join("src/dirty_marker_probe.rs"),
+        "pub fn dirty_marker_probe() -> u32 {\n    7\n}\n",
+    )
+    .expect("write dirty marker probe source");
     refresh_fixture_index(&fixture);
     fixture.dirty_marker_path = Some(marker_path.clone());
     fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
@@ -5867,6 +5917,126 @@ fn bad_tool_call_args_return_jsonrpc_error() {
             .contains("tool"),
         "bad tools/call args should name the tool problem: {response}"
     );
+}
+
+#[test]
+fn advertised_tool_argument_contract_is_enforced_instead_of_silently_repaired() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    for (id, tool, arguments, pointer, code) in [
+        (
+            "args-unknown-property",
+            "search",
+            json!({"query": "AppController", "limt": 3}),
+            "/arguments/limt",
+            "unknown_property",
+        ),
+        (
+            "args-bad-enum",
+            "search",
+            json!({"query": "AppController", "repo_text": "yes"}),
+            "/arguments/repo_text",
+            "invalid_enum_value",
+        ),
+        (
+            "args-out-of-range",
+            "search",
+            json!({"query": "AppController", "limit": 5000}),
+            "/arguments/limit",
+            "above_maximum",
+        ),
+        (
+            "args-wrong-type",
+            "search",
+            json!({"query": "AppController", "limit": "10"}),
+            "/arguments/limit",
+            "invalid_type",
+        ),
+        (
+            "args-missing-required",
+            "packet",
+            json!({"budget": "compact"}),
+            "/arguments/question",
+            "missing_required",
+        ),
+        (
+            "args-ambiguous-selector",
+            "symbol",
+            json!({"query": "AppController", "id": "42"}),
+            "/arguments",
+            "invalid_selector",
+        ),
+        (
+            "args-absent-selector",
+            "trail",
+            json!({"depth": 1}),
+            "/arguments",
+            "invalid_selector",
+        ),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}
+            }),
+        );
+        assert_invalid_params(&response, json!(id), tool, pointer, code);
+    }
+}
+
+#[test]
+fn graph_family_tool_errors_preserve_machine_classification() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    for (id, tool, arguments) in [
+        (
+            "typed-symbol-miss",
+            "symbol",
+            json!({"query": "definitely-not-an-indexed-symbol-zzz"}),
+        ),
+        (
+            "typed-node-miss",
+            "get_node",
+            json!({"id": "definitely-not-a-node-zzz"}),
+        ),
+        (
+            "typed-bookmark-miss",
+            "context",
+            json!({"bookmark": "definitely-not-a-bookmark-zzz"}),
+        ),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}
+            }),
+        );
+        let error = assert_tool_error(&response, json!(id));
+        let code = error["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool} error must carry a machine code: {response}"));
+        assert!(
+            !code.is_empty()
+                && code
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '_'),
+            "{tool} must classify with a typed code rather than prose: {response}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{tool} must keep the human-readable message beside the code: {response}"
+        );
+    }
 }
 
 #[test]

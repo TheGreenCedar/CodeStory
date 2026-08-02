@@ -86,9 +86,11 @@ use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::snippets::bounded_direct_markdown_snippet;
 use crate::snippets::bounded_markdown_snippet_from_path;
 use codestory_contracts::api::{
-    ArtifactCachePolicyDto, CorePromotionTimings, IndexMode, IndexedFilesRequest,
-    ListRootSymbolsRequest, OpenProjectRequest, StartIndexingRequest,
-    UpdateBookmarkCategoryRequest, WriteFileTextRequest,
+    ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
+    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListRootSymbolsRequest,
+    OpenProjectRequest, StartIndexingRequest, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
@@ -106,7 +108,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 #[path = "tests/activation_coverage_tests.rs"]
 mod activation_coverage_tests;
@@ -1852,7 +1854,7 @@ fn run_indexing_without_runtime_refresh_populates_dense_anchor_inputs_in_storage
 }
 
 #[test]
-fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
+fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -1876,9 +1878,44 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
         .expect("first dense manifest");
     drop(first_storage);
 
+    // An empty refresh plan is short-circuited and publishes nothing: the
+    // carried dense anchors stay bound to the still-live publication.
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
         .expect("unchanged incremental index");
+    {
+        let storage = Storage::open(&storage_path).expect("unchanged incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("unchanged publication")
+            .expect("complete unchanged publication");
+        assert_eq!(publication, first_publication);
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("unchanged dense manifest");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_eq!(manifest.core_run_id, first_manifest.core_run_id);
+        let live_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        assert!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("carried dense anchors")
+                .iter()
+                .all(|anchor| anchor.source_identity == live_source),
+            "a short-circuited refresh must leave every dense anchor bound to the live publication"
+        );
+    }
+
+    // A refresh with real work rebinds the carried anchors onto the new
+    // publication identity.
+    fs::write(
+        workspace.path().join("dense_anchor_rebind_probe.md"),
+        "# rebind probe\n\nA documented change.\n",
+    )
+    .expect("write changed source");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("publishing incremental index");
     let storage = Storage::open(&storage_path).expect("incremental storage");
     let publication = storage
         .get_complete_index_publication()
@@ -1887,7 +1924,6 @@ fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() 
     let manifest = storage
         .validate_dense_anchor_publication(&publication)
         .expect("incremental dense manifest");
-    assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
     assert_ne!(manifest.core_run_id, first_manifest.core_run_id);
     let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
     assert!(
@@ -3683,7 +3719,7 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             .get_connection()
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("schema version"),
-        30
+        codestory_store::CURRENT_SCHEMA_VERSION
     );
     assert_eq!(
         storage
@@ -6072,6 +6108,7 @@ fn empty_indexing_run_summary() -> IndexingRunSummary {
             published_at_epoch_ms: 1,
         },
         prepared_search_state: None,
+        unchanged_publication: false,
     }
 }
 
@@ -7931,6 +7968,502 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
     assert_eq!(retried_publication.mode, IndexPublicationMode::Incremental);
 }
 
+struct EmptyPlanShortCircuitFixture {
+    _workspace: tempfile::TempDir,
+    controller: AppController,
+    storage_path: PathBuf,
+    source_path: PathBuf,
+    baseline_publication: IndexPublicationRecord,
+    baseline_search_generations: Vec<String>,
+}
+
+fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    let workspace = tempdir().expect("workspace dir");
+    let source_path = workspace.path().join("lib.rs");
+    fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open short-circuit project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish short-circuit baseline");
+    let baseline_publication = Storage::open(&storage_path)
+        .expect("open baseline storage")
+        .get_complete_index_publication()
+        .expect("read baseline publication record")
+        .expect("complete baseline publication record");
+    let baseline_search_generations = persisted_search_generation_names(&storage_path);
+    assert_eq!(
+        baseline_search_generations.len(),
+        1,
+        "the baseline must publish exactly one completed search generation"
+    );
+    EmptyPlanShortCircuitFixture {
+        _workspace: workspace,
+        controller,
+        storage_path,
+        source_path,
+        baseline_publication,
+        baseline_search_generations,
+    }
+}
+
+#[test]
+fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding_search() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("unchanged incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::ShortCircuited,
+        "an unchanged workspace must resolve to the short-circuit outcome: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(
+        probe.skipped_database_copies, 3,
+        "skipping the staged pipeline avoids the staged clone, the rollback backup copy, and the staged-to-live restore"
+    );
+    assert!(probe.skipped_search_state_rebuild);
+    assert!(
+        probe.live_database_file_bytes > 0,
+        "the saved work must be measured against the published core size"
+    );
+    assert_eq!(
+        probe.skipped_database_copy_bytes,
+        probe.live_database_file_bytes * 3
+    );
+    assert_eq!(
+        timings.publish_ms, None,
+        "a short-circuited refresh must not record a publication"
+    );
+    assert_eq!(timings.staged_snapshot_copy, None);
+    assert_eq!(timings.core_promotion, None);
+    assert_eq!(
+        timings.cache_refresh_ms, None,
+        "a short-circuited refresh must not enter the runtime cache rebuild at all"
+    );
+    assert!(
+        !fixture.controller.state.lock().is_indexing,
+        "a short-circuited refresh must release the indexing state"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a short-circuited refresh must leave the published core generation in place"
+    );
+    assert!(
+        !storage
+            .has_incomplete_incremental_run()
+            .expect("read post-refresh incremental marker"),
+        "a short-circuited refresh must not leave a recovery marker behind"
+    );
+    drop(storage);
+    assert_eq!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a short-circuited refresh must not build a new search generation"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    fs::write(&fixture.source_path, "pub fn steady_state() -> i32 { 2 }\n").expect("change source");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("changed incremental refresh");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
+        "a changed workspace must not be reported as short-circuited: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 1);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert_eq!(probe.skipped_database_copy_bytes, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+    assert!(
+        timings.publish_ms.is_some(),
+        "a changed workspace must still publish"
+    );
+    assert!(
+        timings.cache_refresh_ms.is_some(),
+        "a changed workspace must still run the runtime cache rebuild"
+    );
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let published = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        published.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    assert_eq!(published.mode, IndexPublicationMode::Incremental);
+    drop(storage);
+    assert_ne!(
+        persisted_search_generation_names(&fixture.storage_path),
+        fixture.baseline_search_generations,
+        "a changed workspace must build a new search generation"
+    );
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_completed_search_generation_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let generation_root = search_index_generation_root(&fixture.storage_path);
+    for name in &fixture.baseline_search_generations {
+        fs::remove_dir_all(generation_root.join(name)).expect("remove completed search generation");
+    }
+    assert!(persisted_search_generation_names(&fixture.storage_path).is_empty());
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a reusable search generation");
+
+    let rebuilt = persisted_search_generation_names(&fixture.storage_path);
+    assert_eq!(
+        rebuilt.len(),
+        1,
+        "the refresh must rebuild the missing search generation: {rebuilt:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete,
+        "an empty plan must not short-circuit when the published search generation is gone: {probe:?}"
+    );
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(!probe.skipped_search_state_rebuild);
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_dense_anchor_manifest_is_missing() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch("DELETE FROM dense_anchor_publication;")
+        .expect("clear dense anchor manifest");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh without a dense anchor manifest");
+
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    assert!(
+        storage
+            .get_dense_anchor_publication_manifest()
+            .expect("read rebuilt dense anchor manifest")
+            .is_some(),
+        "the refresh must republish the dense anchor manifest it could not reuse"
+    );
+    assert_eq!(
+        storage
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1
+    );
+    drop(storage);
+    assert!(timings.publish_ms.is_some());
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+        "an empty plan must not short-circuit while a complete dense anchor rebuild is owed: {probe:?}"
+    );
+}
+
+#[test]
+fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let workspace_root = fixture
+        .source_path
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    // The whole point of the regression: a repository with no oversized files
+    // has an empty exclusion set under both the old and the new policy, so a
+    // row-only comparison is trivially satisfied.
+    assert!(
+        Storage::open(&fixture.storage_path)
+            .expect("open baseline storage")
+            .get_source_policy_exclusions()
+            .expect("read baseline exclusions")
+            .is_empty(),
+        "the fixture must carry no oversized-source exclusions"
+    );
+
+    let changed_policy = SourceIndexPolicy::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP / 2);
+    assert_ne!(
+        changed_policy.byte_cap,
+        SourceIndexPolicy::default().byte_cap
+    );
+    let controller = AppController::new_with_source_index_policy(
+        codestory_retrieval::SidecarRuntimeConfig::local(),
+        changed_policy,
+    );
+    controller
+        .open_project_summary_with_storage_path(workspace_root, fixture.storage_path.clone())
+        .expect("open the published core under the changed policy");
+    assert!(
+        controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness under the changed policy"),
+        "a policy change must leave the published exclusion manifest owing a repair"
+    );
+
+    let timings = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh under the changed policy");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
+        "an empty plan must not short-circuit while the exclusion manifest is bound to a superseded policy: {probe:?}"
+    );
+    assert_eq!(probe.files_to_index, 0);
+    assert_eq!(probe.files_to_remove, 0);
+    assert_eq!(probe.skipped_database_copies, 0);
+    assert!(timings.publish_ms.is_some());
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refresh storage")
+            .get_complete_index_publication()
+            .expect("read post-refresh publication")
+            .expect("complete post-refresh publication")
+            .generation,
+        fixture.baseline_publication.generation + 1,
+        "the prescribed `index --refresh incremental` repair must republish"
+    );
+    assert!(
+        !controller
+            .complete_core_requires_publication_repair(&fixture.storage_path)
+            .expect("read publication repair readiness after the repair"),
+        "the repair must leave the published core readable under the current policy"
+    );
+}
+
+#[test]
+fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // An indexed file published without verified content and without completion
+    // is a stored `CollectorFailure` gap. It does not schedule any work, so only
+    // the coverage check stands between it and a successful refresh.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+        )
+        .expect("stage a stored coverage gap");
+
+    let error = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect_err("an incremental refresh must refuse a stored coverage gap");
+
+    assert_eq!(error.code, "source_collector_failure");
+    let coverage_gaps = error
+        .details
+        .as_ref()
+        .map(|details| details.coverage_gaps.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        coverage_gaps.len(),
+        1,
+        "the refusal must carry the gap it could not verify: {coverage_gaps:?}"
+    );
+    assert_eq!(
+        coverage_gaps[0].reason,
+        FileCoverageReason::CollectorFailure
+    );
+    assert_eq!(
+        Storage::open(&fixture.storage_path)
+            .expect("open post-refusal storage")
+            .get_complete_index_publication()
+            .expect("read post-refusal publication"),
+        Some(fixture.baseline_publication.clone()),
+        "a refused refresh must preserve the previous complete publication"
+    );
+    assert_no_staged_publication_artifacts(&fixture.storage_path);
+}
+
+#[test]
+fn incremental_refresh_rebinds_a_dense_anchor_carrying_a_stale_source_identity() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    let live_source = format!(
+        "core:{}:{}",
+        fixture.baseline_publication.generation_id, fixture.baseline_publication.run_id
+    );
+    {
+        let storage = Storage::open(&fixture.storage_path).expect("open live storage");
+        assert!(
+            !storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("read baseline dense anchors")
+                .is_empty(),
+            "the fixture must publish at least one dense anchor to drift"
+        );
+        // Per-row source identity is outside the manifest digest, so count and
+        // digest still match: only the strict publication validation sees this.
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE dense_anchor_input SET source_identity = 'core:stale-generation:stale-run'
+                 WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+            )
+            .expect("stage a stale dense anchor source identity");
+        assert!(
+            storage
+                .validate_dense_anchor_publication(&fixture.baseline_publication)
+                .is_err(),
+            "the staged drift must be visible to the strict publication validation"
+        );
+    }
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over drifted dense anchors");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a dense anchor publication readers refuse: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the repair must leave a dense anchor publication readers accept");
+    let repaired_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+    assert_ne!(repaired_source, live_source);
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read repaired dense anchors")
+            .iter()
+            .all(|anchor| anchor.source_identity == repaired_source),
+        "the repair must rebind every anchor onto the republished identity"
+    );
+}
+
+#[test]
+fn incremental_refresh_adjudicates_mixed_dense_anchor_policy_versions() {
+    let fixture = publish_empty_plan_short_circuit_baseline();
+    // `publish_dense_anchor_generation` refuses a mixed anchor policy set. That
+    // refusal is unreachable on a short-circuited run, so the mixed set must at
+    // minimum reach the staged pipeline that owns it.
+    Storage::open(&fixture.storage_path)
+        .expect("open live storage")
+        .get_connection()
+        .execute_batch(
+            "UPDATE dense_anchor_input SET policy_version = 'superseded-anchor-policy'
+             WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+        )
+        .expect("stage a mixed dense anchor policy version");
+
+    let timings = fixture
+        .controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental refresh over a mixed anchor policy set");
+
+    let probe = timings
+        .incremental_plan_probe
+        .as_ref()
+        .expect("an incremental refresh must report its plan probe");
+    assert_eq!(
+        probe.outcome,
+        IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+        "an empty plan must not short-circuit over a mixed anchor policy set: {probe:?}"
+    );
+    let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read post-refresh publication")
+        .expect("complete post-refresh publication");
+    assert_eq!(
+        publication.generation,
+        fixture.baseline_publication.generation + 1
+    );
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("the staged pipeline must leave one accepted anchor policy behind");
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("read post-refresh dense anchors")
+            .iter()
+            .all(|anchor| anchor.policy_version == SEMANTIC_POLICY_VERSION),
+        "no anchor may keep the superseded policy version"
+    );
+}
+
 #[test]
 fn incremental_boundaries_preserve_live_state_and_retry_atomically() {
     for boundary in [
@@ -9408,4 +9941,774 @@ fn update_bookmark_category_returns_not_found_when_missing() {
         .expect_err("missing category should return not_found");
 
     assert_eq!(err.code, "not_found");
+}
+
+struct AnnotationProject {
+    _workspace: TempDir,
+    root: PathBuf,
+    source_path: PathBuf,
+    storage_path: PathBuf,
+    controller: AppController,
+}
+
+impl AnnotationProject {
+    fn open(source: &str) -> Self {
+        let workspace = tempdir().expect("workspace dir");
+        let root = workspace.path().to_path_buf();
+        let source_path = root.join("lib.rs");
+        fs::write(&source_path, source).expect("write source");
+        let storage_path = root.join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(root.clone(), storage_path.clone())
+            .expect("open annotation project");
+        Self {
+            _workspace: workspace,
+            root,
+            source_path,
+            storage_path,
+            controller,
+        }
+    }
+
+    fn index(&self) {
+        self.controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("index annotation project");
+        self.controller
+            .open_project_summary_with_storage_path(self.root.clone(), self.storage_path.clone())
+            .expect("reopen annotation project");
+    }
+
+    /// Drive the sibling asynchronous entry point rather than the blocking one.
+    fn index_async(&self) {
+        let events = self.controller.events();
+        self.controller
+            .start_indexing(StartIndexingRequest {
+                mode: IndexMode::Full,
+            })
+            .expect("start asynchronous full refresh");
+        loop {
+            match events
+                .recv_timeout(Duration::from_secs(120))
+                .expect("asynchronous indexing terminal event")
+            {
+                AppEventPayload::IndexingComplete { .. } => break,
+                AppEventPayload::IndexingFailed { error } => {
+                    panic!("asynchronous full refresh failed: {error}")
+                }
+                _ => {}
+            }
+        }
+        self.controller
+            .open_project_summary_with_storage_path(self.root.clone(), self.storage_path.clone())
+            .expect("reopen annotation project");
+    }
+
+    fn write(&self, relative: &str, source: &str) {
+        fs::write(self.root.join(relative), source).expect("write source");
+    }
+
+    /// Seed the retained core tables the way a pre-cutover release would have.
+    fn seed_legacy_bookmark(&self, symbol: &str, comment: &str) -> i64 {
+        let node_id = self.node_id_for(symbol).to_core().expect("core node id");
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some(comment))
+            .expect("legacy bookmark")
+    }
+
+    fn sidecar_path(&self) -> PathBuf {
+        codestory_contracts::owned_artifacts::annotations_sidecar_path(&self.storage_path)
+    }
+
+    fn node_id_for(&self, name: &str) -> codestory_contracts::api::NodeId {
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let node = storage
+            .get_nodes()
+            .expect("read nodes")
+            .into_iter()
+            .find(|node| node.serialized_name == name)
+            .unwrap_or_else(|| panic!("no node named {name}"));
+        codestory_contracts::api::NodeId::from(node.id)
+    }
+
+    fn bookmark(&self, name: &str) -> codestory_contracts::api::BookmarkDto {
+        let category = self
+            .controller
+            .create_bookmark_category(CreateBookmarkCategoryRequest {
+                name: "Favorites".to_string(),
+            })
+            .expect("create category");
+        self.controller
+            .create_bookmark(CreateBookmarkRequest {
+                category_id: category.id,
+                node_id: self.node_id_for(name),
+                comment: Some("keep".to_string()),
+            })
+            .expect("create bookmark")
+    }
+
+    fn legacy_row_counts(&self) -> (i64, i64) {
+        let storage = Storage::open(&self.storage_path).expect("open core");
+        let categories = storage
+            .get_connection()
+            .query_row("SELECT COUNT(*) FROM bookmark_category", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy category count");
+        let bookmarks = storage
+            .get_connection()
+            .query_row("SELECT COUNT(*) FROM bookmark_node", [], |row| row.get(0))
+            .expect("legacy bookmark count");
+        (categories, bookmarks)
+    }
+}
+
+#[test]
+fn observational_annotation_paths_never_materialize_the_sidecar() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+
+    assert!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("list categories")
+            .is_empty()
+    );
+    assert!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("list bookmarks")
+            .is_empty()
+    );
+    assert!(
+        !project.sidecar_path().exists(),
+        "project-open and listing must stay observational"
+    );
+
+    project.index();
+    assert!(
+        !project.sidecar_path().exists(),
+        "indexing a project with no annotations must not create the sidecar"
+    );
+}
+
+#[test]
+fn the_cutover_imports_legacy_annotations_once_and_never_writes_them_again() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    // Seed the retained core tables the way a pre-cutover release would have.
+    let node_id = project
+        .node_id_for("alpha")
+        .to_core()
+        .expect("core node id");
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some("legacy note"))
+            .expect("legacy bookmark");
+    }
+    let legacy_before = project.legacy_row_counts();
+    assert_eq!(legacy_before, (1, 1));
+
+    // Reading still sees the legacy rows while the sidecar does not exist.
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("pre-cutover read")
+            .len(),
+        1
+    );
+    assert!(!project.sidecar_path().exists());
+
+    // The first annotation write cuts over.
+    let category = project
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Favorites".to_string(),
+        })
+        .expect("create category");
+    assert!(project.sidecar_path().is_file());
+    let migrated = project
+        .controller
+        .list_bookmarks(None)
+        .expect("post-cutover read");
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(migrated[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        migrated[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+    assert!(
+        codestory_contracts::owned_artifacts::annotations_migration_backup_path(
+            &project.storage_path
+        )
+        .is_file(),
+        "the pre-migration backup must be retained"
+    );
+
+    let created = project
+        .controller
+        .create_bookmark(CreateBookmarkRequest {
+            category_id: category.id.clone(),
+            node_id: project.node_id_for("alpha"),
+            comment: None,
+        })
+        .expect("create bookmark");
+    project
+        .controller
+        .update_bookmark(
+            &created.id,
+            UpdateBookmarkRequest {
+                category_id: None,
+                comment: Some(Some("edited".to_string())),
+            },
+        )
+        .expect("update bookmark");
+    project
+        .controller
+        .delete_bookmark(&created.id)
+        .expect("delete bookmark");
+
+    assert_eq!(
+        project.legacy_row_counts(),
+        legacy_before,
+        "retained legacy tables must receive no writes after the cutover"
+    );
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("post-crud read")
+            .len(),
+        1,
+        "the migrated annotation is the only surviving one"
+    );
+}
+
+#[test]
+fn annotations_survive_position_shifting_edits_and_full_refresh() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    assert_eq!(
+        bookmark.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+
+    fs::write(
+        &project.source_path,
+        "// a new leading comment\n// and another\npub fn alpha() -> i32 { 1 }\n",
+    )
+    .expect("shift positions");
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after refresh");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a position-shifting edit must not orphan an annotation"
+    );
+    assert_eq!(after[0].node_kind, NodeKind::FUNCTION.into());
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories after refresh")
+            .len(),
+        1,
+        "categories are user-owned and survive a full refresh"
+    );
+}
+
+#[test]
+fn a_deleted_target_stays_a_visible_orphan_and_rebinds_on_reappearance() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    fs::write(&project.source_path, "pub fn beta() -> i32 { 2 }\n").expect("remove target");
+    project.index();
+    let orphaned = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after deletion");
+    assert_eq!(
+        orphaned.len(),
+        1,
+        "a deleted target never deletes user state"
+    );
+    assert_eq!(orphaned[0].id, bookmark.id);
+    assert_eq!(
+        orphaned[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned
+    );
+    assert_eq!(orphaned[0].comment.as_deref(), Some("keep"));
+    assert!(orphaned[0].orphan_reason.is_some());
+
+    fs::write(&project.source_path, "pub fn alpha() -> i32 { 1 }\n").expect("restore target");
+    project.index();
+    let restored = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after reappearance");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a reappearing target rebinds by exact anchor identity"
+    );
+}
+
+#[test]
+fn a_cache_reset_leaves_annotations_intact_and_user_owned() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // A derived-cache reset removes the core projections; the sidecar sits
+    // outside the promotion fence and is untouched.
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        storage.clear().expect("clear derived core state");
+    }
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after cache reset");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(after[0].comment.as_deref(), Some("keep"));
+
+    project.index();
+    let rebound = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after reindex");
+    assert_eq!(
+        rebound[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "reindexing after a reset rebinds the surviving annotation"
+    );
+}
+
+#[test]
+fn a_full_refresh_rescues_legacy_annotations_before_it_replaces_core() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let node_id = project
+        .node_id_for("alpha")
+        .to_core()
+        .expect("core node id");
+    {
+        let storage = Storage::open(&project.storage_path).expect("open core");
+        let category_id = storage
+            .create_bookmark_category("Legacy")
+            .expect("legacy category");
+        storage
+            .add_bookmark(category_id, node_id, Some("legacy note"))
+            .expect("legacy bookmark");
+    }
+    assert!(!project.sidecar_path().exists());
+
+    // A full refresh installs a database built from scratch, which never
+    // carried the legacy annotation tables.
+    project.index();
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after full refresh");
+    assert_eq!(
+        surviving.len(),
+        1,
+        "the core-replacing operation must not be able to destroy user annotations"
+    );
+    assert_eq!(surviving[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        surviving[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+}
+
+#[test]
+fn annotations_outlive_a_quarantined_core_database() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // A guided derived-cache reset can take the core database away entirely.
+    // The sidecar sits outside the promotion fence, so the annotation is still
+    // readable from its own durable state.
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", project.storage_path.display()));
+        let _ = fs::remove_file(path);
+    }
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("annotations remain readable without core");
+    assert_eq!(surviving.len(), 1);
+    assert_eq!(surviving[0].id, bookmark.id);
+    assert_eq!(surviving[0].comment.as_deref(), Some("keep"));
+    assert!(
+        surviving[0].last_known_evidence.is_some(),
+        "an annotation without core still reports its last known evidence"
+    );
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories remain readable without core")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_foreign_native_root_fails_closed_and_requires_export_import() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    let export = project
+        .controller
+        .export_annotations()
+        .expect("export annotations");
+
+    // Copying a project cache into a different native root is a clone, not a
+    // move, so the sidecar refuses to adopt it.
+    let clone = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    clone.index();
+    fs::create_dir_all(clone.sidecar_path().parent().expect("cache root"))
+        .expect("create cache root");
+    fs::copy(project.sidecar_path(), clone.sidecar_path()).expect("copy sidecar");
+    let error = clone
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Adopted".to_string(),
+        })
+        .expect_err("a foreign native root must fail closed");
+    assert!(
+        error.message.contains("export"),
+        "the failure must name the export/import path: {}",
+        error.message
+    );
+
+    // Explicit import is the supported path for a clone.
+    fs::remove_file(clone.sidecar_path()).expect("discard the foreign sidecar");
+    assert_eq!(
+        clone
+            .controller
+            .import_annotations(&export)
+            .expect("import annotations"),
+        1
+    );
+    let imported = clone
+        .controller
+        .list_bookmarks(None)
+        .expect("read imported annotations");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].comment.as_deref(), Some("keep"));
+    assert_ne!(
+        imported[0].id, bookmark.id,
+        "an import creates new annotation identities rather than replacing them"
+    );
+}
+
+/// Two callables whose shapes differ, so the annotated one has a normalized
+/// signature that separates it from its neighbours. `alpha` calls `helper`;
+/// `gamma` calls nothing.
+const RENAMEABLE_SOURCE: &str = "pub fn alpha(value: i32) -> i32 {\n    helper(value) + 1\n}\n\npub fn helper(value: i32) -> i32 {\n    value * 2\n}\n\npub fn gamma() -> i32 {\n    7\n}\n";
+
+#[test]
+fn a_unique_rename_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(RENAMEABLE_SOURCE);
+    project.index();
+    let bookmark = project.bookmark("alpha");
+    assert_eq!(
+        bookmark.resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+
+    // The symbol keeps its file and its code and takes a new name. Nothing
+    // about the old anchor tuple still matches, so only real normalized
+    // signature evidence can carry the annotation across.
+    project.write(
+        "lib.rs",
+        &RENAMEABLE_SOURCE.replace("pub fn alpha(", "pub fn renamed_alpha("),
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after rename");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique rename must rebind rather than orphan"
+    );
+    assert_eq!(
+        after[0].node_label, "renamed_alpha",
+        "the annotation must follow the symbol to its new name"
+    );
+    assert_eq!(after[0].comment.as_deref(), Some("keep"));
+}
+
+#[test]
+fn a_unique_move_rebinds_the_annotation_one_generation_later() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    // The symbol keeps its name and its code and lands in another file, at a
+    // different line. Position and file both changed.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "// a new leading comment\npub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after move");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound,
+        "a unique move must rebind rather than orphan"
+    );
+    assert!(
+        after[0]
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("moved.rs")),
+        "the annotation must follow the symbol to its new file: {:?}",
+        after[0].file_path
+    );
+}
+
+#[test]
+fn a_moved_name_whose_code_changed_is_a_visible_signature_changed_orphan() {
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma() -> i32 {\n    7\n}\n",
+    );
+    project.index();
+    project.bookmark("alpha");
+
+    // The name turns up in another file, but the code there is not the code
+    // the user annotated. Sharing a name is not evidence of a move.
+    project.write("lib.rs", "pub fn gamma() -> i32 {\n    7\n}\n");
+    project.write(
+        "moved.rs",
+        "pub fn alpha(value: i32) -> i32 {\n    let doubled = gamma() + value;\n    doubled * 9\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the name reappeared elsewhere");
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned
+    );
+    assert_eq!(
+        after[0].orphan_reason,
+        Some(BookmarkOrphanReasonDto::SignatureChanged),
+        "a disagreeing shape must be reported as such, not silently rebound"
+    );
+}
+
+#[test]
+fn a_deleted_symbol_never_hands_its_annotation_to_a_same_shaped_sibling() {
+    // `alpha` and `gamma` have the same normalized signature, which is exactly
+    // what a shape hash is allowed to do. Deleting `alpha` leaves `gamma` as
+    // the sole same-shaped candidate in the file, so a rename probe that only
+    // asked "is there exactly one" would hand the annotation to `gamma`.
+    let project = AnnotationProject::open(
+        "pub fn alpha(value: i32) -> i32 {\n    value * 3 + 1\n}\n\npub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+    let bookmark = project.bookmark("alpha");
+
+    project.write(
+        "lib.rs",
+        "pub fn gamma(value: i32) -> i32 {\n    value * 4 + 2\n}\n",
+    );
+    project.index();
+
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after deletion");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, bookmark.id);
+    assert_eq!(
+        after[0].resolution_status,
+        BookmarkResolutionStatusDto::Orphaned,
+        "a surviving same-shaped sibling must never inherit the annotation"
+    );
+    assert_ne!(after[0].node_label, "gamma");
+}
+
+#[test]
+fn a_partially_completed_cutover_still_reports_every_annotation() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert_eq!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("pre-cutover read")
+            .len(),
+        1
+    );
+
+    // The cutover creates and binds the sidecar first and imports afterwards.
+    // Anything that fails in between — a backup write onto a full disk, an
+    // unreadable core, a process kill — leaves exactly this state: a schema'd,
+    // bound, empty sidecar sitting on top of intact legacy rows.
+    {
+        let root = project.root.clone();
+        let token = codestory_workspace::workspace_path_identity_token(&root)
+            .expect("observe the native root");
+        let partial = codestory_store::AnnotationStore::open_for_write(
+            &project.sidecar_path(),
+            &codestory_store::NativeRootBinding::new(token, root),
+        )
+        .expect("create the sidecar without importing");
+        assert!(
+            !partial.core_import_completed().expect("journal"),
+            "the import must not have completed"
+        );
+    }
+    assert!(project.sidecar_path().is_file());
+
+    let during = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read during a partial cutover");
+    assert_eq!(
+        during.len(),
+        1,
+        "an unfinished cutover must not hide annotations that core still owns"
+    );
+    assert_eq!(during[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        project
+            .controller
+            .list_bookmark_categories()
+            .expect("categories during a partial cutover")
+            .len(),
+        1
+    );
+
+    // Finishing the cutover moves the same annotation across exactly once.
+    project
+        .controller
+        .create_bookmark_category(CreateBookmarkCategoryRequest {
+            name: "Favorites".to_string(),
+        })
+        .expect("finish the cutover");
+    let after = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the cutover finished");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].comment.as_deref(), Some("legacy note"));
+}
+
+#[test]
+fn the_asynchronous_refresh_entry_point_also_rescues_legacy_annotations() {
+    // `start_indexing` is public on the controller and re-exported on both
+    // index-service facades. It publishes a from-scratch database, so it has
+    // to move annotations out of core first, exactly like its blocking
+    // sibling.
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+    assert!(!project.sidecar_path().exists());
+
+    project.index_async();
+
+    let surviving = project
+        .controller
+        .list_bookmarks(None)
+        .expect("read after the asynchronous full refresh");
+    assert_eq!(
+        surviving.len(),
+        1,
+        "an asynchronous full refresh must not be able to destroy user annotations"
+    );
+    assert_eq!(surviving[0].comment.as_deref(), Some("legacy note"));
+    assert_eq!(
+        surviving[0].resolution_status,
+        BookmarkResolutionStatusDto::Bound
+    );
+}
+
+#[test]
+fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() {
+    let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
+    project.index();
+    project.seed_legacy_bookmark("alpha", "legacy note");
+
+    // The id a caller holds is the one the last read handed it, and that read
+    // happened before any write triggered the cutover.
+    let listed = project
+        .controller
+        .list_bookmarks(None)
+        .expect("pre-cutover read");
+    assert_eq!(listed.len(), 1);
+    let id = listed[0].id.clone();
+
+    let updated = project
+        .controller
+        .update_bookmark(
+            &id,
+            UpdateBookmarkRequest {
+                category_id: None,
+                comment: Some(Some("edited".to_string())),
+            },
+        )
+        .expect("the id the API just returned must stay usable");
+    assert_eq!(updated.comment.as_deref(), Some("edited"));
+
+    project
+        .controller
+        .delete_bookmark(&id)
+        .expect("the id the API just returned must stay usable");
+    assert!(
+        project
+            .controller
+            .list_bookmarks(None)
+            .expect("read after delete")
+            .is_empty()
+    );
 }
