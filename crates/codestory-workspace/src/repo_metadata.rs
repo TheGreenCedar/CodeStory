@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 thread_local! {
     static OBSERVATION_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static OBSERVATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_TREE_TRAVERSAL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -23,6 +24,8 @@ thread_local! {
     static BEFORE_GIX_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static BEFORE_LOCAL_CONFIG_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_BOUNDED_IDENTITY_CAPTURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -50,6 +53,22 @@ fn run_before_local_config_open_hook() {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();
         }
+    });
+}
+
+#[cfg(test)]
+fn run_after_bounded_identity_capture_hook() {
+    AFTER_BOUNDED_IDENTITY_CAPTURE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_bounded_identity_capture_hook_for_test(hook: impl FnOnce() + 'static) {
+    AFTER_BOUNDED_IDENTITY_CAPTURE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
 
@@ -147,6 +166,83 @@ pub fn read_repository_metadata(project_root: &Path) -> RepositoryMetadata {
     reader.metadata()
 }
 
+/// One bounded repeated-admission observation. The repository instance uses
+/// only native identities for the resolved gitdir and common-dir directories.
+pub(crate) enum BoundedRepositoryIdentityObservation {
+    Absent,
+    Present {
+        remote_url: Option<String>,
+        git_dir_identity: crate::repository_identity::WorkspacePathIdentity,
+        common_dir_identity: crate::repository_identity::WorkspacePathIdentity,
+    },
+}
+
+/// Read only `.git`/`commondir`, local config bytes, and the native identities
+/// of the two resolved metadata roots. Includes are never followed. This path
+/// deliberately does not open a gix repository or inspect HEAD, the index,
+/// status, refs, objects, alternates, tracked paths, or nested metadata trees.
+pub(crate) fn observe_bounded_repository_identity(
+    project_root: &Path,
+) -> Result<BoundedRepositoryIdentityObservation> {
+    let root = canonical_existing(project_root)
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let dot_git = root.join(".git");
+    match fs::symlink_metadata(&dot_git) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            run_after_bounded_identity_capture_hook();
+            return match fs::symlink_metadata(&dot_git) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(BoundedRepositoryIdentityObservation::Absent)
+                }
+                _ => bail!("repository .git entry changed during bounded identity observation"),
+            };
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", dot_git.display()));
+        }
+    }
+
+    let captured = MetadataRoots::resolve(&root)?;
+    captured.validate_configured_worktree()?;
+    let remote_url = captured.remote_url()?;
+    let git_dir_identity = crate::repository_identity::workspace_path_identity(&captured.git_dir)
+        .context("observe repository gitdir native identity")?;
+    let common_dir_identity =
+        crate::repository_identity::workspace_path_identity(&captured.common_dir)
+            .context("observe repository common-dir native identity")?;
+
+    #[cfg(test)]
+    run_after_bounded_identity_capture_hook();
+
+    let current = MetadataRoots::resolve(&root)
+        .map_err(|_| anyhow!("repository metadata changed during bounded identity observation"))?;
+    current
+        .validate_configured_worktree()
+        .map_err(|_| anyhow!("repository metadata changed during bounded identity observation"))?;
+    if current != captured {
+        bail!("repository pointer or local config changed during bounded identity observation");
+    }
+    let current_git_dir_identity =
+        crate::repository_identity::workspace_path_identity(&current.git_dir)
+            .context("revalidate repository gitdir native identity")?;
+    let current_common_dir_identity =
+        crate::repository_identity::workspace_path_identity(&current.common_dir)
+            .context("revalidate repository common-dir native identity")?;
+    if current_git_dir_identity != git_dir_identity
+        || current_common_dir_identity != common_dir_identity
+    {
+        bail!("repository metadata root identity changed during bounded identity observation");
+    }
+
+    Ok(BoundedRepositoryIdentityObservation::Present {
+        remote_url,
+        git_dir_identity,
+        common_dir_identity,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn record_repository_metadata_observation() {
     OBSERVATION_LIMIT.with(|limit| {
@@ -190,6 +286,32 @@ pub fn with_repository_metadata_observation_limit_for_test<T>(
         previous_count,
     };
     task()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn record_repository_metadata_tree_traversal() {
+    METADATA_TREE_TRAVERSAL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Run test support with an isolated counter for metadata-directory walks.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_repository_metadata_tree_traversal_count_for_test<T>(
+    task: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Reset(usize);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            METADATA_TREE_TRAVERSAL_COUNT.with(|count| count.set(self.0));
+        }
+    }
+
+    let previous = METADATA_TREE_TRAVERSAL_COUNT.with(|count| count.replace(0));
+    let reset = Reset(previous);
+    let result = task();
+    let observed = METADATA_TREE_TRAVERSAL_COUNT.with(std::cell::Cell::get);
+    drop(reset);
+    (result, observed)
 }
 
 /// Read changed paths without invoking the Git executable.
@@ -561,7 +683,7 @@ fn change_from_index_worktree(
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct MetadataRoots {
     root: PathBuf,
     git_dir: PathBuf,
@@ -571,7 +693,7 @@ struct MetadataRoots {
     local_configs: Vec<MetadataConfigFile>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct MetadataPointer {
     path: PathBuf,
     expected_contents: Vec<u8>,
@@ -589,7 +711,7 @@ impl MetadataPointer {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct MetadataConfigFile {
     path: PathBuf,
     expected_contents: Option<Vec<u8>>,
@@ -623,10 +745,20 @@ impl MetadataConfigFile {
     }
 
     fn configured_worktree(&self) -> Result<Option<PathBuf>> {
+        let Some(config) = self.parsed()? else {
+            return Ok(None);
+        };
+        config
+            .string("core.worktree")
+            .map(|value| bytes_to_path(value.as_ref()))
+            .transpose()
+    }
+
+    fn parsed(&self) -> Result<Option<gix::config::File>> {
         let Some(contents) = self.expected_contents.as_deref() else {
             return Ok(None);
         };
-        let config = gix::config::File::from_bytes_no_includes(
+        gix::config::File::from_bytes_no_includes(
             contents,
             gix::config::file::Metadata::default(),
             gix::config::file::init::Options {
@@ -634,11 +766,8 @@ impl MetadataConfigFile {
                 ..Default::default()
             },
         )
-        .with_context(|| format!("parse repository local config {}", self.path.display()))?;
-        config
-            .string("core.worktree")
-            .map(|value| bytes_to_path(value.as_ref()))
-            .transpose()
+        .with_context(|| format!("parse repository local config {}", self.path.display()))
+        .map(Some)
     }
 }
 
@@ -667,6 +796,13 @@ struct MetadataDirectoryFingerprint {
     creation_time: u64,
     #[cfg(windows)]
     last_write_time: u64,
+}
+
+fn configured_origin_url(config: &gix::config::File) -> Option<String> {
+    config
+        .string("remote.origin.url")
+        .map(|value| String::from_utf8_lossy(value.as_ref()).trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 impl MetadataRoots {
@@ -722,7 +858,13 @@ impl MetadataRoots {
         }
 
         let commondir_path = git_dir.join("commondir");
-        let commondir_metadata = fs::symlink_metadata(&commondir_path).ok();
+        let commondir_metadata = match fs::symlink_metadata(&commondir_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", commondir_path.display()));
+            }
+        };
         let (common_dir, common_dir_pointer) = if let Some(metadata) = commondir_metadata {
             if metadata.file_type().is_symlink() {
                 bail!("repository commondir pointer must not be a symlink");
@@ -779,6 +921,35 @@ impl MetadataRoots {
             common_dir_pointer,
             local_configs,
         })
+    }
+
+    fn remote_url(&self) -> Result<Option<String>> {
+        let common_config = self
+            .local_config(&self.common_dir.join("config"))
+            .context("captured repository common config is missing")?
+            .parsed()?;
+        let mut remote_url = common_config.as_ref().and_then(configured_origin_url);
+        let worktree_config_enabled = match common_config.as_ref() {
+            Some(config) => config
+                .boolean("extensions.worktreeConfig")
+                .context("parse extensions.worktreeConfig from repository local config")?
+                .unwrap_or(false),
+            None => false,
+        };
+        if worktree_config_enabled
+            && let Some(worktree_config) = self
+                .local_config(&self.git_dir.join("config.worktree"))
+                .context("captured repository worktree config is missing")?
+                .parsed()?
+            && let Some(worktree_remote_url) = configured_origin_url(&worktree_config)
+        {
+            remote_url = Some(worktree_remote_url);
+        }
+        Ok(remote_url)
+    }
+
+    fn local_config(&self, path: &Path) -> Option<&MetadataConfigFile> {
+        self.local_configs.iter().find(|config| config.path == path)
     }
 
     fn validate_configured_worktree(&self) -> Result<()> {
@@ -1089,6 +1260,8 @@ fn reject_nested_metadata_symlinks(
 
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        #[cfg(any(test, feature = "test-support"))]
+        record_repository_metadata_tree_traversal();
         for entry in fs::read_dir(&directory).with_context(|| {
             format!("read repository metadata directory {}", directory.display())
         })? {
@@ -1116,6 +1289,8 @@ fn reject_nested_metadata_symlinks(
 }
 
 fn reject_shared_index_symlinks(git_dir: &Path) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    record_repository_metadata_tree_traversal();
     for entry in fs::read_dir(git_dir)
         .with_context(|| format!("read repository gitdir {}", git_dir.display()))?
     {

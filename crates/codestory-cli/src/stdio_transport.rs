@@ -642,30 +642,37 @@ impl StdioServerSession {
         }
         let project_root = crate::runtime::canonicalize_project_root(Path::new(project))
             .map_err(|error| anyhow::anyhow!("project_unavailable: {error}"))?;
-        if !self.project_required
-            && self.active_project.as_ref().is_some_and(|active| {
-                codestory_workspace::same_workspace_path(
-                    &active.runtime.project_root,
-                    &project_root,
-                )
-            })
-        {
-            return Ok(());
-        }
+        let active_same_root = self.active_project.as_ref().filter(|active| {
+            codestory_workspace::same_workspace_path(&active.runtime.project_root, &project_root)
+        });
         let workspace_id = codestory_workspace::workspace_id_v3_for_root(&project_root);
-        let cache_dir = self
-            .startup
-            .stdio_cache_root
-            .as_ref()
-            .cloned()
-            .map(|root| root.join(&workspace_id));
-        let candidate = RuntimeContext::new_agent_sidecar_with_startup(
-            &args::ProjectArgs {
-                project: project_root.clone(),
-                cache_dir,
-            },
-            &self.startup,
-        )?;
+        let cache_dir = active_same_root
+            .filter(|_| !self.project_required)
+            .map(|active| active.runtime.cache_root.clone())
+            .or_else(|| {
+                self.startup
+                    .stdio_cache_root
+                    .as_ref()
+                    .map(|root| root.join(&workspace_id))
+            });
+        let args = args::ProjectArgs {
+            project: project_root.clone(),
+            cache_dir,
+        };
+        if let Some(active) = active_same_root {
+            let candidate_key = RuntimeContext::agent_sidecar_context_key_with_startup(
+                &args,
+                &self.startup,
+                &active.runtime,
+            )?;
+            if candidate_key
+                .as_ref()
+                .is_some_and(|candidate| active.runtime.context_key == *candidate)
+            {
+                return Ok(());
+            }
+        }
+        let candidate = RuntimeContext::new_agent_sidecar_with_startup(&args, &self.startup)?;
         if self
             .active_project
             .as_ref()
@@ -7673,7 +7680,7 @@ version = "0.11.20"
     }
 
     #[test]
-    fn multi_project_session_keys_same_path_by_runtime_configuration() {
+    fn multi_project_session_skips_context_construction_until_configuration_changes() {
         let cache = tempfile::tempdir().expect("cache");
         let project = tempfile::tempdir().expect("project");
         let config_path = project.path().join(".codestory.toml");
@@ -7699,6 +7706,16 @@ version = "0.11.20"
             .runtime
             .context_key
             .clone();
+        let constructions = crate::runtime::runtime_context_construction_count_for_test();
+
+        session
+            .select_project(project.path().join(".").to_str())
+            .expect("reselect unchanged active project through alias");
+        assert_eq!(
+            crate::runtime::runtime_context_construction_count_for_test(),
+            constructions,
+            "same unchanged active project must return before constructing another runtime context"
+        );
 
         std::fs::write(&config_path, "semantic_doc_scope = \"all\"\n")
             .expect("write changed config");
@@ -7713,6 +7730,11 @@ version = "0.11.20"
             .context_key
             .clone();
         assert_ne!(default_key, changed_key);
+        assert_eq!(
+            crate::runtime::runtime_context_construction_count_for_test(),
+            constructions + 1,
+            "configuration drift must construct exactly one replacement runtime context"
+        );
         assert!(
             session
                 .retained_projects
@@ -7732,6 +7754,480 @@ version = "0.11.20"
                 .runtime
                 .context_key,
             default_key
+        );
+    }
+
+    #[test]
+    fn multi_project_session_replaces_same_root_once_when_remote_changes() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/team/repository-a.git",
+        ]);
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+
+        codestory_workspace::with_repository_metadata_observation_limit_for_test(2, || {
+            session
+                .select_project(project.path().to_str())
+                .expect("select remote A");
+            let remote_a = session
+                .active_project
+                .as_ref()
+                .expect("remote A active")
+                .runtime
+                .context_key
+                .clone();
+            let constructions = crate::runtime::runtime_context_construction_count_for_test();
+
+            git(&[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/team/repository-b.git",
+            ]);
+            session
+                .select_project(project.path().to_str())
+                .expect("select remote B");
+            let remote_b = session
+                .active_project
+                .as_ref()
+                .expect("remote B active")
+                .runtime
+                .context_key
+                .clone();
+            assert_eq!(remote_a.workspace_id, remote_b.workspace_id);
+            assert_ne!(remote_a.project_id, remote_b.project_id);
+            assert_eq!(remote_a.repository_instance, remote_b.repository_instance);
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1,
+                "logical identity drift must construct exactly one replacement context"
+            );
+            assert!(session.retained_projects.iter().any(|retained| {
+                retained.runtime.context_key.project_id == remote_a.project_id
+            }));
+
+            session
+                .select_project(project.path().join(".").to_str())
+                .expect("reselect unchanged remote B");
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1,
+                "the replacement context must be reused after logical identity converges"
+            );
+        });
+
+        let active = session.active_project.as_ref().expect("replacement active");
+        let activation = active.runtime.activation.clone();
+        let _ = activation.activate_project_with_foreground_budget(
+            &active.runtime.project_root,
+            &active.runtime.storage_path,
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            activation
+                .snapshot()
+                .expect("replacement activation")
+                .attempt,
+            1
+        );
+        activation.cancel_and_wait();
+    }
+
+    #[test]
+    fn multi_project_session_replaces_same_root_once_after_reinit_without_remote() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/team/repository-a.git",
+        ]);
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+
+        codestory_workspace::with_repository_metadata_observation_limit_for_test(2, || {
+            session
+                .select_project(project.path().to_str())
+                .expect("select original repository");
+            let original = session
+                .active_project
+                .as_ref()
+                .expect("original active")
+                .runtime
+                .context_key
+                .clone();
+            let constructions = crate::runtime::runtime_context_construction_count_for_test();
+
+            std::fs::rename(
+                project.path().join(".git"),
+                project.path().join(".git-retired"),
+            )
+            .expect("retire original repository metadata");
+            git(&["init", "-q"]);
+            session
+                .select_project(project.path().to_str())
+                .expect("select reinitialized repository");
+            let reinitialized = session
+                .active_project
+                .as_ref()
+                .expect("reinitialized active")
+                .runtime
+                .context_key
+                .clone();
+            assert_eq!(original.workspace_id, reinitialized.workspace_id);
+            assert_ne!(original.project_id, reinitialized.project_id);
+            assert_eq!(reinitialized.project_id, reinitialized.workspace_id);
+            assert_ne!(
+                original.repository_instance,
+                reinitialized.repository_instance
+            );
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1,
+                "reinit must construct exactly one no-remote replacement context"
+            );
+
+            session
+                .select_project(project.path().to_str())
+                .expect("reselect unchanged reinitialized repository");
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1
+            );
+        });
+    }
+
+    #[test]
+    fn multi_project_session_replaces_same_root_once_after_same_remote_reinit() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/team/repository-a.git",
+        ]);
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+
+        codestory_workspace::with_repository_metadata_observation_limit_for_test(2, || {
+            session
+                .select_project(project.path().to_str())
+                .expect("select original repository instance");
+            let original = session
+                .active_project
+                .as_ref()
+                .expect("original active")
+                .runtime
+                .context_key
+                .clone();
+            let constructions = crate::runtime::runtime_context_construction_count_for_test();
+
+            std::fs::rename(
+                project.path().join(".git"),
+                project.path().join(".git-retired"),
+            )
+            .expect("retire original repository metadata");
+            git(&["init", "-q"]);
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/team/repository-a.git",
+            ]);
+            session
+                .select_project(project.path().to_str())
+                .expect("select recreated repository instance");
+            let recreated = session
+                .active_project
+                .as_ref()
+                .expect("recreated active")
+                .runtime
+                .context_key
+                .clone();
+            assert_eq!(original.project_id, recreated.project_id);
+            assert_eq!(original.workspace_id, recreated.workspace_id);
+            assert_ne!(original.repository_instance, recreated.repository_instance);
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1,
+                "same-remote metadata recreation must construct exactly one replacement context"
+            );
+
+            session
+                .select_project(project.path().to_str())
+                .expect("reselect stable recreated repository");
+            assert_eq!(
+                crate::runtime::runtime_context_construction_count_for_test(),
+                constructions + 1
+            );
+        });
+    }
+
+    #[test]
+    fn ready_lease_reuses_one_runtime_across_packet_then_search_without_preparation() {
+        fn call_until_ready(
+            session: &mut StdioServerSession,
+            name: &str,
+            arguments: serde_json::Value,
+            id_prefix: &str,
+        ) -> serde_json::Value {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            for attempt in 0..20 {
+                let id = format!("{id_prefix}-{attempt}");
+                let response = handle_stdio_message(
+                    session,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments.clone()}
+                    })
+                    .to_string(),
+                    &Arc::new(AtomicBool::new(false)),
+                )
+                .expect("tool response");
+                if response.pointer("/result/isError") != Some(&json!(true)) {
+                    assert!(response.pointer("/result/structuredContent").is_some());
+                    return response;
+                }
+                let error = &response["result"]["structuredContent"];
+                assert_eq!(
+                    error["code"],
+                    json!("codestory_preparing"),
+                    "ready-lease fixture must converge instead of becoming unavailable: {response}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "broad call did not become ready: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(
+                    error["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                ));
+            }
+            panic!("broad call did not converge within the bounded retry count")
+        }
+
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("metadata.rs"),
+            "// READY_LEASE_STDIO_ANCHOR\n",
+        )
+        .expect("write zero-dense stdio fixture");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run ready-lease git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "codestory-tests@example.com"]);
+        git(&["config", "user.name", "CodeStory Tests"]);
+        git(&["add", "metadata.rs"]);
+        git(&["commit", "-qm", "ready lease fixture"]);
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select ready-lease project");
+        let active = session.active_project.as_ref().expect("active project");
+        active
+            .runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish ready-lease core");
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &active.runtime.project_root,
+            &active.runtime.storage_path,
+            &active.runtime.sidecar,
+        )
+        .expect("publish strict zero-dense retrieval fixture");
+        active
+            .runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
+        let context_constructions = crate::runtime::runtime_context_construction_count_for_test();
+
+        let initialized = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "init-ready-lease-reuse",
+                "method": "initialize",
+                "params": {}
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("initialize response");
+        assert!(initialized.get("result").is_some());
+
+        let project_argument = project.path().to_string_lossy().to_string();
+        let packet = call_until_ready(
+            &mut session,
+            "packet",
+            json!({
+                "project": project_argument,
+                "question": "Where is READY_LEASE_STDIO_ANCHOR?"
+            }),
+            "ready-lease-packet",
+        );
+        let packet_publication = packet["result"]["_meta"]["codestory_publication"].clone();
+        assert!(packet_publication["core_publication"].is_object());
+        assert!(packet_publication["retrieval_publication"].is_object());
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("active ready project")
+            .runtime
+            .activation
+            .clone();
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (1, 1),
+            "the first broad call must prepare native embedding and finalize retrieval exactly once"
+        );
+        assert_eq!(
+            crate::runtime::runtime_context_construction_count_for_test(),
+            context_constructions,
+            "packet activation must retain the selected runtime context"
+        );
+        let before_warm_admission = activation.snapshot().expect("ready activation snapshot");
+        let storage_path = session
+            .active_project
+            .as_ref()
+            .expect("active ready project")
+            .runtime
+            .storage_path
+            .clone();
+        let (warm_admission, metadata_tree_traversals) =
+            codestory_workspace::with_repository_metadata_tree_traversal_count_for_test(|| {
+                activation
+                    .activate_project(
+                        project.path(),
+                        &storage_path,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .expect("warm ready lease admission")
+            });
+        assert_eq!(metadata_tree_traversals, 0);
+        assert_eq!(warm_admission.snapshot, before_warm_admission);
+        let (_, full_observation_traversals) =
+            codestory_workspace::with_repository_metadata_tree_traversal_count_for_test(|| {
+                codestory_workspace::project_identity_v3(project.path())
+            });
+        assert!(
+            full_observation_traversals > 0,
+            "the warm-admission zero-traversal counter needs an armed full-observation control"
+        );
+        activation.arm_preparation_seams_for_test();
+
+        // Public search performs its own source/freshness proof and deliberately
+        // stays outside the warm-admission traversal counter.
+        let search = call_until_ready(
+            &mut session,
+            "search",
+            json!({
+                "project": project.path(),
+                "query": "READY_LEASE_STDIO_ANCHOR"
+            }),
+            "ready-lease-search",
+        );
+        let search_publication = search["result"]["_meta"]["codestory_publication"].clone();
+        assert_eq!(
+            search_publication["core_publication"], packet_publication["core_publication"],
+            "ready reuse must retain one complete core identity"
+        );
+        assert_eq!(
+            search_publication["retrieval_publication"],
+            packet_publication["retrieval_publication"],
+            "ready reuse must retain one retrieval generation and producer identity"
+        );
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (1, 1),
+            "the second broad tool must not reach either armed preparation seam"
+        );
+        assert_eq!(
+            crate::runtime::runtime_context_construction_count_for_test(),
+            context_constructions,
+            "the second broad tool must not construct another runtime context"
         );
     }
 

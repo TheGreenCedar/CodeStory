@@ -17,6 +17,33 @@ use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::path::Path;
 
+/// Stable live engine fields that make a ready retrieval publication
+/// admissible for reuse without starting or reloading the native worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyEmbeddingEngineIdentity {
+    pub instance_id: String,
+    pub load_generation: u64,
+    pub model_load_count: u64,
+    pub model_digest: String,
+    pub ggml_build_identity: String,
+    pub backend: String,
+    pub adapter_name: String,
+    pub policy: String,
+    pub execution_device_names: Vec<String>,
+    pub execution_backend_names: Vec<String>,
+    pub accelerator_execution_verified: bool,
+}
+
+/// Bounded retrieval pointer and producer observation retained by runtime
+/// activation. Artifact contents remain protected by pinned reader admission;
+/// this identity only decides whether activation itself can be skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyRetrievalIdentity {
+    pub manifest: codestory_store::RetrievalIndexManifest,
+    pub producer_compatibility_identity: String,
+    pub engine: Option<ReadyEmbeddingEngineIdentity>,
+}
+
 /// Observe retrieval-generation health for the selected project.
 pub fn sidecar_status(
     project_root: &Path,
@@ -61,6 +88,87 @@ pub fn strict_sidecar_status_for_runtime(
     runtime: SidecarRuntimeConfig,
 ) -> Result<RetrievalStatusReport> {
     status_with_runtime(project_root, storage_path, true, runtime)
+}
+
+/// Observe the current retrieval publication, producer, and live engine
+/// identities without finalizing a generation, loading a model, or validating
+/// every immutable artifact row.
+///
+/// The initial lease is captured only after strict readiness succeeds. Repeat
+/// activation uses [`observe_ready_retrieval_identity_for_project_id`] with
+/// the retained manifest owner; the pinned query boundary still performs deep
+/// artifact validation before serving.
+pub fn ready_retrieval_identity_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Option<ReadyRetrievalIdentity>> {
+    if !storage_path.is_file() {
+        return Ok(None);
+    }
+    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
+    observe_ready_retrieval_identity_for_project_id(storage_path, runtime, &project_id)
+}
+
+/// Observe a retained ready lease by its already-validated manifest project id.
+///
+/// This is the warm-admission boundary: it reads only the exact observational
+/// manifest row plus in-memory producer/live-engine identity. It accepts no
+/// project root and therefore cannot re-enter repository identity, source
+/// freshness, or mutable Git state. Initial activation and lease capture must
+/// continue to use [`ready_retrieval_identity_for_runtime`].
+pub fn observe_ready_retrieval_identity_for_project_id(
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    project_id: &str,
+) -> Result<Option<ReadyRetrievalIdentity>> {
+    if !storage_path.is_file() {
+        return Ok(None);
+    }
+    let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(runtime);
+    if !embedding_snapshot.probe.reachable || !embedding_snapshot.device.full_retrieval_allowed {
+        return Ok(None);
+    }
+    #[cfg(not(feature = "test-support"))]
+    if embedding_snapshot.identity.is_none() {
+        return Ok(None);
+    }
+
+    let producer_compatibility_identity =
+        crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_snapshot.device,
+            embedding_snapshot.identity.as_ref(),
+            u32::try_from(crate::embeddings::semantic_vector_dim())
+                .context("embedding dimension exceeds ready-lease contract")?,
+        )?;
+    let storage = Store::open_observational(storage_path)
+        .context("open storage observationally for ready retrieval identity")?;
+    let Some(manifest) = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load retrieval manifest for ready retrieval identity")?
+    else {
+        return Ok(None);
+    };
+    let engine = embedding_snapshot
+        .identity
+        .map(|identity| ReadyEmbeddingEngineIdentity {
+            instance_id: identity.instance_id,
+            load_generation: identity.load_generation,
+            model_load_count: identity.model_load_count,
+            model_digest: identity.model_digest.to_string(),
+            ggml_build_identity: identity.ggml_build_identity.to_string(),
+            backend: identity.backend,
+            adapter_name: identity.adapter_name,
+            policy: identity.policy.to_string(),
+            execution_device_names: identity.execution_device_names,
+            execution_backend_names: identity.execution_backend_names,
+            accelerator_execution_verified: identity.accelerator_execution_verified,
+        });
+    Ok(Some(ReadyRetrievalIdentity {
+        manifest,
+        producer_compatibility_identity,
+        engine,
+    }))
 }
 
 fn status_with_runtime(

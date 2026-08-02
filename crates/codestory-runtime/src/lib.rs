@@ -16,17 +16,18 @@ use codestory_contracts::api::{
     GroundingOrientationDto, GroundingOrientationUncertaintyDto, GroundingSnapshotDto,
     GroundingSymbolDigestDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
     IndexFreshnessNotCheckedCauseDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto,
-    IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-    RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
-    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
-    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
-    TrailContextDto, WorkspaceMemberIndexDto,
+    IndexPublicationDto, IndexedFileRoleDto, IndexingPhaseTimings, NodeDetailsRequest, NodeId,
+    NodeKind, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointKindDto, RouteEndpointMetadataDto,
+    SearchHit, SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto,
+    SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto,
+    SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto,
+    SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto,
+    SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto, SearchPlanSubqueryDto,
+    SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
+    StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
+    WorkspaceMemberIndexDto,
 };
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
@@ -530,6 +531,7 @@ struct AppState {
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     search_engine: Option<SearchEngine>,
     search_publication: Option<IndexPublicationRecord>,
+    observed_core_publication: Option<IndexPublicationDto>,
     is_indexing: bool,
     index_freshness_cache: Option<CachedIndexFreshness>,
     #[cfg(test)]
@@ -543,6 +545,7 @@ fn publish_search_engine(
     publication: Option<IndexPublicationRecord>,
 ) {
     state.index_freshness_cache = None;
+    state.observed_core_publication = publication.clone().map(index_publication_dto);
     state.search_engine = Some(engine);
     state.search_publication = publication;
 }

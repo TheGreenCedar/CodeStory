@@ -132,14 +132,34 @@ impl AppController {
             ))
         })?;
 
-        {
+        let changed = {
             let mut s = self.state.lock();
+            let target_changed =
+                s.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || s.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            let core_changed = s.observed_core_publication.as_ref() != summary.publication.as_ref();
+            let resident_search_changed = s
+                .search_publication
+                .as_ref()
+                .cloned()
+                .map(index_publication_dto)
+                .is_some_and(|publication| Some(&publication) != summary.publication.as_ref());
+            let changed = target_changed || core_changed || resident_search_changed;
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
-            s.node_names.clear();
-            clear_search_engine(&mut s);
+            s.observed_core_publication = summary.publication.clone();
+            if changed {
+                s.node_names.clear();
+                clear_search_engine(&mut s);
+            }
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
         }
-        self.sidecar_query_cache.lock().clear();
 
         Ok(summary)
     }
@@ -166,6 +186,7 @@ impl AppController {
             let mut s = self.state.lock();
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
+            s.observed_core_publication = summary.publication.clone();
             s.node_names = loaded.node_names;
             publish_search_engine(&mut s, loaded.engine, loaded.publication);
         }
@@ -600,6 +621,16 @@ impl AppController {
                     "The complete core publication disappeared before search preparation.",
                 )
             })?;
+        let resident_search_is_current = {
+            let state = self.state.lock();
+            state.storage_path.as_ref().is_some_and(|current| {
+                codestory_workspace::same_workspace_path(current, &storage_path)
+            }) && state.search_engine.is_some()
+                && state.search_publication.as_ref() == Some(&expected_publication)
+        };
+        if resident_search_is_current {
+            return Ok(());
+        }
         let mut validate_before_completion =
             |prepared_publication: &IndexPublicationRecord| -> Result<(), ApiError> {
                 if cancel_token.is_cancelled() {

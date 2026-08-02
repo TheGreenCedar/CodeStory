@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static INDETERMINATE_REPOSITORY_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Lossless repository identity hashing contract available for migration.
 pub const REPOSITORY_IDENTITY_V2_SCHEMA_VERSION: u32 = 2;
@@ -30,6 +33,44 @@ enum WorkspacePathIdentityKind {
     MissingUnix(PathBuf),
     #[cfg(windows)]
     MissingWindows(Vec<u16>),
+}
+
+/// Opaque native identity for one repository metadata instance.
+///
+/// A present identity is the pair of native gitdir and common-dir identities;
+/// repository contents and mutable Git state never participate. An
+/// indeterminate observation is deliberately unique so a failed bounded probe
+/// cannot admit reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RepositoryInstanceIdentity(RepositoryInstanceIdentityKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RepositoryInstanceIdentityKind {
+    Absent,
+    Present {
+        git_dir: WorkspacePathIdentity,
+        common_dir: WorkspacePathIdentity,
+    },
+    Indeterminate(u64),
+}
+
+impl RepositoryInstanceIdentity {
+    fn absent() -> Self {
+        Self(RepositoryInstanceIdentityKind::Absent)
+    }
+
+    fn present(git_dir: WorkspacePathIdentity, common_dir: WorkspacePathIdentity) -> Self {
+        Self(RepositoryInstanceIdentityKind::Present {
+            git_dir,
+            common_dir,
+        })
+    }
+
+    fn indeterminate() -> Self {
+        Self(RepositoryInstanceIdentityKind::Indeterminate(
+            INDETERMINATE_REPOSITORY_OBSERVATION_ID.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
 }
 
 /// Operation-scoped platform-lexical path spelling for containment checks.
@@ -104,6 +145,18 @@ pub struct ProjectIdentityV3 {
     pub portable_reuse_reason: String,
 }
 
+/// Bounded logical identity used on repeated same-root admissions.
+///
+/// This intentionally carries only the remote-derived project id and the
+/// native-root workspace id. It never observes HEAD, dirtiness, tracked paths,
+/// or artifact portability.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LogicalProjectIdentityV3 {
+    pub project_id: String,
+    pub workspace_id: String,
+    pub repository_instance: RepositoryInstanceIdentity,
+}
+
 /// Inspect the lossless repository identity without migrating current consumers.
 pub fn inspect_repository_identity_v2(project_root: &Path) -> RepositoryIdentityV2 {
     let metadata = crate::read_repository_metadata(project_root);
@@ -141,6 +194,41 @@ pub fn inspect_repository_identity_v2(project_root: &Path) -> RepositoryIdentity
 pub fn project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
     let repository_identity = inspect_repository_identity_v2(project_root);
     project_identity_v3_from_repository(project_root, &repository_identity)
+}
+
+/// Observe logical repository ownership without executing Git or scanning the
+/// repository contents. An absent, invalid, or unreadable remote fails closed
+/// to the native workspace identity. The irreducible blind spot is an in-place
+/// metadata replacement that preserves both native gitdir/common-dir identities
+/// and the exact local remote bytes; no bounded filesystem observation can
+/// distinguish that event without reading mutable repository state.
+pub fn observe_logical_project_identity_v3(project_root: &Path) -> LogicalProjectIdentityV3 {
+    let workspace_id = workspace_id_v3_for_root(project_root);
+    let (remote_url, repository_instance) =
+        match crate::repo_metadata::observe_bounded_repository_identity(project_root) {
+            Ok(crate::repo_metadata::BoundedRepositoryIdentityObservation::Absent) => {
+                (None, RepositoryInstanceIdentity::absent())
+            }
+            Ok(crate::repo_metadata::BoundedRepositoryIdentityObservation::Present {
+                remote_url,
+                git_dir_identity,
+                common_dir_identity,
+            }) => (
+                remote_url,
+                RepositoryInstanceIdentity::present(git_dir_identity, common_dir_identity),
+            ),
+            Err(_) => (None, RepositoryInstanceIdentity::indeterminate()),
+        };
+    let project_id = remote_url
+        .as_deref()
+        .and_then(parse_repository_identity_v2)
+        .map(|identity| canonical_repository_id_v2(&identity.canonical))
+        .unwrap_or_else(|| workspace_id.clone());
+    LogicalProjectIdentityV3 {
+        project_id,
+        workspace_id,
+        repository_instance,
+    }
 }
 
 /// Resolve the lossless V3 identity from an existing Git observation.
@@ -1080,6 +1168,199 @@ mod tests {
         assert_eq!(clean.workspace_id, dirty.workspace_id);
         assert!(clean.portable_reuse_eligible);
         assert!(!dirty.portable_reuse_eligible);
+    }
+
+    #[test]
+    fn bounded_logical_identity_never_walks_metadata_and_ignores_dirty_or_commit_state() {
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let ((clean, dirty, committed, remote_b), traversals) =
+            crate::with_repository_metadata_tree_traversal_count_for_test(|| {
+                let clean = observe_logical_project_identity_v3(project.path());
+                fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n")
+                    .expect("dirty source");
+                let dirty = observe_logical_project_identity_v3(project.path());
+                git(project.path(), &["add", "lib.rs"]);
+                git(project.path(), &["commit", "-m", "bounded identity commit"]);
+                let committed = observe_logical_project_identity_v3(project.path());
+                git(
+                    project.path(),
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://example.com/team/repository-b.git",
+                    ],
+                );
+                let remote_b = observe_logical_project_identity_v3(project.path());
+                (clean, dirty, committed, remote_b)
+            });
+
+        assert_eq!(traversals, 0, "bounded admission walked Git metadata");
+        assert_eq!(clean.project_id, dirty.project_id);
+        assert_eq!(dirty.project_id, committed.project_id);
+        assert_ne!(committed.project_id, remote_b.project_id);
+        assert_eq!(clean.repository_instance, dirty.repository_instance);
+        assert_eq!(dirty.repository_instance, committed.repository_instance);
+        assert_eq!(committed.repository_instance, remote_b.repository_instance);
+        let (_, full_observation_traversals) =
+            crate::with_repository_metadata_tree_traversal_count_for_test(|| {
+                crate::read_repository_metadata(project.path())
+            });
+        assert!(
+            full_observation_traversals > 0,
+            "the zero-traversal assertion needs an armed positive control"
+        );
+    }
+
+    #[test]
+    fn bounded_logical_identity_tracks_no_remote_metadata_recreation() {
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let remote = observe_logical_project_identity_v3(project.path());
+        fs::rename(
+            project.path().join(".git"),
+            project.path().join(".git-retired"),
+        )
+        .expect("retire original repository metadata");
+        git(project.path(), &["init"]);
+        let no_remote = observe_logical_project_identity_v3(project.path());
+
+        assert_eq!(remote.workspace_id, no_remote.workspace_id);
+        assert_ne!(remote.project_id, no_remote.project_id);
+        assert_eq!(no_remote.project_id, no_remote.workspace_id);
+        assert_ne!(remote.repository_instance, no_remote.repository_instance);
+    }
+
+    #[test]
+    fn bounded_logical_identity_tracks_same_remote_metadata_recreation() {
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let original = observe_logical_project_identity_v3(project.path());
+        fs::rename(
+            project.path().join(".git"),
+            project.path().join(".git-retired"),
+        )
+        .expect("retire original repository metadata");
+        git(project.path(), &["init"]);
+        git(
+            project.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/TheGreenCedar/CodeStory.git",
+            ],
+        );
+        let recreated = observe_logical_project_identity_v3(project.path());
+
+        assert_eq!(original.project_id, recreated.project_id);
+        assert_eq!(original.workspace_id, recreated.workspace_id);
+        assert_ne!(original.repository_instance, recreated.repository_instance);
+    }
+
+    #[test]
+    fn bounded_logical_identity_fails_closed_on_local_config_toctou() {
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let original = observe_logical_project_identity_v3(project.path());
+        let config = project.path().join(".git/config");
+        crate::repo_metadata::set_after_bounded_identity_capture_hook_for_test(move || {
+            let contents = fs::read_to_string(&config).expect("read captured local config");
+            fs::write(
+                &config,
+                contents.replace(
+                    "https://github.com/TheGreenCedar/CodeStory.git",
+                    "https://example.com/team/repository-b.git",
+                ),
+            )
+            .expect("replace local config after bounded capture");
+        });
+        let raced = observe_logical_project_identity_v3(project.path());
+        let stable_replacement = observe_logical_project_identity_v3(project.path());
+
+        assert_eq!(raced.project_id, raced.workspace_id);
+        assert_ne!(raced.repository_instance, original.repository_instance);
+        assert_ne!(
+            raced.repository_instance,
+            stable_replacement.repository_instance
+        );
+        assert_ne!(original.project_id, stable_replacement.project_id);
+    }
+
+    #[test]
+    fn bounded_logical_identity_fails_closed_on_native_metadata_directory_replacement() {
+        let Some(project) = git_project() else {
+            return;
+        };
+
+        let original = observe_logical_project_identity_v3(project.path());
+        let git_dir = project.path().join(".git");
+        let retired_git_dir = project.path().join(".git-captured");
+        crate::repo_metadata::set_after_bounded_identity_capture_hook_for_test(move || {
+            fs::rename(&git_dir, &retired_git_dir)
+                .expect("retire captured repository metadata directory");
+            fs::create_dir(&git_dir).expect("create replacement repository metadata directory");
+            fs::copy(retired_git_dir.join("config"), git_dir.join("config"))
+                .expect("copy identical local config into replacement metadata directory");
+        });
+        let raced = observe_logical_project_identity_v3(project.path());
+        let stable_replacement = observe_logical_project_identity_v3(project.path());
+
+        assert_eq!(raced.project_id, raced.workspace_id);
+        assert_eq!(original.project_id, stable_replacement.project_id);
+        assert_ne!(
+            original.repository_instance,
+            stable_replacement.repository_instance
+        );
+        assert_ne!(
+            raced.repository_instance,
+            stable_replacement.repository_instance
+        );
+    }
+
+    #[test]
+    fn bounded_logical_identity_fails_closed_on_gitdir_pointer_toctou() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        let Some(alternate) = git_project() else {
+            return;
+        };
+        let worktree_parent = tempdir().expect("worktree parent");
+        let worktree = worktree_parent.path().join("linked-worktree");
+        git(
+            project.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().expect("worktree path"),
+                "HEAD",
+            ],
+        );
+        let original = observe_logical_project_identity_v3(&worktree);
+        let pointer = worktree.join(".git");
+        let alternate_git_dir = alternate.path().join(".git");
+        crate::repo_metadata::set_after_bounded_identity_capture_hook_for_test(move || {
+            fs::write(
+                &pointer,
+                format!("gitdir: {}\n", alternate_git_dir.display()),
+            )
+            .expect("replace gitdir pointer after bounded capture");
+        });
+        let raced = observe_logical_project_identity_v3(&worktree);
+
+        assert_eq!(raced.project_id, raced.workspace_id);
+        assert_ne!(raced.repository_instance, original.repository_instance);
     }
 
     #[test]

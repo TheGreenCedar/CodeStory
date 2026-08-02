@@ -178,23 +178,85 @@ pub struct ActivationRun {
 struct ActivationCoordinatorState {
     target: Option<ActivationTarget>,
     current: Option<ActivationSnapshot>,
+    ready_lease: Option<ReadyLease>,
     running: bool,
     current_cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadySourceIdentity {
+    status: IndexFreshnessStatusDto,
+    not_checked_cause: Option<IndexFreshnessNotCheckedCauseDto>,
+    changed_file_count: u32,
+    new_file_count: u32,
+    removed_file_count: u32,
+    checked_file_count: u32,
+    indexed_file_count: u32,
+    gap: Option<String>,
+}
+
+impl From<&IndexFreshnessDto> for ReadySourceIdentity {
+    fn from(freshness: &IndexFreshnessDto) -> Self {
+        Self {
+            status: freshness.status,
+            not_checked_cause: freshness.not_checked_cause,
+            changed_file_count: freshness.changed_file_count,
+            new_file_count: freshness.new_file_count,
+            removed_file_count: freshness.removed_file_count,
+            checked_file_count: freshness.checked_file_count,
+            indexed_file_count: freshness.indexed_file_count,
+            gap: freshness.reason.clone(),
+        }
+    }
+}
+
+impl ReadySourceIdentity {
+    fn is_admissible_snapshot(&self) -> bool {
+        let no_observed_drift = self.changed_file_count == 0
+            && self.new_file_count == 0
+            && self.removed_file_count == 0;
+        match self.status {
+            IndexFreshnessStatusDto::Fresh => {
+                no_observed_drift
+                    && self.checked_file_count == self.indexed_file_count
+                    && self.not_checked_cause.is_none()
+                    && self.gap.is_none()
+            }
+            IndexFreshnessStatusDto::NotChecked => {
+                no_observed_drift
+                    && self.checked_file_count <= self.indexed_file_count
+                    && self.not_checked_cause
+                        == Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+                    && self.gap.is_some()
+            }
+            IndexFreshnessStatusDto::Stale => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadyLease {
+    configuration_id: String,
+    core_publication: IndexPublicationDto,
+    retrieval: codestory_retrieval::ReadyRetrievalIdentity,
+    source: ReadySourceIdentity,
 }
 
 #[derive(Debug, Clone)]
 struct ActivationTarget {
     project_id: String,
     workspace_id: String,
+    repository_instance: codestory_workspace::RepositoryInstanceIdentity,
     storage_path: PathBuf,
 }
 
 impl ActivationTarget {
     fn new(project_root: &Path, storage_path: &Path) -> Self {
-        let project = codestory_workspace::project_identity_v3(project_root);
+        let project = codestory_workspace::observe_logical_project_identity_v3(project_root);
         Self {
             project_id: project.project_id,
             workspace_id: project.workspace_id,
+            repository_instance: project.repository_instance,
             storage_path: storage_path
                 .canonicalize()
                 .unwrap_or_else(|_| storage_path.to_path_buf()),
@@ -204,6 +266,7 @@ impl ActivationTarget {
     fn matches(&self, other: &Self) -> bool {
         self.project_id == other.project_id
             && self.workspace_id == other.workspace_id
+            && self.repository_instance == other.repository_instance
             && (self.storage_path == other.storage_path
                 || codestory_workspace::same_workspace_path(
                     &self.storage_path,
@@ -217,6 +280,28 @@ struct ActivationCoordinator {
     state: Mutex<ActivationCoordinatorState>,
     changed: Condvar,
     next_id: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    worker_start_count: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    worker_start_gate: Mutex<Option<Arc<(Mutex<bool>, Condvar)>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_preparation_count: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    retrieval_finalization_count: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    preparation_seams_armed: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    native_preparation_limit: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    retrieval_finalization_limit: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    use_published_retrieval_fixture: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+enum ActivationPreparationPhase {
+    NativeEmbedding,
+    RetrievalFinalization,
 }
 
 /// Runtime-owned single-flight activation for one logical project, core store,
@@ -233,6 +318,18 @@ enum CompleteCoreAdmission {
     Cold,
     Fenced,
     Corrupt(ApiError),
+}
+
+struct ReadyLeaseProbe {
+    admissible: bool,
+    retained_core_publication: Option<IndexPublicationDto>,
+}
+
+fn ready_retrieval_identity_matches(
+    observed: Option<&codestory_retrieval::ReadyRetrievalIdentity>,
+    retained: &codestory_retrieval::ReadyRetrievalIdentity,
+) -> bool {
+    observed == Some(retained)
 }
 
 impl ActivationService {
@@ -252,12 +349,121 @@ impl ActivationService {
             .clone()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    fn set_worker_start_gate_for_test(&self, gate: Option<Arc<(Mutex<bool>, Condvar)>>) {
+        *self
+            .coordinator
+            .worker_start_gate
+            .lock()
+            .expect("activation worker gate poisoned") = gate;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    fn worker_start_count_for_test(&self) -> u64 {
+        self.coordinator.worker_start_count.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn preparation_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.coordinator
+                .native_preparation_count
+                .load(Ordering::Acquire),
+            self.coordinator
+                .retrieval_finalization_count
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Make any later native preparation or retrieval finalization fail the
+    /// owning activation. Tests arm this only after the first activation has
+    /// established the expected phase counts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn arm_preparation_seams_for_test(&self) {
+        let (native, finalization) = self.preparation_counts_for_test();
+        self.coordinator
+            .native_preparation_limit
+            .store(native, Ordering::Release);
+        self.coordinator
+            .retrieval_finalization_limit
+            .store(finalization, Ordering::Release);
+        self.coordinator
+            .preparation_seams_armed
+            .store(true, Ordering::Release);
+    }
+
+    /// Use an already strict published retrieval fixture at the finalization
+    /// seam. The activation worker still advances through and records the
+    /// native-preparation/finalization boundaries, then performs the normal
+    /// strict readiness and identity validation before publishing its lease.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn use_published_retrieval_fixture_for_test(&self) {
+        self.coordinator
+            .use_published_retrieval_fixture
+            .store(true, Ordering::Release);
+    }
+
+    fn should_finalize_retrieval_for_activation(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .coordinator
+            .use_published_retrieval_fixture
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn record_preparation_phase(&self, phase: ActivationPreparationPhase) -> Result<(), ApiError> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let (count, limit, label) = match phase {
+                ActivationPreparationPhase::NativeEmbedding => (
+                    self.coordinator
+                        .native_preparation_count
+                        .fetch_add(1, Ordering::AcqRel)
+                        + 1,
+                    self.coordinator
+                        .native_preparation_limit
+                        .load(Ordering::Acquire),
+                    "native embedding preparation",
+                ),
+                ActivationPreparationPhase::RetrievalFinalization => (
+                    self.coordinator
+                        .retrieval_finalization_count
+                        .fetch_add(1, Ordering::AcqRel)
+                        + 1,
+                    self.coordinator
+                        .retrieval_finalization_limit
+                        .load(Ordering::Acquire),
+                    "retrieval finalization",
+                ),
+            };
+            if self
+                .coordinator
+                .preparation_seams_armed
+                .load(Ordering::Acquire)
+                && count > limit
+            {
+                return Err(ApiError::internal(format!(
+                    "test preparation seam was invoked again: {label}"
+                )));
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = phase;
+        Ok(())
+    }
+
     fn snapshot_for_target(
         &self,
         project_root: &Path,
         storage_path: &Path,
     ) -> Option<ActivationSnapshot> {
-        let target = ActivationTarget::new(project_root, storage_path);
+        let requested = ActivationTarget::new(project_root, storage_path);
         let state = self
             .coordinator
             .state
@@ -266,9 +472,26 @@ impl ActivationService {
         state
             .target
             .as_ref()
-            .is_some_and(|current| current.matches(&target))
+            .is_some_and(|current| current.matches(&requested))
             .then(|| state.current.clone())
             .flatten()
+    }
+
+    fn target_for_request(&self, project_root: &Path, storage_path: &Path) -> ActivationTarget {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        if let Some(target) = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned")
+            .target
+            .as_ref()
+            .filter(|target| target.matches(&requested))
+            .cloned()
+        {
+            return target;
+        }
+        requested
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -280,6 +503,7 @@ impl ActivationService {
             .lock()
             .expect("activation coordinator poisoned");
         state.current = snapshot;
+        state.ready_lease = None;
     }
 
     pub fn activate_project(
@@ -428,150 +652,371 @@ impl ActivationService {
                 "request cancelled before project activation",
             ));
         }
-        let target = ActivationTarget::new(project_root, storage_path);
-        let retained_core_publication =
-            self.retained_core_publication(storage_path).unwrap_or(None);
-        let mut state = self
-            .coordinator
-            .state
-            .lock()
-            .expect("activation coordinator poisoned");
-        let joined = state.running;
-        let operation_id = if joined {
-            if !state
-                .target
-                .as_ref()
-                .is_some_and(|current| current.matches(&target))
-            {
-                return Err(ApiError::new(
-                    "project_unavailable",
-                    "a different logical project is already activating in this runtime context",
-                ));
-            }
-            let operation_id = state
-                .current
-                .as_ref()
-                .expect("running activation has a snapshot")
-                .operation_id
-                .clone();
-            drop(state);
-            operation_id
-        } else {
-            if !state
-                .target
-                .as_ref()
-                .is_some_and(|current| current.matches(&target))
-            {
-                state.target = Some(target.clone());
-                state.current = None;
-            }
-
-            let operation_id = if let Some(snapshot) = state
-                .current
-                .as_mut()
-                .filter(|snapshot| snapshot.state != ActivationState::Ready)
-            {
-                snapshot.attempt += 1;
-                snapshot.revision += 1;
-                snapshot.failure = None;
-                snapshot.failure_code = None;
-                snapshot.failure_details = None;
-                snapshot.embedding_capacity = None;
-                snapshot.embedding_retry = None;
-                snapshot.retry_after_ms = Some(250);
-                snapshot.state = ActivationState::Preparing;
-                let retained_was_ready = snapshot.capabilities.local_navigation
-                    == ActivationCapabilityState::Ready
-                    && snapshot.retained_core_publication == retained_core_publication;
-                snapshot.retained_core_publication = retained_core_publication.clone();
-                snapshot.capabilities.local_navigation = if retained_was_ready {
-                    ActivationCapabilityState::Ready
-                } else if snapshot.retained_core_publication.is_some() {
-                    ActivationCapabilityState::Retained
-                } else {
-                    ActivationCapabilityState::Unavailable
-                };
-                snapshot.capabilities.broad_search = ActivationCapabilityState::Unavailable;
-                snapshot.operation_id.clone()
-            } else {
-                let project_scope = target
-                    .project_id
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .take(12)
-                    .collect::<String>();
-                let operation_id = format!(
-                    "activation-{project_scope}-{}",
-                    self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
-                );
-                state.current = Some(ActivationSnapshot {
-                    operation_id: operation_id.clone(),
-                    revision: 1,
-                    state: ActivationState::Preparing,
-                    stage: ActivationStage::Discovery,
-                    progress: activation_stage_progress(ActivationStage::Discovery),
-                    attempt: 1,
-                    retry_after_ms: Some(250),
-                    embedding_capacity: None,
-                    embedding_retry: None,
-                    failure_code: None,
-                    failure: None,
-                    failure_details: None,
-                    retained_core_publication: retained_core_publication.clone(),
-                    capabilities: ActivationCapabilities {
-                        local_navigation: if retained_core_publication.is_some() {
-                            ActivationCapabilityState::Retained
-                        } else {
-                            ActivationCapabilityState::Unavailable
-                        },
-                        broad_search: ActivationCapabilityState::Unavailable,
-                    },
-                });
-                operation_id
+        let target = self.target_for_request(project_root, storage_path);
+        let (operation_id, activation_cancelled) = loop {
+            let ready_candidate = {
+                let mut state = self
+                    .coordinator
+                    .state
+                    .lock()
+                    .expect("activation coordinator poisoned");
+                if state.running {
+                    if !state
+                        .target
+                        .as_ref()
+                        .is_some_and(|current| current.matches(&target))
+                    {
+                        return Err(ApiError::new(
+                            "project_unavailable",
+                            "a different logical project is already activating in this runtime context",
+                        ));
+                    }
+                    let operation_id = state
+                        .current
+                        .as_ref()
+                        .expect("running activation has a snapshot")
+                        .operation_id
+                        .clone();
+                    drop(state);
+                    return self.wait_for_activation(
+                        &target,
+                        &operation_id,
+                        true,
+                        request_cancelled.as_ref(),
+                        foreground_budget,
+                    );
+                }
+                if !state
+                    .target
+                    .as_ref()
+                    .is_some_and(|current| current.matches(&target))
+                {
+                    state.target = Some(target.clone());
+                    state.current = None;
+                    state.ready_lease = None;
+                }
+                match (state.current.as_ref(), state.ready_lease.as_ref()) {
+                    (Some(snapshot), Some(lease)) if snapshot.state == ActivationState::Ready => {
+                        Some((snapshot.clone(), lease.clone()))
+                    }
+                    _ => None,
+                }
             };
-            let activation_cancelled = Arc::new(AtomicBool::new(false));
-            state.running = true;
-            state.current_cancel = Some(Arc::clone(&activation_cancelled));
-            drop(state);
 
-            let operation = ActivationOperation {
-                service: self.clone(),
-                operation_id: operation_id.clone(),
-                cancelled: activation_cancelled,
-            };
-            let worker_operation = operation.clone();
-            let worker_service = self.clone();
-            let worker_project_root = project_root.to_path_buf();
-            let worker_storage_path = storage_path.to_path_buf();
-            if let Err(error) = std::thread::Builder::new()
-                .name(format!("codestory-{operation_id}"))
-                .spawn(move || {
-                    run_activation_worker(&worker_operation, || {
-                        worker_service.activate_once(
-                            &worker_operation,
-                            worker_project_root,
-                            worker_storage_path,
-                        )
+            if let Some((candidate_snapshot, candidate_lease)) = ready_candidate {
+                let probe = self.probe_ready_lease(storage_path, &candidate_lease);
+                if request_cancelled.load(Ordering::Acquire) {
+                    return Err(ApiError::new(
+                        "cancelled",
+                        "request cancelled while observing the ready project lease",
+                    ));
+                }
+                let mut state = self
+                    .coordinator
+                    .state
+                    .lock()
+                    .expect("activation coordinator poisoned");
+                if state.running {
+                    if !state
+                        .target
+                        .as_ref()
+                        .is_some_and(|current| current.matches(&target))
+                    {
+                        return Err(ApiError::new(
+                            "project_unavailable",
+                            "a different logical project started activation while the ready lease was being observed",
+                        ));
+                    }
+                    let operation_id = state
+                        .current
+                        .as_ref()
+                        .expect("running activation has a snapshot")
+                        .operation_id
+                        .clone();
+                    drop(state);
+                    return self.wait_for_activation(
+                        &target,
+                        &operation_id,
+                        true,
+                        request_cancelled.as_ref(),
+                        foreground_budget,
+                    );
+                }
+                let candidate_is_current = state
+                    .target
+                    .as_ref()
+                    .is_some_and(|current| current.matches(&target))
+                    && state.current.as_ref().is_some_and(|snapshot| {
+                        snapshot.state == ActivationState::Ready
+                            && snapshot.operation_id == candidate_snapshot.operation_id
+                            && snapshot.revision == candidate_snapshot.revision
+                    })
+                    && state.ready_lease.as_ref() == Some(&candidate_lease);
+                if !candidate_is_current {
+                    drop(state);
+                    continue;
+                }
+                if probe.admissible {
+                    let snapshot = state
+                        .current
+                        .clone()
+                        .expect("validated ready lease has a snapshot");
+                    drop(state);
+                    return Ok(ActivationRun {
+                        snapshot,
+                        joined: false,
                     });
-                })
-            {
-                let error = ApiError::new(
-                    "project_unavailable",
-                    format!("failed to start project activation worker: {error}"),
+                }
+                break self.begin_activation_locked(
+                    &mut state,
+                    &target,
+                    probe.retained_core_publication,
                 );
-                let _ = operation.finish(Some(&error));
-                return Err(error);
             }
-            operation_id
+
+            let retained_core_publication =
+                self.retained_core_publication(storage_path).unwrap_or(None);
+            let mut state = self
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator poisoned");
+            if state.running {
+                if !state
+                    .target
+                    .as_ref()
+                    .is_some_and(|current| current.matches(&target))
+                {
+                    return Err(ApiError::new(
+                        "project_unavailable",
+                        "a different logical project is already activating in this runtime context",
+                    ));
+                }
+                let operation_id = state
+                    .current
+                    .as_ref()
+                    .expect("running activation has a snapshot")
+                    .operation_id
+                    .clone();
+                drop(state);
+                return self.wait_for_activation(
+                    &target,
+                    &operation_id,
+                    true,
+                    request_cancelled.as_ref(),
+                    foreground_budget,
+                );
+            }
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == ActivationState::Ready)
+                && state.ready_lease.is_some()
+            {
+                drop(state);
+                continue;
+            }
+            break self.begin_activation_locked(&mut state, &target, retained_core_publication);
         };
+
+        let operation = ActivationOperation {
+            service: self.clone(),
+            operation_id: operation_id.clone(),
+            cancelled: activation_cancelled,
+        };
+        let worker_operation = operation.clone();
+        let worker_service = self.clone();
+        let worker_project_root = project_root.to_path_buf();
+        let worker_storage_path = storage_path.to_path_buf();
+        #[cfg(any(test, feature = "test-support"))]
+        let worker_start_gate = self
+            .coordinator
+            .worker_start_gate
+            .lock()
+            .expect("activation worker gate poisoned")
+            .clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("codestory-{operation_id}"))
+            .spawn(move || {
+                #[cfg(any(test, feature = "test-support"))]
+                worker_service
+                    .coordinator
+                    .worker_start_count
+                    .fetch_add(1, Ordering::AcqRel);
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(gate) = worker_start_gate {
+                    let (released, changed) = gate.as_ref();
+                    let mut released = released
+                        .lock()
+                        .expect("activation worker test gate poisoned");
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .expect("activation worker test gate poisoned");
+                    }
+                }
+                run_activation_worker(&worker_operation, || {
+                    worker_service.activate_once(
+                        &worker_operation,
+                        worker_project_root,
+                        worker_storage_path,
+                    )
+                });
+            })
+        {
+            let error = ApiError::new(
+                "project_unavailable",
+                format!("failed to start project activation worker: {error}"),
+            );
+            let _ = operation.finish(Some(&error));
+            return Err(error);
+        }
 
         self.wait_for_activation(
             &target,
             &operation_id,
-            joined,
+            false,
             request_cancelled.as_ref(),
             foreground_budget,
         )
+    }
+
+    fn probe_ready_lease(&self, storage_path: &Path, lease: &ReadyLease) -> ReadyLeaseProbe {
+        let configuration_matches = self.controller.runtime_configuration_id().ok().as_ref()
+            == Some(&lease.configuration_id);
+        let retrieval_identity =
+            codestory_retrieval::observe_ready_retrieval_identity_for_project_id(
+                storage_path,
+                &self.controller.runtime_config,
+                &lease.retrieval.manifest.project_id,
+            )
+            .ok()
+            .flatten();
+        let retrieval_matches =
+            ready_retrieval_identity_matches(retrieval_identity.as_ref(), &lease.retrieval);
+        let retained_core_publication =
+            self.retained_core_publication(storage_path).unwrap_or(None);
+        let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
+        ReadyLeaseProbe {
+            admissible: configuration_matches
+                && lease.source.is_admissible_snapshot()
+                && retrieval_matches
+                && core_matches,
+            retained_core_publication,
+        }
+    }
+
+    fn begin_activation_locked(
+        &self,
+        state: &mut ActivationCoordinatorState,
+        target: &ActivationTarget,
+        retained_core_publication: Option<IndexPublicationDto>,
+    ) -> (String, Arc<AtomicBool>) {
+        if !state
+            .target
+            .as_ref()
+            .is_some_and(|current| current.matches(target))
+        {
+            state.target = Some(target.clone());
+            state.current = None;
+        }
+        state.ready_lease = None;
+        let operation_id = if let Some(snapshot) = state.current.as_mut() {
+            let replacing_ready = snapshot.state == ActivationState::Ready;
+            snapshot.attempt += 1;
+            snapshot.revision += 1;
+            snapshot.failure = None;
+            snapshot.failure_code = None;
+            snapshot.failure_details = None;
+            snapshot.embedding_capacity = None;
+            snapshot.embedding_retry = None;
+            snapshot.retry_after_ms = Some(250);
+            snapshot.state = ActivationState::Preparing;
+            if replacing_ready {
+                snapshot.stage = ActivationStage::Discovery;
+                snapshot.progress = activation_stage_progress(ActivationStage::Discovery);
+            }
+            let retained_was_ready = snapshot.capabilities.local_navigation
+                == ActivationCapabilityState::Ready
+                && snapshot.retained_core_publication == retained_core_publication;
+            snapshot.retained_core_publication = retained_core_publication;
+            snapshot.capabilities.local_navigation = if retained_was_ready {
+                ActivationCapabilityState::Ready
+            } else if snapshot.retained_core_publication.is_some() {
+                ActivationCapabilityState::Retained
+            } else {
+                ActivationCapabilityState::Unavailable
+            };
+            snapshot.capabilities.broad_search = ActivationCapabilityState::Unavailable;
+            snapshot.operation_id.clone()
+        } else {
+            let project_scope = target
+                .project_id
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(12)
+                .collect::<String>();
+            let operation_id = format!(
+                "activation-{project_scope}-{}",
+                self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
+            );
+            state.current = Some(ActivationSnapshot {
+                operation_id: operation_id.clone(),
+                revision: 1,
+                state: ActivationState::Preparing,
+                stage: ActivationStage::Discovery,
+                progress: activation_stage_progress(ActivationStage::Discovery),
+                attempt: 1,
+                retry_after_ms: Some(250),
+                embedding_capacity: None,
+                embedding_retry: None,
+                failure_code: None,
+                failure: None,
+                failure_details: None,
+                retained_core_publication: retained_core_publication.clone(),
+                capabilities: ActivationCapabilities {
+                    local_navigation: if retained_core_publication.is_some() {
+                        ActivationCapabilityState::Retained
+                    } else {
+                        ActivationCapabilityState::Unavailable
+                    },
+                    broad_search: ActivationCapabilityState::Unavailable,
+                },
+            });
+            operation_id
+        };
+        let activation_cancelled = Arc::new(AtomicBool::new(false));
+        state.running = true;
+        state.current_cancel = Some(Arc::clone(&activation_cancelled));
+        (operation_id, activation_cancelled)
+    }
+
+    fn require_ready_retrieval_identity_unchanged(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        expected: &codestory_retrieval::ReadyRetrievalIdentity,
+    ) -> Result<(), ApiError> {
+        let current = codestory_retrieval::ready_retrieval_identity_for_runtime(
+            project_root,
+            storage_path,
+            &self.controller.runtime_config,
+        )
+        .map_err(|error| {
+            ApiError::new(
+                "publication_changed",
+                format!(
+                    "failed to revalidate retrieval identity before ready-lease publication: {error}"
+                ),
+            )
+        })?;
+        if current.as_ref() != Some(expected) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the retrieval publication or producer changed during ready-lease validation",
+            ));
+        }
+        Ok(())
     }
 
     fn wait_for_activation(
@@ -667,6 +1112,7 @@ impl ActivationService {
         let mut summary = self
             .controller
             .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
+        summary.freshness = Some(self.controller.index_freshness_uncached()?);
 
         operation.set_stage(ActivationStage::CoreFreshness);
         let core_stale = summary.publication.is_none()
@@ -695,6 +1141,7 @@ impl ActivationService {
                 project_root.clone(),
                 storage_path.clone(),
             )?;
+            summary.freshness = Some(self.controller.index_freshness_uncached()?);
         }
         let local_ready = summary.publication.is_some()
             && summary.stats.node_count > 0
@@ -721,12 +1168,11 @@ impl ActivationService {
                 "activation did not produce a fresh complete core publication",
             ));
         }
-        operation.set_local_publication(
-            summary
-                .publication
-                .clone()
-                .expect("fresh complete core has a publication identity"),
-        );
+        let local_publication = summary
+            .publication
+            .clone()
+            .expect("fresh complete core has a publication identity");
+        operation.set_local_publication(local_publication.clone());
 
         operation.ensure_not_cancelled("search preparation")?;
         operation.set_stage(ActivationStage::SearchPreparation);
@@ -736,21 +1182,37 @@ impl ActivationService {
 
         operation.ensure_not_cancelled("dense preparation")?;
         operation.set_stage(ActivationStage::DensePreparation);
+        self.record_preparation_phase(ActivationPreparationPhase::NativeEmbedding)?;
         codestory_retrieval::ensure_product_embedding_backend_for_runtime(
             &self.controller.runtime_config,
         )
         .map_err(map_activation_error)?;
         operation.ensure_not_cancelled("retrieval publication")?;
         operation.set_stage(ActivationStage::Publication);
-        codestory_retrieval::finalize_index_for_runtime_with_cancel(
+        self.record_preparation_phase(ActivationPreparationPhase::RetrievalFinalization)?;
+        if self.should_finalize_retrieval_for_activation() {
+            codestory_retrieval::finalize_index_for_runtime_with_cancel(
+                &project_root,
+                &storage_path,
+                &self.controller.runtime_config,
+                operation.cancelled.as_ref(),
+            )
+            .map_err(map_activation_error)?;
+        }
+        operation.ensure_not_cancelled("retrieval validation")?;
+        operation.set_stage(ActivationStage::Validation);
+        let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
             &project_root,
             &storage_path,
             &self.controller.runtime_config,
-            operation.cancelled.as_ref(),
         )
-        .map_err(map_activation_error)?;
-        operation.ensure_not_cancelled("retrieval validation")?;
-        operation.set_stage(ActivationStage::Validation);
+        .map_err(map_activation_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                "project_unavailable",
+                "retrieval identity became unavailable before strict ready-lease validation",
+            )
+        })?;
         let status = codestory_retrieval::strict_sidecar_status_for_runtime(
             &project_root,
             Some(&storage_path),
@@ -763,6 +1225,54 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
+        let source_freshness = self.controller.index_freshness_uncached()?;
+        if !index_freshness_admits_operation(&source_freshness) {
+            return Err(ApiError::new(
+                "publication_changed",
+                index_freshness_block_message("activation", &source_freshness),
+            ));
+        }
+        let core_publication = self
+            .retained_core_publication(&storage_path)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "the complete core publication disappeared before ready-lease publication",
+                )
+            })?;
+        if core_publication != local_publication {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the complete core publication changed before ready-lease publication",
+            ));
+        }
+        self.require_ready_retrieval_identity_unchanged(&project_root, &storage_path, &retrieval)?;
+        let revalidated_core = self
+            .retained_core_publication(&storage_path)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "the complete core publication disappeared during ready-lease validation",
+                )
+            })?;
+        if revalidated_core != core_publication {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the complete core publication changed during ready-lease validation",
+            ));
+        }
+        if revalidated_core != local_publication {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the revalidated core publication differs from the activated core",
+            ));
+        }
+        operation.set_ready_lease(ReadyLease {
+            configuration_id: self.controller.runtime_configuration_id()?,
+            core_publication: revalidated_core,
+            retrieval,
+            source: ReadySourceIdentity::from(&source_freshness),
+        });
         operation.set_capability(true, ActivationCapabilityState::Ready);
         Ok(())
     }
@@ -1351,6 +1861,23 @@ impl ActivationOperation {
         self.service.coordinator.changed.notify_all();
     }
 
+    fn set_ready_lease(&self, lease: ReadyLease) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            state.ready_lease = Some(lease);
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
     fn set_capability(&self, broad: bool, capability: ActivationCapabilityState) {
         let mut state = self
             .service
@@ -1380,6 +1907,10 @@ impl ActivationOperation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if error.is_some() {
+            state.ready_lease = None;
+        }
+        let ready_lease_present = state.ready_lease.is_some();
         let Some(snapshot) = state
             .current
             .as_mut()
@@ -1437,6 +1968,10 @@ impl ActivationOperation {
                 });
             snapshot.failure = Some(error.message.clone());
         } else {
+            debug_assert!(
+                ready_lease_present,
+                "successful activation must publish its ready lease before completion"
+            );
             snapshot.state = ActivationState::Ready;
             snapshot.stage = ActivationStage::Ready;
             snapshot.progress = activation_stage_progress(ActivationStage::Ready);
@@ -1981,6 +2516,118 @@ mod activation_tests {
     use crate::test_support::git;
     use std::fs;
 
+    struct ReadyActivationFixture {
+        project: tempfile::TempDir,
+        _cache: tempfile::TempDir,
+        runtime: Runtime,
+        storage_path: PathBuf,
+        lease: ReadyLease,
+    }
+
+    fn ready_activation_fixture() -> ReadyActivationFixture {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("metadata.rs"),
+            "// READY_LEASE_SOURCE_ANCHOR\n",
+        )
+        .expect("write zero-dense source fixture");
+        let sidecar_cache = cache.path().join("sidecar");
+        fs::create_dir_all(&sidecar_cache).expect("create sidecar cache");
+        let mut sidecar = codestory_retrieval::with_test_cache_root(&sidecar_cache, || {
+            codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Agent,
+            )
+        });
+        sidecar.embedding.allow_cpu = true;
+        let runtime = Runtime::new_with_config(sidecar.clone());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("bind ready-lease fixture");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish ready-lease core");
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            project.path(),
+            &storage_path,
+            &sidecar,
+        )
+        .expect("publish ready-lease retrieval fixture");
+
+        let service = runtime.activation_service();
+        let core_publication = service
+            .retained_core_publication(&storage_path)
+            .expect("read ready core")
+            .expect("complete ready core");
+        let source_freshness = service
+            .controller
+            .index_freshness_uncached()
+            .expect("verify ready source snapshot");
+        assert!(index_freshness_admits_operation(&source_freshness));
+        let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
+            project.path(),
+            &storage_path,
+            &sidecar,
+        )
+        .expect("observe ready retrieval identity")
+        .expect("ready retrieval identity");
+        let lease = ReadyLease {
+            configuration_id: service
+                .controller
+                .runtime_configuration_id()
+                .expect("ready runtime configuration identity"),
+            core_publication: core_publication.clone(),
+            retrieval,
+            source: ReadySourceIdentity::from(&source_freshness),
+        };
+        assert!(lease.source.is_admissible_snapshot());
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.target = Some(ActivationTarget::new(project.path(), &storage_path));
+            state.current = Some(ActivationSnapshot {
+                operation_id: "activation-ready-lease-fixture".into(),
+                revision: 17,
+                state: ActivationState::Ready,
+                stage: ActivationStage::Ready,
+                progress: activation_stage_progress(ActivationStage::Ready),
+                attempt: 3,
+                retry_after_ms: None,
+                embedding_capacity: None,
+                embedding_retry: None,
+                failure_code: None,
+                failure: None,
+                failure_details: None,
+                retained_core_publication: Some(core_publication),
+                capabilities: ActivationCapabilities {
+                    local_navigation: ActivationCapabilityState::Ready,
+                    broad_search: ActivationCapabilityState::Ready,
+                },
+            });
+            state.ready_lease = Some(lease.clone());
+            state.running = false;
+            state.current_cancel = None;
+        }
+
+        ReadyActivationFixture {
+            project,
+            _cache: cache,
+            runtime,
+            storage_path,
+            lease,
+        }
+    }
+
     fn initialize_identifiable_git_project(project: &Path) {
         git(project, &["init", "-q"]);
         git(
@@ -2001,6 +2648,242 @@ mod activation_tests {
                 "https://example.com/codestory/fixture.git",
             ],
         );
+    }
+
+    #[test]
+    fn unchanged_ready_lease_returns_without_starting_or_advancing_activation() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let before = service.snapshot().expect("ready snapshot");
+
+        let reused = service
+            .activate_project(
+                fixture.project.path(),
+                &fixture.storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("unchanged ready lease must be reused");
+
+        assert!(!reused.joined);
+        assert_eq!(reused.snapshot, before);
+        assert_eq!(service.worker_start_count_for_test(), 0);
+        let state = service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator");
+        assert!(!state.running);
+        assert_eq!(state.ready_lease.as_ref(), Some(&fixture.lease));
+    }
+
+    #[test]
+    fn ready_lease_probe_rejects_each_bounded_identity_drift() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        assert!(
+            service
+                .probe_ready_lease(&fixture.storage_path, &fixture.lease)
+                .admissible
+        );
+
+        let mut configuration_drift = fixture.lease.clone();
+        configuration_drift.configuration_id.push_str("-changed");
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &configuration_drift)
+                .admissible
+        );
+
+        let mut core_drift = fixture.lease.clone();
+        core_drift.core_publication.generation_id = "changed-core-generation".into();
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &core_drift)
+                .admissible
+        );
+
+        let mut manifest_drift = fixture.lease.clone();
+        manifest_drift.retrieval.manifest.built_at_epoch_ms += 1;
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &manifest_drift)
+                .admissible
+        );
+
+        let mut producer_drift = fixture.lease.clone();
+        producer_drift
+            .retrieval
+            .producer_compatibility_identity
+            .push_str("-changed");
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &producer_drift)
+                .admissible
+        );
+
+        let synthetic_engine = codestory_retrieval::ReadyEmbeddingEngineIdentity {
+            instance_id: "embedding-server-1".into(),
+            load_generation: 7,
+            model_load_count: 2,
+            model_digest: "sha256:model-a".into(),
+            ggml_build_identity: "llama.cpp-build-a".into(),
+            backend: "metal".into(),
+            adapter_name: "Apple M3 Max".into(),
+            policy: "accelerator_required".into(),
+            execution_device_names: vec!["Apple M3 Max".into()],
+            execution_backend_names: vec!["Metal".into()],
+            accelerator_execution_verified: true,
+        };
+        let mut engine_presence_drift = fixture.lease.clone();
+        engine_presence_drift.retrieval.engine = Some(synthetic_engine.clone());
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &engine_presence_drift)
+                .admissible,
+            "a changed live engine identity must invalidate ready reuse"
+        );
+
+        let mut exact_engine_identity = fixture.lease.retrieval.clone();
+        exact_engine_identity.engine = Some(synthetic_engine);
+        assert!(ready_retrieval_identity_matches(
+            Some(&exact_engine_identity),
+            &exact_engine_identity,
+        ));
+        macro_rules! reject_engine_field_drift {
+            ($field:ident, $changed:expr) => {{
+                let mut observed = exact_engine_identity.clone();
+                observed
+                    .engine
+                    .as_mut()
+                    .expect("synthetic engine identity")
+                    .$field = $changed;
+                assert!(
+                    !ready_retrieval_identity_matches(Some(&observed), &exact_engine_identity),
+                    concat!(
+                        "ready retrieval equality omitted engine field `",
+                        stringify!($field),
+                        "`"
+                    )
+                );
+            }};
+        }
+        reject_engine_field_drift!(instance_id, "embedding-server-2".into());
+        reject_engine_field_drift!(load_generation, 8);
+        reject_engine_field_drift!(model_load_count, 3);
+        reject_engine_field_drift!(model_digest, "sha256:model-b".into());
+        reject_engine_field_drift!(ggml_build_identity, "llama.cpp-build-b".into());
+        reject_engine_field_drift!(backend, "cuda".into());
+        reject_engine_field_drift!(adapter_name, "NVIDIA RTX".into());
+        reject_engine_field_drift!(policy, "cpu_explicit".into());
+        reject_engine_field_drift!(execution_device_names, vec!["NVIDIA RTX".into()]);
+        reject_engine_field_drift!(execution_backend_names, vec!["CUDA".into()]);
+        reject_engine_field_drift!(accelerator_execution_verified, false);
+
+        let mut invalid_source_snapshot = fixture.lease.clone();
+        invalid_source_snapshot.source.status = IndexFreshnessStatusDto::Stale;
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &invalid_source_snapshot)
+                .admissible
+        );
+    }
+
+    #[test]
+    fn ready_lease_revalidation_rejects_manifest_change_after_initial_capture() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        Store::open(&fixture.storage_path)
+            .expect("open fixture storage")
+            .get_connection()
+            .execute(
+                "UPDATE retrieval_index_manifest \
+                 SET built_at_epoch_ms = built_at_epoch_ms + 1",
+                [],
+            )
+            .expect("mutate retrieval pointer after initial capture");
+
+        let error = service
+            .require_ready_retrieval_identity_unchanged(
+                fixture.project.path(),
+                &fixture.storage_path,
+                &fixture.lease.retrieval,
+            )
+            .expect_err("changed retrieval pointer must reject ready-lease publication");
+
+        assert_eq!(error.code, "publication_changed");
+    }
+
+    #[test]
+    fn concurrent_missing_pointer_callers_start_one_fail_closed_replacement() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let ready = service.snapshot().expect("ready snapshot");
+        Store::open(&fixture.storage_path)
+            .expect("open fixture storage")
+            .get_connection()
+            .execute("DELETE FROM retrieval_index_manifest", [])
+            .expect("remove retrieval identity pointer");
+
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+        let caller_gate = Arc::new(std::sync::Barrier::new(7));
+        let callers = (0..6)
+            .map(|_| {
+                let service = service.clone();
+                let project_root = fixture.project.path().to_path_buf();
+                let storage_path = fixture.storage_path.clone();
+                let caller_gate = Arc::clone(&caller_gate);
+                std::thread::spawn(move || {
+                    caller_gate.wait();
+                    let error = service
+                        .activate_project_with_foreground_budget(
+                            &project_root,
+                            &storage_path,
+                            Arc::new(AtomicBool::new(false)),
+                            Duration::ZERO,
+                        )
+                        .expect_err("missing pointer must start replacement");
+                    (error, service.snapshot().expect("replacement snapshot"))
+                })
+            })
+            .collect::<Vec<_>>();
+        caller_gate.wait();
+        let observations = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("join replacement caller"))
+            .collect::<Vec<_>>();
+
+        assert!(observations.iter().all(|(error, snapshot)| {
+            error.code == "activation_preparing"
+                && snapshot.operation_id == ready.operation_id
+                && snapshot.attempt == ready.attempt + 1
+                && snapshot.capabilities.broad_search == ActivationCapabilityState::Unavailable
+        }));
+        assert!(
+            observations
+                .iter()
+                .all(|(_, snapshot)| snapshot.revision > ready.revision),
+            "replacement must expose phase/progress revision evidence"
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(service.worker_start_count_for_test(), 1);
+        let replacement = service.snapshot().expect("replacement snapshot");
+        assert_eq!(replacement.stage, ActivationStage::Discovery);
+        assert_eq!(
+            replacement.progress,
+            activation_stage_progress(ActivationStage::Discovery)
+        );
+
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
+        service.cancel_and_wait();
     }
 
     #[test]
@@ -2067,6 +2950,135 @@ mod activation_tests {
         assert_eq!(clean_identity.project_id, dirty_identity.project_id);
         assert_eq!(clean_identity.workspace_id, dirty_identity.workspace_id);
         assert!(clean.matches(&dirty));
+    }
+
+    #[test]
+    fn activation_target_reobserves_same_root_remote_change_and_no_remote_reinit() {
+        let project = tempfile::tempdir().expect("project");
+        initialize_identifiable_git_project(project.path());
+        let storage = project.path().join("cache").join("codestory.db");
+        let service = Runtime::new().activation_service();
+        let remote_a = ActivationTarget::new(project.path(), &storage);
+        let snapshot = ActivationSnapshot {
+            operation_id: "activation-logical-target-fixture".into(),
+            revision: 1,
+            state: ActivationState::Ready,
+            stage: ActivationStage::Ready,
+            progress: activation_stage_progress(ActivationStage::Ready),
+            attempt: 1,
+            retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: None,
+            failure: None,
+            failure_details: None,
+            retained_core_publication: None,
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Ready,
+                broad_search: ActivationCapabilityState::Ready,
+            },
+        };
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.target = Some(remote_a.clone());
+            state.current = Some(snapshot.clone());
+        }
+        assert_eq!(
+            service.snapshot_for_target(project.path(), &storage),
+            Some(snapshot.clone())
+        );
+
+        git(
+            project.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/codestory/other-fixture.git",
+            ],
+        );
+        let remote_b = ActivationTarget::new(project.path(), &storage);
+        assert_eq!(remote_a.workspace_id, remote_b.workspace_id);
+        assert_ne!(remote_a.project_id, remote_b.project_id);
+        assert_eq!(remote_a.repository_instance, remote_b.repository_instance);
+        assert!(!remote_a.matches(&remote_b));
+        assert!(
+            service
+                .snapshot_for_target(project.path(), &storage)
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .target_for_request(project.path(), &storage)
+                .project_id,
+            remote_b.project_id
+        );
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.target = Some(remote_b.clone());
+            state.current = Some(snapshot);
+        }
+
+        fs::rename(
+            project.path().join(".git"),
+            project.path().join(".git-retired"),
+        )
+        .expect("retire original repository metadata");
+        git(project.path(), &["init", "-q"]);
+        let no_remote = ActivationTarget::new(project.path(), &storage);
+        assert_eq!(remote_b.workspace_id, no_remote.workspace_id);
+        assert_eq!(no_remote.project_id, no_remote.workspace_id);
+        assert_ne!(remote_b.repository_instance, no_remote.repository_instance);
+        assert!(!remote_b.matches(&no_remote));
+        assert!(
+            service
+                .snapshot_for_target(project.path(), &storage)
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .target_for_request(project.path(), &storage)
+                .project_id,
+            no_remote.project_id
+        );
+    }
+
+    #[test]
+    fn activation_target_rejects_same_remote_metadata_recreation() {
+        let project = tempfile::tempdir().expect("project");
+        initialize_identifiable_git_project(project.path());
+        let storage = project.path().join("cache").join("codestory.db");
+        let original = ActivationTarget::new(project.path(), &storage);
+
+        fs::rename(
+            project.path().join(".git"),
+            project.path().join(".git-retired"),
+        )
+        .expect("retire original repository metadata");
+        git(project.path(), &["init", "-q"]);
+        git(
+            project.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/codestory/fixture.git",
+            ],
+        );
+        let recreated = ActivationTarget::new(project.path(), &storage);
+
+        assert_eq!(original.project_id, recreated.project_id);
+        assert_eq!(original.workspace_id, recreated.workspace_id);
+        assert_ne!(original.repository_instance, recreated.repository_instance);
+        assert!(!original.matches(&recreated));
     }
 
     #[test]

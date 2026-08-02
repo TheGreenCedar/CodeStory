@@ -31,17 +31,21 @@ pub mod owned_deletion;
 pub mod paths;
 mod repo_metadata;
 mod repository_identity;
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub use repo_metadata::with_repository_metadata_observation_limit_for_test;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
     RepositoryMetadataIssue, read_repository_changes, read_repository_metadata,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use repo_metadata::{
+    with_repository_metadata_observation_limit_for_test,
+    with_repository_metadata_tree_traversal_count_for_test,
+};
 pub use repository_identity::{
-    PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
-    RepositoryIdentityV2, WorkspacePathIdentity, WorkspacePathLexicalIdentity,
-    inspect_repository_identity_v2, project_identity_v3, project_identity_v3_from_repository,
+    LogicalProjectIdentityV3, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3,
+    REPOSITORY_IDENTITY_V2_SCHEMA_VERSION, RepositoryIdentityV2, RepositoryInstanceIdentity,
+    WorkspacePathIdentity, WorkspacePathLexicalIdentity, inspect_repository_identity_v2,
+    observe_logical_project_identity_v3, project_identity_v3, project_identity_v3_from_repository,
     same_workspace_path, workspace_file_identity, workspace_id_v3_for_root,
     workspace_path_identity, workspace_path_lexical_identity,
 };

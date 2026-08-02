@@ -59,6 +59,7 @@ impl AppController {
                 node_names: HashMap::new(),
                 search_engine: None,
                 search_publication: None,
+                observed_core_publication: None,
                 is_indexing: false,
                 index_freshness_cache: None,
                 #[cfg(test)]
@@ -128,6 +129,16 @@ impl AppController {
 
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.state) as usize
+    }
+
+    pub(crate) fn runtime_configuration_id(&self) -> Result<String, ApiError> {
+        let storage_path = self.require_storage_path()?;
+        let project_cache_root = storage_path.parent().unwrap_or(storage_path.as_path());
+        Ok(RuntimeProcessConfig::new(
+            self.runtime_config.as_ref().clone(),
+            self.source_index_policy.as_ref().clone(),
+        )
+        .configuration_id(project_cache_root))
     }
 
     pub(crate) fn open_storage(&self) -> Result<Storage, ApiError> {

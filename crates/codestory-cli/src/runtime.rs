@@ -22,6 +22,18 @@ use std::sync::atomic::AtomicBool;
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, quote_command_path};
 
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_CONTEXT_CONSTRUCTION_COUNT: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_context_construction_count_for_test() -> u64 {
+    RUNTIME_CONTEXT_CONSTRUCTION_COUNT.with(std::cell::Cell::get)
+}
+
 #[derive(Debug)]
 /// Project state after a command has opened or refreshed the repository.
 ///
@@ -55,6 +67,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
+    project_identity: codestory_workspace::ProjectIdentityV3,
     /// Stable logical/workspace identity plus the immutable runtime
     /// configuration used to build this context. Multi-project transports use
     /// this key instead of a path spelling, mutable artifact eligibility, or a
@@ -63,6 +76,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
     pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
 }
 
@@ -70,7 +84,114 @@ pub(crate) struct RuntimeContext {
 pub(crate) struct ProjectContextKey {
     pub(crate) project_id: String,
     pub(crate) workspace_id: String,
+    pub(crate) repository_instance: codestory_workspace::RepositoryInstanceIdentity,
     pub(crate) configuration_id: String,
+}
+
+struct RuntimeContextConfiguration {
+    project_root: PathBuf,
+    project_identity: codestory_workspace::ProjectIdentityV3,
+    context_key: ProjectContextKey,
+    cache_root: PathBuf,
+    storage_path: PathBuf,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
+}
+
+impl RuntimeContextConfiguration {
+    fn resolve(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        retained_project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
+        retained_logical_identity: Option<&codestory_workspace::LogicalProjectIdentityV3>,
+    ) -> Result<Self> {
+        let project_root = canonicalize_project_root(&args.project)?;
+        let project_identity = retained_project_identity.cloned().unwrap_or_else(|| {
+            let repository_identity =
+                codestory_workspace::inspect_repository_identity_v2(&project_root);
+            codestory_workspace::project_identity_v3_from_repository(
+                &project_root,
+                &repository_identity,
+            )
+        });
+        let logical_identity = retained_logical_identity.cloned().unwrap_or_else(|| {
+            codestory_workspace::observe_logical_project_identity_v3(&project_root)
+        });
+        let config = crate::config::load_config_with_startup(&project_root, startup)?;
+        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
+        let process_cache_root = canonicalize_configuration_path(
+            startup
+                .stdio_cache_root
+                .as_deref()
+                .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
+        )?;
+        let cache_root = cache_root_for_project_in(
+            &project_root,
+            cache_override.as_deref(),
+            &process_cache_root,
+        )?;
+        let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
+        let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults_and_identity(
+            &project_identity,
+            &sidecar_defaults,
+            &config.runtime_overrides(),
+        );
+        let source_index_policy = startup.source_index_policy.clone();
+        let context_key = ProjectContextKey {
+            project_id: project_identity.project_id.clone(),
+            workspace_id: project_identity.workspace_id.clone(),
+            repository_instance: logical_identity.repository_instance,
+            configuration_id: runtime_configuration_id(&cache_root, &sidecar, &source_index_policy),
+        };
+        Ok(Self {
+            project_root,
+            project_identity,
+            context_key,
+            cache_root,
+            storage_path,
+            sidecar,
+            source_index_policy,
+        })
+    }
+
+    fn with_profile_and_run_id(
+        mut self,
+        profile: codestory_retrieval::SidecarProfile,
+        run_id: Option<&str>,
+    ) -> Self {
+        self.sidecar =
+            self.sidecar
+                .with_profile_and_run_id(Some(&self.project_root), profile, run_id);
+        self.context_key.configuration_id =
+            runtime_configuration_id(&self.cache_root, &self.sidecar, &self.source_index_policy);
+        self
+    }
+
+    fn build(self) -> RuntimeContext {
+        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
+            self.sidecar.clone(),
+            self.source_index_policy.clone(),
+        ));
+        let events = runtime.events();
+        RuntimeContext {
+            activation: runtime.activation_service(),
+            public_operation: runtime.public_operation_service(),
+            project: runtime.project_service(),
+            index: runtime.index_service(),
+            grounding: runtime.grounding_service(),
+            bookmarks: runtime.bookmark_service(),
+            browser: runtime.browser_service(),
+            events,
+            project_root: self.project_root,
+            project_identity: self.project_identity,
+            context_key: self.context_key,
+            cache_root: self.cache_root,
+            storage_path: self.storage_path,
+            sidecar: self.sidecar,
+            source_index_policy: self.source_index_policy,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +271,8 @@ impl RuntimeContext {
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
+        #[cfg(test)]
+        RUNTIME_CONTEXT_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
         Self::new_agent_sidecar_with_startup_and_selection(args, startup, None, None)
     }
 
@@ -172,32 +295,39 @@ impl RuntimeContext {
         profile: Option<crate::args::CliSidecarProfile>,
         run_id: Option<&str>,
     ) -> Result<Self> {
-        let mut context = Self::new_with_startup(args, startup)?;
         let selected = profile
             .map(Into::into)
             .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
-        context.sidecar =
-            context
-                .sidecar
-                .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
-        context.context_key.configuration_id = runtime_configuration_id(
-            &context.cache_root,
-            &context.sidecar,
-            &context.source_index_policy,
-        );
-        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
-            context.sidecar.clone(),
-            context.source_index_policy.clone(),
-        ));
-        context.project = runtime.project_service();
-        context.index = runtime.index_service();
-        context.grounding = runtime.grounding_service();
-        context.bookmarks = runtime.bookmark_service();
-        context.browser = runtime.browser_service();
-        context.activation = runtime.activation_service();
-        context.public_operation = runtime.public_operation_service();
-        context.events = runtime.events();
-        Ok(context)
+        Ok(
+            RuntimeContextConfiguration::resolve(args, startup, None, None)?
+                .with_profile_and_run_id(selected, run_id)
+                .build(),
+        )
+    }
+
+    pub(crate) fn agent_sidecar_context_key_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        retained: &Self,
+    ) -> Result<Option<ProjectContextKey>> {
+        let logical =
+            codestory_workspace::observe_logical_project_identity_v3(&retained.project_root);
+        if logical.project_id != retained.context_key.project_id
+            || logical.workspace_id != retained.context_key.workspace_id
+            || logical.repository_instance != retained.context_key.repository_instance
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            RuntimeContextConfiguration::resolve(
+                args,
+                startup,
+                Some(&retained.project_identity),
+                Some(&logical),
+            )?
+            .with_profile_and_run_id(codestory_retrieval::SidecarProfile::Agent, None)
+            .context_key,
+        ))
     }
 
     /// Open runtime services without initializing the embedded engine.
@@ -217,60 +347,7 @@ impl RuntimeContext {
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
-        let project_root = canonicalize_project_root(&args.project)?;
-        let repository_identity =
-            codestory_workspace::inspect_repository_identity_v2(&project_root);
-        let project_identity = codestory_workspace::project_identity_v3_from_repository(
-            &project_root,
-            &repository_identity,
-        );
-        let config = crate::config::load_config_with_startup(&project_root, startup)?;
-        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
-        let process_cache_root = canonicalize_configuration_path(
-            startup
-                .stdio_cache_root
-                .as_deref()
-                .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
-        )?;
-        let cache_root = cache_root_for_project_in(
-            &project_root,
-            cache_override.as_deref(),
-            &process_cache_root,
-        )?;
-        let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
-        let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
-        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults_and_identity(
-            &project_identity,
-            &sidecar_defaults,
-            &config.runtime_overrides(),
-        );
-        let source_index_policy = startup.source_index_policy.clone();
-        let context_key = ProjectContextKey {
-            project_id: project_identity.project_id.clone(),
-            workspace_id: project_identity.workspace_id.clone(),
-            configuration_id: runtime_configuration_id(&cache_root, &sidecar, &source_index_policy),
-        };
-        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
-            sidecar.clone(),
-            source_index_policy.clone(),
-        ));
-        let events = runtime.events();
-        Ok(Self {
-            activation: runtime.activation_service(),
-            public_operation: runtime.public_operation_service(),
-            project: runtime.project_service(),
-            index: runtime.index_service(),
-            grounding: runtime.grounding_service(),
-            bookmarks: runtime.bookmark_service(),
-            browser: runtime.browser_service(),
-            events,
-            project_root,
-            context_key,
-            cache_root,
-            storage_path,
-            sidecar,
-            source_index_policy,
-        })
+        Ok(RuntimeContextConfiguration::resolve(args, startup, None, None)?.build())
     }
 
     /// Open project state and run the resolved refresh request when needed.
@@ -510,117 +587,8 @@ fn runtime_configuration_id(
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &codestory_contracts::workspace::SourceIndexPolicy,
 ) -> String {
-    // Do not hash credentials. Their presence participates in the immutable
-    // configuration boundary, while secret material remains outside logs and
-    // diagnostic identifiers.
-    let mut identity = format!(
-        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        configuration_path_identity(cache_root),
-        sidecar.profile,
-        sidecar.namespace,
-        sidecar.embedding.allow_cpu,
-        sidecar.retrieval.hybrid_enabled,
-        sidecar.retrieval.semantic_doc_scope,
-        sidecar.retrieval.semantic_doc_alias_mode,
-        sidecar.retrieval.semantic_doc_max_tokens,
-        sidecar.retrieval.llm_doc_embed_batch_size,
-        sidecar.retrieval.stream_pending_docs,
-        sidecar.retrieval.stream_sort_window_batches,
-        sidecar.summary.endpoint.as_deref().unwrap_or(""),
-        sidecar.summary.api_key.is_some(),
-    );
-    identity.push_str(&format!(
-        "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        sidecar.summary.model,
-        sidecar.summary.max_tokens,
-        sidecar.summary.timeout,
-        sidecar.run_id.as_deref().unwrap_or(""),
-        configuration_path_identity(&sidecar.layout.lexical_data_dir),
-        configuration_path_identity(&sidecar.layout.semantic_data_dir),
-        configuration_path_identity(&sidecar.layout.scip_artifacts_root),
-        configuration_path_identity(&sidecar.layout.state_file),
-        source_index_policy.policy_version,
-        source_index_policy.byte_cap,
-        source_index_policy.structural_unit_cap,
-    ));
-    fnv1a_hex(identity.as_bytes())
-}
-
-fn configuration_path_identity(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        windows_ordinal_configuration_path_identity(path)
-    }
-    #[cfg(not(windows))]
-    {
-        clean_path_string(&path.to_string_lossy())
-    }
-}
-
-#[cfg(windows)]
-fn windows_ordinal_configuration_path_identity(path: &Path) -> String {
-    use std::ptr;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LCMapStringEx(
-            locale_name: *const u16,
-            map_flags: u32,
-            source: *const u16,
-            source_len: i32,
-            destination: *mut u16,
-            destination_len: i32,
-            version_information: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
-            sort_handle: isize,
-        ) -> i32;
-    }
-
-    const LCMAP_UPPERCASE: u32 = 0x0000_0200;
-    let normalized = clean_path_string(&path.to_string_lossy()).replace('/', "\\");
-    let source = normalized.encode_utf16().collect::<Vec<_>>();
-    let Ok(source_len) = i32::try_from(source.len()) else {
-        return normalized.to_uppercase();
-    };
-    let invariant_locale = [0_u16];
-    // SAFETY: all pointers remain valid for the supplied lengths. The invariant
-    // locale uses the same language-independent uppercase table as Windows
-    // ordinal ignore-case comparison.
-    let required = unsafe {
-        LCMapStringEx(
-            invariant_locale.as_ptr(),
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            source_len,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if required <= 0 {
-        return normalized.to_uppercase();
-    }
-    let mut mapped = vec![0_u16; required as usize];
-    // SAFETY: `mapped` has the size returned by the preceding mapping query.
-    let written = unsafe {
-        LCMapStringEx(
-            invariant_locale.as_ptr(),
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            source_len,
-            mapped.as_mut_ptr(),
-            required,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if written <= 0 {
-        return normalized.to_uppercase();
-    }
-    String::from_utf16_lossy(&mapped[..written as usize])
+    RuntimeProcessConfig::new(sidecar.clone(), source_index_policy.clone())
+        .configuration_id(cache_root)
 }
 
 /// Resolve a CLI target selector into one graph-backed search hit.
@@ -810,6 +778,7 @@ fn normalize_canonical_configuration_path(path: PathBuf) -> PathBuf {
 }
 
 /// Small stable hash used for path-derived cache directory names.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -1542,18 +1511,19 @@ mod tests {
         let before_folded = canonicalize_configuration_path(&folded).expect("folded missing path");
         let before_extended =
             canonicalize_configuration_path(&extended).expect("extended missing path");
-        let expected = configuration_path_identity(&before_mixed);
-        assert_eq!(configuration_path_identity(&before_folded), expected);
-        assert_eq!(configuration_path_identity(&before_extended), expected);
+        let configuration = RuntimeProcessConfig::local();
+        let expected = configuration.configuration_id(&before_mixed);
+        assert_eq!(configuration.configuration_id(&before_folded), expected);
+        assert_eq!(configuration.configuration_id(&before_extended), expected);
 
         fs::create_dir_all(&mixed).expect("create mixed-case configuration path");
         let after_mixed = canonicalize_configuration_path(&mixed).expect("mixed existing path");
         let after_folded = canonicalize_configuration_path(&folded).expect("folded existing path");
         let after_extended =
             canonicalize_configuration_path(&extended).expect("extended existing path");
-        assert_eq!(configuration_path_identity(&after_mixed), expected);
-        assert_eq!(configuration_path_identity(&after_folded), expected);
-        assert_eq!(configuration_path_identity(&after_extended), expected);
+        assert_eq!(configuration.configuration_id(&after_mixed), expected);
+        assert_eq!(configuration.configuration_id(&after_folded), expected);
+        assert_eq!(configuration.configuration_id(&after_extended), expected);
     }
 
     #[test]
