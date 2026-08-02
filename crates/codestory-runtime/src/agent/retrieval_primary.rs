@@ -2789,6 +2789,47 @@ mod tests {
     }
 
     #[test]
+    fn stage_two_reference_adjacency_is_published_as_resolved_graph_evidence() {
+        let mut adjacency = CandidateHit::with_source(
+            "src/client.rs",
+            Some("parse_client".into()),
+            0.65,
+            CandidateSource::Scip,
+        );
+        adjacency.node_id = Some("4".into());
+        adjacency.start_line = Some(50);
+        adjacency.scip_hop_distance = Some(1);
+        // Exactly what the sidecar stage stamps: the artifact's evidence source
+        // plus the stage's own public provenance label.
+        adjacency.provenance = vec![
+            "scip_graph_projection".into(),
+            RetrievalStageKind::Stage2ScipExpand
+                .provenance_label()
+                .expect("stage 2 publishes a provenance label")
+                .to_string(),
+        ];
+        let adjacency = rank_candidates(&classify_query("parse_client"), vec![adjacency])
+            .into_iter()
+            .next()
+            .expect("ranked adjacency candidate");
+
+        let hit = search_hit_for_candidate(&adjacency);
+
+        assert_eq!(
+            hit.score_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.graph),
+            Some(0.5),
+            "validated hop-1 reference adjacency publishes the graph feature: {hit:?}"
+        );
+        assert_eq!(
+            hit.evidence_tier,
+            Some(PacketEvidenceTier::ResolvedGraph),
+            "stage-2 adjacency is graph evidence again: {hit:?}"
+        );
+    }
+
+    #[test]
     fn shadow_candidate_summaries_include_loss_point_resolution() {
         let mut candidate = CandidateHit::with_source(
             "semantic:handler",

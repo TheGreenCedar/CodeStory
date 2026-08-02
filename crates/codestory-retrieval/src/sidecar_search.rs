@@ -283,7 +283,7 @@ impl SidecarSearch for LiveSidecarSearch {
     }
 
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>> {
-        ScipClient::expand_same_file_name_affinity(
+        ScipClient::expand_reference_adjacency(
             &self.layout,
             &self.sidecar_generation,
             anchors,
@@ -297,7 +297,7 @@ impl SidecarSearch for LiveSidecarSearch {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        ScipClient::expand_same_file_name_affinity_with_cancel(
+        ScipClient::expand_reference_adjacency_with_cancel(
             &self.layout,
             &self.sidecar_generation,
             anchors,

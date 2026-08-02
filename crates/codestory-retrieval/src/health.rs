@@ -485,10 +485,14 @@ fn lexical_capabilities(
     }
 }
 
-fn scip_capabilities(availability: &ScipAvailability, project_dir: &Path) -> SidecarCapabilities {
+fn scip_capabilities(
+    availability: &ScipAvailability,
+    project_dir: &Path,
+    generation: &str,
+) -> SidecarCapabilities {
     match availability {
         ScipAvailability::Ready { revision }
-            if revision != "stub-v1" && has_real_scip_artifact(project_dir) =>
+            if revision != "stub-v1" && has_real_scip_artifact(project_dir, generation) =>
         {
             SidecarCapabilities {
                 lexical: false,
@@ -501,7 +505,7 @@ fn scip_capabilities(availability: &ScipAvailability, project_dir: &Path) -> Sid
     }
 }
 
-fn has_real_scip_artifact(project_dir: &Path) -> bool {
+fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
     let Some(revision) = std::fs::read_to_string(project_dir.join("revision.txt"))
         .ok()
         .map(|text| text.trim().to_string())
@@ -517,7 +521,7 @@ fn has_real_scip_artifact(project_dir: &Path) -> bool {
             .is_file()
         && project_dir.join("revision.txt").is_file()
         && !project_dir.join("index.scip.stub").is_file()
-        && crate::scip_index::load_fresh_scip_symbols(project_dir, &revision)
+        && crate::scip_index::load_fresh_scip_symbols(project_dir, &revision, generation)
             .ok()
             .flatten()
             .is_some_and(|index| !index.symbols.is_empty())
@@ -684,7 +688,11 @@ pub fn probe_sidecar_health_for_runtime(
 
     let scip_project_dir = layout.scip_project_dir(sidecar_generation);
     let scip_probe = ScipClient::health_probe(layout, sidecar_generation);
-    let scip_capabilities = scip_capabilities(&scip_probe.availability, &scip_project_dir);
+    let scip_capabilities = scip_capabilities(
+        &scip_probe.availability,
+        &scip_project_dir,
+        sidecar_generation,
+    );
     let scip_stub = matches!(&scip_probe.availability, ScipAvailability::Ready { .. })
         && !scip_capabilities.graph;
     let (scip_status, scip_degraded) = match &scip_probe.availability {
