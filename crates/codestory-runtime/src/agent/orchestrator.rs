@@ -865,10 +865,11 @@ fn append_packet_evidence_sections(
     if let Some(obligations) = obligations {
         bind_claims_to_packet_obligations(obligations, &mut claims);
     }
-    answer
-        .retrieval_trace
-        .annotations
-        .extend(claim_telemetry.trace_annotations(packet_claim_profile_registry_summary()));
+    // Typed field, not `annotations`: annotations are scanned as evidence by packet consumers,
+    // so always-on telemetry published there is read as a permanent gap and downgrades every
+    // packet's confidence.
+    answer.retrieval_trace.packet_claim_profile_telemetry =
+        Some(claim_telemetry.to_dto(packet_claim_profile_registry_summary()));
     if !claims.is_empty() {
         answer.sections.insert(
             1,
@@ -4955,8 +4956,10 @@ mod tests {
         EVAL_PROBES_ENV, pop_eval_probes_test_override, push_eval_probes_test_override,
     };
     use crate::agent::packet_batch::packet_anchor_probe_limit;
+    use crate::agent::packet_profile_telemetry::PACKET_CLAIM_PROFILE_CONTRACT_VERSION;
     use crate::agent::planning::packet_plan_query_is_exact_symbol_identity;
     use crate::agent::profiles::ResolvedProfile;
+    use codestory_contracts::api::PacketClaimSourceDto;
 
     struct EvalProbesGuard;
 
@@ -5142,6 +5145,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8438,6 +8442,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8506,60 +8511,133 @@ mod tests {
             None,
         );
 
-        let annotations = &answer.retrieval_trace.annotations;
-        let contract = annotations
-            .iter()
-            .find(|line| line.starts_with("packet_claim_profile_contract "))
-            .expect("contract telemetry annotation");
+        let telemetry = answer
+            .retrieval_trace
+            .packet_claim_profile_telemetry
+            .as_ref()
+            .expect("typed claim-profile telemetry");
         let summary = packet_claim_profile_registry_summary();
-        assert!(
-            contract.contains(&format!("profiles={}", summary.registered))
-                && contract.contains(&format!("pending={}", summary.pending))
-                && contract.contains(&format!("pending_ratchet={}", summary.pending_ratchet))
-                && contract.contains("citations_considered=1"),
-            "contract telemetry must publish the registry shape: {contract}"
+        assert_eq!(
+            telemetry.contract_version,
+            PACKET_CLAIM_PROFILE_CONTRACT_VERSION
+        );
+        assert_eq!(telemetry.registered_profiles as usize, summary.registered);
+        assert_eq!(telemetry.pending_profiles as usize, summary.pending);
+        assert_eq!(telemetry.pending_ratchet as usize, summary.pending_ratchet);
+        assert_eq!(telemetry.citations_considered, 1);
+
+        let fire_rate = |profile_id: &str| {
+            telemetry
+                .profiles
+                .iter()
+                .find(|entry| entry.profile_id == profile_id)
+                .unwrap_or_else(|| panic!("fire-rate entry for {profile_id}"))
+        };
+        let fired = fire_rate("shell-install-dispatch");
+        assert_eq!(
+            (fired.fired, fired.evaluated),
+            (1, 1),
+            "a fired profile must be visible in the packet trace"
+        );
+        let unfired = fire_rate("buffered-io");
+        assert_eq!(
+            (unfired.fired, unfired.evaluated),
+            (0, 1),
+            "a profile that did not fire must still report its denominator"
         );
 
-        let fire_rates = annotations
+        let source_profile_claims = telemetry
+            .claim_sources
             .iter()
-            .find(|line| line.starts_with("packet_claim_profile_fire_rates"))
-            .expect("fire-rate telemetry annotation");
+            .find(|entry| entry.source == PacketClaimSourceDto::SourceProfile)
+            .expect("source-profile claim count")
+            .claims;
         assert!(
-            fire_rates.contains("shell-install-dispatch=1/1"),
-            "a fired profile must be visible in the packet trace: {fire_rates}"
-        );
-        assert!(
-            fire_rates.contains("buffered-io=0/1"),
-            "a profile that did not fire must still report its denominator: {fire_rates}"
+            source_profile_claims > 0,
+            "source-derived claims must be counted apart from name-derived ones"
         );
 
-        let sources = annotations
-            .iter()
-            .find(|line| line.starts_with("packet_claim_sources"))
-            .expect("claim-source telemetry annotation");
-        assert!(
-            !sources.contains("source_profile=0"),
-            "source-derived claims must be counted apart from name-derived ones: {sources}"
-        );
+        let rendered = serde_json::to_string(telemetry).expect("serialize claim telemetry");
+        for leak in [
+            "install_runtime",
+            "install-runtime.sh",
+            script_display.as_str(),
+            "TOOL_DIR",
+            "download_file",
+            "bootstraps",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "claim telemetry must not carry repository text `{leak}`: {rendered}"
+            );
+        }
+    }
 
-        for annotation in annotations
-            .iter()
-            .filter(|line| line.starts_with("packet_claim_"))
-        {
-            for leak in [
+    #[test]
+    fn packet_claim_profile_telemetry_stays_out_of_the_evidence_annotation_channel() {
+        // Regression: the fire-rate counters were appended to `retrieval_trace.annotations`,
+        // which packet consumers scan for evidence gaps. `codestory-cli`'s `is_gap_annotation`
+        // substring-matches this vocabulary, so the always-on telemetry lines
+        // ("profiles_skipped_invalid=0", "skipped=0") were classified as gaps on every packet
+        // and downgraded agent confidence from high/ready to medium/review universally.
+        // Telemetry must therefore travel on its own typed field.
+        const CLI_GAP_MARKERS: [&str; 10] = [
+            "fallback",
+            "gap",
+            "low confidence",
+            "missing",
+            "no relevant",
+            "skipped",
+            "truncated",
+            "uncertain",
+            "unavailable",
+            "weak",
+        ];
+
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script_path = temp.path().join("install-runtime.sh");
+        let source = "install_runtime() {\n  SOURCE_STR='[ -s \"$TOOL_DIR/runtime.sh\" ] && source \"$TOOL_DIR/runtime.sh\"'\n  download_file \"$RUNTIME_SOURCE\" \"$TOOL_DIR/runtime.sh\"\n}\n";
+        std::fs::write(&script_path, source).expect("write shell fixture");
+        let script_display = script_path.to_string_lossy().to_string();
+        let prompt = "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
                 "install_runtime",
-                "install-runtime.sh",
-                script_display.as_str(),
-                "TOOL_DIR",
-                "download_file",
-                "bootstraps",
-            ] {
+                &script_display,
+                0.9,
+            )],
+        );
+        let annotations_before = answer.retrieval_trace.annotations.clone();
+
+        append_packet_evidence_sections(
+            &mut answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &limits,
+            None,
+        );
+
+        assert_eq!(
+            answer.retrieval_trace.annotations, annotations_before,
+            "assembling packet evidence must not add telemetry to the evidence annotation channel"
+        );
+        for annotation in &answer.retrieval_trace.annotations {
+            let lowered = annotation.to_ascii_lowercase();
+            for marker in CLI_GAP_MARKERS {
                 assert!(
-                    !annotation.contains(leak),
-                    "claim telemetry must not carry repository text `{leak}`: {annotation}"
+                    !lowered.contains(marker),
+                    "packet annotation `{annotation}` reads as evidence gap `{marker}`"
                 );
             }
         }
+        assert!(
+            answer
+                .retrieval_trace
+                .packet_claim_profile_telemetry
+                .is_some(),
+            "fire rates must still be observable, on the typed trace field"
+        );
     }
 
     #[test]
@@ -8789,6 +8867,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8873,6 +8952,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8948,6 +9028,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9168,6 +9249,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9242,6 +9324,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9310,6 +9393,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9361,6 +9445,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9409,6 +9494,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9459,6 +9545,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9511,6 +9598,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9548,6 +9636,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,

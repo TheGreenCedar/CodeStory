@@ -8,8 +8,19 @@
 //! Everything published here is derived from the static profile registry and from integer
 //! counts. No citation display name, file path, query, or source excerpt may enter a counter
 //! key or value: the trace is retained field telemetry, not an evidence surface.
+//!
+//! The counters ride on the typed `packet_claim_profile_telemetry` trace field, never on
+//! `retrieval_trace.annotations`. Annotations are the packet's evidence channel: consumers scan
+//! them for gap markers and downgrade packet confidence when one matches. Always-on telemetry
+//! published there is misread as a permanent evidence gap, so the two are kept structurally
+//! apart rather than separated by how the text happens to be worded.
 
 use std::collections::BTreeMap;
+
+use codestory_contracts::api::{
+    PacketClaimProfileFireRateDto, PacketClaimProfileTelemetryDto, PacketClaimSourceCountDto,
+    PacketClaimSourceDto,
+};
 
 /// Version of the claim-profile contract whose counters this telemetry describes.
 ///
@@ -37,16 +48,6 @@ pub(crate) enum PacketClaimSource {
 }
 
 impl PacketClaimSource {
-    pub(crate) const fn id(self) -> &'static str {
-        match self {
-            Self::SourceProfile => "source_profile",
-            Self::CommandProfile => "command_profile",
-            Self::FlowTemplate => "flow_template",
-            Self::RoleTemplate => "role_template",
-            Self::EvalProbe => "eval_probe",
-        }
-    }
-
     pub(crate) const ALL: [Self; 5] = [
         Self::SourceProfile,
         Self::CommandProfile,
@@ -54,6 +55,16 @@ impl PacketClaimSource {
         Self::RoleTemplate,
         Self::EvalProbe,
     ];
+
+    const fn dto(self) -> PacketClaimSourceDto {
+        match self {
+            Self::SourceProfile => PacketClaimSourceDto::SourceProfile,
+            Self::CommandProfile => PacketClaimSourceDto::CommandProfile,
+            Self::FlowTemplate => PacketClaimSourceDto::FlowTemplate,
+            Self::RoleTemplate => PacketClaimSourceDto::RoleTemplate,
+            Self::EvalProbe => PacketClaimSourceDto::EvalProbe,
+        }
+    }
 }
 
 /// Per-profile fire counts for one packet.
@@ -142,48 +153,49 @@ impl PacketClaimTelemetry {
             .count()
     }
 
-    /// Redaction-safe trace lines: static keys, registry profile ids, and integers only.
-    pub(crate) fn trace_annotations(
+    /// Redaction-safe typed telemetry: static registry ids and integer counts only.
+    ///
+    /// This is deliberately *not* a `Vec<String>` appended to `retrieval_trace.annotations`.
+    /// Annotations are scanned as evidence, so an always-on telemetry line published there is
+    /// classified as an evidence gap on every packet and permanently downgrades confidence.
+    pub(crate) fn to_dto(
         &self,
         registry: PacketClaimProfileRegistrySummary,
-    ) -> Vec<String> {
-        let mut annotations = Vec::new();
-        annotations.push(format!(
-            "packet_claim_profile_contract version={} profiles={} contracted={} pending={} pending_ratchet={} citations_considered={} profiles_fired={} profiles_skipped_invalid={}",
-            PACKET_CLAIM_PROFILE_CONTRACT_VERSION,
-            registry.registered,
-            registry.contracted,
-            registry.pending,
-            registry.pending_ratchet,
-            self.citations_considered,
-            self.profiles_fired(),
-            self.profiles_skipped(),
-        ));
-
-        let mut fire_rates = String::from("packet_claim_profile_fire_rates");
-        for (profile_id, count) in &self.profiles {
-            fire_rates.push_str(&format!(
-                " {profile_id}={}/{} claims={} skipped={}",
-                count.fired, count.evaluated, count.claims, count.skipped_invalid
-            ));
-            if let Some(reason) = count.skip_reason {
-                fire_rates.push_str(&format!(" skip_reason={reason}"));
-            }
+    ) -> PacketClaimProfileTelemetryDto {
+        PacketClaimProfileTelemetryDto {
+            contract_version: PACKET_CLAIM_PROFILE_CONTRACT_VERSION,
+            registered_profiles: saturating_count(registry.registered),
+            contracted_profiles: saturating_count(registry.contracted),
+            pending_profiles: saturating_count(registry.pending),
+            pending_ratchet: saturating_count(registry.pending_ratchet),
+            citations_considered: self.citations_considered,
+            profiles_fired: saturating_count(self.profiles_fired()),
+            profiles_skipped_invalid: saturating_count(self.profiles_skipped()),
+            profiles: self
+                .profiles
+                .iter()
+                .map(|(profile_id, count)| PacketClaimProfileFireRateDto {
+                    profile_id: (*profile_id).to_string(),
+                    evaluated: count.evaluated,
+                    fired: count.fired,
+                    claims: count.claims,
+                    skipped_invalid: count.skipped_invalid,
+                    skip_reason: count.skip_reason.map(str::to_string),
+                })
+                .collect(),
+            claim_sources: PacketClaimSource::ALL
+                .into_iter()
+                .map(|source| PacketClaimSourceCountDto {
+                    source: source.dto(),
+                    claims: self.claim_source_count(source),
+                })
+                .collect(),
         }
-        annotations.push(fire_rates);
-
-        let mut sources = String::from("packet_claim_sources");
-        for source in PacketClaimSource::ALL {
-            sources.push_str(&format!(
-                " {}={}",
-                source.id(),
-                self.claim_source_count(source)
-            ));
-        }
-        annotations.push(sources);
-
-        annotations
     }
+}
+
+fn saturating_count(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Static shape of the claim-profile registry, published beside the counts so a field trace
@@ -239,50 +251,113 @@ mod tests {
         telemetry.record_claim_source(PacketClaimSource::RoleTemplate, 7);
         telemetry.record_claim_source(PacketClaimSource::FlowTemplate, 0);
 
-        let annotation = telemetry
-            .trace_annotations(registry())
-            .into_iter()
-            .find(|line| line.starts_with("packet_claim_sources"))
-            .expect("claim-source annotation");
+        let dto = telemetry.to_dto(registry());
         assert_eq!(
-            annotation,
-            "packet_claim_sources source_profile=3 command_profile=0 flow_template=0 role_template=7 eval_probe=0"
+            dto.claim_sources,
+            vec![
+                PacketClaimSourceCountDto {
+                    source: PacketClaimSourceDto::SourceProfile,
+                    claims: 3,
+                },
+                PacketClaimSourceCountDto {
+                    source: PacketClaimSourceDto::CommandProfile,
+                    claims: 0,
+                },
+                PacketClaimSourceCountDto {
+                    source: PacketClaimSourceDto::FlowTemplate,
+                    claims: 0,
+                },
+                PacketClaimSourceCountDto {
+                    source: PacketClaimSourceDto::RoleTemplate,
+                    claims: 7,
+                },
+                PacketClaimSourceCountDto {
+                    source: PacketClaimSourceDto::EvalProbe,
+                    claims: 0,
+                },
+            ]
         );
     }
 
     #[test]
-    fn trace_annotations_publish_the_contract_version_and_registry_shape() {
-        let telemetry = PacketClaimTelemetry::default();
-        let annotations = telemetry.trace_annotations(registry());
-        let expected = [
-            "packet_claim_profile_contract",
-            &format!("version={PACKET_CLAIM_PROFILE_CONTRACT_VERSION}"),
-            "profiles=20",
-            "contracted=4",
-            "pending=16",
-            "pending_ratchet=16",
-            "citations_considered=0",
-            "profiles_fired=0",
-            "profiles_skipped_invalid=0",
-        ]
-        .join(" ");
-        assert_eq!(annotations[0], expected);
+    fn typed_telemetry_publishes_the_contract_version_and_registry_shape() {
+        let dto = PacketClaimTelemetry::default().to_dto(registry());
+        assert_eq!(dto.contract_version, PACKET_CLAIM_PROFILE_CONTRACT_VERSION);
+        assert_eq!(dto.registered_profiles, 20);
+        assert_eq!(dto.contracted_profiles, 4);
+        assert_eq!(dto.pending_profiles, 16);
+        assert_eq!(dto.pending_ratchet, 16);
+        assert_eq!(dto.citations_considered, 0);
+        assert_eq!(dto.profiles_fired, 0);
+        assert_eq!(dto.profiles_skipped_invalid, 0);
+        assert!(dto.profiles.is_empty());
     }
 
     #[test]
-    fn trace_annotations_carry_only_static_ids_and_integers() {
+    fn typed_telemetry_carries_only_static_ids_and_integers() {
         let mut telemetry = PacketClaimTelemetry::default();
         telemetry.record_citation_considered();
         telemetry.record_profile_evaluated("object-mapping-plan", 1);
+        telemetry.record_profile_skipped("session-request-dispatch", "no_allowed_proof_roles");
         telemetry.record_claim_source(PacketClaimSource::SourceProfile, 1);
 
-        for annotation in telemetry.trace_annotations(registry()) {
+        let dto = telemetry.to_dto(registry());
+        let static_id = |value: &str| {
+            value
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+        };
+        for profile in &dto.profiles {
             assert!(
-                annotation.chars().all(|ch| ch.is_ascii_lowercase()
-                    || ch.is_ascii_digit()
-                    || matches!(ch, '_' | '-' | '=' | '/' | ' ')),
-                "telemetry annotation must not carry free text: {annotation}"
+                static_id(&profile.profile_id),
+                "telemetry must not carry free text: {}",
+                profile.profile_id
             );
+            if let Some(reason) = &profile.skip_reason {
+                assert!(
+                    static_id(reason),
+                    "telemetry must not carry free text: {reason}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn typed_telemetry_serializes_without_a_free_text_annotation_channel() {
+        // The counters must never be reachable as annotation prose: annotation text is scanned
+        // for gap markers, and "skipped" in an always-on telemetry line reads as a permanent
+        // evidence gap on every packet.
+        let mut telemetry = PacketClaimTelemetry::default();
+        telemetry.record_citation_considered();
+        telemetry.record_profile_skipped("session-request-dispatch", "no_allowed_proof_roles");
+
+        let json = serde_json::to_value(telemetry.to_dto(registry())).expect("serialize telemetry");
+        assert!(
+            json.get("annotations").is_none(),
+            "claim-profile telemetry must not expose an annotation channel: {json}"
+        );
+        assert_eq!(json["profiles_skipped_invalid"], serde_json::json!(1));
+        assert_eq!(
+            json["profiles"][0]["skip_reason"],
+            serde_json::json!("no_allowed_proof_roles")
+        );
+
+        // A field trace is only comparable against another trace with the same layer names.
+        let layers: Vec<&str> = json["claim_sources"]
+            .as_array()
+            .expect("claim source array")
+            .iter()
+            .map(|entry| entry["source"].as_str().expect("layer id"))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                "source_profile",
+                "command_profile",
+                "flow_template",
+                "role_template",
+                "eval_probe"
+            ]
+        );
     }
 }

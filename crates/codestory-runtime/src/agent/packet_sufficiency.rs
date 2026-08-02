@@ -2653,6 +2653,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
