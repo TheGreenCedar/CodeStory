@@ -1,8 +1,8 @@
 //! Typed evidence metadata for packet citations.
 
 use codestory_contracts::api::{
-    AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHit,
-    SearchHitOrigin,
+    AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
 };
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 
@@ -40,6 +40,21 @@ pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     hit.resolution_status = Some(resolution);
     hit.eligible_for_sufficiency =
         Some(!diagnostic_source_proof && evidence_is_sufficiency_eligible(tier, resolution));
+}
+
+pub(crate) fn decorate_lexical_search_hit_evidence(hit: &mut SearchHit) {
+    hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
+        lexical: hit.score,
+        semantic: 0.0,
+        graph: 0.0,
+        total: hit.score,
+        tier_cap: None,
+        boosts: Vec::new(),
+        dampening: Vec::new(),
+        final_rank_reason: None,
+        provenance: vec!["lexical_source".to_string()],
+    });
+    decorate_search_hit_evidence(hit);
 }
 
 pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
@@ -140,10 +155,7 @@ pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
             return PacketEvidenceTier::LexicalSource;
         }
     }
-    match hit.origin {
-        SearchHitOrigin::IndexedSymbol => PacketEvidenceTier::ResolvedGraph,
-        SearchHitOrigin::TextMatch => PacketEvidenceTier::LexicalSource,
-    }
+    PacketEvidenceTier::GeneratedSummary
 }
 
 pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceResolution {
@@ -156,6 +168,9 @@ pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceReso
     }
     if let Some(resolution) = hit.resolution_status {
         return resolution;
+    }
+    if hit.evidence_tier.is_none() && hit.score_breakdown.is_none() {
+        return PacketEvidenceResolution::DiagnosticOnly;
     }
     if hit.resolvable {
         PacketEvidenceResolution::Resolved
@@ -216,10 +231,7 @@ pub(crate) fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketE
             return PacketEvidenceTier::LexicalSource;
         }
     }
-    match citation.origin {
-        SearchHitOrigin::IndexedSymbol => PacketEvidenceTier::ResolvedGraph,
-        SearchHitOrigin::TextMatch => PacketEvidenceTier::LexicalSource,
-    }
+    PacketEvidenceTier::GeneratedSummary
 }
 
 pub(crate) fn evidence_resolution_for_citation(
@@ -234,6 +246,9 @@ pub(crate) fn evidence_resolution_for_citation(
     }
     if let Some(resolution) = citation.resolution_status {
         return resolution;
+    }
+    if citation.evidence_tier.is_none() && citation.retrieval_score_breakdown.is_none() {
+        return PacketEvidenceResolution::DiagnosticOnly;
     }
     if citation.resolvable {
         PacketEvidenceResolution::Resolved
@@ -417,6 +432,53 @@ mod tests {
         );
         assert_eq!(hit.evidence_producer.as_deref(), Some("indexed_symbol"));
         assert_eq!(hit.eligible_for_sufficiency, Some(true));
+    }
+
+    #[test]
+    fn origin_without_typed_or_scored_evidence_is_diagnostic_only() {
+        for origin in [SearchHitOrigin::IndexedSymbol, SearchHitOrigin::TextMatch] {
+            let mut hit = workflow_hit();
+            hit.origin = origin;
+            hit.evidence_tier = None;
+            hit.evidence_producer = None;
+            hit.resolution_status = None;
+            hit.score_breakdown = None;
+
+            decorate_search_hit_evidence(&mut hit);
+
+            assert_eq!(
+                hit.evidence_tier,
+                Some(PacketEvidenceTier::GeneratedSummary)
+            );
+            assert_eq!(
+                hit.resolution_status,
+                Some(PacketEvidenceResolution::DiagnosticOnly)
+            );
+            assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        }
+    }
+
+    #[test]
+    fn lexical_search_lane_is_explicit_before_classification() {
+        let mut hit = workflow_hit();
+        hit.evidence_tier = None;
+        hit.evidence_producer = None;
+        hit.resolution_status = None;
+        hit.score_breakdown = None;
+
+        decorate_lexical_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::Resolved)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(true));
+        let breakdown = hit.score_breakdown.as_ref().expect("score breakdown");
+        assert_eq!(breakdown.lexical, hit.score);
+        assert_eq!(breakdown.semantic, 0.0);
+        assert_eq!(breakdown.graph, 0.0);
+        assert_eq!(breakdown.provenance, vec!["lexical_source".to_string()]);
     }
 
     #[test]

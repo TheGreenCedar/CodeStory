@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
-const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 1_500;
+const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
 const MIN_PACKET_BATCH_BUDGET_MS: u64 = 1_000;
 const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
@@ -576,9 +576,9 @@ fn sidecar_blocking_cancel_reason(query_result: &QueryResult) -> Option<&str> {
 
 pub(crate) fn sidecar_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
     latency_budget_ms
-        .map(|ms| u64::from(ms).min(DEFAULT_SIDECAR_BUDGET_MS))
+        .map(u64::from)
         .unwrap_or(DEFAULT_SIDECAR_BUDGET_MS)
-        .max(100)
+        .clamp(MIN_PACKET_BATCH_BUDGET_MS, MAX_PACKET_BATCH_BUDGET_MS)
 }
 
 fn sidecar_packet_batch_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
@@ -1884,10 +1884,6 @@ fn classify_resolved_candidate_hit(mut hit: SearchHit, candidate: &CandidateHit)
         hit.file_path = Some(candidate.file_path.clone());
         hit.line = candidate.start_line;
         hit.resolvable = false;
-        hit.evidence_tier = None;
-        hit.evidence_producer = None;
-        hit.resolution_status = None;
-        hit.eligible_for_sufficiency = None;
         hit.source_excerpt = candidate.source_excerpt.clone();
     }
     decorate_search_hit_evidence(&mut hit);
@@ -2673,6 +2669,8 @@ mod tests {
         let breakdown = score_breakdown_for_candidate(candidate);
         let hit = search_hit_for_candidate(candidate);
 
+        assert!(breakdown.lexical > 0.0);
+        assert_eq!(breakdown.semantic, 0.0);
         assert_eq!(breakdown.graph, 0.0);
         assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
     }
@@ -2692,8 +2690,11 @@ mod tests {
         let breakdown = score_breakdown_for_candidate(candidate);
         let hit = search_hit_for_candidate(candidate);
 
+        assert_eq!(breakdown.lexical, 0.0);
+        assert!(breakdown.semantic > 0.0);
         assert_eq!(breakdown.graph, 0.0);
-        assert_ne!(hit.evidence_tier, Some(PacketEvidenceTier::ResolvedGraph));
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::DenseSemantic));
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -2707,6 +2708,12 @@ mod tests {
             CandidateSource::Lexical,
         );
         lexical.provenance = vec!["lexical_source".into()];
+        lexical.start_line = Some(1);
+        lexical.target = Some(SearchTargetDto::FileRange {
+            file_path: "src/service.rs".into(),
+            start_byte: 0,
+            end_byte: 10,
+        });
         let neutral = classify_resolved_candidate_hit(
             undecorated_search_hit_for_candidate(&lexical),
             &lexical,
@@ -2731,6 +2738,10 @@ mod tests {
             structural.evidence_producer.as_deref(),
             Some("structural_markdown_collector")
         );
+        assert_eq!(
+            structural.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
         assert_eq!(structural.eligible_for_sufficiency, Some(false));
 
         let mut exact = undecorated_search_hit_for_candidate(&lexical);
@@ -2740,6 +2751,10 @@ mod tests {
         exact.eligible_for_sufficiency = Some(false);
         let exact = classify_resolved_candidate_hit(exact, &lexical);
         assert_eq!(exact.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(
+            exact.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
         assert_eq!(exact.eligible_for_sufficiency, Some(false));
 
         let mut affinity = CandidateHit::with_source(
@@ -3081,9 +3096,10 @@ mod tests {
 
     #[test]
     fn sidecar_budget_respects_latency_cap() {
-        assert_eq!(sidecar_budget_ms(Some(400)), 400);
-        assert_eq!(sidecar_budget_ms(Some(5_000)), 1_500);
+        assert_eq!(sidecar_budget_ms(Some(400)), 1_000);
+        assert_eq!(sidecar_budget_ms(Some(5_000)), 5_000);
         assert_eq!(sidecar_budget_ms(None), 1_500);
+        assert_eq!(sidecar_budget_ms(Some(250_000)), 120_000);
     }
 
     #[test]

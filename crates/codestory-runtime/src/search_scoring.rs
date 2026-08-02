@@ -12,6 +12,9 @@ use super::{
     looks_like_standalone_symbol_query, mixed_natural_language_query, normalized_hybrid_weights,
     query_mentions_non_primary_source,
 };
+use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
+#[cfg(test)]
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 #[cfg(test)]
 use crate::search_publication::{
     retrieval_state_from_engine, retrieval_state_from_engine_with_storage_contract,
@@ -417,6 +420,10 @@ impl AppController {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
             .collect())
     }
 
@@ -662,6 +669,7 @@ impl AppController {
                     final_rank_reason: None,
                     provenance: Vec::new(),
                 });
+                decorate_search_hit_evidence(&mut hit);
                 out.push(HybridSearchScoredHit {
                     hit,
                     lexical_score: scored.lexical_score,

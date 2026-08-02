@@ -2046,7 +2046,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .with_default(ValueLiteral::Boolean(true)),
         SchemaProperty::integer(
             "latency_budget_ms",
-            "Optional retrieval latency budget in milliseconds; defaults to 1500 when omitted.",
+            "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
         )
         .with_bounds(1000, 120000)
         .nullable(),
@@ -2424,5 +2424,24 @@ mod tests {
             packet["inputSchema"]["allOf"].as_array().map(Vec::len),
             Some(PACKET_PROBE_MAX_COUNT)
         );
+    }
+
+    #[test]
+    fn packet_latency_budget_schema_matches_runtime_default_and_bounds() {
+        let catalog = tools_list_json();
+        let packet = catalog["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool");
+        let budget = &packet["inputSchema"]["properties"]["latency_budget_ms"];
+
+        assert_eq!(
+            budget["description"],
+            "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted."
+        );
+        assert_eq!(budget["minimum"], 1_000);
+        assert_eq!(budget["maximum"], 120_000);
     }
 }
