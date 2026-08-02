@@ -87,12 +87,14 @@ impl IndexWriterGuard {
                     path.display()
                 ))
             })?;
-        if !FileExt::try_lock_exclusive(&file).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to acquire index writer lock {}: {error}",
-                path.display()
-            ))
-        })? {
+        if !codestory_workspace::locking::try_lock_exclusive_outliving_spawn_ghosts(&file).map_err(
+            |error| {
+                ApiError::internal(format!(
+                    "Failed to acquire index writer lock {}: {error}",
+                    path.display()
+                ))
+            },
+        )? {
             return Err(ApiError::new(
                 "cache_busy",
                 format!(
