@@ -693,3 +693,74 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         }
     }
 }
+
+#[test]
+fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_builds() {
+    // ARCH-005 shipped the claim-profile contract behind `debug_assert!`, so a release
+    // binary answered from a profile whose calibration no longer held. Validation has to
+    // run in the shipped build and skip the profile it rejects.
+    let profiles = read("crates/codestory-runtime/src/agent/packet_claim_profiles.rs");
+    let production = production_source_prefix(&profiles);
+    assert!(
+        !production.contains("debug_assert"),
+        "claim-profile contract validation must not be compiled out of release builds"
+    );
+    for required in [
+        "-> Result<(), SourceClaimProfileContractViolation>",
+        "enum SourceClaimProfileContractViolation",
+        "telemetry.record_profile_skipped(profile_id, violation.code());",
+        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+    ] {
+        assert!(
+            production.contains(required),
+            "packet claim-profile registry must keep runtime validate-or-skip: missing {required}"
+        );
+    }
+
+    let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
+    assert!(
+        production_source_prefix(&telemetry).contains("PACKET_CLAIM_PROFILE_CONTRACT_VERSION"),
+        "packet claim-profile telemetry must publish a contract version"
+    );
+}
+
+#[test]
+fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation_channel() {
+    // `retrieval_trace.annotations` is an evidence channel: `codestory-cli`'s
+    // `is_gap_annotation` substring-matches it for gap markers and downgrades packet
+    // confidence when one hits. Always-on telemetry published there matched on "skipped" and
+    // moved every packet from high/ready to medium/review. The counters must therefore be
+    // structurally separated from evidence text, not merely worded around the heuristic.
+    let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
+    let telemetry_production = production_source_prefix(&telemetry);
+    assert!(
+        telemetry_production.contains("-> PacketClaimProfileTelemetryDto"),
+        "claim-profile telemetry must be published as a typed DTO"
+    );
+    assert!(
+        !telemetry_production.contains("fn trace_annotations"),
+        "claim-profile telemetry must not render itself as trace annotations"
+    );
+
+    let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
+    let orchestrator_production = production_source_prefix(&orchestrator);
+    for required in [
+        "answer.retrieval_trace.packet_claim_profile_telemetry =",
+        "claim_telemetry.to_dto(",
+    ] {
+        assert!(
+            orchestrator_production.contains(required),
+            "packet assembly must attach claim-profile telemetry to the typed trace field: missing {required}"
+        );
+    }
+    for forbidden in [
+        ".extend(claim_telemetry",
+        "claim_telemetry.trace_annotations(",
+        "annotations.push(claim_telemetry",
+    ] {
+        assert!(
+            !orchestrator_production.contains(forbidden),
+            "claim-profile telemetry must not be appended to the evidence annotation channel: {forbidden}"
+        );
+    }
+}

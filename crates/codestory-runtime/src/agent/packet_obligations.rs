@@ -1,10 +1,11 @@
 //! Versioned packet obligations planned before retrieval and finalized from carried evidence.
 
-use super::packet_claims::packet_supported_claims;
+use super::packet_claims::packet_supported_claims_with_telemetry;
 use super::packet_evidence::citation_sufficiency_eligible;
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
 };
+use super::packet_profile_telemetry::PacketClaimTelemetry;
 use super::packet_required_probes::{
     packet_prompt_exact_symbol_probe_queries, packet_sufficiency_required_probe_queries_from_terms,
 };
@@ -1265,9 +1266,16 @@ pub(crate) fn packet_claims_with_obligation_receipts(
     answer: &AgentAnswerDto,
     plan: &PacketObligationPlanDto,
 ) -> Vec<PacketClaimDto> {
-    let mut claims = packet_supported_claims(answer);
+    packet_claims_with_obligation_receipts_and_telemetry(answer, plan).0
+}
+
+pub(crate) fn packet_claims_with_obligation_receipts_and_telemetry(
+    answer: &AgentAnswerDto,
+    plan: &PacketObligationPlanDto,
+) -> (Vec<PacketClaimDto>, PacketClaimTelemetry) {
+    let (mut claims, telemetry) = packet_supported_claims_with_telemetry(answer);
     append_packet_obligation_receipt_claims(answer, plan, &mut claims);
-    claims
+    (claims, telemetry)
 }
 
 fn append_packet_obligation_receipt_claims(
@@ -1599,6 +1607,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,

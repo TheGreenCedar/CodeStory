@@ -6,6 +6,9 @@ use crate::agent::packet_evidence_roles::{
     packet_citation_owns_request_pipeline, packet_evidence_role,
 };
 use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
+use crate::agent::packet_profile_telemetry::{
+    PacketClaimProfileRegistrySummary, PacketClaimTelemetry,
+};
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_source_patterns::{
     packet_display_owner, packet_human_join, packet_source_constructed_type, packet_source_has_all,
@@ -105,6 +108,12 @@ const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProductProfile] = &[
     SourceClaimProductProfile::pending(SourceClaimProfile::BufferedIo),
 ];
 
+/// Number of registry profiles still allowed to ship without an anti-overfit contract.
+///
+/// The ratchet only ever falls: a new profile has to arrive contracted, and migrating a
+/// pending profile has to lower this number in the same diff.
+pub(crate) const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 16;
+
 #[derive(Debug, Clone, Copy)]
 struct SourceClaimProductProfile {
     profile: SourceClaimProfile,
@@ -126,9 +135,23 @@ impl SourceClaimProductProfile {
         }
     }
 
-    fn collect(&self, ctx: &SourceClaimContext<'_>, claims: &mut Vec<String>) {
-        self.contract.assert_valid();
+    fn collect(
+        &self,
+        ctx: &SourceClaimContext<'_>,
+        claims: &mut Vec<String>,
+        telemetry: &mut PacketClaimTelemetry,
+    ) {
+        let profile_id = self.profile.id();
+        // A contract that no longer holds is a broken calibration, not a licence to answer.
+        // Release builds used to skip this check entirely, so a violation shipped silently;
+        // now the profile is skipped and the skip is counted.
+        if let Err(violation) = self.contract.validate(self.profile) {
+            telemetry.record_profile_skipped(profile_id, violation.code());
+            return;
+        }
+        let before = claims.len();
         self.profile.collect(ctx, claims);
+        telemetry.record_profile_evaluated(profile_id, claims.len().saturating_sub(before));
     }
 }
 
@@ -138,22 +161,90 @@ enum SourceClaimProfileContractStatus {
     PendingMigration,
 }
 
-impl SourceClaimProfileContractStatus {
-    fn assert_valid(self) {
-        if let Self::Contracted(contract) = self {
-            debug_assert!(matches!(contract.scope, SourceClaimProfileScope::Product));
-            debug_assert!(matches!(
-                contract.allowed_evidence_tier,
-                CoverageMode::RequiresResolvedSourceOrGraph
-                    | CoverageMode::AllowsSourceRange
-                    | CoverageMode::AllowsLexicalSource
-                    | CoverageMode::DiagnosticOnly
-            ));
-            debug_assert!(!contract.domain.is_empty());
-            debug_assert!(!contract.allowed_proof_roles.is_empty());
-            debug_assert!(!contract.positive_fixture_id.is_empty());
-            debug_assert!(!contract.false_positive_fixture_id.is_empty());
+/// Typed reasons a contracted profile is not runtime-valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceClaimProfileContractViolation {
+    NonProductScope,
+    DomainIsNotProfileIdentity,
+    DiagnosticOnlyEvidenceTier,
+    NoAllowedProofRoles,
+    DuplicateAllowedProofRole,
+    MissingPositiveFixture,
+    MissingFalsePositiveFixture,
+    FixtureIdsNotDistinct,
+}
+
+impl SourceClaimProfileContractViolation {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::NonProductScope => "non_product_scope",
+            Self::DomainIsNotProfileIdentity => "domain_is_not_profile_identity",
+            Self::DiagnosticOnlyEvidenceTier => "diagnostic_only_evidence_tier",
+            Self::NoAllowedProofRoles => "no_allowed_proof_roles",
+            Self::DuplicateAllowedProofRole => "duplicate_allowed_proof_role",
+            Self::MissingPositiveFixture => "missing_positive_fixture",
+            Self::MissingFalsePositiveFixture => "missing_false_positive_fixture",
+            Self::FixtureIdsNotDistinct => "fixture_ids_not_distinct",
         }
+    }
+}
+
+impl SourceClaimProfileContractStatus {
+    fn validate(
+        self,
+        profile: SourceClaimProfile,
+    ) -> Result<(), SourceClaimProfileContractViolation> {
+        let Self::Contracted(contract) = self else {
+            return Ok(());
+        };
+        if !matches!(contract.scope, SourceClaimProfileScope::Product) {
+            return Err(SourceClaimProfileContractViolation::NonProductScope);
+        }
+        if contract.domain != profile.id() {
+            return Err(SourceClaimProfileContractViolation::DomainIsNotProfileIdentity);
+        }
+        if matches!(contract.allowed_evidence_tier, CoverageMode::DiagnosticOnly) {
+            return Err(SourceClaimProfileContractViolation::DiagnosticOnlyEvidenceTier);
+        }
+        if contract.allowed_proof_roles.is_empty() {
+            return Err(SourceClaimProfileContractViolation::NoAllowedProofRoles);
+        }
+        for (index, role) in contract.allowed_proof_roles.iter().enumerate() {
+            if contract.allowed_proof_roles[..index]
+                .iter()
+                .any(|earlier| earlier == role)
+            {
+                return Err(SourceClaimProfileContractViolation::DuplicateAllowedProofRole);
+            }
+        }
+        if contract.positive_fixture_id.is_empty() {
+            return Err(SourceClaimProfileContractViolation::MissingPositiveFixture);
+        }
+        if contract.false_positive_fixture_id.is_empty() {
+            return Err(SourceClaimProfileContractViolation::MissingFalsePositiveFixture);
+        }
+        if contract.positive_fixture_id == contract.false_positive_fixture_id {
+            return Err(SourceClaimProfileContractViolation::FixtureIdsNotDistinct);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn packet_claim_profile_registry_summary() -> PacketClaimProfileRegistrySummary {
+    let pending = GENERIC_PRODUCT_CLAIM_PROFILES
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.contract,
+                SourceClaimProfileContractStatus::PendingMigration
+            )
+        })
+        .count();
+    PacketClaimProfileRegistrySummary {
+        registered: GENERIC_PRODUCT_CLAIM_PROFILES.len(),
+        contracted: GENERIC_PRODUCT_CLAIM_PROFILES.len() - pending,
+        pending,
+        pending_ratchet: PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET,
     }
 }
 
@@ -197,6 +288,33 @@ enum SourceClaimProfile {
 }
 
 impl SourceClaimProfile {
+    /// Stable telemetry identity. Counters are keyed by this, never by anything read out of a
+    /// citation, so a published fire rate cannot carry repository text.
+    pub(crate) const fn id(self) -> &'static str {
+        match self {
+            Self::ServerRoute => "server-route",
+            Self::ServerRequestDispatch => "server-request-dispatch",
+            Self::ShellInstallDispatch => "shell-install-dispatch",
+            Self::ShellVersionUse => "shell-version-use",
+            Self::HookCache => "hook-cache",
+            Self::ClientSend => "client-send",
+            Self::UrlSessionRequest => "url-session-request",
+            Self::StringPredicate => "string-predicate",
+            Self::StylesheetAnimation => "stylesheet-animation",
+            Self::HtmlCssTemplateStructure => "html-css-template-structure",
+            Self::SqlSchema => "sql-schema",
+            Self::RuntimeFormatting => "runtime-formatting",
+            Self::LoggerHandlerFlow => "logger-handler-flow",
+            Self::SiteBuildPhase => "site-build-phase",
+            Self::MappingConfigurationPlan => "object-mapping-plan",
+            Self::FormValidation => "form-input-validation",
+            Self::ClientRequestDispatch => "session-request-dispatch",
+            Self::EventLoopCommand => "event-loop-command",
+            Self::SearchExecution => "search-execution",
+            Self::BufferedIo => "buffered-io",
+        }
+    }
+
     fn collect(self, ctx: &SourceClaimContext<'_>, claims: &mut Vec<String>) {
         match self {
             Self::ServerRoute => {
@@ -363,13 +481,25 @@ impl<'a> SourceClaimContext<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packet_source_derived_claims_for_citation(
     prompt: &str,
     citation: &AgentCitationDto,
     source: &str,
 ) -> Vec<String> {
+    let mut telemetry = PacketClaimTelemetry::default();
+    packet_source_derived_claims_for_citation_counted(prompt, citation, source, &mut telemetry)
+}
+
+pub(crate) fn packet_source_derived_claims_for_citation_counted(
+    prompt: &str,
+    citation: &AgentCitationDto,
+    source: &str,
+    telemetry: &mut PacketClaimTelemetry,
+) -> Vec<String> {
     let mut claims = Vec::new();
     let ctx = SourceClaimContext::new(prompt, citation, source);
+    telemetry.record_citation_considered();
 
     #[cfg(test)]
     if eval_probes_enabled() {
@@ -379,7 +509,7 @@ pub(crate) fn packet_source_derived_claims_for_citation(
     }
 
     for profile in GENERIC_PRODUCT_CLAIM_PROFILES {
-        profile.collect(&ctx, &mut claims);
+        profile.collect(&ctx, &mut claims, telemetry);
     }
 
     claims
@@ -2485,129 +2615,455 @@ mod tests {
         }
     }
 
-    #[test]
-    fn high_risk_product_profiles_have_anti_overfit_contracts() {
-        let expectations = [
-            (
-                SourceClaimProfile::ShellInstallDispatch,
-                "shell-install-dispatch",
-                CoverageMode::AllowsLexicalSource,
-                &[
+    /// One row per registered product claim profile. The table is the contract: a profile that
+    /// is not listed here, or listed with a different status, fails the registry tests below.
+    struct ProfileContractRow {
+        profile: SourceClaimProfile,
+        id: &'static str,
+        status: ExpectedContractStatus,
+    }
+
+    enum ExpectedContractStatus {
+        Contracted {
+            allowed_evidence_tier: CoverageMode,
+            allowed_proof_roles: &'static [FlowRole],
+            positive_fixture_id: &'static str,
+            false_positive_fixture_id: &'static str,
+        },
+        PendingMigration,
+    }
+
+    const PROFILE_CONTRACT_TABLE: &[ProfileContractRow] = &[
+        ProfileContractRow {
+            profile: SourceClaimProfile::ServerRoute,
+            id: "server-route",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::ServerRequestDispatch,
+            id: "server-request-dispatch",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::ShellInstallDispatch,
+            id: "shell-install-dispatch",
+            status: ExpectedContractStatus::Contracted {
+                allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+                allowed_proof_roles: &[
                     FlowRole::Entrypoint,
                     FlowRole::Dispatch,
                     FlowRole::TerminalBoundary,
-                ][..],
-                "generic-shell-install-dispatch-positive",
-                "generic-shell-install-dispatch-helper-negative",
-            ),
-            (
-                SourceClaimProfile::ShellVersionUse,
-                "shell-version-use",
-                CoverageMode::AllowsLexicalSource,
-                &[FlowRole::Dispatch][..],
-                "generic-shell-version-use-positive",
-                "generic-shell-version-use-helper-negative",
-            ),
-            (
-                SourceClaimProfile::MappingConfigurationPlan,
-                "object-mapping-plan",
-                CoverageMode::RequiresResolvedSourceOrGraph,
-                &[FlowRole::Configuration, FlowRole::Dispatch][..],
-                "generic-object-mapping-plan-positive",
-                "generic-object-mapping-cache-helper-negative",
-            ),
-            (
-                SourceClaimProfile::ClientRequestDispatch,
-                "session-request-dispatch",
-                CoverageMode::RequiresResolvedSourceOrGraph,
-                &[
+                ],
+                positive_fixture_id: "generic-shell-install-dispatch-positive",
+                false_positive_fixture_id: "generic-shell-install-dispatch-helper-negative",
+            },
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::ShellVersionUse,
+            id: "shell-version-use",
+            status: ExpectedContractStatus::Contracted {
+                allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+                allowed_proof_roles: &[FlowRole::Dispatch],
+                positive_fixture_id: "generic-shell-version-use-positive",
+                false_positive_fixture_id: "generic-shell-version-use-helper-negative",
+            },
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::HookCache,
+            id: "hook-cache",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::ClientSend,
+            id: "client-send",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::UrlSessionRequest,
+            id: "url-session-request",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::StringPredicate,
+            id: "string-predicate",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::StylesheetAnimation,
+            id: "stylesheet-animation",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::HtmlCssTemplateStructure,
+            id: "html-css-template-structure",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::SqlSchema,
+            id: "sql-schema",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::RuntimeFormatting,
+            id: "runtime-formatting",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::LoggerHandlerFlow,
+            id: "logger-handler-flow",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::SiteBuildPhase,
+            id: "site-build-phase",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::MappingConfigurationPlan,
+            id: "object-mapping-plan",
+            status: ExpectedContractStatus::Contracted {
+                allowed_evidence_tier: CoverageMode::RequiresResolvedSourceOrGraph,
+                allowed_proof_roles: &[FlowRole::Configuration, FlowRole::Dispatch],
+                positive_fixture_id: "generic-object-mapping-plan-positive",
+                false_positive_fixture_id: "generic-object-mapping-cache-helper-negative",
+            },
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::FormValidation,
+            id: "form-input-validation",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::ClientRequestDispatch,
+            id: "session-request-dispatch",
+            status: ExpectedContractStatus::Contracted {
+                allowed_evidence_tier: CoverageMode::RequiresResolvedSourceOrGraph,
+                allowed_proof_roles: &[
                     FlowRole::Entrypoint,
                     FlowRole::Dispatch,
                     FlowRole::TransformOrValidate,
                     FlowRole::TerminalBoundary,
-                ][..],
-                "generic-session-request-dispatch-positive",
-                "generic-session-request-transport-negative",
-            ),
-        ];
+                ],
+                positive_fixture_id: "generic-session-request-dispatch-positive",
+                false_positive_fixture_id: "generic-session-request-transport-negative",
+            },
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::EventLoopCommand,
+            id: "event-loop-command",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::SearchExecution,
+            id: "search-execution",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+        ProfileContractRow {
+            profile: SourceClaimProfile::BufferedIo,
+            id: "buffered-io",
+            status: ExpectedContractStatus::PendingMigration,
+        },
+    ];
 
-        for (
-            profile,
-            domain,
-            allowed_evidence_tier,
-            allowed_proof_roles,
-            positive_fixture_id,
-            false_positive_fixture_id,
-        ) in expectations
+    #[test]
+    fn product_claim_profile_table_covers_every_registered_profile_in_order() {
+        assert_eq!(
+            PROFILE_CONTRACT_TABLE.len(),
+            GENERIC_PRODUCT_CLAIM_PROFILES.len(),
+            "every registered claim profile needs a contract row"
+        );
+        let mut seen_ids = HashSet::new();
+        for (row, entry) in PROFILE_CONTRACT_TABLE
+            .iter()
+            .zip(GENERIC_PRODUCT_CLAIM_PROFILES.iter())
         {
-            let contract = contracted_product_profile(profile)
-                .unwrap_or_else(|| panic!("expected anti-overfit contract for {profile:?}"));
-            assert_eq!(contract.domain, domain);
-            assert_eq!(contract.scope, SourceClaimProfileScope::Product);
-            assert_eq!(contract.allowed_evidence_tier, allowed_evidence_tier);
-            assert_eq!(contract.allowed_proof_roles, allowed_proof_roles);
-            assert_eq!(contract.positive_fixture_id, positive_fixture_id);
             assert_eq!(
-                contract.false_positive_fixture_id,
-                false_positive_fixture_id
+                row.profile, entry.profile,
+                "contract table must list profiles in registry order"
             );
+            assert_eq!(
+                row.id,
+                row.profile.id(),
+                "{:?} telemetry id must match the contract table",
+                row.profile
+            );
+            assert!(
+                seen_ids.insert(row.id),
+                "profile telemetry id `{}` is not unique",
+                row.id
+            );
+            assert!(
+                !row.id.is_empty()
+                    && row
+                        .id
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+                "profile telemetry id `{}` must stay a redaction-safe slug",
+                row.id
+            );
+        }
+    }
 
-            for value in [
-                contract.domain,
-                contract.positive_fixture_id,
-                contract.false_positive_fixture_id,
-            ] {
-                let lower = value.to_ascii_lowercase();
-                for blocked in ["requests", "nvm", "automapper", "axios"] {
+    #[test]
+    fn product_claim_profile_table_pins_contracted_fields_and_status() {
+        for (row, entry) in PROFILE_CONTRACT_TABLE
+            .iter()
+            .zip(GENERIC_PRODUCT_CLAIM_PROFILES.iter())
+        {
+            match (&row.status, entry.contract) {
+                (
+                    ExpectedContractStatus::Contracted {
+                        allowed_evidence_tier,
+                        allowed_proof_roles,
+                        positive_fixture_id,
+                        false_positive_fixture_id,
+                    },
+                    SourceClaimProfileContractStatus::Contracted(contract),
+                ) => {
+                    assert_eq!(contract.domain, row.id);
+                    assert_eq!(contract.scope, SourceClaimProfileScope::Product);
+                    assert_eq!(contract.allowed_evidence_tier, *allowed_evidence_tier);
+                    assert_eq!(contract.allowed_proof_roles, *allowed_proof_roles);
+                    assert_eq!(contract.positive_fixture_id, *positive_fixture_id);
+                    assert_eq!(
+                        contract.false_positive_fixture_id,
+                        *false_positive_fixture_id
+                    );
+                    for value in [
+                        contract.domain,
+                        contract.positive_fixture_id,
+                        contract.false_positive_fixture_id,
+                    ] {
+                        let lower = value.to_ascii_lowercase();
+                        for blocked in ["requests", "nvm", "automapper", "axios"] {
+                            assert!(
+                                !lower.contains(blocked),
+                                "contract value `{value}` must stay generic"
+                            );
+                        }
+                    }
+                }
+                (
+                    ExpectedContractStatus::PendingMigration,
+                    SourceClaimProfileContractStatus::PendingMigration,
+                ) => {
                     assert!(
-                        !lower.contains(blocked),
-                        "contract value `{value}` must stay generic"
+                        contracted_product_profile(row.profile).is_none(),
+                        "{:?} needs concrete overfit-risk evidence before contract migration",
+                        row.profile
                     );
                 }
+                (expected, actual) => panic!(
+                    "{:?} contract status drifted from the table: expected {}, registry has {actual:?}",
+                    row.profile,
+                    match expected {
+                        ExpectedContractStatus::Contracted { .. } => "contracted",
+                        ExpectedContractStatus::PendingMigration => "pending migration",
+                    }
+                ),
             }
         }
     }
 
     #[test]
-    fn non_high_risk_product_profiles_stay_pending_until_risk_evidence() {
-        let pending = [
-            SourceClaimProfile::ServerRoute,
-            SourceClaimProfile::ServerRequestDispatch,
-            SourceClaimProfile::HookCache,
-            SourceClaimProfile::ClientSend,
-            SourceClaimProfile::UrlSessionRequest,
-            SourceClaimProfile::StringPredicate,
-            SourceClaimProfile::StylesheetAnimation,
-            SourceClaimProfile::HtmlCssTemplateStructure,
-            SourceClaimProfile::SqlSchema,
-            SourceClaimProfile::RuntimeFormatting,
-            SourceClaimProfile::LoggerHandlerFlow,
-            SourceClaimProfile::SiteBuildPhase,
-            SourceClaimProfile::FormValidation,
-            SourceClaimProfile::EventLoopCommand,
-            SourceClaimProfile::SearchExecution,
-            SourceClaimProfile::BufferedIo,
-        ];
-
-        let actual_pending: Vec<_> = GENERIC_PRODUCT_CLAIM_PROFILES
-            .iter()
-            .filter_map(|entry| match entry.contract {
-                SourceClaimProfileContractStatus::PendingMigration => Some(entry.profile),
-                SourceClaimProfileContractStatus::Contracted(_) => None,
-            })
-            .collect();
-
-        assert_eq!(actual_pending.len(), pending.len());
-        for profile in pending {
-            assert!(
-                actual_pending.contains(&profile),
-                "expected {profile:?} to remain pending migration"
-            );
-            assert!(
-                contracted_product_profile(profile).is_none(),
-                "{profile:?} needs concrete overfit-risk evidence before contract migration"
+    fn every_registered_profile_is_runtime_valid_or_explicitly_pending() {
+        for entry in GENERIC_PRODUCT_CLAIM_PROFILES {
+            assert_eq!(
+                entry.contract.validate(entry.profile),
+                Ok(()),
+                "{:?} ships a contract that runtime validation rejects",
+                entry.profile
             );
         }
+    }
+
+    #[test]
+    fn pending_migration_profiles_stay_at_or_below_the_declared_ratchet() {
+        let summary = packet_claim_profile_registry_summary();
+        let table_pending = PROFILE_CONTRACT_TABLE
+            .iter()
+            .filter(|row| matches!(row.status, ExpectedContractStatus::PendingMigration))
+            .count();
+
+        assert_eq!(summary.registered, PROFILE_CONTRACT_TABLE.len());
+        assert_eq!(summary.pending, table_pending);
+        assert_eq!(summary.contracted, summary.registered - summary.pending);
+        assert_eq!(
+            summary.pending_ratchet,
+            PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET
+        );
+        assert!(
+            summary.pending <= PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET,
+            "a new uncontracted profile must lower, never raise, the pending ratchet"
+        );
+        assert_eq!(
+            summary.pending, PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET,
+            "migrating a pending profile must lower the declared ratchet in the same change"
+        );
+    }
+
+    #[test]
+    fn runtime_contract_validation_rejects_each_typed_violation() {
+        let base = SourceClaimProfileContract {
+            domain: "shell-version-use",
+            scope: SourceClaimProfileScope::Product,
+            allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+            allowed_proof_roles: &[FlowRole::Dispatch],
+            positive_fixture_id: "generic-shell-version-use-positive",
+            false_positive_fixture_id: "generic-shell-version-use-helper-negative",
+        };
+        let profile = SourceClaimProfile::ShellVersionUse;
+        assert_eq!(
+            SourceClaimProfileContractStatus::Contracted(base).validate(profile),
+            Ok(())
+        );
+
+        let cases = [
+            (
+                SourceClaimProfileContract { domain: "", ..base },
+                SourceClaimProfileContractViolation::DomainIsNotProfileIdentity,
+            ),
+            (
+                SourceClaimProfileContract {
+                    allowed_evidence_tier: CoverageMode::DiagnosticOnly,
+                    ..base
+                },
+                SourceClaimProfileContractViolation::DiagnosticOnlyEvidenceTier,
+            ),
+            (
+                SourceClaimProfileContract {
+                    allowed_proof_roles: &[],
+                    ..base
+                },
+                SourceClaimProfileContractViolation::NoAllowedProofRoles,
+            ),
+            (
+                SourceClaimProfileContract {
+                    allowed_proof_roles: &[FlowRole::Dispatch, FlowRole::Dispatch],
+                    ..base
+                },
+                SourceClaimProfileContractViolation::DuplicateAllowedProofRole,
+            ),
+            (
+                SourceClaimProfileContract {
+                    positive_fixture_id: "",
+                    ..base
+                },
+                SourceClaimProfileContractViolation::MissingPositiveFixture,
+            ),
+            (
+                SourceClaimProfileContract {
+                    false_positive_fixture_id: "",
+                    ..base
+                },
+                SourceClaimProfileContractViolation::MissingFalsePositiveFixture,
+            ),
+            (
+                SourceClaimProfileContract {
+                    false_positive_fixture_id: "generic-shell-version-use-positive",
+                    ..base
+                },
+                SourceClaimProfileContractViolation::FixtureIdsNotDistinct,
+            ),
+        ];
+
+        let mut codes = HashSet::new();
+        for (contract, expected) in cases {
+            assert_eq!(
+                SourceClaimProfileContractStatus::Contracted(contract).validate(profile),
+                Err(expected)
+            );
+            assert!(
+                codes.insert(expected.code()),
+                "violation codes must be distinct: {}",
+                expected.code()
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_contract_skips_the_profile_instead_of_emitting_claims() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let fixture = contract_fixture("generic-shell-version-use-positive");
+        let citation = test_packet_citation(fixture.symbol, fixture.path);
+        let ctx = SourceClaimContext::new(fixture.prompt, &citation, fixture.source);
+
+        let valid = SourceClaimProductProfile::contracted(
+            SourceClaimProfile::ShellVersionUse,
+            SourceClaimProfileContract {
+                domain: "shell-version-use",
+                scope: SourceClaimProfileScope::Product,
+                allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+                allowed_proof_roles: &[FlowRole::Dispatch],
+                positive_fixture_id: "generic-shell-version-use-positive",
+                false_positive_fixture_id: "generic-shell-version-use-helper-negative",
+            },
+        );
+        let mut claims = Vec::new();
+        let mut telemetry = PacketClaimTelemetry::default();
+        valid.collect(&ctx, &mut claims, &mut telemetry);
+        assert!(
+            !claims.is_empty(),
+            "control profile must still emit its contracted claim"
+        );
+        let fired = telemetry.profile_fire_count("shell-version-use");
+        assert_eq!(fired.evaluated, 1);
+        assert_eq!(fired.fired, 1);
+        assert_eq!(fired.skipped_invalid, 0);
+
+        let invalid = SourceClaimProductProfile::contracted(
+            SourceClaimProfile::ShellVersionUse,
+            SourceClaimProfileContract {
+                allowed_proof_roles: &[],
+                ..match valid.contract {
+                    SourceClaimProfileContractStatus::Contracted(contract) => contract,
+                    SourceClaimProfileContractStatus::PendingMigration => {
+                        panic!("control profile is contracted")
+                    }
+                }
+            },
+        );
+        let mut claims = Vec::new();
+        let mut telemetry = PacketClaimTelemetry::default();
+        invalid.collect(&ctx, &mut claims, &mut telemetry);
+        assert!(
+            claims.is_empty(),
+            "a profile whose contract fails runtime validation must publish nothing: {claims:?}"
+        );
+        let skipped = telemetry.profile_fire_count("shell-version-use");
+        assert_eq!(skipped.evaluated, 1);
+        assert_eq!(skipped.fired, 0);
+        assert_eq!(skipped.skipped_invalid, 1);
+        assert_eq!(skipped.skip_reason, Some("no_allowed_proof_roles"));
+    }
+
+    #[test]
+    fn source_derived_collection_counts_fire_rates_per_profile() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let fixture = contract_fixture("generic-shell-install-dispatch-positive");
+        let citation = test_packet_citation(fixture.symbol, fixture.path);
+        let mut telemetry = PacketClaimTelemetry::default();
+        let claims = packet_source_derived_claims_for_citation_counted(
+            fixture.prompt,
+            &citation,
+            fixture.source,
+            &mut telemetry,
+        );
+
+        assert!(!claims.is_empty());
+        assert_eq!(telemetry.citations_considered(), 1);
+        let fired = telemetry.profile_fire_count("shell-install-dispatch");
+        assert_eq!(fired.evaluated, 1);
+        assert_eq!(fired.fired, 1);
+        assert_eq!(
+            fired.claims,
+            u32::try_from(claims.len()).expect("claims fit")
+        );
+
+        let quiet = telemetry.profile_fire_count("buffered-io");
+        assert_eq!(quiet.evaluated, 1);
+        assert_eq!(quiet.fired, 0);
+        assert_eq!(quiet.claims, 0);
     }
 
     #[test]

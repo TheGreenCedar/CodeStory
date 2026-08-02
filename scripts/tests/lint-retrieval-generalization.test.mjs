@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import {
   deriveProductRepositoryNames,
   parseBenchmarkPromptLiterals,
+  pendingClaimProfileProblem,
+  pendingInventoryTotalsProblem,
   runRetrievalGeneralizationLint,
 } from "../lib/retrieval-generalization-lint.mjs";
 
@@ -1139,4 +1141,112 @@ test("ranker production has no repository filename literals", () => {
     undefined,
     `ranker production contains a repository filename literal: ${JSON.stringify(finding)}`,
   );
+});
+
+// The pending inventory is checked as data, not against the checkout: the lint
+// binary itself is what compares these declarations to the shipped tree, and it
+// exits non-zero on any drift. These cases pin the comparison in both directions.
+const PENDING_SURFACE_REASON =
+  "Recorded because the surface still exists and the burn-down is tracked on its issue.";
+
+function syntheticInventory() {
+  return {
+    total_markers: 2,
+    total_marker_occurrences: 5,
+    surfaces: {
+      "crates/first/src/lib.rs": {
+        issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+        reason: PENDING_SURFACE_REASON,
+        markers: { alpha: 3 },
+      },
+      "crates/second/src/lib.rs": {
+        issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+        reason: PENDING_SURFACE_REASON,
+        markers: { beta: 2 },
+      },
+    },
+  };
+}
+
+function syntheticClaimProfileRatchet() {
+  return {
+    file: "crates/codestory-runtime/src/agent/packet_claim_profiles.rs",
+    declaration: "SourceClaimProductProfile::pending(",
+    count: 3,
+    issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+    reason: PENDING_SURFACE_REASON,
+  };
+}
+
+function syntheticProfileRegistry(pendingCount) {
+  return "SourceClaimProductProfile::pending(SourceClaimProfile::Example),\n"
+    .repeat(pendingCount);
+}
+
+test("an exact pending inventory reports no totals problem", () => {
+  assert.equal(pendingInventoryTotalsProblem(syntheticInventory()), null);
+});
+
+test("either declared inventory total drifting fails in both directions", () => {
+  for (const field of ["total_markers", "total_marker_occurrences"]) {
+    for (const delta of [-1, 1]) {
+      const inventory = syntheticInventory();
+      inventory[field] += delta;
+      assert.match(
+        pendingInventoryTotalsProblem(inventory) ?? "",
+        new RegExp(`declares ${field} ${inventory[field]} but lists `, "u"),
+        `${field} must be exact, not a floor or a ceiling`,
+      );
+    }
+  }
+});
+
+test("occurrence drift inside one marker fails even when the marker count holds", () => {
+  const inventory = syntheticInventory();
+  inventory.surfaces["crates/first/src/lib.rs"].markers.alpha += 1;
+  const problem = pendingInventoryTotalsProblem(inventory);
+  assert.equal(problem.includes("total_markers "), false);
+  assert.match(problem, /declares total_marker_occurrences 5 but lists 6 occurrences/u);
+});
+
+test("a matching claim-profile ratchet reports no problem", () => {
+  const declared = syntheticClaimProfileRatchet();
+  assert.equal(
+    pendingClaimProfileProblem(declared, () => syntheticProfileRegistry(declared.count)),
+    null,
+  );
+});
+
+test("claim-profile ratchet drift fails deterministically in both directions", () => {
+  const declared = syntheticClaimProfileRatchet();
+  for (const observed of [declared.count - 1, declared.count + 1]) {
+    assert.match(
+      pendingClaimProfileProblem(declared, () => syntheticProfileRegistry(observed)) ?? "",
+      new RegExp(`declared ${declared.count} time\\(s\\), tree has ${observed}`, "u"),
+    );
+  }
+  assert.match(
+    pendingClaimProfileProblem(declared, () => null),
+    /which the tree no longer has/u,
+  );
+});
+
+test("a malformed claim-profile ratchet fails closed", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  for (const invalid of [
+    undefined,
+    null,
+    { ...declared, count: -1 },
+    { ...declared, count: 1.5 },
+    { ...declared, declaration: "" },
+    { ...declared, file: "" },
+    { ...declared, reason: "too short" },
+    { ...declared, issue: "https://example.com/issues/1" },
+  ]) {
+    assert.match(
+      pendingClaimProfileProblem(invalid, registry) ?? "",
+      /pending_claim_profiles must declare/u,
+    );
+  }
 });

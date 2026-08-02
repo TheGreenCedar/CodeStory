@@ -2338,6 +2338,89 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub diagnostic: Option<String>,
 }
 
+/// Which layer produced a packet claim.
+///
+/// Source-grounded profile claims and name-derived templates are different facts; counting
+/// them apart is what lets a field trace answer "did the fitted layer fire, or did this packet
+/// degrade to naming?".
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketClaimSourceDto {
+    /// Source-text-derived claims from the versioned product claim-profile registry.
+    SourceProfile,
+    /// Claims templated from a command/subcommand shape in the question.
+    CommandProfile,
+    /// Generic flow templates that are neither profile- nor role-derived.
+    FlowTemplate,
+    /// Name-and-path-derived evidence-role sentences.
+    RoleTemplate,
+    /// Test-only evaluation-probe flow templates.
+    EvalProbe,
+}
+
+/// Fire counts for one claim profile within one packet.
+///
+/// Every field is either a registry-static profile id or an integer count. No citation display
+/// name, file path, query, or source excerpt may appear here: this is retained field telemetry,
+/// not an evidence surface.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimProfileFireRateDto {
+    /// Static profile id from the claim-profile registry.
+    pub profile_id: String,
+    /// Citations this profile was offered.
+    pub evaluated: u32,
+    /// Citations for which this profile emitted at least one claim.
+    pub fired: u32,
+    /// Claims this profile emitted.
+    pub claims: u32,
+    /// Citations where a runtime contract violation skipped this profile before it ran.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub skipped_invalid: u32,
+    /// Typed violation code that caused the skip, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// Claims attributed to one producing layer within one packet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimSourceCountDto {
+    pub source: PacketClaimSourceDto,
+    pub claims: u32,
+}
+
+/// Packet claim-profile fire-rate telemetry.
+///
+/// This travels on its own typed trace field rather than in
+/// [`AgentRetrievalTraceDto::annotations`] on purpose. Annotations are an evidence channel:
+/// consumers scan them for gap markers and downgrade packet confidence when one is found.
+/// Always-on telemetry pushed through that channel is read as a permanent evidence gap, so the
+/// counters are structurally separated from evidence text instead.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketClaimProfileTelemetryDto {
+    /// Version of the claim-profile contract these counters describe.
+    pub contract_version: u32,
+    /// Profiles present in the registry when the counters were taken.
+    pub registered_profiles: u32,
+    /// Registry profiles carrying a runtime-enforced contract.
+    pub contracted_profiles: u32,
+    /// Registry profiles still awaiting contract migration.
+    pub pending_profiles: u32,
+    /// Ratchet ceiling for `pending_profiles`.
+    pub pending_ratchet: u32,
+    /// Citations offered to the profile layer while assembling the packet.
+    pub citations_considered: u32,
+    /// Distinct profiles that emitted at least one claim.
+    pub profiles_fired: u32,
+    /// Distinct profiles skipped by a runtime contract violation.
+    pub profiles_skipped_invalid: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<PacketClaimProfileFireRateDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_sources: Vec<PacketClaimSourceCountDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
@@ -2355,8 +2438,13 @@ pub struct AgentRetrievalTraceDto {
     pub semantic_fallback_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_fallbacks: Vec<SemanticFallbackRecordDto>,
+    /// Free-text retrieval notes. This is an evidence channel: consumers scan it for gap
+    /// markers. Never publish always-on telemetry here — use a typed field instead.
     #[serde(default)]
     pub annotations: Vec<String>,
+    /// Typed claim-profile fire-rate telemetry, kept out of `annotations` by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_claim_profile_telemetry: Option<PacketClaimProfileTelemetryDto>,
     pub steps: Vec<AgentRetrievalStepDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packet_sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
@@ -3250,6 +3338,7 @@ mod packet_tests {
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
             annotations: Vec::new(),
+            packet_claim_profile_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: Some(RetrievalShadowDto {
@@ -3291,6 +3380,78 @@ mod packet_tests {
                 .map(|shadow| shadow.retrieval_mode.as_str()),
             Some("unavailable")
         );
+    }
+
+    #[test]
+    fn packet_claim_profile_telemetry_is_a_typed_trace_field_separate_from_annotations() {
+        // Annotations are the packet's evidence channel; consumers scan the text for gap
+        // markers. Claim-profile counters are always present, so they get their own typed
+        // field and must never be serialized as annotation prose.
+        let telemetry = PacketClaimProfileTelemetryDto {
+            contract_version: 1,
+            registered_profiles: 20,
+            contracted_profiles: 4,
+            pending_profiles: 16,
+            pending_ratchet: 16,
+            citations_considered: 3,
+            profiles_fired: 2,
+            profiles_skipped_invalid: 1,
+            profiles: vec![PacketClaimProfileFireRateDto {
+                profile_id: "session-request-dispatch".to_string(),
+                evaluated: 3,
+                fired: 0,
+                claims: 0,
+                skipped_invalid: 1,
+                skip_reason: Some("no_allowed_proof_roles".to_string()),
+            }],
+            claim_sources: vec![PacketClaimSourceCountDto {
+                source: PacketClaimSourceDto::SourceProfile,
+                claims: 4,
+            }],
+        };
+        let trace = AgentRetrievalTraceDto {
+            request_id: "r2".to_string(),
+            retrieval_publication: None,
+            resolved_profile: AgentRetrievalPresetDto::Architecture,
+            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+            total_latency_ms: 10,
+            sla_target_ms: None,
+            sla_missed: false,
+            semantic_fallback_count: 0,
+            semantic_fallbacks: Vec::new(),
+            annotations: Vec::new(),
+            packet_claim_profile_telemetry: Some(telemetry.clone()),
+            steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
+            retrieval_shadow: None,
+        };
+
+        let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(value["annotations"], serde_json::json!([]));
+        assert_eq!(
+            value["packet_claim_profile_telemetry"]["profiles_skipped_invalid"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            value["packet_claim_profile_telemetry"]["claim_sources"][0]["source"],
+            serde_json::json!("source_profile")
+        );
+
+        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.packet_claim_profile_telemetry, Some(telemetry));
+
+        // Older payloads without the field stay readable and carry no telemetry.
+        let legacy = serde_json::json!({
+            "request_id": "r3",
+            "resolved_profile": "architecture",
+            "policy_mode": "latency_first",
+            "total_latency_ms": 4,
+            "candidate_count": 0,
+            "steps": [],
+        });
+        let parsed_legacy: AgentRetrievalTraceDto =
+            serde_json::from_value(legacy).expect("deserialize legacy trace");
+        assert!(parsed_legacy.packet_claim_profile_telemetry.is_none());
     }
 
     #[test]
