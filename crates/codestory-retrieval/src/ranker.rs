@@ -197,6 +197,21 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
 }
 
 fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
+    // Ranking may use cross-lane priors, but the public breakdown may only claim
+    // a lane that actually produced this candidate.
+    if !matches!(
+        candidate.source,
+        CandidateSource::Lexical | CandidateSource::Legacy
+    ) && !candidate_has_provenance(candidate, "lexical_source")
+    {
+        features.lexical = 0.0;
+    }
+    if !matches!(candidate.source, CandidateSource::Semantic)
+        && !candidate_has_provenance(candidate, "dense_anchor")
+        && !candidate_has_provenance(candidate, "component_report")
+    {
+        features.semantic = 0.0;
+    }
     if !candidate_has_graph_provenance(candidate) {
         features.scip_distance = 0.0;
     }
@@ -630,6 +645,25 @@ mod tests {
     }
 
     #[test]
+    fn ranker_exports_only_dense_feature_for_pure_dense_candidate() {
+        let features = classify_query("explain search service");
+        let mut dense = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.9,
+            CandidateSource::Semantic,
+        );
+        dense.provenance = vec!["dense_anchor".into()];
+
+        let ranked = rank_candidates(&features, vec![dense]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.0);
+        assert!(rank_features.semantic > 0.0);
+        assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
     fn ranker_prefers_entrypoint_role_over_test_role() {
         let features = classify_query("main startup entrypoint");
         let mut test_hit = CandidateHit::lexical_stub("src/main_test.rs", 0.94);
@@ -925,6 +959,8 @@ mod tests {
         let ranked = rank_candidates(&features, vec![graph]);
         let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
 
+        assert_eq!(rank_features.lexical, 0.0);
+        assert_eq!(rank_features.semantic, 0.0);
         assert_eq!(rank_features.scip_distance, 0.5);
     }
 }

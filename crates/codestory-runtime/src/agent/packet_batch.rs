@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
 
-const DEFAULT_SLA_TARGET_MS: u32 = 1_500;
+const DEFAULT_SLA_TARGET_MS: u32 = 18_000;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn packet_latency_budget_preserves_advertised_range_and_default() {
-        assert_eq!(PacketLatencyBudget::new(None).target_ms, 1_500);
+        assert_eq!(PacketLatencyBudget::new(None).target_ms, 18_000);
         assert_eq!(PacketLatencyBudget::new(Some(10)).target_ms, 1_000);
         assert_eq!(PacketLatencyBudget::new(Some(120_001)).target_ms, 120_000);
         assert!(PacketLatencyBudget::new(Some(1_000)).remaining_ms() >= 1_000);

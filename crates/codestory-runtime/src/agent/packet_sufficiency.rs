@@ -1712,7 +1712,7 @@ fn packet_citation_provenance_labels(citation: &AgentCitationDto) -> BTreeSet<St
 }
 
 fn packet_pass_through_provenance_label(label: &str) -> bool {
-    matches!(label, "precise_semantic_import")
+    matches!(label, "precise_semantic_import" | "same_file_name_affinity")
 }
 
 fn packet_public_provenance_label(label: &str) -> bool {
@@ -1725,6 +1725,7 @@ fn packet_public_provenance_label(label: &str) -> bool {
                 | "graph_neighbor"
                 | "component_report"
                 | "dense_anchor"
+                | "same_file_name_affinity"
         )
 }
 
@@ -4943,6 +4944,25 @@ mod tests {
             future_precise_import,
             None,
         ));
+        let mut same_file_name_affinity = cited_anchor_with_tier(
+            "same_file_name_affinity",
+            "src/service.rs",
+            PacketEvidenceTierDto::DenseSemantic,
+            Some(false),
+        );
+        assert_eq!(
+            same_file_name_affinity.evidence_tier,
+            Some(PacketEvidenceTierDto::DenseSemantic),
+            "the affinity fixture must exercise the typed-tier pass-through path"
+        );
+        same_file_name_affinity.retrieval_score_breakdown =
+            Some(score_breakdown(vec!["same_file_name_affinity"]));
+        claims.push(cited_claim(
+            "Same-file name affinity remains visible without becoming graph proof.",
+            None,
+            same_file_name_affinity,
+            None,
+        ));
         let claim_count = claims.len();
         let diagnostic_tier_claim_count = claims
             .iter()
@@ -4988,6 +5008,7 @@ mod tests {
             "graph_neighbor",
             "lexical_source",
             "precise_semantic_import",
+            "same_file_name_affinity",
             "symbol_doc",
         ];
         assert_eq!(

@@ -1,3 +1,4 @@
+use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
 use crate::route_coverage::{
     RouteHandlerCandidate, compare_route_handler_candidates,
     route_endpoint_metadata_from_canonical, route_endpoint_metadata_from_openapi_label,
@@ -156,6 +157,10 @@ impl AppController {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
+            .map(|mut hit| {
+                decorate_lexical_search_hit_evidence(&mut hit);
+                hit
+            })
             .collect::<Vec<_>>();
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {

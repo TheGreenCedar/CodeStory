@@ -623,8 +623,35 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
 
     let controller = AppController::new();
     controller
-        .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+        .open_project_with_storage_path(temp.path().to_path_buf(), db_path.clone())
         .expect("open project");
+
+    let indexed = controller
+        .resolve_indexed_symbol_candidates("AppController", 10)
+        .expect("resolve indexed candidates");
+    let storage = Storage::open(&db_path).expect("reopen storage");
+    let expanded = controller
+        .expanded_symbol_hits(&storage, "AppController")
+        .expect("resolve expanded candidates");
+    for (lane, hits) in [("indexed", indexed), ("expanded", expanded)] {
+        assert!(!hits.is_empty(), "{lane} lexical lane should return hits");
+        assert!(
+            hits.iter().all(|hit| {
+                hit.evidence_tier
+                    == Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource)
+                    && hit.resolution_status
+                        == Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved)
+                    && hit.eligible_for_sufficiency == Some(true)
+                    && hit.score_breakdown.as_ref().is_some_and(|breakdown| {
+                        breakdown.lexical > 0.0
+                            && breakdown.semantic == 0.0
+                            && breakdown.graph == 0.0
+                            && breakdown.provenance == ["lexical_source"]
+                    })
+            }),
+            "{lane} lexical lane must bind provenance before classification: {hits:#?}"
+        );
+    }
 
     let error = controller
         .search(SearchRequest {

@@ -390,7 +390,7 @@
             "type": "boolean"
           },
           "latency_budget_ms": {
-            "description": "Optional retrieval latency budget in milliseconds; defaults to 1500 when omitted.",
+            "description": "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
             "maximum": 120000,
             "minimum": 1000,
             "type": [
