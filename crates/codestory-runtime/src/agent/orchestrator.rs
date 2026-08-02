@@ -64,7 +64,7 @@ use crate::agent::packet_required_probes::{
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
-    normalize_identifier, packet_citation_rank, packet_display_path,
+    normalize_identifier, packet_citation_rank, packet_display_path, sort_by_cached_rank_desc,
 };
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
@@ -730,10 +730,8 @@ fn hybrid_weights_are_lexical_only(weights: Option<&AgentHybridWeightsDto>) -> b
 fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     let terms = packet_rank_terms(question);
     let prefer_primary_sources = !query_mentions_non_primary_source(question);
-    answer.citations.sort_by(|left, right| {
-        packet_citation_rank(right, &terms, prefer_primary_sources)
-            .partial_cmp(&packet_citation_rank(left, &terms, prefer_primary_sources))
-            .unwrap_or(Ordering::Equal)
+    sort_by_cached_rank_desc(&mut answer.citations, |citation| {
+        packet_citation_rank(citation, &terms, prefer_primary_sources)
     });
 }
 

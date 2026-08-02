@@ -5,7 +5,7 @@ use super::citation::to_citation_from_hit;
 use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
     normalize_identifier, packet_citation_key, packet_citation_rank,
-    packet_stage_citation_carry_limit, packet_subquery_hit_limit,
+    packet_stage_citation_carry_limit, packet_subquery_hit_limit, sort_by_cached_rank_desc,
 };
 use super::packet_terms::packet_probe_terms;
 use super::packet_trace::{
@@ -20,7 +20,6 @@ use codestory_contracts::api::{
     PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, SearchHit,
     SearchHitOrigin, SearchMatchQualityDto,
 };
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Instant;
@@ -443,10 +442,8 @@ pub(crate) fn run_packet_anchor_expansion(
                     .filter(|hit| packet_anchor_hit_is_relevant(&query, hit))
                     .map(|hit| to_citation_from_hit(hit, None, None, include_evidence))
                     .collect::<Vec<_>>();
-                citations.sort_by(|left, right| {
-                    packet_citation_rank(right, rank_terms, true)
-                        .partial_cmp(&packet_citation_rank(left, rank_terms, true))
-                        .unwrap_or(Ordering::Equal)
+                sort_by_cached_rank_desc(&mut citations, |citation| {
+                    packet_citation_rank(citation, rank_terms, true)
                 });
                 for citation in citations.into_iter().take(stage_carry_limit) {
                     if citation_keys.insert(packet_citation_key(&citation)) {

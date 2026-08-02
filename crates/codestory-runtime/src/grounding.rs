@@ -1380,8 +1380,8 @@ impl AppController {
         let children = Self::dedupe_symbol_nodes(children, &labels_by_id)
             .into_iter()
             .take(16)
-            .map(|child| Self::symbol_summary_for_node(&storage, &labels_by_id, child))
-            .collect::<Result<Vec<_>, ApiError>>()?;
+            .collect::<Vec<_>>();
+        let children = Self::symbol_summaries_for_nodes(&storage, &labels_by_id, children)?;
 
         let related_hits = self
             .resolve_indexed_symbol_candidates(&node.display_name, 6)?
