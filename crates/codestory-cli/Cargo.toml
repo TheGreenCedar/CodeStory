@@ -59,6 +59,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+codestory-workspace = { workspace = true, features = ["test-support"] }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-runtime = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }

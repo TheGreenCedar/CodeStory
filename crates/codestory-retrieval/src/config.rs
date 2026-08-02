@@ -232,14 +232,28 @@ impl SidecarRuntimeConfig {
         process_defaults: &SidecarProcessDefaults,
         overrides: &SidecarRuntimeOverrides,
     ) -> Self {
+        let project_identity = codestory_workspace::project_identity_v3(project_root);
+        Self::for_project_auto_with_process_defaults_and_identity(
+            &project_identity,
+            process_defaults,
+            overrides,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn for_project_auto_with_process_defaults_and_identity(
+        project_identity: &codestory_workspace::ProjectIdentityV3,
+        process_defaults: &SidecarProcessDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
         let defaults = process_defaults.runtime();
         let (profile, run_id) = auto_runtime_selection(
             env_profile(defaults),
             env_agent_run_id(defaults),
             running_in_ci_agent(defaults),
         );
-        Self::for_project_profile_with_process_defaults(
-            Some(project_root),
+        Self::for_project_identity_profile_with_process_defaults(
+            Some(project_identity.clone()),
             profile,
             run_id.as_deref(),
             process_defaults,
@@ -273,10 +287,26 @@ impl SidecarRuntimeConfig {
         process_defaults: &SidecarProcessDefaults,
         overrides: &SidecarRuntimeOverrides,
     ) -> Self {
+        let project_identity = project_root.map(codestory_workspace::project_identity_v3);
+        Self::for_project_identity_profile_with_process_defaults(
+            project_identity,
+            profile,
+            run_id,
+            process_defaults,
+            overrides,
+        )
+    }
+
+    fn for_project_identity_profile_with_process_defaults(
+        project_identity: Option<codestory_workspace::ProjectIdentityV3>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        process_defaults: &SidecarProcessDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
         let cache_root = process_defaults.cache_root().to_path_buf();
         let defaults = process_defaults.runtime();
         let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id, defaults));
-        let project_identity = project_root.map(codestory_workspace::project_identity_v3);
         let namespace = namespace_for(project_identity.as_ref(), profile, run_id.as_deref());
         let artifact_root = match profile {
             SidecarProfile::Local => cache_root.clone(),
@@ -311,8 +341,20 @@ impl SidecarRuntimeConfig {
     ) -> Self {
         let process_defaults =
             SidecarProcessDefaults::new(self.cache_root.clone(), SidecarRuntimeDefaults::default());
-        let mut selected = Self::for_project_profile_with_process_defaults(
-            project_root,
+        let project_identity = match project_root {
+            Some(project_root) => match self.project_identity.as_ref() {
+                Some(retained)
+                    if retained.workspace_id
+                        == codestory_workspace::workspace_id_v3_for_root(project_root) =>
+                {
+                    Some(retained.clone())
+                }
+                _ => Some(codestory_workspace::project_identity_v3(project_root)),
+            },
+            None => None,
+        };
+        let mut selected = Self::for_project_identity_profile_with_process_defaults(
+            project_identity,
             profile,
             run_id,
             &process_defaults,
@@ -741,5 +783,46 @@ mod tests {
                 .join("lexical")
         );
         assert_eq!(local.embedding, agent.embedding);
+    }
+
+    #[test]
+    fn profile_selection_observes_a_different_project_instead_of_reusing_retained_identity() {
+        let root = tempfile::tempdir().expect("cache root");
+        let project_a = tempfile::tempdir().expect("project A");
+        let project_b = tempfile::tempdir().expect("project B");
+        let process = defaults(root.path(), &[]);
+        let local = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            Some(project_a.path()),
+            SidecarProfile::Local,
+            None,
+            &process,
+            &SidecarRuntimeOverrides::default(),
+        );
+        let identity_a = local
+            .project_identity
+            .as_ref()
+            .expect("project A identity")
+            .clone();
+
+        let selected = local.with_profile_and_run_id(
+            Some(project_b.path()),
+            SidecarProfile::Agent,
+            Some("Run B"),
+        );
+        let identity_b = selected
+            .project_identity
+            .as_ref()
+            .expect("project B identity");
+
+        assert_ne!(identity_b.workspace_id, identity_a.workspace_id);
+        assert_ne!(identity_b.project_id, identity_a.project_id);
+        assert_eq!(
+            identity_b.workspace_id,
+            codestory_workspace::workspace_id_v3_for_root(project_b.path())
+        );
+        assert_eq!(
+            identity_b,
+            &codestory_workspace::project_identity_v3(project_b.path())
+        );
     }
 }

@@ -25,8 +25,8 @@ use codestory_contracts::api::{
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, SystemActionResponse,
-    TrailConfigDto, TrailContextDto, WorkspaceMemberIndexDto,
+    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
+    TrailContextDto, WorkspaceMemberIndexDto,
 };
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
@@ -299,8 +299,9 @@ mod services;
 mod support;
 mod symbol_query;
 mod symbol_workflow;
-mod system_actions;
 mod target_resolution;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 mod trail_story;

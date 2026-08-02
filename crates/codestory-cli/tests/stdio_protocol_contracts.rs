@@ -957,6 +957,82 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn tools_call_never_executes_hostile_repository_fsmonitor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().expect("hostile repository");
+    let cache_root = tempfile::tempdir().expect("multi-project cache");
+    write_tiny_rust_workspace(project.path());
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "codestory-tests@example.invalid"]);
+    git(&["config", "user.name", "CodeStory Tests"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.com/codestory/hostile-fixture.git",
+    ]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "fixture"]);
+
+    let marker = project.path().join("fsmonitor-executed");
+    let hook = project.path().join("hostile-fsmonitor.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+    )
+    .expect("write hostile fsmonitor hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+        .expect("make hostile hook executable");
+    git(&[
+        "config",
+        "core.fsmonitor",
+        hook.to_str().expect("UTF-8 hostile hook"),
+    ]);
+
+    git(&["status", "--porcelain"]);
+    assert!(
+        marker.exists(),
+        "the hostile fsmonitor sentinel must be live"
+    );
+    fs::remove_file(&marker).expect("reset fsmonitor sentinel");
+
+    let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    initialize_stdio_server(&mut server, "hostile-init");
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hostile-ground",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"project": project.path(), "budget": "strict"}
+            }
+        }),
+    );
+    assert_tool_success(&response, json!("hostile-ground"));
+    assert!(
+        !marker.exists(),
+        "the real MCP tools/call path executed repository core.fsmonitor"
+    );
+}
+
 #[test]
 fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let fixture = unindexed_fixture();

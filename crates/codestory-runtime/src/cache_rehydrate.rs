@@ -2,11 +2,11 @@ use anyhow::{Context, Result, bail};
 use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
 use codestory_workspace::{
     RefreshInputs, WorkspaceInventory, WorkspaceInventoryOutcome, WorkspaceManifest,
+    read_repository_metadata,
 };
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 /// Request to copy a compatible CodeStory cache between sibling worktrees.
@@ -314,44 +314,26 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
 }
 
 fn git_identity(project: &Path) -> Result<GitIdentity> {
-    let dirty = git_output(project, &["status", "--porcelain"])?;
-    if !dirty.trim().is_empty() {
-        bail!("git worktree is dirty: {}", project.display());
-    }
-    let remote = git_output(project, &["config", "--get", "remote.origin.url"])?;
-    let remote = remote.trim();
-    if remote.is_empty() {
-        bail!("git remote origin is missing: {}", project.display());
-    }
-    let tree = git_output(project, &["rev-parse", "HEAD^{tree}"])?;
-    Ok(GitIdentity {
-        remote: remote.to_string(),
-        tree: tree.trim().to_string(),
-    })
-}
-
-fn git_output(project: &Path, args: &[&str]) -> Result<String> {
-    // The inspected checkout is untrusted: repository-local config can name a
-    // `core.fsmonitor` executable that `git status` would run. Disable it (and
-    // index writes) on every invocation of this read-only inspection.
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(project)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git in {}", project.display()))?;
-    if !output.status.success() {
+    let metadata = read_repository_metadata(project);
+    if let Some(issue) = metadata.issues.first() {
         bail!(
-            "git {} failed in {}: {}",
-            args.join(" "),
+            "git metadata inspection failed for {}: {}: {}",
             project.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            issue.code,
+            issue.message
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    if metadata.dirty {
+        bail!("git worktree is dirty: {}", project.display());
+    }
+    let remote = metadata
+        .remote_url
+        .filter(|remote| !remote.trim().is_empty())
+        .with_context(|| format!("git remote origin is missing: {}", project.display()))?;
+    let tree = metadata
+        .head_tree
+        .with_context(|| format!("git HEAD tree is missing: {}", project.display()))?;
+    Ok(GitIdentity { remote, tree })
 }
 
 fn target_cache_has_contents(path: &Path) -> Result<bool> {
@@ -588,6 +570,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git, git_available};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -980,7 +963,7 @@ mod tests {
     }
 
     fn matching_git_projects() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
-        if Command::new("git").arg("--version").output().is_err() {
+        if !git_available() {
             return None;
         }
         let source = tempdir().expect("source project");
@@ -1030,21 +1013,6 @@ mod tests {
         }
         git(project, &["add", "-A"]);
         git(project, &["commit", "-m", "stale source change"]);
-    }
-
-    fn git(project: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     fn seed_cache(path: &Path, project: &Path) {

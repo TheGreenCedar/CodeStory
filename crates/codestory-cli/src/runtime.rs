@@ -218,7 +218,12 @@ impl RuntimeContext {
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
-        let project_identity = codestory_workspace::project_identity_v3(&project_root);
+        let repository_identity =
+            codestory_workspace::inspect_repository_identity_v2(&project_root);
+        let project_identity = codestory_workspace::project_identity_v3_from_repository(
+            &project_root,
+            &repository_identity,
+        );
         let config = crate::config::load_config_with_startup(&project_root, startup)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
         let process_cache_root = canonicalize_configuration_path(
@@ -234,8 +239,8 @@ impl RuntimeContext {
         )?;
         let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
         let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
-        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults(
-            &project_root,
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults_and_identity(
+            &project_identity,
             &sidecar_defaults,
             &config.runtime_overrides(),
         );
@@ -1371,6 +1376,44 @@ mod tests {
             first.context_key.configuration_id,
             second.context_key.configuration_id
         );
+    }
+
+    #[test]
+    fn runtime_context_construction_observes_repository_identity_once() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.clone()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache,
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+
+        let runtime =
+            codestory_workspace::with_repository_metadata_observation_limit_for_test(1, || {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project,
+                        cache_dir: None,
+                    },
+                    &startup,
+                )
+                .expect("runtime context")
+            });
+
+        let retained = runtime
+            .sidecar
+            .project_identity
+            .as_ref()
+            .expect("sidecar retains observed project identity");
+        assert_eq!(retained.project_id, runtime.context_key.project_id);
+        assert_eq!(retained.workspace_id, runtime.context_key.workspace_id);
     }
 
     #[test]

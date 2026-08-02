@@ -4,10 +4,15 @@ use super::affected_rendering::render_affected_markdown;
 use crate::args::{AffectedChangeSource, AffectedCommand, AffectedStdinFormat};
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
-use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use codestory_contracts::api::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
     CommandFailureEnvelope,
+};
+use codestory_workspace::{
+    RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, read_repository_changes,
 };
 use std::io::Read;
 
@@ -63,68 +68,42 @@ pub(super) fn affected_change_records(
         dedupe_affected_change_records(&mut records);
         return Ok(records);
     }
-    let output = affected_git_change_output(cmd)?;
-    if !output.status.success() {
-        bail!(
-            "git change discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let mut records = match cmd.changes {
-        AffectedChangeSource::Untracked => parse_git_nul_path_records(
-            &output.stdout,
-            AffectedChangeKindDto::Untracked,
-            "??",
-            "git_ls_files",
-        )?,
-        AffectedChangeSource::Head
-        | AffectedChangeSource::Staged
-        | AffectedChangeSource::Unstaged => parse_git_name_status_records_z(&output.stdout)?,
+    let scope = match cmd.changes {
+        AffectedChangeSource::Head => RepositoryChangeScope::Head,
+        AffectedChangeSource::Staged => RepositoryChangeScope::Staged,
+        AffectedChangeSource::Unstaged => RepositoryChangeScope::Unstaged,
+        AffectedChangeSource::Untracked => RepositoryChangeScope::Untracked,
     };
+    let mut records = read_repository_changes(&cmd.project.project, scope)
+        .context("Failed to read repository changes")?
+        .into_iter()
+        .map(affected_repository_change_record)
+        .collect::<Result<Vec<_>>>()?;
     dedupe_affected_change_records(&mut records);
     Ok(records)
 }
 
-pub(super) fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Output> {
-    let mut command = std::process::Command::new("git");
-    // The selected project is untrusted input: repository-local config can
-    // name a `core.fsmonitor` executable that status/diff walks would run.
-    // Disable it (and index writes) for these read-only queries.
-    command
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(&cmd.project.project);
-    match cmd.changes {
-        AffectedChangeSource::Head => {
-            command
-                .arg("diff")
-                .arg("--name-status")
-                .arg("-z")
-                .arg("HEAD");
-        }
-        AffectedChangeSource::Staged => {
-            command
-                .arg("diff")
-                .arg("--cached")
-                .arg("--name-status")
-                .arg("-z");
-        }
-        AffectedChangeSource::Unstaged => {
-            command.arg("diff").arg("--name-status").arg("-z");
-        }
-        AffectedChangeSource::Untracked => {
-            command
-                .arg("ls-files")
-                .arg("-z")
-                .arg("--others")
-                .arg("--exclude-standard");
-        }
-    }
-    command
-        .output()
-        .context("Failed to run git change discovery")
+fn affected_repository_change_record(change: RepositoryChange) -> Result<AffectedChangeRecordDto> {
+    let (kind, status) = match change.kind {
+        RepositoryChangeKind::Added => (AffectedChangeKindDto::Added, "A"),
+        RepositoryChangeKind::Copied => (AffectedChangeKindDto::Copied, "C"),
+        RepositoryChangeKind::Deleted => (AffectedChangeKindDto::Deleted, "D"),
+        RepositoryChangeKind::Modified => (AffectedChangeKindDto::Modified, "M"),
+        RepositoryChangeKind::Renamed => (AffectedChangeKindDto::Renamed, "R"),
+        RepositoryChangeKind::TypeChanged => (AffectedChangeKindDto::Modified, "T"),
+        RepositoryChangeKind::Unmerged => (AffectedChangeKindDto::Modified, "U"),
+        RepositoryChangeKind::Untracked => (AffectedChangeKindDto::Untracked, "??"),
+    };
+    Ok(AffectedChangeRecordDto {
+        path: path_text_from_bytes(&change.path, "repository_metadata")?,
+        kind,
+        status: status.to_string(),
+        previous_path: change
+            .previous_path
+            .as_deref()
+            .map(|path| path_text_from_bytes(path, "repository_metadata"))
+            .transpose()?,
+    })
 }
 
 #[derive(Debug)]
@@ -170,7 +149,8 @@ pub(in crate::app) fn unsupported_non_utf8_path_envelope(
     )
 }
 
-pub(super) fn nul_delimited_git_fields(input: &[u8]) -> Result<Vec<&[u8]>> {
+#[cfg(test)]
+fn nul_delimited_git_fields(input: &[u8]) -> Result<Vec<&[u8]>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -192,21 +172,7 @@ pub(super) fn path_text_from_bytes(bytes: &[u8], source: &'static str) -> Result
         .map_err(|_| anyhow::Error::new(UnsupportedNonUtf8Path { source }))
 }
 
-pub(super) fn parse_git_nul_path_records(
-    input: &[u8],
-    kind: AffectedChangeKindDto,
-    status: &str,
-    source: &'static str,
-) -> Result<Vec<AffectedChangeRecordDto>> {
-    nul_delimited_git_fields(input)?
-        .into_iter()
-        .map(|field| {
-            path_text_from_bytes(field, source)
-                .map(|path| affected_path_record(&path, kind.clone(), status))
-        })
-        .collect()
-}
-
+#[cfg(test)]
 pub(in crate::app) fn parse_git_name_status_records_z(
     input: &[u8],
 ) -> Result<Vec<AffectedChangeRecordDto>> {

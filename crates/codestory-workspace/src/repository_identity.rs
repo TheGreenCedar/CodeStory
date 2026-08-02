@@ -1,23 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 /// Lossless repository identity hashing contract available for migration.
 pub const REPOSITORY_IDENTITY_V2_SCHEMA_VERSION: u32 = 2;
 
 /// Lossless shared project identity contract available for migration.
 pub const PROJECT_IDENTITY_V3_SCHEMA_VERSION: u32 = 3;
-const PROJECT_IDENTITY_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(1);
-
-static PROJECT_IDENTITY_V3_OBSERVATION_CACHE: OnceLock<
-    Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV3)>>,
-> = OnceLock::new();
-
 /// Hashable native identity for one workspace path observation.
 ///
 /// Existing paths use filesystem identity. Missing paths use normalized
@@ -116,11 +106,10 @@ pub struct ProjectIdentityV3 {
 
 /// Inspect the lossless repository identity without migrating current consumers.
 pub fn inspect_repository_identity_v2(project_root: &Path) -> RepositoryIdentityV2 {
-    let remote = git_output(project_root, &["config", "--get", "remote.origin.url"]).ok();
-    let tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"]).ok();
-    let dirty = git_output(project_root, &["status", "--porcelain"])
-        .map(|status| !status.trim().is_empty())
-        .unwrap_or(true);
+    let metadata = crate::read_repository_metadata(project_root);
+    let remote = metadata.remote_url;
+    let tree = metadata.head_tree;
+    let dirty = metadata.dirty;
     let normalized = remote.as_deref().and_then(parse_repository_identity_v2);
     let canonical_repository_id = normalized
         .as_ref()
@@ -182,26 +171,6 @@ pub fn project_identity_v3_from_repository(
         portable_reuse_eligible: repository_identity.portable_reuse_eligible,
         portable_reuse_reason: repository_identity.portable_reuse_reason.clone(),
     }
-}
-
-/// Resolve lossless identity for repeated observational status reads.
-///
-/// Mutating paths must use `project_identity_v3` so dirtiness changes are
-/// observed immediately.
-pub fn cached_project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
-    let key = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let cache = PROJECT_IDENTITY_V3_OBSERVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_at, identity)) = cache.get(&key)
-        && cached_at.elapsed() < PROJECT_IDENTITY_OBSERVATION_CACHE_TTL
-    {
-        return identity.clone();
-    }
-    let identity = project_identity_v3(project_root);
-    cache.insert(key, (Instant::now(), identity.clone()));
-    identity
 }
 
 /// Return the schema-3 workspace id hashed from native path data.
@@ -373,8 +342,8 @@ fn parse_repository_identity_v2(remote: &str) -> Option<NormalizedRepositoryIden
 fn normalize_scp_repository_identity(
     value: &str,
 ) -> Option<(String, String, Option<String>, String)> {
-    let without_user = strip_userinfo(value);
-    if let Some((host, path)) = split_scp_host_path(without_user) {
+    if let Some((authority, path)) = split_scp_host_path(value) {
+        let host = strip_userinfo(authority);
         let path = if path.starts_with('/') || path.starts_with('~') {
             path.to_string()
         } else {
@@ -386,11 +355,11 @@ fn normalize_scp_repository_identity(
 }
 
 fn split_scp_host_path(value: &str) -> Option<(&str, &str)> {
-    if value.starts_with('[') {
-        let end = value.find(']')?;
-        let host = &value[..=end];
+    if let Some(bracket_start) = value.find('[') {
+        let end = value[bracket_start..].find(']')? + bracket_start;
+        let authority = &value[..=end];
         let path = value[end + 1..].strip_prefix(':')?;
-        return (!path.is_empty()).then_some((host, path));
+        return (!path.is_empty()).then_some((authority, path));
     }
     let (host, path) = value.split_once(':')?;
     (!host.contains('/') && !path.is_empty()).then_some((host, path))
@@ -404,8 +373,8 @@ fn normalize_url_repository_identity(
     if scheme == "file" {
         return None;
     }
-    let rest = strip_userinfo(rest);
     let (authority, path) = rest.split_once('/')?;
+    let authority = strip_userinfo(authority);
     let (host, explicit_port) = split_host_port(authority)?;
     let default_port = match scheme.as_str() {
         "http" => Some("80"),
@@ -861,26 +830,6 @@ fn windows_ordinal_case_fold(source: &[u16]) -> io::Result<Vec<u16>> {
     Ok(folded)
 }
 
-fn git_output(project: &Path, args: &[&str]) -> Result<String, ()> {
-    // The repository under inspection is untrusted input: a checkout can carry
-    // `.git/config` naming a `core.fsmonitor` executable that `git status`
-    // would run. Disable it (and index writes, which a read-only inspection
-    // must never perform) on every invocation.
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(project)
-        .args(args)
-        .output()
-        .map_err(|_| ())?;
-    if !output.status.success() {
-        return Err(());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn mix_u32(state: &mut u64, value: u32) {
     for byte in value.to_le_bytes() {
         *state ^= u64::from(byte);
@@ -932,6 +881,7 @@ fn fnv1a_path_hex(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -993,6 +943,15 @@ mod tests {
         assert_eq!(
             normalize_repository_identity_v2("https://example.com/team/repo.GIT").as_deref(),
             Some("https://example.com:443/team/repo.GIT")
+        );
+        assert_eq!(
+            normalize_repository_identity_v2("https://user@example.com/team/repo@release.git")
+                .as_deref(),
+            Some("https://example.com:443/team/repo@release")
+        );
+        assert_eq!(
+            normalize_repository_identity_v2("example.com:team/repo@release.git").as_deref(),
+            Some("ssh://example.com:22/~/team/repo@release")
         );
     }
 
