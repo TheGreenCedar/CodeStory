@@ -7825,11 +7825,31 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
     ["blanket failed-job rerun", workflows => {
       const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
         .find(({ name }) => name === "Re-dispatch only the lost jobs");
-      step.run = step.run.replace(
-        "actions/jobs/$job_id/rerun",
-        "actions/runs/$FAILED_RUN_ID/rerun-failed-jobs",
-      );
+      step.run = 'gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$FAILED_RUN_ID/rerun-failed-jobs"\n';
     }],
+    // The hosts share one machine, so one incident loses two of them at once. A loop that calls
+    // the API directly stops at the first refusal under `set -e` and abandons the rest of the
+    // recovery, which is the shape the tolerant dispatcher replaced.
+    ["shell-loop re-dispatch with no per-id tolerance", workflows => {
+      const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs");
+      step.run = [
+        "set -euo pipefail",
+        'test -n "$JOB_IDS"',
+        'for job_id in $JOB_IDS; do',
+        '  gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/rerun"',
+        "done",
+        "",
+      ].join("\n");
+    }, /must not run for job_id in/u],
+    ["re-dispatch that records no per-id receipt", workflows => {
+      const step = workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
+        .find(({ name }) => name === "Re-dispatch only the lost jobs");
+      step.run = step.run.replace(
+        /\s*--out target\/lost-runner\/rerun-dispatch\.json/u,
+        "",
+      );
+    }, /must run --out target\/lost-runner\/rerun-dispatch\.json/u],
     ["ungated re-dispatch", workflows => {
       delete workflows.get(rerunFile).jobs["rerun-lost-jobs"].steps
         .find(({ name }) => name === "Re-dispatch only the lost jobs").if;
@@ -7893,10 +7913,14 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
       });
     }],
   ];
-  for (const [label, mutate] of mutations) {
+  for (const [label, mutate, expected] of mutations) {
     const workflows = loadWorkflows();
     mutate(workflows);
-    assert.notDeepEqual(validateWorkflows(workflows), [], label);
+    const violations = validateWorkflows(workflows);
+    assert.notDeepEqual(violations, [], label);
+    // Some mutations name the rule that has to catch them, so a rule that stopped looking cannot
+    // hide behind an unrelated violation the same edit happened to trip.
+    if (expected) assert.match(violations.join("\n"), expected, label);
   }
 
   // A recovery bound that drifts from the release claim graph is caught even when the workflows
@@ -7907,6 +7931,22 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
   const rephrased = structuredClone(graph);
   rephrased.non_claim_policy.annotation = "The runner went away.";
   assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), rephrased), []);
+
+  // The two recovery properties a reader cannot recover from the YAML alone -- which execution of
+  // a job the plan reads, and what one refused re-dispatch does to the others -- are graph facts,
+  // so the graph losing them is a violation even with the workflows untouched.
+  for (const drift of [
+    (value) => { value.workflow_policy.lost_runner_rerun.selection = "every_collected_execution"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_tolerance = "abort_on_first_refusal"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_failure = "never_fail"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.plan_schema = "codestory.lost-runner-rerun-plan/v1"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.dispatch_schema = "codestory.something-else/v1"; },
+    (value) => { value.workflow_policy.lost_runner_rerun.recovery_contract = ".github/scripts/other.mjs"; },
+  ]) {
+    const mutated = structuredClone(graph);
+    drift(mutated);
+    assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), mutated), []);
+  }
 });
 
 // Catalog publication is delivery, not a release gate. Relaxing a gate is exactly where a vacuous

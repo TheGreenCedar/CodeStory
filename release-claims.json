@@ -1520,6 +1520,20 @@
         }
       ]
     },
+    "lost_runner_rerun": {
+      "workflow": "lost-runner-rerun.yml",
+      "job": "rerun-lost-jobs",
+      "recovery_contract": ".github/scripts/lost-runner-recovery.mjs",
+      "plan_schema": "codestory.lost-runner-rerun-plan/v2",
+      "plan_file": "target/lost-runner/rerun-plan.json",
+      "dispatch_schema": "codestory.lost-runner-rerun-dispatch/v1",
+      "dispatch_file": "target/lost-runner/rerun-dispatch.json",
+      "dispatch_step": "Re-dispatch only the lost jobs",
+      "dispatch_command": "node .github/scripts/lost-runner-recovery.mjs dispatch-rerun",
+      "selection": "latest_execution_per_job_name",
+      "dispatch_tolerance": "per_job_id",
+      "dispatch_failure": "fail_only_when_no_job_was_accepted"
+    },
     "artifact_workflows": [
       "source-proof.yml",
       "release-candidate-evidence.yml",

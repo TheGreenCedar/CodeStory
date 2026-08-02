@@ -63,18 +63,20 @@ jobs:
             --input target/lost-runner/rerun-input.json \
             --out target/lost-runner/rerun-plan.json
 
+      # One refused id may not consume the recovery of the others: the hosts share a machine, so a
+      # single incident can lose two of them at once. The dispatcher asks for every named id
+      # separately, records what each one answered, and fails only when no id was accepted at all.
       - name: Re-dispatch only the lost jobs
         if: steps.plan.outputs.rerun == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          JOB_IDS: ${{ steps.plan.outputs.job_ids }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$JOB_IDS"
-          for job_id in $JOB_IDS; do
-            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/rerun"
-          done
+          node .github/scripts/lost-runner-recovery.mjs dispatch-rerun \
+            --plan target/lost-runner/rerun-plan.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --out target/lost-runner/rerun-dispatch.json
 
       - name: Upload the recovery decision
         if: always()
