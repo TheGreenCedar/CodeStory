@@ -2168,11 +2168,18 @@ mod tests {
 
         assert!(inventory.files.contains(&project.path().join("lib.rs")));
         assert!(!inventory.files.contains(&project.path().join("scratch.rs")));
-        assert_eq!(inventory.outcome, crate::WorkspaceInventoryOutcome::Partial);
-        assert_eq!(inventory.issues.len(), 1, "{inventory:?}");
-        assert_eq!(inventory.issues[0].path, project.path().join("lib.rs"));
+        // The restored file is present and indexed, so the inventory stays
+        // complete and serviceable; the degraded discovery route is recorded
+        // as a warning rather than an issue.
+        assert_eq!(
+            inventory.outcome,
+            crate::WorkspaceInventoryOutcome::Complete
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+        assert_eq!(inventory.warnings.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.warnings[0].path, project.path().join("lib.rs"));
         assert!(
-            inventory.issues[0]
+            inventory.warnings[0]
                 .message
                 .contains("ignore rules excluded a tracked source")
         );

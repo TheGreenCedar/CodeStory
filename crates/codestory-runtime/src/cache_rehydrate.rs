@@ -1087,12 +1087,14 @@ mod tests {
     }
 
     #[test]
-    fn rehydrate_skips_when_a_tracked_source_is_repo_ignored() {
+    fn rehydrate_reuses_when_a_tracked_source_is_repo_ignored_but_restored() {
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
         // A committed file later covered by the repository's own ignore rules
-        // makes the source inventory Partial, so freshness cannot be proven.
+        // is restored by the repository index, so the inventory stays complete
+        // and freshness remains provable: reuse is allowed and the degraded
+        // discovery route is carried as a warning, not a refusal (#1734).
         for project in [source_project.path(), target_project.path()] {
             fs::write(project.join("ignored.rs"), "pub fn hidden() {}\n").expect("ignored source");
             fs::write(project.join(".gitignore"), "ignored.rs\n").expect("gitignore");
@@ -1112,17 +1114,29 @@ mod tests {
             source_cache_dir: source_cache.path(),
             target_project: target_project.path(),
             target_cache_dir: target_cache.path(),
-            dry_run: false,
+            dry_run: true,
         })
         .expect("rehydrate");
 
-        assert_eq!(output.status, "skipped");
-        let reason = output.reason.as_deref().expect("skip reason");
-        assert!(
-            reason.contains("source cache freshness check failed") && reason.contains("Partial"),
-            "a Partial source inventory must refuse reuse: {reason}"
+        assert_ne!(
+            output
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Partial"),
+            true,
+            "a restored tracked source must not make the inventory partial: {output:?}"
         );
-        assert!(!target_cache.path().join("codestory.db").exists());
+        let manifest =
+            codestory_workspace::WorkspaceManifest::open(source_project.path().to_path_buf())
+                .expect("open source workspace");
+        let inventory = manifest.source_inventory().expect("source inventory");
+        assert_eq!(
+            inventory.outcome,
+            codestory_workspace::WorkspaceInventoryOutcome::Complete
+        );
+        assert!(inventory.issues.is_empty(), "{inventory:?}");
+        assert_eq!(inventory.warnings.len(), 1, "{inventory:?}");
     }
 
     #[test]
