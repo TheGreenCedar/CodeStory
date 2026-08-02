@@ -2600,11 +2600,33 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeSteps = list(windowsNative.steps).map(object);
     add(
       violations,
-      windowsNativeSteps.length === 6
+      windowsNativeSteps.length === 7
         && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
         && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
         && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
-      `${sourceFile} Windows native source contracts must keep the exact blocking six-step shape`,
+      `${sourceFile} Windows native source contracts must keep the exact blocking seven-step shape`,
+    );
+    // The qualification harness regression runs before the toolchain steps: it
+    // needs no build, and a Windows-native reproduction of the control
+    // directory mismatch is worth nothing if it only reports after a Vulkan
+    // SDK install and a release Cargo test have already spent the job.
+    add(
+      violations,
+      windowsNativeSteps[1]?.name
+        === "Prove the Windows-native qualification harness contracts",
+      `${sourceFile} Windows native source contracts must prove the qualification harness before any build step`,
+    );
+    requireStepRun(
+      violations,
+      sourceFile,
+      windowsNative,
+      "Prove the Windows-native qualification harness contracts",
+      [
+        "python .github/scripts/check-packaged-agent-proof.py --self-test",
+        "Windows-native qualification harness contracts failed",
+        "past their 90000 ms budget",
+        "Windows-native qualification harness contracts:",
+      ],
     );
     requireStepRun(violations, sourceFile, windowsNative, "Install Rust stable", [
       "rustup toolchain install stable --profile minimal",

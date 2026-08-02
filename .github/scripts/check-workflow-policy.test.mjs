@@ -4292,6 +4292,54 @@ test("exact-head source proof owns Windows path and native-staging harnesses", a
   }
 });
 
+test("exact-head source proof owns the Windows-native qualification harness regression", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "source-proof.yml";
+  const stepName = "Prove the Windows-native qualification harness contracts";
+  const mutations = [
+    ["regression is removed", workflow => {
+      const job = workflow.jobs["windows-native-contracts"];
+      job.steps = job.steps.filter(step => step.name !== stepName);
+    }],
+    ["regression is deferred behind the build steps", workflow => {
+      const job = workflow.jobs["windows-native-contracts"];
+      const [step] = job.steps.splice(
+        job.steps.findIndex(candidate => candidate.name === stepName),
+        1,
+      );
+      job.steps.push(step);
+    }],
+    ["harness self-test stops running", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], stepName);
+      step.run = step.run.replace(
+        "python .github/scripts/check-packaged-agent-proof.py --self-test",
+        "python --version",
+      );
+    }],
+    ["regression budget is dropped", workflow => {
+      const step = draftStep(workflow.jobs["windows-native-contracts"], stepName);
+      step.run = step.run.replace("past their 90000 ms budget", "slow");
+    }],
+    ["regression becomes advisory", workflow => {
+      draftStep(
+        workflow.jobs["windows-native-contracts"],
+        stepName,
+      )["continue-on-error"] = true;
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /Windows native source contracts|Windows-native qualification harness contracts|qualification harness before any build step/u,
+      );
+    });
+  }
+});
+
 test("reusable compiler caches and proof modes reject hostile downgrades", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 

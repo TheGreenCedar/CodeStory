@@ -16,6 +16,7 @@ from .publication_consistency_verifier import (
 )
 from .publication_fault_producer import produce_product_publication_fault_evidence
 from .publication_fault_verifier import verify_publication_fault_raw_evidence
+from .qualification_directory_binding import bind_qualification_directory
 from .qualification_production_types import (
     QualificationExternalEvidence,
     QualificationProducerContext,
@@ -81,7 +82,9 @@ def prepare_qualification_producer(
     }
     qualification_env = dict(env)
     qualification_env.pop("CODESTORY_CLI", None)
-    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
+    # Nothing is resident on this directory yet, so the initial bind is the one
+    # binding that needs no server replacement. Every later move is a rebind.
+    bind_qualification_directory(qualification_env, private_root)
     qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
     qualification_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = archive_sha256
     server_cleanup_control.update(
