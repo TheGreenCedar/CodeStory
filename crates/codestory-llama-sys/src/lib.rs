@@ -10,6 +10,9 @@ pub use admission::{
 
 use admission::EmbeddingAdmissionTracker;
 use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline, acquire_with_deadline};
+use codestory_contracts::owned_artifacts::{
+    EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE, embedded_model_directory,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, bounded, select_biased, unbounded};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
@@ -1934,17 +1937,14 @@ pub fn materialize_embedded_model(cache_root: &Path) -> Result<MaterializedModel
         )));
     }
 
-    let directory = cache_root
-        .join("embedded-models")
-        .join("sha256")
-        .join(MODEL_SHA256);
+    let directory = embedded_model_directory(cache_root, MODEL_SHA256);
     fs::create_dir_all(&directory).map_err(cache_error)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(directory.join(".materialize.lock"))
+        .open(directory.join(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE))
         .map_err(cache_error)?;
     acquire_with_deadline(
         &lock,

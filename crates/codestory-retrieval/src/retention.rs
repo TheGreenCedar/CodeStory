@@ -13,8 +13,23 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-const RETENTION_SCHEMA_VERSION: u32 = 1;
+/// Marker schema 1: no workspace registration, so its roots can never be
+/// proven retired. Still read so a peer running an older binary keeps pinning
+/// the generations it is serving.
+pub const RETENTION_MARKER_SCHEMA_V1: u32 = 1;
+/// Marker schema 2 adds the workspace registration (`owner`), the canonical
+/// generation it pins, and a heartbeat, which is what lets a dead worktree be
+/// retired instead of pinning its generations forever.
+pub const RETENTION_MARKER_SCHEMA_V2: u32 = 2;
+/// The schema this binary writes. Readers accept every schema in
+/// [`RETENTION_MARKER_SCHEMA_V1`]..=[`RETENTION_MARKER_SCHEMA_V2`].
+const RETENTION_SCHEMA_VERSION: u32 = RETENTION_MARKER_SCHEMA_V2;
 const RETENTION_DIR: &str = "retention";
+/// Extensions the retention directory is allowed to contain. Anything else is
+/// evidence this reader does not understand, so it protects instead of being
+/// skipped: a future marker encoding must not silently read as "no roots".
+const RETENTION_MARKER_EXTENSION: &str = "json";
+const RETENTION_LOCK_EXTENSION: &str = "lock";
 pub const GLOBAL_GENERATION_GC_LOCK_SCOPE: &str = "global_generation_gc";
 
 pub fn global_generation_gc_state_file(runtime: &SidecarRuntimeConfig) -> PathBuf {
@@ -31,6 +46,18 @@ pub fn global_generation_gc_state_file(runtime: &SidecarRuntimeConfig) -> PathBu
     base.join("generation-retention-coordination.state")
 }
 
+/// Workspace registration carried by a schema-2 marker.
+///
+/// `project_root` is the registration itself: without it a marker's roots can
+/// never be proven retired, which is why a schema-1 marker stays protected
+/// forever. `workspace_id` is repeated here so a registration copied into the
+/// wrong marker file fails validation rather than retiring another workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionMarkerOwner {
+    pub workspace_id: String,
+    pub project_root: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationRetentionMarker {
     pub schema_version: u32,
@@ -40,11 +67,24 @@ pub struct GenerationRetentionMarker {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RetrievalIndexRollbackRecord>,
     pub updated_at_epoch_ms: i64,
+    /// Schema 2 only. Absent in a schema-1 marker, which dual-read still
+    /// accepts as an unretirable root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<RetentionMarkerOwner>,
+    /// Schema 2 only: the canonical generation this marker pins, recorded so a
+    /// reader can report the pin without re-deriving it from the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// Schema 2 only: last time the registering workspace refreshed this
+    /// marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_epoch_ms: Option<i64>,
 }
 
 impl GenerationRetentionMarker {
     pub fn next(
         workspace_id: &str,
+        project_root: &Path,
         active: RetrievalIndexManifest,
         verified_previous: Option<RetrievalIndexRollbackRecord>,
         updated_at_epoch_ms: i64,
@@ -57,6 +97,10 @@ impl GenerationRetentionMarker {
                     .ok()
                     .is_some_and(|generation| generation != active_generation)
         });
+        let project_root = project_root
+            .to_str()
+            .context("workspace registration requires a UTF-8 project root")?
+            .to_string();
         let marker = Self {
             schema_version: RETENTION_SCHEMA_VERSION,
             workspace_id: workspace_id.to_string(),
@@ -64,9 +108,76 @@ impl GenerationRetentionMarker {
             active,
             rollback,
             updated_at_epoch_ms,
+            owner: Some(RetentionMarkerOwner {
+                workspace_id: workspace_id.to_string(),
+                project_root,
+            }),
+            generation: Some(active_generation),
+            heartbeat_epoch_ms: Some(updated_at_epoch_ms),
         };
         validate_marker(&marker)?;
         Ok(marker)
+    }
+
+    /// Whether this marker's roots may be retired without further evidence.
+    ///
+    /// Only a schema-2 registration whose recorded project root has since
+    /// disappeared qualifies. Every other shape — schema 1, an unreadable
+    /// root, or a root that still exists — keeps protecting.
+    pub fn retirement(&self) -> MarkerRetirement {
+        let Some(owner) = self.owner.as_ref() else {
+            return MarkerRetirement::UnregisteredWorkspace;
+        };
+        let project_root = Path::new(&owner.project_root);
+        match std::fs::symlink_metadata(project_root) {
+            Ok(_) => return MarkerRetirement::LiveWorkspace,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return MarkerRetirement::UnprovenWorkspace,
+        }
+        // A missing leaf under a directory that is still there is a deleted
+        // worktree. A missing leaf whose parent is also gone is indistinguishable
+        // from an unplugged drive or an unmounted network share, and an absent
+        // volume is not evidence that the workspace was abandoned.
+        let Some(parent) = project_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return MarkerRetirement::UnprovenWorkspace;
+        };
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => MarkerRetirement::RetiredWorkspace,
+            Ok(_) | Err(_) => MarkerRetirement::UnprovenWorkspace,
+        }
+    }
+}
+
+/// Why one marker's roots do or do not still protect their generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerRetirement {
+    /// Schema-1 marker: no registration exists, so retirement is unprovable.
+    UnregisteredWorkspace,
+    /// The registered project root still exists.
+    LiveWorkspace,
+    /// The registered project root could not be observed at all.
+    UnprovenWorkspace,
+    /// The registered project root is provably gone.
+    RetiredWorkspace,
+}
+
+impl MarkerRetirement {
+    /// A marker stops rooting its generations only under proven retirement.
+    pub const fn still_protects(self) -> bool {
+        !matches!(self, Self::RetiredWorkspace)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnregisteredWorkspace => "unregistered_workspace",
+            Self::LiveWorkspace => "live_workspace",
+            Self::UnprovenWorkspace => "unproven_workspace",
+            Self::RetiredWorkspace => "retired_workspace",
+        }
     }
 }
 
@@ -132,6 +243,34 @@ impl GenerationRetentionLock {
         }
     }
 
+    /// Observe the retention lock without creating it.
+    ///
+    /// A read-only pass may not be the reason a retention directory or lock
+    /// file first appears: an inventory that reports what exists must leave the
+    /// cache tree exactly as it found it. A lock file that does not exist
+    /// cannot be held by anyone, which is [`ObservedRetentionLock::Absent`].
+    pub fn observe_shared(state_file: &Path, scope_id: &str) -> Result<ObservedRetentionLock> {
+        let path = retention_lock_path(state_file, scope_id)?;
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ObservedRetentionLock::Absent);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("observe generation retention lock {}", path.display())
+                });
+            }
+        };
+        match bounded_locks::try_acquire(&file, FileLockKind::Shared) {
+            Ok(true) => Ok(ObservedRetentionLock::Acquired(Self { file })),
+            Ok(false) => Ok(ObservedRetentionLock::Contended),
+            Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
+                format!("try lock shared generation retention {}", path.display())
+            }),
+        }
+    }
+
     /// Every blocking retention acquisition goes through one absolute deadline:
     /// a sibling publication holding this lock must never be able to stall an
     /// unrelated query, eviction, or shutdown for longer than the caller's
@@ -170,6 +309,24 @@ impl GenerationRetentionLock {
 impl Drop for GenerationRetentionLock {
     fn drop(&mut self) {
         let _ = bounded_locks::release(&self.file);
+    }
+}
+
+/// What a non-creating observation of a retention lock found.
+#[derive(Debug)]
+pub enum ObservedRetentionLock {
+    /// No lock file exists, so no publication can be holding one.
+    Absent,
+    /// Held shared for as long as this value lives.
+    Acquired(GenerationRetentionLock),
+    /// A peer holds it exclusively right now.
+    Contended,
+}
+
+impl ObservedRetentionLock {
+    /// Whether the observation proves no exclusive holder was present.
+    pub const fn is_quiescent(&self) -> bool {
+        matches!(self, Self::Absent | Self::Acquired(_))
     }
 }
 
@@ -265,7 +422,26 @@ pub struct RetentionProtectionScan {
     pub rollback: Vec<RetrievalIndexManifest>,
     pub storage_paths_scanned: Vec<PathBuf>,
     pub marker_paths_scanned: Vec<PathBuf>,
+    /// Markers whose registered workspace is provably gone, so their roots
+    /// were deliberately not collected.
+    #[serde(default)]
+    pub retired_marker_paths: Vec<PathBuf>,
+    /// Set whenever some protection evidence could not be interpreted: an
+    /// unreadable or unknown-schema marker, an unrecognized entry in the
+    /// retention directory, a marker directory that could not be enumerated,
+    /// or a store this binary refuses to observe. It is the typed reason to
+    /// suppress pruning, so protection never depends on a caller happening to
+    /// treat a free-text error as fatal.
+    #[serde(default)]
+    pub protection_incomplete: bool,
     pub errors: Vec<String>,
+}
+
+impl RetentionProtectionScan {
+    fn record_incomplete(&mut self, message: String) {
+        self.protection_incomplete = true;
+        self.errors.push(message);
+    }
 }
 
 pub fn scan_retention_protection(
@@ -274,9 +450,15 @@ pub fn scan_retention_protection(
     state_file: &Path,
 ) -> RetentionProtectionScan {
     let mut scan = RetentionProtectionScan::default();
-    let storage_paths = storage_paths_for_scan(cache_root, active_storage_path, &mut scan.errors);
+    let storage_paths = storage_paths_for_scan(cache_root, active_storage_path, &mut scan);
     for storage_path in storage_paths {
-        match Store::open(&storage_path).and_then(|store| store.list_retrieval_index_publications())
+        // Observation only. The live open path recovers interrupted
+        // promotions, converts the journal to WAL, and runs the migration
+        // ladder, so a scan of another project's cache would rewrite a
+        // database this process does not own. An observer that refuses is
+        // reported as unreadable protection evidence instead.
+        match Store::open_observational(&storage_path)
+            .and_then(|store| store.list_retrieval_index_publications())
         {
             Ok(publications) => {
                 let manifests = publications
@@ -295,8 +477,8 @@ pub fn scan_retention_protection(
                 scan.active.extend(manifests);
                 scan.rollback.extend(rollbacks);
             }
-            Err(error) => scan.errors.push(format!(
-                "scan retrieval manifests in {}: {error}",
+            Err(error) => scan.record_incomplete(format!(
+                "observe retrieval manifests in {}: {error}",
                 storage_path.display()
             )),
         }
@@ -305,7 +487,7 @@ pub fn scan_retention_protection(
     let marker_dir = retention_dir(state_file);
     match std::fs::symlink_metadata(&marker_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            scan.errors.push(format!(
+            scan.record_incomplete(format!(
                 "retention marker path is not a direct directory: {}",
                 marker_dir.display()
             ));
@@ -316,7 +498,7 @@ pub fn scan_retention_protection(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
-                            scan.errors.push(format!(
+                            scan.record_incomplete(format!(
                                 "read retention marker entry in {}: {error}",
                                 marker_dir.display()
                             ));
@@ -324,13 +506,21 @@ pub fn scan_retention_protection(
                         }
                     };
                     let path = entry.path();
-                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                        continue;
+                    match classify_retention_entry(&path) {
+                        RetentionDirEntry::Marker => {}
+                        RetentionDirEntry::Ignorable => continue,
+                        RetentionDirEntry::Unrecognized => {
+                            scan.record_incomplete(format!(
+                                "retention directory holds evidence this reader cannot interpret: {}",
+                                path.display()
+                            ));
+                            continue;
+                        }
                     }
                     let file_type = match entry.file_type() {
                         Ok(file_type) => file_type,
                         Err(error) => {
-                            scan.errors.push(format!(
+                            scan.record_incomplete(format!(
                                 "read retention marker type {}: {error}",
                                 path.display()
                             ));
@@ -338,7 +528,7 @@ pub fn scan_retention_protection(
                         }
                     };
                     if file_type.is_symlink() || !file_type.is_file() {
-                        scan.errors.push(format!(
+                        scan.record_incomplete(format!(
                             "retention marker is not a direct regular file: {}",
                             path.display()
                         ));
@@ -346,6 +536,11 @@ pub fn scan_retention_protection(
                     }
                     match read_marker_path(&path) {
                         Ok(Some(marker)) => {
+                            let retirement = marker.retirement();
+                            if !retirement.still_protects() {
+                                scan.retired_marker_paths.push(path);
+                                continue;
+                            }
                             scan.marker_paths_scanned.push(path);
                             scan.active.push(marker.active);
                             if let Some(rollback) = marker.rollback {
@@ -353,20 +548,20 @@ pub fn scan_retention_protection(
                             }
                         }
                         Ok(None) => {}
-                        Err(error) => scan.errors.push(format!(
+                        Err(error) => scan.record_incomplete(format!(
                             "scan retention marker {}: {error:#}",
                             path.display()
                         )),
                     }
                 }
             }
-            Err(error) => scan.errors.push(format!(
+            Err(error) => scan.record_incomplete(format!(
                 "read retention marker directory {}: {error}",
                 marker_dir.display()
             )),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => scan.errors.push(format!(
+        Err(error) => scan.record_incomplete(format!(
             "inspect retention marker directory {}: {error}",
             marker_dir.display()
         )),
@@ -529,7 +724,10 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
         builders.entry(generation.clone()).or_default();
     }
 
-    let effective_unrooted_state = if errors.is_empty() {
+    // Unreadable protection evidence is its own reason to stop, independent of
+    // the free-text error list: a marker this reader cannot interpret may be
+    // rooting the very generation about to be reclaimed.
+    let effective_unrooted_state = if errors.is_empty() && !protection.protection_incomplete {
         unrooted_state
     } else {
         GenerationRetentionState::Building
@@ -810,14 +1008,44 @@ impl BundleBuilder {
     }
 }
 
-fn retention_dir(state_file: &Path) -> PathBuf {
+/// What one entry inside the retention directory means to this reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionDirEntry {
+    /// A marker file to parse.
+    Marker,
+    /// A lock file or an in-flight atomic temporary: never protection
+    /// evidence, so skipping it loses nothing.
+    Ignorable,
+    /// Something inside a CodeStory-owned evidence directory that this reader
+    /// does not understand — treated as missing protection, not as absence.
+    Unrecognized,
+}
+
+pub(crate) fn classify_retention_entry(path: &Path) -> RetentionDirEntry {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return RetentionDirEntry::Unrecognized;
+    };
+    // `write_file_atomic` publishes through a dot-prefixed sibling, and a
+    // crashed writer can leave one behind. Hidden files are likewise not
+    // retention evidence.
+    if name.starts_with('.') {
+        return RetentionDirEntry::Ignorable;
+    }
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(RETENTION_MARKER_EXTENSION) => RetentionDirEntry::Marker,
+        Some(RETENTION_LOCK_EXTENSION) => RetentionDirEntry::Ignorable,
+        _ => RetentionDirEntry::Unrecognized,
+    }
+}
+
+pub(crate) fn retention_dir(state_file: &Path) -> PathBuf {
     state_file
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(RETENTION_DIR)
 }
 
-fn ensure_retention_dir(state_file: &Path) -> Result<PathBuf> {
+pub(crate) fn ensure_retention_dir(state_file: &Path) -> Result<PathBuf> {
     let path = retention_dir(state_file);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -859,14 +1087,51 @@ fn validate_retention_component(component: &str) -> Result<()> {
 }
 
 fn validate_marker(marker: &GenerationRetentionMarker) -> Result<()> {
-    if marker.schema_version != RETENTION_SCHEMA_VERSION {
-        bail!("unsupported generation retention marker schema");
+    // Dual-read: a peer on the previous binary still writes schema 1 and must
+    // keep pinning what it serves, so both schemas parse. Anything outside the
+    // known range is evidence this reader cannot interpret and is refused, so
+    // the caller protects instead of ignoring it.
+    match marker.schema_version {
+        RETENTION_MARKER_SCHEMA_V1 => {
+            if marker.owner.is_some()
+                || marker.generation.is_some()
+                || marker.heartbeat_epoch_ms.is_some()
+            {
+                bail!("schema 1 generation retention marker carries schema 2 registration fields");
+            }
+        }
+        RETENTION_MARKER_SCHEMA_V2 => {
+            let owner = marker
+                .owner
+                .as_ref()
+                .context("schema 2 generation retention marker is missing its workspace owner")?;
+            if owner.workspace_id != marker.workspace_id {
+                bail!(
+                    "generation retention marker owner workspace does not match marker workspace"
+                );
+            }
+
+            if owner.project_root.is_empty() {
+                bail!("generation retention marker owner has an empty project root");
+            }
+            marker
+                .heartbeat_epoch_ms
+                .context("schema 2 generation retention marker is missing its heartbeat")?;
+        }
+        _ => bail!("unsupported generation retention marker schema"),
     }
     validate_retention_component(&marker.workspace_id)?;
     if marker.project_id != marker.active.project_id {
         bail!("generation retention marker active project does not match marker project");
     }
     let active_generation = canonical_manifest_generation(&marker.active)?;
+    if marker
+        .generation
+        .as_ref()
+        .is_some_and(|generation| generation != &active_generation)
+    {
+        bail!("generation retention marker generation does not match its active manifest");
+    }
     if let Some(rollback) = marker.rollback.as_ref() {
         if rollback.manifest.project_id != marker.project_id {
             bail!("generation retention rollback project does not match marker project");
@@ -878,7 +1143,7 @@ fn validate_marker(marker: &GenerationRetentionMarker) -> Result<()> {
     Ok(())
 }
 
-fn read_marker_path(path: &Path) -> Result<Option<GenerationRetentionMarker>> {
+pub(crate) fn read_marker_path(path: &Path) -> Result<Option<GenerationRetentionMarker>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -921,17 +1186,20 @@ fn canonical_suffix(suffix: &str) -> Option<&str> {
     .then_some(suffix)
 }
 
+/// Every store that may hold protection evidence. A candidate this scan cannot
+/// even enumerate is missing evidence, so it marks the scan incomplete rather
+/// than shrinking the protected set silently.
 fn storage_paths_for_scan(
     cache_root: &Path,
     active_storage_path: Option<&Path>,
-    errors: &mut Vec<String>,
+    scan: &mut RetentionProtectionScan,
 ) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
     if let Some(path) = active_storage_path {
-        insert_direct_storage_path(path, "active storage", &mut paths, errors);
+        insert_direct_storage_path(path, "active storage", &mut paths, scan);
     }
     let flat = cache_root.join("codestory.db");
-    insert_direct_storage_path(&flat, "flat cache storage", &mut paths, errors);
+    insert_direct_storage_path(&flat, "flat cache storage", &mut paths, scan);
     if !cache_root.exists() {
         return paths;
     }
@@ -943,7 +1211,7 @@ fn storage_paths_for_scan(
                         let file_type = match entry.file_type() {
                             Ok(file_type) => file_type,
                             Err(error) => {
-                                errors.push(format!(
+                                scan.record_incomplete(format!(
                                     "read cache entry type {}: {error}",
                                     entry.path().display()
                                 ));
@@ -951,7 +1219,7 @@ fn storage_paths_for_scan(
                             }
                         };
                         if file_type.is_symlink() {
-                            errors.push(format!(
+                            scan.record_incomplete(format!(
                                 "cache scan refuses linked entry {}",
                                 entry.path().display()
                             ));
@@ -965,17 +1233,17 @@ fn storage_paths_for_scan(
                             &path,
                             "project cache storage",
                             &mut paths,
-                            errors,
+                            scan,
                         );
                     }
-                    Err(error) => errors.push(format!(
+                    Err(error) => scan.record_incomplete(format!(
                         "read cache entry under {}: {error}",
                         cache_root.display()
                     )),
                 }
             }
         }
-        Err(error) => errors.push(format!(
+        Err(error) => scan.record_incomplete(format!(
             "read cache root {} for retention manifests: {error}",
             cache_root.display()
         )),
@@ -987,17 +1255,21 @@ fn insert_direct_storage_path(
     path: &Path,
     label: &str,
     paths: &mut BTreeSet<PathBuf>,
-    errors: &mut Vec<String>,
+    scan: &mut RetentionProtectionScan,
 ) {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => errors.push(
-            format!("{label} is not a direct regular file: {}", path.display()),
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => scan
+            .record_incomplete(format!(
+                "{label} is not a direct regular file: {}",
+                path.display()
+            )),
         Ok(_) => {
             paths.insert(path.to_path_buf());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => errors.push(format!("inspect {label} {}: {error}", path.display())),
+        Err(error) => {
+            scan.record_incomplete(format!("inspect {label} {}: {error}", path.display()))
+        }
     }
 }
 
@@ -1232,7 +1504,7 @@ fn direct_directory_exists_or_missing(root: &Path, label: &str, errors: &mut Vec
     }
 }
 
-fn directory_size(path: &Path) -> Result<u64> {
+pub(crate) fn directory_size(path: &Path) -> Result<u64> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspect directory {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1462,6 +1734,7 @@ mod tests {
         ] {
             let marker = GenerationRetentionMarker::next(
                 workspace,
+                root.path(),
                 manifest(project, active, 10),
                 Some(RetrievalIndexRollbackRecord {
                     manifest: manifest(project, rollback, 5),
@@ -1747,6 +2020,7 @@ mod tests {
 
     #[test]
     fn marker_update_preserves_only_a_freshly_verified_rollback() {
+        let root = tempdir().expect("root");
         let project = "repo-v1-project";
         let active = manifest(project, "aaaaaaaaaaaaaaaa", 10);
         let rollback = RetrievalIndexRollbackRecord {
@@ -1758,6 +2032,7 @@ mod tests {
 
         let refreshed = GenerationRetentionMarker::next(
             "workspace_1",
+            root.path(),
             refreshed_active,
             Some(rollback.clone()),
             21,
@@ -1773,6 +2048,7 @@ mod tests {
         let state_file = root.path().join("retrieval-sidecars.json");
         let marker = GenerationRetentionMarker::next(
             "workspace_1",
+            root.path(),
             manifest("repo-v1-project", "aaaaaaaaaaaaaaaa", 1),
             None,
             2,
@@ -1790,6 +2066,7 @@ mod tests {
         assert_eq!(scan.active.len(), 1);
         assert_eq!(scan.errors.len(), 1);
         assert!(scan.errors[0].contains("bad.json"));
+        assert!(scan.protection_incomplete);
     }
 
     /// A second OS process holds the retention lock for longer than the
@@ -1925,6 +2202,295 @@ mod tests {
         assert!(
             waited >= DEFAULT_LOCK_WAIT,
             "the wait gave up after {waited:?}, inside the {DEFAULT_LOCK_WAIT:?} foreground budget, so a legitimate publication would be refused"
+        );
+    }
+
+    /// A peer already running the schema-2 writer publishes a marker into the
+    /// shared retention directory. Before dual-read this reader rejected the
+    /// unknown schema outright, so the peer's live generation became an
+    /// unrooted reclaim candidate and the whole project stopped pruning.
+    #[test]
+    fn a_schema_2_marker_from_a_peer_roots_its_generation_for_a_dual_reading_scanner() {
+        let root = tempdir().expect("root");
+        let peer_workspace_root = root.path().join("peer-worktree");
+        std::fs::create_dir_all(&peer_workspace_root).expect("peer worktree");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let peer = "aaaaaaaaaaaaaaaa";
+        let stale = "cccccccccccccccc";
+        write_bundle(&layout, project, peer, [1, 1, 1]);
+        write_bundle(&layout, project, stale, [1, 1, 1]);
+        let state_file = layout.state_file.clone();
+        let marker = GenerationRetentionMarker::next(
+            "workspace_peer",
+            &peer_workspace_root,
+            manifest(project, peer, 10),
+            None,
+            10,
+        )
+        .expect("schema 2 marker");
+        assert_eq!(marker.schema_version, RETENTION_MARKER_SCHEMA_V2);
+        write_retention_marker(&state_file, &marker).expect("write marker");
+
+        let protection = scan_retention_protection(root.path(), None, &state_file);
+        let plan = plan_generation_retention(&layout, project, &protection);
+
+        assert!(
+            !protection.protection_incomplete,
+            "a schema 2 marker is readable evidence, not a gap: {:?}",
+            protection.errors
+        );
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .map(|bundle| (bundle.generation.as_str(), bundle.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "repo-v1-project-aaaaaaaaaaaaaaaa",
+                    GenerationRetentionState::Active
+                ),
+                (
+                    "repo-v1-project-cccccccccccccccc",
+                    GenerationRetentionState::Reclaimable
+                ),
+            ]
+        );
+        assert!(!plan.pruning_suppressed);
+    }
+
+    /// Dual-read runs the other way too: a peer still on the previous binary
+    /// writes schema 1, and its generation must keep its pin.
+    #[test]
+    fn a_schema_1_marker_still_roots_its_generation() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let legacy = "bbbbbbbbbbbbbbbb";
+        write_bundle(&layout, project, legacy, [1, 1, 1]);
+        let state_file = layout.state_file.clone();
+        let legacy_marker = GenerationRetentionMarker {
+            schema_version: RETENTION_MARKER_SCHEMA_V1,
+            workspace_id: "workspace_legacy".into(),
+            project_id: project.into(),
+            active: manifest(project, legacy, 10),
+            rollback: None,
+            updated_at_epoch_ms: 10,
+            owner: None,
+            generation: None,
+            heartbeat_epoch_ms: None,
+        };
+        ensure_retention_dir(&state_file).expect("retention dir");
+        std::fs::write(
+            retention_marker_path(&state_file, "workspace_legacy").expect("marker path"),
+            serde_json::to_vec(&legacy_marker).expect("serialize legacy marker"),
+        )
+        .expect("write legacy marker");
+
+        let protection = scan_retention_protection(root.path(), None, &state_file);
+        let plan = plan_generation_retention(&layout, project, &protection);
+
+        assert!(!protection.protection_incomplete, "{:?}", protection.errors);
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .map(|bundle| (bundle.generation.as_str(), bundle.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                "repo-v1-project-bbbbbbbbbbbbbbbb",
+                GenerationRetentionState::Active
+            )]
+        );
+        assert_eq!(
+            legacy_marker.retirement(),
+            MarkerRetirement::UnregisteredWorkspace
+        );
+    }
+
+    /// The point of the registration: a worktree that has been deleted stops
+    /// pinning, while a worktree that still exists keeps its pin no matter how
+    /// old its marker is.
+    #[test]
+    fn a_deleted_worktree_releases_its_generation_while_a_live_one_keeps_it() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let live_root = root.path().join("live-worktree");
+        let dead_root = root.path().join("dead-worktree");
+        std::fs::create_dir_all(&live_root).expect("live worktree");
+        std::fs::create_dir_all(&dead_root).expect("dead worktree");
+        let live = "aaaaaaaaaaaaaaaa";
+        let dead = "dddddddddddddddd";
+        write_bundle(&layout, project, live, [1, 1, 1]);
+        write_bundle(&layout, project, dead, [1, 1, 1]);
+        let state_file = layout.state_file.clone();
+        for (workspace, worktree, suffix, age) in [
+            ("workspace_live", &live_root, live, 1),
+            ("workspace_dead", &dead_root, dead, 9_999),
+        ] {
+            let marker = GenerationRetentionMarker::next(
+                workspace,
+                worktree,
+                manifest(project, suffix, age),
+                None,
+                age,
+            )
+            .expect("marker");
+            write_retention_marker(&state_file, &marker).expect("write marker");
+        }
+        std::fs::remove_dir_all(&dead_root).expect("retire the dead worktree");
+
+        let protection = scan_retention_protection(root.path(), None, &state_file);
+        let plan = plan_generation_retention(&layout, project, &protection);
+
+        assert!(!protection.protection_incomplete, "{:?}", protection.errors);
+        assert_eq!(
+            protection
+                .retired_marker_paths
+                .iter()
+                .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+                .collect::<Vec<_>>(),
+            vec!["workspace_dead.json"]
+        );
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .map(|bundle| (bundle.generation.as_str(), bundle.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "repo-v1-project-aaaaaaaaaaaaaaaa",
+                    GenerationRetentionState::Active
+                ),
+                (
+                    "repo-v1-project-dddddddddddddddd",
+                    GenerationRetentionState::Reclaimable
+                ),
+            ]
+        );
+    }
+
+    /// A future marker encoding this reader does not recognize sits in the
+    /// same owned directory. Skipping it reads as "no roots", which is the one
+    /// interpretation that deletes a live pin, so it must protect instead.
+    #[test]
+    fn an_unrecognized_retention_entry_protects_instead_of_being_skipped() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let live_root = root.path().join("live-worktree");
+        std::fs::create_dir_all(&live_root).expect("live worktree");
+        let pinned = "aaaaaaaaaaaaaaaa";
+        let other = "cccccccccccccccc";
+        write_bundle(&layout, project, pinned, [1, 1, 1]);
+        write_bundle(&layout, project, other, [1, 1, 1]);
+        let state_file = layout.state_file.clone();
+        let marker = GenerationRetentionMarker::next(
+            "workspace_live",
+            &live_root,
+            manifest(project, pinned, 10),
+            None,
+            10,
+        )
+        .expect("marker");
+        write_retention_marker(&state_file, &marker).expect("write marker");
+        // A marker written in an encoding a later release introduces.
+        std::fs::write(
+            retention_dir(&state_file).join("workspace_future.marker3"),
+            b"opaque",
+        )
+        .expect("future marker");
+
+        let protection = scan_retention_protection(root.path(), None, &state_file);
+        let plan = plan_generation_retention(&layout, project, &protection);
+
+        assert!(
+            protection.protection_incomplete,
+            "an entry this reader cannot interpret is missing protection, not absent protection"
+        );
+        assert!(
+            protection
+                .errors
+                .iter()
+                .any(|error| error.contains("workspace_future.marker3")),
+            "{:?}",
+            protection.errors
+        );
+        assert!(plan.pruning_suppressed);
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .find(|bundle| bundle.generation.ends_with(other))
+                .map(|bundle| bundle.state),
+            Some(GenerationRetentionState::Building),
+            "no generation may be reclaimable while protection evidence is unreadable"
+        );
+    }
+
+    /// Lock files and crashed atomic-write temporaries share the directory and
+    /// are not protection evidence, so they must not wedge pruning forever.
+    #[test]
+    fn locks_and_abandoned_temporaries_are_not_unreadable_protection() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let live_root = root.path().join("live-worktree");
+        std::fs::create_dir_all(&live_root).expect("live worktree");
+        write_bundle(&layout, project, "aaaaaaaaaaaaaaaa", [1, 1, 1]);
+        let state_file = layout.state_file.clone();
+        let marker = GenerationRetentionMarker::next(
+            "workspace_live",
+            &live_root,
+            manifest(project, "aaaaaaaaaaaaaaaa", 10),
+            None,
+            10,
+        )
+        .expect("marker");
+        write_retention_marker(&state_file, &marker).expect("write marker");
+        let dir = retention_dir(&state_file);
+        std::fs::write(dir.join("repo-v1-project.lock"), b"").expect("lock file");
+        std::fs::write(
+            dir.join(".generation-retention.4242.7.tmp"),
+            b"abandoned partial write",
+        )
+        .expect("abandoned temporary");
+
+        let protection = scan_retention_protection(root.path(), None, &state_file);
+
+        assert!(
+            !protection.protection_incomplete,
+            "locks and temporaries are not evidence: {:?}",
+            protection.errors
+        );
+        assert!(protection.errors.is_empty(), "{:?}", protection.errors);
+    }
+
+    /// A schema-2 marker whose registration was copied from another workspace
+    /// would retire the wrong cache, so it is refused rather than trusted.
+    #[test]
+    fn a_marker_registration_for_another_workspace_is_refused() {
+        let root = tempdir().expect("root");
+        let project = "repo-v1-project";
+        let mut marker = GenerationRetentionMarker::next(
+            "workspace_1",
+            root.path(),
+            manifest(project, "aaaaaaaaaaaaaaaa", 1),
+            None,
+            2,
+        )
+        .expect("marker");
+        marker.owner = Some(RetentionMarkerOwner {
+            workspace_id: "workspace_2".into(),
+            project_root: root.path().display().to_string(),
+        });
+
+        let error = validate_marker(&marker).expect_err("mismatched registration is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("owner workspace does not match marker workspace"),
+            "{error:#}"
         );
     }
 }
