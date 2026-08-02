@@ -17,6 +17,7 @@ pub(crate) fn to_citation_from_hit(
         line: hit.line,
         score: hit.score,
         origin: hit.origin,
+        target: hit.target.clone(),
         resolvable: hit.resolvable,
         subgraph_id: subgraph_id.map(ToOwned::to_owned),
         evidence_edge_ids: if include_evidence && hit.resolvable {

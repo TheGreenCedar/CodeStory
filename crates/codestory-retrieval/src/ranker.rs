@@ -213,8 +213,7 @@ fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
 }
 
 fn candidate_has_graph_provenance(candidate: &CandidateHit) -> bool {
-    matches!(candidate.source, CandidateSource::Scip)
-        || candidate_has_provenance(candidate, "graph_neighbor")
+    candidate_has_provenance(candidate, "graph_neighbor")
         || candidate_has_provenance(candidate, "exact")
 }
 
@@ -888,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn ranker_fuses_duplicate_lane_provenance_into_rank_features() {
+    fn ranker_does_not_export_graph_for_same_file_name_affinity() {
         let features = classify_query("how does service startup flow");
         let mut fused = CandidateHit::with_source(
             "src/service.rs",
@@ -899,7 +898,7 @@ mod tests {
         fused.provenance = vec![
             "lexical_source".into(),
             "dense_anchor".into(),
-            "graph_neighbor".into(),
+            "same_file_name_affinity".into(),
         ];
         fused.scip_hop_distance = Some(1);
 
@@ -908,6 +907,24 @@ mod tests {
 
         assert_eq!(rank_features.lexical, 0.85);
         assert_eq!(rank_features.semantic, 0.85);
+        assert_eq!(rank_features.scip_distance, 0.0);
+    }
+
+    #[test]
+    fn ranker_exports_graph_only_for_explicit_graph_provenance() {
+        let features = classify_query("how does service startup flow");
+        let mut graph = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.85,
+            CandidateSource::Scip,
+        );
+        graph.provenance = vec!["graph_neighbor".into()];
+        graph.scip_hop_distance = Some(1);
+
+        let ranked = rank_candidates(&features, vec![graph]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
         assert_eq!(rank_features.scip_distance, 0.5);
     }
 }

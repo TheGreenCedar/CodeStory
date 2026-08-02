@@ -295,6 +295,7 @@ pub(in crate::app) fn drill_search_hit_from_packet_citation(
         line: citation.line,
         score: citation.score,
         origin: citation.origin,
+        target: citation.target.clone(),
         match_quality,
         resolvable: citation.resolvable,
         evidence_tier: citation.evidence_tier,

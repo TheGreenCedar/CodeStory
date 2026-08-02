@@ -4,11 +4,12 @@ use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
+use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto,
     PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
     RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStageTimingDto, SearchHit, SearchResultsDto,
+    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
@@ -1696,6 +1697,13 @@ fn resolve_candidate_node_id(
     rel_path: &str,
     candidate: &CandidateHit,
 ) -> Option<CoreNodeId> {
+    if candidate.target.is_some() {
+        return candidate_lookup_paths(project_root, rel_path)
+            .into_iter()
+            .find_map(|path| storage.get_file_by_path(&path).ok().flatten())
+            .map(|file| CoreNodeId(file.id));
+    }
+
     if let Some(node_id) = candidate
         .node_id
         .as_deref()
@@ -1827,15 +1835,13 @@ fn resolve_sidecar_candidates_in_storage(
         if !seen.insert(dedupe_key) {
             continue;
         }
-        let Some(mut hit) =
+        let Some(hit) =
             AppController::build_search_hit(storage, node_names, node_id, candidate.score)?
         else {
             unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;
         };
-        hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
-        decorate_search_hit_evidence(&mut hit);
-        hits.push(hit);
+        hits.push(classify_resolved_candidate_hit(hit, candidate));
     }
 
     let has_resolved_hit = !hits.is_empty();
@@ -1853,6 +1859,25 @@ fn resolve_sidecar_candidates_in_storage(
         blocking_unresolved_candidate_count,
         attempted_candidate_indices,
     })
+}
+
+fn classify_resolved_candidate_hit(mut hit: SearchHit, candidate: &CandidateHit) -> SearchHit {
+    hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
+    if candidate.target.is_some() {
+        hit.origin = SearchHitOrigin::TextMatch;
+        hit.target = candidate.target.clone();
+        hit.kind = ApiNodeKind::FILE;
+        hit.file_path = Some(candidate.file_path.clone());
+        hit.line = candidate.start_line;
+        hit.resolvable = false;
+        hit.evidence_tier = None;
+        hit.evidence_producer = None;
+        hit.resolution_status = None;
+        hit.eligible_for_sufficiency = None;
+        hit.source_excerpt = candidate.source_excerpt.clone();
+    }
+    decorate_search_hit_evidence(&mut hit);
+    hit
 }
 
 #[cfg(test)]
@@ -1910,7 +1935,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
     let label = match candidate.source {
         CandidateSource::Lexical => "lexical_source",
         CandidateSource::Semantic => "dense_anchor",
-        CandidateSource::Scip => "graph_neighbor",
+        CandidateSource::Scip => "scip_candidate",
         CandidateSource::Legacy => "legacy",
     };
     vec![label.to_string()]
@@ -1920,7 +1945,9 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::agent::packet_evidence::PacketEvidenceTier;
-    use codestory_contracts::api::{NodeId, NodeKind as ApiNodeKind, SearchHitOrigin};
+    use codestory_contracts::api::{
+        NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
+    };
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
         classify_query, project_id_for_root, rank_candidates,
@@ -1994,7 +2021,7 @@ mod tests {
         crate::process_env_test_lock()
     }
 
-    fn search_hit_for_candidate(candidate: &CandidateHit) -> SearchHit {
+    fn undecorated_search_hit_for_candidate(candidate: &CandidateHit) -> SearchHit {
         SearchHit {
             node_id: NodeId("candidate".to_string()),
             display_name: candidate
@@ -2006,6 +2033,7 @@ mod tests {
             line: candidate.start_line,
             score: candidate.score,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -2016,8 +2044,12 @@ mod tests {
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
-            score_breakdown: Some(score_breakdown_for_candidate(candidate)),
+            score_breakdown: None,
         }
+    }
+
+    fn search_hit_for_candidate(candidate: &CandidateHit) -> SearchHit {
+        classify_resolved_candidate_hit(undecorated_search_hit_for_candidate(candidate), candidate)
     }
 
     fn retrieval_cache_key_for_test(query_fingerprint: &str) -> RetrievalCacheKey {
@@ -2392,6 +2424,85 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_lexical_candidate_resolves_to_typed_file_range_evidence() {
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: PathBuf::from("src/lib.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 3,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_nodes_batch(&[
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/lib.rs".to_string(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "unrelated_symbol".to_string(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+
+        let mut candidate =
+            CandidateHit::with_source("src/lib.rs", None, 0.8, CandidateSource::Lexical);
+        candidate.start_line = Some(2);
+        candidate.target = Some(SearchTargetDto::FileRange {
+            file_path: "src/lib.rs".to_string(),
+            start_byte: 12,
+            end_byte: 19,
+        });
+        candidate.source_excerpt = Some("fn needle() {}".to_string());
+        candidate.provenance = vec!["lexical_source".to_string()];
+
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[candidate],
+            1,
+        )
+        .expect("resolve typed lexical candidate");
+        let hit = outcome.resolved_hits.first().expect("resolved file hit");
+
+        assert_eq!(hit.node_id, NodeId("1".to_string()));
+        assert_eq!(hit.kind, ApiNodeKind::FILE);
+        assert_eq!(hit.origin, SearchHitOrigin::TextMatch);
+        assert_eq!(hit.line, Some(2));
+        assert_eq!(
+            hit.target,
+            Some(SearchTargetDto::FileRange {
+                file_path: "src/lib.rs".to_string(),
+                start_byte: 12,
+                end_byte: 19,
+            })
+        );
+        assert_eq!(hit.source_excerpt.as_deref(), Some("fn needle() {}"));
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(crate::agent::packet_evidence::PacketEvidenceResolution::SourceRangeOnly)
+        );
+    }
+
+    #[test]
     fn unresolved_sidecar_candidates_are_diagnostic_only() {
         let result = QueryResult {
             publication_identity: None,
@@ -2545,8 +2656,7 @@ mod tests {
         let candidate = ranked.first().expect("ranked candidate");
 
         let breakdown = score_breakdown_for_candidate(candidate);
-        let mut hit = search_hit_for_candidate(candidate);
-        decorate_search_hit_evidence(&mut hit);
+        let hit = search_hit_for_candidate(candidate);
 
         assert_eq!(breakdown.graph, 0.0);
         assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
@@ -2565,11 +2675,81 @@ mod tests {
         let candidate = ranked.first().expect("ranked candidate");
 
         let breakdown = score_breakdown_for_candidate(candidate);
-        let mut hit = search_hit_for_candidate(candidate);
-        decorate_search_hit_evidence(&mut hit);
+        let hit = search_hit_for_candidate(candidate);
 
         assert_eq!(breakdown.graph, 0.0);
         assert_ne!(hit.evidence_tier, Some(PacketEvidenceTier::ResolvedGraph));
+    }
+
+    #[test]
+    fn candidate_evidence_is_classified_once_after_lane_context_is_attached() {
+        use crate::agent::packet_evidence::PacketEvidenceResolution;
+
+        let mut lexical = CandidateHit::with_source(
+            "src/service.rs",
+            Some("Service".into()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        lexical.provenance = vec!["lexical_source".into()];
+        let neutral = classify_resolved_candidate_hit(
+            undecorated_search_hit_for_candidate(&lexical),
+            &lexical,
+        );
+        assert_eq!(
+            neutral.evidence_tier,
+            Some(PacketEvidenceTier::LexicalSource)
+        );
+        assert_eq!(neutral.evidence_producer.as_deref(), Some("lexical_source"));
+
+        let mut structural = undecorated_search_hit_for_candidate(&lexical);
+        structural.evidence_tier = Some(PacketEvidenceTier::StructuralText);
+        structural.evidence_producer = Some("structural_markdown_collector".into());
+        structural.resolution_status = Some(PacketEvidenceResolution::SourceRangeOnly);
+        structural.eligible_for_sufficiency = Some(false);
+        let structural = classify_resolved_candidate_hit(structural, &lexical);
+        assert_eq!(
+            structural.evidence_tier,
+            Some(PacketEvidenceTier::StructuralText)
+        );
+        assert_eq!(
+            structural.evidence_producer.as_deref(),
+            Some("structural_markdown_collector")
+        );
+        assert_eq!(structural.eligible_for_sufficiency, Some(false));
+
+        let mut exact = undecorated_search_hit_for_candidate(&lexical);
+        exact.evidence_tier = Some(PacketEvidenceTier::ExactSource);
+        exact.evidence_producer = Some("openapi_endpoint_schema".into());
+        exact.resolution_status = Some(PacketEvidenceResolution::SourceRangeOnly);
+        exact.eligible_for_sufficiency = Some(false);
+        let exact = classify_resolved_candidate_hit(exact, &lexical);
+        assert_eq!(exact.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(exact.eligible_for_sufficiency, Some(false));
+
+        let mut affinity = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ServiceImpl".into()),
+            0.8,
+            CandidateSource::Scip,
+        );
+        affinity.provenance = vec!["same_file_name_affinity".into()];
+        let affinity = rank_candidates(&classify_query("ServiceImpl"), vec![affinity])
+            .into_iter()
+            .next()
+            .expect("ranked affinity candidate");
+        let affinity_hit = search_hit_for_candidate(&affinity);
+        assert_eq!(
+            affinity_hit
+                .score_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.graph),
+            Some(0.0)
+        );
+        assert_ne!(
+            affinity_hit.evidence_tier,
+            Some(PacketEvidenceTier::ResolvedGraph)
+        );
     }
 
     #[test]

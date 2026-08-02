@@ -222,6 +222,7 @@ fn sample_runtime_hit(
         line: Some(line),
         score: 1.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         source_excerpt: None,

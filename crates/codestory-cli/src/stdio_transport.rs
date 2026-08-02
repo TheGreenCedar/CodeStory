@@ -6378,6 +6378,7 @@ version = "0.11.20"
             line: Some(12),
             score: 0.8,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),

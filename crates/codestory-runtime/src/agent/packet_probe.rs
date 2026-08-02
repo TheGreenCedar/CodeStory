@@ -187,6 +187,7 @@ fn exact_path_probe_citation(
         line: Some(1),
         score: 100.0,
         origin: SearchHitOrigin::TextMatch,
+        target: None,
         resolvable: false,
         subgraph_id: None,
         evidence_edge_ids: Vec::new(),

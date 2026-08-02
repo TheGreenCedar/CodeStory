@@ -1055,6 +1055,7 @@ mod tests {
             line: Some(1),
             score,
             origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
             resolvable: true,
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),

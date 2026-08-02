@@ -3,7 +3,7 @@ use crate::args::{SearchHitOutput, VerificationTargetOutput};
 use crate::runtime::RuntimeContext;
 use codestory_contracts::api::{
     NodeId, NodeKind, NodeOccurrencesRequest, RetrievalScoreBreakdownDto, SearchHit,
-    SearchMatchQualityDto, SourceOccurrenceDto,
+    SearchMatchQualityDto, SearchTargetDto, SourceOccurrenceDto,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -65,6 +65,20 @@ pub(crate) fn build_search_hit_output(
         line: hit.line,
         score: hit.score,
         origin: hit.origin,
+        target: hit.target.as_ref().map(|target| match target {
+            SearchTargetDto::File { file_path } => SearchTargetDto::File {
+                file_path: crate::display::relative_path(project_root, file_path),
+            },
+            SearchTargetDto::FileRange {
+                file_path,
+                start_byte,
+                end_byte,
+            } => SearchTargetDto::FileRange {
+                file_path: crate::display::relative_path(project_root, file_path),
+                start_byte: *start_byte,
+                end_byte: *end_byte,
+            },
+        }),
         match_quality: hit
             .match_quality
             .unwrap_or_else(|| search_match_quality(query, hit)),

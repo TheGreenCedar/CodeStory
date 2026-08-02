@@ -266,11 +266,10 @@ fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
     assert_eq!(tree_sitter.score, ast.score);
     assert_eq!(lexical_fallback.score, text_only.score);
     assert_eq!(normal.score, 1.0);
-    assert_eq!(
-        normal.evidence_tier,
-        Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        "a valid missing unit remains resolved graph evidence"
-    );
+    assert_eq!(normal.evidence_tier, None);
+    assert_eq!(normal.evidence_producer, None);
+    assert_eq!(normal.resolution_status, None);
+    assert_eq!(normal.eligible_for_sufficiency, None);
 
     let mut hits = [text_only, ast.clone()];
     hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
@@ -650,6 +649,7 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         line: None,
         score: 184.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: None,
@@ -670,6 +670,7 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         line: None,
         score: 184.0,
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+        target: None,
         match_quality: None,
         resolvable: true,
         evidence_tier: None,
@@ -1592,6 +1593,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(10),
             score: 0.25,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1612,6 +1614,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(20),
             score: 0.75,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1636,6 +1639,7 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             line: Some(10),
             score: 250.0,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1675,6 +1679,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(178),
             score: 0.90,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1695,6 +1700,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(187),
             score: 0.80,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1715,6 +1721,7 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             line: Some(194),
             score: 0.70,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1757,6 +1764,7 @@ fn exact_search_results_keep_repeated_display_keys() {
             line: Some(178),
             score: 0.90,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,
@@ -1777,6 +1785,7 @@ fn exact_search_results_keep_repeated_display_keys() {
             line: Some(187),
             score: 0.80,
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
             evidence_tier: None,

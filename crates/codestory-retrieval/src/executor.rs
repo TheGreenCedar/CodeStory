@@ -937,6 +937,12 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             if existing.start_line.is_none() {
                 existing.start_line = hit.start_line;
             }
+            if existing.target.is_none() {
+                existing.target = hit.target.clone();
+            }
+            if existing.source_excerpt.is_none() {
+                existing.source_excerpt = hit.source_excerpt.clone();
+            }
             if existing.file_role.is_none() {
                 existing.file_role = hit.file_role;
             }
@@ -1614,7 +1620,10 @@ mod tests {
         );
         assert!(result.hits.iter().any(|hit| {
             hit.file_path == "src/graph_neighbor.rs"
-                && hit.provenance.iter().any(|value| value == "graph_neighbor")
+                && hit
+                    .provenance
+                    .iter()
+                    .any(|value| value == "same_file_name_affinity")
         }));
 
         let result = executor
@@ -2071,13 +2080,13 @@ mod tests {
     #[test]
     fn executor_merges_duplicate_candidate_provenance() {
         let query = "how extension service starts";
-        let mut graph_hit = CandidateHit::with_source(
+        let mut affinity_hit = CandidateHit::with_source(
             "src/service.rs",
             Some("ExtensionService".into()),
             0.75,
             CandidateSource::Scip,
         );
-        graph_hit.scip_hop_distance = Some(1);
+        affinity_hit.scip_hop_distance = Some(1);
         let mock = MockSidecarSearch {
             lexical: Mutex::new(HashMap::from([(
                 query.into(),
@@ -2097,7 +2106,7 @@ mod tests {
                     CandidateSource::Semantic,
                 )],
             )])),
-            scip_expand: Mutex::new(vec![graph_hit]),
+            scip_expand: Mutex::new(vec![affinity_hit]),
             ..Default::default()
         };
         let mut cache = RetrievalCache::new();
@@ -2120,12 +2129,16 @@ mod tests {
             "merged candidate should keep ranker-adjusted score above lexical-only input: {hit:?}"
         );
         assert!(hit.provenance.iter().any(|label| label == "lexical_source"));
-        assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));
+        assert!(
+            hit.provenance
+                .iter()
+                .any(|label| label == "same_file_name_affinity")
+        );
         assert!(hit.provenance.iter().any(|label| label == "dense_anchor"));
         let rank_features = hit.rank_features.as_ref().expect("rank features");
         assert!(rank_features.lexical >= 0.85);
         assert!(rank_features.semantic >= 0.85);
-        assert_eq!(rank_features.scip_distance, 0.5);
+        assert_eq!(rank_features.scip_distance, 0.0);
     }
 
     #[test]

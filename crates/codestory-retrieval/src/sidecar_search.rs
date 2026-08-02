@@ -283,7 +283,12 @@ impl SidecarSearch for LiveSidecarSearch {
     }
 
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>> {
-        ScipClient::expand_graph(&self.layout, &self.sidecar_generation, anchors, limit)
+        ScipClient::expand_same_file_name_affinity(
+            &self.layout,
+            &self.sidecar_generation,
+            anchors,
+            limit,
+        )
     }
 
     fn scip_expand_with_context(
@@ -292,7 +297,7 @@ impl SidecarSearch for LiveSidecarSearch {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        ScipClient::expand_graph_with_cancel(
+        ScipClient::expand_same_file_name_affinity_with_cancel(
             &self.layout,
             &self.sidecar_generation,
             anchors,

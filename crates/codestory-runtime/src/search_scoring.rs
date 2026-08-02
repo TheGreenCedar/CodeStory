@@ -1,9 +1,8 @@
 use super::{
     AgentHybridWeightsDto, ApiError, AppController, ExpandedSymbolMatches, HashMap, HashSet,
     NodeId, NodeKind, RetrievalStateDto, SearchHit, SearchPlanSubqueryDto, SearchRequest, Storage,
-    aggregate_symbol_matches, decorate_search_hit_evidence, extract_symbol_search_terms,
-    node_display_name, preferred_occurrence, route_endpoint_adjusted_search_score,
-    symbol_name_match_rank,
+    aggregate_symbol_matches, extract_symbol_search_terms, node_display_name, preferred_occurrence,
+    route_endpoint_adjusted_search_score, symbol_name_match_rank,
 };
 #[cfg(test)]
 use super::{
@@ -354,7 +353,7 @@ impl AppController {
             ))
         })?;
 
-        let mut hit = SearchHit {
+        let hit = SearchHit {
             node_id: NodeId::from(id),
             display_name,
             kind: NodeKind::from(node.kind),
@@ -362,38 +361,30 @@ impl AppController {
             line,
             score: route_endpoint_adjusted_search_score(score, node.canonical_id.as_deref()),
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            target: None,
             match_quality: None,
             resolvable: true,
-            evidence_tier: Some(if structural_unit.is_some() {
-                codestory_contracts::api::PacketEvidenceTierDto::StructuralText
-            } else if openapi_endpoint {
-                codestory_contracts::api::PacketEvidenceTierDto::ExactSource
-            } else {
-                codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph
-            }),
-            evidence_producer: Some(if let Some(unit) = structural_unit.as_ref() {
-                unit.producer.clone()
-            } else {
-                if openapi_endpoint {
-                    "openapi_endpoint_schema"
-                } else {
-                    "route_endpoint"
-                }
-                .to_string()
-            }),
-            resolution_status: Some(if structural_unit.is_some() || openapi_endpoint {
-                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly
-            } else {
-                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved
-            }),
+            evidence_tier: structural_unit
+                .as_ref()
+                .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+                .or_else(|| {
+                    openapi_endpoint
+                        .then_some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+                }),
+            evidence_producer: structural_unit
+                .as_ref()
+                .map(|unit| unit.producer.clone())
+                .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string())),
+            resolution_status: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(structural_unit.is_none() && !openapi_endpoint),
+            eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(false),
             source_excerpt: None,
             verification_targets: Vec::new(),
             score_breakdown: None,
         };
-        decorate_search_hit_evidence(&mut hit);
         Ok(Some(hit))
     }
 

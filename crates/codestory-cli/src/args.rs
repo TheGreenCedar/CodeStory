@@ -14,8 +14,9 @@ use codestory_contracts::api::{
     PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
     ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
     RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
+    SearchQueryAssessmentDto, SearchTargetDto, SnippetContextDto, SummaryGenerationDto,
+    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    validate_packet_probe,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
@@ -1614,6 +1615,8 @@ pub(crate) struct SearchHitOutput {
     pub(crate) line: Option<u32>,
     pub(crate) score: f32,
     pub(crate) origin: SearchHitOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<SearchTargetDto>,
     pub(crate) match_quality: SearchMatchQualityDto,
     pub(crate) resolvable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -34,7 +34,7 @@ impl RetrievalStageKind {
             RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
             RetrievalStageKind::Stage1Lexical => Some("lexical_source"),
             RetrievalStageKind::Stage1bSemantic => Some("dense_anchor"),
-            RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
+            RetrievalStageKind::Stage2ScipExpand => Some("same_file_name_affinity"),
             RetrievalStageKind::Stage3RepoTextFallback => None,
         }
     }
@@ -245,7 +245,7 @@ mod tests {
             ),
             (
                 RetrievalStageKind::Stage2ScipExpand,
-                Some("graph_neighbor"),
+                Some("same_file_name_affinity"),
                 true,
             ),
             (RetrievalStageKind::Stage3RepoTextFallback, None, false),

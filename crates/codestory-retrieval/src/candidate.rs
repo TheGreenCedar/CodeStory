@@ -1,3 +1,4 @@
+use codestory_contracts::api::SearchTargetDto;
 use codestory_store::FileRole;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,10 @@ pub struct CandidateHit {
     pub file_path: String,
     pub symbol_name: Option<String>,
     pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SearchTargetDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_excerpt: Option<String>,
     pub score: f32,
     pub source: CandidateSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -66,6 +71,8 @@ impl CandidateHit {
             file_path: file_path.into(),
             symbol_name: None,
             start_line: None,
+            target: None,
+            source_excerpt: None,
             score,
             source: CandidateSource::Lexical,
             provenance: vec!["lexical_source".into()],
@@ -86,6 +93,8 @@ impl CandidateHit {
             file_path: file_path.into(),
             symbol_name,
             start_line: None,
+            target: None,
+            source_excerpt: None,
             score,
             source,
             provenance: Vec::new(),
