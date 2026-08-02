@@ -533,7 +533,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "ureq",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 

@@ -223,6 +223,62 @@ test("fail-open handoff shutdown is bounded for a child that ignores stdin and S
   assert.equal(child.stdin.writableEnded, true);
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });
+
+test("runtime death diagnostics retain only typed fields", () => {
+  const correlationId = launcherTest.runtimeCorrelationId();
+  assert.match(correlationId, /^[0-9a-f]{32}$/u);
+  assert.equal(launcherTest.sanitizeRuntimeDiagnosticText("unlabeled private query"), "[redacted]");
+  const detail = launcherTest.runtimeFailureDetail("runtime_stdio_child_exit", {
+    code: 17,
+    signal: null,
+    correlationId,
+    error: new Error("unlabeled private query"),
+    errorCode: "EPIPE",
+    stderrBytes: 23,
+    stderrChunks: 2,
+    stderrBytesCapped: false,
+    stderrChunksCapped: false,
+  });
+  assert.match(detail, /reason_code=runtime_stdio_child_exit exit_code=17 signal=none/u);
+  assert.match(detail, new RegExp(`correlation_id=${correlationId}`, "u"));
+  assert.match(detail, /stderr_bytes=23 stderr_chunks=2/u);
+  assert.match(detail, /error_code=EPIPE/u);
+  assert.doesNotMatch(detail, /unlabeled private query/u);
+  const untrustedReason = launcherTest.runtimeFailureDetail("unlabeled_private_query");
+  assert.doesNotMatch(untrustedReason, /unlabeled_private_query/u);
+  assert.match(untrustedReason, /reason_code=unknown_runtime_failure/u);
+});
+
+test("runtime stderr observation never retains unlabeled child text", () => {
+  let observation = null;
+  observation = launcherTest.appendRuntimeStderrTail(observation, "unlabeled ");
+  observation = launcherTest.appendRuntimeStderrTail(observation, "private query\n");
+  const rendered = launcherTest.renderRuntimeStderrTail(observation);
+
+  assert.doesNotMatch(JSON.stringify(observation), /unlabeled|private query/u);
+  assert.deepEqual(rendered, {
+    stderrBytes: Buffer.byteLength("unlabeled private query\n", "utf8"),
+    stderrChunks: 2,
+    stderrBytesCapped: false,
+    stderrChunksCapped: false,
+  });
+});
+
+test("runtime stderr metadata counters saturate at fixed bounds", () => {
+  let observation = {
+    observedBytes: launcherTest.runtimeStderrObservedBytesCap - 1,
+    observedChunks: launcherTest.runtimeStderrObservedChunksCap - 1,
+  };
+  observation = launcherTest.appendRuntimeStderrTail(observation, "private query");
+  observation = launcherTest.appendRuntimeStderrTail(observation, "private query");
+  assert.deepEqual(launcherTest.renderRuntimeStderrTail(observation), {
+    stderrBytes: launcherTest.runtimeStderrObservedBytesCap,
+    stderrChunks: launcherTest.runtimeStderrObservedChunksCap,
+    stderrBytesCapped: true,
+    stderrChunksCapped: true,
+  });
+});
+
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
   return join(dataDir, `.codestory-active-thread-${key}.json`);
@@ -2378,8 +2434,8 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     [
       "const args = process.argv.slice(2);",
       "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
-      "if (args[0] === 'serve') { process.exit(17); }",
-      "process.exit(2);",
+      "else if (args[0] === 'serve') { process.stderr.write('unlabeled '); setTimeout(() => { process.stderr.write('private query\\n'); process.exit(17); }, 25); }",
+      "else { process.exit(2); }",
     ].join("\n"),
   );
 
@@ -2465,6 +2521,19 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       status.readiness[0].setup.probe_error,
       /codestory-cli serve --stdio exited with status 17/u,
     );
+    assert.equal(status.readiness[0].setup.runtime_exit_code, 17);
+    assert.equal(status.readiness[0].setup.runtime_exit_signal, null);
+    assert.match(status.readiness[0].setup.runtime_correlation_id, /^[0-9a-f]{32}$/u);
+    assert.equal(
+      status.readiness[0].setup.runtime_stderr_bytes,
+      Buffer.byteLength("unlabeled private query\n", "utf8"),
+    );
+    assert.ok(status.readiness[0].setup.runtime_stderr_chunks >= 1);
+    assert.equal(status.readiness[0].setup.runtime_stderr_bytes_capped, false);
+    assert.equal(status.readiness[0].setup.runtime_stderr_chunks_capped, false);
+    assert.equal(status.readiness[0].setup.runtime_stderr_tail, undefined);
+    assert.doesNotMatch(JSON.stringify(status), /unlabeled private query/u);
+    assert.doesNotMatch(stderr, /unlabeled private query/u);
     assert.equal(status.managed_retrieval.automatic, true);
     child.stdin.end();
     assert.equal((await completed)[0], 0);
@@ -4065,13 +4134,16 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
     "const {PassThrough}=require('node:stream');",
     "let failed=false;",
     "const status=()=>({plugin_runtime:{plugin_version:'test'},degraded_reason:failed?'managed_cli_handoff_unspawnable':'managed_cli_provisioning',recommended_next_calls:[]});",
-    "run(status,{shouldHandoff:()=>!failed,startRuntime:()=>{const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();process.nextTick(()=>child.emit('error',new Error('synthetic spawn error')));return child},onRuntimeFailure:()=>{failed=true}});",
+    "run(status,{shouldHandoff:()=>!failed,startRuntime:()=>{const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();process.nextTick(()=>{const error=new Error('unlabeled private query');error.code='EACCES';child.emit('error',error)});return child},onRuntimeFailure:(failure)=>{failed=true;process.stderr.write(JSON.stringify(failure))}});",
   ].join("");
   const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
   const completed = once(child, "close");
   let output = "";
+  let stderr = "";
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.write([
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
     JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
@@ -4094,6 +4166,12 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
   assert.equal(responses.find((response) => response.id === 2)?.error.code, -32000);
   const status = JSON.parse(responses.find((response) => response.id === 3).result.contents[0].text);
   assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
+  assert.doesNotMatch(output, /unlabeled private query/u);
+  assert.doesNotMatch(stderr, /unlabeled private query/u);
+  const failure = JSON.parse(stderr);
+  assert.equal(failure.spawnError, true);
+  assert.equal(failure.errorCode, "EACCES");
+  assert.equal(failure.reasonCode, "runtime_stdio_child_spawn");
 });
 
 test("fail-open status tool preserves primary runtime failures and no-project precedence", { timeout: 5000 }, async () => {

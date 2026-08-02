@@ -118,6 +118,7 @@ use runtime::map_api_error;
 
 #[tokio::main]
 pub async fn run() -> ExitCode {
+    crate::diagnostics::install_process_diagnostics();
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
     if std::env::var_os("CODESTORY_EMBED_ALLOW_CPU")
@@ -164,6 +165,7 @@ pub async fn run() -> ExitCode {
     match run_cli(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            crate::diagnostics::record_command_failure(&error);
             let structured = error.downcast_ref::<StructuredCommandFailure>();
             if json {
                 let envelope = structured
