@@ -3,6 +3,9 @@ name: crate-durability
 on:
   pull_request:
     paths:
+      - Cargo.toml
+      - Cargo.lock
+      - vendor/**
       - crates/codestory-store/**
       - crates/codestory-indexer/**
       - crates/codestory-workspace/**
@@ -19,6 +22,9 @@ on:
       - main
       - dev/codestory-next
     paths:
+      - Cargo.toml
+      - Cargo.lock
+      - vendor/**
       - crates/codestory-store/**
       - crates/codestory-indexer/**
       - crates/codestory-workspace/**

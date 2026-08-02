@@ -1086,6 +1086,11 @@ const draftCompilerSaveCondition =
   "success() && steps.compiler-cache-restore.outputs.cache-hit != 'true' && steps.compiler-cache-restore.outputs.cache-primary-key != ''";
 const draftCompilerSaveKey = "${{ steps.compiler-cache-restore.outputs.cache-primary-key }}";
 const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
+const crateDurabilityDependencyTriggerPaths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "vendor/**",
+];
 const draftWorkflowPaths = [
   "Cargo.lock",
   "Cargo.toml",
@@ -1416,6 +1421,11 @@ export function proofFloorPolicyViolations(
       list(eventValue.paths).length === list(durability.paths).length
         && sameMembers(eventValue.paths, durability.paths),
       `${file} ${event} paths must match the exact owning-path set`,
+    );
+    add(
+      violations,
+      includesAll(eventValue.paths, crateDurabilityDependencyTriggerPaths),
+      `${file} ${event} paths must cover root Cargo manifests, the lockfile, and vendored dependencies`,
     );
   }
   add(
