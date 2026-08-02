@@ -7,11 +7,15 @@
 //
 //   node scripts/bump-version.mjs --version 0.17.0
 //   node scripts/bump-version.mjs --version 0.17.0 --check
+//   node scripts/bump-version.mjs --version 0.17.1 --lane plugin
+//   node scripts/bump-version.mjs --version 0.17.1 --lane plugin --check
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { parsePublishedArchiveDigests } from "./lib/pinned-archive-digests.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
@@ -39,6 +43,8 @@ const MODEL_CONTRACT = "crates/codestory-llama-sys/model-contract.json";
 const CHANGELOG = "CHANGELOG.md";
 const CLI_VERSION_PIN = "plugins/codestory/cli-version.json";
 const CARGO_LOCK = "Cargo.lock";
+const RELEASE_REPOSITORY = "TheGreenCedar/CodeStory";
+const PYTHON = process.env.CODESTORY_PYTHON || "python3";
 
 function fail(message) {
   console.error(`bump-version: ${message}`);
@@ -46,7 +52,7 @@ function fail(message) {
 }
 
 function parseArguments(argv) {
-  const values = { check: false };
+  const values = { check: false, lane: "native" };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--check") {
@@ -56,13 +62,25 @@ function parseArguments(argv) {
     const separator = argument.indexOf("=");
     const name = separator < 0 ? argument : argument.slice(0, separator);
     const inline = separator < 0 ? undefined : argument.slice(separator + 1);
-    if (name !== "--version") fail(`unknown argument ${argument}`);
-    values.version = inline ?? argv[++index];
+    const next = argv[index + 1];
+    const value =
+      inline ?? (next && !next.startsWith("--") ? argv[++index] : undefined);
+    if (!value) fail(`${name} requires a value`);
+    if (name === "--version") values.version = value;
+    else if (name === "--lane") values.lane = value;
+    else if (name === "--archive-checksums") values.archiveChecksums = value;
+    else fail(`unknown argument ${argument}`);
   }
   if (!values.version) fail("--version is required");
   values.version = values.version.replace(/^v/u, "");
   if (!SEMVER.test(values.version)) {
     fail(`--version must be strict semver like 0.17.0, got ${values.version}`);
+  }
+  if (!new Set(["native", "plugin"]).has(values.lane)) {
+    fail(`--lane must be native or plugin, got ${values.lane}`);
+  }
+  if (values.lane === "native" && values.archiveChecksums) {
+    fail("--archive-checksums belongs only to the plugin lane");
   }
   return values;
 }
@@ -82,6 +100,13 @@ function setPackageVersion(source, version) {
   const packageSection = /(^\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/mu;
   if (!packageSection.test(source)) fail("crate manifest has no [package] version");
   return source.replace(packageSection, `$1${version}$3`);
+}
+
+function packageVersion(source) {
+  const packageSection = /(^\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/mu;
+  const version = packageSection.exec(source)?.[2];
+  if (!version) fail("crate manifest has no [package] version");
+  return version;
 }
 
 /// Replace one JSON string value in place.
@@ -135,10 +160,120 @@ function cargoLockCarriesVersion(source, version) {
   return [...cargoLockVersions(source).values()].every((current) => current === version);
 }
 
-function main() {
-  const { version, check } = parseArguments(process.argv.slice(2));
+function compareSemverCore(left, right) {
+  const parse = (value) => value.split("-")[0].split(".").map(Number);
+  const [leftMajor, leftMinor, leftPatch] = parse(left);
+  const [rightMajor, rightMinor, rightPatch] = parse(right);
+  if (leftMajor !== rightMajor) return leftMajor - rightMajor;
+  if (leftMinor !== rightMinor) return leftMinor - rightMinor;
+  return leftPatch - rightPatch;
+}
+
+async function publishedArchiveDigests(pin, checksumSource) {
+  if (
+    !pin ||
+    typeof pin.cli_version !== "string" ||
+    !SEMVER.test(pin.cli_version) ||
+    pin.release_tag !== `v${pin.cli_version}`
+  ) {
+    fail(`${CLI_VERSION_PIN} does not name a valid published CLI release`);
+  }
+  const source =
+    checksumSource ??
+    `https://github.com/${RELEASE_REPOSITORY}/releases/download/` +
+      `${encodeURIComponent(pin.release_tag)}/SHA256SUMS.txt`;
+  let contents;
+  if (/^https:\/\//u.test(source)) {
+    const response = await fetch(source, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) {
+      fail(`could not fetch ${source}: HTTP ${response.status}`);
+    }
+    contents = await response.text();
+  } else {
+    contents = readFileSync(path.resolve(repositoryRoot, source), "utf8");
+  }
+  try {
+    return parsePublishedArchiveDigests(contents, pin.cli_version);
+  } catch (error) {
+    fail(error.message);
+  }
+}
+
+async function main() {
+  const { version, check, lane, archiveChecksums } = parseArguments(
+    process.argv.slice(2),
+  );
   const changes = [];
   const cargoLockBefore = readFileSync(path.join(repositoryRoot, CARGO_LOCK), "utf8");
+
+  if (lane === "plugin") {
+    const cliVersion = packageVersion(
+      readFileSync(
+        path.join(repositoryRoot, "crates/codestory-cli/Cargo.toml"),
+        "utf8",
+      ),
+    );
+    const pinSource = readFileSync(path.join(repositoryRoot, CLI_VERSION_PIN), "utf8");
+    const pin = JSON.parse(pinSource);
+    if (pin.cli_version !== cliVersion) {
+      fail(
+        `${CLI_VERSION_PIN} pins ${pin.cli_version}, but the workspace CLI is ${cliVersion}`,
+      );
+    }
+    if (compareSemverCore(version, cliVersion) <= 0) {
+      fail(`plugin version ${version} must be ahead of pinned CLI ${cliVersion}`);
+    }
+    const archives = await publishedArchiveDigests(pin, archiveChecksums);
+
+    for (const manifest of PLUGIN_MANIFESTS) {
+      rewrite(
+        manifest,
+        (source) => setJsonVersion(source, version, ["version"]),
+        changes,
+        { check },
+      );
+    }
+    rewrite(
+      CLI_VERSION_PIN,
+      (source) => {
+        const current = JSON.parse(source);
+        const next = { ...current, archives };
+        const after = `${JSON.stringify(next, null, 2)}\n`;
+        return after === source ? source : after;
+      },
+      changes,
+      { check },
+    );
+    rewrite(CHANGELOG, (source) => promoteChangelog(source, version), changes, { check });
+
+    if (check) {
+      if (changes.length > 0) {
+        fail(`these plugin surfaces do not carry ${version}:\n  ${changes.join("\n  ")}`);
+      }
+      console.log(
+        `Every plugin release surface already carries ${version} with pinned CLI digests.`,
+      );
+      return;
+    }
+
+    execFileSync(
+      PYTHON,
+      [
+        ".github/scripts/check-codestory-release.py",
+        "--version",
+        version,
+        "--lane",
+        "plugin",
+      ],
+      { cwd: repositoryRoot, stdio: "inherit" },
+    );
+    console.log(
+      changes.length > 0
+        ? `Set plugin ${version} across ${changes.length} files:\n  ${changes.join("\n  ")}`
+        : `Every plugin release surface already carried ${version}.`,
+    );
+    return;
+  }
 
   for (const member of WORKSPACE_MEMBERS) {
     rewrite(
@@ -200,7 +335,7 @@ function main() {
 
   // Fail here rather than in CI if a surface was missed.
   execFileSync(
-    "python3",
+    PYTHON,
     [".github/scripts/check-codestory-release.py", "--version", version],
     { cwd: repositoryRoot, stdio: "inherit" },
   );
@@ -212,4 +347,4 @@ function main() {
   );
 }
 
-main();
+main().catch((error) => fail(error.message));

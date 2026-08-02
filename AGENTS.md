@@ -260,6 +260,13 @@ adapter to compensate for incorrect upstream state.
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
+- For a plugin-only release, use
+  `node scripts/bump-version.mjs --version <plugin-version> --lane plugin`.
+  That lane leaves native and model versions unchanged, fetches the pinned
+  CLI release's published checksum file, and writes all three archive digests
+  into `plugins/codestory/cli-version.json`.
+  `--archive-checksums <path-or-https-url>` is the explicit offline/test source;
+  never type those digests by hand.
 - Release ordering is **bump-then-calibrate**. Bump the version first,
   calibrate the per-user embedding server on the bumped tree, land the
   constant-set freeze commit, then package and release. The frozen-candidate

@@ -19,6 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { waitForManagedRuntime } from "./lib/wait-for-managed-runtime.mjs";
+import { requirePinnedArchiveDigest } from "./lib/pinned-archive-digests.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(repositoryRoot, "plugins/codestory/scripts/codestory-mcp.cjs");
@@ -85,11 +86,10 @@ if (manifest.version !== pin.cli_version) {
 if (manifest.build_source !== "github_release") {
   fail(`expected a github_release provision, observed ${manifest.build_source}.`);
 }
-if (pin.archives?.[target] && manifest.archive_sha256 !== pin.archives[target]) {
-  fail(
-    `provisioned archive digest ${manifest.archive_sha256} does not match the pin's ` +
-      `${target} digest ${pin.archives[target]}.`,
-  );
+try {
+  requirePinnedArchiveDigest(pin, target, manifest.archive_sha256);
+} catch (error) {
+  fail(`${error.message}.`);
 }
 const binary = path.join(versionDir, manifest.path);
 const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim();

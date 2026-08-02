@@ -6,6 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { requirePinnedArchiveDigest } from "../lib/pinned-archive-digests.mjs";
+
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const proofScript = path.join(scriptsDir, "prove-plugin-pinned-provision.mjs");
 const waitModuleUrl = pathToFileURL(path.join(scriptsDir, "lib/wait-for-managed-runtime.mjs")).href;
@@ -14,6 +16,46 @@ const waitModuleUrl = pathToFileURL(path.join(scriptsDir, "lib/wait-for-managed-
 // on disk, so drive it in its own process and kill it if it outlives the bound. A hang here is a
 // reported failure, not a wedged test run.
 const KILL_AFTER_MS = 5_000;
+const VALID_DIGEST = "a".repeat(64);
+
+test("the provision gate requires a source-pinned digest", () => {
+  assert.throws(
+    () => requirePinnedArchiveDigest({ schema_version: 1 }, "macos-arm64", VALID_DIGEST),
+    /no valid macos-arm64 archive digest/u,
+  );
+  assert.throws(
+    () =>
+      requirePinnedArchiveDigest(
+        { archives: { "macos-arm64": "not-a-digest" } },
+        "macos-arm64",
+        VALID_DIGEST,
+      ),
+    /no valid macos-arm64 archive digest/u,
+  );
+});
+
+test("the provision gate rejects a hostile archive digest", () => {
+  assert.throws(
+    () =>
+      requirePinnedArchiveDigest(
+        { archives: { "linux-x64": VALID_DIGEST } },
+        "linux-x64",
+        "b".repeat(64),
+      ),
+    /does not match the pin's linux-x64 digest/u,
+  );
+});
+
+test("the provision gate accepts the exact source-pinned digest", () => {
+  assert.equal(
+    requirePinnedArchiveDigest(
+      { archives: { "windows-x64": VALID_DIGEST } },
+      "windows-x64",
+      VALID_DIGEST,
+    ),
+    VALID_DIGEST,
+  );
+});
 
 function runNode(args, options = {}) {
   return new Promise((resolve) => {
