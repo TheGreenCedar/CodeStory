@@ -790,6 +790,8 @@ mod tests {
                         resolved_hit_count: 1,
                         unresolved_candidate_count: 0,
                         blocking_unresolved_candidate_count: 0,
+                        semantic_stage_timeout_zero_hits: false,
+                        semantic_abstained: false,
                         diagnostic: None,
                     }),
             );
@@ -1074,7 +1076,7 @@ mod tests {
             answer_id: "packet-budget-test".to_string(),
             prompt: question.to_string(),
             summary: "Packet budget test answer.".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -1105,6 +1107,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),

@@ -1,6 +1,7 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
+use crate::agent::packet_degradation::semantic_stage_degradation;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
@@ -35,6 +36,8 @@ const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
 const RETRIEVAL_PUBLICATION_ATTEMPTS: usize = 2;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
+/// Typed cancel reason for a query whose semantic stage timed out and resolved nothing.
+pub(crate) const SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL: &str = "semantic_stage_timeout_zero_hits";
 
 const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
@@ -848,14 +851,25 @@ fn packet_sidecar_query_diagnostic(
         .iter()
         .map(|stage| stage.elapsed_ms)
         .fold(0_u32, u32::saturating_add);
+    let semantic = semantic_stage_degradation(&stage_timings);
+    // EV-8: a required query whose dense lane went dark and then resolved nothing produced no
+    // evidence, but the sidecar itself reports no blocking cancel — the stage budget, not the
+    // query, ran out. Left as `Completed` it would satisfy its query obligation on an empty
+    // result. Naming the cancel here is what lets the obligation ledger demote it.
+    let semantic_timeout_without_hits =
+        semantic.timed_out_zero_hits && resolution.resolved_hits.is_empty();
+    let cancel_reason = sidecar_blocking_cancel_reason(query_result)
+        .map(str::to_string)
+        .or_else(|| {
+            semantic_timeout_without_hits.then(|| SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL.to_string())
+        });
     PacketSidecarQueryDiagnosticDto {
         query: query_result.query.clone(),
-        completion: sidecar_blocking_cancel_reason(query_result).map_or(
-            PacketQueryCompletionDto::Completed,
-            |reason| PacketQueryCompletionDto::Cancelled {
-                reason: reason.to_string(),
-            },
-        ),
+        completion: cancel_reason
+            .clone()
+            .map_or(PacketQueryCompletionDto::Completed, |reason| {
+                PacketQueryCompletionDto::Cancelled { reason }
+            }),
         retrieval_mode: query_result.trace.retrieval_mode.clone(),
         sidecar_query_ms: Some(sidecar_query_ms),
         candidate_resolution_ms: Some(candidate_resolution_ms),
@@ -872,7 +886,9 @@ fn packet_sidecar_query_diagnostic(
             resolution.blocking_unresolved_candidate_count,
         )
         .unwrap_or(u32::MAX),
-        diagnostic: sidecar_blocking_cancel_reason(query_result)
+        semantic_stage_timeout_zero_hits: semantic.timed_out_zero_hits,
+        semantic_abstained: semantic.abstained,
+        diagnostic: cancel_reason
             .map(|reason| format!("sidecar query has blocking cancel reason `{reason}`"))
             .or_else(|| {
                 (resolution.unresolved_candidate_count > 0).then(|| {
@@ -2681,6 +2697,129 @@ mod tests {
         assert_eq!(diagnostic.unresolved_candidate_count, 1);
         assert_eq!(diagnostic.total_elapsed_ms, Some(3));
         assert!(diagnostic.diagnostic.is_some());
+    }
+
+    fn semantic_stage_trace(
+        completion_status: codestory_retrieval::StageCompletionStatus,
+        candidates_added: usize,
+    ) -> codestory_retrieval::StageTrace {
+        codestory_retrieval::StageTrace {
+            stage: codestory_retrieval::RetrievalStageKind::Stage1bSemantic,
+            budget_ms: 40,
+            elapsed_ms: 40,
+            admission_wait_ms: 0,
+            queue_wait_ms: None,
+            execution_ms: None,
+            candidates_added,
+            marginal_gain: 0.0,
+            cancel_reason: Some("stage_deadline".into()),
+            cache_hit: false,
+            degraded: false,
+            stub_reason: None,
+            completion_status,
+        }
+    }
+
+    fn query_result_with_stages(stages: Vec<codestory_retrieval::StageTrace>) -> QueryResult {
+        QueryResult {
+            publication_identity: None,
+            query: "how does activation admit a lease".into(),
+            features: classify_query("how does activation admit a lease"),
+            hits: Vec::new(),
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 100,
+                elapsed_ms: 40,
+                cancel_reason: None,
+                cache_hit: false,
+                stages,
+            },
+        }
+    }
+
+    fn empty_resolution() -> SidecarCandidateResolutionOutcome {
+        SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::new(),
+        }
+    }
+
+    /// EV-8. The sidecar reports no blocking cancel when only a *stage* runs out of budget, so a
+    /// query whose dense lane went dark and then resolved nothing used to arrive as `Completed`
+    /// and satisfy its query obligation on an empty result.
+    #[test]
+    fn a_semantic_stage_timeout_with_no_resolved_hits_cancels_the_query() {
+        let result = query_result_with_stages(vec![semantic_stage_trace(
+            codestory_retrieval::StageCompletionStatus::PendingAfterDeadline,
+            0,
+        )]);
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &empty_resolution(), 40, 1, 41);
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Cancelled {
+                reason: SEMANTIC_TIMEOUT_ZERO_HITS_CANCEL.to_string()
+            },
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic.semantic_stage_timeout_zero_hits,
+            "{diagnostic:?}"
+        );
+    }
+
+    /// The demotion is about lost evidence, not about the stage clock. A query that still
+    /// resolved hits produced evidence and must stay `Completed`.
+    #[test]
+    fn a_semantic_stage_timeout_that_still_resolved_hits_stays_completed() {
+        let result = query_result_with_stages(vec![semantic_stage_trace(
+            codestory_retrieval::StageCompletionStatus::PendingAfterDeadline,
+            0,
+        )]);
+        let mut resolution = empty_resolution();
+        resolution.resolved_hits = vec![undecorated_search_hit_for_candidate(
+            &CandidateHit::with_source(
+                "crates/codestory-runtime/src/services.rs",
+                Some("activate_once".to_string()),
+                0.9,
+                CandidateSource::Lexical,
+            ),
+        )];
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 40, 1, 41);
+
+        assert_eq!(
+            diagnostic.completion,
+            PacketQueryCompletionDto::Completed,
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic.semantic_stage_timeout_zero_hits,
+            "the lost stage is still counted even when the query recovered: {diagnostic:?}"
+        );
+    }
+
+    /// A deliberately skipped dense lane on a repository with no dense anchors is correct
+    /// behavior. It is counted, not cancelled.
+    #[test]
+    fn a_skipped_semantic_stage_abstains_without_cancelling_the_query() {
+        let mut skipped =
+            semantic_stage_trace(codestory_retrieval::StageCompletionStatus::Skipped, 0);
+        skipped.cancel_reason = Some("zero_dense_anchors".into());
+        let result = query_result_with_stages(vec![skipped]);
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &empty_resolution(), 1, 1, 2);
+
+        assert_eq!(diagnostic.completion, PacketQueryCompletionDto::Completed);
+        assert!(diagnostic.semantic_abstained, "{diagnostic:?}");
+        assert!(
+            !diagnostic.semantic_stage_timeout_zero_hits,
+            "{diagnostic:?}"
+        );
     }
 
     #[test]

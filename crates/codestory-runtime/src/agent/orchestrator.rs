@@ -33,6 +33,7 @@ use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::{
     packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
 };
+use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
@@ -489,6 +490,7 @@ pub(crate) fn agent_packet(
         answer.retrieval_trace.retrieval_shadow = Some(shadow);
     }
     append_packet_step_trace_annotation(&mut answer);
+    apply_packet_semantic_degradation_counters(&mut answer);
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
@@ -5120,7 +5122,7 @@ mod tests {
             answer_id: "packet-fixture".to_string(),
             prompt: question.to_string(),
             summary: "Fixture packet is covered by cited anchors.".to_string(),
-            freshness: None,
+            freshness: Some(crate::agent::packet_freshness::fresh_index_observation()),
             sections: vec![AgentResponseSectionDto {
                 id: "answer".to_string(),
                 title: "Answer".to_string(),
@@ -5142,6 +5144,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -5291,6 +5295,8 @@ mod tests {
                     resolved_hit_count: 1,
                     unresolved_candidate_count: 0,
                     blocking_unresolved_candidate_count: 0,
+                    semantic_stage_timeout_zero_hits: false,
+                    semantic_abstained: false,
                     diagnostic: None,
                 }),
         );
@@ -8439,6 +8445,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -8864,6 +8872,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -8949,6 +8959,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9025,6 +9037,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9246,6 +9260,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9321,6 +9337,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9390,6 +9408,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9442,6 +9462,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9491,6 +9513,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9542,6 +9566,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9595,6 +9621,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
@@ -9633,6 +9661,8 @@ mod tests {
                 sla_missed: false,
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
                 steps: Vec::new(),
