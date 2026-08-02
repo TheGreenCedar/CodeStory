@@ -47,6 +47,8 @@ struct CorpusReport {
     codestory_input_files: usize,
     codestory_stored_files: usize,
     codestory_indexed_files: usize,
+    incomplete_files: usize,
+    incomplete_file_samples: Vec<String>,
     nodes: usize,
     edges: usize,
     errors: usize,
@@ -58,7 +60,7 @@ struct CorpusReport {
     stats: IncrementalIndexingStats,
 }
 
-const SUPPORTED_LANGUAGE_NAMES: &[&str] = &[
+const CORPUS_LANGUAGE_NAMES: &[&str] = &[
     "python",
     "java",
     "rust",
@@ -77,6 +79,9 @@ const SUPPORTED_LANGUAGE_NAMES: &[&str] = &[
     "html",
     "css",
     "sql",
+    "svelte",
+    "vue",
+    "astro",
 ];
 
 const SKIPPED_DIRS: &[&str] = &[
@@ -334,6 +339,48 @@ const OSS_CORPUS: &[OssCorpusCase] = &[
         min_nodes: 10,
         max_errors: 0,
     },
+    OssCorpusCase {
+        language: "svelte",
+        repo_name: "sveltejs/svelte",
+        repo_url: "https://github.com/sveltejs/svelte.git",
+        // svelte@5.56.8
+        commit: "44a7813730579b94004e182e5a67aab27aa9d2a6",
+        project_subdir: Some("packages/svelte/tests/runtime-runes/samples"),
+        extensions: &["svelte"],
+        min_baseline_files: 1_000,
+        min_baseline_loc: 1_000,
+        min_indexed_files: 1_000,
+        min_nodes: 25,
+        max_errors: 0,
+    },
+    OssCorpusCase {
+        language: "vue",
+        repo_name: "vuejs/core",
+        repo_url: "https://github.com/vuejs/core.git",
+        // v3.5.40
+        commit: "fa2885d8c48768d26f1666a01bd540ffe3b20f9b",
+        project_subdir: None,
+        extensions: &["vue"],
+        min_baseline_files: 10,
+        min_baseline_loc: 300,
+        min_indexed_files: 10,
+        min_nodes: 10,
+        max_errors: 0,
+    },
+    OssCorpusCase {
+        language: "astro",
+        repo_name: "withastro/astro",
+        repo_url: "https://github.com/withastro/astro.git",
+        // astro@7.1.6
+        commit: "9865d1c03af6d1a1f15c9811858778cc952ca4e4",
+        project_subdir: Some("examples"),
+        extensions: &["astro"],
+        min_baseline_files: 80,
+        min_baseline_loc: 500,
+        min_indexed_files: 80,
+        min_nodes: 25,
+        max_errors: 0,
+    },
 ];
 
 #[test]
@@ -384,11 +431,12 @@ fn oss_language_corpus_compares_raw_baseline_to_codestory() -> Result<()> {
                 let row = report_json(&report);
                 writeln!(writer, "{row}")?;
                 println!(
-                    "{}: raw_files={} raw_loc={} codestory_indexed_files={} nodes={} edges={} errors={} index_ms={}",
+                    "{}: raw_files={} raw_loc={} codestory_indexed_files={} incomplete_files={} nodes={} edges={} errors={} index_ms={}",
                     report.language,
                     report.raw_files,
                     report.raw_loc,
                     report.codestory_indexed_files,
+                    report.incomplete_files,
                     report.nodes,
                     report.edges,
                     report.errors,
@@ -454,6 +502,13 @@ fn run_case(case: &OssCorpusCase, cache_root: &Path) -> Result<CorpusReport> {
 
     let stored_files = storage.get_files()?;
     let codestory_indexed_files = stored_files.iter().filter(|file| file.indexed).count();
+    let incomplete_files = stored_files.iter().filter(|file| !file.complete).count();
+    let incomplete_file_samples = stored_files
+        .iter()
+        .filter(|file| !file.complete)
+        .take(10)
+        .map(|file| file.path.display().to_string())
+        .collect();
     let nodes = storage.get_nodes()?;
     let edges = storage.get_edges()?;
     let errors = storage.get_errors(None)?;
@@ -478,6 +533,8 @@ fn run_case(case: &OssCorpusCase, cache_root: &Path) -> Result<CorpusReport> {
         codestory_input_files: baseline.files.len(),
         codestory_stored_files: stored_files.len(),
         codestory_indexed_files,
+        incomplete_files,
+        incomplete_file_samples,
         nodes: nodes.len(),
         edges: edges.len(),
         errors: errors.len(),
@@ -494,7 +551,7 @@ fn run_case(case: &OssCorpusCase, cache_root: &Path) -> Result<CorpusReport> {
 }
 
 fn validate_manifest() -> Result<()> {
-    let expected: BTreeSet<&str> = SUPPORTED_LANGUAGE_NAMES.iter().copied().collect();
+    let expected: BTreeSet<&str> = CORPUS_LANGUAGE_NAMES.iter().copied().collect();
     let actual: BTreeSet<&str> = OSS_CORPUS.iter().map(|case| case.language).collect();
     if expected != actual {
         let missing: Vec<&str> = expected.difference(&actual).copied().collect();
@@ -508,6 +565,15 @@ fn validate_manifest() -> Result<()> {
     for case in OSS_CORPUS {
         if !repos.insert(case.repo_name) {
             bail!("duplicate OSS corpus repo {}", case.repo_name);
+        }
+        if is_template_language(case.language) {
+            if case.extensions != [case.language] {
+                bail!(
+                    "{} template corpus must use its matching extension",
+                    case.language
+                );
+            }
+            continue;
         }
         let profile = language_support_profile_for_language_name(case.language)
             .with_context(|| format!("{} is not a supported language", case.language))?;
@@ -563,7 +629,7 @@ fn selected_languages() -> Result<Option<HashSet<String>>> {
         _ => return Ok(None),
     };
 
-    let supported: HashSet<&str> = SUPPORTED_LANGUAGE_NAMES.iter().copied().collect();
+    let supported: HashSet<&str> = CORPUS_LANGUAGE_NAMES.iter().copied().collect();
     let mut selected = HashSet::new();
     for part in value.split(',') {
         let language = part.trim().to_ascii_lowercase();
@@ -645,6 +711,14 @@ fn assert_codestory_thresholds(case: &OssCorpusCase, report: &CorpusReport) -> R
             "{} CodeStory emitted {} fatal errors",
             case.language,
             report.fatal_errors
+        );
+    }
+    if is_template_language(case.language) && report.incomplete_files > 0 {
+        bail!(
+            "{} CodeStory marked {} pinned template corpus files incomplete: {:?}",
+            case.language,
+            report.incomplete_files,
+            report.incomplete_file_samples
         );
     }
     Ok(())
@@ -849,6 +923,8 @@ fn report_json(report: &CorpusReport) -> serde_json::Value {
             "input_files": report.codestory_input_files,
             "stored_files": report.codestory_stored_files,
             "indexed_files": report.codestory_indexed_files,
+            "incomplete_files": report.incomplete_files,
+            "incomplete_file_samples": report.incomplete_file_samples,
             "nodes": report.nodes,
             "edges": report.edges,
             "errors": report.errors,
@@ -878,6 +954,10 @@ fn normalize_extension(extension: &str) -> String {
         .trim()
         .trim_start_matches('.')
         .to_ascii_lowercase()
+}
+
+fn is_template_language(language: &str) -> bool {
+    matches!(language, "svelte" | "vue" | "astro")
 }
 
 fn sanitize_repo_name(repo_name: &str) -> String {
