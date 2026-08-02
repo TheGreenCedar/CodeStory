@@ -2877,6 +2877,15 @@ pub struct PacketCoverageReportDto {
     pub budget_omitted: Vec<String>,
 }
 
+/// One executable packet follow-up, in the same `{program, args}` shape the
+/// affected surface already publishes.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketFollowUpInvocationDto {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketSufficiencyDto {
     pub status: PacketSufficiencyStatusDto,
@@ -2892,6 +2901,13 @@ pub struct PacketSufficiencyDto {
     pub gaps: Vec<String>,
     #[serde(default)]
     pub follow_up_commands: Vec<String>,
+    /// The same follow-ups as executable invocations.
+    ///
+    /// `follow_up_commands` is the shell rendering of these entries. A caller
+    /// that runs a follow-up spawns the invocation directly instead of parsing
+    /// the display string back apart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_up_invocations: Vec<PacketFollowUpInvocationDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_report: Option<PacketCoverageReportDto>,
 }
@@ -3505,6 +3521,7 @@ mod packet_tests {
             avoid_opening_paths: Vec::new(),
             gaps: vec!["No focused symbol selected.".to_string()],
             follow_up_commands: Vec::new(),
+            follow_up_invocations: Vec::new(),
             coverage_report: None,
         })
         .expect("serialize");
@@ -3519,6 +3536,7 @@ mod packet_tests {
             avoid_opening_paths: vec!["crates/codestory-cli/src/main.rs".to_string()],
             gaps: vec!["Sidecar readiness is not full.".to_string()],
             follow_up_commands: Vec::new(),
+            follow_up_invocations: Vec::new(),
             coverage_report: None,
         })
         .expect("serialize");

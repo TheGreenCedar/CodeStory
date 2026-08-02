@@ -724,7 +724,9 @@ fn resolve_target_with(
             message: ambiguous.message,
         }
         .into()),
-        Ok(TargetResolution::Rejected(message)) => Err(anyhow!(message)),
+        Ok(TargetResolution::Rejected(message)) => {
+            Err(typed_api_error(ApiError::not_found(message)))
+        }
         Err(error) => Err(map_api_error(error)),
     }
 }
@@ -971,6 +973,19 @@ impl std::fmt::Display for CliApiError {
 }
 
 impl std::error::Error for CliApiError {}
+
+/// Carry a machine code beside an adapter-owned failure without rewriting the
+/// text.
+///
+/// `map_api_error` renders `code: message` plus recovery commands for human CLI
+/// output. Adapter-level classifications — a rejected target, a missing
+/// bookmark — already read correctly on their own, so this keeps the displayed
+/// message intact while `api_error_in_chain` still recovers the code for the
+/// HTTP and MCP adapters.
+pub(crate) fn typed_api_error(error: ApiError) -> anyhow::Error {
+    let message = error.message.clone();
+    anyhow::Error::new(CliApiError { error, message })
+}
 
 /// Return the typed runtime error retained by the CLI adapter, including when
 /// command-specific context has been attached above it.

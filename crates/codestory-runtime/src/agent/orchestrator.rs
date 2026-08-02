@@ -9,7 +9,7 @@ use crate::agent::packet_batch::{
 };
 #[cfg(test)]
 use crate::agent::packet_budget::{
-    apply_packet_budget, next_deeper_packet_command, packet_budget_usage,
+    apply_packet_budget, next_deeper_packet_argv, next_deeper_packet_command, packet_budget_usage,
     truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
@@ -70,7 +70,7 @@ use crate::agent::packet_source_patterns::packet_sql_identifier_after;
 use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, render_packet_command,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
@@ -10200,6 +10200,44 @@ mod tests {
                     && !command.contains("--repo-text on")),
             "insufficient packets should recommend sidecar-primary search diagnostics: {insufficient:?}"
         );
+
+        // CR-050: the invocation is the executable contract; the shell strings
+        // are only its rendering, so a caller never re-parses a quoted command.
+        assert_eq!(
+            insufficient.follow_up_invocations.len(),
+            insufficient.follow_up_commands.len(),
+            "every published follow-up must carry an executable invocation: {insufficient:?}"
+        );
+        assert_eq!(
+            insufficient
+                .follow_up_invocations
+                .iter()
+                .map(|invocation| {
+                    let mut argv = vec![invocation.program.clone()];
+                    argv.extend(invocation.args.iter().cloned());
+                    render_packet_command(&argv)
+                })
+                .collect::<Vec<_>>(),
+            insufficient.follow_up_commands,
+            "the displayed follow-up must be the rendering of its invocation: {insufficient:?}"
+        );
+        assert!(
+            insufficient.follow_up_invocations.iter().all(|invocation| {
+                invocation.program == "codestory-cli"
+                    && invocation
+                        .args
+                        .iter()
+                        .all(|argument| !argument.starts_with('\'') && !argument.is_empty())
+            }),
+            "invocation arguments must be unquoted: {insufficient:?}"
+        );
+        assert!(
+            insufficient
+                .follow_up_invocations
+                .iter()
+                .any(|invocation| invocation.args.contains(&question.to_string())),
+            "the question must reach the invocation verbatim: {insufficient:?}"
+        );
     }
 
     #[test]
@@ -10207,10 +10245,33 @@ mod tests {
         let question = "Inspect $env:SECRET and $(Get-ChildItem) and 'literal'";
         let quoted = quote_packet_command_value(question);
 
+        // Doubling the apostrophe is the PowerShell convention; `sh` joins the
+        // adjacent quoted runs and deletes the character outright.
         assert_eq!(
             quoted,
-            "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+            r#"'Inspect $env:SECRET and $(Get-ChildItem) and '\''literal'\'''"#
         );
+        let argv = next_deeper_packet_argv(
+            packet_fixture_project_root(),
+            question,
+            PacketBudgetModeDto::Tiny,
+        )
+        .expect("tiny packet should have deeper argv");
+        assert_eq!(
+            argv,
+            vec![
+                "codestory-cli".to_string(),
+                "packet".to_string(),
+                "--project".to_string(),
+                "C:/workspace/project root".to_string(),
+                "--question".to_string(),
+                question.to_string(),
+                "--budget".to_string(),
+                "compact".to_string(),
+            ],
+            "the follow-up must be typed argv, with the question carried verbatim"
+        );
+
         let command = next_deeper_packet_command(
             packet_fixture_project_root(),
             question,
@@ -10218,8 +10279,12 @@ mod tests {
         )
         .expect("tiny packet should have deeper command");
         assert!(
-            command.contains("--question 'Inspect $env:SECRET and $(Get-ChildItem)"),
+            command.contains(r#"--question 'Inspect $env:SECRET and $(Get-ChildItem)"#),
             "packet command should single-quote shell-sensitive question text: {command}"
+        );
+        assert!(
+            command.contains(r#"and '\''literal'\'''"#),
+            "packet command must escape apostrophes so a POSIX shell preserves them: {command}"
         );
         assert!(
             command.contains("--project 'C:/workspace/project root'"),

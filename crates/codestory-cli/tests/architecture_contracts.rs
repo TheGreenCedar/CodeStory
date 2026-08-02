@@ -501,6 +501,115 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
 }
 
 #[test]
+fn graph_family_adapters_answer_with_typed_errors_instead_of_stringified_ones() {
+    // ARCH-019: the graph tools used to hand agents `format!("{e}")`, forcing
+    // downstream substring re-classification. Every error slot in the graph
+    // handlers must now come from a producer that keeps the ApiError code.
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
+    let graph_handlers = source_between(
+        &stdio_transport,
+        "fn handle_stdio_symbol(",
+        "fn stdio_graph_tool_output(",
+    );
+    let typed_producers = [
+        "stdio_typed_error_value(",
+        "stdio_api_error_value(",
+        "stdio_graph_argument_error(",
+    ];
+    let lines = graph_handlers.lines().collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("\"error\":") {
+            continue;
+        }
+        let window = lines[index..lines.len().min(index + 3)].join("\n");
+        if !typed_producers
+            .iter()
+            .any(|producer| window.contains(producer))
+        {
+            violations.push(line.trim().to_string());
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "graph-family error slots must carry a typed ApiError:\n{}",
+        violations.join("\n")
+    );
+
+    assert!(
+        stdio_transport.contains("fn stdio_typed_error_value(")
+            && source_between(
+                &stdio_transport,
+                "fn stdio_typed_error_value(",
+                "fn read_stdio_resource("
+            )
+            .contains("crate::runtime::api_error_in_chain(error)"),
+        "the stdio graph error seam must recover the runtime's typed classification"
+    );
+
+    let http_transport = read("crates/codestory-cli/src/http_transport.rs");
+    assert!(
+        source_between(
+            &http_transport,
+            "fn write_http_typed_error(",
+            "fn target_selection_from_params("
+        )
+        .contains("runtime::api_error_in_chain(error)"),
+        "the HTTP graph error seam must recover the runtime's typed classification"
+    );
+    assert!(
+        source_between(
+            &http_transport,
+            "fn write_http_target_error(",
+            "fn write_http_typed_error("
+        )
+        .contains("write_http_typed_error("),
+        "HTTP target failures must route through the typed error writer"
+    );
+}
+
+#[test]
+fn mcp_tool_arguments_are_validated_from_the_generated_catalog() {
+    // CR-026: the advertised schema is the contract. Validation reads the
+    // published declaration so a new catalog constraint cannot ship unenforced.
+    let validator = read("crates/codestory-cli/src/stdio_arguments.rs");
+    let catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
+    let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
+
+    assert!(
+        validator.contains("crate::stdio_catalog::tool_input_schema(tool)"),
+        "argument validation must read the published catalog schema, not a parallel rule set"
+    );
+    assert!(
+        catalog.contains("pub(crate) fn tool_input_schema(")
+            && source_between(
+                &catalog,
+                "pub(crate) fn tool_input_schema(",
+                "/// Build the `tools/list` response."
+            )
+            .contains(".to_json()"),
+        "the validated schema must be the same value tools/list emits"
+    );
+    assert!(
+        source_between(
+            &stdio_transport,
+            "\"tools/call\" => {",
+            "let prepared = match"
+        )
+        .contains("crate::stdio_arguments::validate_tool_arguments("),
+        "tools/call must validate arguments before dispatching a tool"
+    );
+
+    // Selectors the runtime resolves to exactly one target must advertise
+    // oneOf; anyOf would promise a combination the runtime cannot honour.
+    let input_schemas = source_between(&catalog, "static SEARCH_INPUT_SCHEMA", "static TOOLS");
+    assert!(
+        !input_schemas.contains("with_any_of_required"),
+        "tool input selectors must advertise oneOf, not anyOf"
+    );
+}
+
+#[test]
 fn production_source_never_spawns_git() {
     let mut files = Vec::new();
     collect_rs_files(&repo_root().join("crates"), &mut files);

@@ -10,7 +10,7 @@ use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_obligation_context,
-    quote_packet_command_value, quote_packet_project_arg,
+    packet_argv, packet_display_project_arg, render_packet_command,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
 use codestory_contracts::api::{
@@ -567,17 +567,33 @@ pub(crate) fn next_deeper_packet_command(
     question: &str,
     requested: PacketBudgetModeDto,
 ) -> Option<String> {
+    next_deeper_packet_argv(project_root, question, requested)
+        .map(|argv| render_packet_command(&argv))
+}
+
+/// The deeper-budget retry as executable argv; the displayed command renders
+/// from this, never the other way round.
+pub(crate) fn next_deeper_packet_argv(
+    project_root: &Path,
+    question: &str,
+    requested: PacketBudgetModeDto,
+) -> Option<Vec<String>> {
     let next = match requested {
         PacketBudgetModeDto::Tiny => "compact",
         PacketBudgetModeDto::Compact => "standard",
         PacketBudgetModeDto::Standard => "deep",
         PacketBudgetModeDto::Deep => return None,
     };
-    let project = quote_packet_project_arg(project_root);
-    Some(format!(
-        "codestory-cli packet --project {project} --question {} --budget {next}",
-        quote_packet_command_value(question)
-    ))
+    let project = packet_display_project_arg(project_root);
+    Some(packet_argv(&[
+        "packet",
+        "--project",
+        project.as_str(),
+        "--question",
+        question,
+        "--budget",
+        next,
+    ]))
 }
 
 #[cfg(test)]
@@ -1134,6 +1150,7 @@ mod tests {
             avoid_opening_paths: Vec::new(),
             gaps: Vec::new(),
             follow_up_commands: Vec::new(),
+            follow_up_invocations: Vec::new(),
             coverage_report: Some(PacketCoverageReportDto::default()),
         };
         let retrieval_trace_summary = PacketRetrievalTraceSummaryDto {

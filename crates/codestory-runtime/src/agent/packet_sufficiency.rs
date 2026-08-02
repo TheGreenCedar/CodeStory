@@ -1,3 +1,4 @@
+use crate::agent::packet_budget::next_deeper_packet_argv;
 use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::packet_evidence_role;
@@ -22,9 +23,9 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphArtifactDto,
     GraphResponse, NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
     PacketClaimObligationDto, PacketCoverageReportDto, PacketEvidenceTierDto,
-    PacketObligationPlanDto, PacketObligationProofStatusDto, PacketProbeDto,
-    PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketFollowUpInvocationDto, PacketObligationPlanDto, PacketObligationProofStatusDto,
+    PacketProbeDto, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
@@ -444,10 +445,10 @@ fn assemble_packet_sufficiency_with_probe_context(
                     .any(|blocking| blocking == query)
         })
         .collect::<Vec<_>>();
-    let follow_up_commands = if terminally_sufficient {
+    let follow_up_argv = if terminally_sufficient {
         Vec::new()
     } else {
-        packet_follow_up_commands(
+        packet_follow_up_argv(
             project_root,
             question,
             status,
@@ -457,6 +458,14 @@ fn assemble_packet_sufficiency_with_probe_context(
             packet_full_retrieval_available(answer),
         )
     };
+    let follow_up_commands = follow_up_argv
+        .iter()
+        .map(|argv| render_packet_command(argv))
+        .collect::<Vec<_>>();
+    let follow_up_invocations = follow_up_argv
+        .iter()
+        .map(|argv| packet_follow_up_invocation(argv))
+        .collect::<Vec<_>>();
     let coverage_report = packet_coverage_report(PacketCoverageReportInput {
         supported_claims: &supported_claims,
         proven_claims: &proven_claims,
@@ -473,14 +482,14 @@ fn assemble_packet_sufficiency_with_probe_context(
         follow_up_commands.clone()
     };
     if !terminally_sufficient && !open_next_paths.is_empty() {
-        let quoted_project = quote_packet_project_arg(project_root);
+        let project = packet_display_project_arg(project_root);
         let candidate_commands = if packet_full_retrieval_available(answer) {
-            packet_follow_up_search_commands(&quoted_project, &open_next_paths)
+            packet_follow_up_search_argv(&project, &open_next_paths)
         } else {
-            packet_follow_up_trail_commands(&quoted_project, &open_next_paths)
+            packet_follow_up_trail_argv(&project, &open_next_paths)
         };
         for command in candidate_commands {
-            push_unique_term(&mut open_next, &command);
+            push_unique_term(&mut open_next, &render_packet_command(&command));
         }
         open_next.truncate(12);
     }
@@ -537,6 +546,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         avoid_opening_paths,
         gaps,
         follow_up_commands,
+        follow_up_invocations,
         coverage_report: Some(coverage_report),
     }
 }
@@ -7932,7 +7942,14 @@ pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -
     budget.used.output_bytes > budget.limits.max_output_bytes
 }
 
-fn packet_follow_up_commands(
+/// Build the follow-up contract as typed argv.
+///
+/// Argv is the product, not a rendering of one. Composing shell text first is
+/// exactly what let a PowerShell-style quote doubling ship: on a POSIX shell it
+/// silently deleted apostrophes from the suggested query. Callers that execute
+/// a follow-up read `follow_up_argv`; `follow_up_commands` is the display
+/// projection of the same argv through one correct quoter.
+fn packet_follow_up_argv(
     project_root: &Path,
     question: &str,
     status: PacketSufficiencyStatusDto,
@@ -7940,8 +7957,8 @@ fn packet_follow_up_commands(
     missing_required_probe_queries: &[String],
     targeted_follow_up_queries: Vec<String>,
     full_retrieval_available: bool,
-) -> Vec<String> {
-    let project = quote_packet_project_arg(project_root);
+) -> Vec<Vec<String>> {
+    let project = packet_display_project_arg(project_root);
     match status {
         PacketSufficiencyStatusDto::Sufficient => Vec::new(),
         PacketSufficiencyStatusDto::Partial => {
@@ -7951,39 +7968,81 @@ fn packet_follow_up_commands(
                 missing_required_probe_queries.to_vec()
             };
             if !full_retrieval_available {
-                let mut commands = vec![packet_retrieval_activation_command(project.as_str())];
-                commands.extend(packet_follow_up_trail_commands(project.as_str(), &queries));
+                let mut commands = vec![packet_retrieval_activation_argv(&project)];
+                commands.extend(packet_follow_up_trail_argv(&project, &queries));
                 commands.truncate(8);
                 return commands;
             }
-            let mut commands = packet_follow_up_search_commands(project.as_str(), &queries);
+            let mut commands = packet_follow_up_search_argv(&project, &queries);
             commands.truncate(8);
             commands
                 .into_iter()
-                .chain(budget.next_deeper_command.clone())
-                .chain(std::iter::once(format!(
-                    "codestory-cli search --project {project} --query {} --why",
-                    quote_packet_command_value(question)
-                )))
+                .chain(next_deeper_packet_argv(
+                    project_root,
+                    question,
+                    budget.requested,
+                ))
+                .chain(std::iter::once(packet_search_argv(&project, question)))
                 .collect()
         }
         PacketSufficiencyStatusDto::Insufficient => {
             if full_retrieval_available {
                 vec![
-                    format!("codestory-cli index --project {project} --refresh full"),
-                    format!(
-                        "codestory-cli search --project {project} --query {} --why",
-                        quote_packet_command_value(question)
-                    ),
+                    packet_argv(&["index", "--project", project.as_str(), "--refresh", "full"]),
+                    packet_search_argv(&project, question),
                 ]
             } else {
                 vec![
-                    packet_retrieval_activation_command(project.as_str()),
-                    format!("codestory-cli ground --project {project} --why"),
+                    packet_retrieval_activation_argv(&project),
+                    packet_argv(&["ground", "--project", project.as_str(), "--why"]),
                 ]
             }
         }
     }
+}
+
+pub(crate) fn packet_argv(arguments: &[&str]) -> Vec<String> {
+    std::iter::once("codestory-cli".to_string())
+        .chain(arguments.iter().map(|argument| (*argument).to_string()))
+        .collect()
+}
+
+fn packet_search_argv(project: &str, query: &str) -> Vec<String> {
+    packet_argv(&["search", "--project", project, "--query", query, "--why"])
+}
+
+/// Split argv into the published `{program, args}` invocation.
+pub(crate) fn packet_follow_up_invocation(argv: &[String]) -> PacketFollowUpInvocationDto {
+    let (program, args) = argv.split_first().expect("packet argv carries a program");
+    PacketFollowUpInvocationDto {
+        program: program.clone(),
+        args: args.to_vec(),
+    }
+}
+
+/// Render argv as one copy-pasteable POSIX shell command.
+///
+/// Arguments made only of characters a shell passes through untouched stay
+/// bare so the suggestion reads like something a person would type; everything
+/// else is single-quoted.
+pub(crate) fn render_packet_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| {
+            if packet_command_argument_is_shell_safe(argument) {
+                argument.clone()
+            } else {
+                quote_packet_command_value(argument)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn packet_command_argument_is_shell_safe(argument: &str) -> bool {
+    !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character))
 }
 
 fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
@@ -7994,21 +8053,35 @@ fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
         .is_some_and(|shadow| shadow.retrieval_mode == "full")
 }
 
-fn packet_retrieval_activation_command(quoted_project: &str) -> String {
-    format!(
-        "codestory-cli retrieval index --profile agent --refresh auto --project {quoted_project} --format json"
-    )
+fn packet_retrieval_activation_argv(project: &str) -> Vec<String> {
+    packet_argv(&[
+        "retrieval",
+        "index",
+        "--profile",
+        "agent",
+        "--refresh",
+        "auto",
+        "--project",
+        project,
+        "--format",
+        "json",
+    ])
 }
 
-fn packet_follow_up_trail_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
+fn packet_follow_up_trail_argv(project: &str, queries: &[String]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for query in queries {
-        push_unique_term(
+        push_unique_argv(
             &mut commands,
-            &format!(
-                "codestory-cli trail --project {quoted_project} --query {} --story --hide-speculative",
-                quote_packet_command_value(query)
-            ),
+            packet_argv(&[
+                "trail",
+                "--project",
+                project,
+                "--query",
+                query,
+                "--story",
+                "--hide-speculative",
+            ]),
         );
     }
     commands
@@ -8038,26 +8111,26 @@ fn packet_interleave_follow_up_queries(paths: &[String], probes: &[String]) -> V
     merged
 }
 
-fn packet_follow_up_search_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
+fn packet_follow_up_search_argv(project: &str, queries: &[String]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for query in queries {
-        push_unique_term(
-            &mut commands,
-            &format!(
-                "codestory-cli search --project {quoted_project} --query {} --why",
-                quote_packet_command_value(query)
-            ),
-        );
+        push_unique_argv(&mut commands, packet_search_argv(project, query));
     }
     commands
 }
 
-pub(crate) fn quote_packet_project_arg(project_root: &Path) -> String {
-    quote_packet_command_value(project_root.to_string_lossy().as_ref())
+/// The project argument as the caller would type it, before any quoting.
+pub(crate) fn packet_display_project_arg(project_root: &Path) -> String {
+    project_root.to_string_lossy().into_owned()
 }
 
+/// Quote one argv element for a POSIX shell.
+///
+/// Doubling the apostrophe is the PowerShell/SQL convention; `sh` concatenates
+/// the adjacent quoted runs and drops the character, so an argument has to end
+/// the quoted run, escape the apostrophe, and reopen it.
 pub(crate) fn quote_packet_command_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -8066,6 +8139,12 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 fn contains_all(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| haystack.contains(needle))
+}
+
+fn push_unique_argv(commands: &mut Vec<Vec<String>>, argv: Vec<String>) {
+    if !commands.contains(&argv) {
+        commands.push(argv);
+    }
 }
 
 fn push_unique_term(terms: &mut Vec<String>, value: &str) {

@@ -5,6 +5,9 @@
 //! annotations, and safety metadata stable because clients discover behavior
 //! from these responses before calling into the transport.
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use codestory_contracts::api::{PACKET_PROBE_MAX_COUNT, PACKET_PROBE_MAX_TEXT_LENGTH};
 use serde_json::{Map, Value, json};
@@ -1659,7 +1662,7 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded local graph alias around one node.",
@@ -1680,7 +1683,7 @@ static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a readable trace around a symbol id or query.",
@@ -1706,7 +1709,7 @@ static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a symbol by query or stable node id.",
@@ -1721,7 +1724,7 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a symbol and return bounded line or function-body source context.",
@@ -1754,7 +1757,7 @@ static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a single indexed graph node by stable id or query.",
@@ -1769,7 +1772,7 @@ static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded graph neighborhood around one node.",
@@ -1793,7 +1796,7 @@ static GRAPH_NEIGHBORS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static SHORTEST_PATH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return a bounded forward path graph between two stable node ids.",
@@ -1832,7 +1835,7 @@ static QUERY_SUBGRAPH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"]]);
+.with_one_of_required(&[&["query"], &["id"]]);
 
 static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Browse root symbols or children for a parent id.",
@@ -1914,7 +1917,7 @@ static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
+.with_one_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
 static PACKET_EXACT_PATH_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
     "Exact project-relative path probe.",
@@ -2271,6 +2274,38 @@ static PROMPTS: &[PromptSpec] = &[
 /// Return whether a name is a registered stdio tool.
 pub(crate) fn is_tool_name(name: &str) -> bool {
     TOOLS.iter().any(|tool| tool.name == name)
+}
+
+/// Return the registered stdio tool names in catalog order.
+#[cfg(test)]
+pub(crate) fn tool_names() -> impl Iterator<Item = &'static str> {
+    TOOLS.iter().map(|tool| tool.name)
+}
+
+/// Return the input schema published for `name`, byte-identical to the one
+/// `tools/list` emits.
+///
+/// Argument validation reads the published declaration rather than a parallel
+/// hand-written rule set, so the generated catalog and the enforced contract
+/// are the same bytes and cannot drift.
+pub(crate) fn tool_input_schema(name: &str) -> Option<&'static Value> {
+    static SCHEMAS: OnceLock<BTreeMap<&'static str, Value>> = OnceLock::new();
+    SCHEMAS
+        .get_or_init(|| {
+            TOOLS
+                .iter()
+                .map(|tool| {
+                    let name = tool.name;
+                    let schema = tool
+                        .to_json()
+                        .as_object_mut()
+                        .and_then(|tool| tool.remove("inputSchema"))
+                        .expect("stdio tool json carries an input schema");
+                    (name, schema)
+                })
+                .collect()
+        })
+        .get(name)
 }
 
 /// Build the `tools/list` response.
