@@ -1,4 +1,6 @@
-use codestory_contracts::bounded_locks::{FileLockKind, LockDeadline, acquire_with_deadline};
+use codestory_contracts::bounded_locks::{
+    FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -16,9 +18,15 @@ use crate::native_runtime_layout::{
 
 const STAGING_LOCK: &str = ".codestory-native-staging.lock";
 /// A sibling launcher that is staging a generation copies and verifies the
-/// whole runtime tree, so this budget is generous; it exists so a wedged
-/// staging process can never hold a new launcher for the session's lifetime.
-const STAGING_LOCK_WAIT: Duration = Duration::from_secs(120);
+/// whole runtime tree, which is the same publication-class hold every other
+/// long budget names. It exists so a wedged staging process can never hold a
+/// new launcher for the session's lifetime.
+///
+/// This wait runs before the runtime exists, so it has no cancellation flag to
+/// inherit and is uninterruptible for its whole budget. That is sound only
+/// because no thread here is joined against a quiescence budget: the launcher
+/// process has no activation worker and installs no fail-stop hook.
+const STAGING_LOCK_WAIT: Duration = PUBLICATION_LOCK_WAIT;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn run() -> ExitCode {

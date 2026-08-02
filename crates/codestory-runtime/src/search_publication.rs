@@ -1,11 +1,12 @@
 use super::{
-    ApiError, CancellationToken, DEFAULT_LOCK_WAIT, EmbeddingProfileContractDto, FileLockKind,
+    ApiError, CancellationToken, EmbeddingProfileContractDto, FileLockKind,
     HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexPublicationRecord, Instant, LockDeadline,
-    OwnedDeletionRoot, Path, PathBuf, RetrievalFallbackReasonDto, RetrievalModeDto,
-    RetrievalStateDto, SearchEngine, SearchSymbolProjection, SemanticModeDto, Storage, Store,
-    StoredSemanticDocsContractDto, UNIX_EPOCH, Uuid, acquire_with_deadline, bounded_locks,
-    clamp_u128_to_u32, clamp_usize_to_u32, embedding_runtime_availability_from_config,
-    indexing_cancelled_error, is_indexing_cancelled, open_storage_for_read,
+    OwnedDeletionRoot, PUBLICATION_LOCK_WAIT, Path, PathBuf, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalStateDto, SearchEngine, SearchSymbolProjection, SemanticModeDto,
+    Storage, Store, StoredSemanticDocsContractDto, UNIX_EPOCH, Uuid, acquire_with_deadline,
+    bounded_locks, clamp_u128_to_u32, clamp_usize_to_u32,
+    embedding_runtime_availability_from_config, indexing_cancelled_error, is_indexing_cancelled,
+    open_storage_for_read,
 };
 #[cfg(test)]
 use super::{
@@ -181,17 +182,17 @@ impl SearchGenerationCatalogGuard {
         acquire_with_deadline(
             &file,
             FileLockKind::Exclusive,
-            LockDeadline::after(DEFAULT_LOCK_WAIT),
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
             None,
         )
         .map_err(|error| {
-            ApiError::new(
-                error.code(),
-                format!(
-                    "Failed to acquire search generation catalog lock {}: {error}",
-                    path.display()
-                ),
-            )
+            // The typed code rides in the message; the public error code stays
+            // `internal`, as it was before acquisition became bounded.
+            ApiError::internal(format!(
+                "Failed to acquire search generation catalog lock {} ({}): {error}",
+                path.display(),
+                error.code()
+            ))
         })?;
         Ok(Self { file, path })
     }
@@ -223,13 +224,11 @@ pub(super) fn inspect_search_generation(path: &Path) -> Result<Option<bool>, Api
             ))
         })?;
     if !bounded_locks::try_acquire(&lock, FileLockKind::Shared).map_err(|error| {
-        ApiError::new(
-            error.code(),
-            format!(
-                "Failed to inspect persisted search generation lock {}: {error}",
-                lock_path.display()
-            ),
-        )
+        ApiError::internal(format!(
+            "Failed to inspect persisted search generation lock {} ({}): {error}",
+            lock_path.display(),
+            error.code()
+        ))
     })? {
         return Ok(None);
     }
@@ -265,13 +264,11 @@ pub(super) fn try_remove_search_generation(
             ))
         })?;
     if !bounded_locks::try_acquire(&lock, FileLockKind::Exclusive).map_err(|error| {
-        ApiError::new(
-            error.code(),
-            format!(
-                "Failed to lock persisted search generation {} for removal: {error}",
-                path.display()
-            ),
-        )
+        ApiError::internal(format!(
+            "Failed to lock persisted search generation {} for removal ({}): {error}",
+            path.display(),
+            error.code()
+        ))
     })? {
         return Ok(false);
     }

@@ -26,10 +26,28 @@ use std::time::{Duration, Instant};
 const DEFAULT_ACTIVATION_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const ACTIVATION_WAIT_SLICE: Duration = Duration::from_millis(25);
 /// Longest an eviction or shutdown waits for a cancelled activation worker to
-/// reach a quiescent boundary. The worker checks cancellation between every
-/// preparation stage and inside indexing, so exceeding this budget means the
-/// worker is wedged inside owned mutation or a held publication/store lock.
+/// reach a quiescent boundary before fail-stopping the process.
+///
+/// The worker checks cancellation between every preparation stage and inside
+/// indexing, and [`run_activation_worker`] installs its cancellation flag as
+/// the ambient one for every bounded lock acquisition on the worker thread. A
+/// lock wait therefore never blocks the worker for its own budget — a peer's
+/// whole publication, up to [`bounded_locks::PUBLICATION_LOCK_WAIT`] — but only
+/// until the flag is observed, within
+/// [`bounded_locks::MAX_CANCELLATION_LATENCY`]. Exceeding this budget means the
+/// worker is wedged inside owned mutation, not merely waiting for a peer.
 const ACTIVATION_QUIESCENCE_BUDGET: Duration = Duration::from_secs(20);
+
+/// The invariant this whole path rests on: the budget an eviction uses before
+/// aborting the process must exceed the longest a worker can stay inside a
+/// bounded lock wait after its cancellation is raised. Without the ambient
+/// scope that longest wait would instead be `PUBLICATION_LOCK_WAIT`, and an
+/// ordinary slow activation would abort a healthy session.
+const _: () = assert!(
+    ACTIVATION_QUIESCENCE_BUDGET.as_millis()
+        > codestory_contracts::bounded_locks::MAX_CANCELLATION_LATENCY.as_millis(),
+    "the quiescence budget must exceed the bounded-lock cancellation latency"
+);
 /// Fail-stop reason recorded when a cancelled activation worker never reaches
 /// a quiescent boundary.
 pub const ACTIVATION_QUIESCENCE_FAIL_STOP: &str = "activation_quiescence_timeout";
@@ -118,10 +136,14 @@ fn with_public_operation_cancellation<T>(
     cancelled: Arc<AtomicBool>,
     build: impl FnOnce() -> T,
 ) -> T {
-    let previous =
-        ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| active.replace(Some(cancelled)));
+    let previous = ACTIVE_PUBLIC_OPERATION_CANCELLATION
+        .with(|active| active.replace(Some(Arc::clone(&cancelled))));
     let _guard = ActivePublicOperationCancellationGuard { previous };
-    build()
+    // A request body reaches the same publication-class locks the activation
+    // worker does, and waits behind a peer's whole publication pass. That is
+    // only tolerable while the request's own cancellation can end the wait, so
+    // the flag becomes the ambient one for every bounded acquisition below.
+    codestory_contracts::bounded_locks::with_thread_cancellation(cancelled, build)
 }
 
 pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> {
@@ -369,41 +391,7 @@ enum CompleteCoreAdmission {
 
 struct ReadyLeaseProbe {
     admissible: bool,
-    retained_core_publication: RetainedCoreObservation,
-}
-
-/// What one observational read of the on-disk core publication proved.
-///
-/// A transient read failure — SQLite lock contention past the busy timeout is
-/// the realistic trigger — is not evidence that no retained publication exists.
-/// Collapsing both into `None` demoted retained local navigation that the
-/// on-disk core would still have admitted, so the two stay distinct.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RetainedCoreObservation {
-    Observed(Option<IndexPublicationDto>),
-    Unobservable,
-}
-
-impl RetainedCoreObservation {
-    fn from_read(result: Result<Option<IndexPublicationDto>, ApiError>) -> Self {
-        match result {
-            Ok(retained) => Self::Observed(retained),
-            Err(error) => {
-                tracing::warn!(
-                    code = %error.code,
-                    "retained core publication could not be observed; keeping the last proven retained capability"
-                );
-                Self::Unobservable
-            }
-        }
-    }
-
-    fn observed(&self) -> Option<&IndexPublicationDto> {
-        match self {
-            Self::Observed(retained) => retained.as_ref(),
-            Self::Unobservable => None,
-        }
-    }
+    retained_core_publication: Option<IndexPublicationDto>,
 }
 
 fn ready_retrieval_identity_matches(
@@ -856,7 +844,7 @@ impl ActivationService {
             }
 
             let retained_core_publication =
-                RetainedCoreObservation::from_read(self.retained_core_publication(storage_path));
+                self.retained_core_publication(storage_path).unwrap_or(None);
             let mut state = self
                 .coordinator
                 .state
@@ -976,11 +964,8 @@ impl ActivationService {
         let retrieval_matches =
             ready_retrieval_identity_matches(retrieval_identity.as_ref(), &lease.retrieval);
         let retained_core_publication =
-            RetainedCoreObservation::from_read(self.retained_core_publication(storage_path));
-        // An unobservable core cannot prove the lease still matches, so
-        // admission stays fail-closed even though the retained capability is
-        // preserved below.
-        let core_matches = retained_core_publication.observed() == Some(&lease.core_publication);
+            self.retained_core_publication(storage_path).unwrap_or(None);
+        let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
         ReadyLeaseProbe {
             admissible: configuration_matches
                 && lease.source.is_admissible_snapshot()
@@ -994,7 +979,7 @@ impl ActivationService {
         &self,
         state: &mut ActivationCoordinatorState,
         target: &ActivationTarget,
-        retained_core_publication: RetainedCoreObservation,
+        retained_core_publication: Option<IndexPublicationDto>,
     ) -> (String, Arc<AtomicBool>) {
         if !state
             .target
@@ -1020,30 +1005,17 @@ impl ActivationService {
                 snapshot.stage = ActivationStage::Discovery;
                 snapshot.progress = activation_stage_progress(ActivationStage::Discovery);
             }
-            match retained_core_publication {
-                RetainedCoreObservation::Observed(retained) => {
-                    let retained_was_ready = snapshot.capabilities.local_navigation
-                        == ActivationCapabilityState::Ready
-                        && snapshot.retained_core_publication == retained;
-                    snapshot.retained_core_publication = retained;
-                    snapshot.capabilities.local_navigation = if retained_was_ready {
-                        ActivationCapabilityState::Ready
-                    } else if snapshot.retained_core_publication.is_some() {
-                        ActivationCapabilityState::Retained
-                    } else {
-                        ActivationCapabilityState::Unavailable
-                    };
-                }
-                // A failed read proves nothing about the on-disk core, so the
-                // previously proven retained publication and its capability
-                // survive the replacement instead of being stripped.
-                RetainedCoreObservation::Unobservable => {
-                    if snapshot.capabilities.local_navigation == ActivationCapabilityState::Ready {
-                        snapshot.capabilities.local_navigation =
-                            ActivationCapabilityState::Retained;
-                    }
-                }
-            }
+            let retained_was_ready = snapshot.capabilities.local_navigation
+                == ActivationCapabilityState::Ready
+                && snapshot.retained_core_publication == retained_core_publication;
+            snapshot.retained_core_publication = retained_core_publication;
+            snapshot.capabilities.local_navigation = if retained_was_ready {
+                ActivationCapabilityState::Ready
+            } else if snapshot.retained_core_publication.is_some() {
+                ActivationCapabilityState::Retained
+            } else {
+                ActivationCapabilityState::Unavailable
+            };
             snapshot.capabilities.broad_search = ActivationCapabilityState::Unavailable;
             snapshot.operation_id.clone()
         } else {
@@ -1070,11 +1042,9 @@ impl ActivationService {
                 failure_code: None,
                 failure: None,
                 failure_details: None,
-                retained_core_publication: retained_core_publication.observed().cloned(),
+                retained_core_publication: retained_core_publication.clone(),
                 capabilities: ActivationCapabilities {
-                    // A first activation has no earlier proof to preserve, so
-                    // an unobservable core is indistinguishable from none.
-                    local_navigation: if retained_core_publication.observed().is_some() {
+                    local_navigation: if retained_core_publication.is_some() {
                         ActivationCapabilityState::Retained
                     } else {
                         ActivationCapabilityState::Unavailable
@@ -1894,16 +1864,29 @@ fn run_activation_worker(
     operation: &ActivationOperation,
     activate: impl FnOnce() -> Result<(), ApiError>,
 ) {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let attempt = operation.attempt();
-        activate().map_err(|error| classify_activation_api_error_for_attempt(error, attempt))
-    }))
-    .unwrap_or_else(|_| {
-        Err(ApiError::new(
-            "project_unavailable",
-            "project activation worker stopped unexpectedly",
-        ))
-    });
+    // This thread is the one whose quiescence an eviction or shutdown joins
+    // against ACTIVATION_QUIESCENCE_BUDGET, and past that budget the process
+    // aborts. Its lock waits must therefore all be interruptible. The deep ones
+    // — model materialization, promotion, the search index and generation
+    // catalog guards, retention — are reached through APIs that carry no
+    // cancellation flag, so the flag is installed on the thread instead and
+    // every bounded acquisition below inherits it.
+    let result = codestory_contracts::bounded_locks::with_thread_cancellation(
+        Arc::clone(&operation.cancelled),
+        || {
+            catch_unwind(AssertUnwindSafe(|| {
+                let attempt = operation.attempt();
+                activate()
+                    .map_err(|error| classify_activation_api_error_for_attempt(error, attempt))
+            }))
+            .unwrap_or_else(|_| {
+                Err(ApiError::new(
+                    "project_unavailable",
+                    "project activation worker stopped unexpectedly",
+                ))
+            })
+        },
+    );
     let _ = operation.finish(result.as_ref().err());
 }
 
@@ -4328,29 +4311,127 @@ mod bounded_runtime_tests {
         }
     }
 
-    fn ready_snapshot(
-        retained: Option<IndexPublicationDto>,
-        local_navigation: ActivationCapabilityState,
-    ) -> ActivationSnapshot {
+    fn preparing_snapshot(operation_id: &str) -> ActivationSnapshot {
         ActivationSnapshot {
-            operation_id: "activation-bounded-fixture".into(),
-            revision: 4,
-            state: ActivationState::Ready,
-            stage: ActivationStage::Ready,
-            progress: activation_stage_progress(ActivationStage::Ready),
-            attempt: 2,
-            retry_after_ms: None,
+            operation_id: operation_id.to_string(),
+            revision: 1,
+            state: ActivationState::Preparing,
+            stage: ActivationStage::Publication,
+            progress: activation_stage_progress(ActivationStage::Publication),
+            attempt: 1,
+            retry_after_ms: Some(250),
             embedding_capacity: None,
             embedding_retry: None,
             failure_code: None,
             failure: None,
             failure_details: None,
-            retained_core_publication: retained,
+            retained_core_publication: None,
             capabilities: ActivationCapabilities {
-                local_navigation,
-                broad_search: ActivationCapabilityState::Ready,
+                local_navigation: ActivationCapabilityState::Unavailable,
+                broad_search: ActivationCapabilityState::Unavailable,
             },
         }
+    }
+
+    /// The invariant the fail-stop budget rests on: the longest a worker can be
+    /// stuck without observing cancellation must stay under
+    /// `ACTIVATION_QUIESCENCE_BUDGET`.
+    ///
+    /// A peer holding a retention lock for a whole publication is ordinary, not
+    /// a fault, and the waiter's own budget for it is
+    /// `PUBLICATION_LOCK_WAIT` — six times the quiescence budget. Unless the
+    /// wait ends on cancellation, an eviction or a shutdown during a slow first
+    /// activation joins a worker that is merely waiting, calls it unquiesced,
+    /// and aborts the process out from under a healthy session.
+    ///
+    /// `GenerationRetentionLock::acquire` is a real production call site that
+    /// passes no cancellation flag of its own, exactly like the promotion,
+    /// search index, generation catalog, and model materialization waits the
+    /// worker also reaches. It must inherit the worker's.
+    #[test]
+    fn a_worker_waiting_on_a_held_publication_lock_quiesces_on_cancellation() {
+        let fixture = bounded_runtime_fixture();
+        let service = fixture.runtime.activation_service();
+        let state_file = fixture.project.path().join("retrieval-sidecars.json");
+        let holder = codestory_retrieval::GenerationRetentionLock::acquire(
+            &state_file,
+            "quiescence_contention",
+        )
+        .expect("a peer takes the retention lock for its publication pass");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let operation_id = "activation-quiescence-contention".to_string();
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.current = Some(preparing_snapshot(&operation_id));
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let waited_state_file = state_file.clone();
+        let worker = std::thread::spawn(move || {
+            run_activation_worker(&operation, || {
+                entered
+                    .send(())
+                    .expect("announce that the worker is running");
+                // Either outcome ends the body; the worker always reports a
+                // failure so completion takes the error path rather than the
+                // ready-lease one this fixture never publishes.
+                match codestory_retrieval::GenerationRetentionLock::acquire(
+                    &waited_state_file,
+                    "quiescence_contention",
+                ) {
+                    Ok(_) => Err(ApiError::new(
+                        "activation_retryable",
+                        "the wait outlived cancellation and ended by acquiring the lock",
+                    )),
+                    Err(error) => Err(ApiError::new("cancelled", error.to_string())),
+                }
+            });
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker entered its body");
+
+        let started = Instant::now();
+        let quiescence = service.cancel_and_wait_within(ACTIVATION_QUIESCENCE_BUDGET);
+        let waited = started.elapsed();
+
+        // Released before the join so a regression fails in the worker's own
+        // budget rather than parking this test behind PUBLICATION_LOCK_WAIT.
+        drop(holder);
+        worker.join().expect("activation worker thread");
+        let failure_code = service
+            .snapshot()
+            .expect("the fixture seeded a snapshot")
+            .failure_code;
+
+        assert_eq!(
+            quiescence,
+            ActivationQuiescence::Quiesced,
+            "a worker merely waiting behind a peer's publication was reported unquiesced after {waited:?}, which aborts the process"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the cancelled worker took {waited:?} to leave a lock wait it should have left within {:?}",
+            codestory_contracts::bounded_locks::MAX_CANCELLATION_LATENCY
+        );
+        // Not merely fast: the wait ended because the flag was raised, and not
+        // because the peer happened to release first.
+        assert_eq!(
+            failure_code.as_deref(),
+            Some("cancelled"),
+            "the worker must leave the lock wait on its cancellation flag"
+        );
     }
 
     #[test]
@@ -4437,65 +4518,5 @@ mod bounded_runtime_tests {
         });
 
         assert_eq!(error.code, "cancelled");
-    }
-
-    #[test]
-    fn an_unobservable_retained_core_keeps_the_proven_local_navigation_capability() {
-        // SQLite lock contention past the busy timeout is a read failure, not
-        // proof that the on-disk core is gone. Collapsing the two stripped
-        // retained local navigation the core would still have admitted.
-        let fixture = bounded_runtime_fixture();
-        let service = fixture.runtime.activation_service();
-        let storage_path = fixture.project.path().join("codestory.db");
-        let target = ActivationTarget::new(fixture.project.path(), &storage_path);
-        let publication = IndexPublicationDto {
-            generation: 9,
-            generation_id: "generation-bounded".into(),
-            run_id: "run-bounded".into(),
-            mode: codestory_contracts::api::IndexPublicationModeDto::Full,
-            published_at_epoch_ms: 17,
-        };
-
-        let mut state = service
-            .coordinator
-            .state
-            .lock()
-            .expect("activation coordinator");
-        state.target = Some(target.clone());
-        state.current = Some(ready_snapshot(
-            Some(publication.clone()),
-            ActivationCapabilityState::Ready,
-        ));
-        service.begin_activation_locked(&mut state, &target, RetainedCoreObservation::Unobservable);
-        let after_unobservable = state.current.clone().expect("replacement snapshot");
-        assert_eq!(
-            after_unobservable.retained_core_publication,
-            Some(publication.clone()),
-            "an unreadable core must not erase the proven retained publication"
-        );
-        assert_eq!(
-            after_unobservable.capabilities.local_navigation,
-            ActivationCapabilityState::Retained
-        );
-
-        state.running = false;
-        state.current = Some(ready_snapshot(
-            Some(publication),
-            ActivationCapabilityState::Ready,
-        ));
-        service.begin_activation_locked(
-            &mut state,
-            &target,
-            RetainedCoreObservation::Observed(None),
-        );
-        let after_absent = state.current.clone().expect("replacement snapshot");
-        assert_eq!(
-            after_absent.retained_core_publication, None,
-            "a successful read proving no retained core must still demote"
-        );
-        assert_eq!(
-            after_absent.capabilities.local_navigation,
-            ActivationCapabilityState::Unavailable
-        );
     }
 }

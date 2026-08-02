@@ -3,7 +3,7 @@ use crate::symbol_query::RetrievalFileRole;
 use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::bounded_locks::{
-    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_contracts::graph::NodeId;
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
@@ -505,13 +505,21 @@ impl PersistedSearchIndexGuard {
             PersistedSearchIndexLockMode::Shared => FileLockKind::Shared,
             PersistedSearchIndexLockMode::Exclusive => FileLockKind::Exclusive,
         };
-        acquire_with_deadline(&file, kind, LockDeadline::after(DEFAULT_LOCK_WAIT), None)
-            .with_context(|| {
-                format!(
-                    "Failed to take {kind} search index lock {}",
-                    search_dir.display()
-                )
-            })?;
+        // The exclusive side is held for a whole search index publication, so
+        // both sides wait on the publication budget. The wait is interruptible
+        // through the caller's ambient cancellation.
+        acquire_with_deadline(
+            &file,
+            kind,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to take {kind} search index lock {}",
+                search_dir.display()
+            )
+        })?;
         Ok(Self {
             file,
             path: lock_path,
@@ -583,7 +591,7 @@ impl PersistedSearchIndexGuard {
         if !self.is_exclusive() {
             return Ok(());
         }
-        bounded_locks::downgrade_to_shared(&self.file, LockDeadline::after(DEFAULT_LOCK_WAIT))
+        bounded_locks::downgrade_to_shared(&self.file, LockDeadline::after(PUBLICATION_LOCK_WAIT))
             .with_context(|| {
                 format!(
                     "Failed to downgrade persisted search index lock {} to shared",

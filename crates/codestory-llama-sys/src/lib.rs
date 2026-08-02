@@ -42,10 +42,16 @@ include!(concat!(env!("OUT_DIR"), "/model_contract.rs"));
 include!(concat!(env!("OUT_DIR"), "/embedding_server_contract.rs"));
 
 const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// A peer materializing the embedded model writes and verifies the whole
-/// model file, so this budget is generous; it exists so a wedged peer can
-/// never hold activation open indefinitely.
-const MODEL_MATERIALIZE_LOCK_WAIT: Duration = Duration::from_secs(120);
+/// A peer materializing the embedded model writes and verifies the whole model
+/// file — the same publication-class hold every other long budget names. It
+/// exists so a wedged peer can never hold activation open indefinitely.
+///
+/// The activation worker reaches this through
+/// `ensure_product_embedding_backend_for_runtime`, whose signature carries no
+/// cancellation flag. The wait inherits the worker's flag from
+/// `bounded_locks::with_thread_cancellation` instead, so a cancelled activation
+/// leaves it without waiting out the peer.
+const MODEL_MATERIALIZE_LOCK_WAIT: Duration = bounded_locks::PUBLICATION_LOCK_WAIT;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUALIFICATION_NATIVE_STALL: AtomicBool = AtomicBool::new(false);

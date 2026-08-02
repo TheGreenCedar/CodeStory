@@ -3,8 +3,7 @@
 use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::bounded_locks::{
-    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT,
-    acquire_with_deadline,
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_store::{RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
@@ -77,26 +76,48 @@ pub struct GenerationRetentionLock {
 }
 
 impl GenerationRetentionLock {
-    /// Exclusive retention lock for a publication or cleanup pass. Only
-    /// background workers take it, so it carries the longer publication
-    /// budget rather than the foreground one.
+    /// Exclusive retention lock for a publication or cleanup pass. The holder
+    /// keeps it for the whole pass, so waiters carry the publication budget:
+    /// a shorter one would refuse ordinary contention.
     pub fn acquire(state_file: &Path, scope_id: &str) -> Result<Self> {
+        Self::acquire_with_cancel(state_file, scope_id, None)
+    }
+
+    /// [`Self::acquire`] for a caller that holds the cancellation flag of the
+    /// work being done, so the wait ends on cancellation rather than on the
+    /// peer's whole publication.
+    pub fn acquire_with_cancel(
+        state_file: &Path,
+        scope_id: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self> {
         Self::acquire_bounded(
             state_file,
             scope_id,
             FileLockKind::Exclusive,
             LockDeadline::after(PUBLICATION_LOCK_WAIT),
-            None,
+            cancel,
         )
     }
 
+    /// The shared side waits behind the same exclusive publication holder, so
+    /// it carries the same budget. Ten seconds refused a legitimate commit.
     pub fn acquire_shared(state_file: &Path, scope_id: &str) -> Result<Self> {
+        Self::acquire_shared_with_cancel(state_file, scope_id, None)
+    }
+
+    /// [`Self::acquire_shared`] for a caller that holds a cancellation flag.
+    pub fn acquire_shared_with_cancel(
+        state_file: &Path,
+        scope_id: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self> {
         Self::acquire_bounded(
             state_file,
             scope_id,
             FileLockKind::Shared,
-            LockDeadline::after(DEFAULT_LOCK_WAIT),
-            None,
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
+            cancel,
         )
     }
 
@@ -1849,5 +1870,61 @@ mod tests {
         );
 
         holder.wait().expect("holder process exits");
+    }
+
+    /// A publication pass routinely holds this lock longer than
+    /// [`codestory_contracts::bounded_locks::DEFAULT_LOCK_WAIT`]. A waiter that
+    /// refuses at ten seconds turns ordinary contention behind a legitimate
+    /// commit into a hard failure, so the shared side carries the publication
+    /// budget — and stays interruptible, which is the only reason a budget that
+    /// long is safe.
+    ///
+    /// Both halves are proven at once: past the ten-second mark the wait is
+    /// still running (so the budget is not the default one) and it then ends on
+    /// the cancellation flag rather than on a timeout.
+    #[test]
+    fn a_publication_length_hold_is_waited_out_rather_than_refused_at_the_default_budget() {
+        use codestory_contracts::bounded_locks::DEFAULT_LOCK_WAIT;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempdir().expect("root");
+        let state_file = root.path().join("retrieval-sidecars.json");
+        let _holder = GenerationRetentionLock::acquire(&state_file, "long_publication")
+            .expect("a peer takes the lock for its publication pass");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let raiser = Arc::clone(&cancel);
+        let past_the_default_budget = DEFAULT_LOCK_WAIT + Duration::from_millis(750);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(past_the_default_budget);
+            raiser.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let waiter_state_file = state_file.clone();
+        let waiter_cancel = Arc::clone(&cancel);
+        let waiter = std::thread::spawn(move || {
+            // The ambient scope stands in for the activation worker's: the
+            // production call site below passes no flag of its own.
+            codestory_contracts::bounded_locks::with_thread_cancellation(waiter_cancel, || {
+                GenerationRetentionLock::acquire_shared(&waiter_state_file, "long_publication")
+            })
+        });
+        let outcome = waiter.join().expect("waiter thread");
+        let waited = started.elapsed();
+        canceller.join().expect("cancellation thread");
+
+        let error = outcome.expect_err("the peer never released, so the wait cannot succeed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("lock_wait_cancelled")),
+            "the wait must end on cancellation, not on a budget shorter than the peer's pass: {error:#}"
+        );
+        assert!(
+            waited >= DEFAULT_LOCK_WAIT,
+            "the wait gave up after {waited:?}, inside the {DEFAULT_LOCK_WAIT:?} foreground budget, so a legitimate publication would be refused"
+        );
     }
 }

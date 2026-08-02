@@ -12,14 +12,13 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [build-dependencies]
-fs4 = { workspace = true }
+# The build script stages the native runtime under an advisory lock, and takes
+# it through the same bounded entry point production source uses.
+codestory-contracts = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-# The native staging test target compiles the build-script source directly, so
-# it needs the same raw lock dependency the build script has.
-fs4 = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

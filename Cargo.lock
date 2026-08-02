@@ -639,7 +639,6 @@ version = "0.16.3"
 dependencies = [
  "codestory-contracts",
  "crossbeam-channel",
- "fs4",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "serde_json",
@@ -683,7 +682,6 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
- "fs4",
  "nucleo-matcher",
  "parking_lot",
  "rayon",

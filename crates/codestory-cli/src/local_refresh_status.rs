@@ -549,6 +549,8 @@ fn acquire_local_refresh_state_guard(cache_root: &Path) -> Result<LocalRefreshSt
     fs::create_dir_all(cache_root)?;
     let path = cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE);
     let file = open_local_refresh_state_guard_file(&path)?;
+    // The critical section is one read-modify-write of the state file, never a
+    // publication, so the foreground budget is the matching one.
     acquire_with_deadline(
         &file,
         FileLockKind::Exclusive,

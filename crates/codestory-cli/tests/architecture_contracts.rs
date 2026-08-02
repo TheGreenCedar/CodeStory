@@ -84,6 +84,55 @@ fn production_source_prefix(source: &str) -> &str {
         .map_or(source, |(production, _)| production)
 }
 
+/// Everything in `source` that a release build actually compiles: every
+/// top-level `#[cfg(test)]` item is removed, wherever in the file it sits.
+///
+/// The shape this replaces was `source.split("\n#[cfg(test)]\n").next()`, which
+/// keeps only the text before the *first* gate. A single `#[cfg(test)] use ..;`
+/// in a file's import block therefore exempted the entire rest of that file
+/// from every contract built on the helper — including
+/// `crates/codestory-runtime/src/search/engine.rs` (gate on line 2),
+/// `crates/codestory-runtime/src/index_commit.rs` (line 3),
+/// `crates/codestory-store/src/storage_impl/mod.rs` (line 12), and
+/// `crates/codestory-runtime/src/lib.rs` (line 41), which between them hold the
+/// biggest lock and owned-artifact call sites in the tree.
+///
+/// `#[cfg(any(test, feature = "test-support"))]` is deliberately *not* stripped:
+/// that gate compiles into a release build whenever the feature is on, so its
+/// body is production code.
+fn production_source(source: &str) -> String {
+    let mut kept = String::with_capacity(source.len());
+    let mut lines = source.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() == "#[cfg(test)]" {
+            skip_gated_item(&mut lines);
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Consume the item a top-level `#[cfg(test)]` gates. Rustfmt guarantees the
+/// two shapes that matter: a block item closes with a column-zero `}` or `};`,
+/// and a statement item ends at the first line closing with `;`.
+fn skip_gated_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
+    let mut opened_block = false;
+    for line in lines {
+        if line.starts_with('}') {
+            return;
+        }
+        if line.contains('{') {
+            opened_block = true;
+            continue;
+        }
+        if !opened_block && line.trim_end().ends_with(';') {
+            return;
+        }
+    }
+}
+
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source.find(start).expect("start marker exists");
     let tail = &source[start_index..];
@@ -489,22 +538,23 @@ fn advisory_file_locks_have_exactly_one_bounded_entry_point() {
     collect_rs_files(&repo_root().join("crates"), &mut files);
     files.sort();
     let mut violations = Vec::new();
+    let mut scanned = 0_usize;
     for path in files {
-        if !path
+        // Everything a crate ships or builds with is in scope: `src`, build
+        // scripts at the crate root, and modules they include. Only integration
+        // test targets, which exist to build hostile fixtures, are exempt.
+        if path
             .components()
-            .any(|component| component.as_os_str() == "src")
+            .any(|component| component.as_os_str() == "tests")
             || path == owner
         {
             continue;
         }
+        scanned += 1;
         let source = fs::read_to_string(&path).expect("read Rust source");
-        // Inline test modules may still drive raw locks to build fixtures;
-        // production code above the trailing test module may not.
-        let production = source
-            .split("\n#[cfg(test)]\n")
-            .next()
-            .expect("split returns at least the full source");
-        if production.contains("fs4::") {
+        // Inline `#[cfg(test)]` items may still drive raw locks to build
+        // fixtures; nothing a release build compiles may.
+        if production_source(&source).contains("fs4::") {
             violations.push(path.display().to_string());
         }
     }
@@ -512,6 +562,10 @@ fn advisory_file_locks_have_exactly_one_bounded_entry_point() {
         violations.is_empty(),
         "advisory locks must be taken through codestory_contracts::bounded_locks:\n{}",
         violations.join("\n")
+    );
+    assert!(
+        scanned > 100,
+        "the fs4 gate scanned only {scanned} files; its file filter has stopped matching"
     );
 
     let bounded = read("crates/codestory-contracts/src/bounded_locks.rs");
@@ -521,12 +575,158 @@ fn advisory_file_locks_have_exactly_one_bounded_entry_point() {
             && bounded.contains("cancel: Option<&AtomicBool>"),
         "the bounded entry point must take an absolute deadline and a cancellation flag"
     );
+    assert!(
+        bounded.contains("let cancel = cancel.or(inherited.as_deref());"),
+        "a call site with no flag of its own must inherit the thread's cancellation"
+    );
     for blocking in ["FileExt::lock_exclusive", "FileExt::lock_shared"] {
         assert!(
             !bounded.contains(blocking),
             "the bounded entry point must never call the uninterruptible {blocking}"
         );
     }
+}
+
+/// The helper above is the whole reason the fs4 and owned-artifact gates see
+/// anything at all, so it is proven directly rather than trusted.
+#[test]
+fn the_production_source_helper_strips_every_test_gate_not_just_the_first() {
+    let gate_in_the_import_block = "\
+use std::fs::File;
+#[cfg(test)]
+use std::sync::Arc;
+
+fn production() {
+    real_call();
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        gated_call();
+    }
+}
+";
+    let production = production_source(gate_in_the_import_block);
+    assert!(
+        production.contains("real_call()"),
+        "production code must survive the strip: {production}"
+    );
+    assert!(
+        !production.contains("use std::sync::Arc;"),
+        "a gated use statement must be stripped: {production}"
+    );
+    assert!(
+        !production.contains("gated_call()"),
+        "a gated module after an earlier gate must still be stripped: {production}"
+    );
+
+    let feature_gated = "\
+#[cfg(any(test, feature = \"test-support\"))]
+pub fn shipped_with_the_feature() {
+    real_call();
+}
+";
+    assert!(
+        production_source(feature_gated).contains("real_call()"),
+        "a feature-reachable gate compiles into a release build and is production code"
+    );
+
+    let multiline_gated_use = "\
+#[cfg(test)]
+use crate::{
+    first, second,
+};
+
+fn production() {
+    real_call();
+}
+";
+    let production = production_source(multiline_gated_use);
+    assert!(!production.contains("first, second"));
+    assert!(production.contains("real_call()"));
+}
+
+/// Every lock a peer holds for a whole publication must be waited on with the
+/// publication budget. `DEFAULT_LOCK_WAIT` is ten seconds — shorter than a
+/// legitimate commit — so pointing one of these at it converts ordinary
+/// contention into a hard failure for a reader that previously waited.
+#[test]
+fn publication_class_lock_waits_carry_the_publication_budget() {
+    let publication_class = [
+        // The atomic old-or-new promotion.
+        (
+            "crates/codestory-store/src/storage_impl/mod.rs",
+            "fn acquire(path: &Path) -> Result<Self, StorageError> {",
+        ),
+        // The persisted search index publication.
+        (
+            "crates/codestory-runtime/src/search/engine.rs",
+            "fn acquire_with_mode(search_dir: &Path, mode: PersistedSearchIndexLockMode)",
+        ),
+        // The search generation catalog write.
+        (
+            "crates/codestory-runtime/src/search_publication.rs",
+            "acquire_with_deadline(",
+        ),
+        // Sidecar generation publication and retention, both directions.
+        (
+            "crates/codestory-retrieval/src/retention.rs",
+            "pub fn acquire_with_cancel(",
+        ),
+        (
+            "crates/codestory-retrieval/src/retention.rs",
+            "pub fn acquire_shared_with_cancel(",
+        ),
+    ];
+    for (path, marker) in publication_class {
+        let source = read(path);
+        let body = source_between(&source, marker, "\n    }\n");
+        assert!(
+            body.contains("PUBLICATION_LOCK_WAIT"),
+            "{path} waits on a publication-class lock with a budget other than PUBLICATION_LOCK_WAIT:\n{body}"
+        );
+    }
+
+    // A long budget is only safe while it stays interruptible, and the two
+    // constants must not collapse into each other.
+    let bounded = read("crates/codestory-contracts/src/bounded_locks.rs");
+    assert!(
+        bounded.contains("pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(10);")
+            && bounded
+                .contains("pub const PUBLICATION_LOCK_WAIT: Duration = Duration::from_secs(120);"),
+        "the two wait classes must stay distinct and named"
+    );
+}
+
+/// Bounded acquisition replaced a blocking `flock`; it must not also have
+/// changed what callers report. A refusal keeps the surface each site already
+/// had and carries the typed lock code in its message.
+#[test]
+fn bounded_acquisition_did_not_change_public_error_codes() {
+    let publication = read("crates/codestory-runtime/src/search_publication.rs");
+    assert!(
+        !publication.contains("ApiError::new(\n                error.code(),")
+            && !publication.contains("ApiError::new(\n            error.code(),")
+            && !publication.contains("ApiError::new(\n        error.code(),"),
+        "search publication lock refusals must keep reporting `internal`, not promote the lock code to a public API error code"
+    );
+    for context in [
+        "Failed to acquire search generation catalog lock",
+        "Failed to inspect persisted search generation lock",
+        "Failed to lock persisted search generation",
+    ] {
+        assert!(
+            publication.contains(context),
+            "the refusal for {context:?} must survive"
+        );
+    }
+
+    let storage = read("crates/codestory-store/src/storage_impl/mod.rs");
+    assert!(
+        storage.contains("StorageError::Other(format!(\n                \"Failed to acquire promotion lock for {} ({}): {error}\","),
+        "the promotion refusal must stay a StorageError::Other carrying the typed lock code, matching the other sites"
+    );
 }
 
 #[test]
@@ -538,6 +738,29 @@ fn evicting_a_context_never_detaches_an_unquiesced_activation_worker() {
             && services.contains("run_activation_fail_stop(ACTIVATION_QUIESCENCE_FAIL_STOP)"),
         "eviction must join with a deadline and fail-stop instead of detaching a worker that may hold a publication or store lock"
     );
+    // The budget only bounds the worker if the worker's own lock waits can end
+    // on cancellation. Past that budget the CLI hook aborts the process, so a
+    // worker merely waiting behind a peer's publication would kill a healthy
+    // session and blame quiescence for it. Scoped to the worker's body: another
+    // caller installing a scope proves nothing about this thread.
+    let worker_body = source_between(
+        &services,
+        "fn run_activation_worker(",
+        "\nimpl ActivationOperation {",
+    );
+    assert!(
+        worker_body.contains("bounded_locks::with_thread_cancellation(")
+            && worker_body.contains("Arc::clone(&operation.cancelled)"),
+        "run_activation_worker must install the operation's cancellation as the ambient one for every bounded lock wait the worker performs:\n{worker_body}"
+    );
+    assert!(
+        services.contains("ACTIVATION_QUIESCENCE_BUDGET.as_millis()")
+            && services.contains(
+                "codestory_contracts::bounded_locks::MAX_CANCELLATION_LATENCY.as_millis()"
+            ),
+        "the quiescence budget must be asserted against the bounded-lock cancellation latency"
+    );
+
     let diagnostics = read("crates/codestory-cli/src/diagnostics.rs");
     assert!(
         diagnostics.contains("set_activation_fail_stop_hook"),
@@ -872,12 +1095,9 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("read producer source");
-            // Inline test modules pin these names on purpose; production code
-            // above the crate's trailing test module must not spell them.
-            let production = source
-                .split("\n#[cfg(test)]\n")
-                .next()
-                .expect("split returns at least the full source");
+            // Inline test modules pin these names on purpose; nothing a release
+            // build compiles may spell them.
+            let production = production_source(&source);
             for literal in literals {
                 assert!(
                     !production.contains(literal),

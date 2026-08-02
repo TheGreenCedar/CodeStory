@@ -1,5 +1,5 @@
 use codestory_contracts::bounded_locks::{
-    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_contracts::owned_artifacts;
 
@@ -1196,18 +1196,24 @@ impl PromotionLock {
             })
     }
 
+    /// A peer holds this for the whole atomic old-or-new promotion, so the
+    /// budget is the publication one: a foreground budget would refuse
+    /// ordinary contention behind a legitimate commit. The wait stays
+    /// interruptible through the caller's ambient cancellation, so a cancelled
+    /// request or activation still leaves it at once.
     fn acquire(path: &Path) -> Result<Self, StorageError> {
         let file = Self::open(path)?;
         acquire_with_deadline(
             &file,
             FileLockKind::Exclusive,
-            LockDeadline::after(DEFAULT_LOCK_WAIT),
+            LockDeadline::after(PUBLICATION_LOCK_WAIT),
             None,
         )
         .map_err(|error| {
             StorageError::Other(format!(
-                "Failed to acquire promotion lock for {}: {error}",
-                path.display()
+                "Failed to acquire promotion lock for {} ({}): {error}",
+                path.display(),
+                error.code()
             ))
         })?;
         Ok(Self { file })

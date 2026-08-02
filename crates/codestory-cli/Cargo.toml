@@ -25,7 +25,6 @@ codestory-runtime = { workspace = true }
 codestory-workspace = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-fs4 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,6 +59,9 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 codestory-workspace = { workspace = true, features = ["test-support"] }
+# Integration tests hold raw advisory locks to build hostile fixtures;
+# production CLI source takes them through codestory_contracts::bounded_locks.
+fs4 = { workspace = true }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-runtime = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }

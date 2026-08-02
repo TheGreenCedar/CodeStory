@@ -30,7 +30,7 @@ use codestory_contracts::api::{
     WorkspaceMemberIndexDto,
 };
 use codestory_contracts::bounded_locks::{
-    self, DEFAULT_LOCK_WAIT, FileLockKind, LockDeadline, acquire_with_deadline,
+    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
 use codestory_contracts::language_support::{
