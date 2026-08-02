@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -902,10 +902,14 @@ fn read_structural_text_unit_rollback_identity(
     let Some(identity) = identity else {
         return Ok(None);
     };
-    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(&conn)?;
-    let (projection_count, projection_digest, projection_versions) =
-        structural_text_projection_content_summary(&conn)?;
-    validate_structural_text_projection_rows(&conn)?;
+    let StructuralTextContentScan {
+        unit_count,
+        unit_digest,
+        unit_versions,
+        projection_count,
+        projection_digest,
+        projection_versions,
+    } = scan_structural_text_content(&conn)?;
     validate_structural_text_artifact_cache_rows(&conn).map_err(|error| {
         promotion_error(format!(
             "Structural artifact cache rollback identity does not match {}: {error}",
@@ -989,6 +993,139 @@ fn require_candidate_structural_text_identity(
         )));
     }
     require_recorded_structural_text_identity(path, publication, expected, role)
+}
+
+/// Byte extent of the SQLite database header.
+const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
+
+/// Header slots SQLite rewrites as bookkeeping when it commits or completes a
+/// `sqlite3_backup`, and which therefore carry no database content: the file
+/// change counter (24..28), the schema cookie (40..44), and the version-valid-for
+/// counter (92..96). Every other byte of the file, header included, participates.
+const SQLITE_VOLATILE_HEADER_SLOTS: [(usize, usize); 3] = [(24, 28), (40, 44), (92, 96)];
+
+/// Rollback-journal sidecars that can hold database content outside the main
+/// file. `-shm` is excluded on purpose: it is a rebuildable wal-index, never
+/// content.
+const SQLITE_CONTENT_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-journal"];
+
+/// Whole-database byte identity for one promotion artifact.
+///
+/// This is content evidence, not a handle: two databases with the same image
+/// hold the same pages, so a validation that passed on one is a validation of
+/// the other. It is deliberately opaque so no caller can manufacture one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromotionDatabaseImage([u8; 32]);
+
+/// Digest the whole database file, masking only the header slots SQLite itself
+/// rewrites.
+///
+/// `None` means the image is not provable — a hot `-wal` or `-journal` sidecar
+/// puts content outside the main file, and a file shorter than the header is not
+/// a database. An unprovable image never admits reuse; it forces full
+/// revalidation.
+fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage>, StorageError> {
+    for suffix in SQLITE_CONTENT_SIDECAR_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match fs::metadata(&sidecar) {
+            Ok(metadata) if metadata.len() > 0 => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(promotion_path_error("inspect", &sidecar, error)),
+        }
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(promotion_path_error("open", path, error)),
+    };
+    let mut reader = BufReader::new(file);
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(promotion_path_error("read", path, error)),
+    }
+    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
+        header[start..end].fill(0);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| promotion_path_error("read", path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some(PromotionDatabaseImage(hasher.finalize().into())))
+}
+
+/// How the post-restore fence was satisfied for one promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotedValidation {
+    /// The restored file is byte-identical to the validated candidate, so the
+    /// candidate's receipt covers it.
+    ReusedCandidateReceipt,
+    /// The restored file could not be proven identical, so it was validated in
+    /// full.
+    Revalidated,
+}
+
+impl PromotedValidation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReusedCandidateReceipt => "reused_candidate_receipt",
+            Self::Revalidated => "revalidated",
+        }
+    }
+}
+
+/// Fence the restored live database before the promotion may commit.
+///
+/// The publication identity is always read back from the promoted file. The
+/// deep source-policy and structural-text validations are reused from the staged
+/// candidate only when the restored file's whole-database image equals the image
+/// sealed to that candidate's validation — which proves the two files hold the
+/// same pages, so re-deriving the same verdict from them is redundant work. A
+/// missing image on either side, or any difference at all, revalidates in full.
+fn validate_promoted_live_database(
+    live_path: &Path,
+    staged_path: &Path,
+    candidate: &IndexPublicationRecord,
+    candidate_source_policy: &Option<SourcePolicyExclusionRollbackIdentity>,
+    candidate_structural_text: &Option<StructuralTextUnitRollbackIdentity>,
+    candidate_image: Option<PromotionDatabaseImage>,
+) -> Result<PromotedValidation, StorageError> {
+    let published =
+        require_complete_promotion_database_identity(live_path, "Promoted live database")?;
+    if &published != candidate {
+        return Err(promotion_error(format!(
+            "Promoted live database identity does not match staged candidate {}",
+            staged_path.display()
+        )));
+    }
+    if let Some(candidate_image) = candidate_image
+        && promotion_database_image(live_path)? == Some(candidate_image)
+    {
+        return Ok(PromotedValidation::ReusedCandidateReceipt);
+    }
+    require_candidate_source_policy_identity(
+        live_path,
+        &published,
+        candidate_source_policy,
+        "Promoted live database",
+    )?;
+    require_candidate_structural_text_identity(
+        live_path,
+        &published,
+        candidate_structural_text,
+        "Promoted live database",
+    )?;
+    Ok(PromotedValidation::Revalidated)
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
@@ -2564,6 +2701,158 @@ fn hash_structural_text_unit_part(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+/// Everything a structural validation receipt needs from the unit and
+/// projection tables.
+#[derive(Debug)]
+struct StructuralTextContentScan {
+    unit_count: u64,
+    unit_digest: String,
+    unit_versions: HashSet<u32>,
+    projection_count: u64,
+    projection_digest: String,
+    projection_versions: HashSet<u32>,
+}
+
+/// Per-file unit evidence accumulated while the unit table is scanned.
+struct StructuralTextFileUnits {
+    count: u64,
+    digest: Sha256,
+}
+
+/// Read the structural unit and projection evidence in one ordered scan per
+/// table.
+///
+/// The publication summary and the per-file unit digests come from the same
+/// `structural_text_unit` cursor, and the projection summary and the per-file
+/// comparison come from the same `structural_text_projection` cursor, so a
+/// validation costs one pass over each table instead of two. Both digests keep
+/// the exact bytes their producers hashed: the publication summary hashes the
+/// stored column text, and the per-file digest hashes the decoded unit the way
+/// [`structural_text_unit_digest`] does. Neither validation is skipped.
+fn scan_structural_text_content(
+    conn: &Connection,
+) -> Result<StructuralTextContentScan, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut unit_hasher = Sha256::new();
+    unit_hasher.update(STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN);
+    let mut unit_count = 0_u64;
+    let mut unit_versions = HashSet::new();
+    let mut units_by_file = HashMap::<i64, StructuralTextFileUnits>::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            StorageError::Other("structural text unit descriptor version is invalid".into())
+        })?;
+        unit_versions.insert(descriptor_version);
+        let file_id = row.get::<_, i64>(1)?;
+        let file_role = row.get::<_, String>(15)?;
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            file_id.to_string(),
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?.to_string(),
+            row.get::<_, i64>(11)?.to_string(),
+            row.get::<_, i64>(12)?.to_string(),
+            row.get::<_, i64>(13)?.to_string(),
+            row.get::<_, i64>(14)?.to_string(),
+            file_role.clone(),
+        ];
+        for value in &values {
+            hash_structural_text_unit_part(&mut unit_hasher, value.as_bytes());
+        }
+        unit_count = unit_count.saturating_add(1);
+
+        // The per-file digest is the producer's digest, so it hashes the
+        // decoded unit: an out-of-range kind or span is rejected here exactly as
+        // decoding a row would reject it, and the role is the decoded role.
+        let unit = structural_text_unit_from_row(row)?;
+        let file = units_by_file
+            .entry(file_id)
+            .or_insert_with(|| StructuralTextFileUnits {
+                count: 0,
+                digest: new_structural_text_file_unit_digest(),
+            });
+        file.count = file.count.saturating_add(1);
+        hash_structural_text_unit_fields(&mut file.digest, &unit);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut projection_hasher = Sha256::new();
+    projection_hasher.update(b"codestory-structural-text-projection-publication-v1\0");
+    let mut projection_count = 0_u64;
+    let mut projection_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+            StorageError::Other("structural text projection descriptor version is invalid".into())
+        })?;
+        projection_versions.insert(descriptor_version);
+        let file_id = row.get::<_, i64>(0)?;
+        let declared_unit_count = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+        let declared_unit_digest = row.get::<_, String>(7)?;
+        let values = [
+            file_id.to_string(),
+            row.get::<_, String>(1)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?.to_string(),
+            declared_unit_digest.clone(),
+        ];
+        for value in &values {
+            hash_structural_text_unit_part(&mut projection_hasher, value.as_bytes());
+        }
+        projection_count = projection_count.saturating_add(1);
+
+        let observed = units_by_file
+            .remove(&file_id)
+            .unwrap_or_else(|| StructuralTextFileUnits {
+                count: 0,
+                digest: new_structural_text_file_unit_digest(),
+            });
+        if declared_unit_count != observed.count
+            || declared_unit_digest != format!("{:x}", observed.digest.finalize())
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {file_id} does not match its unit set"
+            )));
+        }
+    }
+    if !units_by_file.is_empty() {
+        return Err(StorageError::Other(
+            "structural text units exist without owning projections".into(),
+        ));
+    }
+
+    Ok(StructuralTextContentScan {
+        unit_count,
+        unit_digest: format!("{:x}", unit_hasher.finalize()),
+        unit_versions,
+        projection_count,
+        projection_digest: format!("{:x}", projection_hasher.finalize()),
+        projection_versions,
+    })
+}
+
 fn structural_text_unit_content_summary(
     conn: &Connection,
 ) -> Result<(u64, String, HashSet<u32>), StorageError> {
@@ -2619,26 +2908,37 @@ pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
     structural_text_unit_digest_ordered(&units)
 }
 
-fn structural_text_unit_digest_ordered(units: &[&StructuralTextUnit]) -> String {
+const STRUCTURAL_TEXT_FILE_UNIT_DIGEST_DOMAIN: &[u8] = b"codestory-structural-text-file-units-v1\0";
+
+fn new_structural_text_file_unit_digest() -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"codestory-structural-text-file-units-v1\0");
+    hasher.update(STRUCTURAL_TEXT_FILE_UNIT_DIGEST_DOMAIN);
+    hasher
+}
+
+fn hash_structural_text_unit_fields(hasher: &mut Sha256, unit: &StructuralTextUnit) {
+    hash_structural_text_unit_part(hasher, unit.node_id.0.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.file_id.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.placement_id.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.content_hash.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.source_content_hash.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.descriptor_version.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.producer.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.evidence_tier.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.resolution.as_bytes());
+    hash_structural_text_unit_part(hasher, unit.language.as_bytes());
+    hash_structural_text_unit_part(hasher, (unit.kind as i32).to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.start_line.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.start_col.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.end_line.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.end_col.to_string().as_bytes());
+    hash_structural_text_unit_part(hasher, unit.file_role.as_str().as_bytes());
+}
+
+fn structural_text_unit_digest_ordered(units: &[&StructuralTextUnit]) -> String {
+    let mut hasher = new_structural_text_file_unit_digest();
     for unit in units {
-        hash_structural_text_unit_part(&mut hasher, unit.node_id.0.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.file_id.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.placement_id.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.content_hash.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.source_content_hash.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.descriptor_version.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.producer.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.evidence_tier.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.resolution.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.language.as_bytes());
-        hash_structural_text_unit_part(&mut hasher, (unit.kind as i32).to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.start_line.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.start_col.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.end_line.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.end_col.to_string().as_bytes());
-        hash_structural_text_unit_part(&mut hasher, unit.file_role.as_str().as_bytes());
+        hash_structural_text_unit_fields(&mut hasher, unit);
     }
     format!("{:x}", hasher.finalize())
 }
@@ -2692,40 +2992,38 @@ fn structural_text_artifact_cache_key_is_valid(cache_key: &str) -> bool {
         && !identity.is_empty()
 }
 
+/// Validate every cached structural artifact against its verified projection in
+/// one ordered scan of the cache table.
+///
+/// The outer join carries the orphan check that used to need a second pass: a
+/// cache row whose projection is absent still arrives, and it is rejected on the
+/// same terms as before.
 fn validate_structural_text_artifact_cache_rows(conn: &Connection) -> Result<(), StorageError> {
-    let orphaned_rows = conn.query_row(
-        "SELECT COUNT(*)
-         FROM structural_text_artifact_cache c
-         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
-         WHERE p.file_id IS NULL",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if orphaned_rows != 0 {
-        return Err(StorageError::Other(
-            "structural artifact cache contains rows without verified projections".into(),
-        ));
-    }
     let mut stmt = conn.prepare(
         "SELECT c.file_id, c.cache_key, c.source_content_hash,
                 c.descriptor_version, c.producer, c.artifact_digest, c.artifact_blob,
-                p.source_content_hash, p.descriptor_version, p.producer
+                p.file_id, p.source_content_hash, p.descriptor_version, p.producer
          FROM structural_text_artifact_cache c
-         INNER JOIN structural_text_projection p ON p.file_id = c.file_id
+         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
          ORDER BY c.file_id ASC",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let file_id = row.get::<_, i64>(0)?;
+        if row.get::<_, Option<i64>>(7)?.is_none() {
+            return Err(StorageError::Other(
+                "structural artifact cache contains rows without verified projections".into(),
+            ));
+        }
         let cache_key = row.get::<_, String>(1)?;
         let source_content_hash = row.get::<_, String>(2)?;
         let descriptor_version = row.get::<_, i64>(3)?;
         let producer = row.get::<_, String>(4)?;
         let artifact_digest = row.get::<_, String>(5)?;
         let artifact_blob = row.get::<_, Vec<u8>>(6)?;
-        let projection_source_content_hash = row.get::<_, String>(7)?;
-        let projection_descriptor_version = row.get::<_, i64>(8)?;
-        let projection_producer = row.get::<_, String>(9)?;
+        let projection_source_content_hash = row.get::<_, String>(8)?;
+        let projection_descriptor_version = row.get::<_, i64>(9)?;
+        let projection_producer = row.get::<_, String>(10)?;
         let expected_digest = format!("{:x}", Sha256::digest(&artifact_blob));
         if source_content_hash != projection_source_content_hash
             || descriptor_version != projection_descriptor_version
@@ -5532,6 +5830,7 @@ impl Storage {
         durations.lock_recovery = lock_recovery_started.elapsed();
 
         let candidate_validation_started = Instant::now();
+        let candidate_image_before_validation = promotion_database_image(staged_path)?;
         let candidate = require_complete_promotion_database_identity(
             staged_path,
             "Staged promotion candidate",
@@ -5552,6 +5851,16 @@ impl Storage {
                 staged_path.display()
             )));
         }
+        // A receipt may only seal bytes the validation above actually read, so
+        // the image is taken on both sides of it. A staged file that moved under
+        // its own validation seals nothing and the promoted copy is revalidated.
+        let candidate_image = match (
+            candidate_image_before_validation,
+            promotion_database_image(staged_path)?,
+        ) {
+            (Some(before), Some(after)) if before == after => Some(after),
+            _ => None,
+        };
         let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
         durations.candidate_validation = candidate_validation_started.elapsed();
 
@@ -5687,33 +5996,25 @@ impl Storage {
         durations.staged_to_live_restore = staged_to_live_restore_started.elapsed();
 
         let promoted_validation_started = Instant::now();
-        let published =
-            require_complete_promotion_database_identity(live_path, "Promoted live database")?;
-        if published != candidate {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(promotion_error(format!(
-                "Promoted live database identity does not match staged candidate {}",
-                staged_path.display()
-            )));
-        }
-        if let Err(error) = require_candidate_source_policy_identity(
+        let promoted_validation = match validate_promoted_live_database(
             live_path,
-            &published,
+            staged_path,
+            &candidate,
             &candidate_source_policy,
-            "Promoted live database",
-        ) {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(error);
-        }
-        if let Err(error) = require_candidate_structural_text_identity(
-            live_path,
-            &published,
             &candidate_structural_text,
-            "Promoted live database",
+            candidate_image,
         ) {
-            let _ = rollback_prepared_promotion(live_path, &prepared);
-            return Err(error);
-        }
+            Ok(promoted_validation) => promoted_validation,
+            Err(error) => {
+                let _ = rollback_prepared_promotion(live_path, &prepared);
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            live_path = %live_path.display(),
+            promoted_validation = promoted_validation.as_str(),
+            "promotion fenced the restored live database"
+        );
         durations.promoted_validation = promoted_validation_started.elapsed();
 
         let committed_journal_started = Instant::now();
