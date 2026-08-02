@@ -109,6 +109,31 @@
   bare filename was only recognised for three languages. Every language
   CodeStory supports is now recognised, and only a genuine mid-word capital or
   qualifier marks a query as a symbol.
+- One failed request no longer takes the whole editor session down with it. A
+  request that crashed inside CodeStory ended the server, so every project the
+  session had open went with it and the next question got no answer at all. The
+  crash is now contained to the request that caused it: it comes back as a
+  stated failure, the project it was working on is thrown away and rebuilt
+  before anything reads from it again, and the other projects keep answering.
+- A client that sends requests faster than CodeStory can answer them is told so
+  instead of growing the queue without limit. Everything waiting — work still to
+  run and refusals not yet written out — is capped together at 32 requests and
+  8 MiB, and anything past that is refused with a message that names the limit
+  it hit. Those refusals go out straight away rather than queueing behind the
+  work already accepted, so a client that keeps pushing during a long request
+  hears back immediately and memory stops growing. A cancelled request also
+  leaves the queue right away instead of sitting there holding its place until
+  its turn came.
+- Requests carrying an enormous id are answered without it. CodeStory will not
+  hold on to an identifier longer than 512 bytes, so a refusal for one comes
+  back with an empty id and states the limit; ordinary ids are unaffected.
+- Asking CodeStory to shut down now ends it predictably and on a clock. It stops
+  taking new work, tells the request it is already running to stop, and gives
+  the whole wind-down three seconds: whatever finishes in time is answered
+  normally, and anything still going — including a request that will not stop,
+  or an editor that has stopped reading replies — is told the server is
+  stopping and left there. It then exits reporting a clean shutdown, instead of
+  waiting for input that will never arrive until the host force-kills it.
 
 ## 0.16.3
 

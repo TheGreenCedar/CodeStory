@@ -5790,6 +5790,59 @@ fn oversized_stdio_frame_returns_structured_protocol_error() {
     assert_success_envelope(&follow_up, json!("after-oversized"));
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_the_stdio_serve_loop_instead_of_killing_the_process() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "before-termination");
+
+    let pid = server.child.id();
+    let delivered = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(delivered.success(), "SIGTERM delivery failed for pid {pid}");
+
+    let signalled = Instant::now();
+    let deadline = signalled + Duration::from_secs(30);
+    let status = loop {
+        match server.child.try_wait().expect("poll stdio server") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                panic!("stdio server did not drain within 30s of SIGTERM");
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    // The drain is bounded, so the server stops on its own well inside the
+    // grace window a host allows between SIGTERM and SIGKILL.
+    let drained_in = signalled.elapsed();
+    assert!(
+        drained_in < Duration::from_secs(10),
+        "the terminating drain must be bounded, not open-ended: took {drained_in:?}"
+    );
+    // Exit code 0: the host asked the server to stop and it stopped after
+    // answering everything it owed. A completed shutdown must not look like a
+    // crash to a supervisor or to a restart policy.
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM should drain the serve loop and report a completed shutdown: {status:?}"
+    );
+    let mut trailing = String::new();
+    let bytes = server
+        .stdout
+        .read_line(&mut trailing)
+        .expect("read trailing stdout");
+    assert_eq!(
+        bytes, 0,
+        "no request was pending, so termination must emit nothing: {trailing}"
+    );
+}
+
 #[test]
 fn bad_tool_call_args_return_jsonrpc_error() {
     let fixture = indexed_fixture();
