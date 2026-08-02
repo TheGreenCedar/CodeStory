@@ -34,6 +34,7 @@ mod query;
 mod query_features;
 mod ranker;
 mod retention;
+mod rollback;
 mod scip_client;
 mod scip_index;
 mod sidecar;
@@ -156,6 +157,11 @@ pub use retention::{
     GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
     GenerationRetentionPlan, MarkerRetirement, ObservedRetentionLock, RETENTION_MARKER_SCHEMA_V1,
     RETENTION_MARKER_SCHEMA_V2, global_generation_gc_state_file,
+};
+pub use rollback::{
+    RetainedRollbackObservation, RollbackActivationError, RollbackActivationOutcome,
+    RollbackActivationRefusal, activate_retained_rollback_generation,
+    observe_retained_rollback_generation,
 };
 pub use scip_client::ScipClient;
 pub use sidecar::{

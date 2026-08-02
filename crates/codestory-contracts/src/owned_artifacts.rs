@@ -88,6 +88,11 @@ pub fn embedded_model_directory(cache_root: &Path, digest: &str) -> PathBuf {
     embedded_model_digest_root(cache_root).join(digest)
 }
 
+/// Directory the guided derived-cache reset moves quarantined derived state
+/// into, inside the cache root that holds the storage file. The reset moves
+/// rather than deletes, so the name is an owned identity like any other.
+pub const DERIVED_RESET_QUARANTINE_DIR: &str = "derived-reset-quarantine";
+
 fn cache_root_for(storage_path: &Path) -> &Path {
     storage_path
         .parent()
@@ -149,6 +154,11 @@ pub fn annotations_migration_backup_path(storage_path: &Path) -> PathBuf {
     cache_root_for(storage_path).join(ANNOTATIONS_MIGRATION_BACKUP_FILE)
 }
 
+/// The index-writer lock one storage file's indexing runs hold end to end.
+pub fn index_writer_lock_path(storage_path: &Path) -> PathBuf {
+    storage_path.with_extension(INDEX_WRITER_LOCK_EXTENSION)
+}
+
 /// Exact owned file identities beside one storage file: the database and its
 /// sidecars, the index-writer lock, promotion siblings, the rollback backup
 /// and its sidecars, the search directory locks, the local-refresh files, and
@@ -157,7 +167,7 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     let cache_root = cache_root_for(storage_path);
     let rollback_backup = storage_path.with_extension(ROLLBACK_BACKUP_EXTENSION);
     let mut files = sqlite_file_with_sidecars(storage_path);
-    files.push(storage_path.with_extension(INDEX_WRITER_LOCK_EXTENSION));
+    files.push(index_writer_lock_path(storage_path));
     files.extend(
         PROMOTION_SIBLING_SUFFIXES
             .iter()
@@ -177,6 +187,67 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
     )));
     files.push(annotations_migration_backup_path(storage_path));
     files
+}
+
+/// One promotion sibling path for a storage file.
+pub fn promotion_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
+    path_with_display_suffix(storage_path, suffix)
+}
+
+/// The annotations sidecar and its SQLite siblings in one cache root.
+///
+/// These hold user-authored state. Nothing that reclaims derived output may
+/// move or remove them, which is why they are named separately from the rest
+/// of the owned set rather than filtered at each call site.
+pub fn annotation_owned_file_identities(cache_root: &Path) -> Vec<PathBuf> {
+    sqlite_file_with_sidecars(&cache_root.join(ANNOTATIONS_SIDECAR_FILE))
+}
+
+/// Root the guided derived-cache reset quarantines into for one storage file.
+pub fn derived_reset_quarantine_root(storage_path: &Path) -> PathBuf {
+    cache_root_for(storage_path).join(DERIVED_RESET_QUARANTINE_DIR)
+}
+
+/// Exclusions the guided reset holds for the whole move, in acquisition order.
+///
+/// An indexing run holds the index-writer lock for its entire pass and takes
+/// the promotion lock inside it, so the reset must take them in the same order
+/// or the two paths can deadlock against each other. The promotion lock alone
+/// excludes only the publish critical section, which is a few milliseconds of
+/// a minutes-long index run — a reset that took only that lock would move the
+/// cache out from under a live indexer.
+pub fn derived_reset_held_lock_paths(storage_path: &Path) -> [PathBuf; 2] {
+    [
+        index_writer_lock_path(storage_path),
+        promotion_sibling_path(storage_path, PROMOTION_LOCK_SUFFIX),
+    ]
+}
+
+/// Derived file identities the guided reset quarantines.
+///
+/// This is every file identity the storage file owns, minus two exclusion
+/// families. The annotation sidecar family is user-owned state and is
+/// preserved in place. The locks in [`derived_reset_held_lock_paths`] are the
+/// exclusions the reset itself holds while it runs, and an empty coordination
+/// file carries no derived state, so moving one would only drop the exclusion
+/// a concurrent publisher or indexer is waiting on — or let a new indexer take
+/// a fresh lock file at the old path and start writing mid-reset.
+pub fn derived_reset_file_identities(storage_path: &Path) -> Vec<PathBuf> {
+    let preserved = annotation_owned_file_identities(cache_root_for(storage_path));
+    let held = derived_reset_held_lock_paths(storage_path);
+    storage_owned_file_identities(storage_path)
+        .into_iter()
+        .filter(|path| !held.contains(path) && !preserved.contains(path))
+        .collect()
+}
+
+/// Derived directory identities the guided reset quarantines: the search trees
+/// owned by one storage file.
+pub fn derived_reset_directory_identities(storage_path: &Path) -> Vec<PathBuf> {
+    SEARCH_DIRECTORY_SUFFIXES
+        .iter()
+        .map(|suffix| search_directory_for_storage(storage_path, suffix))
+        .collect()
 }
 
 /// Build the staged snapshot path for one live database and unique parts.
@@ -248,6 +319,66 @@ mod tests {
         expect("/cache/annotations.sqlite3");
         expect("/cache/annotations.sqlite3-shm");
         expect("/cache/annotations.pre-migration.json");
+    }
+
+    #[test]
+    fn derived_reset_quarantines_the_core_cache_and_preserves_annotations() {
+        let storage = Path::new("/cache/custom-core.db");
+        let derived = derived_reset_file_identities(storage);
+        let contains = |name: &str| derived.iter().any(|file| file == Path::new(name));
+
+        for annotation in annotation_owned_file_identities(Path::new("/cache")) {
+            assert!(
+                !derived.contains(&annotation),
+                "{} is user-owned annotation state and must never be quarantined",
+                annotation.display()
+            );
+        }
+        assert_eq!(
+            derived_reset_held_lock_paths(storage),
+            [
+                PathBuf::from("/cache/custom-core.index-writer.lock"),
+                PathBuf::from("/cache/custom-core.db.promotion.lock"),
+            ],
+            "the reset must exclude an indexing run, not only a publish, and must take the two locks in the order an indexer takes them"
+        );
+        for held in derived_reset_held_lock_paths(storage) {
+            assert!(
+                !derived.contains(&held),
+                "{} is the exclusion the reset holds; quarantining it would let a peer take a fresh lock at the live path mid-reset",
+                held.display()
+            );
+        }
+        for required in [
+            "/cache/custom-core.db",
+            "/cache/custom-core.db-wal",
+            "/cache/custom-core.db-shm",
+            "/cache/custom-core.db.promotion.prepared.json",
+            "/cache/custom-core.db.promotion.committed.json",
+            "/cache/custom-core.db.promotion.cleanup-blocked",
+            "/cache/custom-core.sqlite.backup",
+            "/cache/custom-core.search.lock",
+            "/cache/custom-core.search-generations.lock",
+            "/cache/local-refresh-status.json",
+            "/cache/local-refresh.lock",
+            "/cache/local-refresh-state.guard",
+        ] {
+            assert!(
+                contains(required),
+                "{required} must be quarantined by the reset"
+            );
+        }
+        assert_eq!(
+            derived_reset_directory_identities(storage),
+            vec![
+                PathBuf::from("/cache/custom-core.search"),
+                PathBuf::from("/cache/custom-core.search-generations"),
+            ]
+        );
+        assert_eq!(
+            derived_reset_quarantine_root(storage),
+            Path::new("/cache").join(DERIVED_RESET_QUARANTINE_DIR)
+        );
     }
 
     #[test]

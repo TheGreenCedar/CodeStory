@@ -110,6 +110,8 @@ pub(super) fn run_cache(cmd: CacheCommand) -> Result<()> {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
         CacheAction::Rehydrate(cmd) => run_cache_rehydrate(cmd),
         CacheAction::Clean(cmd) => run_cache_clean(cmd),
+
+        CacheAction::Reset(cmd) => crate::cache_reset::run_cache_reset(cmd),
     }
 }
 

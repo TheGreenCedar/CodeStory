@@ -1189,6 +1189,7 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         "annotations.pre-migration.json",
         "embedded-models",
         ".materialize.lock",
+        "derived-reset-quarantine",
     ];
     let producer_crates = [
         "crates/codestory-workspace/src",

@@ -37,7 +37,8 @@ pub(in crate::app) fn build_doctor_output(
     );
     let readiness_lanes =
         build_readiness_lanes_for_runtime(runtime, &readiness, None, Some(&readiness_sidecar));
-    let next_commands = readiness::compatibility_next_commands(&readiness);
+    let mut next_commands = readiness::compatibility_next_commands(&readiness);
+    let retained_rollback = observe_retained_rollback(runtime);
     let mut checks = Vec::new();
     checks.push(doctor_check(
         "project",
@@ -75,6 +76,14 @@ pub(in crate::app) fn build_doctor_output(
         )
     });
     checks.push(doctor_sidecar_check(&readiness_sidecar));
+    if let Some(check) = doctor_rollback_check(
+        &project,
+        &sidecar_retrieval,
+        retained_rollback.as_ref(),
+        &mut next_commands,
+    ) {
+        checks.push(check);
+    }
     if let Some(retrieval) = retrieval.as_ref()
         && retrieval.stored_embedding.is_some()
     {
@@ -119,6 +128,155 @@ pub(in crate::app) fn build_doctor_output(
         checks,
         next_commands,
         environment,
+    }
+}
+
+/// Observe the retained rollback pointer without mutating anything.
+///
+/// Doctor is an observational surface: a failure to read the pointer must
+/// leave doctor reporting everything else rather than failing the command, and
+/// the read itself goes through the strictly non-mutating observation entry
+/// point so inspecting a project can never migrate or recover it.
+fn observe_retained_rollback(
+    runtime: &RuntimeContext,
+) -> Option<codestory_retrieval::RetainedRollbackObservation> {
+    codestory_retrieval::observe_retained_rollback_generation(
+        &runtime.project_root,
+        &runtime.storage_path,
+        &runtime.sidecar,
+    )
+    .ok()
+    .flatten()
+}
+
+/// Report the rollback lever, and recommend it only when it could help.
+///
+/// Doctor stays read-only: this appends a command for the operator to run, it
+/// never activates anything. The recommendation is suppressed while retrieval
+/// is live-ready, because rolling a healthy generation back is a regression,
+/// not a repair.
+fn doctor_rollback_check(
+    project: &str,
+    sidecar_retrieval: &RetrievalStatusOutput,
+    retained: Option<&codestory_retrieval::RetainedRollbackObservation>,
+    next_commands: &mut Vec<String>,
+) -> Option<crate::args::DoctorCheckOutput> {
+    let retained = retained?;
+    let generation = retained.rollback_generation.as_deref()?;
+    if doctor_sidecar_status_is_live_ready(sidecar_retrieval) {
+        return Some(doctor_check(
+            "retrieval_rollback",
+            "ok",
+            format!(
+                "Retrieval is live-ready; verified rollback generation `{generation}` stays retained."
+            ),
+        ));
+    }
+    let command = format!("codestory-cli retrieval activate-rollback --project {project}");
+    let message = format!(
+        "Retrieval is not live-ready and verified rollback generation `{generation}` is retained. Validate it with `{command} --dry-run`, then run `{command}` to make it current."
+    );
+    if !next_commands.iter().any(|existing| existing == &command) {
+        next_commands.insert(0, command);
+    }
+    Some(doctor_check("retrieval_rollback", "warn", message))
+}
+
+#[cfg(test)]
+mod rollback_recommendation_tests {
+    use super::*;
+    use crate::app::diagnostics::sidecar::doctor_sidecar_status_from_report;
+
+    /// A real production status report, not a hand-built DTO: an absent
+    /// manifest is what a project with unusable retrieval actually renders.
+    fn unavailable_status() -> RetrievalStatusOutput {
+        let layout = codestory_retrieval::SidecarLayout::from_env();
+        doctor_sidecar_status_from_report(
+            codestory_retrieval::probe_sidecar_health(&layout, "doctor-rollback-fixture", None),
+            None,
+        )
+    }
+
+    fn live_ready_status() -> RetrievalStatusOutput {
+        let mut status = unavailable_status();
+        status.retrieval_mode = "full".into();
+        status.degraded_reason = None;
+        status
+    }
+
+    fn retained(generation: &str) -> codestory_retrieval::RetainedRollbackObservation {
+        codestory_retrieval::RetainedRollbackObservation {
+            project_id: "doctor-rollback-fixture".into(),
+            current_generation: Some("doctor-rollback-fixture-current".into()),
+            rollback_generation: Some(generation.into()),
+            rollback_verified_at_epoch_ms: 7,
+        }
+    }
+
+    #[test]
+    fn a_retained_rollback_is_recommended_when_retrieval_is_not_live_ready() {
+        let mut next_commands = vec!["codestory-cli index --project /repo --refresh full".into()];
+        let observed = retained("doctor-rollback-fixture-previous");
+
+        let check = doctor_rollback_check(
+            "/repo",
+            &unavailable_status(),
+            Some(&observed),
+            &mut next_commands,
+        )
+        .expect("a retained rollback must be reported");
+
+        assert_eq!(check.name, "retrieval_rollback");
+        assert_eq!(check.status, "warn");
+        assert!(
+            check.message.contains("doctor-rollback-fixture-previous"),
+            "the check must name the retained generation: {}",
+            check.message
+        );
+        assert_eq!(
+            next_commands.first().map(String::as_str),
+            Some("codestory-cli retrieval activate-rollback --project /repo"),
+            "the lever must be the first thing doctor tells the operator to run: {next_commands:?}"
+        );
+        assert_eq!(
+            next_commands.len(),
+            2,
+            "the existing repair guidance must survive: {next_commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_ready_retrieval_reports_the_rollback_without_recommending_it() {
+        let mut next_commands = vec!["codestory-cli ready --project /repo --goal agent".into()];
+        let observed = retained("doctor-rollback-fixture-previous");
+
+        let check = doctor_rollback_check(
+            "/repo",
+            &live_ready_status(),
+            Some(&observed),
+            &mut next_commands,
+        )
+        .expect("a retained rollback must still be reported");
+
+        assert_eq!(check.status, "ok");
+        assert_eq!(
+            next_commands,
+            vec!["codestory-cli ready --project /repo --goal agent".to_string()],
+            "rolling a healthy generation back is a regression, not a repair"
+        );
+    }
+
+    #[test]
+    fn no_retained_rollback_produces_no_check_and_no_recommendation() {
+        let mut next_commands = vec!["codestory-cli index --project /repo --refresh full".into()];
+
+        let check = doctor_rollback_check("/repo", &unavailable_status(), None, &mut next_commands);
+
+        assert!(check.is_none(), "there is no lever to report");
+        assert_eq!(
+            next_commands,
+            vec!["codestory-cli index --project /repo --refresh full".to_string()]
+        );
     }
 }
 

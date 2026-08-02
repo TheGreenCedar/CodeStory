@@ -8,7 +8,8 @@ use codestory_retrieval::{
 };
 
 use crate::args::{
-    CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalCommand,
+    CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction,
+    RetrievalActivateRollbackCommand, RetrievalActivateRollbackOutput, RetrievalCommand,
     RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
     RetrievalRepublishProjectionsCommand, RetrievalStatusCommand,
 };
@@ -24,7 +25,87 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
             run_retrieval_republish_projections(republish_cmd)
         }
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
+        RetrievalAction::ActivateRollback(activate_cmd) => {
+            run_retrieval_activate_rollback(activate_cmd)
+        }
     }
+}
+
+fn run_retrieval_activate_rollback(cmd: RetrievalActivateRollbackCommand) -> Result<()> {
+    preflight_output(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let outcome = codestory_retrieval::activate_retained_rollback_generation(
+        &runtime.project_root,
+        &runtime.storage_path,
+        &runtime.sidecar,
+        !cmd.dry_run,
+    )
+    .map_err(annotate_rollback_activation_error)?;
+    let project = crate::display::clean_path_string(&runtime.project_root.to_string_lossy());
+    let next_commands = rollback_activation_next_commands(&project, &outcome);
+    let markdown = render_rollback_activation_markdown(&project, &outcome, &next_commands);
+    let payload = RetrievalActivateRollbackOutput {
+        project,
+        outcome,
+        next_commands,
+    };
+    emit(cmd.format, &payload, markdown, cmd.output_file.as_deref())
+}
+
+/// Carry the typed refusal code into the CLI error chain.
+///
+/// The refusal is the product answer, not an internal failure, so the code has
+/// to survive into stderr and into any wrapping context a caller adds.
+fn annotate_rollback_activation_error(
+    error: codestory_retrieval::RollbackActivationError,
+) -> anyhow::Error {
+    let code = error.code();
+    anyhow::anyhow!("{error}").context(format!("retrieval activate-rollback refused: {code}"))
+}
+
+fn rollback_activation_next_commands(
+    project: &str,
+    outcome: &codestory_retrieval::RollbackActivationOutcome,
+) -> Vec<String> {
+    if outcome.applied {
+        return vec![
+            format!("codestory-cli doctor --project \"{project}\" --format markdown"),
+            format!("codestory-cli retrieval inventory --project \"{project}\" --apply"),
+        ];
+    }
+    vec![format!(
+        "codestory-cli retrieval activate-rollback --project \"{project}\""
+    )]
+}
+
+fn render_rollback_activation_markdown(
+    project: &str,
+    outcome: &codestory_retrieval::RollbackActivationOutcome,
+    next_commands: &[String],
+) -> String {
+    let mut markdown = format!(
+        "# Retrieval rollback activation\n\n- project: `{project}`\n- project_id: `{}`\n- applied: {}\n- previous_generation: `{}`\n- activated_generation: `{}`\n- activated_semantic_generation: `{}`\n- activated_retrieval_mode: `{}`\n- rollback_pointer_retained: {}\n",
+        outcome.project_id,
+        outcome.applied,
+        outcome
+            .previous_generation
+            .as_deref()
+            .unwrap_or("<missing>"),
+        outcome.activated_generation,
+        outcome.activated_semantic_generation,
+        outcome.activated_retrieval_mode,
+        outcome.rollback_pointer_retained,
+    );
+    if !outcome.applied {
+        markdown.push_str(
+            "\nValidation only: the current retrieval generation was not changed. Rerun without `--dry-run` to activate.\n",
+        );
+    }
+    markdown.push_str("\n## Next\n\n");
+    for command in next_commands {
+        markdown.push_str(&format!("- `{command}`\n"));
+    }
+    markdown
 }
 
 fn run_retrieval_republish_projections(cmd: RetrievalRepublishProjectionsCommand) -> Result<()> {

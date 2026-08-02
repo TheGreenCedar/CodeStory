@@ -999,6 +999,8 @@ pub(crate) fn api_error_in_chain(error: &anyhow::Error) -> Option<&ApiError> {
 fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow::Error {
     let message = if api_error_is_cache_busy(&error) {
         cache_busy_message(project)
+    } else if api_error_is_schema_too_new(&error) {
+        schema_too_new_message(&error, project)
     } else {
         let mut message = format!("{}: {}", error.code, error.message);
         if let Some((minimum_next, full_repair)) = api_error_repair_groups(&error) {
@@ -1062,6 +1064,32 @@ fn api_error_is_cache_busy(error: &ApiError) -> bool {
 fn is_cache_busy_text(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("database is locked") || text.contains("sqlite_busy")
+}
+
+fn api_error_is_schema_too_new(error: &ApiError) -> bool {
+    is_schema_too_new_text(&format!("{} {}", error.code, error.message))
+}
+
+fn is_schema_too_new_text(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("unsupported database schema version")
+}
+
+/// Name the executable downgrade path on a schema-too-new cache.
+///
+/// Migrations are forward-only, so an older CodeStory refuses a newer cache
+/// and the advertised `--refresh full` repair refuses it too. Without this the
+/// operator is told only that the cache is unsupported, with no in-band way
+/// out. The reset is a move, not a delete, and preserves annotations, so it is
+/// safe to recommend directly.
+fn schema_too_new_message(error: &ApiError, project: Option<&Path>) -> String {
+    let project = project
+        .map(quote_command_path)
+        .unwrap_or_else(|| "<repo>".to_string());
+    format!(
+        "{}: {}\n\nThis CodeStory build is older than the cache it was pointed at. Migrations are forward-only, so `--refresh full` refuses it too. Quarantine the derived cache (annotations are preserved, nothing is deleted) and rebuild:\n\nMinimum next:\n  codestory-cli cache reset --project {project} --derived-only --dry-run\n  codestory-cli cache reset --project {project} --derived-only --confirm\n  codestory-cli index --project {project} --refresh full\n\nAdditional checks:\n  codestory-cli doctor --project {project} --format markdown",
+        error.code, error.message
+    )
 }
 
 fn cache_busy_message(project: Option<&Path>) -> String {
@@ -1186,6 +1214,68 @@ mod tests {
             "codestory-cli ready --project {project} --goal agent"
         )));
         assert!(human.contains(&format!("codestory-cli doctor --project {project}")));
+    }
+
+    #[test]
+    fn a_schema_too_new_cache_names_the_derived_reset_recovery() {
+        // ARCH-020: migrations are forward-only, so an older CodeStory refuses
+        // a cache a newer release wrote, and the advertised `--refresh full`
+        // repair refuses it too. The operator was told the cache was
+        // unsupported and nothing else. This drives the real production path —
+        // a real store, its version stamped past what this build supports,
+        // opened through the same `RuntimeContext` every command uses — and
+        // pins that the executable recovery reaches the operator.
+        let _env_lock = crate::config::config_env_test_lock();
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::create_dir_all(&cache).expect("create cache");
+        fs::write(project.join("lib.rs"), "pub fn alpha() {}\n").expect("seed source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+        let seed = RuntimeContext::new_inspect_only(&args).expect("resolve runtime paths");
+        seed.ensure_open(RefreshMode::Full)
+            .expect("publish a cache this build supports");
+        let storage_path = seed.storage_path.clone();
+        drop(seed);
+
+        // Stamp the cache one version past whatever this build wrote, which is
+        // exactly the shape a rolled-back CLI meets in the field.
+        let stamp = rusqlite::Connection::open(&storage_path).expect("open cache for stamping");
+        let supported: i64 = stamp
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read the supported schema version");
+        assert!(supported > 0, "the seeded cache must record a version");
+        stamp
+            .pragma_update(None, "user_version", supported + 1)
+            .expect("stamp a newer schema version");
+        drop(stamp);
+
+        let runtime = RuntimeContext::new_inspect_only(&args).expect("resolve runtime paths");
+        let error = runtime
+            .open_project_summary()
+            .expect_err("a newer schema must fail closed");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Unsupported database schema version"),
+            "the fail-closed reason must survive into the CLI message: {rendered}"
+        );
+        assert!(
+            rendered.contains("cache reset"),
+            "a schema-too-new cache must name the derived reset: {rendered}"
+        );
+        assert!(
+            rendered.contains("--derived-only --confirm"),
+            "the recovery must be executable, not a hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("--refresh full"),
+            "the recovery must name the reindex step that follows: {rendered}"
+        );
     }
 
     #[test]
