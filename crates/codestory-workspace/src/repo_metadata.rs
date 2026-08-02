@@ -699,10 +699,10 @@ fn change_from_index_worktree(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct MetadataRoots {
-    root: PathBuf,
-    git_dir: PathBuf,
-    common_dir: PathBuf,
+pub(crate) struct MetadataRoots {
+    pub(crate) root: PathBuf,
+    pub(crate) git_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
     git_dir_pointer: Option<MetadataPointer>,
     common_dir_pointer: Option<MetadataPointer>,
     local_configs: Vec<MetadataConfigFile>,
@@ -821,7 +821,7 @@ fn configured_origin_url(config: &gix::config::File) -> Option<String> {
 }
 
 impl MetadataRoots {
-    fn resolve(project_root: &Path) -> Result<Self> {
+    pub(crate) fn resolve(project_root: &Path) -> Result<Self> {
         let root = canonical_existing(project_root)
             .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
         let dot_git = root.join(".git");
@@ -988,6 +988,26 @@ impl MetadataRoots {
         Ok(())
     }
 
+    pub(crate) fn validate_hook_metadata(&self) -> Result<()> {
+        if let Some(pointer) = &self.git_dir_pointer {
+            pointer.validate()?;
+        }
+        if let Some(pointer) = &self.common_dir_pointer {
+            pointer.validate()?;
+        }
+        for config in &self.local_configs {
+            config.validate()?;
+        }
+        self.validate_configured_worktree()
+    }
+
+    pub(crate) fn captured_local_config(&self, path: &Path) -> Option<Option<&[u8]>> {
+        self.local_configs
+            .iter()
+            .find(|config| config.path == path)
+            .map(|config| config.expected_contents.as_deref())
+    }
+
     fn validate_redirects(&self) -> Result<MetadataBoundarySnapshot> {
         if let Some(pointer) = &self.git_dir_pointer {
             pointer.validate()?;
@@ -1139,7 +1159,7 @@ fn open_metadata_file_no_follow(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
 }
 

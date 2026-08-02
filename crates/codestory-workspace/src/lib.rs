@@ -30,6 +30,7 @@ pub mod atomic_file;
 pub mod owned_deletion;
 pub mod paths;
 mod repo_metadata;
+mod repository_hooks;
 mod repository_identity;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
@@ -40,6 +41,10 @@ pub use repo_metadata::{
 pub use repo_metadata::{
     with_repository_metadata_observation_limit_for_test,
     with_repository_metadata_tree_traversal_count_for_test,
+};
+pub use repository_hooks::{
+    RepositoryHookAction, RepositoryHookReport, RepositoryHookRequest, RepositoryHookTargetReport,
+    manage_repository_hooks,
 };
 pub use repository_identity::{
     LogicalProjectIdentityV3, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV3,

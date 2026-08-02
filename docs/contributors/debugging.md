@@ -246,14 +246,19 @@ checkout, merge, or rewrite operations. Install them only when you want that
 repo-level signal:
 
 ```sh
-node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir>
-node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
 ```
+
+The installed plugin may omit `--cli` after one successful runtime launch has
+published a checksummed CLI receipt in its plugin-data directory. A source
+checkout should pass its explicit development CLI. `status` only uses those
+existing seams; it never provisions or downloads a CLI.
 
 Uninstall is safe and removes only CodeStory-managed hook blocks:
 
 ```sh
-node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir> --cli <absolute-codestory-cli-path>
 ```
 
 `foreign_hook_present` means existing hook content was preserved.
