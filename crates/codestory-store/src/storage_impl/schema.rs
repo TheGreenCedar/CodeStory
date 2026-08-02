@@ -143,6 +143,9 @@ const TABLE_STATEMENTS: &[&str] = &[
         coverage_reason TEXT,
         FOREIGN KEY(file_id) REFERENCES file(id)
     )",
+    // Retained for one release behind the schema-31 writer barrier. The
+    // annotations sidecar owns user annotations; these tables receive no writes
+    // after the cutover and are dropped in the next release.
     "CREATE TABLE IF NOT EXISTS bookmark_category (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL
@@ -380,6 +383,11 @@ const TABLE_STATEMENTS: &[&str] = &[
         precise_semantic_import_revision TEXT,
         precise_semantic_import_producer TEXT,
         rollback_record_json TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS annotation_sidecar_cutover (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        sidecar_schema_version INTEGER NOT NULL CHECK(sidecar_schema_version > 0),
+        cutover_at_epoch_ms INTEGER NOT NULL CHECK(cutover_at_epoch_ms >= 0)
     )",
 ];
 
@@ -700,6 +708,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v30_semantic_projection_publication_mode(&storage.conn)?;
     if stored_version < 30 {
         storage.set_schema_version(30)?;
+    }
+    migrate_v31_annotation_sidecar_cutover(&storage.conn)?;
+    if stored_version < 31 {
+        storage.set_schema_version(31)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -1228,6 +1240,37 @@ pub(super) fn migrate_v30_semantic_projection_publication_mode(
     )?;
     tx.execute("DROP TABLE index_publication_v29", [])?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Stamp the annotation-sidecar cutover, which is the schema-31 writer barrier.
+///
+/// The barrier is the whole point of the bump: forward-only migration already
+/// refuses a newer schema, so a 0.16.3 writer that opens this database fails
+/// closed on the database as a whole instead of silently writing the retained
+/// legacy `bookmark_category`/`bookmark_node` tables and forking annotation
+/// truth away from the sidecar. The marker row is what status and doctor read
+/// to report which side owns annotations.
+pub(super) fn migrate_v31_annotation_sidecar_cutover(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS annotation_sidecar_cutover (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            sidecar_schema_version INTEGER NOT NULL CHECK(sidecar_schema_version > 0),
+            cutover_at_epoch_ms INTEGER NOT NULL CHECK(cutover_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO annotation_sidecar_cutover (id, sidecar_schema_version, cutover_at_epoch_ms)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            crate::annotations::ANNOTATION_SCHEMA_VERSION,
+            current_epoch_ms()
+        ],
+    )?;
     Ok(())
 }
 

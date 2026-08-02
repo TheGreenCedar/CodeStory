@@ -36,13 +36,16 @@ mod row_mapping;
 mod schema;
 mod trail;
 
+use crate::annotations::{
+    AnnotationCategory, CoreAnchorCandidate, LegacyAnnotationSnapshot, LegacyBookmarkRow,
+};
 use crate::sqlite_path;
 use helpers::{
     decode_embedding_blob, deserialize_candidate_targets, encode_embedding_blob,
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 30;
+const SCHEMA_VERSION: u32 = 31;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -107,18 +110,22 @@ const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
 const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
-const PROMOTION_JOURNAL_VERSION: u32 = 5;
+const SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION: u32 = 5;
+const PROMOTION_JOURNAL_VERSION: u32 = 6;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
 // identity at schema 28. Journal v4 binds the structural-unit source-policy
 // identity added at schema 29. Journal v5 admits the semantic-projection
-// publication mode added at schema 30. Recovery runs before schema migration, so these
+// publication mode added at schema 30. Journal v6 admits the annotation-sidecar
+// cutover at schema 31, which moves user annotations out of the promoted
+// database entirely. Recovery runs before schema migration, so these
 // boundaries are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
 const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
+const ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION: u32 = 31;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -478,6 +485,32 @@ fn uniform_optional_u32_with_count(
     uniform_optional_u32(min_value, max_value)
 }
 
+/// Selective anchor projection shared by every annotation lookup.
+///
+/// `callable_projection_state` carries the only normalized-signature evidence
+/// core owns today, and it is joined rather than scanned so a rebind probe
+/// stays a keyed lookup.
+const ANNOTATION_ANCHOR_SELECT: &str = "SELECT n.id, n.canonical_id, f.path, n.qualified_name,
+            n.kind, cps.signature_hash, n.start_line
+     FROM node n
+     LEFT JOIN file f ON f.id = n.file_node_id
+     LEFT JOIN callable_projection_state cps ON cps.node_id = n.id";
+
+fn annotation_anchor_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CoreAnchorCandidate, StorageError> {
+    let signature_hash: Option<i64> = row.get(5)?;
+    Ok(CoreAnchorCandidate {
+        node_id: row.get(0)?,
+        canonical_id: row.get(1)?,
+        file_identity: row.get(2)?,
+        qualified_name: row.get(3)?,
+        kind: row.get(4)?,
+        normalized_signature: signature_hash.map(|hash| hash.to_string()),
+        start_line: row.get(6)?,
+    })
+}
+
 fn current_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -551,9 +584,14 @@ impl RecoveryDatabaseContract {
             Self::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION) => {
                 (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
                     ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                    ..=ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
                     .contains(&schema_version)
             }
             Self::Journal(_) => false,
@@ -1102,6 +1140,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
             | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
+            | SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -4072,6 +4111,36 @@ impl Storage {
         )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
+    }
+
+    /// Count retained legacy annotation rows without migrating or recovering.
+    ///
+    /// The cutover has to know whether a core-replacing operation would destroy
+    /// user annotations, and it has to know it on any schema old enough to
+    /// still own them, so this read accepts whatever schema is on disk and
+    /// treats absent tables as zero.
+    pub fn database_legacy_annotation_count(path: &Path) -> Result<u64, StorageError> {
+        let conn = Connection::open_with_flags(
+            sqlite_path::open_path(path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut total = 0_i64;
+        for table in ["bookmark_category", "bookmark_node"] {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                continue;
+            }
+            total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+        Ok(total.max(0) as u64)
     }
 
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
@@ -11714,7 +11783,160 @@ impl Storage {
     }
 
     // ========================================================================
-    // Bookmark Management
+    // Annotation anchors (sidecar-owned user state)
+    // ========================================================================
+
+    /// Cutover marker stamped by the schema-31 writer barrier.
+    ///
+    /// `Some` means annotations are owned by the sidecar and the core
+    /// `bookmark_category`/`bookmark_node` tables are retained-only.
+    pub fn annotation_sidecar_cutover(&self) -> Result<Option<(u32, i64)>, StorageError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sidecar_schema_version, cutover_at_epoch_ms
+                 FROM annotation_sidecar_cutover WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(version, at)| (version.max(0) as u32, at)))
+    }
+
+    /// Read the retained core annotation tables as sidecar-shaped rows.
+    ///
+    /// This is the only remaining core annotation read: the cutover imports it
+    /// once, and afterwards the sidecar is the sole source of truth.
+    pub fn legacy_annotation_snapshot(&self) -> Result<LegacyAnnotationSnapshot, StorageError> {
+        let categories = bookmarks::get_bookmark_categories(&self.conn)?
+            .into_iter()
+            .map(|category| AnnotationCategory {
+                id: category.id,
+                name: category.name,
+            })
+            .collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.category_id, b.comment, n.canonical_id, f.path, n.qualified_name,
+                    n.kind, cps.signature_hash, n.start_line
+             FROM bookmark_node b
+             LEFT JOIN node n ON n.id = b.node_id
+             LEFT JOIN file f ON f.id = n.file_node_id
+             LEFT JOIN callable_projection_state cps ON cps.node_id = n.id
+             ORDER BY b.id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut bookmarks = Vec::new();
+        while let Some(row) = rows.next()? {
+            let signature_hash: Option<i64> = row.get(7)?;
+            bookmarks.push(LegacyBookmarkRow {
+                id: row.get(0)?,
+                category_id: row.get(1)?,
+                comment: row.get(2)?,
+                canonical_id: row.get(3)?,
+                file_identity: row.get(4)?,
+                qualified_name: row.get(5)?,
+                kind: row.get(6)?,
+                normalized_signature: signature_hash.map(|hash| hash.to_string()),
+                start_line: row.get(8)?,
+            });
+        }
+        Ok(LegacyAnnotationSnapshot {
+            categories,
+            bookmarks,
+        })
+    }
+
+    /// Anchor evidence for one node, used when an annotation is created.
+    pub fn annotation_anchor_for_node(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<CoreAnchorCandidate>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.id = ?1"))?;
+        let mut rows = stmt.query(params![node_id.0])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(annotation_anchor_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every anchor candidate carrying one durable canonical symbol id.
+    pub fn annotation_anchors_by_canonical_id(
+        &self,
+        canonical_id: &str,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!("{ANNOTATION_ANCHOR_SELECT} WHERE n.canonical_id = ?1 ORDER BY n.id ASC"),
+            params![canonical_id],
+        )
+    }
+
+    /// Every anchor candidate matching the complete legacy anchor tuple.
+    pub fn annotation_anchors_by_anchor_tuple(
+        &self,
+        file_identity: &str,
+        qualified_name: &str,
+        kind: i64,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        self.annotation_anchors(
+            &format!(
+                "{ANNOTATION_ANCHOR_SELECT}
+                 WHERE f.path = ?1 AND n.qualified_name = ?2 AND n.kind = ?3
+                 ORDER BY n.id ASC"
+            ),
+            params![file_identity, qualified_name, kind],
+        )
+    }
+
+    /// Every anchor candidate carrying one normalized signature.
+    ///
+    /// The lookup is selective on `callable_projection_state`, so a rename or
+    /// move probe never scans the workspace graph.
+    pub fn annotation_anchors_by_normalized_signature(
+        &self,
+        normalized_signature: &str,
+        file_identity: Option<&str>,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        let Ok(signature_hash) = normalized_signature.parse::<i64>() else {
+            return Ok(Vec::new());
+        };
+        match file_identity {
+            Some(file_identity) => self.annotation_anchors(
+                &format!(
+                    "{ANNOTATION_ANCHOR_SELECT}
+                     WHERE cps.signature_hash = ?1 AND f.path = ?2
+                     ORDER BY n.id ASC"
+                ),
+                params![signature_hash, file_identity],
+            ),
+            None => self.annotation_anchors(
+                &format!(
+                    "{ANNOTATION_ANCHOR_SELECT}
+                     WHERE cps.signature_hash = ?1
+                     ORDER BY n.id ASC"
+                ),
+                params![signature_hash],
+            ),
+        }
+    }
+
+    fn annotation_anchors(
+        &self,
+        query: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<CoreAnchorCandidate>, StorageError> {
+        let mut stmt = self.conn.prepare(query)?;
+        let mut rows = stmt.query(params)?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            candidates.push(annotation_anchor_from_row(row)?);
+        }
+        Ok(candidates)
+    }
+
+    // ========================================================================
+    // Bookmark Management (retained legacy tables; sidecar owns annotations)
     // ========================================================================
 
     /// Create a bookmark category
@@ -11750,11 +11972,6 @@ impl Storage {
     /// Get bookmarks, optionally filtered by category
     pub fn get_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<Bookmark>, StorageError> {
         bookmarks::get_bookmarks(&self.conn, category_id)
-    }
-
-    /// Update a bookmark's comment
-    pub fn update_bookmark_comment(&self, id: i64, comment: &str) -> Result<(), StorageError> {
-        bookmarks::update_bookmark_comment(&self.conn, id, comment)
     }
 
     /// Update bookmark fields.

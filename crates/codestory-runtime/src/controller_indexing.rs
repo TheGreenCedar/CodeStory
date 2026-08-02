@@ -455,6 +455,14 @@ impl AppController {
             }
         };
 
+        // A refresh can install a database that never carried the legacy
+        // annotation tables, so annotations move to the sidecar before the run
+        // starts rather than after it publishes.
+        if let Err(error) = self.ensure_annotations_owned_before_core_replacement() {
+            self.state.lock().is_indexing = false;
+            return Err(error);
+        }
+
         let result = match mode {
             IndexMode::Full => index_full_for_runtime(
                 &root,
@@ -570,6 +578,16 @@ impl AppController {
             cache_stats.semantic_stats = summary.staged_semantic_stats;
         }
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
+        // The publication that just replaced core projections is the mutating
+        // trigger for annotations: rebinding here keeps recorded anchor
+        // evidence one generation behind the live core, which is exactly the
+        // window the conservative rebind gate accepts.
+        if let Err(error) = self.rebind_annotations_after_core_publication() {
+            tracing::warn!(
+                error = %error.message,
+                "Annotation rebinding failed after core publication; annotations stay at their last recorded binding"
+            );
+        }
         Ok(summary.phase_timings)
     }
 

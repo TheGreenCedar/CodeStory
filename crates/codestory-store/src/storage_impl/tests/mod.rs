@@ -8452,7 +8452,7 @@ fn test_bookmark_crud() -> Result<(), StorageError> {
     assert_eq!(bookmarks[0].comment, Some("Important function".to_string()));
 
     // Update comment
-    storage.update_bookmark_comment(bm_id, "Updated comment")?;
+    storage.update_bookmark(bm_id, None, Some(Some("Updated comment")))?;
     let bookmarks = storage.get_bookmarks(Some(cat_id))?;
     assert_eq!(bookmarks[0].comment, Some("Updated comment".to_string()));
 
@@ -9962,6 +9962,150 @@ fn node_ids_with_child_symbols_runs_one_statement_per_bind_limit_chunk() -> Resu
         prepares.load(AtomicOrdering::Relaxed),
         3,
         "five candidates at a bind limit of two must run exactly three statements"
+    );
+    Ok(())
+}
+
+fn seed_annotation_anchor(
+    storage: &mut Storage,
+    node_id: i64,
+    path: &str,
+    qualified_name: &str,
+    signature_hash: i64,
+) -> Result<(), StorageError> {
+    let file_node_id = node_id - 1;
+    storage.insert_file(&FileInfo {
+        id: file_node_id,
+        path: PathBuf::from(path),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 10,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_node(&Node {
+        id: NodeId(file_node_id),
+        kind: NodeKind::FILE,
+        serialized_name: path.to_string(),
+        ..Default::default()
+    })?;
+    storage.insert_node(&Node {
+        id: NodeId(node_id),
+        kind: NodeKind::FUNCTION,
+        serialized_name: qualified_name.to_string(),
+        qualified_name: Some(qualified_name.to_string()),
+        file_node_id: Some(NodeId(file_node_id)),
+        start_line: Some(7),
+        end_line: Some(9),
+        ..Default::default()
+    })?;
+    storage.upsert_callable_projection_states(&[CallableProjectionState {
+        file_id: file_node_id,
+        symbol_key: qualified_name.to_string(),
+        node_id: NodeId(node_id),
+        signature_hash,
+        body_hash: 1,
+        start_line: 7,
+        end_line: 9,
+    }])?;
+    Ok(())
+}
+
+#[test]
+fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Result<(), StorageError>
+{
+    // The schema bump is the writer barrier: forward-only migration already
+    // refuses a newer schema, so an older CLI fails closed on the whole
+    // database instead of writing the retained legacy annotation tables.
+    let storage = Storage::new_in_memory()?;
+
+    assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+    let (sidecar_version, cutover_at) = storage
+        .annotation_sidecar_cutover()?
+        .expect("a current-schema database is stamped with the cutover marker");
+    assert_eq!(
+        sidecar_version,
+        crate::annotations::ANNOTATION_SCHEMA_VERSION
+    );
+    assert!(cutover_at >= 0);
+
+    storage.set_schema_version(CURRENT_SCHEMA_VERSION + 1)?;
+    let error = storage
+        .apply_schema_migrations()
+        .expect_err("a newer schema must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported database schema version"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pre_cutover_database_migrates_its_legacy_annotation_rows_intact() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", 4242)?;
+    let category_id = storage.create_bookmark_category("Favorites")?;
+    let _ = storage.add_bookmark(category_id, NodeId(100), Some("keep"))?;
+
+    // A schema-30 database re-migrating must find the same legacy rows.
+    storage.set_schema_version(30)?;
+    storage.apply_schema_migrations()?;
+
+    let snapshot = storage.legacy_annotation_snapshot()?;
+    assert_eq!(snapshot.categories.len(), 1);
+    assert_eq!(snapshot.bookmarks.len(), 1);
+    let bookmark = &snapshot.bookmarks[0];
+    assert_eq!(bookmark.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(bookmark.qualified_name.as_deref(), Some("alpha"));
+    assert_eq!(bookmark.kind, Some(NodeKind::FUNCTION as i64));
+    assert_eq!(bookmark.normalized_signature.as_deref(), Some("4242"));
+    assert_eq!(bookmark.comment.as_deref(), Some("keep"));
+    assert!(storage.annotation_sidecar_cutover()?.is_some());
+    Ok(())
+}
+
+#[test]
+fn annotation_anchor_lookups_stay_selective_and_report_ambiguity() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    seed_annotation_anchor(&mut storage, 100, "/repo/src/lib.rs", "alpha", 4242)?;
+    seed_annotation_anchor(&mut storage, 200, "/repo/src/other.rs", "alpha", 4242)?;
+
+    let anchor = storage
+        .annotation_anchor_for_node(NodeId(100))?
+        .expect("anchor for node");
+    assert_eq!(anchor.file_identity.as_deref(), Some("/repo/src/lib.rs"));
+    assert_eq!(anchor.normalized_signature.as_deref(), Some("4242"));
+
+    let unique = storage.annotation_anchors_by_anchor_tuple(
+        "/repo/src/lib.rs",
+        "alpha",
+        NodeKind::FUNCTION as i64,
+    )?;
+    assert_eq!(unique.len(), 1);
+    assert_eq!(unique[0].node_id, 100);
+
+    let scoped =
+        storage.annotation_anchors_by_normalized_signature("4242", Some("/repo/src/other.rs"))?;
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].node_id, 200);
+
+    let ambiguous = storage.annotation_anchors_by_normalized_signature("4242", None)?;
+    assert_eq!(
+        ambiguous
+            .iter()
+            .map(|anchor| anchor.node_id)
+            .collect::<Vec<_>>(),
+        vec![100, 200],
+        "an ambiguous signature must surface every candidate rather than pick one"
+    );
+
+    assert!(
+        storage
+            .annotation_anchors_by_normalized_signature("not-a-hash", None)?
+            .is_empty()
     );
     Ok(())
 }

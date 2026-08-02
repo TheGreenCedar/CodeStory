@@ -134,6 +134,19 @@
   or an editor that has stopped reading replies — is told the server is
   stopping and left there. It then exits reporting a clean shutdown, instead of
   waiting for input that will never arrive until the host force-kills it.
+- Bookmarks and bookmark categories are no longer destroyed by ordinary editing.
+  They used to live in the same database that indexing rebuilds and replaces, so
+  a refresh, a cleanup, or a reset could take them with it. They now live in
+  their own file beside the cache, and each one remembers the symbol it points
+  at rather than a row number — so it survives edits that move the code down the
+  file, a full re-index, a cache reset, and the symbol disappearing and coming
+  back. A bookmark whose target was renamed or moved is only followed when the
+  evidence is unambiguous; anything less leaves it visible and yours, labelled
+  with why it could not be followed, until you relink or delete it. Copying a
+  project to another machine or volume no longer silently adopts someone else's
+  bookmarks — export and import them explicitly. Opening this release's cache
+  with 0.16.3 now refuses the whole database instead of quietly writing
+  bookmarks the new release will not read.
 
 ## 0.16.3
 

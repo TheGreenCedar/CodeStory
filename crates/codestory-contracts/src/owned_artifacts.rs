@@ -52,6 +52,10 @@ pub const LOCAL_REFRESH_STATE_GUARD_FILE: &str = "local-refresh-state.guard";
 /// sidecar cutover so discovery excludes it from the first write.
 pub const ANNOTATIONS_SIDECAR_FILE: &str = "annotations.sqlite3";
 
+/// Retained pre-migration export of the core annotation tables, written once
+/// by the sidecar cutover and kept for the documented downgrade path.
+pub const ANNOTATIONS_MIGRATION_BACKUP_FILE: &str = "annotations.pre-migration.json";
+
 /// Fixed file names CodeStory owns inside the cache root that holds the
 /// storage file, independent of the storage file's own name.
 pub const CACHE_ROOT_OWNED_FILE_NAMES: [&str; 3] = [
@@ -107,6 +111,20 @@ pub fn search_directory_for_storage(storage_path: &Path, suffix: &str) -> PathBu
     cache_root_for(storage_path).join(format!("{}.{suffix}", storage_stem(storage_path)))
 }
 
+/// Annotations sidecar beside one storage file.
+///
+/// The sidecar sits in the cache root next to the storage file but outside the
+/// core promotion fence, so its name is derived from the cache root rather than
+/// from the storage stem.
+pub fn annotations_sidecar_path(storage_path: &Path) -> PathBuf {
+    cache_root_for(storage_path).join(ANNOTATIONS_SIDECAR_FILE)
+}
+
+/// Retained pre-migration annotation export beside one storage file.
+pub fn annotations_migration_backup_path(storage_path: &Path) -> PathBuf {
+    cache_root_for(storage_path).join(ANNOTATIONS_MIGRATION_BACKUP_FILE)
+}
+
 /// Exact owned file identities beside one storage file: the database and its
 /// sidecars, the index-writer lock, promotion siblings, the rollback backup
 /// and its sidecars, the search directory locks, the local-refresh files, and
@@ -130,9 +148,10 @@ pub fn storage_owned_file_identities(storage_path: &Path) -> Vec<PathBuf> {
             .iter()
             .map(|name| cache_root.join(name)),
     );
-    files.extend(sqlite_file_with_sidecars(
-        &cache_root.join(ANNOTATIONS_SIDECAR_FILE),
-    ));
+    files.extend(sqlite_file_with_sidecars(&annotations_sidecar_path(
+        storage_path,
+    )));
+    files.push(annotations_migration_backup_path(storage_path));
     files
 }
 
@@ -204,6 +223,7 @@ mod tests {
         expect("/cache/local-refresh-state.guard");
         expect("/cache/annotations.sqlite3");
         expect("/cache/annotations.sqlite3-shm");
+        expect("/cache/annotations.pre-migration.json");
     }
 
     #[test]

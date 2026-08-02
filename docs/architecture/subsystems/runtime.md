@@ -27,6 +27,7 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: packet, retrieval-primary, planning, and evidence workflows
+- `src/controller_bookmarks.rs`: annotation CRUD against the store's sidecar
 
 ## Publication contract
 

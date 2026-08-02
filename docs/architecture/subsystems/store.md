@@ -6,7 +6,10 @@ recovery.
 
 ## Durable state
 
-- file, node, edge, occurrence, component, callable, bookmark, and trail rows;
+- file, node, edge, occurrence, component, callable, and trail rows;
+- retained legacy `bookmark_category`/`bookmark_node` tables, read-only for one
+  release behind the schema-31 writer barrier; the annotations sidecar owns
+  user annotations;
 - grounding snapshots and canonical paged search-symbol reads from the node
   table; the legacy materialized search projection remains compatibility-only;
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
@@ -80,10 +83,55 @@ rollback record in the same SQLite row. They change in one transaction. The
 filesystem retention marker is derived after commit and can only make cleanup
 more conservative; it is not a publication authority.
 
+## Annotations sidecar
+
+User annotations are not core state. They live in `annotations.sqlite3` beside
+the core database, outside the promotion fence, with their own WAL connection,
+busy timeout, foreign keys, and explicit schema-version row. Schema v1 owns
+`bookmark_category(id, name UNIQUE)` and
+`bookmark(uuid PK, category_id FK CASCADE, canonical_id, file_identity,
+qualified_name, kind, normalized_signature, start_line, comment,
+resolution_status, orphan_reason, last_known_evidence, created_at, updated_at)`,
+plus an idempotent migration journal and the native-root location registry.
+
+The sidecar is created and migrated only by an annotation write or by an
+operation that can replace core projections. Project-open, status, and doctor
+paths open it observationally and never materialize it. Before the cutover the
+retained core `bookmark_category`/`bookmark_node` tables are the source of
+truth; after it the sidecar is. There is no instant at which both are, and no
+dual write.
+
+Resolution is recomputed from the anchor on every read. Re-resolving an
+unchanged anchor — an exact canonical id, or the exact
+`(file_identity, qualified_name, kind)` tuple — is an identity lookup, so a
+position-shifting edit or a rebuilt projection simply finds the symbol again.
+Rebinding a *changed* anchor — a rename or a move — is an inference and requires
+an adjacent core generation, agreeing normalized-signature evidence, and a
+unique candidate. Ambiguity never guesses: the annotation becomes a visible,
+user-owned orphan carrying `orphan_reason` and its last known evidence until an
+explicit relink or delete.
+
+The migration is paired with the schema-31 core writer barrier. Forward-only
+migration already refuses a newer schema, so a 0.16.3 CLI opening a migrated
+database fails closed on the whole database instead of silently writing the
+retained legacy tables and forking annotation truth.
+
+**Downgrade path.** Export annotations first
+(`AppController::export_annotations`, written to the retained
+`annotations.pre-migration.json` shape), then run EV-9's guided derived-cache
+reset to drop the schema-31 core. The exported file is re-importable with
+`AppController::import_annotations`. The same export/import pair is the only
+supported way to move annotations onto a clone or a cross-volume copy: the
+native-root location registry binds a same-filesystem move by filesystem
+identity and fails closed on any other root.
+
 ## Entry points
 
 - `src/storage_impl/mod.rs`: schema lifecycle, reads/writes, publication journal,
   recovery, and staged promotion
+- `src/annotations/mod.rs`: the versioned annotation sidecar, its journaled
+  cutover, and the native-root location registry
+- `src/annotations/resolution.rs`: the conservative rebind ladder
 - `src/snapshot_store.rs`: staged and live grounding snapshots
 - `src/file_store.rs`: focused file persistence
 - `src/storage_impl/trail.rs`: trail queries

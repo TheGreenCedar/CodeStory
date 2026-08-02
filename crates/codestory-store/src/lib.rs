@@ -6,12 +6,20 @@
 //! read-heavy grounding views. The store layer persists evidence; it does not
 //! upgrade structural source proof into parser-backed graph evidence.
 
+mod annotations;
 mod file_store;
 mod projection_store;
 mod snapshot_store;
 mod sqlite_path;
 mod storage_impl;
 
+pub use annotations::{
+    ANNOTATION_SCHEMA_VERSION, AnnotationBookmark, AnnotationCategory, AnnotationError,
+    AnnotationExport, AnnotationExportBookmark, AnnotationExportCategory, AnnotationResolution,
+    AnnotationStore, BookmarkAnchorEvidence, BookmarkAnchorInput, CoreAnchorCandidate,
+    CoreAnchorIndex, LegacyAnnotationSnapshot, LegacyBookmarkRow, NativeRootBinding, OrphanReason,
+    ResolutionStatus, resolve_bookmark,
+};
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
