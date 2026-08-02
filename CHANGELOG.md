@@ -109,6 +109,21 @@
   bare filename was only recognised for three languages. Every language
   CodeStory supports is now recognised, and only a genuine mid-word capital or
   qualifier marks a query as a symbol.
+- One failed request no longer takes the whole editor session down with it. A
+  request that crashed inside CodeStory ended the server, so every project the
+  session had open went with it and the next question got no answer at all. The
+  crash is now contained to the request that caused it: it comes back as a
+  stated failure, the project it was working on is thrown away and rebuilt
+  before anything reads from it again, and the other projects keep answering.
+- A client that sends requests faster than CodeStory can answer them is told so
+  instead of growing the queue without limit. Work waiting to run is capped at
+  32 requests and 8 MiB, and anything past that is refused with a message that
+  names the limit it hit. A cancelled request also leaves the queue right away
+  instead of sitting there holding its place until its turn came.
+- Asking CodeStory to shut down now ends it predictably. It stops taking new
+  work, finishes the request it is already running and answers it, tells every
+  request still waiting that the server is stopping, and exits — instead of
+  waiting for input that will never arrive until the host force-kills it.
 
 ## 0.16.3
 

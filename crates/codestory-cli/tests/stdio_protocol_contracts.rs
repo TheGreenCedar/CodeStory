@@ -5790,6 +5790,47 @@ fn oversized_stdio_frame_returns_structured_protocol_error() {
     assert_success_envelope(&follow_up, json!("after-oversized"));
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_the_stdio_serve_loop_instead_of_killing_the_process() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "before-termination");
+
+    let pid = server.child.id();
+    let delivered = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(delivered.success(), "SIGTERM delivery failed for pid {pid}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match server.child.try_wait().expect("poll stdio server") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                panic!("stdio server did not drain within 30s of SIGTERM");
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    assert!(
+        status.success(),
+        "SIGTERM should drain the serve loop, not terminate the process: {status:?}"
+    );
+    let mut trailing = String::new();
+    let bytes = server
+        .stdout
+        .read_line(&mut trailing)
+        .expect("read trailing stdout");
+    assert_eq!(
+        bytes, 0,
+        "no request was pending, so termination must emit nothing: {trailing}"
+    );
+}
+
 #[test]
 fn bad_tool_call_args_return_jsonrpc_error() {
     let fixture = indexed_fixture();

@@ -29,7 +29,9 @@ fs4 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `signal` lets the stdio serve loop drain on SIGTERM instead of relying on a
+# stdin EOF the host may never send.
+tokio = { workspace = true, features = ["signal"] }
 toml = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }
