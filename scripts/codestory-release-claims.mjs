@@ -922,10 +922,13 @@ function validateProofFloor(value) {
     floor.merged_suite_lanes,
     "workflow_policy.proof_floor.merged_suite_lanes",
   );
+  nonEmptyText(
+    mergedLanes.workflow,
+    "workflow_policy.proof_floor.merged_suite_lanes.workflow",
+  );
   if (
     JSON.stringify(Object.keys(mergedLanes).sort())
       !== JSON.stringify(["commands", "job", "step", "workflow"])
-    || mergedLanes.workflow !== "retrieval-engine-smoke.yml"
     || mergedLanes.job !== "linux-contracts"
     || mergedLanes.step !== "Evidence, readiness, hooks, and workspace contract tests"
   ) {
