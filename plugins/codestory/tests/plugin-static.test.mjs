@@ -21,9 +21,6 @@ const devCliContract = require(join(pluginRoot, "scripts", "codestory-dev-cli-co
 const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
   dirtyMarkerPathForProject,
-  dirtyHookStatus,
-  installDirtyHooks,
-  uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
@@ -1148,59 +1145,21 @@ test("dirty marker writer stores one project-keyed marker under plugin data", as
   }
 });
 
-test("dirty marker hook manager installs idempotently and preserves foreign hook content", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-data-"));
-  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-project-"));
-
-  try {
-    await mkdir(join(projectRoot, ".git", "hooks"), { recursive: true });
-    const postMerge = join(projectRoot, ".git", "hooks", "post-merge");
-    await writeFile(postMerge, "#!/bin/sh\necho foreign\n", "utf8");
-
-    const before = dirtyHookStatus(projectRoot, { pluginDataDir: dataDir });
-    assert.equal(before.status, "foreign_hook_present");
-
-    const installed = installDirtyHooks(projectRoot, { pluginDataDir: dataDir });
-    assert.equal(installed.status, "installed");
-    assert.equal(installed.hooks.every((hook) => hook.state === "installed"), true);
-    assert.equal(installed.hooks.every((hook) => hook.changed === true), true);
-    const firstPostMerge = await readFile(postMerge, "utf8");
-    assert.match(firstPostMerge, /echo foreign/u);
-    assert.match(firstPostMerge, /codestory dirty marker/u);
-
-    const repeated = installDirtyHooks(projectRoot, { pluginDataDir: dataDir });
-    assert.equal(repeated.status, "installed");
-    assert.equal(repeated.hooks.every((hook) => hook.changed === false), true);
-    assert.equal(await readFile(postMerge, "utf8"), firstPostMerge);
-
-    const uninstalled = uninstallDirtyHooks(projectRoot, { pluginDataDir: dataDir });
-    assert.equal(uninstalled.status, "foreign_hook_present");
-    assert.equal(await readFile(postMerge, "utf8"), "#!/bin/sh\necho foreign\n");
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("dirty marker hook command reports uninstall-required stale managed blocks", async () => {
+test("dirty marker hook manager delegates install and status to an explicit CLI", async () => {
+  if (process.platform === "win32") return;
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-cli-data-"));
   const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-cli-project-"));
   const script = join(pluginRoot, "hooks", "codestory-dirty-hook.cjs");
+  const fakeCli = join(dataDir, "fake-cli");
+  const observedArgs = join(dataDir, "hook-args.json");
 
   try {
-    await mkdir(join(projectRoot, ".git", "hooks"), { recursive: true });
-    const hookPath = join(projectRoot, ".git", "hooks", "post-checkout");
     await writeFile(
-      hookPath,
-      [
-        "#!/bin/sh",
-        "# >>> codestory dirty marker >>>",
-        "node old-script.cjs mark --project old --plugin-data old || true",
-        "# <<< codestory dirty marker <<<",
-        "",
-      ].join("\n"),
+      fakeCli,
+      `#!${process.execPath}\nrequire('fs').writeFileSync(process.env.HOOK_ARGS, JSON.stringify(process.argv.slice(2))); process.stdout.write(JSON.stringify({schema_version:1,status:'installed',hooks:[]}));\n`,
       "utf8",
     );
+    await chmod(fakeCli, 0o755);
 
     const install = spawnSync(process.execPath, [
       script,
@@ -1209,22 +1168,29 @@ test("dirty marker hook command reports uninstall-required stale managed blocks"
       projectRoot,
       "--plugin-data",
       dataDir,
-    ], { encoding: "utf8" });
+      "--cli",
+      fakeCli,
+    ], { encoding: "utf8", env: { ...process.env, HOOK_ARGS: observedArgs } });
     assert.equal(install.status, 0, install.stderr);
-    const installed = JSON.parse(install.stdout);
-    assert.equal(installed.status, "uninstall_required");
-    assert.equal(installed.hooks.find((hook) => hook.hook === "post-checkout").state, "uninstall_required");
+    assert.equal(JSON.parse(install.stdout).status, "installed");
+    const delegated = JSON.parse(await readFile(observedArgs, "utf8"));
+    assert.deepEqual(delegated.slice(0, 2), ["internal-dirty-hook", "install"]);
+    assert.equal(delegated[delegated.indexOf("--project") + 1], projectRoot);
+    assert.equal(delegated[delegated.indexOf("--plugin-data") + 1], dataDir);
+    assert.equal(delegated[delegated.indexOf("--node") + 1], process.execPath);
+    assert.equal(delegated[delegated.indexOf("--script") + 1], await realpath(script));
+    await assert.rejects(access(join(projectRoot, ".git")));
 
-    const uninstall = spawnSync(process.execPath, [
+    const status = spawnSync(process.execPath, [
       script,
-      "uninstall",
+      "status",
       "--project",
       projectRoot,
       "--plugin-data",
       dataDir,
-    ], { encoding: "utf8" });
-    assert.equal(uninstall.status, 0, uninstall.stderr);
-    assert.equal(JSON.parse(uninstall.stdout).status, "not_installed");
+    ], { encoding: "utf8", env: { ...process.env, CODESTORY_CLI: "", CODESTORY_PLUGIN_CLI_PATH: "" } });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).status, "cli_unavailable");
 
     const mark = spawnSync(process.execPath, [
       script,
@@ -1245,6 +1211,77 @@ test("dirty marker hook command reports uninstall-required stale managed blocks"
     await rm(dataDir, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test("dirty hook status accepts only a checksummed runtime receipt and never provisions", async () => {
+  if (process.platform === "win32") return;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-receipt-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-receipt-project-"));
+  const script = join(pluginRoot, "hooks", "codestory-dirty-hook.cjs");
+  const fakeCli = join(dataDir, "fake-cli");
+  const sentinel = join(dataDir, "ran");
+  try {
+    await writeFile(
+      fakeCli,
+      `#!${process.execPath}\nrequire('fs').writeFileSync(process.env.HOOK_SENTINEL, 'ran'); process.stdout.write(JSON.stringify({schema_version:1,status:'not_installed',hooks:[]}));\n`,
+      "utf8",
+    );
+    await chmod(fakeCli, 0o755);
+    const digest = createHash("sha256").update(await readFile(fakeCli)).digest("hex");
+    const receipt = join(dataDir, ".codestory-mcp-runtime.json");
+    await writeFile(receipt, JSON.stringify({ path: fakeCli, sha256: digest }), "utf8");
+
+    const verified = spawnSync(process.execPath, [
+      script,
+      "status",
+      "--project",
+      projectRoot,
+      "--plugin-data",
+      dataDir,
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, CODESTORY_CLI: "", CODESTORY_PLUGIN_CLI_PATH: "", HOOK_SENTINEL: sentinel },
+    });
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.equal(JSON.parse(verified.stdout).status, "not_installed");
+    await access(sentinel);
+
+    await rm(sentinel, { force: true });
+    await writeFile(receipt, JSON.stringify({ path: fakeCli, sha256: "0".repeat(64) }), "utf8");
+    const rejected = spawnSync(process.execPath, [
+      script,
+      "status",
+      "--project",
+      projectRoot,
+      "--plugin-data",
+      dataDir,
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, CODESTORY_CLI: "", CODESTORY_PLUGIN_CLI_PATH: "", HOOK_SENTINEL: sentinel },
+    });
+    assert.equal(rejected.status, 0, rejected.stderr);
+    assert.equal(JSON.parse(rejected.stdout).status, "cli_unavailable");
+    await assert.rejects(access(sentinel));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("production hook code neither duplicates Git config nor spawns Git", async () => {
+  const javascriptSources = await Promise.all([
+    readFile(join(pluginRoot, "hooks", "codestory-dirty-hook.cjs"), "utf8"),
+    readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8"),
+  ]);
+  for (const source of javascriptSources) {
+    assert.doesNotMatch(source, /hooksPath|gitDirForProject|spawnSync\(['"]git['"]/u);
+  }
+  const rustSource = await readFile(
+    join(repoRoot, "crates", "codestory-workspace", "src", "repository_hooks.rs"),
+    "utf8",
+  );
+  const productionRust = rustSource.split("#[cfg(test)]\nmod tests")[0];
+  assert.equal(productionRust.includes(`Command::new("git"`), false);
 });
 
 test("mcp launcher prefers a checksummed explicit package without PATH", async () => {

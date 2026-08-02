@@ -121,6 +121,8 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-dirty-hook", hide = true)]
+    InternalDirtyHook(InternalDirtyHookCommand),
     #[command(name = "internal-embedding-server", hide = true)]
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
@@ -133,6 +135,27 @@ pub(crate) struct InternalOwnedDeleteCommand {
     pub(crate) root: PathBuf,
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub(crate) relative: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InternalDirtyHookAction {
+    Install,
+    Uninstall,
+    Status,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalDirtyHookCommand {
+    #[arg(value_enum)]
+    pub(crate) action: InternalDirtyHookAction,
+    #[arg(long, value_name = "REPOSITORY")]
+    pub(crate) project: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    pub(crate) plugin_data: PathBuf,
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub(crate) node: PathBuf,
+    #[arg(long, value_name = "SCRIPT")]
+    pub(crate) script: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -2571,7 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_server_entrypoint_is_parsable_but_hidden() {
+    fn internal_entrypoints_are_parsable_but_hidden() {
         let parsed = Cli::try_parse_from(["codestory-cli", "internal-embedding-server"])
             .expect("hidden embedding server entrypoint should parse");
         assert!(matches!(parsed.command, Command::InternalEmbeddingServer));
@@ -2598,6 +2621,36 @@ mod tests {
         assert!(
             !help.contains("internal-embedding-qualification-worker"),
             "internal qualification worker leaked into public help: {help}"
+        );
+
+        let dirty_hook = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-dirty-hook",
+            "install",
+            "--project",
+            "/tmp/project",
+            "--plugin-data",
+            "/tmp/plugin-data",
+            "--node",
+            "/usr/bin/node",
+            "--script",
+            "/tmp/codestory-dirty-hook.cjs",
+        ])
+        .expect("hidden dirty-hook adapter should parse");
+        let Command::InternalDirtyHook(dirty_hook) = dirty_hook.command else {
+            panic!("expected internal dirty-hook command");
+        };
+        assert_eq!(dirty_hook.action, InternalDirtyHookAction::Install);
+        assert_eq!(dirty_hook.project, PathBuf::from("/tmp/project"));
+        assert_eq!(dirty_hook.plugin_data, PathBuf::from("/tmp/plugin-data"));
+        assert_eq!(dirty_hook.node, PathBuf::from("/usr/bin/node"));
+        assert_eq!(
+            dirty_hook.script,
+            PathBuf::from("/tmp/codestory-dirty-hook.cjs")
+        );
+        assert!(
+            !help.contains("internal-dirty-hook"),
+            "internal dirty-hook adapter leaked into public help: {help}"
         );
     }
 

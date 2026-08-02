@@ -1,5 +1,6 @@
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,8 @@ const STAGING_LOCK: &str = ".codestory-native-staging.lock";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn run() -> ExitCode {
-    match prepare_runtime().and_then(execute_runtime) {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match prepare_runtime(&args).and_then(execute_runtime) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("codestory-cli: native runtime activation failed: {error}");
@@ -25,7 +27,7 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-fn prepare_runtime() -> io::Result<PathBuf> {
+fn prepare_runtime(args: &[OsString]) -> io::Result<PathBuf> {
     let launcher = std::env::current_exe()?;
     let root = launcher.parent().ok_or_else(|| {
         io::Error::new(
@@ -33,7 +35,25 @@ fn prepare_runtime() -> io::Result<PathBuf> {
             format!("launcher has no parent directory: {}", launcher.display()),
         )
     })?;
+    prepare_runtime_for_args_at(root, args)
+}
+
+fn prepare_runtime_for_args_at(root: &Path, args: &[OsString]) -> io::Result<PathBuf> {
+    if is_observational_hook_status(args) {
+        return pinned_current_runtime(root)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "hook status requires an already-published native runtime generation",
+            )
+        });
+    }
     prepare_runtime_at(root)
+}
+
+fn is_observational_hook_status(args: &[OsString]) -> bool {
+    args.first()
+        .is_some_and(|arg| arg == OsStr::new("internal-dirty-hook"))
+        && args.get(1).is_some_and(|arg| arg == OsStr::new("status"))
 }
 
 fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
@@ -560,10 +580,11 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
 mod tests {
     use super::{
         NATIVE_RUNTIME_CURRENT_FILE, NATIVE_RUNTIME_EXECUTABLE, NATIVE_RUNTIME_FILE_LIST,
-        NATIVE_RUNTIME_GENERATIONS_DIR, NATIVE_RUNTIME_SEEDS_DIR, final_generation_id,
-        job_step_error, native_seed_id, prepare_runtime_at, raw_exit_evidence, seed_id_from_bytes,
+        NATIVE_RUNTIME_GENERATIONS_DIR, NATIVE_RUNTIME_SEEDS_DIR, STAGING_LOCK,
+        final_generation_id, job_step_error, native_seed_id, prepare_runtime_at,
+        prepare_runtime_for_args_at, raw_exit_evidence, seed_id_from_bytes,
     };
-    use std::fs;
+    use std::{ffi::OsString, fs};
 
     const SEED: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -646,6 +667,32 @@ mod tests {
             "the failing step survives into the rendered failure"
         );
         assert_eq!(error.kind(), kind, "the classification is preserved");
+    }
+
+    #[test]
+    fn hook_status_does_not_stage_a_build_tree_runtime() {
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let root = temp.path();
+        fs::write(root.join(NATIVE_RUNTIME_EXECUTABLE), b"build-tree launcher")
+            .expect("build-tree candidate");
+        let args = [
+            OsString::from("internal-dirty-hook"),
+            OsString::from("status"),
+        ];
+
+        let error = prepare_runtime_for_args_at(root, &args)
+            .expect_err("status must not stage an unpublished build-tree candidate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!root.join(STAGING_LOCK).exists(), "no staging lock created");
+        assert!(
+            !root.join(NATIVE_RUNTIME_GENERATIONS_DIR).exists(),
+            "no generation directory created"
+        );
+        assert!(
+            !root.join(NATIVE_RUNTIME_CURRENT_FILE).exists(),
+            "no current-generation pointer created"
+        );
     }
 
     #[test]
@@ -881,8 +928,10 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
 #[cfg(test)]
 mod installed_layout_tests {
     use super::tests::install_fixture;
-    use super::{NATIVE_RUNTIME_EXECUTABLE, STAGING_LOCK, prepare_runtime_at};
-    use std::fs;
+    use super::{
+        NATIVE_RUNTIME_EXECUTABLE, STAGING_LOCK, prepare_runtime_at, prepare_runtime_for_args_at,
+    };
+    use std::{ffi::OsString, fs};
 
     #[test]
     fn an_installed_generation_activates_without_taking_the_staging_lock() {
@@ -900,6 +949,30 @@ mod installed_layout_tests {
         assert!(
             !root.join(STAGING_LOCK).exists(),
             "an installed activation must not create the staging lock"
+        );
+    }
+
+    #[test]
+    fn hook_status_uses_the_published_generation_without_staging_the_candidate() {
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let root = temp.path();
+        install_fixture(root);
+        fs::remove_file(root.join(STAGING_LOCK)).expect("clear the lock left by staging");
+        let args = [
+            OsString::from("internal-dirty-hook"),
+            OsString::from("status"),
+        ];
+
+        let runtime = prepare_runtime_for_args_at(root, &args).expect("published hook runtime");
+
+        assert!(runtime.is_file());
+        assert!(
+            root.join(NATIVE_RUNTIME_EXECUTABLE).is_file(),
+            "the build-tree candidate remains available but unused"
+        );
+        assert!(
+            !root.join(STAGING_LOCK).exists(),
+            "observational status never creates the staging lock"
         );
     }
 
