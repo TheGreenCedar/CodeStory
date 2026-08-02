@@ -10201,5 +10201,379 @@ fn annotation_uniqueness_probes_never_read_more_rows_than_the_decision_needs()
         2,
         "a crowded name must not stream the whole workspace into the rebind ladder"
     );
+
+    Ok(())
+}
+
+/// Seed one promotion-ready database whose structural evidence spans several
+/// files, each with several units, one projection, and one bound cache row.
+fn seed_structural_promotion_corpus(path: &Path, generation: i64) -> Result<(), StorageError> {
+    const FILE_COUNT: i64 = 4;
+    const UNITS_PER_FILE: i64 = 3;
+
+    let mut storage = Storage::open(path)?;
+    let mut files = Vec::new();
+    let mut file_content_hashes = Vec::new();
+    let mut nodes = Vec::new();
+    let mut units = Vec::new();
+    let mut projections = Vec::new();
+    for index in 0..FILE_COUNT {
+        let file_id = generation * 100 + index + 1;
+        let source_hash = format!("{file_id:064x}");
+        files.push(FileInfo {
+            id: file_id,
+            path: PathBuf::from(format!("src/module_{file_id}.rs")),
+            language: "rust".to_string(),
+            modification_time: file_id,
+            indexed: true,
+            complete: true,
+            line_count: 64,
+            file_role: FileRole::Source,
+        });
+        file_content_hashes.push(FileContentHash {
+            file_id,
+            content_hash: source_hash.clone(),
+        });
+        let first_unit = units.len();
+        for offset in 0..UNITS_PER_FILE {
+            let node_id = file_id * 10 + offset;
+            nodes.push(Node {
+                id: NodeId(node_id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("module_{file_id}::f{offset}"),
+                ..Default::default()
+            });
+            units.push(structural_unit_fixture(node_id, file_id, &source_hash));
+        }
+        projections.push(StructuralTextProjection {
+            file_id,
+            source_content_hash: source_hash,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "fixture".to_string(),
+            language: "rust".to_string(),
+            file_role: FileRole::Source,
+            unit_count: UNITS_PER_FILE as u64,
+            unit_digest: structural_text_unit_digest(&units[first_unit..]),
+        });
+    }
+    let cache_writes = files
+        .iter()
+        .map(|file| StructuralTextArtifactCacheWrite {
+            path: &file.path,
+            file_id: file.id,
+            cache_key: "v1:fixture",
+            artifact_blob: b"verified structural artifact",
+        })
+        .collect::<Vec<_>>();
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &file_content_hashes,
+        nodes: &nodes,
+        structural_text_units: &units,
+        structural_text_projections: &projections,
+        structural_text_cache_writes: &cache_writes,
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    })?;
+    let publication = IndexPublicationRecord {
+        generation: generation.max(0) as u64,
+        generation_id: format!("generation-{generation}"),
+        run_id: format!("run-{generation}"),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: generation.max(0),
+    };
+    storage.put_index_publication(&publication)?;
+    storage.publish_structural_text_unit_generation(&publication)?;
+    storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "test-project",
+        "test-workspace",
+        source_policy_identity(
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        ),
+        &[],
+    )?;
+    storage.finalize_staged_snapshot()
+}
+
+#[test]
+fn structural_content_scan_reproduces_the_separate_summaries_and_per_file_digests()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-equivalence");
+    seed_structural_promotion_corpus(&path, 7)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+
+    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(conn)?;
+    let (projection_count, projection_digest, projection_versions) =
+        structural_text_projection_content_summary(conn)?;
+    validate_structural_text_projection_rows(conn)?;
+
+    let scan = scan_structural_text_content(conn)?;
+
+    assert_eq!(scan.unit_count, unit_count);
+    assert_eq!(scan.unit_digest, unit_digest);
+    assert_eq!(scan.unit_versions, unit_versions);
+    assert_eq!(scan.projection_count, projection_count);
+    assert_eq!(scan.projection_digest, projection_digest);
+    assert_eq!(scan.projection_versions, projection_versions);
+    assert_eq!(scan.unit_count, 12, "the fixture publishes twelve units");
+    assert_eq!(
+        scan.projection_count, 4,
+        "the fixture publishes four projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_a_projection_that_no_longer_owns_its_units()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("structural-content-scan-lost-unit");
+    seed_structural_promotion_corpus(&path, 8)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let (file_id, node_id) = conn.query_row(
+        "SELECT file_id, node_id FROM structural_text_unit ORDER BY node_id ASC LIMIT 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_unit WHERE node_id = ?1",
+        params![node_id],
+    )?;
+
+    let error = scan_structural_text_content(conn)
+        .expect_err("a projection that lost a unit must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        format!("Other error: structural text projection {file_id} does not match its unit set"),
+        "the merged scan must report the same defect the separate pass reported"
+    );
+    assert_eq!(
+        validate_structural_text_projection_rows(conn)
+            .expect_err("the separate pass agrees")
+            .to_string(),
+        error.to_string()
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn structural_content_scan_rejects_units_without_an_owning_projection() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("structural-content-scan-orphan-units");
+    seed_structural_promotion_corpus(&path, 9)?;
+    let storage = Storage::open(&path)?;
+    let conn = storage.get_connection();
+    let file_id = conn.query_row(
+        "SELECT file_id FROM structural_text_projection ORDER BY file_id ASC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "DELETE FROM structural_text_projection WHERE file_id = ?1",
+        params![file_id],
+    )?;
+
+    let error = scan_structural_text_content(conn).expect_err("orphaned units must not validate");
+
+    assert_eq!(
+        error.to_string(),
+        "Other error: structural text units exist without owning projections"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_covers_content_and_ignores_only_sqlite_bookkeeping()
+-> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promotion-image-source");
+    let live_path = unique_temp_db_path("promotion-image-destination");
+    seed_structural_promotion_corpus(&staged_path, 11)?;
+    seed_structural_promotion_corpus(&live_path, 12)?;
+
+    let staged_image = promotion_database_image(&staged_path)?.expect("staged image is provable");
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("live image is provable"),
+        staged_image,
+        "two different databases must not share an image"
+    );
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_ne!(
+        fs::read(&staged_path).expect("read staged bytes"),
+        fs::read(&live_path).expect("read live bytes"),
+        "a restore leaves SQLite's own header counters different, which is why \
+         the image masks exactly those slots"
+    );
+    assert_eq!(
+        promotion_database_image(&live_path)?.expect("restored image is provable"),
+        staged_image,
+        "a faithful page-level restore carries the candidate's content"
+    );
+
+    let restored = fs::read(&live_path).expect("read live bytes");
+    let reimage = |mutate: &dyn Fn(&mut Vec<u8>)| -> Result<PromotionDatabaseImage, StorageError> {
+        let mut bytes = restored.clone();
+        mutate(&mut bytes);
+        fs::write(&live_path, &bytes).expect("write mutated live bytes");
+        Ok(promotion_database_image(&live_path)?.expect("mutated image is provable"))
+    };
+
+    // Only the three bookkeeping slots are outside the image.
+    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
+        assert_eq!(
+            reimage(&|bytes| bytes[start..end].iter_mut().for_each(|byte| *byte ^= 0xff))?,
+            staged_image,
+            "header slot {start}..{end} is SQLite bookkeeping, not content"
+        );
+    }
+    // Every other header byte is content: the page size, the text encoding, the
+    // freelist head, the user version and the application id all participate.
+    for offset in [16, 28, 32, 44, 56, 60, 68, 96] {
+        assert_ne!(
+            reimage(&|bytes| bytes[offset] ^= 0xff)?,
+            staged_image,
+            "header byte {offset} must participate in the image"
+        );
+    }
+    // And so does one byte of page content well past the header.
+    let content_offset = restored.len() / 2;
+    assert_ne!(
+        reimage(&|bytes| bytes[content_offset] ^= 0xff)?,
+        staged_image,
+        "byte drift in the pages must break the image"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
+    Ok(())
+}
+
+#[test]
+fn promotion_database_image_is_unprovable_when_content_sits_outside_the_main_file()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("promotion-image-hot-sidecar");
+    seed_structural_promotion_corpus(&path, 13)?;
+    let sealed = promotion_database_image(&path)?.expect("sealed image is provable");
+
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = sqlite_sidecar_path(&path, suffix);
+        fs::write(&sidecar, b"pending frames").expect("stage a hot sidecar");
+        assert_eq!(
+            promotion_database_image(&path)?,
+            None,
+            "{suffix} content outside the main file must leave the image unprovable"
+        );
+        fs::remove_file(&sidecar).expect("remove the hot sidecar");
+    }
+    assert_eq!(
+        promotion_database_image(&path)?,
+        Some(sealed),
+        "removing the sidecars restores the same image"
+    );
+
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
+fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), StorageError> {
+    let staged_path = unique_temp_db_path("promoted-receipt-staged");
+    let live_path = unique_temp_db_path("promoted-receipt-live");
+    seed_structural_promotion_corpus(&staged_path, 21)?;
+    seed_structural_promotion_corpus(&live_path, 22)?;
+
+    let candidate =
+        require_complete_promotion_database_identity(&staged_path, "Staged promotion candidate")?;
+    let candidate_source_policy =
+        read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
+    let candidate_structural_text =
+        read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
+    let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
+
+    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
+    live_conn.restore(
+        MAIN_DB,
+        sqlite_path::open_path(&staged_path),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live_conn);
+
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            Some(candidate_image),
+        )?,
+        PromotedValidation::ReusedCandidateReceipt,
+        "a restore proven byte-identical to the validated candidate reuses its receipt"
+    );
+    assert_eq!(
+        validate_promoted_live_database(
+            &live_path,
+            &staged_path,
+            &candidate,
+            &candidate_source_policy,
+            &candidate_structural_text,
+            None,
+        )?,
+        PromotedValidation::Revalidated,
+        "without a candidate image the promoted copy is validated in full"
+    );
+
+    // In-place corruption after the restore leaves the publication identity
+    // untouched, so only the deep validation can catch it. The receipt must not
+    // be reusable here.
+    corrupt_test_structural_cache(&live_path, "blob")?;
+    assert_ne!(
+        promotion_database_image(&live_path)?.expect("corrupted image"),
+        candidate_image,
+        "in-place corruption must break the seal"
+    );
+    let error = validate_promoted_live_database(
+        &live_path,
+        &staged_path,
+        &candidate,
+        &candidate_source_policy,
+        &candidate_structural_text,
+        Some(candidate_image),
+    )
+    .expect_err("a corrupted restore must fail the post-restore fence");
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("structural artifact cache"),
+        "unexpected fence error: {error}"
+    );
+
+    cleanup_sqlite_sidecars(&staged_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
     Ok(())
 }
