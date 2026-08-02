@@ -50,6 +50,56 @@ pub struct CorePromotionTimings {
     pub rollback_backup_bytes: Option<u64>,
 }
 
+/// Why an incremental refresh did or did not skip its staged republication.
+///
+/// Every variant except `ShortCircuited` means the staged clone/publish/search
+/// pipeline ran, so the probe cost is pure overhead for that run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum IncrementalPlanProbeOutcomeDto {
+    /// The refresh plan was empty and every derived surface was already published.
+    ShortCircuited,
+    /// Discovery scheduled files to index or remove.
+    PlanNotEmpty,
+    /// Discovery did not complete, so the staged pipeline owns the verdict.
+    InventoryIncomplete,
+    /// Verified oversized-source exclusions drifted from the published set.
+    PolicyExclusionsChanged,
+    /// The published exclusion manifest does not validate against the current
+    /// source-index policy identity, so readers refuse it until it is rewritten.
+    SourcePolicyPublicationStale,
+    /// The published core carries a stored coverage gap the staged refresh owns.
+    StoredCoverageGap,
+    /// The published core has no complete dense-anchor manifest to reuse.
+    DenseAnchorManifestMissing,
+    /// The dense-anchor manifest exists but fails its strict publication
+    /// validation (row count, digest, per-row source identity, or policy).
+    DenseAnchorPublicationStale,
+    /// Stored semantic documents were built under a previous contract and owe a repair.
+    SemanticDocContractDrift,
+    /// The published core has no completed lexical search generation to reuse.
+    SearchGenerationIncomplete,
+    /// The probe could not read the published core, so nothing is established.
+    ProbeUnavailable,
+}
+
+/// Work an incremental refresh avoided by proving its plan was empty.
+///
+/// `live_database_file_bytes` is the on-disk size of the published core
+/// database file (not its SQLite logical image, and not including WAL). The
+/// skipped-copy counters are zero on every run that proceeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct IncrementalPlanProbeTimings {
+    pub outcome: IncrementalPlanProbeOutcomeDto,
+    pub probe_ms: u32,
+    pub files_to_index: u32,
+    pub files_to_remove: u32,
+    pub live_database_file_bytes: u64,
+    pub skipped_database_copies: u32,
+    pub skipped_database_copy_bytes: u64,
+    pub skipped_search_state_rebuild: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactCachePolicyDto {
@@ -253,6 +303,8 @@ pub struct IndexingPhaseTimings {
     pub staged_snapshot_copy: Option<DatabaseSnapshotCopyTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_promotion: Option<CorePromotionTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_plan_probe: Option<IncrementalPlanProbeTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_existing_projection_ids_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,6 +516,7 @@ mod tests {
             staged_sqlite_sync_ms: None,
             staged_snapshot_copy: None,
             core_promotion: None,
+            incremental_plan_probe: None,
             setup_existing_projection_ids_ms: None,
             setup_seed_symbol_table_ms: None,
             flush_files_ms: None,
@@ -817,5 +870,91 @@ mod tests {
             serde_json::from_value(value).expect("deserialize timings");
         assert_eq!(decoded.staged_snapshot_copy, Some(snapshot_copy));
         assert_eq!(decoded.core_promotion, Some(core_promotion));
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_incremental_plan_probe() {
+        let probe = IncrementalPlanProbeTimings {
+            outcome: IncrementalPlanProbeOutcomeDto::ShortCircuited,
+            probe_ms: 7,
+            files_to_index: 0,
+            files_to_remove: 0,
+            live_database_file_bytes: 4_096,
+            skipped_database_copies: 3,
+            skipped_database_copy_bytes: 12_288,
+            skipped_search_state_rebuild: true,
+        };
+        let timings = IndexingPhaseTimings {
+            incremental_plan_probe: Some(probe.clone()),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(
+            value["incremental_plan_probe"]["outcome"],
+            "short_circuited"
+        );
+        assert_eq!(
+            value["incremental_plan_probe"]["skipped_database_copy_bytes"],
+            12_288
+        );
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.incremental_plan_probe, Some(probe));
+    }
+
+    #[test]
+    fn test_incremental_plan_probe_outcomes_are_stable_snake_case_wire_values() {
+        for (outcome, wire) in [
+            (
+                IncrementalPlanProbeOutcomeDto::ShortCircuited,
+                "short_circuited",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
+                "plan_not_empty",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::InventoryIncomplete,
+                "inventory_incomplete",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::PolicyExclusionsChanged,
+                "policy_exclusions_changed",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::SourcePolicyPublicationStale,
+                "source_policy_publication_stale",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::StoredCoverageGap,
+                "stored_coverage_gap",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+                "dense_anchor_manifest_missing",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+                "dense_anchor_publication_stale",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
+                "semantic_doc_contract_drift",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete,
+                "search_generation_incomplete",
+            ),
+            (
+                IncrementalPlanProbeOutcomeDto::ProbeUnavailable,
+                "probe_unavailable",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(outcome).expect("serialize probe outcome"),
+                serde_json::Value::String(wire.to_string())
+            );
+        }
     }
 }

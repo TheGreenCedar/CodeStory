@@ -1,9 +1,10 @@
+use crate::index_incremental::{INCREMENTAL_PUBLICATION_DATABASE_COPIES, IncrementalPlanProbe};
 use crate::semantic_projection::{SearchStateBuildResult, SemanticProjectionStats};
 use crate::{clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32};
 use codestory_contracts::api::{
     ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
-    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IndexingPhaseTimings,
-    ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
+    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalPlanProbeTimings,
+    IndexingPhaseTimings, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
 };
 use codestory_indexer::{ArtifactCacheFamilyStats, ArtifactCachePolicy, IncrementalIndexingStats};
 #[cfg(test)]
@@ -19,6 +20,32 @@ pub(super) struct IndexingRunSummary {
     #[cfg(test)]
     pub(super) publication: IndexPublicationRecord,
     pub(super) prepared_search_state: Option<SearchStateBuildResult>,
+    /// The run proved the published core already satisfied the request and
+    /// wrote nothing, so no runtime cache rebuild or republication is owed.
+    pub(super) unchanged_publication: bool,
+}
+
+pub(super) fn incremental_plan_probe_timings(
+    probe: &IncrementalPlanProbe,
+) -> IncrementalPlanProbeTimings {
+    let short_circuited = probe.short_circuited();
+    let skipped_database_copies = if short_circuited {
+        INCREMENTAL_PUBLICATION_DATABASE_COPIES
+    } else {
+        0
+    };
+    IncrementalPlanProbeTimings {
+        outcome: probe.outcome,
+        probe_ms: probe.probe_ms,
+        files_to_index: probe.files_to_index,
+        files_to_remove: probe.files_to_remove,
+        live_database_file_bytes: probe.live_database_file_bytes,
+        skipped_database_copies,
+        skipped_database_copy_bytes: probe
+            .live_database_file_bytes
+            .saturating_mul(u64::from(skipped_database_copies)),
+        skipped_search_state_rebuild: short_circuited,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

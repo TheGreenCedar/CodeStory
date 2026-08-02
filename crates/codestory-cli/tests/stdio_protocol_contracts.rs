@@ -4032,6 +4032,15 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
         }),
     );
     thread::sleep(Duration::from_millis(1200));
+    // An incremental refresh with an empty plan is short-circuited and writes
+    // no publication, so it cannot advance storage state past the marker. The
+    // marker-versus-index freshness contract is exercised by a refresh that
+    // actually republishes.
+    fs::write(
+        fixture.workspace.path().join("src/dirty_marker_probe.rs"),
+        "pub fn dirty_marker_probe() -> u32 {\n    7\n}\n",
+    )
+    .expect("write dirty marker probe source");
     refresh_fixture_index(&fixture);
     fixture.dirty_marker_path = Some(marker_path.clone());
     fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
