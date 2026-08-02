@@ -305,38 +305,13 @@ fn verdict_state(
         }
     }
 
-    // EV-7: freshness is a property of the publication, not of one caller goal. Nesting this
-    // match inside the LocalNavigation branch let `agent_packet_search` report `ready` over an
-    // index the runtime serving gate already refuses, so the readiness surface disagreed with
-    // what the next call would actually do. The bounded-inventory waiver is unaffected:
-    // `freshness_requires_refresh` still admits it, and the unknown state travels on the typed
-    // `freshness_unknown` field instead of demoting the lane.
-    match freshness {
-        Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
-            return index_repair_state(
-                goal,
-                "The index has changed, new, or removed files.",
-                project_arg,
-            );
-        }
-        Some(freshness)
-            if freshness.status == IndexFreshnessStatusDto::NotChecked
-                && freshness_requires_refresh(freshness) =>
-        {
-            let command = check_index_command(goal, project_arg);
-            return (
-                ReadinessStatusDto::CheckIndex,
-                "Index drift was not checked for this cache view.".to_string(),
-                vec![command.clone()],
-                vec![
-                    command,
-                    format!("codestory-cli doctor --project {project_arg}"),
-                ],
-            );
-        }
-        Some(_) | None => {}
-    }
-
+    // EV-7 widened the freshness match from `local_navigation` to both goals, but it stays
+    // *behind* the agent sidecar gate. A lane whose retrieval publication does not exist is
+    // blocked at the retrieval engine, and index drift over a publication the caller cannot read
+    // yet is not the fact an operator needs: repairing the core index would not clear that lane.
+    // Ordering the sidecar gate first keeps `agent_packet_search=blocked` on an unpublished
+    // sidecar (the shipped doctor contract) while still refusing `ready` once the sidecar is full
+    // and the publication underneath it has drifted.
     if goal == ReadinessGoalDto::AgentPacketSearch {
         let sidecar_profile = sidecar.and_then(|sidecar| sidecar.profile);
         let sidecar_run_id = sidecar.and_then(|sidecar| sidecar.run_id);
@@ -367,6 +342,38 @@ fn verdict_state(
                 next_commands,
             );
         }
+    }
+
+    // Freshness is a property of the publication, not of one caller goal. Nesting this match
+    // inside the LocalNavigation branch let `agent_packet_search` report `ready` over an index the
+    // runtime serving gate already refuses, so the readiness surface advertised a call it would
+    // then reject. The bounded-inventory waiver is unaffected: `freshness_requires_refresh` still
+    // admits it, and the unknown state travels on the typed `freshness_unknown` field instead of
+    // demoting the lane.
+    match freshness {
+        Some(freshness) if freshness.status == IndexFreshnessStatusDto::Stale => {
+            return index_repair_state(
+                goal,
+                "The index has changed, new, or removed files.",
+                project_arg,
+            );
+        }
+        Some(freshness)
+            if freshness.status == IndexFreshnessStatusDto::NotChecked
+                && freshness_requires_refresh(freshness) =>
+        {
+            let command = check_index_command(goal, project_arg);
+            return (
+                ReadinessStatusDto::CheckIndex,
+                "Index drift was not checked for this cache view.".to_string(),
+                vec![command.clone()],
+                vec![
+                    command,
+                    format!("codestory-cli doctor --project {project_arg}"),
+                ],
+            );
+        }
+        Some(_) | None => {}
     }
 
     let minimum_next = match goal {
@@ -840,6 +847,79 @@ mod tests {
         assert!(
             verdict.minimum_next[0].contains("retrieval index --project"),
             "the agent lane repairs through its own retrieval publication: {verdict:?}"
+        );
+    }
+
+    /// The freshness demotion widened to both goals in EV-7, but it must stay behind the agent
+    /// sidecar gate. When the retrieval publication does not exist at all, the agent lane's
+    /// blocker is the retrieval engine, not core index drift: `codestory-cli index --refresh`
+    /// would leave the lane exactly as unusable as it was. Doctor has shipped
+    /// `agent_packet_search=blocked` for this state, and
+    /// `doctor_next_commands_stop_at_index_repair_when_inventory_is_stale` asserts it end to end.
+    #[test]
+    fn a_stale_index_leaves_an_unpublished_agent_sidecar_blocked_not_repair_index() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Stale);
+        let unpublished = ReadinessSidecarInput {
+            profile: None,
+            run_id: None,
+            retrieval_mode: "unavailable",
+            degraded_reason: Some("retrieval_manifest_missing"),
+            ..agent_sidecar()
+        };
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(&stats, Some(&freshness), Some(unpublished)),
+        );
+
+        assert_eq!(
+            verdict.status,
+            ReadinessStatusDto::Blocked,
+            "an absent retrieval publication is a retrieval-engine block, not index drift: {verdict:?}"
+        );
+        assert_eq!(
+            failed_layer(&verdict),
+            Some("retrieval_engine"),
+            "the reported layer must name the blocker an operator has to clear first: {verdict:?}"
+        );
+        assert!(
+            verdict.minimum_next[0].contains("--refresh auto"),
+            "the blocked lane still routes to retrieval activation: {verdict:?}"
+        );
+
+        // The local lane keeps reporting the drift, so nothing about stale freshness is hidden.
+        let local = build_readiness_verdict(
+            ReadinessGoalDto::LocalNavigation,
+            inputs(&stats, Some(&freshness), Some(unpublished)),
+        );
+        assert_eq!(local.status, ReadinessStatusDto::RepairIndex, "{local:?}");
+    }
+
+    /// The same ordering for the unchecked-freshness arm: a lane with no publication cannot be
+    /// told to go check drift on one.
+    #[test]
+    fn unchecked_freshness_leaves_an_unpublished_agent_sidecar_blocked() {
+        let stats = stats(3);
+        let mut freshness = freshness(IndexFreshnessStatusDto::NotChecked);
+        freshness.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable);
+        let unpublished = ReadinessSidecarInput {
+            profile: None,
+            run_id: None,
+            retrieval_mode: "unavailable",
+            degraded_reason: Some("retrieval_manifest_missing"),
+            ..agent_sidecar()
+        };
+
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(&stats, Some(&freshness), Some(unpublished)),
+        );
+
+        assert_eq!(
+            verdict.status,
+            ReadinessStatusDto::Blocked,
+            "retrieval activation precedes any drift question for this lane: {verdict:?}"
         );
     }
 

@@ -286,6 +286,73 @@ mod tests {
         assert!(primary_retrieval_truncated(&shadow));
     }
 
+    /// The three declared deadline-loss states are wire strings the retrieval layer emits, and
+    /// each one means the same thing to the verdict: candidates the run had planned to collect
+    /// were dropped. Naming only the first in a test leaves the other two free to be deleted from
+    /// `stage_lost_to_deadline` without any suite noticing, so every state is pinned by literal.
+    #[test]
+    fn every_declared_deadline_loss_state_truncates_the_primary_run() {
+        for completion_status in [
+            "pending_after_deadline",
+            "cancelled_before_start",
+            "completed_late",
+        ] {
+            let shadow = shadow(vec![stage(
+                RetrievalStageKind::Stage2ScipExpand.label(),
+                completion_status,
+                0,
+            )]);
+
+            assert!(
+                primary_retrieval_truncated(&shadow),
+                "`{completion_status}` drops planned candidates and must truncate the run"
+            );
+        }
+    }
+
+    /// The same three states on the semantic stage, with nothing merged, are the zero-hit timeout
+    /// that demotes the owning query obligation.
+    #[test]
+    fn every_declared_deadline_loss_state_with_no_candidates_is_a_semantic_timeout() {
+        for completion_status in [
+            "pending_after_deadline",
+            "cancelled_before_start",
+            "completed_late",
+        ] {
+            let degradation = semantic_stage_degradation(&[stage(
+                RetrievalStageKind::Stage1bSemantic.label(),
+                completion_status,
+                0,
+            )]);
+
+            assert!(
+                degradation.timed_out_zero_hits,
+                "`{completion_status}` with zero merged candidates is a lost semantic lane"
+            );
+        }
+    }
+
+    /// The complement of the state list: a status outside it is not a deadline loss, so widening
+    /// the match to every non-`completed` state would not silently pass either.
+    #[test]
+    fn a_completed_stage_is_not_a_deadline_loss() {
+        let shadow = shadow(vec![stage(
+            RetrievalStageKind::Stage2ScipExpand.label(),
+            "completed",
+            0,
+        )]);
+
+        assert!(!primary_retrieval_truncated(&shadow));
+        assert!(
+            !semantic_stage_degradation(&[stage(
+                RetrievalStageKind::Stage1bSemantic.label(),
+                "completed",
+                0,
+            )])
+            .timed_out_zero_hits
+        );
+    }
+
     fn counter_answer() -> AgentAnswerDto {
         AgentAnswerDto {
             answer_id: "packet-degradation-test".to_string(),
