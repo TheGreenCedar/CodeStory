@@ -724,6 +724,7 @@ dependencies = [
  "glob",
  "ignore",
  "libc",
+ "notify",
  "remove_dir_all",
  "serde",
  "serde_json",

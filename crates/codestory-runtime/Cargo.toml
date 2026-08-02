@@ -28,5 +28,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["test-support"] }
+codestory-workspace = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }

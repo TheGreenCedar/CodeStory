@@ -13,6 +13,7 @@ use codestory_contracts::api::{
 };
 
 use crate::AppController;
+use crate::index_freshness::FreshnessObservationPolicy;
 use codestory_indexer::CancellationToken;
 use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
@@ -1254,7 +1255,10 @@ impl ActivationService {
         let mut summary = self
             .controller
             .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
-        summary.freshness = Some(self.controller.index_freshness_uncached()?);
+        summary.freshness = Some(
+            self.controller
+                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
+        );
 
         operation.set_stage(ActivationStage::CoreFreshness);
         let core_stale = summary.publication.is_none()
@@ -1283,7 +1287,10 @@ impl ActivationService {
                 project_root.clone(),
                 storage_path.clone(),
             )?;
-            summary.freshness = Some(self.controller.index_freshness_uncached()?);
+            summary.freshness = Some(
+                self.controller
+                    .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
+            );
         }
         let local_ready = summary.publication.is_some()
             && summary.stats.node_count > 0
@@ -1367,7 +1374,9 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
-        let source_freshness = self.controller.index_freshness_uncached()?;
+        let source_freshness = self
+            .controller
+            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
         if !index_freshness_admits_operation(&source_freshness) {
             return Err(ApiError::new(
                 "publication_changed",
@@ -1772,7 +1781,9 @@ impl PublicOperationService {
         let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
-                let freshness = self.controller.index_freshness_uncached()?;
+                let freshness = self
+                    .controller
+                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
                 if !index_freshness_admits_operation(&freshness)
                     && !self.retained_core_allows(operation, publication)
                 {
@@ -1801,7 +1812,13 @@ impl PublicOperationService {
                     // including a mutation that preserved both mtime and byte
                     // length. Only re-hashing content sees that, so the
                     // operation-scoped verdict memo must not answer here.
-                    let after = self.controller.index_freshness_reverified()?;
+                    // Observed as well, because the re-read is still a scan with
+                    // a window of its own: the memo drop makes the scan see
+                    // drift that landed before it started, and the observer
+                    // makes it refuse drift that lands while it runs.
+                    let after = self.controller.index_freshness_reverified(
+                        FreshnessObservationPolicy::ObserveSourceRoot,
+                    )?;
                     if !index_freshness_admits_operation(&after)
                         && !self.retained_core_allows(operation, publication)
                     {
@@ -2751,7 +2768,7 @@ mod activation_tests {
             .expect("complete ready core");
         let source_freshness = service
             .controller
-            .index_freshness_uncached()
+            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
             .expect("verify ready source snapshot");
         assert!(index_freshness_admits_operation(&source_freshness));
         let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
@@ -2873,7 +2890,7 @@ mod activation_tests {
             .runtime
             .activation_service()
             .controller
-            .index_freshness_uncached()
+            .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)
             .expect("observe indexed inventory")
             .indexed_file_count;
         assert!(

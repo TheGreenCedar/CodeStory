@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod filesystem_observer;
 pub mod locking;
 pub mod owned_deletion;
 pub mod paths;
@@ -1631,6 +1632,16 @@ fn observed_file_metadata(path: &Path) -> Result<ObservedFileMetadata> {
         modified_ms: clamp_system_time_to_epoch_millis(modified),
         len: metadata.len(),
     })
+}
+
+/// Re-verify one stored file against the bytes on disk right now.
+///
+/// This is the exact predicate refresh planning applies during discovery, exposed so a caller
+/// that learned a specific path was written *after* the plan was built can settle that path
+/// without re-walking the tree. Sharing the predicate is the point: a second, similar-looking
+/// comparison would be free to disagree with the planner about what counts as drift.
+pub fn stored_file_requires_reindex(path: &Path, file: &StoredFileState) -> bool {
+    stored_file_needs_index(path, file)
 }
 
 fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {

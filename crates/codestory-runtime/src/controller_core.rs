@@ -1,6 +1,7 @@
 use crate::browser::ReadOnlyBrowserService;
 use crate::index_freshness::{
-    index_freshness_from_storage_with_policy, open_existing_storage_for_read, open_storage_for_read,
+    FreshnessObservation, FreshnessObservationPolicy, index_freshness_from_storage_with_policy,
+    open_existing_storage_for_read, open_storage_for_read,
 };
 use crate::search_publication::{
     load_persisted_search_state_for_runtime, retrieval_state_from_storage_for_runtime,
@@ -12,8 +13,8 @@ use crate::services::{
 use crate::workspace_state::runtime_workspace_manifest;
 use crate::{
     ACTIVE_CORE_READ, ActiveCoreRead, ActiveCoreReadGuard, AppController, AppState, ReadStorage,
-    RuntimeProcessConfig, SidecarQueryCacheState, Storage, clear_search_engine,
-    publish_search_engine,
+    RuntimeProcessConfig, SidecarQueryCacheState, SourceObserverState, Storage,
+    clear_search_engine, publish_search_engine,
 };
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexFreshnessDto, ProjectSummary, RetrievalStateDto,
@@ -23,7 +24,7 @@ use codestory_workspace::SourceIndexPolicy;
 use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ impl AppController {
             })),
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             canonical_symbol_names: Arc::new(Mutex::new(Default::default())),
+            source_observer: Arc::new(Mutex::new(SourceObserverState::default())),
             events_tx,
             events_rx,
             runtime_config: Arc::new(config),
@@ -260,17 +262,28 @@ impl AppController {
         result
     }
 
-    pub(crate) fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
+    pub(crate) fn index_freshness_uncached(
+        &self,
+        observation: FreshnessObservationPolicy,
+    ) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage = self.open_storage_for_freshness()?;
         let storage_path = self.require_storage_path()?;
         let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        let session = match observation {
+            FreshnessObservationPolicy::Unobserved => None,
+            FreshnessObservationPolicy::ObserveSourceRoot => self.source_observer_session(&root),
+        };
         Ok(index_freshness_from_storage_with_policy(
             &root,
             &workspace,
             &storage,
             &self.source_index_policy,
+            session.as_deref().map_or(
+                FreshnessObservation::Unobserved,
+                FreshnessObservation::Observed,
+            ),
         ))
     }
 
@@ -285,9 +298,89 @@ impl AppController {
     /// preserves both mtime and byte length is invisible to metadata, and the
     /// content hash is the only mechanism that catches it. Callers guarding the
     /// *end* of an operation use this entry point so the hash runs again.
-    pub(crate) fn index_freshness_reverified(&self) -> Result<IndexFreshnessDto, ApiError> {
+    ///
+    /// The observation policy is passed straight through: dropping the memo
+    /// governs what the scan is allowed to remember, arming the observer
+    /// governs what the scan is allowed to miss, and the end-of-operation
+    /// refusal needs both.
+    pub(crate) fn index_freshness_reverified(
+        &self,
+        observation: FreshnessObservationPolicy,
+    ) -> Result<IndexFreshnessDto, ApiError> {
         codestory_workspace::reverify_source_freshness_from_content();
-        self.index_freshness_uncached()
+        self.index_freshness_uncached(observation)
+    }
+
+    /// Arm, or reuse, the filesystem observer over `root`.
+    ///
+    /// Arming is the expensive half — a recursive watch over the working tree — so one session
+    /// serves every observed read of the same root. A session that has already lost coverage is
+    /// kept rather than replaced: it seals indeterminate from then on, which is exactly the
+    /// unobserved fallback, and re-arming on every read would pay the watch cost repeatedly on a
+    /// host that is producing more churn than the notifier can carry.
+    pub(crate) fn source_observer_session(
+        &self,
+        root: &Path,
+    ) -> Option<Arc<codestory_workspace::filesystem_observer::FilesystemObserverSession>> {
+        use codestory_workspace::filesystem_observer::FilesystemObserverSession;
+
+        let mut state = self.source_observer.lock();
+        if state.root.as_deref() != Some(root) {
+            *state = SourceObserverState {
+                root: Some(root.to_path_buf()),
+                #[cfg(any(test, feature = "test-support"))]
+                arm_requests: state.arm_requests,
+                ..SourceObserverState::default()
+            };
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            state.arm_requests = state.arm_requests.saturating_add(1);
+        }
+        if let Some(session) = state.session.as_ref() {
+            return Some(Arc::clone(session));
+        }
+        if state.refused.is_some() {
+            return None;
+        }
+        match FilesystemObserverSession::arm(root) {
+            Ok(session) => {
+                let session = Arc::new(session);
+                state.session = Some(Arc::clone(&session));
+                Some(session)
+            }
+            Err(gap) => {
+                tracing::debug!(
+                    root = %root.display(),
+                    gap = gap.id(),
+                    detail = %gap.detail(),
+                    "filesystem observation unavailable; freshness falls back to the scan verdict"
+                );
+                state.refused = Some(gap);
+                None
+            }
+        }
+    }
+
+    /// Install a caller-driven observer session so a test can script the racing window.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn install_source_observer_for_test(
+        &self,
+        root: &Path,
+        session: Arc<codestory_workspace::filesystem_observer::FilesystemObserverSession>,
+    ) {
+        let mut state = self.source_observer.lock();
+        state.root = Some(root.to_path_buf());
+        state.session = Some(session);
+        state.refused = None;
+    }
+
+    /// How many times a read asked this controller for an observer session.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn source_observer_requests_for_test(&self) -> u64 {
+        self.source_observer.lock().arm_requests
     }
 
     pub(crate) fn clear_search_state(&self) {
