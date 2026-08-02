@@ -167,6 +167,19 @@ pub struct WorkspaceManifest {
     discovery_exclusion_observation_count: Cell<usize>,
 }
 
+fn default_source_exclude_patterns() -> Vec<String> {
+    [
+        "**/node_modules/**",
+        "**/target/**",
+        "**/.git/**",
+        "**/dist/**",
+        "**/build/**",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Multi-member workspace manifest.
 ///
 /// Each member becomes a synthetic source group rooted at that member path.
@@ -366,13 +379,7 @@ impl WorkspaceManifest {
                 language: Language::Rust,
                 standard: LanguageStandard::Default,
                 source_paths: vec![root_path],
-                exclude_patterns: vec![
-                    "**/node_modules/**".to_string(),
-                    "**/target/**".to_string(),
-                    "**/.git/**".to_string(),
-                    "**/dist/**".to_string(),
-                    "**/build/**".to_string(),
-                ],
+                exclude_patterns: default_source_exclude_patterns(),
                 include_paths: Vec::new(),
                 defines: HashMap::new(),
                 language_specific: LanguageSpecificSettings::Other,
@@ -423,13 +430,7 @@ impl WorkspaceManifest {
                 language: Language::Rust,
                 standard: LanguageStandard::Default,
                 source_paths: vec![member.clone()],
-                exclude_patterns: vec![
-                    "**/node_modules/**".to_string(),
-                    "**/target/**".to_string(),
-                    "**/.git/**".to_string(),
-                    "**/dist/**".to_string(),
-                    "**/build/**".to_string(),
-                ],
+                exclude_patterns: default_source_exclude_patterns(),
                 include_paths: Vec::new(),
                 defines: HashMap::new(),
                 language_specific: LanguageSpecificSettings::Other,
@@ -951,6 +952,9 @@ impl WorkspaceDiscovery {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
                     builder.follow_links(true);
                     builder.require_git(false);
+                    // Hidden source trees such as .github are product input. The
+                    // manifest's explicit excludes still prune repository metadata.
+                    builder.hidden(false);
                     let workspace_root_for_filter = workspace_root.clone();
                     let source_root_for_filter = source_root.clone();
                     let exclude_patterns = exclude_patterns.clone();
@@ -2992,6 +2996,26 @@ mod tests {
         assert!(files.contains(&root.join("app.ts")));
         assert!(files.contains(&root.join("App.svelte")));
         assert!(files.contains(&root.join("src").join("main.py")));
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_manifest_discovers_hidden_sources_but_excludes_git_metadata() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let workflow = root.join(".github/workflows/ci.yml");
+        let git_source = root.join(".git/objects/should-not-index.rs");
+        fs::create_dir_all(workflow.parent().expect("workflow parent"))?;
+        fs::create_dir_all(git_source.parent().expect("git source parent"))?;
+        fs::write(&workflow, "name: CI\non: push\njobs: {}\n")?;
+        fs::write(&git_source, "pub fn repository_metadata() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.contains(&workflow));
+        assert!(!inventory.files.contains(&git_source));
         Ok(())
     }
 

@@ -16701,11 +16701,23 @@ fn prepare_template_index_work(
     index_template_file(path, template_kind, &source)
 }
 
+fn parser_source_is_complete(source: &str, language_config: &LanguageConfig) -> Result<bool> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language_config.language)
+        .map_err(|error| anyhow!("Language error: {error:?}"))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow!("Failed to parse template script regions"))?;
+    Ok(!tree.root_node().has_error())
+}
+
 fn index_template_file(
     path: &Path,
     template_kind: template_pipeline::TemplateKind,
     source: &str,
 ) -> Result<IntermediateStorage> {
+    let content_hash = source_content_hash(source.as_bytes());
     let prepared = template_pipeline::prepare_template_source(template_kind, source);
     let script_ext = match prepared.script_language {
         "typescript" => "ts",
@@ -16715,9 +16727,12 @@ fn index_template_file(
         .ok_or_else(|| anyhow!("missing tree-sitter config for template script language"))?;
 
     let mut index_result = index_file(path, &prepared.blanked, &language_config, None, None)?;
+    let parser_region_complete =
+        parser_source_is_complete(&prepared.completeness_blanked, &language_config)?;
     let surface_language = template_pipeline::template_surface_language(path).unwrap_or("template");
     if let Some(file_info) = index_result.files.first_mut() {
         file_info.language = surface_language.to_string();
+        file_info.complete = parser_region_complete;
     }
 
     let file_id = index_result
@@ -16730,6 +16745,12 @@ fn index_template_file(
     local_storage.files.extend(index_result.files);
     local_storage.nodes.extend(index_result.nodes);
     local_storage.occurrences.extend(index_result.occurrences);
+    local_storage
+        .component_access
+        .extend(index_result.component_access);
+    local_storage
+        .impl_anchor_node_ids
+        .extend(index_result.impl_anchor_node_ids);
     append_text_only_framework_routes(path, surface_language, source, file_id, &mut local_storage);
     // Insert Tauri invoke edges before tree-sitter CALL edges so SQLite ON CONFLICT keeps
     // the heuristic uncertain boundary evidence when identities collide.
@@ -16741,27 +16762,62 @@ fn index_template_file(
         file_id,
         &mut local_storage,
     );
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("template");
     let file_identity = WorkspaceIndexer::file_identity_path(path);
     let flags = index_feature_flags();
     let (final_nodes, id_remap) = canonicalize_nodes_with_file_identity(
-        file_name,
+        &file_identity,
         &file_identity,
         local_storage.nodes,
         &HashMap::new(),
     );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     local_storage.nodes = final_nodes;
+    let final_node_ids = local_storage
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
     remap_file_affinity(&mut local_storage.nodes, new_file_id);
     remap_edges(&mut local_storage.edges, new_file_id, &id_remap, flags);
     remap_occurrences(&mut local_storage.occurrences, &id_remap);
+    local_storage.component_access = local_storage
+        .component_access
+        .into_iter()
+        .filter_map(|(node_id, access)| {
+            let remapped = id_remap.get(&node_id).copied().unwrap_or(node_id);
+            final_node_ids
+                .contains(&remapped)
+                .then_some((remapped, access))
+        })
+        .collect();
+    local_storage.structural_unit_node_ids = local_storage
+        .structural_unit_node_ids
+        .into_iter()
+        .map(|node_id| id_remap.get(&node_id).copied().unwrap_or(node_id))
+        .filter(|node_id| final_node_ids.contains(node_id))
+        .collect();
+    local_storage.structural_unit_node_ids.sort_unstable();
+    local_storage.structural_unit_node_ids.dedup();
+    local_storage.impl_anchor_node_ids = local_storage
+        .impl_anchor_node_ids
+        .into_iter()
+        .map(|node_id| id_remap.get(&node_id).copied().unwrap_or(node_id))
+        .filter(|node_id| final_node_ids.contains(node_id))
+        .collect();
+    local_storage.impl_anchor_node_ids.sort_unstable();
+    local_storage.impl_anchor_node_ids.dedup();
     if let Some(file_info) = local_storage.files.first_mut()
         && let Some(remapped) = id_remap.get(&NodeId(file_info.id))
     {
         file_info.id = remapped.0;
+    }
+    if let Some(file_info) = local_storage.files.first() {
+        local_storage
+            .file_content_hashes
+            .push(codestory_store::FileContentHash {
+                file_id: file_info.id,
+                content_hash,
+            });
     }
     local_storage.callable_projection_states = build_callable_projection_states(
         &local_storage.nodes,
@@ -16773,6 +16829,7 @@ fn index_template_file(
 
 fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
     let source = std::fs::read_to_string(path)?;
+    let content_hash = source_content_hash(source.as_bytes());
     let mut local_storage = IntermediateStorage::default();
     let (file_node, _file_name, file_id) = file_node_from_source(path, &source);
     local_storage.files.push(codestory_store::FileInfo {
@@ -16807,6 +16864,12 @@ fn index_text_only_file(path: &Path) -> Result<IntermediateStorage> {
         &local_storage.edges,
         &local_storage.occurrences,
     );
+    local_storage
+        .file_content_hashes
+        .push(codestory_store::FileContentHash {
+            file_id: local_storage.files[0].id,
+            content_hash,
+        });
     Ok(local_storage)
 }
 
@@ -26640,6 +26703,60 @@ jobs:
         assert_eq!(storage.files[0].path, path);
         assert!(storage.nodes.iter().any(|node| node.kind == NodeKind::FILE));
         assert!(storage.edges.is_empty());
+        assert_eq!(storage.file_content_hashes.len(), 1);
+        assert_eq!(
+            storage.file_content_hashes[0].content_hash,
+            source_content_hash(
+                b"<script>\n  import { invoke } from '@tauri-apps/api/core';\n</script>\n"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_collector_records_verified_source_hash() -> Result<()> {
+        let source = "<script>export const answer = 42</script>\n";
+        let storage = index_template_file(
+            Path::new("src/Answer.svelte"),
+            template_pipeline::TemplateKind::Svelte,
+            source,
+        )?;
+
+        assert_eq!(storage.file_content_hashes.len(), 1);
+        assert_eq!(storage.file_content_hashes[0].file_id, storage.files[0].id);
+        assert_eq!(
+            storage.file_content_hashes[0].content_hash,
+            source_content_hash(source.as_bytes())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_basename_templates_keep_distinct_symbol_identities() -> Result<()> {
+        let source = r#"<script lang="ts">
+export interface Props { title: string }
+</script>
+"#;
+        let left = index_template_file(
+            Path::new("src/left/index.vue"),
+            template_pipeline::TemplateKind::Vue,
+            source,
+        )?;
+        let right = index_template_file(
+            Path::new("src/right/index.vue"),
+            template_pipeline::TemplateKind::Vue,
+            source,
+        )?;
+        let props_id = |storage: &IntermediateStorage| {
+            storage
+                .nodes
+                .iter()
+                .find(|node| node.serialized_name == "Props")
+                .map(|node| node.id)
+                .expect("Props symbol")
+        };
+
+        assert_ne!(props_id(&left), props_id(&right));
         Ok(())
     }
 
@@ -26730,6 +26847,7 @@ jobs:
             .iter()
             .find(|node| node.canonical_id.as_deref() == Some("tauri:command:get_snapshot"))
             .expect("tauri command node");
+        let file_id = local.files[0].id;
         assert!(local.edges.iter().any(|edge| {
             edge.kind == EdgeKind::CALL
                 && edge.target == command.id
@@ -26754,6 +26872,10 @@ jobs:
             })?;
 
         let edges = storage.get_edges()?;
+        assert_eq!(
+            storage.get_file_content_hash(file_id)?.as_deref(),
+            Some(source_content_hash(source.as_bytes()).as_str())
+        );
         assert!(
             edges.iter().any(|edge| {
                 edge.kind == EdgeKind::CALL
