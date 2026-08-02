@@ -24,8 +24,10 @@ const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` fo
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
 failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";
-const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
-fresh index, or `incremental` to refresh a compatible existing cache without allowing full-refresh escalation.";
+const DRILL_REFRESH_HELP: &str = "Drill defaults to `auto`: it chooses `full` for an empty, pre-current, or structurally \
+incompatible cache and `incremental` for a compatible existing publication, so each report is mechanically fresh without \
+forcing a full rebuild of a compatible cache. Use `none` to query the existing cache only, or `full` to force a rebuild \
+after a cache reset, schema change, or indexing failure. Explicit `incremental` never escalates to `full`.";
 const CLI_LONG_ABOUT: &str = "\
 CodeStory turns a local repository into auditable grounding evidence.
 
@@ -954,7 +956,7 @@ pub(crate) struct DrillCommand {
     #[arg(
         long,
         value_enum,
-        default_value_t = RefreshMode::Full,
+        default_value_t = RefreshMode::Auto,
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
@@ -997,7 +999,7 @@ pub(crate) struct DrillSuiteCommand {
     #[arg(
         long,
         value_enum,
-        default_value_t = RefreshMode::Full,
+        default_value_t = RefreshMode::Auto,
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
@@ -2652,7 +2654,50 @@ mod tests {
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
-        assert!(help.contains("Drill defaults to `full`"));
+        assert!(help.contains("Drill defaults to `auto`"));
+        assert!(help.contains("without forcing a full rebuild of a compatible cache"));
+    }
+
+    #[test]
+    fn drill_commands_default_to_auto_refresh() {
+        // `full` replaces the database without copying its bookmark tables, so
+        // making it the default drops annotations even when the existing cache
+        // is compatible. `auto` still guarantees a mechanically fresh report
+        // because it escalates to `full` whenever the cache is empty,
+        // pre-current, or structurally incompatible. Ordinary incremental
+        // `FullReplace` updates have their own annotation-loss path through
+        // `delete_file_projection`; this default change is only containment.
+        let drill = Cli::try_parse_from([
+            "codestory-cli",
+            "drill",
+            "--project",
+            ".",
+            "--anchors",
+            "Alpha",
+            "--output-dir",
+            "target/drill",
+        ])
+        .expect("parse drill");
+        let Command::Drill(drill) = drill.command else {
+            panic!("expected drill command");
+        };
+        assert_eq!(drill.refresh, RefreshMode::Auto);
+
+        let suite = Cli::try_parse_from([
+            "codestory-cli",
+            "drill-suite",
+            "--project",
+            ".",
+            "--case-file",
+            "cases.json",
+            "--output-dir",
+            "target/drill-suite",
+        ])
+        .expect("parse drill-suite");
+        let Command::DrillSuite(suite) = suite.command else {
+            panic!("expected drill-suite command");
+        };
+        assert_eq!(suite.refresh, RefreshMode::Auto);
     }
 
     #[test]
