@@ -159,6 +159,20 @@ jobs:
           cargo test --locked -p codestory-runtime --lib -- --exact tests::repo_text_tests::search_results_ignores_repo_text_hits_without_full_sidecars
           cargo test --locked -p codestory-runtime --lib -- --exact tests::repo_text_tests::repo_text_auto_fallback_is_not_product_search_without_full_sidecars
 
+      # Merged proof suites from EV-FIX (#1718), READY-A (#1727), HOOK (#1672),
+      # and W1.SEC (#1643) previously ran only in the dispatch-gated workspace
+      # suite; a regression in any of them merged green. This step is their
+      # per-PR lane (#1735).
+      - name: Evidence, readiness, hooks, and workspace contract tests
+        run: |
+          cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
+          cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::
+          cargo test --locked -p codestory-runtime --lib agent::packet_batch::
+          cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
+          cargo test --locked -p codestory-runtime --lib services::
+          cargo test --locked -p codestory-cli --lib
+          cargo test --locked -p codestory-workspace
+
       - name: Stdio protocol contract tests
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
 

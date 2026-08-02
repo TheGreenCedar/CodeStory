@@ -5923,6 +5923,33 @@ test("proof floor keeps architecture universal and durability path-scoped", asyn
     ["write permission granted", workflows => {
       workflows.get(crateDurabilityFile).permissions.contents = "write";
     }],
+    ["merged suite lane step removed", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      steps.splice(steps.findIndex(step =>
+        step.name === "Evidence, readiness, hooks, and workspace contract tests"), 1);
+    }],
+    ["merged suite lane command dropped", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane.run = lane.run.trim().split("\n").slice(1).join("\n");
+    }],
+    ["merged suite lane made conditional", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane.if = "github.event_name == 'workflow_dispatch'";
+    }],
+    ["merged suite lane made nonblocking", workflows => {
+      const job = workflows.get(retrievalFile).jobs["linux-contracts"];
+      const lane = draftStep(job, "Evidence, readiness, hooks, and workspace contract tests");
+      lane["continue-on-error"] = true;
+    }],
+    ["merged suite lane moved after artifact seeding", workflows => {
+      const steps = workflows.get(retrievalFile).jobs["linux-contracts"].steps;
+      const laneIndex = steps.findIndex(step =>
+        step.name === "Evidence, readiness, hooks, and workspace contract tests");
+      const [lane] = steps.splice(laneIndex, 1);
+      steps.push(lane);
+    }],
   ];
 
   for (const [name, mutate] of mutations) {

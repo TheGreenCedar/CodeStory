@@ -38,6 +38,21 @@ It does not emit artifacts or turn unrelated crate changes into durability
 work. Run broad source proof once on the frozen candidate rather than using
 this focused durability lane as a second source-proof coordinator.
 
+The same universal `linux-contracts` job also runs the merged proof suites as
+a blocking per-PR lane, so evidence classification, packet sufficiency,
+readiness leases, hook installation, and the confined workspace reader cannot
+regress between dispatch-gated workspace proofs:
+
+```bash
+cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
+cargo test --locked -p codestory-runtime --lib agent::packet_sufficiency::
+cargo test --locked -p codestory-runtime --lib agent::packet_batch::
+cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
+cargo test --locked -p codestory-runtime --lib services::
+cargo test --locked -p codestory-cli --lib
+cargo test --locked -p codestory-workspace
+```
+
 ## Draft source checks
 
 Run the relevant focused commands while implementing. A typical Rust lane is:
