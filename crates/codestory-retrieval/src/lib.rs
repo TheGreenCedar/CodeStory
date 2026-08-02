@@ -152,6 +152,8 @@ pub use retention::{
 };
 pub use scip_client::ScipClient;
 pub use sidecar::{
+    ReadyEmbeddingEngineIdentity, ReadyRetrievalIdentity,
+    observe_ready_retrieval_identity_for_project_id, ready_retrieval_identity_for_runtime,
     sidecar_status, strict_sidecar_status, strict_sidecar_status_for_profile,
     strict_sidecar_status_for_runtime,
 };

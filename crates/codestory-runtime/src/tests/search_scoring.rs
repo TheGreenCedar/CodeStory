@@ -873,25 +873,220 @@ fn build_search_state_prefers_qualified_name() {
 }
 
 #[test]
-fn open_project_summary_clears_search_state() {
-    let temp = tempdir().expect("create temp dir");
+fn open_project_summary_preserves_search_state_for_the_same_complete_publication() {
+    let temp = copy_tictactoe_workspace();
     let storage_path = temp.path().join("cache").join("codestory.db");
     let controller = AppController::new();
 
     controller
-        .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
-        .expect("open project with search state");
-    assert!(
-        controller.state.lock().search_engine.is_some(),
-        "expected full open to initialize search state"
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete project and search state");
+    let before_cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+    let before = controller.state.lock();
+    assert!(before.search_engine.is_some());
+    assert!(!before.node_names.is_empty());
+    let publication = before
+        .search_publication
+        .clone()
+        .expect("search publication");
+    let node_count = before.node_names.len();
+    drop(before);
+
+    controller
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
+        .expect("open project summary");
+    let state = controller.state.lock();
+    assert!(state.search_engine.is_some());
+    assert_eq!(state.search_publication.as_ref(), Some(&publication));
+    assert_eq!(state.node_names.len(), node_count);
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation,
+        "unchanged summary open must preserve the sidecar query cache epoch"
     );
+}
+
+#[test]
+fn activation_search_preparation_preserves_resident_state_for_retrieval_only_replacement() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    fs::write(
+        project.path().join("metadata.rs"),
+        "// RETRIEVAL_ONLY_REPLACEMENT_ANCHOR\n",
+    )
+    .expect("write zero-dense project");
+    let sidecar_cache = cache.path().join("sidecar");
+    fs::create_dir_all(&sidecar_cache).expect("create sidecar cache");
+    let runtime = codestory_retrieval::with_test_cache_root(&sidecar_cache, || {
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Agent,
+        )
+    });
+    let storage_path = cache.path().join("codestory.db");
+    let controller = AppController::new_with_config(runtime.clone());
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete core and resident search state");
+    let manifest_a = codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+        project.path(),
+        &storage_path,
+        &runtime,
+    )
+    .expect("publish retrieval identity A");
+    let mut manifest_b = manifest_a.clone();
+    manifest_b.built_at_epoch_ms += 1;
+    Storage::open(&storage_path)
+        .expect("open retrieval pointer store")
+        .upsert_retrieval_index_manifest(&manifest_b)
+        .expect("publish retrieval-only identity B");
+
+    let sentinel_id = CoreNodeId(9_999_991);
+    let sentinel_name = "retrieval_only_resident_search_sentinel";
+    let core_publication = {
+        let mut state = controller.state.lock();
+        state
+            .node_names
+            .insert(sentinel_id, sentinel_name.to_string());
+        let engine = state
+            .search_engine
+            .as_mut()
+            .expect("resident search engine");
+        engine.extend_symbol_projection([(sentinel_id, sentinel_name.to_string())]);
+        state
+            .search_publication
+            .clone()
+            .expect("resident search publication")
+    };
+    let cache_key = codestory_retrieval::RetrievalCacheKey::from_manifest(
+        &manifest_b,
+        "retrieval-only-cache-sentinel",
+    );
+    controller.sidecar_query_cache.lock().insert(
+        cache_key.clone(),
+        vec![codestory_retrieval::CandidateHit::lexical_stub(
+            "metadata.rs",
+            1.0,
+        )],
+    );
+    let cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+
+    controller
+        .prepare_search_state_for_activation(&CancellationToken::new())
+        .expect("same-core retrieval replacement must reuse resident search state");
+
+    {
+        let state = controller.state.lock();
+        assert_eq!(
+            state.node_names.get(&sentinel_id).map(String::as_str),
+            Some(sentinel_name)
+        );
+        assert_eq!(state.search_publication.as_ref(), Some(&core_publication));
+        assert!(
+            state
+                .search_engine
+                .as_ref()
+                .expect("resident search engine survives")
+                .search_symbol(sentinel_name)
+                .contains(&sentinel_id),
+            "retrieval-only activation rebuilt the resident search engine"
+        );
+    }
+    let cache = controller.sidecar_query_cache.lock();
+    assert_eq!(cache.snapshot().0, cache_generation);
+    assert_eq!(
+        cache.get(&cache_key).expect("sidecar cache entry survives")[0].file_path,
+        "metadata.rs"
+    );
+    drop(cache);
+
+    codestory_retrieval::test_support::publish_replacement_core_and_zero_dense_fixture(
+        project.path(),
+        &storage_path,
+        &runtime,
+        core_publication.generation + 1,
+        "33333333-3333-4333-8333-333333333333",
+        "retrieval-only-core-replacement",
+    )
+    .expect("publish true core replacement");
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("observe true core replacement");
+    {
+        let state = controller.state.lock();
+        assert!(state.search_engine.is_none());
+        assert!(state.search_publication.is_none());
+        assert!(state.node_names.is_empty());
+    }
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        cache_generation.wrapping_add(1),
+        "true core replacement must clear the sidecar cache once"
+    );
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path)
+        .expect("reobserve unchanged replacement core");
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        cache_generation.wrapping_add(1),
+        "one core transition must not repeatedly clear resident state"
+    );
+}
+
+#[test]
+fn open_project_summary_clears_state_bound_to_another_core_publication() {
+    let temp = copy_tictactoe_workspace();
+    let storage_path = temp.path().join("cache").join("codestory.db");
+    let controller = AppController::new();
+
+    controller
+        .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking(IndexMode::Full)
+        .expect("publish complete project and search state");
+    let before_cache_generation = controller.sidecar_query_cache.lock().snapshot().0;
+    {
+        let mut state = controller.state.lock();
+        let mut stale = state
+            .search_publication
+            .clone()
+            .expect("search publication");
+        stale.generation_id = "stale-search-publication".into();
+        state.search_publication = Some(stale);
+    }
 
     controller
         .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
         .expect("open project summary");
     let state = controller.state.lock();
     assert!(state.search_engine.is_none());
+    assert!(state.search_publication.is_none());
     assert!(state.node_names.is_empty());
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation.wrapping_add(1),
+        "changed core identity must invalidate the sidecar query cache once"
+    );
+    drop(state);
+
+    controller
+        .open_project_summary_with_storage_path(
+            temp.path().to_path_buf(),
+            temp.path().join("cache").join("codestory.db"),
+        )
+        .expect("reopen the already-observed core publication");
+    assert_eq!(
+        controller.sidecar_query_cache.lock().snapshot().0,
+        before_cache_generation.wrapping_add(1),
+        "one publication transition must not repeatedly invalidate resident caches"
+    );
 }
 
 #[test]
