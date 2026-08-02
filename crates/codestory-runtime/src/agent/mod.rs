@@ -17,6 +17,7 @@ pub(crate) mod packet_flow_requirements;
 pub(crate) mod packet_obligations;
 pub(crate) mod packet_plan;
 pub(crate) mod packet_probe;
+pub(crate) mod packet_profile_telemetry;
 pub(crate) mod packet_required_probes;
 pub(crate) mod packet_scoring;
 pub(crate) mod packet_search;

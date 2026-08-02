@@ -1,6 +1,14 @@
 {
-  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion, and total_markers must equal the number of markers listed below, so this file cannot grow without a reviewable diff that raises a stated number.",
+  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion; total_markers must equal the number of markers listed below and total_marker_occurrences must equal the sum of their counts, so neither the number of surfaces nor the number of production lines they occupy can move without a reviewable diff that restates both numbers.",
   "total_markers": 182,
+  "total_marker_occurrences": 257,
+  "pending_claim_profiles": {
+    "file": "crates/codestory-runtime/src/agent/packet_claim_profiles.rs",
+    "declaration": "SourceClaimProductProfile::pending(",
+    "count": 16,
+    "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
+    "reason": "Product claim profiles that still ship without an anti-overfit contract and fixture pair. The count is a ratchet: a new profile has to arrive contracted, and migrating one of these has to lower this number and PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET in the same change."
+  },
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",

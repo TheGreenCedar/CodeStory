@@ -5,7 +5,7 @@ use crate::agent::eval_probes::{
 };
 use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_claim_profiles::{
-    packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation,
+    packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation_counted,
 };
 use crate::agent::packet_command_profiles::packet_append_command_flow_template_claims;
 use crate::agent::packet_evidence::{
@@ -15,6 +15,7 @@ use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
 use crate::agent::packet_plan::packet_rank_terms;
+use crate::agent::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term,
@@ -56,13 +57,27 @@ pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
 }
 
 pub(crate) fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+    packet_supported_claims_with_telemetry(answer).0
+}
+
+pub(crate) fn packet_supported_claims_with_telemetry(
+    answer: &AgentAnswerDto,
+) -> (Vec<PacketClaimDto>, PacketClaimTelemetry) {
     let mut claims = Vec::new();
     let mut seen_claims = HashSet::new();
+    let mut telemetry = PacketClaimTelemetry::default();
     let rank_terms = packet_rank_terms(&answer.prompt);
     let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
     let citations = answer.citations.clone();
 
-    append_flow_template_claims(&answer.prompt, &citations, &mut claims, &mut seen_claims);
+    append_flow_template_claims(
+        &answer.prompt,
+        &citations,
+        &mut claims,
+        &mut seen_claims,
+        &mut telemetry,
+    );
+    let before_role_claims = claims.len();
     append_ranked_citation_claims(
         &answer.prompt,
         &citations,
@@ -71,8 +86,12 @@ pub(crate) fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClai
         &mut claims,
         &mut seen_claims,
     );
+    telemetry.record_claim_source(
+        PacketClaimSource::RoleTemplate,
+        claims.len().saturating_sub(before_role_claims),
+    );
     decorate_packet_claims_proof_metadata(&mut claims);
-    claims
+    (claims, telemetry)
 }
 
 pub(crate) fn decorate_packet_claims_proof_metadata(claims: &mut [PacketClaimDto]) {
@@ -132,20 +151,58 @@ pub(crate) fn append_flow_template_claims(
     citations: &[AgentCitationDto],
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
+    telemetry: &mut PacketClaimTelemetry,
 ) {
     let normalized_prompt = normalize_identifier(prompt);
 
+    let phase = ClaimSourcePhase::start(claims);
     packet_append_command_flow_template_claims(prompt, citations, claims, seen);
+    phase.finish(PacketClaimSource::CommandProfile, claims, telemetry);
+
+    let phase = ClaimSourcePhase::start(claims);
     packet_append_event_output_flow_template_claims(&normalized_prompt, citations, claims, seen);
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
-    packet_append_source_derived_flow_claims(prompt, citations, claims, seen);
+    phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
+
+    let phase = ClaimSourcePhase::start(claims);
+    packet_append_source_derived_flow_claims(prompt, citations, claims, seen, telemetry);
+    phase.finish(PacketClaimSource::SourceProfile, claims, telemetry);
+
+    let phase = ClaimSourcePhase::start(claims);
     packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
+    phase.finish(PacketClaimSource::FlowTemplate, claims, telemetry);
+
     #[cfg(test)]
     if eval_probes_enabled() {
+        let phase = ClaimSourcePhase::start(claims);
         packet_append_indexing_storage_flow_template_claims(prompt, citations, claims, seen);
         for (claim, citation) in eval_flow_template_claims(&normalized_prompt, citations) {
             packet_push_flow_template_claim(claims, seen, &claim, Some(citation));
         }
+        phase.finish(PacketClaimSource::EvalProbe, claims, telemetry);
+    }
+}
+
+/// Counts claims one assembly layer actually added, so `claim_source` totals describe the
+/// packet that shipped rather than what a layer offered before dedupe and the claim cap.
+struct ClaimSourcePhase {
+    before: usize,
+}
+
+impl ClaimSourcePhase {
+    fn start(claims: &[PacketClaimDto]) -> Self {
+        Self {
+            before: claims.len(),
+        }
+    }
+
+    fn finish(
+        self,
+        source: PacketClaimSource,
+        claims: &[PacketClaimDto],
+        telemetry: &mut PacketClaimTelemetry,
+    ) {
+        telemetry.record_claim_source(source, claims.len().saturating_sub(self.before));
     }
 }
 
@@ -309,13 +366,16 @@ fn packet_append_source_derived_flow_claims(
     citations: &[AgentCitationDto],
     claims: &mut Vec<PacketClaimDto>,
     seen: &mut HashSet<String>,
+    telemetry: &mut PacketClaimTelemetry,
 ) {
     for citation in citations.iter().take(24) {
         let source = match packet_citation_source_text(citation) {
             Some(source) if source.len() <= 800_000 => source,
             _ => continue,
         };
-        for claim in packet_source_derived_claims_for_citation(prompt, citation, &source) {
+        for claim in
+            packet_source_derived_claims_for_citation_counted(prompt, citation, &source, telemetry)
+        {
             let claim_citation =
                 packet_preferred_source_derived_claim_citation(&claim, citation, citations);
             // The pending source-derived profiles still return prose only, so they cannot declare

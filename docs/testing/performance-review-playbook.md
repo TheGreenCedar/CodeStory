@@ -309,9 +309,22 @@ banned marker outside that inventory, on one more occurrence of a marker inside
 it, and on any listed entry that stops matching, so both growing and deleting
 such a surface must edit the inventory. The inventory is bounded and
 attributable as well as recorded: every surface carries a reason and the issue
-tracking its deletion, and its declared `total_markers` must equal the number of
-markers listed, so it cannot grow without a reviewable diff that raises a stated
-number.
+tracking its deletion, its declared `total_markers` must equal the number of
+markers listed, and its declared `total_marker_occurrences` must equal the sum of
+their counts, so neither the number of surfaces nor the number of production
+lines they occupy can move without a reviewable diff that restates both numbers.
+
+The same file carries the `pending_claim_profiles` ratchet: how many product
+claim profiles still ship without an anti-overfit contract and fixture pair. The
+lint counts the declarations in the registry, so a new uncontracted profile
+cannot land without raising a stated number and migrating one cannot land
+without lowering it and the matching
+`PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. Every packet also
+publishes `packet_claim_profile_contract`, `packet_claim_profile_fire_rates`, and
+`packet_claim_sources` into its retrieval trace, so which profiles fired — and
+whether the packet fell back to name-derived templates — is observable in the
+field. Those annotations carry static profile ids and integers only; no citation
+name, path, or source text enters them.
 
 The inventory is executable rather than documentation-only. Supported text and
 configuration files under `scripts/`, `.github/scripts/`,

@@ -20,6 +20,7 @@ use crate::agent::packet_capping::{
     cap_citations, cap_packet_citations, promote_focus_neighborhood_citations,
     promote_required_probe_citations,
 };
+use crate::agent::packet_claim_profiles::packet_claim_profile_registry_summary;
 #[cfg(test)]
 use crate::agent::packet_claim_profiles::{
     packet_generic_css_animation_flow_claims, packet_generic_string_predicate_flow_claims,
@@ -27,7 +28,11 @@ use crate::agent::packet_claim_profiles::{
 };
 #[cfg(test)]
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
-use crate::agent::packet_claims::{packet_flow_claims_markdown, packet_supported_claims};
+#[cfg(test)]
+use crate::agent::packet_claims::packet_supported_claims;
+use crate::agent::packet_claims::{
+    packet_flow_claims_markdown, packet_supported_claims_with_telemetry,
+};
 use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
@@ -36,7 +41,7 @@ use crate::agent::packet_evidence_roles::{
 use crate::agent::packet_obligations::build_packet_obligation_plan;
 use crate::agent::packet_obligations::{
     append_packet_probe_obligations, bind_claims_to_packet_obligations,
-    finalize_packet_obligation_plan, packet_claims_with_obligation_receipts,
+    finalize_packet_obligation_plan, packet_claims_with_obligation_receipts_and_telemetry,
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
@@ -852,14 +857,18 @@ fn append_packet_evidence_sections(
         },
     );
 
-    let mut claims = if let Some(obligations) = obligations {
-        packet_claims_with_obligation_receipts(answer, obligations)
+    let (mut claims, claim_telemetry) = if let Some(obligations) = obligations {
+        packet_claims_with_obligation_receipts_and_telemetry(answer, obligations)
     } else {
-        packet_supported_claims(answer)
+        packet_supported_claims_with_telemetry(answer)
     };
     if let Some(obligations) = obligations {
         bind_claims_to_packet_obligations(obligations, &mut claims);
     }
+    answer
+        .retrieval_trace
+        .annotations
+        .extend(claim_telemetry.trace_annotations(packet_claim_profile_registry_summary()));
     if !claims.is_empty() {
         answer.sections.insert(
             1,
@@ -8470,6 +8479,87 @@ mod tests {
             !text.contains("`PacketRegression` covers regression behavior"),
             "test-path regression claims should not crowd out primary flow claims: {text}"
         );
+    }
+
+    #[test]
+    fn packet_evidence_sections_publish_claim_profile_fire_rates_without_source_text() {
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script_path = temp.path().join("install-runtime.sh");
+        let source = "install_runtime() {\n  SOURCE_STR='[ -s \"$TOOL_DIR/runtime.sh\" ] && source \"$TOOL_DIR/runtime.sh\"'\n  download_file \"$RUNTIME_SOURCE\" \"$TOOL_DIR/runtime.sh\"\n}\n";
+        std::fs::write(&script_path, source).expect("write shell fixture");
+        let script_display = script_path.to_string_lossy().to_string();
+        let prompt = "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "install_runtime",
+                &script_display,
+                0.9,
+            )],
+        );
+
+        append_packet_evidence_sections(
+            &mut answer,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &limits,
+            None,
+        );
+
+        let annotations = &answer.retrieval_trace.annotations;
+        let contract = annotations
+            .iter()
+            .find(|line| line.starts_with("packet_claim_profile_contract "))
+            .expect("contract telemetry annotation");
+        let summary = packet_claim_profile_registry_summary();
+        assert!(
+            contract.contains(&format!("profiles={}", summary.registered))
+                && contract.contains(&format!("pending={}", summary.pending))
+                && contract.contains(&format!("pending_ratchet={}", summary.pending_ratchet))
+                && contract.contains("citations_considered=1"),
+            "contract telemetry must publish the registry shape: {contract}"
+        );
+
+        let fire_rates = annotations
+            .iter()
+            .find(|line| line.starts_with("packet_claim_profile_fire_rates"))
+            .expect("fire-rate telemetry annotation");
+        assert!(
+            fire_rates.contains("shell-install-dispatch=1/1"),
+            "a fired profile must be visible in the packet trace: {fire_rates}"
+        );
+        assert!(
+            fire_rates.contains("buffered-io=0/1"),
+            "a profile that did not fire must still report its denominator: {fire_rates}"
+        );
+
+        let sources = annotations
+            .iter()
+            .find(|line| line.starts_with("packet_claim_sources"))
+            .expect("claim-source telemetry annotation");
+        assert!(
+            !sources.contains("source_profile=0"),
+            "source-derived claims must be counted apart from name-derived ones: {sources}"
+        );
+
+        for annotation in annotations
+            .iter()
+            .filter(|line| line.starts_with("packet_claim_"))
+        {
+            for leak in [
+                "install_runtime",
+                "install-runtime.sh",
+                script_display.as_str(),
+                "TOOL_DIR",
+                "download_file",
+                "bootstraps",
+            ] {
+                assert!(
+                    !annotation.contains(leak),
+                    "claim telemetry must not carry repository text `{leak}`: {annotation}"
+                );
+            }
+        }
     }
 
     #[test]

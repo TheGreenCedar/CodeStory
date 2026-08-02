@@ -693,3 +693,33 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
         }
     }
 }
+
+#[test]
+fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_builds() {
+    // ARCH-005 shipped the claim-profile contract behind `debug_assert!`, so a release
+    // binary answered from a profile whose calibration no longer held. Validation has to
+    // run in the shipped build and skip the profile it rejects.
+    let profiles = read("crates/codestory-runtime/src/agent/packet_claim_profiles.rs");
+    let production = production_source_prefix(&profiles);
+    assert!(
+        !production.contains("debug_assert"),
+        "claim-profile contract validation must not be compiled out of release builds"
+    );
+    for required in [
+        "-> Result<(), SourceClaimProfileContractViolation>",
+        "enum SourceClaimProfileContractViolation",
+        "telemetry.record_profile_skipped(profile_id, violation.code());",
+        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+    ] {
+        assert!(
+            production.contains(required),
+            "packet claim-profile registry must keep runtime validate-or-skip: missing {required}"
+        );
+    }
+
+    let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
+    assert!(
+        production_source_prefix(&telemetry).contains("PACKET_CLAIM_PROFILE_CONTRACT_VERSION"),
+        "packet claim-profile telemetry must publish a contract version"
+    );
+}

@@ -124,6 +124,75 @@ function structuredFinding(message) {
   return { kind: "lint", pattern: null, file: null, message: String(message) };
 }
 
+const pendingSurfaceIssuePattern =
+  /^https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+$/;
+const pendingSurfaceReasonFloor = 60;
+
+// Both declared totals have to be exact: `total_markers` is how many markers are
+// listed, `total_marker_occurrences` is how many production lines they occupy.
+// Counting only the markers let a surface grow line by line under an unchanged
+// number, so the second total is what makes the inventory a size bound rather
+// than an entry bound. Either total drifting fails the lint in both directions.
+export function pendingInventoryTotalsProblem(inventory) {
+  let markers = 0;
+  let occurrences = 0;
+  for (const entry of Object.values(inventory?.surfaces ?? {})) {
+    const counts = Object.entries(entry?.markers ?? {});
+    markers += counts.length;
+    occurrences += counts.reduce((total, [, count]) => total + count, 0);
+  }
+  for (
+    const [field, declared, listed, unit] of [
+      ["total_markers", inventory?.total_markers, markers, "markers"],
+      [
+        "total_marker_occurrences",
+        inventory?.total_marker_occurrences,
+        occurrences,
+        "occurrences",
+      ],
+    ]
+  ) {
+    if (declared !== listed) {
+      return `pending inventory declares ${field} ${JSON.stringify(declared)} but lists `
+        + `${listed} ${unit}; the declared total is the bound on this file and must match it `
+        + "exactly";
+    }
+  }
+  return null;
+}
+
+// The uncontracted claim profiles are the other half of this debt: each one
+// answers on shape alone, with no fixture proving it does not fire on a helper.
+// The inventory states how many are left and the lint counts the declarations,
+// so a new uncontracted profile cannot land without raising a stated number and
+// migrating one cannot land without lowering it.
+export function pendingClaimProfileProblem(declared, readSource) {
+  if (
+    typeof declared !== "object" || declared == null || Array.isArray(declared)
+    || typeof declared.file !== "string" || declared.file.length === 0
+    || typeof declared.declaration !== "string" || declared.declaration.length === 0
+    || !Number.isInteger(declared.count) || declared.count < 0
+    || typeof declared.reason !== "string"
+    || declared.reason.trim().length < pendingSurfaceReasonFloor
+    || typeof declared.issue !== "string"
+    || !pendingSurfaceIssuePattern.test(declared.issue.trim())
+  ) {
+    return "pending_claim_profiles must declare file, declaration, a non-negative count, a "
+      + `reason of at least ${pendingSurfaceReasonFloor} characters, and the issue tracking the `
+      + "migration";
+  }
+  const source = readSource(declared.file);
+  if (source == null) {
+    return `pending_claim_profiles names ${declared.file}, which the tree no longer has`;
+  }
+  const observed = source.split(declared.declaration).length - 1;
+  if (observed !== declared.count) {
+    return `${declared.file}: ${declared.declaration} declared ${declared.count} time(s), `
+      + `tree has ${observed}`;
+  }
+  return null;
+}
+
 export function runRetrievalGeneralizationLint({
   repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
   productionRepositoryRoot = repositoryRoot,
@@ -2987,44 +3056,52 @@ function isEvalOnlyProductionFile(filePath) {
 // file.
 //
 // It is also bounded and attributable. Every surface has to carry a reason and
-// the issue that tracks its deletion, and the declared `total_markers` has to
-// equal the number of markers actually listed - no slack in either direction.
-// Recording one more marker is therefore a reviewable diff that raises a stated
-// number and answers "why is this still here", and deleting a surface forces
-// that number down.
-const pendingSurfaceIssuePattern =
-  /^https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+$/;
-const pendingSurfaceReasonFloor = 60;
-
+// the issue that tracks its deletion, and both declared totals have to be exact
+// (see `pendingInventoryTotalsProblem`). Recording one more line is therefore a
+// reviewable diff that raises a stated number and answers "why is this still
+// here", and deleting a surface forces both numbers down.
 function loadPendingSurfaces() {
-  let inventory;
-  try {
-    inventory = JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
-  } catch (error) {
-    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
-    process.exit(2);
-  }
+  const inventory = readPendingInventory();
   const surfaces = new Map();
-  let declaredMarkers = 0;
   for (const [file, entry] of Object.entries(inventory?.surfaces ?? {})) {
     const problem = pendingSurfaceEntryProblem(entry);
     if (problem != null) {
       console.error(`lint-retrieval-generalization: invalid pending entry for ${file}: ${problem}`);
       process.exit(2);
     }
-    const counts = Object.entries(entry.markers);
-    declaredMarkers += counts.length;
-    surfaces.set(path.resolve(repoRoot, file), new Map(counts));
+    surfaces.set(path.resolve(repoRoot, file), new Map(Object.entries(entry.markers)));
   }
-  if (inventory?.total_markers !== declaredMarkers) {
-    console.error(
-      `lint-retrieval-generalization: pending inventory declares total_markers `
-      + `${JSON.stringify(inventory?.total_markers)} but lists ${declaredMarkers}; `
-      + `the declared total is the bound on this file and must match it exactly`,
-    );
+  const totalsProblem = pendingInventoryTotalsProblem(inventory);
+  if (totalsProblem != null) {
+    console.error(`lint-retrieval-generalization: ${totalsProblem}`);
     process.exit(2);
   }
   return surfaces;
+}
+
+function readPendingInventory() {
+  try {
+    return JSON.parse(readFileSync(pendingSurfacePath, "utf8"));
+  } catch (error) {
+    console.error(`lint-retrieval-generalization: unreadable pending inventory: ${error}`);
+    process.exit(2);
+  }
+  return undefined;
+}
+
+function pendingClaimProfileDrift() {
+  // The inventory describes the shipped tree; a caller-supplied scan root has no
+  // reason to reach the claim-profile registry.
+  if (!validatePendingSurfaceInventory || !usesDefaultScanRoots) {
+    return null;
+  }
+  return pendingClaimProfileProblem(
+    readPendingInventory()?.pending_claim_profiles,
+    (file) => {
+      const profilePath = path.resolve(repoRoot, file);
+      return existsSync(profilePath) ? readFileSync(profilePath, "utf8") : null;
+    },
+  );
 }
 
 function pendingSurfaceEntryProblem(entry) {
@@ -3443,6 +3520,14 @@ if (stalePending.length > 0) {
   failed = true;
 }
 
+const claimProfileDrift = pendingClaimProfileDrift();
+if (claimProfileDrift != null) {
+  console.error(
+    `Pending claim-profile ratchet no longer matches the tree; restate it in ${path.relative(repoRoot, pendingSurfacePath)}:\n${claimProfileDrift}\n`,
+  );
+  failed = true;
+}
+
 if (failed) {
   console.error(
     "retrieval generalization lint failed: remove eval/query dependencies from protected product paths",
@@ -3452,8 +3537,13 @@ if (failed) {
 
 const pendingSurfaceCount = [...pendingSurfaces.values()]
   .reduce((total, markers) => total + markers.size, 0);
+const pendingOccurrenceCount = [...pendingSurfaces.values()].reduce(
+  (total, markers) => total + [...markers.values()].reduce((sum, count) => sum + count, 0),
+  0,
+);
+const pendingClaimProfileCount = readPendingInventory()?.pending_claim_profiles?.count ?? 0;
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) in ${pendingSurfaces.size} file(s) awaiting deletion)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns, ${pendingSurfaceCount} pending benchmark-family surface(s) over ${pendingOccurrenceCount} production line(s) in ${pendingSurfaces.size} file(s) awaiting deletion, ${pendingClaimProfileCount} uncontracted claim profile(s))`,
 );
     return result(0);
   } catch (error) {
