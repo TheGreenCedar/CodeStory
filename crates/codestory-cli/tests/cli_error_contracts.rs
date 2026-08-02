@@ -639,6 +639,54 @@ fn read_command_without_cache_reports_recovery_command() {
 }
 
 #[test]
+fn unknown_config_keys_reach_the_terminal_by_name_without_their_values() {
+    // Schema version 1 (the default when `.codestory.toml` omits the key) must
+    // warn on a surface a person actually reads. The process diagnostics sink
+    // is a private rotating file that redacts free-form text, so a warning that
+    // only reaches it names nothing and repairs nothing.
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    fs::write(
+        workspace.path().join(".codestory.toml"),
+        "hybrid_retrieval_enabled = true\nembedding_query_prefix = \"unshared-prefix-value\"\n",
+    )
+    .expect("write project config");
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("embedding_query_prefix"),
+        "the unknown key must be named on stderr\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unshared-prefix-value"),
+        "the warning must never echo a configured value\nstderr:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("embedding_query_prefix"),
+        "stdout stays reserved for the machine-readable envelope\nstdout:\n{stdout}"
+    );
+    // The command still runs: version 1 loads the file and ignores the key.
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["error"]["code"], "command_failed");
+}
+
+#[test]
 fn missing_output_parent_is_rejected_before_runtime_cache_creation() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

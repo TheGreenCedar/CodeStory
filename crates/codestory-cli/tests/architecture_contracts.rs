@@ -683,15 +683,21 @@ fn production_sources() -> Vec<(String, String)> {
 }
 
 #[test]
-fn environment_identities_are_declared_in_the_config_registry_with_one_owner() {
+fn environment_identities_are_spelled_only_where_the_config_registry_declares_them() {
     // ARCH-021: every environment knob must exist in
     // codestory_contracts::config_registry, which is what generates the
     // configuration reference and records the module accountable for the
-    // setting. A second file spelling the same identity is the ambient read
-    // that let the same variable mean two things in two crates.
+    // setting. A second file spelling the same identity is the ad-hoc read that
+    // let the same variable mean two things in two crates.
+    //
+    // Scope, stated so the registry and the generated page can be held to it:
+    // this checks the *spelling* of an identity, not who reads it. Modules
+    // other than the declaring one legitimately read a setting by importing the
+    // constant, so neither this contract nor the page it generates asserts a
+    // single reader.
     let identity = production_environment_identities();
     let mut undeclared = Vec::new();
-    let mut misowned = Vec::new();
+    let mut misspelled = Vec::new();
     for (name, files) in &identity {
         let Some(setting) = codestory_contracts::config_registry::env_setting(name) else {
             let spelled_in = files.iter().map(String::as_str).collect::<Vec<_>>();
@@ -700,8 +706,8 @@ fn environment_identities_are_declared_in_the_config_registry_with_one_owner() {
         };
         for file in files {
             if file != setting.owner {
-                misowned.push(format!(
-                    "{name} is spelled in {file} but the registry owner is {}",
+                misspelled.push(format!(
+                    "{name} is spelled in {file} but the registry declares it in {}",
                     setting.owner
                 ));
             }
@@ -713,18 +719,18 @@ fn environment_identities_are_declared_in_the_config_registry_with_one_owner() {
         undeclared.join("\n")
     );
     assert!(
-        misowned.is_empty(),
+        misspelled.is_empty(),
         "import the identity from codestory_contracts::config_registry instead of spelling it:\n{}",
-        misowned.join("\n")
+        misspelled.join("\n")
     );
 }
 
 #[test]
-fn config_registry_owners_name_real_production_files() {
+fn config_registry_declaration_sites_name_real_production_files() {
     for setting in codestory_contracts::config_registry::ENV_SETTINGS {
         assert!(
             repo_root().join(setting.owner).is_file(),
-            "{} names a missing owner {}",
+            "{} names a missing declaration site {}",
             setting.name,
             setting.owner
         );

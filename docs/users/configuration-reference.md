@@ -29,13 +29,17 @@ CodeStory reads configuration from two places: `.codestory.toml` files and the p
 | 2 | rejected | the command fails with `unknown_config_key` |
 | above 2 | not interpreted | the command fails with `unsupported_config_schema` |
 
-Warnings and errors name unknown keys. They never repeat a configured value, so a mistyped credential key cannot reach a log line.
+The version 1 warning is printed to standard error, so it reaches the terminal without disturbing command output. Warnings and errors name unknown keys. They never repeat a configured value, so a mistyped credential key cannot reach a log line.
 
-## Supported environment variables
+## Environment variables
+
+`Declared in` names the one production source file allowed to spell the variable; every other module reads the setting by importing that identity, which is what keeps one name per knob. It is not a claim that the named file is the only reader.
+
+### Supported environment variables
 
 Operator-facing settings. Environment values win over `.codestory.toml`.
 
-| Variable | Type | Owner | Meaning |
+| Variable | Type | Declared in | Meaning |
 | --- | --- | --- | --- |
 | `CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS` | integer | `crates/codestory-cli/src/app/readiness_commands/preflight.rs` | Milliseconds `agent preflight` waits for a local refresh before reporting. |
 | `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | boolean | `crates/codestory-cli/src/config.rs` | Process-wide opt-in that lets project `.codestory.toml` files set summary network keys. |
@@ -63,11 +67,11 @@ Operator-facing settings. Environment values win over `.codestory.toml`.
 | `CODESTORY_SUMMARY_MODEL` | text | `crates/codestory-retrieval/src/config.rs` | Model name sent to the symbol summary endpoint. |
 | `CODESTORY_SUMMARY_TIMEOUT_SECS` | integer | `crates/codestory-retrieval/src/config.rs` | Seconds a symbol summary request may take, clamped to 1-300. |
 
-## Host-provided environment variables
+### Host-provided environment variables
 
 The plugin launcher and installed hosts set these. Setting them by hand misreports provisioning provenance.
 
-| Variable | Type | Owner | Meaning |
+| Variable | Type | Declared in | Meaning |
 | --- | --- | --- | --- |
 | `CODESTORY_CLI` | path | `crates/codestory-cli/src/runtime.rs` | Executable an installed host launches instead of the provisioned CLI. |
 | `CODESTORY_LATEST_RELEASE_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Latest published version supplied by the host instead of a live release probe. |
@@ -95,11 +99,11 @@ The plugin launcher and installed hosts set these. Setting them by hand misrepor
 | `CODESTORY_PLUGIN_RUNTIME_CWD` | path | `crates/codestory-cli/src/stdio_transport.rs` | Working directory the runtime binary should adopt. |
 | `CODESTORY_PLUGIN_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Version of the installed plugin package. |
 
-## Diagnostic environment variables
+### Diagnostic environment variables
 
 Rollout and diagnostic switches. They are not product configuration and may change or disappear without a compatibility window.
 
-| Variable | Type | Owner | Meaning |
+| Variable | Type | Declared in | Meaning |
 | --- | --- | --- | --- |
 | `CODESTORY_DISABLE_INSTALLED_CLI_PROBE` | boolean | `crates/codestory-cli/src/stdio_transport.rs` | Suppresses the installed-CLI probe that status reports as provisioning evidence. |
 | `CODESTORY_DISABLE_RELEASE_PROBE` | boolean | `crates/codestory-cli/src/stdio_transport.rs` | Suppresses the latest-release probe and records the probe source as disabled. |
@@ -127,11 +131,11 @@ Rollout and diagnostic switches. They are not product configuration and may chan
 | `CODESTORY_RETRIEVAL_SHADOW` | boolean | `crates/codestory-runtime/src/agent/retrieval_primary.rs` | Runs published retrieval beside the incumbent path for comparison. |
 | `CODESTORY_SYMBOL_FULL_TEXT_INDEX` | boolean | `crates/codestory-runtime/src/search/engine.rs` | Builds the symbol full-text index (default on). |
 
-## Test-harness environment variables
+### Test-harness environment variables
 
 Only the test suites set these. They drive failure shapes that must never occur in a product run.
 
-| Variable | Type | Owner | Meaning |
+| Variable | Type | Declared in | Meaning |
 | --- | --- | --- | --- |
 | `CODESTORY_TEST_EMBED_ALLOW_CPU` | boolean | `crates/codestory-retrieval/src/config.rs` | Test-support builds only: exercises CPU-shaped embedding failures. |
 | `CODESTORY_TEST_PROMOTION_ABORT_SENTINEL` | path | `crates/codestory-store/src/storage_impl/mod.rs` | Sentinel path that aborts a promotion mid-flight to prove crash recovery. |
