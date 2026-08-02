@@ -61,6 +61,25 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
+/// `COALESCE(resolved_source_node_id, source_node_id) = ?1` is spelled as two
+/// branches because only a branch is index-seekable; the branches stay disjoint
+/// on `resolved_source_node_id IS NULL`, so their union is exactly the edges
+/// whose `Edge::effective_source` is `?1`. Both branches pin their index because
+/// an unpinned planner reads `resolved_source_node_id IS NULL` as the more
+/// selective term and seeks every unresolved CALL edge in the repository.
+/// `raw_call_edges_by_effective_source_plan_seeks_both_branches` holds the shape.
+/// Every pinned index is created for any live store (schema.rs:396,415).
+const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids
+     FROM edge e INDEXED BY idx_edge_resolved_source
+     WHERE e.resolved_source_node_id = ?1
+       AND e.kind = ?2
+     UNION ALL
+     SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id, e.line, e.resolved_source_node_id, e.resolved_target_node_id, e.confidence, e.callsite_identity, e.certainty, e.candidate_target_node_ids
+     FROM edge e INDEXED BY idx_edge_kind_source
+     WHERE e.kind = ?2
+       AND e.source_node_id = ?1
+       AND e.resolved_source_node_id IS NULL
+     ORDER BY id ASC";
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -6426,6 +6445,28 @@ impl Storage {
         Ok(edges)
     }
 
+    /// Reads the CALL edges whose effective source is `source_node_id`, unpolicied.
+    ///
+    /// Route metadata reports the persisted resolution of a handler call, so this
+    /// accessor deliberately skips the trail policy that
+    /// [`Self::get_edges_for_node_ids`] applies: that policy clears
+    /// `resolved_target`, `confidence`, and `certainty` on uncertain and
+    /// common-unqualified calls, which are exactly the fields the route handler
+    /// DTO reports. Every other field, and the edge-ID row order, match filtering
+    /// [`Self::get_edges`] by `Edge::effective_source`.
+    pub fn get_raw_call_edges_by_effective_source(
+        &self,
+        source_node_id: NodeId,
+    ) -> Result<Vec<Edge>, StorageError> {
+        let mut stmt = self.conn.prepare(RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL)?;
+        let mut rows = stmt.query(params![source_node_id.0, EdgeKind::CALL as i32])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        Ok(edges)
+    }
+
     pub fn get_edges_for_node_ids(
         &self,
         node_ids: &[NodeId],
@@ -11225,6 +11266,60 @@ impl Storage {
             nodes.push(Self::node_from_row(row)?);
         }
         Ok(nodes)
+    }
+
+    /// Returns the subset of `node_ids` that has at least one child symbol.
+    ///
+    /// Membership is exactly `!get_children_symbols(id).is_empty()`, so the
+    /// `node` join stays: a MEMBER edge whose target row is absent yields no
+    /// child there and must yield no presence here. Input IDs carry set
+    /// semantics and each SQLite bind-limit chunk runs one statement, replacing
+    /// one materialising child query per rendered symbol.
+    pub fn node_ids_with_child_symbols(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashSet<NodeId>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for child-presence lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support child-presence lookup".to_string(),
+            ));
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|node_id| node_id.0);
+        unique_node_ids.dedup();
+
+        let kind_member = codestory_contracts::graph::EdgeKind::MEMBER as i32;
+        let mut with_children = HashSet::new();
+        for batch in unique_node_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            // The MEMBER kind is an inlined enum discriminant so a chunk binds
+            // exactly `variable_limit` values.
+            let query = format!(
+                "SELECT DISTINCT e.source_node_id
+                 FROM edge e
+                 JOIN node n ON n.id = e.target_node_id
+                 WHERE e.source_node_id IN ({placeholders})
+                   AND e.kind = {kind_member}"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                with_children.insert(NodeId(row.get(0)?));
+            }
+        }
+        Ok(with_children)
     }
 
     /// Return store counts, preferring ready summary snapshots when available.

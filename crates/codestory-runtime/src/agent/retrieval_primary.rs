@@ -1624,6 +1624,39 @@ fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
             .any(|path| path.exists())
 }
 
+/// Order the resolvable candidates ahead of the unresolvable ones, by score.
+///
+/// `path_resolvable` stats the filesystem, so it is decorated once per surviving
+/// candidate instead of once per comparison, and the resolved verdict is handed
+/// back for the unresolved-candidate label. The comparator is unchanged, so a
+/// NaN score still compares equal and stable sorting keeps input order for ties.
+fn ordered_sidecar_candidates<F>(
+    candidates: &[CandidateHit],
+    mut path_resolvable: F,
+) -> Vec<(usize, &CandidateHit, bool)>
+where
+    F: FnMut(&CandidateHit) -> bool,
+{
+    let mut ordered = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
+        .map(|(index, candidate)| {
+            let resolvable = path_resolvable(candidate);
+            (index, candidate, resolvable)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(_, left, left_resolvable), (_, right, right_resolvable)| {
+        right_resolvable.cmp(left_resolvable).then(
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    ordered
+}
+
 fn candidate_path_text_is_path_like(path: &str) -> bool {
     let trimmed = path.trim();
     !trimmed.is_empty()
@@ -1818,23 +1851,11 @@ fn resolve_sidecar_candidates_in_storage(
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashSet::new();
-    let mut ordered: Vec<(usize, &CandidateHit)> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
-        .collect();
-    ordered.sort_by(|(_, left), (_, right)| {
-        let left_resolvable = candidate_path_resolvable(project_root, &left.file_path);
-        let right_resolvable = candidate_path_resolvable(project_root, &right.file_path);
-        right_resolvable.cmp(&left_resolvable).then(
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+    let ordered = ordered_sidecar_candidates(candidates, |candidate| {
+        candidate_path_resolvable(project_root, &candidate.file_path)
     });
 
-    for (candidate_index, candidate) in ordered {
+    for (candidate_index, candidate, path_resolvable) in ordered {
         if hits.len() >= max_results {
             break;
         }
@@ -1843,7 +1864,7 @@ fn resolve_sidecar_candidates_in_storage(
         let Some(node_id) =
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         else {
-            let label = if candidate_path_resolvable(project_root, &candidate.file_path) {
+            let label = if path_resolvable {
                 "node_unresolved"
             } else {
                 "path_unresolvable"
@@ -2360,6 +2381,111 @@ mod tests {
             ),
             "source-root path should resolve through src/test/java"
         );
+    }
+
+    #[test]
+    fn sidecar_candidate_order_evaluates_path_resolution_once_per_candidate() {
+        let candidates = vec![
+            CandidateHit::lexical_stub("ok/equal-a.rs", 1.0),
+            CandidateHit::lexical_stub("ok/equal-b.rs", 1.0),
+            CandidateHit::lexical_stub("missing/high.rs", 100.0),
+            CandidateHit::lexical_stub("lexical:phantom", 500.0),
+        ];
+        let mut evaluations = 0usize;
+        let ordered = ordered_sidecar_candidates(&candidates, |candidate| {
+            evaluations += 1;
+            candidate.file_path.starts_with("ok/")
+        });
+        assert_eq!(
+            evaluations, 3,
+            "path resolution must run once per surviving candidate"
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(index, candidate, resolvable)| (
+                    *index,
+                    candidate.file_path.as_str(),
+                    *resolvable
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "ok/equal-a.rs", true),
+                (1, "ok/equal-b.rs", true),
+                (2, "missing/high.rs", false),
+            ],
+            "resolvability stays the primary key and equal scores keep input order"
+        );
+
+        let nan_candidates = vec![
+            CandidateHit::lexical_stub("ok/nan.rs", f32::NAN),
+            CandidateHit::lexical_stub("ok/finite.rs", 2.0),
+        ];
+        let ordered = ordered_sidecar_candidates(&nan_candidates, |_| true);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, candidate, _)| candidate.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok/nan.rs", "ok/finite.rs"],
+            "a NaN score must stay comparator-equal and stable"
+        );
+    }
+
+    #[test]
+    fn sidecar_candidate_order_matches_the_recomputing_comparator() {
+        // The zero-movement claim rests on this: decorating the resolvable
+        // verdict must be a permutation-for-permutation replacement of the
+        // comparator that stat'ed the filesystem on every comparison.
+        let scores = [
+            1.0_f32,
+            f32::NAN,
+            1.0,
+            50.0,
+            -3.0,
+            f32::NAN,
+            0.0,
+            50.0,
+            f32::INFINITY,
+        ];
+        let resolvable = |path: &str| path.starts_with("ok/");
+        for window in 1..=scores.len() {
+            for offset in 0..=(scores.len() - window) {
+                let candidates = scores[offset..offset + window]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, score)| {
+                        let prefix = if index.is_multiple_of(3) { "ok" } else { "no" };
+                        CandidateHit::lexical_stub(format!("{prefix}/candidate-{index}.rs"), *score)
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut previous = candidates.iter().enumerate().collect::<Vec<_>>();
+                previous.sort_by(|(_, left), (_, right)| {
+                    let left_resolvable = resolvable(&left.file_path);
+                    let right_resolvable = resolvable(&right.file_path);
+                    right_resolvable.cmp(&left_resolvable).then(
+                        right
+                            .score
+                            .partial_cmp(&left.score)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                });
+
+                let current = ordered_sidecar_candidates(&candidates, |candidate| {
+                    resolvable(&candidate.file_path)
+                });
+
+                assert_eq!(
+                    current
+                        .iter()
+                        .map(|(index, _, _)| *index)
+                        .collect::<Vec<_>>(),
+                    previous.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                    "candidate order moved for window={window} offset={offset}"
+                );
+            }
+        }
     }
 
     #[test]

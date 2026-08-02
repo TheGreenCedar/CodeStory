@@ -9564,3 +9564,404 @@ fn test_grounding_edge_digests_ignore_ambiguous_resolved_targets() -> Result<(),
 
     Ok(())
 }
+
+#[test]
+fn raw_call_edges_by_effective_source_match_the_broad_edge_filter() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/routes.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "route".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(11),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "raw_caller".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            // A very common unqualified call name, so trail policy clears any
+            // resolution below `Certain`.
+            id: NodeId(20),
+            kind: NodeKind::METHOD,
+            serialized_name: "insert".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(21),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "handler".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(22),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        // Unresolved source, so the effective source is the raw source.
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(7),
+            resolved_target: Some(NodeId(21)),
+            confidence: Some(0.42),
+            callsite_identity: Some("routes.rs:7:handler".to_string()),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            candidate_targets: vec![NodeId(21), NodeId(22)],
+            ..Default::default()
+        },
+        // A resolved source rewrites the effective source onto the route node.
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(11),
+            target: NodeId(20),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(10)),
+            resolved_target: Some(NodeId(20)),
+            confidence: Some(0.8),
+            certainty: Some(ResolutionCertainty::Probable),
+            ..Default::default()
+        },
+        // Same raw source, but the resolved source moves it elsewhere.
+        Edge {
+            id: EdgeId(3),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_source: Some(NodeId(11)),
+            ..Default::default()
+        },
+        // Right source, wrong kind.
+        Edge {
+            id: EdgeId(4),
+            source: NodeId(10),
+            target: NodeId(21),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        // A later unresolved-branch edge, so the two branches interleave by id.
+        Edge {
+            id: EdgeId(5),
+            source: NodeId(10),
+            target: NodeId(22),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(21)),
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(0.99),
+            ..Default::default()
+        },
+    ])?;
+
+    let expected = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(10))
+        .collect::<Vec<_>>();
+    let selective = storage.get_raw_call_edges_by_effective_source(NodeId(10))?;
+    assert_eq!(
+        selective, expected,
+        "selective route lookup diverged from the broad edge filter"
+    );
+    assert_eq!(
+        selective.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2), EdgeId(5)],
+        "selective route lookup lost deterministic edge-id order across branches"
+    );
+
+    // The trail accessor is not a substitute: its policy clears exactly the
+    // resolution fields the route-handler DTO reports, for both the uncertain
+    // call and the probable common-name call.
+    let trail_edges = storage.get_edges_for_node_id(NodeId(10))?;
+    for edge_id in [EdgeId(1), EdgeId(2)] {
+        let policied = trail_edges
+            .iter()
+            .find(|edge| edge.id == edge_id)
+            .unwrap_or_else(|| panic!("trail lookup returns {edge_id:?}"));
+        assert_eq!(policied.resolved_target, None, "{edge_id:?}");
+        assert_eq!(policied.certainty, None, "{edge_id:?}");
+        assert_eq!(policied.confidence, None, "{edge_id:?}");
+    }
+    let raw_uncertain = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(1))
+        .expect("raw lookup returns the uncertain call");
+    assert_eq!(raw_uncertain.resolved_target, Some(NodeId(21)));
+    assert_eq!(
+        raw_uncertain.certainty,
+        Some(ResolutionCertainty::Uncertain)
+    );
+    assert_eq!(raw_uncertain.confidence, Some(0.42));
+    let raw_common = selective
+        .iter()
+        .find(|edge| edge.id == EdgeId(2))
+        .expect("raw lookup returns the resolved-source call");
+    assert_eq!(raw_common.resolved_target, Some(NodeId(20)));
+    assert_eq!(raw_common.certainty, Some(ResolutionCertainty::Probable));
+    assert_eq!(raw_common.confidence, Some(0.8));
+
+    assert!(
+        storage
+            .get_raw_call_edges_by_effective_source(NodeId(22))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_route_edge_lookup_costs_less_vm_work_than_the_broad_edge_scan() -> Result<(), StorageError> {
+    const REPRESENTATIVE_NODE_COUNT: i64 = 12_000;
+    const REPRESENTATIVE_EDGE_COUNT: i64 = 48_000;
+    const ROUTE_NODE_ID: i64 = 7;
+
+    let storage = Storage::new_in_memory()?;
+    let call_kind = EdgeKind::CALL as i32;
+    storage.conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_NODE_COUNT}
+         )
+         INSERT INTO node(id, kind, serialized_name)
+         SELECT value, 3, printf('node-%d', value) FROM sequence;
+         WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_EDGE_COUNT}
+         )
+         INSERT INTO edge(
+             id,
+             source_node_id,
+             target_node_id,
+             kind,
+             resolved_source_node_id
+         )
+         SELECT
+             value,
+             (value % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             ((value * 17) % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             {call_kind},
+             CASE WHEN value % 3 = 0 THEN ((value * 19) % {REPRESENTATIVE_NODE_COUNT}) + 1 END
+         FROM sequence;"
+    ))?;
+
+    let plan = storage
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL}"
+        ))?
+        .query_map(rusqlite::params![ROUTE_NODE_ID, call_kind], |row| {
+            row.get::<_, String>(3)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_resolved_source")),
+        "route lookup lost the resolved-source index: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_edge_kind_source")),
+        "route lookup lost the kind/source index: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|line| !line.contains("SCAN e")),
+        "route lookup still scans the edge table: {plan:?}"
+    );
+
+    let count_vm_steps = |run: &dyn Fn() -> Result<Vec<Edge>, StorageError>| {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&callbacks);
+        storage.conn.progress_handler(
+            100,
+            Some(move || {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+                false
+            }),
+        )?;
+        let edges = run()?;
+        storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+        Ok::<_, StorageError>((edges, callbacks.load(AtomicOrdering::Relaxed)))
+    };
+
+    let (broad_edges, broad_callbacks) = count_vm_steps(&|| {
+        Ok(storage
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::CALL && edge.effective_source() == NodeId(ROUTE_NODE_ID)
+            })
+            .collect())
+    })?;
+    let (selective_edges, selective_callbacks) =
+        count_vm_steps(&|| storage.get_raw_call_edges_by_effective_source(NodeId(ROUTE_NODE_ID)))?;
+
+    assert!(
+        !selective_edges.is_empty(),
+        "representative fixture produced no route edges"
+    );
+    assert_eq!(
+        selective_edges, broad_edges,
+        "selective route lookup diverged from the broad scan on the representative fixture"
+    );
+    assert!(
+        broad_callbacks > selective_callbacks.saturating_mul(5),
+        "representative route lookup VM work did not improve enough: broad={broad_callbacks}, selective={selective_callbacks}"
+    );
+    eprintln!(
+        "raw route edge representative proof: nodes={REPRESENTATIVE_NODE_COUNT} edges={REPRESENTATIVE_EDGE_COUNT} broad_callbacks={broad_callbacks} selective_callbacks={selective_callbacks}"
+    );
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_matches_per_node_children() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::CLASS,
+            serialized_name: "WithChild".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::CLASS,
+            serialized_name: "Childless".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "child".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::CLASS,
+            serialized_name: "OnlyCalls".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(1),
+            source: NodeId(1),
+            target: NodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(2),
+            source: NodeId(4),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            ..Default::default()
+        },
+    ])?;
+
+    let candidates = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(1)];
+    let batched = storage.node_ids_with_child_symbols(&candidates)?;
+    for node_id in candidates {
+        assert_eq!(
+            batched.contains(&node_id),
+            !storage.get_children_symbols(node_id)?.is_empty(),
+            "batched child presence diverged from per-node children for {node_id:?}"
+        );
+    }
+    assert!(storage.node_ids_with_child_symbols(&[])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn node_ids_with_child_symbols_runs_one_statement_per_bind_limit_chunk() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    let parents = (1..=5_i64).collect::<Vec<_>>();
+    storage.insert_nodes_batch(
+        &parents
+            .iter()
+            .map(|id| Node {
+                id: NodeId(*id),
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Parent{id}"),
+                ..Default::default()
+            })
+            .chain(std::iter::once(Node {
+                id: NodeId(100),
+                kind: NodeKind::METHOD,
+                serialized_name: "member".to_string(),
+                ..Default::default()
+            }))
+            .collect::<Vec<_>>(),
+    )?;
+    storage.insert_edges_batch(
+        &parents
+            .iter()
+            .filter(|id| **id % 2 == 1)
+            .map(|id| Edge {
+                id: EdgeId(*id),
+                source: NodeId(*id),
+                target: NodeId(100),
+                kind: EdgeKind::MEMBER,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    let node_ids = parents.iter().map(|id| NodeId(*id)).collect::<Vec<_>>();
+    let unchunked = storage.node_ids_with_child_symbols(&node_ids)?;
+    assert_eq!(
+        unchunked,
+        [NodeId(1), NodeId(3), NodeId(5)].into_iter().collect()
+    );
+
+    let previous_limit = storage.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 2)?;
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&prepares);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Select) {
+                counter.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Authorization::Allow
+        }))?;
+    let chunked = storage.node_ids_with_child_symbols(&node_ids);
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    storage
+        .conn
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    let chunked = chunked?;
+
+    assert_eq!(chunked, unchunked);
+    assert_eq!(
+        prepares.load(AtomicOrdering::Relaxed),
+        3,
+        "five candidates at a bind limit of two must run exactly three statements"
+    );
+    Ok(())
+}

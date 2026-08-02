@@ -1,25 +1,25 @@
 use super::{
-    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, EnvGuard,
-    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
+    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, Edge, EdgeId, EdgeKind,
+    EnvGuard, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
     IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
-    RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine,
-    SearchGenerationCatalogGuard, SearchGenerationCompletion, SearchHit, SearchRepoTextMode,
-    SearchRequest, SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation,
-    Storage, apply_hybrid_limits, arm_publication_test_fault,
-    assert_mandatory_retrieval_unavailable, assert_no_staged_publication_artifacts,
-    build_persisted_search_state_from_canonical_symbols, build_search_state, compare_search_hits,
-    copy_tictactoe_workspace, current_epoch_ms, dedupe_inexact_search_hits_by_display_key,
-    default_source_policy_identity, finalize_staged_semantic_docs,
-    flush_pending_dense_anchor_inputs, fs, hybrid_search_config_for_request, hybrid_test_env,
-    insert_semantic_fixture_nodes, llm_symbol_doc_hash, load_persisted_search_state,
-    merge_search_hits_by_node_id, normalized_hybrid_weights, pending_semantic_doc_for_test,
-    persisted_search_generation_names, primary_source_retention_threshold, process_env_test_lock,
-    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
-    search_generation_completion_path, search_index_generation_root,
-    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
-    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
-    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    ResolutionCertainty, RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV,
+    SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine, SearchGenerationCatalogGuard,
+    SearchGenerationCompletion, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation, Storage,
+    apply_hybrid_limits, arm_publication_test_fault, assert_mandatory_retrieval_unavailable,
+    assert_no_staged_publication_artifacts, build_persisted_search_state_from_canonical_symbols,
+    build_search_state, compare_search_hits, copy_tictactoe_workspace, current_epoch_ms,
+    dedupe_inexact_search_hits_by_display_key, default_source_policy_identity,
+    finalize_staged_semantic_docs, flush_pending_dense_anchor_inputs, fs,
+    hybrid_search_config_for_request, hybrid_test_env, insert_semantic_fixture_nodes,
+    llm_symbol_doc_hash, load_persisted_search_state, merge_search_hits_by_node_id,
+    normalized_hybrid_weights, pending_semantic_doc_for_test, persisted_search_generation_names,
+    primary_source_retention_threshold, process_env_test_lock, project_identity_v3,
+    prune_search_generations, rebuild_search_state_from_storage, search_generation_completion_path,
+    search_index_generation_root, search_index_path_for_publication, search_index_storage_path,
+    semantic_doc_text_for_test, semantic_projection_republish_for_runtime, tempdir,
+    test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
 use codestory_contracts::bounded_locks::{self, FileLockKind};
@@ -275,6 +275,218 @@ fn build_search_hit_adjusts_route_scores_by_extraction_provenance() {
     let mut hits = [text_only, ast.clone()];
     hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
     assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&ast.node_id));
+}
+
+#[test]
+fn canonical_and_openapi_route_metadata_keep_uncertain_resolved_handlers() {
+    let route_canonical_id = format!(
+        "route_endpoint:{}",
+        serde_json::json!({
+            "kind": "framework_route",
+            "framework": "express",
+            "method": "GET",
+            "path": "/api/users",
+            "provenance": ["framework:express"],
+        })
+    );
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[
+            Node {
+                id: CoreNodeId(100),
+                kind: NodeKind::FILE,
+                serialized_name: "src/routes.ts".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(101),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "GET /api/users".to_string(),
+                canonical_id: Some(route_canonical_id),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(10),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(102),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "POST /api/users".to_string(),
+                canonical_id: Some("openapi:endpoint:POST /api/users".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(20),
+                ..Default::default()
+            },
+            // The raw call targets are the router verbs the handler filter drops.
+            Node {
+                id: CoreNodeId(103),
+                kind: NodeKind::METHOD,
+                serialized_name: "get".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(104),
+                kind: NodeKind::METHOD,
+                serialized_name: "post".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(105),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "list_users".to_string(),
+                qualified_name: Some("handlers::list_users".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(40),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(106),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "create_user".to_string(),
+                qualified_name: Some("handlers::create_user".to_string()),
+                file_node_id: Some(CoreNodeId(100)),
+                start_line: Some(50),
+                ..Default::default()
+            },
+        ])
+        .expect("insert route graph");
+    storage
+        .insert_edges_batch(&[
+            Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(101),
+                target: CoreNodeId(103),
+                kind: EdgeKind::CALL,
+                resolved_target: Some(CoreNodeId(105)),
+                confidence: Some(0.25),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: CoreNodeId(102),
+                target: CoreNodeId(104),
+                kind: EdgeKind::CALL,
+                resolved_target: Some(CoreNodeId(106)),
+                confidence: Some(0.2),
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+        ])
+        .expect("insert route handler edges");
+
+    for route_id in [CoreNodeId(101), CoreNodeId(102)] {
+        let trail_edges = storage
+            .get_edges_for_node_ids(&[route_id])
+            .expect("trail edge lookup");
+        assert!(
+            trail_edges[&route_id]
+                .iter()
+                .all(|edge| edge.resolved_target.is_none()),
+            "the trail accessor must remain an invalid substitute for raw route metadata"
+        );
+    }
+
+    let controller = AppController::new();
+    for (route_id, expected_handler) in [
+        (CoreNodeId(101), NodeId("105".to_string())),
+        (CoreNodeId(102), NodeId("106".to_string())),
+    ] {
+        let route = storage
+            .get_node(route_id)
+            .expect("load route")
+            .expect("route node");
+        let metadata = controller
+            .route_endpoint_metadata(&storage, &route, Some("src/routes.ts"), "route")
+            .expect("route metadata");
+        let handler = metadata.handler.expect("resolved handler");
+        assert_eq!(handler.node_id, expected_handler);
+        assert_eq!(handler.certainty.as_deref(), Some("uncertain"));
+        assert_eq!(handler.file_path.as_deref(), Some("src/routes.ts"));
+        assert!(
+            metadata
+                .provenance
+                .iter()
+                .any(|entry| entry == "graph:handler_edge")
+        );
+    }
+}
+
+#[test]
+fn symbol_summaries_batch_child_presence_for_the_rendered_window() {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[
+            Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::CLASS,
+                serialized_name: "WithChild".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::CLASS,
+                serialized_name: "Childless".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(3),
+                kind: NodeKind::METHOD,
+                serialized_name: "child".to_string(),
+                ..Default::default()
+            },
+        ])
+        .expect("insert nodes");
+    storage
+        .insert_edges_batch(&[Edge {
+            id: EdgeId(1),
+            source: CoreNodeId(1),
+            target: CoreNodeId(3),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        }])
+        .expect("insert member edge");
+
+    let nodes = [CoreNodeId(1), CoreNodeId(2), CoreNodeId(3)]
+        .into_iter()
+        .map(|id| storage.get_node(id).expect("load node").expect("node"))
+        .collect::<Vec<_>>();
+    let labels = HashMap::from([(CoreNodeId(1), "WithChild".to_string())]);
+    let summaries = AppController::symbol_summaries_for_nodes(&storage, &labels, nodes.clone())
+        .expect("symbol summaries");
+
+    assert_eq!(summaries.len(), nodes.len());
+    for (summary, node) in summaries.iter().zip(nodes.iter()) {
+        assert_eq!(
+            summary.has_children,
+            !storage
+                .get_children_symbols(node.id)
+                .expect("children")
+                .is_empty(),
+            "batched child presence diverged for {:?}",
+            node.id
+        );
+    }
+    assert_eq!(summaries[0].label, "WithChild");
+    assert_eq!(summaries[1].label, "Childless");
+}
+
+#[test]
+fn indexed_symbol_name_lookup_is_bounded_by_the_candidate_ids() {
+    let node_names = HashMap::from([
+        (CoreNodeId(1), "one".to_string()),
+        (CoreNodeId(2), "two".to_string()),
+        (CoreNodeId(3), "three".to_string()),
+    ]);
+
+    let bounded =
+        crate::controller_symbols::node_names_for_ids(&node_names, [CoreNodeId(2), CoreNodeId(9)]);
+
+    assert_eq!(
+        bounded,
+        HashMap::from([(CoreNodeId(2), "two".to_string())]),
+        "only the candidate ids may be copied out of the symbol-name table"
+    );
+    assert!(crate::controller_symbols::node_names_for_ids(&node_names, []).is_empty());
 }
 
 #[test]

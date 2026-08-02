@@ -3,14 +3,13 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::citation::to_citation_from_hit;
-use super::packet_scoring::{packet_citation_key, packet_citation_rank};
+use super::packet_scoring::{packet_citation_key, packet_citation_rank, sort_by_cached_rank_desc};
 use super::trace::field;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
     PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
 };
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 fn sanitize_section_id(value: &str) -> String {
@@ -58,10 +57,8 @@ pub(crate) fn merge_packet_fused_subquery_batch(
             .iter()
             .map(|hit| to_citation_from_hit(hit, None, None, include_evidence))
             .collect::<Vec<_>>();
-        citations.sort_by(|left, right| {
-            packet_citation_rank(right, rank_terms, true)
-                .partial_cmp(&packet_citation_rank(left, rank_terms, true))
-                .unwrap_or(Ordering::Equal)
+        sort_by_cached_rank_desc(&mut citations, |citation| {
+            packet_citation_rank(citation, rank_terms, true)
         });
         for citation in citations.into_iter().take(stage_carry_limit) {
             if citation_keys.insert(packet_citation_key(&citation)) {

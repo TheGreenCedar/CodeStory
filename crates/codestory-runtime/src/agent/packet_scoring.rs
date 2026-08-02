@@ -20,6 +20,25 @@ use crate::retrieval_file_role_from_path;
 use codestory_contracts::api::{
     AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
 };
+use std::cmp::Ordering;
+
+/// Sort descending on a rank that is evaluated exactly once per element.
+///
+/// `packet_citation_rank` and `packet_claim_carry_rank` allocate and rescan every
+/// ranking term, so they are decorated before the sort rather than recomputed
+/// inside the comparator. The comparator itself is unchanged — a NaN rank still
+/// compares equal, and the stable sort keeps input order for equal ranks.
+pub(crate) fn sort_by_cached_rank_desc<T>(values: &mut Vec<T>, mut rank: impl FnMut(&T) -> f32) {
+    let mut decorated = std::mem::take(values)
+        .into_iter()
+        .map(|value| {
+            let rank = rank(&value);
+            (value, rank)
+        })
+        .collect::<Vec<_>>();
+    decorated.sort_by(|(_, left), (_, right)| right.partial_cmp(left).unwrap_or(Ordering::Equal));
+    *values = decorated.into_iter().map(|(value, _)| value).collect();
+}
 
 /// Citations merged from each packet retrieval stage before the final budget cap.
 pub(crate) fn packet_stage_citation_carry_limit(limits: &PacketBudgetLimitsDto) -> usize {
@@ -1268,6 +1287,86 @@ fn path_after_named_repo_root(normalized: &str) -> Option<String> {
 mod tests {
     use super::*;
     use codestory_contracts::api::NodeId;
+
+    #[test]
+    fn cached_rank_sort_evaluates_once_and_keeps_equal_and_nan_order() {
+        let mut evaluations = 0usize;
+        let mut values = vec![
+            ("equal-a", 2.0_f32),
+            ("equal-b", 2.0),
+            ("low", 1.0),
+            ("high", 3.0),
+        ];
+        sort_by_cached_rank_desc(&mut values, |(_, rank)| {
+            evaluations += 1;
+            *rank
+        });
+        assert_eq!(evaluations, values.len());
+        assert_eq!(
+            values.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            vec!["high", "equal-a", "equal-b", "low"],
+            "equal ranks must keep input order"
+        );
+
+        for mut values in [
+            vec![("nan", f32::NAN), ("finite", 2.0_f32)],
+            vec![("finite", 2.0_f32), ("nan", f32::NAN)],
+        ] {
+            let expected = values.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+            sort_by_cached_rank_desc(&mut values, |(_, rank)| *rank);
+            assert_eq!(
+                values.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+                expected,
+                "a NaN rank must stay comparator-equal and stable"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_rank_sort_permutes_exactly_like_the_recomputing_comparator() {
+        // The zero-movement claim rests on this: the decorated sort must be a
+        // permutation-for-permutation replacement of the comparator that
+        // recomputed the rank on every comparison.
+        let ranks = [
+            3.0_f32,
+            f32::NAN,
+            3.0,
+            -100.0,
+            0.0,
+            f32::NAN,
+            12.5,
+            -0.0,
+            12.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0,
+            1.0,
+            1.0,
+        ];
+        for window in 1..=ranks.len() {
+            for offset in 0..=(ranks.len() - window) {
+                let labelled = ranks[offset..offset + window]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, rank)| (index, *rank))
+                    .collect::<Vec<_>>();
+
+                let mut previous = labelled.clone();
+                previous.sort_by(|(_, left), (_, right)| {
+                    right.partial_cmp(left).unwrap_or(Ordering::Equal)
+                });
+
+                let mut current = labelled;
+                sort_by_cached_rank_desc(&mut current, |(_, rank)| *rank);
+
+                assert_eq!(
+                    current.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                    previous.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                    "cached-rank sort moved rows for window={window} offset={offset}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_like_display_names_include_go_style_pascal_names() {
