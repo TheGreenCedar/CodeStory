@@ -1418,4 +1418,72 @@ mod tests {
         fs::create_dir_all(&project).expect("project");
         assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
     }
+
+    #[test]
+    fn local_refresh_state_is_never_discovered_as_project_source() {
+        use codestory_workspace::{WorkspaceInventoryOutcome, WorkspaceManifest};
+
+        let temp = tempfile::tempdir().expect("project");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("root");
+        let user_source = root.join("main.py");
+        fs::write(&user_source, "print(\"hello\")\n").expect("user source");
+        // The in-project cache root is a supported configuration
+        // (`--cache-dir` / config `cache_dir`), and the storage file lives
+        // directly inside it, so refresh state files are storage siblings.
+        let cache_root = root.join(".cache");
+        let storage_path = cache_root.join("codestory.db");
+
+        let discovered = |label: &str| -> Vec<PathBuf> {
+            let manifest =
+                WorkspaceManifest::open_with_storage_owned_exclusions(root.clone(), &storage_path)
+                    .expect(label);
+            let inventory = manifest.source_inventory().expect(label);
+            assert_eq!(
+                inventory.outcome,
+                WorkspaceInventoryOutcome::Complete,
+                "{label}: inventory must stay complete"
+            );
+            inventory.files
+        };
+
+        let lock = match try_acquire_local_refresh_lock(&cache_root, &root).expect("acquire") {
+            LocalRefreshLockAttempt::Acquired(lock) => lock,
+            LocalRefreshLockAttempt::Busy(busy) => {
+                panic!("lock should be acquired, got busy at {:?}", busy.lock_path)
+            }
+        };
+        write_local_refresh_status(
+            &cache_root,
+            &root,
+            "running",
+            "index",
+            lock.started_at_epoch_ms(),
+            lock.pid(),
+            None,
+        )
+        .expect("status write");
+        assert!(cache_root.join(LOCAL_REFRESH_STATUS_FILE).is_file());
+        assert!(cache_root.join(LOCAL_REFRESH_LOCK_FILE).is_file());
+        assert!(cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE).is_file());
+        assert_eq!(discovered("during refresh"), vec![user_source.clone()]);
+
+        // A heartbeat rewrite replaces the status file while discovery runs.
+        write_local_refresh_status(
+            &cache_root,
+            &root,
+            "running",
+            "index",
+            lock.started_at_epoch_ms(),
+            lock.pid(),
+            None,
+        )
+        .expect("heartbeat rewrite");
+        assert_eq!(discovered("after heartbeat"), vec![user_source.clone()]);
+
+        // Releasing the lock keeps the persistent state guard on disk.
+        drop(lock);
+        assert!(cache_root.join(LOCAL_REFRESH_STATE_GUARD_FILE).is_file());
+        assert_eq!(discovered("after release"), vec![user_source]);
+    }
 }
