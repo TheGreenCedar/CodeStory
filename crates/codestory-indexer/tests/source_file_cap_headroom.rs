@@ -11,9 +11,13 @@ use codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Fail while there is still room to react. A file past this fraction of the
-/// cap is one ordinary change away from breaking the integration suite.
-const HEADROOM_FRACTION: f64 = 0.90;
+/// Deliberately an absolute budget, not a fraction of
+/// `DEFAULT_SOURCE_FILE_BYTE_CAP`. That cap is admission headroom and moves for
+/// reasons that have nothing to do with this crate's file hygiene — when it
+/// went from 1 MB to 2 MB, a 90% fraction would have moved the warning line to
+/// 1.8 MB against a largest file of 495 KB, leaving the guard passing until
+/// `lib.rs` had grown 3.6x. The absolute number is what keeps it honest.
+const WARN_AT_BYTES: u64 = 900_000;
 
 fn crate_src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -33,7 +37,13 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn no_crate_source_approaches_the_oversized_source_cap() {
     let cap = DEFAULT_SOURCE_FILE_BYTE_CAP;
-    let warn_at = (cap as f64 * HEADROOM_FRACTION) as u64;
+    // The guard exists to protect `tests/integration.rs`, which indexes this
+    // crate's own sources against the cap; a budget above the cap could not.
+    assert!(
+        WARN_AT_BYTES < cap,
+        "the warning budget must sit below the {cap}-byte cap it protects"
+    );
+    let warn_at = WARN_AT_BYTES;
     let mut files = Vec::new();
     rust_sources(&crate_src(), &mut files);
     assert!(!files.is_empty(), "found no crate sources to measure");
@@ -49,11 +59,11 @@ fn no_crate_source_approaches_the_oversized_source_cap() {
 
     assert!(
         crowded.is_empty(),
-        "these files are within {}% of the {cap}-byte oversized-source cap this \
-         crate enforces on its own sources, so tests/integration.rs is about to \
-         start skipping them and failing with a temp path instead of a cause. \
-         Split them along module seams (see #1801):\n{}",
-        ((1.0 - HEADROOM_FRACTION) * 100.0) as u32,
+        "these files are past the {warn_at}-byte hygiene budget for this crate's \
+         own sources (the oversized-source cap it enforces on other repositories \
+         is {cap}), so tests/integration.rs is heading for a skip that fails with \
+         a temp path instead of a cause. Split them along module seams \
+         (see #1801):\n{}",
         crowded
             .iter()
             .map(|(bytes, path)| format!(

@@ -17,7 +17,10 @@ pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
 const LEGACY_INDEX_FILE: &str = "lexical-index.jsonl";
 const LEGACY_META_FILE: &str = "shard-meta.json";
 const LEGACY_STUB_MARKER: &str = ".zoekt-stub";
-const MAX_FILE_BYTES: u64 = 1_000_000;
+/// Derived from the source cap. A file the indexer admits but this lane drops
+/// is indexed-but-unfindable: no error row, no `retry_required`, and strict
+/// readiness still reports Full.
+pub(crate) const MAX_FILE_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 const MAX_CANDIDATES: usize = 4_096;
 const COVERAGE_PATH_SAMPLE: usize = 32;
 
@@ -1444,6 +1447,15 @@ pub(crate) fn make_test_file_writable(path: &Path) {
     permissions.set_readonly(false);
     std::fs::set_permissions(path, permissions).expect("make test file writable");
 }
+
+/// A file the indexer admits but this lane drops is indexed-but-unfindable: it
+/// lands in the graph with symbols, is absent from the FTS shard, and nothing
+/// reports an error — strict readiness still says Full. Asserted at compile
+/// time so a future cap change cannot ship without confronting it.
+const _: () = assert!(
+    MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+    "the lexical lane must admit every file the indexer does"
+);
 
 #[cfg(test)]
 mod tests {

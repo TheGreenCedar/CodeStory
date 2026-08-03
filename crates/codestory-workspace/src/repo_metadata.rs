@@ -77,7 +77,13 @@ const MAX_COMMONDIR_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_ALTERNATES_BYTES: u64 = 1024 * 1024;
 const MAX_LOCAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_METADATA_TREE_ENTRIES: usize = 100_000;
-const MAX_REWRITE_BLOB_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
+/// gix `core.bigFileThreshold`, governing rename and similarity detection.
+///
+/// Deliberately NOT derived from the source cap. Its previous equality with
+/// that cap was an accident of value, and inheriting a source-admission change
+/// would silently alter rewrite detection in a subsystem with no relationship
+/// to source size — no failure, just different output.
+const MAX_REWRITE_BLOB_BYTES: u64 = 1024 * 1024;
 const MAX_REWRITE_SIMILARITY_PERMUTATIONS: usize = 1_000;
 
 /// One problem that prevented a complete repository metadata observation.

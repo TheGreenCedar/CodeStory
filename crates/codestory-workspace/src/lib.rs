@@ -606,13 +606,7 @@ impl WorkspaceManifest {
         &self,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyFileInventory> {
-        WorkspaceDiscovery.source_inventory_with_policy_inner(
-            self,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            None,
-        )
+        WorkspaceDiscovery.source_inventory_with_policy_inner(self, policy, None)
     }
 
     /// Re-read every classified exclusion at the publication fence.
@@ -740,6 +734,18 @@ pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
     )
 }
 
+/// Build a policy for the two legacy entry points that still take a bare
+/// `(byte_cap, policy_version)` pair. They predate the per-kind structural
+/// bound and carry the defaults for it.
+fn legacy_positional_policy(byte_cap: u64, policy_version: &str) -> SourceIndexPolicy {
+    SourceIndexPolicy {
+        policy_version: policy_version.to_string(),
+        byte_cap,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+        structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+    }
+}
+
 impl WorkspaceDiscovery {
     /// Discover all source files for `manifest`.
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
@@ -780,9 +786,7 @@ impl WorkspaceDiscovery {
     ) -> Result<WorkspacePolicyFileInventory> {
         self.source_inventory_with_policy_inner(
             manifest,
-            byte_cap,
-            policy_version,
-            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            &legacy_positional_policy(byte_cap, policy_version),
             None,
         )
     }
@@ -795,6 +799,7 @@ impl WorkspaceDiscovery {
         policy: &SourceIndexPolicy,
     ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
         if policy.byte_cap == 0
+            || policy.structural_byte_cap == 0
             || policy.structural_unit_cap == 0
             || policy.policy_version.trim().is_empty()
         {
@@ -805,8 +810,10 @@ impl WorkspaceDiscovery {
         verified.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
         let mut previous_path: Option<&str> = None;
         for candidate in &verified {
+            // Strict, unlike the store's `<=`: this fence has the path, so it
+            // can assert the exact per-kind cap the candidate must name.
             if candidate.policy_version != policy.policy_version
-                || candidate.byte_cap != policy.byte_cap
+                || candidate.byte_cap != policy.effective_byte_cap(&candidate.normalized_path)
                 || candidate.structural_unit_cap != policy.structural_unit_cap
                 || previous_path == Some(candidate.normalized_path.as_str())
             {
@@ -825,9 +832,10 @@ impl WorkspaceDiscovery {
                 );
             }
             let (content_hash, observed_size) = current_content_identity(&path)?;
-            let byte_bound = observed_size > policy.byte_cap && candidate.observed_unit_count == 0;
+            let effective_cap = policy.effective_byte_cap(&candidate.normalized_path);
+            let byte_bound = observed_size > effective_cap && candidate.observed_unit_count == 0;
             let unit_bound = candidate.observed_unit_count > policy.structural_unit_cap
-                && observed_size <= policy.byte_cap;
+                && observed_size <= effective_cap;
             if content_hash != candidate.content_hash
                 || observed_size != candidate.observed_size
                 || !(byte_bound || unit_bound)
@@ -844,12 +852,14 @@ impl WorkspaceDiscovery {
     fn source_inventory_with_policy_inner(
         &self,
         manifest: &WorkspaceManifest,
-        byte_cap: u64,
-        policy_version: &str,
-        structural_unit_cap: u64,
+        policy: &SourceIndexPolicy,
         max_files: Option<usize>,
     ) -> Result<WorkspacePolicyFileInventory> {
-        if byte_cap == 0 || structural_unit_cap == 0 || policy_version.trim().is_empty() {
+        if policy.byte_cap == 0
+            || policy.structural_byte_cap == 0
+            || policy.structural_unit_cap == 0
+            || policy.policy_version.trim().is_empty()
+        {
             bail!("bounded source policy requires non-zero caps and a non-empty version");
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
@@ -880,7 +890,9 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
-            if metadata.len() <= byte_cap {
+            // Nothing is excluded below the smaller of the two caps, so a file
+            // under it never pays for path normalization.
+            if metadata.len() <= policy.minimum_byte_cap() {
                 files.push(path);
                 continue;
             }
@@ -895,6 +907,14 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
+            // Classified from the workspace-relative path: the structural
+            // classifier is path-shape sensitive, so repository ancestors must
+            // not influence admission.
+            let effective_cap = policy.effective_byte_cap(&normalized_path);
+            if metadata.len() <= effective_cap {
+                files.push(path);
+                continue;
+            }
             let (content_hash, observed_size) = match current_content_identity(&path) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -906,7 +926,7 @@ impl WorkspaceDiscovery {
                     continue;
                 }
             };
-            if observed_size <= byte_cap {
+            if observed_size <= effective_cap {
                 files.push(path);
                 continue;
             }
@@ -915,9 +935,10 @@ impl WorkspaceDiscovery {
                 content_hash,
                 observed_size,
                 observed_unit_count: 0,
-                policy_version: policy_version.to_string(),
-                byte_cap,
-                structural_unit_cap,
+                policy_version: policy.policy_version.clone(),
+                // The cap that refused *this* source, not the policy headroom.
+                byte_cap: effective_cap,
+                structural_unit_cap: policy.structural_unit_cap,
             });
         }
         policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
@@ -1237,13 +1258,7 @@ impl WorkspaceDiscovery {
         inputs: &RefreshInputs,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory = self.source_inventory_with_policy_inner(
-            manifest,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            None,
-        )?;
+        let mut inventory = self.source_inventory_with_policy_inner(manifest, policy, None)?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
@@ -1270,9 +1285,7 @@ impl WorkspaceDiscovery {
     ) -> Result<WorkspacePolicyRefreshOutcome> {
         let inventory = self.source_inventory_with_policy_inner(
             manifest,
-            byte_cap,
-            policy_version,
-            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            &legacy_positional_policy(byte_cap, policy_version),
             Some(max_current_files),
         )?;
         let refresh = build_refresh_outcome_from_inventory(
@@ -1297,13 +1310,8 @@ impl WorkspaceDiscovery {
         max_current_files: usize,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory = self.source_inventory_with_policy_inner(
-            manifest,
-            policy.byte_cap,
-            &policy.policy_version,
-            policy.structural_unit_cap,
-            Some(max_current_files),
-        )?;
+        let mut inventory =
+            self.source_inventory_with_policy_inner(manifest, policy, Some(max_current_files))?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
@@ -2654,6 +2662,7 @@ mod tests {
         let policy = SourceIndexPolicy {
             policy_version: "test-structural-policy-v1".to_string(),
             byte_cap: 1_000,
+            structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
             structural_unit_cap: 2,
         };
         let (content_hash, observed_size) = current_content_identity(&path)?;
@@ -2681,6 +2690,68 @@ mod tests {
         let changed = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
         assert_eq!(changed.refresh.plan.files_to_index, vec![path]);
         assert!(changed.policy_exclusions.is_empty());
+        Ok(())
+    }
+
+    /// The whole point of the split cap: raising the parser headroom must not
+    /// drag structural formats up with it.
+    ///
+    /// Before this, a 1.5 MB JSON under a 2 MB headroom was *admitted* by
+    /// planning, then refused by the collector's hardcoded 1 MiB limit, and
+    /// `FileCoverageReason::Oversized` is refresh-fatal — so the whole index
+    /// failed, permanently, on every run. Planning has to refuse it first, and
+    /// the record has to name the cap that actually refused it.
+    #[test]
+    fn the_structural_bound_holds_when_the_parser_headroom_is_raised() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized_structural = root.join("data.json");
+        fs::write(&oversized_structural, vec![b'x'; 1_500_000])?;
+        let big_source = root.join("src").join("big.rs");
+        fs::write(&big_source, vec![b'x'; 1_500_000])?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let policy = SourceIndexPolicy::default();
+        let inventory = manifest.source_inventory_with_policy(&policy)?;
+
+        assert!(
+            inventory.files.iter().any(|path| path == &big_source),
+            "a 1.5 MB Rust source is inside the 2 MB headroom and must be indexed"
+        );
+        assert!(
+            !inventory
+                .files
+                .iter()
+                .any(|path| path == &oversized_structural),
+            "a 1.5 MB JSON is past the structural bound and must not be scheduled"
+        );
+
+        let excluded: Vec<_> = inventory
+            .policy_exclusions
+            .iter()
+            .filter(|candidate| candidate.normalized_path.ends_with("data.json"))
+            .collect();
+        assert_eq!(excluded.len(), 1, "the JSON must be a published exclusion");
+        assert_eq!(
+            excluded[0].byte_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+            "the record must name the cap that refused it, not the headroom"
+        );
+        assert_eq!(
+            excluded[0].observed_unit_count, 0,
+            "a structural file over the byte bound is byte-bound, not unit-bound"
+        );
+
+        // Revalidation runs at the publication fence on every commit and
+        // recomputes the same classification. If it disagreed, no core would
+        // ever publish.
+        let verified = WorkspaceDiscovery.revalidate_source_policy_exclusions(
+            &manifest,
+            &inventory.policy_exclusions,
+            &policy,
+        )?;
+        assert_eq!(verified.len(), inventory.policy_exclusions.len());
         Ok(())
     }
 

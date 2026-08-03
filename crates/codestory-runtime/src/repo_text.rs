@@ -13,7 +13,10 @@ use crate::search_intent::text_contains_query_term;
 pub(super) const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
 pub(super) const REPO_TEXT_SCAN_BYTE_CAP: usize = 32 * 1024 * 1024;
 pub(super) const REPO_TEXT_SCAN_TIME_CAP_MS: u128 = 500;
-pub(super) const REPO_TEXT_MAX_FILE_BYTES: u64 = 1_000_000;
+/// Derived from the source cap, for the same reason as the lexical and
+/// semantic lanes: an admitted file must stay searchable.
+pub(super) const REPO_TEXT_MAX_FILE_BYTES: u64 =
+    codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 #[derive(Debug, Clone)]
 pub(super) struct RepoTextScan {
     pub(super) hits: Vec<SearchHit>,
@@ -327,3 +330,15 @@ impl AppController {
         );
     }
 }
+
+/// Same parity the lexical lane asserts. These constants are what make an
+/// admitted file readable; any of them lagging the source cap is silent.
+const _: () = assert!(
+    REPO_TEXT_MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+    "repo-text scanning must admit every file the indexer does"
+);
+const _: () = assert!(
+    crate::support::SEMANTIC_FILE_TEXT_MAX_BYTES
+        >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+    "semantic document text must admit every file the indexer does"
+);

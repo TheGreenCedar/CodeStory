@@ -2236,6 +2236,7 @@ fn structural_unit_exclusion_uses_the_caller_owned_policy_cap() -> Result<()> {
     let policy = SourceIndexPolicy {
         policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: 2,
     };
     let plan = codestory_workspace::RefreshExecutionPlan {

@@ -878,8 +878,11 @@ mod tests {
     fn partial_lexical_coverage_stays_usable_and_reports_diagnostic() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("source");
-        std::fs::write(project.path().join("oversized.rs"), vec![b'x'; 1_000_001])
-            .expect("oversized");
+        std::fs::write(
+            project.path().join("oversized.rs"),
+            vec![b'x'; crate::lexical_index::MAX_FILE_BYTES as usize + 1],
+        )
+        .expect("oversized");
         let data = TempDir::new().expect("data");
         let mut layout = SidecarLayout::from_env();
         layout.lexical_data_dir = data.path().to_path_buf();
@@ -910,7 +913,11 @@ mod tests {
     #[test]
     fn all_omitted_lexical_sources_cannot_report_full_readiness() {
         let project = TempDir::new().expect("project");
-        std::fs::write(project.path().join("large.rs"), vec![b'x'; 1_000_001]).expect("oversized");
+        std::fs::write(
+            project.path().join("large.rs"),
+            vec![b'x'; crate::lexical_index::MAX_FILE_BYTES as usize + 1],
+        )
+        .expect("oversized");
         std::fs::write(project.path().join("invalid.rs"), [0xff, 0xfe, 0xfd])
             .expect("invalid utf-8");
         let data = TempDir::new().expect("data");

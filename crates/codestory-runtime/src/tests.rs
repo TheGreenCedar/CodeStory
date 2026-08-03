@@ -253,6 +253,7 @@ fn semantic_projection_source_policy_bridge_is_directional_and_cap_exact() {
     let legacy_runtime = SourceIndexPolicy {
         policy_version: LEGACY_OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: current.byte_cap,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: current.structural_unit_cap,
     };
     assert_eq!(
@@ -2951,6 +2952,7 @@ fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation()
     let excluding_policy = SourceIndexPolicy {
         policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: 2,
     };
     let excluding_controller = AppController::new_with_source_index_policy(
@@ -3387,6 +3389,7 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
         SourceIndexPolicy {
             policy_version: "oversized-source-v2".into(),
             byte_cap: 64,
+            structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
             structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         },
     ] {

@@ -1512,6 +1512,7 @@ pub struct WorkspaceIndexer {
     batch_config: IncrementalIndexingConfig,
     full_refresh_chunk_budget: FullRefreshChunkBudget,
     source_file_byte_cap: u64,
+    structural_source_byte_cap: u64,
     source_index_policy: Option<SourceIndexPolicy>,
     artifact_cache_policies: ArtifactCachePolicies,
     #[cfg(test)]
@@ -1551,6 +1552,7 @@ impl WorkspaceIndexer {
             batch_config: IncrementalIndexingConfig::default(),
             full_refresh_chunk_budget: FullRefreshChunkBudget::default(),
             source_file_byte_cap: SourceIndexPolicy::default().byte_cap,
+            structural_source_byte_cap: SourceIndexPolicy::default().structural_byte_cap,
             source_index_policy: None,
             artifact_cache_policies: ArtifactCachePolicies::default(),
             #[cfg(test)]
@@ -1585,6 +1587,10 @@ impl WorkspaceIndexer {
     /// Enable verified structural-unit exclusions under one caller-owned policy.
     pub fn with_source_index_policy(mut self, policy: SourceIndexPolicy) -> Self {
         self.source_file_byte_cap = policy.byte_cap;
+        // Clamped for the same reason `effective_byte_cap` clamps: an operator
+        // lowering the headroom below the structural bound must not leave the
+        // collector admitting above it.
+        self.structural_source_byte_cap = policy.structural_byte_cap.min(policy.byte_cap);
         self.source_index_policy = Some(policy);
         self
     }
@@ -3243,7 +3249,7 @@ impl WorkspaceIndexer {
                 )
             })?
             .len();
-        if structural_size > structural::MAX_STRUCTURAL_SOURCE_BYTES {
+        if structural_size > self.structural_source_byte_cap {
             return Err(incomplete_file_storage(
                 &full_path,
                 None,
@@ -3251,9 +3257,7 @@ impl WorkspaceIndexer {
                 codestory_contracts::graph::ErrorInfo {
                     message: format!(
                         "Skipped structural source {:?}: {} bytes exceeds the {} byte structural collector limit",
-                        path,
-                        structural_size,
-                        structural::MAX_STRUCTURAL_SOURCE_BYTES
+                        path, structural_size, self.structural_source_byte_cap
                     ),
                     file_id: None,
                     line: None,
@@ -3486,6 +3490,36 @@ impl WorkspaceIndexer {
         if !is_openapi_candidate_path(full_path) {
             return Ok(None);
         }
+        // OpenAPI candidates are `.json`/`.yaml`/`.yml`, so planning already
+        // excludes them above the structural cap and this only catches a file
+        // that grew since — the same growth race `:2919` covers for parsers.
+        // Without it this is the widest unbounded read in the crate:
+        // `decode_structural_source` has no size check of its own, so the whole
+        // file is read and projected on the strength of the caller's bound.
+        match std::fs::metadata(full_path) {
+            Ok(metadata) if metadata.len() > self.structural_source_byte_cap => {
+                return Err(incomplete_file_storage(
+                    full_path,
+                    None,
+                    "openapi",
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Skipped OpenAPI schema {:?}: {} bytes exceeds the {} byte structural collector limit",
+                            full_path,
+                            metadata.len(),
+                            self.structural_source_byte_cap
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        coverage_reason: Some(FileCoverageReason::Oversized),
+                    },
+                ));
+            }
+            _ => {}
+        }
         let bytes = match std::fs::read(full_path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3668,6 +3702,7 @@ impl WorkspaceIndexer {
             &prepared_input.full_path,
             &prepared_input.source,
             structural_unit_cap,
+            self.structural_source_byte_cap,
         ) {
             Ok(collected) => collected,
             Err(structural::StructuralCollectionError::UnitLimit {
@@ -3716,6 +3751,7 @@ impl WorkspaceIndexer {
                     };
                 };
                 let normalized_path = relative.to_string_lossy().replace('\\', "/");
+                let effective_byte_cap = policy.effective_byte_cap(&normalized_path);
                 return PreparedIndexJobResult {
                     local_storage: IntermediateStorage::default(),
                     cache_write: None,
@@ -3727,7 +3763,12 @@ impl WorkspaceIndexer {
                             observed_size: prepared_input.source.len() as u64,
                             observed_unit_count,
                             policy_version: policy.policy_version.clone(),
-                            byte_cap: policy.byte_cap,
+                            // The cap that governs this path, not the parser
+                            // headroom. This is a structural source by
+                            // construction, so it is the structural bound, and
+                            // revalidation at the publication fence recomputes
+                            // exactly the same value from the same path.
+                            byte_cap: effective_byte_cap,
                             structural_unit_cap: policy.structural_unit_cap,
                         },
                     }),
@@ -3739,7 +3780,7 @@ impl WorkspaceIndexer {
                         FileCoverageReason::Malformed
                     }
                     structural::StructuralCollectionError::Binary => FileCoverageReason::Binary,
-                    structural::StructuralCollectionError::SourceByteLimit(_)
+                    structural::StructuralCollectionError::SourceByteLimit { .. }
                     | structural::StructuralCollectionError::UnitLimit { .. } => {
                         FileCoverageReason::Oversized
                     }

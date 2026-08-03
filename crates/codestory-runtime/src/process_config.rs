@@ -55,7 +55,7 @@ impl RuntimeProcessConfig {
             sidecar.summary.api_key.is_some(),
         );
         identity.push_str(&format!(
-            "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             sidecar.summary.model,
             sidecar.summary.max_tokens,
             sidecar.summary.timeout,
@@ -66,6 +66,7 @@ impl RuntimeProcessConfig {
             configuration_path_identity(&sidecar.layout.state_file),
             source_index_policy.policy_version,
             source_index_policy.byte_cap,
+            source_index_policy.structural_byte_cap,
             source_index_policy.structural_unit_cap,
         ));
         fnv1a_hex(identity.as_bytes())
@@ -166,4 +167,30 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod structural_cap_identity_tests {
+    use super::*;
+
+    /// `configuration_id` is a hand-written `\0`-joined format string, not a
+    /// derive, so a new `SourceIndexPolicy` field is omitted silently. Two
+    /// runtimes that differ only in the structural bound would then share an
+    /// identity and reuse each other's ready-leases and retained transport
+    /// contexts. Nothing else in the tree can catch that.
+    #[test]
+    fn configuration_id_separates_policies_that_differ_only_in_the_structural_cap() {
+        let sidecar = crate::test_sidecar_runtime_from_env();
+        let base = SourceIndexPolicy::default();
+        let narrowed = SourceIndexPolicy {
+            structural_byte_cap: base.structural_byte_cap / 2,
+            ..base.clone()
+        };
+        let cache_root = Path::new("/tmp/codestory-configuration-identity");
+        assert_ne!(
+            RuntimeProcessConfig::new(sidecar.clone(), base).configuration_id(cache_root),
+            RuntimeProcessConfig::new(sidecar, narrowed).configuration_id(cache_root),
+            "the structural bound must take part in the configuration identity"
+        );
+    }
 }

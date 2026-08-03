@@ -47,7 +47,7 @@ Operator-facing settings. Environment values win over `.codestory.toml`.
 | `CODESTORY_EMBED_ALLOW_CPU` | boolean | `crates/codestory-cli/src/app.rs` | Rejected at startup: CPU embedding is unsupported, so any non-empty value fails closed. |
 | `CODESTORY_HYBRID_RETRIEVAL_ENABLED` | boolean | `crates/codestory-retrieval/src/config.rs` | Enables hybrid lexical/semantic ranking (default on). |
 | `CODESTORY_INDEX_FRESHNESS_TTL_SECS` | integer | `crates/codestory-runtime/src/index_freshness.rs` | Seconds a content-verified freshness verdict is reused before rechecking. |
-| `CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP` | integer | `crates/codestory-cli/src/config.rs` | Largest source file, in bytes, the indexer will read; non-positive values keep the default. |
+| `CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP` | integer | `crates/codestory-cli/src/config.rs` | Admission headroom in bytes for parser-backed sources; structural formats keep their own smaller bound. Not a cost bound. Non-positive values keep the default. |
 | `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` | integer | `crates/codestory-retrieval/src/config.rs` | Documents per embedding batch during semantic publication. |
 | `CODESTORY_LOG` | enum | `crates/codestory-cli/src/diagnostics.rs` | Process log level: `error`, `warn`, `info`, `debug`, or `trace`. |
 | `CODESTORY_LOG_CORRELATION_ID` | text | `crates/codestory-cli/src/diagnostics.rs` | Correlation id stamped on every diagnostic record of this process. |
