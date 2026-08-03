@@ -129,8 +129,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 // `get_language_for_ext` so dead rule files do not silently linger.
 const PYTHON_GRAPH_QUERY: &str = include_str!("../rules/python.scm");
 const JAVA_GRAPH_QUERY: &str = include_str!("../rules/java.scm");
-const RUST_GRAPH_QUERY: &str = include_str!("../rules/rust.graph.scm");
-const RUST_TAGS_QUERY: &str = include_str!("../rules/rust.tags.scm");
 const JAVASCRIPT_GRAPH_QUERY: &str = include_str!("../rules/javascript.scm");
 const TYPESCRIPT_GRAPH_QUERY: &str = include_str!("../rules/typescript.graph.scm");
 const TYPESCRIPT_TAGS_QUERY: &str = include_str!("../rules/typescript.tags.scm");
@@ -295,12 +293,10 @@ impl LanguageRuleset {
             LanguageRuleset::Java => {
                 compiled_rules_cache(language, JAVA_GRAPH_QUERY, None, &JAVA_RULES)
             }
-            LanguageRuleset::Rust => compiled_rules_cache(
-                language,
-                RUST_GRAPH_QUERY,
-                Some(RUST_TAGS_QUERY),
-                &RUST_RULES,
-            ),
+            // Answered by the registry above; see the Kotlin arm below.
+            LanguageRuleset::Rust => Err(anyhow!(
+                "rust compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::JavaScript => {
                 compiled_rules_cache(language, JAVASCRIPT_GRAPH_QUERY, None, &JAVASCRIPT_RULES)
             }
@@ -374,7 +370,6 @@ fn compiled_rules_cache(
 
 static PYTHON_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static JAVA_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static JAVASCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -15213,7 +15208,7 @@ fn qualified_name_delimiter(language_name: &str) -> &'static str {
         return extraction.qualified_name_delimiter;
     }
     match language_name {
-        "rust" | "cpp" | "c" => "::",
+        "cpp" | "c" => "::",
         _ => ".",
     }
 }
@@ -17072,16 +17067,7 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
     }
     matches!(
         language_name,
-        "javascript"
-            | "typescript"
-            | "java"
-            | "rust"
-            | "go"
-            | "php"
-            | "csharp"
-            | "dart"
-            | "vue"
-            | "astro"
+        "javascript" | "typescript" | "java" | "go" | "php" | "csharp" | "dart" | "vue" | "astro"
     )
 }
 
@@ -25724,9 +25710,16 @@ class Test {
 
     #[test]
     fn test_live_rule_registry_uses_split_rule_assets() {
+        // Rust's split rule assets moved into `languages::rust`; the config must
+        // still come back through the same extension lookup, and it must still
+        // be the only graph rule file that pairs with a tags query.
         let rust = get_language_for_ext("rs").expect("rust config");
-        assert_eq!(rust.graph_query, RUST_GRAPH_QUERY);
-        assert_eq!(rust.tags_query, Some(RUST_TAGS_QUERY));
+        let rust_row = languages::extraction_for_ext("rs").expect("rust registry row");
+        assert_eq!(rust.language_name, "rust");
+        assert_eq!(rust.graph_query, rust_row.graph_query);
+        assert_eq!(rust.tags_query, rust_row.tags_query);
+        assert!(rust.tags_query.is_some());
+        assert_ne!(rust.graph_query, rust.tags_query.expect("rust tags query"));
 
         let ts = get_language_for_ext("ts").expect("ts config");
         assert_eq!(ts.graph_query, TYPESCRIPT_GRAPH_QUERY);

@@ -17,6 +17,7 @@
 //! package to land deletes the residual arms entirely.
 
 pub(crate) mod kotlin;
+pub(crate) mod rust;
 
 use std::sync::OnceLock;
 
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, rust::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {
@@ -235,6 +236,37 @@ mod tests {
         assert_eq!(
             extraction_for_ext("kts").map(|row| row.language_name),
             Some("kotlin")
+        );
+    }
+
+    /// The Rust row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`, `language_configs.rs` and `semantic/mod.rs`.
+    ///
+    /// `qualified_name_delimiter` is the sharpest of these: `::` used to be one
+    /// arm of a three-language match and no other test in the tree reads it, so
+    /// a `.` here would rename every Rust member without turning a single
+    /// threshold suite red.
+    #[test]
+    fn rust_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let rust = extraction_for_language("rust").expect("rust row");
+        assert_eq!(rust.qualified_name_delimiter, "::");
+        assert!(!rust.promotes_type_member_functions_to_methods);
+        assert!(rust.route_comments_are_c_style);
+        assert_eq!(rust.semantic_family, "rust");
+        // Rust resolves through `semantic::RustSemanticResolver`, not the shared
+        // name-only resolver; the generic flag must stay off.
+        assert!(!rust.uses_generic_semantic_resolver);
+        // Rust's rule file emits no `call_syntax`, so it has no callsite marker.
+        assert!(rust.member_callsite_marker.is_none());
+        assert!(rust.graph_call_syntax.is_none());
+        // Rust's receiver-call inference is not a `language_receiver_call_specs`
+        // collector; see `languages::rust`'s module docs.
+        assert!(rust.receiver_call_specs.is_none());
+        // Rust is the only graph rule file that pairs with a tags query.
+        assert!(rust.tags_query.is_some());
+        assert_eq!(
+            extraction_for_ext("rs").map(|row| row.language_name),
+            Some("rust")
         );
     }
 }
