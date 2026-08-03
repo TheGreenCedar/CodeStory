@@ -4962,6 +4962,260 @@ fn test_delete_projection_for_callers_removes_callable_scoped_data() -> Result<(
 }
 
 #[test]
+fn test_delete_unowned_projection_for_file_spares_nodes_and_annotations() -> Result<(), StorageError>
+{
+    // The reposition repair's whole reason to exist is that it removes the
+    // rows a re-parse re-emits and nothing else. Over-deleting here is exactly
+    // as damaging as the `FullReplace` it replaces, and the incremental
+    // integration probes cannot see it: they re-insert everything afterwards.
+    let mut storage = Storage::new_in_memory()?;
+    let file_id = 9_i64;
+    let file_node = Node {
+        id: NodeId(file_id),
+        kind: NodeKind::FILE,
+        serialized_name: "src/lib.rs".to_string(),
+        ..Default::default()
+    };
+    let callable = Node {
+        id: NodeId(901),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "run".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+    let header = Node {
+        id: NodeId(902),
+        kind: NodeKind::STRUCT,
+        serialized_name: "Thing".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+    let imported = Node {
+        id: NodeId(903),
+        kind: NodeKind::MODULE,
+        serialized_name: "std::fmt".to_string(),
+        file_node_id: Some(file_node.id),
+        ..Default::default()
+    };
+
+    storage.insert_file(&FileInfo {
+        id: file_id,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 50,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_nodes_batch(&[
+        file_node.clone(),
+        callable.clone(),
+        header.clone(),
+        imported.clone(),
+        Node {
+            id: NodeId(951),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(950),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "other".to_string(),
+            file_node_id: Some(NodeId(951)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        // Owned: a call the caller-scoped cleanup rewrites.
+        Edge {
+            id: EdgeId(1),
+            source: callable.id,
+            target: imported.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(file_node.id),
+            line: Some(11),
+            ..Default::default()
+        },
+        // Unowned: an import edge the file sources.
+        Edge {
+            id: EdgeId(2),
+            source: file_node.id,
+            target: imported.id,
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(file_node.id),
+            line: Some(1),
+            ..Default::default()
+        },
+        // Unowned by kind even though a projected callable sources it.
+        Edge {
+            id: EdgeId(3),
+            source: callable.id,
+            target: header.id,
+            kind: EdgeKind::TYPE_USAGE,
+            file_node_id: Some(file_node.id),
+            line: Some(11),
+            ..Default::default()
+        },
+        // Another file's row, incidentally pointing into this one.
+        Edge {
+            id: EdgeId(4),
+            source: NodeId(950),
+            target: callable.id,
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(951)),
+            line: Some(4),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_occurrences_batch(&[
+        // Owned: the callable's own definition.
+        Occurrence {
+            element_id: callable.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 10,
+                start_col: 0,
+                end_line: 12,
+                end_col: 1,
+            },
+        },
+        // Owned: inside the callable's recorded extent.
+        Occurrence {
+            element_id: imported.id.0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 11,
+                start_col: 4,
+                end_line: 11,
+                end_col: 10,
+            },
+        },
+        // Unowned: the import, above every callable.
+        Occurrence {
+            element_id: imported.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 14,
+            },
+        },
+        // Unowned: the struct header, between the import and the callable.
+        Occurrence {
+            element_id: header.id.0,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_node.id,
+                start_line: 3,
+                start_col: 0,
+                end_line: 3,
+                end_col: 12,
+            },
+        },
+    ])?;
+    storage.upsert_callable_projection_states(&[
+        CallableProjectionState {
+            file_id,
+            symbol_key: "src/lib.rs::run:FUNCTION".to_string(),
+            node_id: callable.id,
+            signature_hash: 111,
+            normalized_signature: None,
+            body_hash: 211,
+            start_line: 10,
+            end_line: 12,
+        },
+        // The file-structural row: same `node_id` as the file, extent covering
+        // the whole file. Treated as an owner it would protect every row here.
+        CallableProjectionState {
+            file_id,
+            symbol_key: "__file_structural__".to_string(),
+            node_id: file_node.id,
+            signature_hash: 311,
+            normalized_signature: None,
+            body_hash: 411,
+            start_line: 1,
+            end_line: 50,
+        },
+    ])?;
+
+    let category = storage.create_bookmark_category("review")?;
+    let on_header = storage.add_bookmark(category, header.id, Some("the header"))?;
+    let on_import = storage.add_bookmark(category, imported.id, Some("the import"))?;
+
+    let summary = storage.delete_unowned_projection_for_file(file_id)?;
+    assert_eq!(
+        summary.removed_edge_count, 2,
+        "the import and the type usage"
+    );
+    assert_eq!(
+        summary.removed_occurrence_count, 2,
+        "the import definition and the struct header"
+    );
+
+    let mut remaining_edges = storage
+        .get_edges()?
+        .into_iter()
+        .map(|edge| edge.id.0)
+        .collect::<Vec<_>>();
+    remaining_edges.sort_unstable();
+    assert_eq!(
+        remaining_edges,
+        vec![1, 4],
+        "the caller-scoped call survives for the caller cleanup, and another \
+         file's row is not this file's to delete"
+    );
+
+    let mut remaining_occurrences = storage
+        .get_occurrences()?
+        .into_iter()
+        .map(|occurrence| (occurrence.element_id, occurrence.location.start_line))
+        .collect::<Vec<_>>();
+    remaining_occurrences.sort_unstable();
+    assert_eq!(
+        remaining_occurrences,
+        vec![(callable.id.0, 10), (imported.id.0, 11)],
+        "everything a projected callable owns survives"
+    );
+
+    let mut remaining_nodes = storage
+        .get_nodes()?
+        .into_iter()
+        .map(|node| node.id.0)
+        .collect::<Vec<_>>();
+    remaining_nodes.sort_unstable();
+    assert_eq!(
+        remaining_nodes,
+        vec![file_id, 901, 902, 903, 950, 951],
+        "the repair must not delete a single node row"
+    );
+    assert_eq!(
+        storage
+            .get_callable_projection_states_for_file(file_id)?
+            .len(),
+        2,
+        "projection state is rewritten by the flush, not by this cleanup"
+    );
+
+    let mut bookmarks = storage.get_bookmarks(Some(category))?;
+    bookmarks.sort_by_key(|bookmark| bookmark.id);
+    assert_eq!(
+        bookmarks
+            .iter()
+            .map(|bookmark| (bookmark.id, bookmark.node_id))
+            .collect::<Vec<_>>(),
+        vec![(on_header, header.id), (on_import, imported.id)],
+        "no annotation may be destroyed by the reposition repair"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_opening_v3_db_resets_projection_state() -> Result<(), StorageError> {
     let db_path = std::env::temp_dir().join(format!(
         "codestory-store-v3-migration-{}.db",

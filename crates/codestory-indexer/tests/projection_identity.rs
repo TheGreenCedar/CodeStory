@@ -221,11 +221,12 @@ fn a_moved_call_edge_carries_its_new_line() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_shifted_occurrence_no_callable_owns_forces_a_full_replacement() -> anyhow::Result<()> {
+fn a_shifted_occurrence_no_callable_owns_is_repaired_in_place() -> anyhow::Result<()> {
     // Occurrence rows carry no id, so an occurrence the caller-scoped cleanup
     // does not delete becomes a duplicate rather than an updated row. The
     // struct field's occurrence sits outside every callable, so nothing but the
-    // file fence can see it move.
+    // file fence can see it move — and until SRC-C2 the fence answered by
+    // replacing the file, which is what destroyed the bookmark asserted below.
     let dir = tempdir()?;
     let root = dir.path();
     let path = root.join("lib.rs");
@@ -237,6 +238,8 @@ fn a_shifted_occurrence_no_callable_owns_forces_a_full_replacement() -> anyhow::
         .into_iter()
         .find(|node| node.serialized_name == "Thing::value")
         .expect("field node");
+    let category = storage.create_bookmark_category("review")?;
+    let bookmark = storage.add_bookmark(category, field.id, Some("the field"))?;
 
     // Insert above everything, so the field itself moves.
     fs::write(&path, format!("// header\n{RUST_BEFORE}"))?;
@@ -251,6 +254,15 @@ fn a_shifted_occurrence_no_callable_owns_forces_a_full_replacement() -> anyhow::
         field_spans,
         vec![(field.id.0, 5, 5)],
         "the field's occurrence must move once, not be duplicated"
+    );
+    let bookmarks = storage.get_bookmarks(Some(category))?;
+    assert_eq!(
+        bookmarks
+            .iter()
+            .map(|entry| (entry.id, entry.node_id))
+            .collect::<Vec<_>>(),
+        vec![(bookmark, field.id)],
+        "repairing the fence in place is what keeps the field's annotation alive"
     );
     Ok(())
 }

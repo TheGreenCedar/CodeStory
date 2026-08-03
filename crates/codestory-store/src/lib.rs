@@ -48,7 +48,7 @@ pub use storage_impl::{
     StructuralTextArtifactCacheWrite, StructuralTextProjection,
     StructuralTextPublicationCompatibility, StructuralTextUnit,
     StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    stored_vector_encoding, structural_text_unit_digest,
+    UnownedProjectionRemovalSummary, stored_vector_encoding, structural_text_unit_digest,
 };
 
 impl Store {
