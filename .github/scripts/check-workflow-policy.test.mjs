@@ -23,6 +23,7 @@ import {
 import {
   absorbedFailureViolations,
   annotationScopeViolations,
+  callerInputBindings,
   basicWorkflowViolations,
   benchmarkDependencyIsolationViolations,
   crateDurabilityFile,
@@ -7342,6 +7343,127 @@ test("a script that absorbs its own failure must hand that failure to something 
         + " needs.plugin-static.result required",
     ]);
   });
+
+  // The job-level rule accepted exactly the `if:`-only read the step-level rule above
+  // deliberately refuses, and it scanned the absorbing job's own text too, so a job could
+  // satisfy the rule by mentioning its own name. Both readings are the same mistake: a
+  // condition decides whether a reader runs, and a skipped reader is not a failed run.
+  const absorbingCoordinator = () => {
+    const workflows = loadWorkflows();
+    workflows.get("plugin-static.yml").jobs["plugin-static"]["continue-on-error"] = true;
+    return workflows;
+  };
+  const jobViolation = "plugin-static.yml jobs.plugin-static absorbs its own failure and must have"
+    + " needs.plugin-static.result required";
+
+  await t.test("a downstream if: does not make an absorbed job failure required", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      if: "needs.plugin-static.result == 'success'",
+      steps: [{ name: "Report", shell: "bash", run: "echo reported\n" }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("a step-level if: inside the reader is no better", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      steps: [{
+        name: "Report",
+        if: "needs.plugin-static.result == 'success'",
+        shell: "bash",
+        run: "echo reported\n",
+      }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("the absorbing job cannot answer for itself", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs["plugin-static"].steps.push({
+      name: "Mention the result",
+      shell: "bash",
+      run: "echo needs.plugin-static.result\n",
+    });
+    assert.deepEqual(absorbedFailureViolations(workflows), [jobViolation]);
+  });
+
+  await t.test("a reader that absorbs its own failure is not a successor", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      "continue-on-error": true,
+      steps: [{
+        name: "Require the coordinator",
+        shell: "bash",
+        env: { COORDINATOR: "${{ needs.plugin-static.result }}" },
+        run: 'test "$COORDINATOR" = success\n',
+      }],
+    };
+    assert.match(absorbedFailureViolations(workflows).join("\n"), /jobs\.plugin-static absorbs/u);
+  });
+
+  // And the shape that is allowed, one level up: a blocking downstream job that receives the
+  // result where a script can test it and exit non-zero.
+  await t.test("a blocking downstream job that can fail on the result is a successor", () => {
+    const workflows = absorbingCoordinator();
+    workflows.get("plugin-static.yml").jobs.reader = {
+      needs: ["plugin-static"],
+      "runs-on": "ubuntu-latest",
+      steps: [{
+        name: "Require the coordinator",
+        shell: "bash",
+        env: { COORDINATOR: "${{ needs.plugin-static.result }}" },
+        run: 'test "$COORDINATOR" = success\n',
+      }],
+    };
+    assert.deepEqual(absorbedFailureViolations(workflows), []);
+  });
+});
+
+// A caller can pin a callee input to a literal, or it can hand over an expression. Only the
+// first is fixed for every run of that caller; everything interpolated is free, because this
+// check must never invent reachability the caller cannot actually deliver.
+//
+// There used to be a `${{ inputs.x || '' }}` regex separating a verbatim-forwarded dispatch
+// input from every other expression -- and both branches then produced the same free binding.
+// The regex decided nothing, so the guard was exactly as lax as "any expression is free" while
+// its comment claimed a narrower rule. This pins the behaviour that is actually correct, so
+// reintroducing a special case that treats some expressions as fixed fails here.
+test("every interpolated caller input is free and only literals are fixed", () => {
+  const specifications = new Map([
+    ["forwarded", { boolean: false, default: "" }],
+    ["computed", { boolean: false, default: "" }],
+    ["flag", { boolean: true, default: false }],
+    ["pinned", { boolean: false, default: "" }],
+    ["omitted", { boolean: false, default: "fallback" }],
+    ["omitted_flag", { boolean: true, default: false }],
+  ]);
+  const bindings = callerInputBindings({
+    with: {
+      forwarded: "${{ inputs.forwarded || '' }}",
+      computed: "${{ github.event.pull_request.head.sha }}",
+      flag: "${{ github.event_name == 'workflow_dispatch' }}",
+      pinned: "release",
+    },
+  }, specifications);
+
+  const free = { fixed: false, values: ["", "supplied-by-dispatch"] };
+  assert.deepEqual(bindings.get("forwarded"), free);
+  assert.deepEqual(bindings.get("computed"), free);
+  assert.deepEqual(bindings.get("flag"), { fixed: false, values: [true, false] });
+  assert.deepEqual(bindings.get("pinned"), { fixed: true, values: ["release"] });
+  assert.deepEqual(bindings.get("omitted"), { fixed: true, values: ["fallback"] });
+  assert.deepEqual(bindings.get("omitted_flag"), { fixed: true, values: [false] });
+
+  // The retired regex must not come back as a distinction the bindings do not make.
+  const source = readFileSync(path.join(root, ".github", "scripts", "check-workflow-policy.mjs"), "utf8");
+  assert.equal(source.includes("dispatchForwardedPattern"), false, "the dead forwarding branch is retired");
 });
 
 // Routing a dispatched value through `env:` removes it from the script's text -- and from the

@@ -1103,14 +1103,23 @@ pub(crate) struct DrillCommand {
     pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
+    /// Deprecated no-op, retained for one release so pinned invocations keep
+    /// parsing.
+    ///
+    /// The evidence packet owns internal batch scheduling, so a single drill
+    /// has no anchor or bridge worker pool to size — `execute_drill` discarded
+    /// this value while help and the grounding skill advertised it as a real
+    /// control. It is hidden from help and warns when supplied this release;
+    /// removal is next release. `drill-suite --jobs` is a different flag and
+    /// still schedules cases.
     #[arg(
         long,
         value_name = "N",
-        default_value_t = 1,
         value_parser = parse_positive_usize,
-        help = "Read-only anchor and bridge evidence workers for --refresh none drills. Defaults to 1."
+        hide = true,
+        help = "Deprecated and ignored; the evidence packet owns drill scheduling. Removed next release."
     )]
-    pub(crate) jobs: usize,
+    pub(crate) jobs: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -2932,7 +2941,6 @@ mod tests {
         assert!(help.contains("--output-dir <DIR>"));
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
-        assert!(help.contains("--jobs <N>"));
         assert!(help.contains("--profile <PROFILE>"));
         assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
@@ -2990,8 +2998,18 @@ mod tests {
         assert!(!help.contains("--ledger"));
     }
 
+    /// `drill --jobs` is a deprecated no-op in its final release: it must still
+    /// parse so pinned invocations keep working, must no longer be advertised
+    /// in help, and must be distinguishable from "not supplied" so the run can
+    /// say it is being ignored. Removal is next release.
     #[test]
-    fn drill_jobs_parse_with_conservative_default() {
+    fn deprecated_drill_jobs_stays_parseable_but_unadvertised() {
+        let help = render_subcommand_help("drill");
+        assert!(
+            !help.contains("--jobs"),
+            "a flag that schedules nothing must not be advertised: {help}"
+        );
+
         let drill = Cli::try_parse_from([
             "codestory-cli",
             "drill",
@@ -3000,9 +3018,9 @@ mod tests {
             "--output-dir",
             "target/drill/test",
         ])
-        .expect("drill default jobs");
+        .expect("drill without the deprecated flag");
         match drill.command {
-            Command::Drill(cmd) => assert_eq!(cmd.jobs, 1),
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, None),
             _ => panic!("expected drill command"),
         }
 
@@ -3016,9 +3034,9 @@ mod tests {
             "--jobs",
             "4",
         ])
-        .expect("drill explicit jobs");
+        .expect("a pinned invocation must keep parsing for one more release");
         match drill.command {
-            Command::Drill(cmd) => assert_eq!(cmd.jobs, 4),
+            Command::Drill(cmd) => assert_eq!(cmd.jobs, Some(4)),
             _ => panic!("expected drill command"),
         }
 

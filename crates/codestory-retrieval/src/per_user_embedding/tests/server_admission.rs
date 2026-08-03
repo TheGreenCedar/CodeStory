@@ -33,6 +33,57 @@ fn request_deadline_covers_pre_engine_work_and_cancels_abandoned_context() {
     assert!(context.is_cancelled());
 }
 
+/// A panicked worker must not turn the server into a zombie.
+///
+/// Poisoning is recoverable state, not work in flight. Reading a poisoned
+/// request map as "busy" meant one panic anywhere under that lock made every
+/// later idle check false: the server could no longer finish a request, could
+/// no longer drain, and therefore never exited its idle window — it held the
+/// socket and the native engine open indefinitely. Serving still fails closed;
+/// only retirement is allowed to proceed.
+#[test]
+fn a_poisoned_request_map_still_lets_the_idle_window_retire_the_server() {
+    let state = test_server_state();
+    let key = "connection:poisoned";
+    state.active.lock().expect("active map").insert(
+        key.to_string(),
+        ActiveServerRequest {
+            request_id: "poisoned".into(),
+            scope_id: "scope".into(),
+            request_class: EmbeddingRequestClass::Query,
+            phase: "running".into(),
+            started_ns: 0,
+        },
+    );
+
+    let poisoner = Arc::clone(&state);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _active = poisoner.active.lock().expect("active map");
+        let _gate = poisoner.admission_gate.lock().expect("admission gate");
+        panic!("intentional: a worker dies holding the request map and the admission gate");
+    }));
+    assert!(state.active.is_poisoned());
+    assert!(state.admission_gate.is_poisoned());
+
+    state.finish_request(key);
+    assert!(
+        state
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "a poisoned map must still lose the finished request"
+    );
+    assert!(
+        state.true_idle(),
+        "a poisoned lock is recoverable state, not work in flight"
+    );
+    assert!(
+        state.begin_draining_if_idle(),
+        "a server that can no longer serve must still be able to retire"
+    );
+}
+
 #[test]
 fn idle_admission_closes_before_a_new_request_can_enter() {
     let state = test_server_state();

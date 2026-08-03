@@ -41,22 +41,31 @@ struct ModelContract {
     license_source_url: String,
 }
 
+/// The constant-set values this build script turns into compiled constants.
+///
+/// Every field here is read by product code. The constant set also carries
+/// `bulk_replay_success_budget_ms` and the `election_backoff_policy` pair;
+/// those are deliberately *not* fields, because no product code reads them —
+/// they survive only as build-time invariant inputs (the bulk deadline must
+/// cover one successful replay; election backoff must be ordered), which
+/// `load_embedding_server_constants` asserts before this struct is built.
+/// Emitting them as constants nothing reads is the ARCH-024 debt, and
+/// `generated_embedding_constants_are_all_read_by_product_code` fails if it
+/// returns.
 struct EmbeddingServerConstants {
     frozen: bool,
     connect_timeout_ms: u64,
     spawn_convergence_timeout_ms: u64,
     retry_after_ms: u64,
     query_request_deadline_ms: u64,
-    bulk_replay_success_budget_ms: u64,
     bulk_request_deadline_ms: u64,
     hard_native_no_progress_ms: u64,
     watchdog_cadence_ms: u64,
-    election_initial_backoff_ms: Option<u64>,
-    election_maximum_backoff_ms: Option<u64>,
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
+    println!("cargo:rerun-if-changed=model_source_gate.rs");
     println!("cargo:rerun-if-changed={MODEL_CONTRACT_FILE}");
     println!("cargo:rerun-if-changed=model_staging.rs");
     println!("cargo:rerun-if-changed=native_staging.rs");
@@ -118,8 +127,6 @@ fn main() {
             "pub const MODEL_FILE_NAME: &str = {:?};\n\
              pub const MODEL_SIZE: u64 = {};\n\
              pub const MODEL_SHA256: &str = {:?};\n\
-             pub const LLAMA_CPP_CRATE_VERSION: &str = {:?};\n\
-             pub const LLAMA_CPP_SOURCE_COMMIT: &str = {:?};\n\
              const EMBEDDING_DIMENSION: usize = {};\n\
              pub const MODEL_TOKENIZER_SHA256: &str = {:?};\n\
              pub const MODEL_CONFIG_SHA256: &str = {:?};\n\
@@ -135,7 +142,6 @@ fn main() {
              pub const NATIVE_ENGINE_LINKAGE: &str = {engine_linkage:?};\n\
              pub const NATIVE_ENGINE_BACKEND_LOADING: &str = {backend_loading:?};\n\
              pub const NATIVE_ENGINE_COMPILED_BACKENDS: &[&str] = &{compiled_backends:?};\n\
-             pub const NATIVE_ENGINE_GENERATION_ID: &str = {native_generation_id:?};\n\
              pub static NATIVE_ENGINE_GENERATION_MARKER: &[u8] = {native_generation_marker:?}.as_bytes();\n\
              pub const NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256: &str = {embedding_contract_sha256:?};\n\
              pub const GGML_BUILD_IDENTITY: &str = {ggml_build_identity:?};\n\
@@ -143,8 +149,6 @@ fn main() {
             contract.file_name,
             contract.size,
             contract.sha256,
-            contract.llama_cpp_crate_version,
-            contract.llama_cpp_source_commit,
             contract.dimension,
             contract.tokenizer_sha256,
             contract.config_sha256,
@@ -170,12 +174,9 @@ fn main() {
              pub const PER_USER_EMBEDDING_SPAWN_CONVERGENCE_TIMEOUT_MS: u64 = {spawn_convergence_timeout_ms};\n\
              pub const PER_USER_EMBEDDING_RETRY_AFTER_MS: u64 = {retry_after_ms};\n\
              pub const PER_USER_EMBEDDING_QUERY_REQUEST_DEADLINE_MS: u64 = {query_request_deadline_ms};\n\
-             pub const PER_USER_EMBEDDING_BULK_REPLAY_SUCCESS_BUDGET_MS: u64 = {bulk_replay_success_budget_ms};\n\
              pub const PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS: u64 = {bulk_request_deadline_ms};\n\
              pub const PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS: u64 = {hard_native_no_progress_ms};\n\
              pub const PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS: u64 = {watchdog_cadence_ms};\n\
-             pub const PER_USER_EMBEDDING_ELECTION_INITIAL_BACKOFF_MS: Option<u64> = {election_initial_backoff_ms:?};\n\
-             pub const PER_USER_EMBEDDING_ELECTION_MAXIMUM_BACKOFF_MS: Option<u64> = {election_maximum_backoff_ms:?};\n\
              #[used]\n\
              pub static EMBEDDING_SERVER_PROOF_MARKER: &[u8] = {embedding_server_proof_marker:?}.as_bytes();\n",
             constant_set_frozen = embedding_server_constants.frozen,
@@ -185,17 +186,11 @@ fn main() {
             retry_after_ms = embedding_server_constants.retry_after_ms,
             query_request_deadline_ms =
                 embedding_server_constants.query_request_deadline_ms,
-            bulk_replay_success_budget_ms =
-                embedding_server_constants.bulk_replay_success_budget_ms,
             bulk_request_deadline_ms =
                 embedding_server_constants.bulk_request_deadline_ms,
             hard_native_no_progress_ms =
                 embedding_server_constants.hard_native_no_progress_ms,
             watchdog_cadence_ms = embedding_server_constants.watchdog_cadence_ms,
-            election_initial_backoff_ms =
-                embedding_server_constants.election_initial_backoff_ms,
-            election_maximum_backoff_ms =
-                embedding_server_constants.election_maximum_backoff_ms,
         ),
     )
     .expect("write embedding server proof contract");
@@ -375,12 +370,9 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
         spawn_convergence_timeout_ms,
         retry_after_ms,
         query_request_deadline_ms,
-        bulk_replay_success_budget_ms,
         bulk_request_deadline_ms,
         hard_native_no_progress_ms,
         watchdog_cadence_ms,
-        election_initial_backoff_ms,
-        election_maximum_backoff_ms,
     }
 }
 
@@ -739,11 +731,14 @@ fn ordered_contract_digest(domain: &str, values: &[&str]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+include!("model_source_gate.rs");
+
 fn resolve_model_source() -> Option<PathBuf> {
     if let Some(source) = env::var_os("CODESTORY_EMBED_MODEL_SOURCE") {
         return Some(PathBuf::from(source));
     }
-    if env::var("DEBUG").as_deref() != Ok("false") {
+    let profile = env::var("PROFILE").ok();
+    if !profile_requires_embedded_model(profile.as_deref()) {
         return None;
     }
 
