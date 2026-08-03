@@ -389,6 +389,44 @@ impl SidecarRuntimeConfig {
     }
 }
 
+/// Hybrid ranking stays on unless a value explicitly turns it off.
+const HYBRID_RETRIEVAL_ENABLED_DEFAULT: bool = true;
+
+/// The retrieval-owned runtime settings, read from the live process
+/// environment.
+///
+/// This file is the declared owner of every setting in
+/// [`RetrievalRuntimeConfig`], so it is the only one that may read them.
+/// Modules that used to interpret the same variables — the runtime's semantic
+/// projection and search publication — call this instead, which is what makes a
+/// clamp or a default apply once rather than twice with two answers.
+///
+/// Unlike [`sidecar_process_defaults`] this does not freeze: it observes the
+/// environment as it stands at the call. Callers holding a
+/// [`SidecarRuntimeConfig`] should read `runtime.retrieval` from it rather than
+/// call here; this exists for the callers that have no configured runtime in
+/// hand.
+pub fn retrieval_runtime_config_from_process_env() -> RetrievalRuntimeConfig {
+    retrieval_runtime_config(
+        &SidecarRuntimeDefaults::from_process_env(),
+        &SidecarRuntimeOverrides::default(),
+    )
+}
+
+/// Whether hybrid lexical/semantic ranking is enabled for this process.
+///
+/// Narrower than [`retrieval_runtime_config_from_process_env`] because the
+/// query path asks per request; it resolves the value through the same
+/// interpretation, so the two can never disagree.
+pub fn hybrid_retrieval_enabled_from_process_env() -> bool {
+    parse_optional_bool(
+        std::env::var("CODESTORY_HYBRID_RETRIEVAL_ENABLED")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(HYBRID_RETRIEVAL_ENABLED_DEFAULT)
+}
+
 fn retrieval_runtime_config(
     defaults: &SidecarRuntimeDefaults,
     overrides: &SidecarRuntimeOverrides,
@@ -396,7 +434,7 @@ fn retrieval_runtime_config(
     RetrievalRuntimeConfig {
         hybrid_enabled: default_optional_bool(defaults, "CODESTORY_HYBRID_RETRIEVAL_ENABLED")
             .or(overrides.hybrid_retrieval_enabled)
-            .unwrap_or(true),
+            .unwrap_or(HYBRID_RETRIEVAL_ENABLED_DEFAULT),
         semantic_doc_scope: default_nonempty(defaults, "CODESTORY_SEMANTIC_DOC_SCOPE")
             .or_else(|| overrides.semantic_doc_scope.clone())
             .unwrap_or_else(|| "durable".to_string()),
@@ -465,13 +503,17 @@ fn default_nonempty(defaults: &SidecarRuntimeDefaults, name: &str) -> Option<Str
 }
 
 fn default_optional_bool(defaults: &SidecarRuntimeDefaults, name: &str) -> Option<bool> {
-    defaults
-        .get(name)
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
+    parse_optional_bool(defaults.get(name))
+}
+
+/// One interpretation of a boolean setting, shared by every entry point in this
+/// file so a caller cannot get a different answer by asking a different way.
+fn parse_optional_bool(value: Option<&str>) -> Option<bool> {
+    value.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
 }
 
 fn default_bounded_usize(

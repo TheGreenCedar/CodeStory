@@ -43,10 +43,11 @@ pub use storage_impl::{
     STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
     SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
     SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
-    StorageError, StorageOpenMode, StorageStats, StructuralTextArtifactCacheWrite,
-    StructuralTextProjection, StructuralTextPublicationCompatibility, StructuralTextUnit,
+    StorageError, StorageOpenMode, StorageStats, StoredVectorEncoding,
+    StructuralTextArtifactCacheWrite, StructuralTextProjection,
+    StructuralTextPublicationCompatibility, StructuralTextUnit,
     StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    structural_text_unit_digest,
+    stored_vector_encoding, structural_text_unit_digest,
 };
 
 impl Store {

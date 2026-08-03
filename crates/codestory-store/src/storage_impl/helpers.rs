@@ -9,10 +9,27 @@ const EMBEDDING_BLOB_ENCODING_COMPACT_SCALED_INT8: u8 = 3;
 const EMBEDDING_BLOB_HEADER_LEN: usize = 9;
 const EMBEDDING_BLOB_SCALED_INT8_HEADER_LEN: usize = 13;
 
+/// Encoding used for vectors persisted in the core database.
+///
+/// The store writes the blobs, so the store decides what
+/// `CODESTORY_STORED_VECTOR_ENCODING` means, and it is the only module that
+/// reads the setting. Anything that needs to know how vectors are stored —
+/// notably the runtime's quantized semantic prefilter — takes this typed value
+/// rather than interpreting the raw string a second time. The two variants are
+/// the whole vocabulary: a value the store does not recognise is float32,
+/// because that is what the encoder then writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingBlobEncoding {
+pub enum StoredVectorEncoding {
     Float32,
     Int8,
+}
+
+/// The stored vector encoding this process is configured for.
+pub fn stored_vector_encoding() -> StoredVectorEncoding {
+    match std::env::var(STORED_VECTOR_ENCODING_ENV) {
+        Ok(raw) if raw.trim().eq_ignore_ascii_case("int8") => StoredVectorEncoding::Int8,
+        _ => StoredVectorEncoding::Float32,
+    }
 }
 
 pub(crate) fn numbered_placeholders(start: usize, count: usize) -> String {
@@ -55,20 +72,13 @@ pub(crate) fn deserialize_candidate_targets(
 }
 
 pub(crate) fn encode_embedding_blob(values: &[f32]) -> Vec<u8> {
-    encode_embedding_blob_with_encoding(values, embedding_blob_encoding_from_env())
+    encode_embedding_blob_with_encoding(values, stored_vector_encoding())
 }
 
-fn encode_embedding_blob_with_encoding(values: &[f32], encoding: EmbeddingBlobEncoding) -> Vec<u8> {
+fn encode_embedding_blob_with_encoding(values: &[f32], encoding: StoredVectorEncoding) -> Vec<u8> {
     match encoding {
-        EmbeddingBlobEncoding::Float32 => encode_float32_embedding_blob(values),
-        EmbeddingBlobEncoding::Int8 => encode_int8_embedding_blob(values),
-    }
-}
-
-fn embedding_blob_encoding_from_env() -> EmbeddingBlobEncoding {
-    match std::env::var(STORED_VECTOR_ENCODING_ENV) {
-        Ok(raw) if raw.trim().eq_ignore_ascii_case("int8") => EmbeddingBlobEncoding::Int8,
-        _ => EmbeddingBlobEncoding::Float32,
+        StoredVectorEncoding::Float32 => encode_float32_embedding_blob(values),
+        StoredVectorEncoding::Int8 => encode_int8_embedding_blob(values),
     }
 }
 
@@ -206,7 +216,7 @@ mod tests {
     fn test_decode_legacy_float32_embedding_blob() {
         let values = [0.25, -0.5, 0.75];
 
-        let encoded = encode_embedding_blob_with_encoding(&values, EmbeddingBlobEncoding::Float32);
+        let encoded = encode_embedding_blob_with_encoding(&values, StoredVectorEncoding::Float32);
         let decoded = decode_embedding_blob(&encoded).expect("decode legacy f32 blob");
 
         assert_eq!(encoded.len(), values.len() * std::mem::size_of::<f32>());
@@ -217,7 +227,7 @@ mod tests {
     fn test_int8_embedding_blob_is_compact_and_normalized() {
         let values = [0.6, -0.8, 0.0];
 
-        let encoded = encode_embedding_blob_with_encoding(&values, EmbeddingBlobEncoding::Int8);
+        let encoded = encode_embedding_blob_with_encoding(&values, StoredVectorEncoding::Int8);
         let decoded = decode_embedding_blob(&encoded).expect("decode int8 blob");
         let norm = decoded
             .iter()

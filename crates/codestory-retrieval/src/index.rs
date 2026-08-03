@@ -204,10 +204,9 @@ struct PublicationQualificationHook {
 impl PublicationQualificationHook {
     #[cfg(not(feature = "test-support"))]
     fn from_environment() -> Result<Option<Self>> {
-        Self::from_environment_values(
-            std::env::var_os(EMBEDDING_QUALIFICATION_DIR_ENV),
-            std::env::var(EMBEDDING_QUALIFICATION_NONCE_ENV).ok(),
-        )
+        let gate = crate::per_user_embedding::qualification_gate_environment();
+        let nonce = gate.nonce_string();
+        Self::from_environment_values(gate.directory, nonce)
     }
 
     fn from_environment_values(

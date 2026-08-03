@@ -5846,6 +5846,31 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// What the host declared about the pair it provisioned.
+///
+/// The plugin identities are declared to this file, so this is where they are
+/// read. `runtime.rs` builds the `_meta.codestory_publication` stamp from this
+/// value instead of reading the same three variables with its own copy of
+/// `env_nonempty` — the skew detector and the status surface have to be looking
+/// at the same provisioning, or the stamp reports a pairing status the status
+/// report contradicts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HostProvisioningIdentity {
+    pub(crate) plugin_version: Option<String>,
+    pub(crate) plugin_cli_version: Option<String>,
+    /// `None` when the host declared nothing; callers supply their own label
+    /// for a direct launch.
+    pub(crate) cli_source: Option<String>,
+}
+
+pub(crate) fn host_provisioning_identity() -> HostProvisioningIdentity {
+    HostProvisioningIdentity {
+        plugin_version: env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        plugin_cli_version: env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
+        cli_source: env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE"),
+    }
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Sha256::new();

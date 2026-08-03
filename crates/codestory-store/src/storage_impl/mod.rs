@@ -45,6 +45,8 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
+pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+
 const SCHEMA_VERSION: u32 = 31;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.

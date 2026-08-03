@@ -626,6 +626,45 @@ fn semantic_doc_token_budget_defaults_to_safe_window() {
     assert!(semantic_doc_shape_contract().contains("max_tokens=128"));
 }
 
+#[test]
+fn semantic_doc_token_budget_matches_the_owning_module_at_the_clamp_floor() {
+    let _lock = process_env_test_lock();
+    // The setting is declared to codestory-retrieval/src/config.rs, which
+    // clamps a below-floor request up to 16. The runtime used to read the
+    // variable itself and reject a zero back to the 128-token default, so the
+    // same environment described a 16-token budget to publication planning and
+    // a 128-token budget to the projection that wrote the docs.
+    let _env = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "0");
+
+    let owner = codestory_retrieval::retrieval_runtime_config_from_process_env();
+    assert_eq!(owner.semantic_doc_max_tokens, 16);
+    assert_eq!(semantic_doc_max_tokens_from_env(), 16);
+}
+
+#[test]
+fn hybrid_retrieval_flag_matches_the_owning_module() {
+    let _lock = process_env_test_lock();
+    // CODESTORY_HYBRID_RETRIEVAL_ENABLED is declared to
+    // codestory-retrieval/src/config.rs. The runtime's query path asks that
+    // module rather than parsing the variable with its own boolean vocabulary.
+    let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "off");
+    assert!(!crate::hybrid_retrieval_enabled());
+    assert_eq!(
+        crate::hybrid_retrieval_enabled(),
+        codestory_retrieval::retrieval_runtime_config_from_process_env().hybrid_enabled
+    );
+
+    let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "sometimes");
+    assert!(
+        crate::hybrid_retrieval_enabled(),
+        "an unreadable value falls back to the owner's default"
+    );
+    assert_eq!(
+        crate::hybrid_retrieval_enabled(),
+        codestory_retrieval::retrieval_runtime_config_from_process_env().hybrid_enabled
+    );
+}
+
 fn pending_semantic_doc_for_test(node_id: i64, doc_text: &str) -> PendingLlmSymbolDoc {
     PendingLlmSymbolDoc {
         node_id: CoreNodeId(node_id),
