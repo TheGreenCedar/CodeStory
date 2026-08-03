@@ -2051,16 +2051,25 @@ GROUP BY
     f.line_count";
 
 fn outside_related_file_edge_predicate(file_param: &str) -> String {
+    outside_related_file_edge_predicate_for("", file_param)
+}
+
+/// The same "this edge survives the removal" predicate, qualified for joins.
+///
+/// `qualifier` is either empty (bare `edge` statements) or an alias prefix such
+/// as `"e."`. The affected-caller probe joins `node`, which also carries a
+/// `file_node_id` column, so the bare form would be ambiguous there.
+fn outside_related_file_edge_predicate_for(qualifier: &str, file_param: &str) -> String {
     format!(
-        "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-         AND target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+        "{qualifier}source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+         AND {qualifier}target_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
          AND {}",
-        outside_file_node_predicate(file_param)
+        outside_file_node_predicate(qualifier, file_param)
     )
 }
 
-fn outside_file_node_predicate(file_param: &str) -> String {
-    format!("(file_node_id IS NULL OR file_node_id != {file_param})")
+fn outside_file_node_predicate(qualifier: &str, file_param: &str) -> String {
+    format!("({qualifier}file_node_id IS NULL OR {qualifier}file_node_id != {file_param})")
 }
 
 fn get_index_artifact_cache_from_connection(
@@ -3152,28 +3161,25 @@ impl FileRole {
     }
 
     pub fn classify_path(path: &Path) -> Self {
-        let mut normalized = path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let mut best_repo_relative: Option<(usize, String)> = None;
-        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
-            if let Some(index) = normalized.rfind(marker) {
-                let remainder = &normalized[index + marker.len()..];
-                if let Some((_, repo_relative)) = remainder.split_once('/')
-                    && best_repo_relative
-                        .as_ref()
-                        .is_none_or(|(best_index, _)| index > *best_index)
-                {
-                    best_repo_relative = Some((index, repo_relative.to_string()));
-                }
-            }
-        }
-        if let Some((_, repo_relative)) = best_repo_relative {
-            normalized = repo_relative;
-        }
-        let marked = format!("/{normalized}");
-        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+        Self::classify_normalized(&NormalizedRolePath::from_path(path))
+    }
+
+    /// The one owner of "this path names a test or benchmark file".
+    ///
+    /// Callers that only need the test/bench question must route through here
+    /// rather than re-listing directory and suffix markers: a second rule list
+    /// drifts from `classify_path` and the two then disagree about the same
+    /// file. Role precedence is deliberately *not* applied — a vendored or
+    /// generated test file is still a test file for scope filtering, even
+    /// though `classify_path` reports the stronger `Vendor`/`Generated` role.
+    pub fn path_is_test_or_bench(path: &str) -> bool {
+        let normalized = NormalizedRolePath::new(path);
+        normalized.matches_test_markers() || normalized.matches_benchmark_markers()
+    }
+
+    fn classify_normalized(normalized: &NormalizedRolePath) -> Self {
+        let marked = normalized.marked.as_str();
+        let file_name = normalized.file_name();
 
         if marked.contains("/node_modules/")
             || marked.contains("/vendor/")
@@ -3193,24 +3199,7 @@ impl FileRole {
         {
             return Self::Generated;
         }
-        if marked.contains("/tests/")
-            || marked.contains("/test/")
-            || marked.contains("/spec/")
-            || marked.contains("/fixtures/")
-            || marked.contains("/__tests__/")
-            || marked.contains("-test-client/")
-            || marked.contains("_test_client/")
-            || file_name.contains(".test.")
-            || file_name.contains(".spec.")
-            || file_name.ends_with("_test.rs")
-            || file_name.ends_with("_tests.rs")
-            || file_name.ends_with("_test.py")
-            || file_name.ends_with("_tests.py")
-            || file_name.ends_with("_test.ts")
-            || file_name.ends_with("_tests.ts")
-            || file_name.ends_with("_test.tsx")
-            || file_name.ends_with("_tests.tsx")
-        {
+        if normalized.matches_test_markers() {
             return Self::Test;
         }
         if marked.contains("/docs/")
@@ -3219,11 +3208,7 @@ impl FileRole {
         {
             return Self::Docs;
         }
-        if marked.contains("/benchmarks/")
-            || marked.contains("/benchmark/")
-            || marked.contains("/benches/")
-            || marked.contains("/bench/")
-        {
+        if normalized.matches_benchmark_markers() {
             return Self::Benchmark;
         }
         if matches!(
@@ -3243,6 +3228,82 @@ impl FileRole {
             return Self::Entrypoint;
         }
         Self::Source
+    }
+}
+
+/// A path reduced to the form every `FileRole` rule is written against.
+///
+/// Separator- and case-normalized, cut down to the repo-relative remainder when
+/// the path runs through a clone root, and prefixed with `/` so a single
+/// `contains("/tests/")` also matches a repo-root-relative `tests/...`.
+struct NormalizedRolePath {
+    marked: String,
+}
+
+impl NormalizedRolePath {
+    fn from_path(path: &Path) -> Self {
+        Self::new(&path.to_string_lossy())
+    }
+
+    fn new(path: &str) -> Self {
+        let mut normalized = path.replace('\\', "/").to_ascii_lowercase();
+        let mut best_repo_relative: Option<(usize, String)> = None;
+        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+            if let Some(index) = normalized.rfind(marker) {
+                let remainder = &normalized[index + marker.len()..];
+                if let Some((_, repo_relative)) = remainder.split_once('/')
+                    && best_repo_relative
+                        .as_ref()
+                        .is_none_or(|(best_index, _)| index > *best_index)
+                {
+                    best_repo_relative = Some((index, repo_relative.to_string()));
+                }
+            }
+        }
+        if let Some((_, repo_relative)) = best_repo_relative {
+            normalized = repo_relative;
+        }
+        Self {
+            marked: format!("/{normalized}"),
+        }
+    }
+
+    fn file_name(&self) -> &str {
+        self.marked
+            .rsplit('/')
+            .next()
+            .unwrap_or(self.marked.as_str())
+    }
+
+    fn matches_test_markers(&self) -> bool {
+        let marked = self.marked.as_str();
+        let file_name = self.file_name();
+        marked.contains("/tests/")
+            || marked.contains("/test/")
+            || marked.contains("/spec/")
+            || marked.contains("/fixtures/")
+            || marked.contains("/__tests__/")
+            || marked.contains("/__test__/")
+            || marked.contains("-test-client/")
+            || marked.contains("_test_client/")
+            || marked.contains(".test.")
+            || marked.contains(".spec.")
+            || file_name.ends_with("_test.rs")
+            || file_name.ends_with("_tests.rs")
+            || file_name.ends_with("_test.py")
+            || file_name.ends_with("_tests.py")
+            || file_name.ends_with("_test.ts")
+            || file_name.ends_with("_tests.ts")
+            || file_name.ends_with("_test.tsx")
+            || file_name.ends_with("_tests.tsx")
+    }
+
+    fn matches_benchmark_markers(&self) -> bool {
+        let marked = self.marked.as_str();
+        marked.contains("/benchmarks/")
+            || marked.contains("/benchmark/")
+            || marked.contains("/benches/")
+            || marked.contains("/bench/")
     }
 }
 
@@ -3640,6 +3701,36 @@ pub struct FileProjectionRemovalSummary {
     pub removed_local_symbol_count: usize,
     pub removed_file_row_count: usize,
     pub removed_callable_projection_state_count: usize,
+    /// Canonical file node ids that still own an edge whose resolution this
+    /// removal cleared, ascending and deduplicated.
+    ///
+    /// Removing a file nulls `resolved_target_node_id`/`resolved_source_node_id`
+    /// on surviving edges that pointed into it. Those callers live in files the
+    /// incremental plan never scheduled, so unless the caller is carried into
+    /// the resolution scope the edge stays unresolved until a full rebuild —
+    /// deleting a preferred definition would silently shrink what later queries
+    /// can resolve. Collected before the clearing UPDATEs, which is the last
+    /// moment the pointers still exist.
+    #[serde(default)]
+    pub affected_caller_file_ids: Vec<i64>,
+}
+
+/// One file's in-transaction removal result.
+///
+/// `related_node_ids` is post-commit cache bookkeeping, not a reportable
+/// outcome, so it stays off the public summary.
+struct FileProjectionRemoval {
+    summary: FileProjectionRemovalSummary,
+    related_node_ids: Vec<i64>,
+}
+
+/// Aggregate of one hoisted `delete_files_batch` transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchProjectionRemovalSummary {
+    /// Union of every removed file's affected callers, ascending and
+    /// deduplicated, with the removed files themselves excluded: a file deleted
+    /// in the same batch has no surviving caller left to re-resolve.
+    pub affected_caller_file_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11768,6 +11859,62 @@ impl Storage {
         file_node_id: i64,
     ) -> Result<FileProjectionRemovalSummary, StorageError> {
         let tx = self.conn.transaction()?;
+        let removal = Self::delete_file_projection_in_tx(&tx, file_node_id)?;
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+        self.evict_cached_nodes(removal.related_node_ids);
+        Ok(removal.summary)
+    }
+
+    /// Delete every listed file's projection in one transaction.
+    ///
+    /// The transaction and the snapshot invalidation are hoisted out of the
+    /// per-file loop: one commit and one invalidation for the whole batch
+    /// instead of two per file. The batch is therefore all-or-nothing — a
+    /// failure part-way through leaves every file's projection intact rather
+    /// than a half-removed graph.
+    pub fn delete_files_batch(
+        &mut self,
+        file_ids: &[i64],
+    ) -> Result<BatchProjectionRemovalSummary, StorageError> {
+        if file_ids.is_empty() {
+            return Ok(BatchProjectionRemovalSummary::default());
+        }
+
+        let mut affected_caller_file_ids = BTreeSet::new();
+        let mut related_node_ids = Vec::new();
+        let tx = self.conn.transaction()?;
+        for file_id in file_ids {
+            let removal = Self::delete_file_projection_in_tx(&tx, *file_id)?;
+            affected_caller_file_ids.extend(removal.summary.affected_caller_file_ids);
+            related_node_ids.extend(removal.related_node_ids);
+        }
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+        self.evict_cached_nodes(related_node_ids);
+
+        for removed in file_ids {
+            affected_caller_file_ids.remove(removed);
+        }
+        Ok(BatchProjectionRemovalSummary {
+            affected_caller_file_ids: affected_caller_file_ids.into_iter().collect(),
+        })
+    }
+
+    fn evict_cached_nodes(&self, node_ids: Vec<i64>) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut nodes = self.cache.nodes.write();
+        for node_id in node_ids {
+            nodes.remove(&NodeId(node_id));
+        }
+    }
+
+    fn delete_file_projection_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        file_node_id: i64,
+    ) -> Result<FileProjectionRemoval, StorageError> {
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS related_node_ids (
                 node_id INTEGER PRIMARY KEY
@@ -11793,6 +11940,34 @@ impl Storage {
         }
 
         let outside_related_file_edges = outside_related_file_edge_predicate("?1");
+
+        // Collect the callers whose resolution the two UPDATEs below are about
+        // to clear. This must happen first: afterwards the pointers into the
+        // removed file are NULL and the affected callers are unrecoverable.
+        // `COALESCE(caller.file_node_id, e.file_node_id)` matches how the
+        // incremental resolution pass keys a caller's owning file.
+        let affected_caller_file_ids = {
+            let joined_outside_related_file_edges =
+                outside_related_file_edge_predicate_for("e.", "?1");
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT COALESCE(caller.file_node_id, e.file_node_id) AS caller_file_id
+                 FROM edge e
+                 LEFT JOIN node caller ON caller.id = e.source_node_id
+                 WHERE (
+                     e.resolved_target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                     OR e.resolved_source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 )
+                 AND {joined_outside_related_file_edges}
+                 AND COALESCE(caller.file_node_id, e.file_node_id) IS NOT NULL
+                 ORDER BY caller_file_id"
+            ))?;
+            let mut rows = stmt.query(params![file_node_id])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                ids.push(row.get::<_, i64>(0)?);
+            }
+            ids
+        };
 
         tx.execute(
             &format!(
@@ -11937,42 +12112,22 @@ impl Storage {
         let removed_file_rows =
             tx.execute("DELETE FROM file WHERE id = ?1", params![file_node_id])?;
 
-        tx.commit()?;
-        self.invalidate_grounding_snapshots()?;
-
-        {
-            let mut nodes = self.cache.nodes.write();
-            for node_id in related_node_ids {
-                nodes.remove(&NodeId(node_id));
-            }
-        }
-
-        Ok(FileProjectionRemovalSummary {
-            canonical_file_node_id: file_node_id,
-            removed_node_count: removed_nodes,
-            removed_edge_count: removed_edges,
-            removed_occurrence_count: removed_occurrences,
-            removed_error_count: removed_errors,
-            removed_bookmark_node_count: removed_bookmarks,
-            removed_component_access_count: removed_component_access,
-            removed_local_symbol_count: removed_local_symbols,
-            removed_file_row_count: removed_file_rows,
-            removed_callable_projection_state_count,
+        Ok(FileProjectionRemoval {
+            summary: FileProjectionRemovalSummary {
+                canonical_file_node_id: file_node_id,
+                removed_node_count: removed_nodes,
+                removed_edge_count: removed_edges,
+                removed_occurrence_count: removed_occurrences,
+                removed_error_count: removed_errors,
+                removed_bookmark_node_count: removed_bookmarks,
+                removed_component_access_count: removed_component_access,
+                removed_local_symbol_count: removed_local_symbols,
+                removed_file_row_count: removed_file_rows,
+                removed_callable_projection_state_count,
+                affected_caller_file_ids,
+            },
+            related_node_ids,
         })
-    }
-
-    /// Delete a file and all associated projection data.
-    pub fn delete_file(&mut self, file_id: i64) -> Result<(), StorageError> {
-        self.delete_file_projection(file_id)?;
-        Ok(())
-    }
-
-    /// Delete multiple files by their IDs
-    pub fn delete_files_batch(&mut self, file_ids: &[i64]) -> Result<(), StorageError> {
-        for id in file_ids {
-            self.delete_file(*id)?;
-        }
-        Ok(())
     }
 
     // ========================================================================
@@ -12457,28 +12612,9 @@ fn is_caller_scope_allowed(scope: TrailCallerScope, caller_file_path: Option<&st
     match scope {
         TrailCallerScope::IncludeTestsAndBenches => true,
         TrailCallerScope::ProductionOnly => caller_file_path
-            .map(|path| !is_test_or_bench_path(path))
+            .map(|path| !FileRole::path_is_test_or_bench(path))
             .unwrap_or(true),
     }
-}
-
-fn is_test_or_bench_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.starts_with("tests/")
-        || normalized.starts_with("test/")
-        || normalized.starts_with("benches/")
-        || normalized.starts_with("bench/")
-        || normalized.starts_with("__tests__/")
-        || normalized.starts_with("__test__/")
-        || normalized.contains("/tests/")
-        || normalized.contains("/test/")
-        || normalized.contains("/__tests__/")
-        || normalized.contains("/__test__/")
-        || normalized.contains("/benches/")
-        || normalized.contains("/bench/")
-        || normalized.ends_with("_test.rs")
-        || normalized.contains(".test.")
-        || normalized.contains(".spec.")
 }
 
 fn should_ignore_call_resolution(
