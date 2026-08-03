@@ -2211,3 +2211,214 @@ fn the_sealed_receipt_states_its_windows_limit_in_the_contract_and_the_docs() {
         );
     }
 }
+
+/// EV-6c (#1775). Every `Gap`-kind retrieval annotation a release build can emit, keyed by the
+/// file that produces it and the exact argument the producer passes, in source order.
+///
+/// EV-6b (#1746) pinned only the harmless direction: an observation carrying all ten retired
+/// prose markers no longer downgrades `agent_confidence`. The dangerous direction stayed open.
+/// Swapping `trace.annotate_gap(..)` for `trace.observe(..)`, or `RetrievalAnnotationDto::gap(..)`
+/// for `::observation(..)`, at any one site reclassifies a real evidence gap as routine
+/// telemetry: `agent_gap_notes` drops it, the packet keeps `high`/`ready`, and the operator is
+/// told an answer is grounded when the evidence behind it was never retrieved. That direction
+/// *inflates* stated confidence.
+///
+/// The behavioural half of this pin lives with the producers: `agent::trace::tests`,
+/// `agent::packet_batch::tests` and `agent::orchestrator::tests` drive the real code paths and
+/// read the kind back off the published `AgentRetrievalTraceDto`. This inventory covers the
+/// rest: the latency cut-offs and post-retrieval failures inside `execute_retrieval`,
+/// `investigate_query_expansion`, `maybe_read_source_context` and `build_mermaid_artifacts`,
+/// which no unit test can enter because reaching them needs a served retrieval and therefore a
+/// fully indexed sidecar. It is fail-closed in both directions: a producer whose kind flips, a
+/// producer that disappears, and a newly added gap producer all fail here.
+const PRODUCTION_GAP_ANNOTATION_PRODUCERS: &[(&str, &[&str])] = &[
+    (
+        "crates/codestory-runtime/src/agent/orchestrator.rs",
+        &[
+            "annotation",
+            "format!(\"Index freshness not checked: {}\", error.message)",
+            "format!(\"Graph artifact bundle truncated at {} bytes; narrow focus or reduce trail depth for complete graph exports.\", GRAPH_ARTIFACT_BUNDLE_BYTE_CAP)",
+            "format!(\"retrieval_primary rejected=true fail_closed=true reason={reason}\")",
+            "format!(\"retrieval_primary unavailable=true fail_closed=true reason={reason}\")",
+            "\"retrieval_primary skipped local nucleo investigation supplement on weak hits\"",
+            "format!(\"Investigation query expansion failed; continuing with initial hits: {}\", error.message)",
+            "\"Investigation discarded expansion-only hits for an unanchored natural-language query.\"",
+            "\"Investigation skipped repo-text diagnostics because packet evidence must come from sidecar-backed resolvable hits or direct source reads.\"",
+            "\"Investigation discarded low-confidence unanchored hits for a natural-language query.\"",
+            "\"Repo-text diagnostics are disabled for packet evidence; weak unanchored hits were not promoted.\"",
+            "\"Investigation low confidence gap after sidecar query expansion.\"",
+            "\"Grounding snapshot supplement skipped because sidecar-primary retrieval is mandatory.\"",
+            "\"Trail filter options unavailable; continuing with unsanitized filters.\"",
+            "\"Neighborhood retrieval failed; continuing with trail retrieval.\"",
+            "trail_truncated_annotation(idx + 1, plan.max_nodes)",
+            "format!(\"Trail {} failed and was skipped.\", idx + 1)",
+            "\"Latency-first cutoff skipped node occurrence lookups.\"",
+            "format!(\"Node occurrence lookup failed for {}: {}\", hit.display_name, error.message)",
+            "\"Latency-first cutoff skipped edge occurrence lookups.\"",
+            "\"Latency-first cutoff skipped investigation query expansion.\"",
+            "\"Latency-first cutoff skipped source reads.\"",
+            "\"Latency-first cutoff skipped mermaid synthesis.\"",
+        ],
+    ),
+    (
+        "crates/codestory-runtime/src/agent/packet_batch.rs",
+        &[
+            "\"packet_subqueries skipped budget=tiny\"",
+            "format!(\"packet_fused_subquery_batch_failed error={error:?}\")",
+            "format!(\"packet_fused_blocking_cancel_retry skipped reason=latency_budget_exhausted count={}\", retry_pending.len())",
+            "format!(\"packet_fused_blocking_cancel_retry_failed error={error:?}\")",
+            "format!(\"packet_fused_blocking_cancel_retry exhausted count={}\", retry_outcome.retryable_queries.len())",
+            "format!(\"packet_anchor_probes skipped reason={reason}\")",
+            "format!(\"packet_anchor_probe_failed query=`{}` error={}\", query.replace('`', \"'\"), message)",
+        ],
+    ),
+    ("crates/codestory-runtime/src/agent/trace.rs", &["message"]),
+];
+
+/// Collapse `source` onto one line so a producer's argument compares equal however rustfmt
+/// wrapped it.
+fn collapse_call_source(source: &str) -> String {
+    source
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("( ", "(")
+        .replace(" )", ")")
+}
+
+/// The argument expression of every `Gap`-kind annotation producer in `source`, in source order.
+///
+/// `fn annotate_gap(..)` is `TraceRecorder`'s declaration, not a producer, so it is skipped; the
+/// one push inside its body is the producer that stands for it.
+fn gap_annotation_producer_arguments(source: &str) -> Vec<String> {
+    let dense = collapse_call_source(&production_source(source));
+    let mut arguments = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < dense.len() {
+        let Some((offset, token)) = ["annotate_gap(", "RetrievalAnnotationDto::gap("]
+            .into_iter()
+            .filter_map(|token| dense[cursor..].find(token).map(|at| (at, token)))
+            .min()
+        else {
+            break;
+        };
+        let start = cursor + offset;
+        cursor = start + token.len();
+        if dense[..start].ends_with("fn ") {
+            continue;
+        }
+        arguments.push(balanced_call_argument(&dense, cursor));
+    }
+    arguments
+}
+
+/// Text between a producer's opening parenthesis (already consumed) and its match. String and
+/// char literals are skipped so `query.replace('`', "'")` cannot unbalance the scan.
+fn balanced_call_argument(dense: &str, after_open: usize) -> String {
+    let bytes = dense.as_bytes();
+    let mut depth = 1usize;
+    let mut index = after_open;
+    let mut in_string = false;
+    let mut in_char = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string || in_char {
+            match byte {
+                b'\\' => index += 1,
+                b'"' if in_string => in_string = false,
+                b'\'' if in_char => in_char = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'\'' => in_char = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return dense[after_open..index].trim_end_matches(',').to_string();
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    panic!("unbalanced annotation producer call at byte {after_open}");
+}
+
+#[test]
+fn every_production_gap_annotation_producer_is_pinned_to_the_gap_kind() {
+    for (path, expected) in PRODUCTION_GAP_ANNOTATION_PRODUCERS {
+        let expected = expected
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gap_annotation_producer_arguments(&read(path)),
+            expected,
+            "{path}: the Gap-kind annotation producers changed. Reclassifying one as an \
+             observation inflates reported confidence, because `agent_gap_notes` then drops it \
+             and the packet keeps its high/ready verdict; adding one needs a behavioural test \
+             beside this inventory."
+        );
+    }
+
+    // Fail closed: no production file may classify an annotation as a gap without being pinned
+    // above, so a producer moved into a new module cannot escape the inventory.
+    let pinned = PRODUCTION_GAP_ANNOTATION_PRODUCERS
+        .iter()
+        .map(|(path, _)| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let mut discovered = BTreeSet::new();
+    for member in workspace_members() {
+        let source_dir = repo_root().join(&member).join("src");
+        if !source_dir.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_rs_files(&source_dir, &mut files);
+        for file in files {
+            let relative = file
+                .strip_prefix(repo_root())
+                .expect("workspace-relative path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = fs::read_to_string(&file).expect("read source");
+            let shipped = production_source(&source);
+
+            // The inventory scans two entry points. Keep them the *only* two: a struct literal
+            // or a bare `RetrievalAnnotationKindDto::Gap` outside the DTO would mint a gap the
+            // scan cannot see, and the pin above would quietly stop covering it.
+            assert!(
+                !shipped.contains("RetrievalAnnotationDto {")
+                    || relative == "crates/codestory-contracts/src/api/dto.rs",
+                "{relative} builds a RetrievalAnnotationDto by struct literal; annotations must \
+                 be minted through RetrievalAnnotationDto::gap / ::observation so the gap \
+                 inventory can see them"
+            );
+            assert!(
+                !shipped.contains("RetrievalAnnotationKindDto::Gap")
+                    || matches!(
+                        relative.as_str(),
+                        "crates/codestory-contracts/src/api/dto.rs"
+                            | "crates/codestory-cli/src/output.rs"
+                    ),
+                "{relative} names RetrievalAnnotationKindDto::Gap outside the DTO constructors \
+                 and the single confidence consumer"
+            );
+
+            if gap_annotation_producer_arguments(&source).is_empty() {
+                continue;
+            }
+            discovered.insert(relative);
+        }
+    }
+    assert_eq!(
+        discovered, pinned,
+        "a production file emits Gap-kind annotations without being pinned in \
+         PRODUCTION_GAP_ANNOTATION_PRODUCERS"
+    );
+}
