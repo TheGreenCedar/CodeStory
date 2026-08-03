@@ -454,6 +454,20 @@ mod tests {
 }
 pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
 `);
+  // A lifetime and a possessive are not quotes. Read as quotes they pair off in
+  // file order, and everything between them -- here the split marker -- stops
+  // being a literal the compact pass can see, which made what the gate reads a
+  // function of how many apostrophes the file happens to contain.
+  reject("apostrophe-parity.rs", `
+pub fn version() -> &'static str { "neutral" }
+pub fn leaked() -> String { ["dispatch", "request"].concat() }
+// This file's own prose must not decide whether the line above is scanned.
+`);
+  allow("apostrophe-parity-neutral.rs", `
+pub fn newline() -> char { '\\n' }
+// The crate's own comment stays a comment.
+pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
+`);
   const splitConstructionFiles = new Map([
     ["split-family/use-s-wr.rs", {
       source: 'pub fn leaked() -> String { ["use", "s", "wr"].concat() }\n',
@@ -850,6 +864,10 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     assert.ok(result.stderr.includes("codex-rs/prod/src/lib.rs"));
     assert.ok(!result.stderr.includes("crates/codestory-retrieval/src/ranker.rs (production slice)"));
 
+    assert.ok(
+      banFiredFor(result, "apostrophe-parity.rs", "dispatchrequest"),
+      "a lifetime and a possessive apostrophe hid a split marker from the compact pass",
+    );
     for (const marker of CURRENT_HOLDOUT_LITERALS) {
       assert.ok(
         banFiredFor(result, "current-holdouts.rs", marker),

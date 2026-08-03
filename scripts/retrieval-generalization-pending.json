@@ -1,7 +1,7 @@
 {
-  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion; total_markers must equal the number of markers listed below and total_marker_occurrences must equal the sum of their counts, so neither the number of surfaces nor the number of production lines they occupy can move without a reviewable diff that restates both numbers.",
-  "total_markers": 182,
-  "total_marker_occurrences": 257,
+  "note": "Benchmark-family surfaces the v0.16.1 generalization audit found in agent packet code and in architecture coverage scoring, with the number of production lines each marker occupies today. They are recorded, not excused. The lint fails on any banned corpus marker outside this inventory, on one more occurrence of a marker inside it, and on any entry that stops matching, so growing or deleting one of these surfaces must edit this file. Every surface must also carry a reason and the issue tracking its deletion; total_markers must equal the number of markers listed below and total_marker_occurrences must equal the sum of their counts, so neither the number of surfaces nor the number of production lines they occupy can move without a reviewable diff that restates both numbers. Twenty-one of the markers below, and two of the counts, were added when the lint stopped reading a Rust lifetime or a possessive apostrophe as an opening string quote: the scanner had been pairing those apostrophes off in file order, so every string literal between one and the next was invisible to it. Those surfaces are not new code, they are code the gate could not see, and they are recorded on the same terms as the rest -- the deletion each file's reason describes now has to cover them too.",
+  "total_markers": 203,
+  "total_marker_occurrences": 293,
   "pending_claim_profiles": {
     "file": "crates/codestory-runtime/src/agent/packet_claim_profiles.rs",
     "declaration": "SourceClaimProductProfile::pending(",
@@ -18,7 +18,14 @@
         "RouterGroup": 1,
         "TypeMap": 2,
         "addRoute": 1,
-        "mapperconfiguration": 1
+        "applicationjs": 1,
+        "foreignkey": 5,
+        "formvalidation": 1,
+        "initserver": 1,
+        "mapperconfiguration": 1,
+        "processcommand": 1,
+        "responsejs": 1,
+        "typemap": 1
       }
     },
     "crates/codestory-runtime/src/agent/packet_capping.rs": {
@@ -43,7 +50,7 @@
         "addroute": 1,
         "addurlrule": 1,
         "callexecutesthecommandprocandhandlespropagationmonitoringandslowlogaccounting": 1,
-        "dispatchrequest": 4,
+        "dispatchrequest": 5,
         "div#app": 1,
         "formatargstore": 3,
         "formaterror": 1,
@@ -51,12 +58,20 @@
         "fulldispatchrequest": 2,
         "isBlank": 3,
         "isEmpty": 3,
+        "isblank": 3,
+        "isempty": 3,
+        "processcommand": 1,
+        "processcommandresolvesthecommandtableentryandenforcesaclarityandclusterchecks": 1,
         "processinputbuffer": 1,
         "pushHandler": 1,
         "regionMatches": 1,
+        "regionmatches": 1,
+        "requestresume": 1,
         "routergroup": 1,
         "searchparallel": 1,
-        "searchworker": 1,
+        "searchworker": 3,
+        "sessionrequest": 2,
+        "sessionsend": 1,
         "typemap": 2,
         "wsgiapp": 1
       }
@@ -66,6 +81,7 @@
       "reason": "Claim assembly names holdout storage engines when it decides a claim is source-backed. The check has to move to what the indexed file says about itself.",
       "markers": {
         "SourceGroup": 1,
+        "foreignkey": 1,
         "json_output": 2
       }
     },
@@ -91,8 +107,13 @@
         "IndexerCommand": 1,
         "SourceGroup": 5,
         "buildIndex": 1,
+        "buildindex": 1,
         "event_processor": 2,
+        "eventprocessor": 3,
+        "foreignkey": 2,
+        "formatargstore": 1,
         "run_main": 1,
+        "runmain": 1,
         "source_group": 1
       }
     },
