@@ -491,6 +491,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "javascript",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "typescript",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1264,7 +1268,10 @@ mod tests {
             .iter()
             .map(|profile| profile.language_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["kotlin", "java", "cpp", "javascript"]);
+        assert_eq!(
+            names,
+            vec!["kotlin", "java", "cpp", "javascript", "typescript"]
+        );
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
                 language_support_profile_for_language_name(profile.language_name).is_some(),
@@ -1278,6 +1285,10 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("typescript"), Some("//"));
+        // `tsx` is an indexer-only dispatch name with no public profile, so it
+        // keeps answering from the CLI's own roster until #1682 lands.
+        assert_eq!(line_comment_for_language("tsx"), None);
         assert_eq!(line_comment_for_language("java"), Some("//"));
         assert_eq!(line_comment_for_language("cpp"), Some("//"));
         assert_eq!(line_comment_for_language("javascript"), Some("//"));

@@ -30,8 +30,9 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     match (profile.language_name, ext.as_str()) {
         ("python", _) => Some(python()),
         ("rust", _) => Some(rust()),
+        // `ts`/`mts`/`cts` are answered by the registry above; `tsx` keeps its
+        // own grammar and rule file until #1682 gives it a registry row.
         ("typescript", "tsx") => Some(tsx()),
-        ("typescript", _) => Some(typescript()),
         ("go", _) => Some(go()),
         ("ruby", _) => Some(ruby()),
         ("php", _) => Some(php()),
@@ -60,16 +61,6 @@ fn rust() -> LanguageConfig {
         RUST_GRAPH_QUERY,
         Some(RUST_TAGS_QUERY),
         LanguageRuleset::Rust,
-    )
-}
-
-fn typescript() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "typescript",
-        TYPESCRIPT_GRAPH_QUERY,
-        Some(TYPESCRIPT_TAGS_QUERY),
-        LanguageRuleset::TypeScript,
     )
 }
 
