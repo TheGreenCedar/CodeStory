@@ -3942,7 +3942,7 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
             "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            | "cpp" | "dart" | "php" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5572,8 +5572,9 @@ mod tests {
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
-    /// Kotlin's comment marker now comes from the language registry rather than
-    /// the local roster, and every other language must be unmoved.
+    /// Kotlin's and Swift's comment markers now come from the language
+    /// registry rather than the local roster, and every other language must be
+    /// unmoved.
     ///
     /// Asserting only "Kotlin still dims `//`" would pass with the registry
     /// lookup deleted, because the local roster used to answer for Kotlin too.
@@ -5631,14 +5632,20 @@ mod tests {
             }
         }
 
-        // The registry is the source for Kotlin: it must agree with the marker
-        // the roster used to hold.
+        // The registry is the source for Kotlin and Swift: it must agree with
+        // the markers the roster used to hold.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("kotlin"),
             Some("//")
         );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("swift"),
+            Some("//")
+        );
+        let swift = ansi_highlight_snippet("app/Main.swift", "let ok = true // comment");
+        assert!(swift.contains("\x1b[90m// comment\x1b[0m"), "{swift:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

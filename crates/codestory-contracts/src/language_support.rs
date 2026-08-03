@@ -474,10 +474,16 @@ pub struct LanguageCommentProfile {
     pub line_comment: &'static str,
 }
 
-pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[LanguageCommentProfile {
-    language_name: "kotlin",
-    line_comment: "//",
-}];
+pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
+    LanguageCommentProfile {
+        language_name: "kotlin",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "swift",
+        line_comment: "//",
+    },
+];
 
 /// Line-comment marker for a registered language name.
 pub fn line_comment_for_language(language_name: &str) -> Option<&'static str> {
@@ -1245,7 +1251,7 @@ mod tests {
             .iter()
             .map(|profile| profile.language_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["kotlin"]);
+        assert_eq!(names, vec!["kotlin", "swift"]);
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
                 language_support_profile_for_language_name(profile.language_name).is_some(),
@@ -1259,7 +1265,8 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
-        assert_eq!(line_comment_for_language("swift"), None);
+        assert_eq!(line_comment_for_language("swift"), Some("//"));
+        assert_eq!(line_comment_for_language("dart"), None);
     }
 
     #[test]

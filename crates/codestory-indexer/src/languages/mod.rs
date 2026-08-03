@@ -17,6 +17,7 @@
 //! package to land deletes the residual arms entirely.
 
 pub(crate) mod kotlin;
+pub(crate) mod swift;
 
 use std::sync::OnceLock;
 
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, swift::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {

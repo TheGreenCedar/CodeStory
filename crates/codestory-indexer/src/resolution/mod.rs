@@ -1381,7 +1381,7 @@ fn is_swift_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opti
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::SWIFT_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::swift::MEMBER_CALLSITE_MARKER)
     })
 }
 
