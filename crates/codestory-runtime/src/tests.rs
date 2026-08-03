@@ -3637,6 +3637,59 @@ fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
     assert!(changed.observed_size > first_exclusion.observed_size);
 }
 
+/// CAP-1b: a partially parsed file is not "covered".
+///
+/// `ParserPartial` is the one coverage reason that survives publication — both
+/// refresh gates refuse to commit on any other — so it is precisely the defect
+/// a *served* packet can rest on. Reporting such a file `Indexed` would
+/// contradict this contract's own definition of the word, and would leave the
+/// half of the coverage surface that can actually occur doing nothing.
+#[test]
+fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let partial = workspace.path().join("job-store.ts");
+    fs::write(
+        &partial,
+        "declare function sql<T>(parts: TemplateStringsArray): T;\n\
+         export const row = sql<unknown>`SELECT 1`;\n",
+    )
+    .expect("write a source the parser only partly understands");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("a parser-partial file must not block publication");
+
+    let observations =
+        crate::source_coverage::observe_source_coverage(&controller, &["job-store.ts".to_string()]);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].status,
+        codestory_contracts::api::SourceCoverageStatusDto::Incomplete,
+        "a file with a recorded coverage defect is not covered: {observations:?}"
+    );
+    assert_eq!(
+        observations[0].reason,
+        Some(codestory_contracts::graph::FileCoverageReason::ParserPartial),
+        "{observations:?}"
+    );
+
+    let input =
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations);
+    assert!(
+        input.caps_sufficiency(),
+        "an incompletely parsed file must stop a packet claiming sufficiency"
+    );
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never
@@ -10901,231 +10954,5 @@ fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() 
             .list_bookmarks(None)
             .expect("read after delete")
             .is_empty()
-    );
-}
-
-
-/// TMP REFUTATION PROBE — delete after review.
-/// The claim: "A test that seeds an exclusion row and asserts
-/// observe_source_coverage returns PolicyExcluded for a cited path would fail
-/// today for any parser-backed extension."
-#[test]
-fn tmp_probe_parser_backed_extension_reaches_policy_excluded() {
-    let _env = hybrid_test_env();
-    let workspace = copy_tictactoe_workspace();
-
-    // Parser-backed extension, above the 2_000_000 parser byte cap.
-    let src_dir = workspace.path().join("src");
-    fs::create_dir_all(&src_dir).expect("src dir");
-    let huge_rs = src_dir.join("huge.rs");
-    let mut body = String::from("pub fn huge_entry() {}\n");
-    while body.len() < 2_500_000 {
-        body.push_str("// padding padding padding padding padding padding padding\n");
-    }
-    fs::write(&huge_rs, &body).expect("write huge.rs");
-
-    let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-    controller
-        .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path.clone())
-        .expect("open project");
-    controller
-        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect("index");
-
-    let rows = Store::open(&storage_path)
-        .expect("storage")
-        .get_source_policy_exclusions()
-        .expect("exclusions");
-    println!("TMP_PROBE rows={rows:?}");
-
-    let spellings = vec![
-        "src/huge.rs".to_string(),
-        huge_rs.to_string_lossy().to_string(),
-        format!(
-            ".{}src{}huge.rs",
-            std::path::MAIN_SEPARATOR,
-            std::path::MAIN_SEPARATOR
-        ),
-    ];
-    let observations = crate::source_coverage::observe_source_coverage(&controller, &spellings);
-    println!("TMP_PROBE observations={observations:?}");
-    for observation in &observations {
-        assert_eq!(
-            observation.status,
-            codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
-            "parser-backed .rs must reach PolicyExcluded: {observation:?}"
-        );
-        assert_eq!(
-            observation.byte_cap,
-            Some(codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP),
-            "{observation:?}"
-        );
-    }
-}
-
-/// TMP REFUTATION PROBE — delete after review.
-/// Claim under test: "a half-published index reads as fully covered" because
-/// observe_source_coverage does not gate on a complete publication.
-#[test]
-fn tmp_probe_half_published_index_is_gated_above_source_coverage() {
-    use crate::index_freshness::FreshnessObservationPolicy;
-
-    let _env = hybrid_test_env();
-    let workspace = copy_tictactoe_workspace();
-    let structural = workspace.path().join("docs").join("api.json");
-    fs::create_dir_all(structural.parent().expect("docs dir")).expect("create docs dir");
-    fs::write(&structural, vec![b'x'; 1_300_010]).expect("write oversized structural source");
-
-    let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-    controller
-        .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path.clone())
-        .expect("open project");
-    controller
-        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect("publish complete core");
-
-    let baseline =
-        crate::source_coverage::observe_source_coverage(&controller, &["docs/api.json".to_string()]);
-    println!("TMP_PROBE baseline={baseline:?}");
-    controller
-        .with_complete_core_snapshot(|publication| {
-            println!("TMP_PROBE healthy_gate_generation={}", publication.generation);
-            Ok(())
-        })
-        .expect("healthy gate admits");
-
-    // Scenario 1 from the claim: mid-refresh.
-    {
-        let storage = Storage::open(&storage_path).expect("open live storage");
-        storage
-            .begin_incremental_run()
-            .expect("mark a live run in flight");
-    }
-    let mid_refresh_gate = controller.with_complete_core_snapshot(|_| Ok(()));
-    println!(
-        "TMP_PROBE mid_refresh_gate_err={:?}",
-        mid_refresh_gate.as_ref().err().map(|e| (e.code.clone(), e.message.clone()))
-    );
-    let mid_refresh_observation =
-        crate::source_coverage::observe_source_coverage(&controller, &["docs/api.json".to_string()]);
-    println!("TMP_PROBE mid_refresh_observation={mid_refresh_observation:?}");
-    {
-        let storage = Storage::open(&storage_path).expect("open live storage");
-        storage.finish_incremental_run().expect("clear marker");
-    }
-
-    // Scenario 2 from the claim: exclusion rows unwritten, core publication complete.
-    {
-        let storage = Storage::open(&storage_path).expect("open live storage");
-        storage
-            .get_connection()
-            .execute("DELETE FROM source_policy_exclusion", [])
-            .expect("simulate unwritten exclusion rows");
-    }
-    let torn_observation =
-        crate::source_coverage::observe_source_coverage(&controller, &["docs/api.json".to_string()]);
-    println!("TMP_PROBE torn_observation={torn_observation:?}");
-    let torn_gate = controller.with_complete_core_snapshot(|_| Ok(()));
-    println!(
-        "TMP_PROBE torn_core_gate_err={:?}",
-        torn_gate.as_ref().err().map(|e| (e.code.clone(), e.message.clone()))
-    );
-    let freshness = controller
-        .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
-        .expect("freshness after tearing rows");
-    println!(
-        "TMP_PROBE torn_freshness status={:?} new={} changed={} reason={:?}",
-        freshness.status, freshness.new_file_count, freshness.changed_file_count, freshness.reason
-    );
-    let read = Storage::open_read_only(&storage_path).expect("read-only live");
-    let publication = read
-        .get_complete_index_publication()
-        .expect("read publication")
-        .expect("complete publication");
-    let identity = project_identity_v3(workspace.path());
-    let validated = read.validate_source_policy_exclusion_publication(
-        &publication,
-        &identity.project_id,
-        &identity.workspace_id,
-        default_source_policy_identity(),
-    );
-    println!(
-        "TMP_PROBE torn_manifest_validation_err={:?}",
-        validated.err().map(|e| e.to_string())
-    );
-}
-
-/// TMP REFUTATION PROBE — delete after review.
-/// Claim under test: `Indexed` is a fallthrough default, not an observation.
-#[test]
-fn tmp_probe_indexed_is_a_fallthrough_default() {
-    use crate::agent::packet_coverage::PacketCoverageInput;
-    use crate::agent::packet_probe::{exact_packet_probe_paths, resolve_packet_probes};
-    use codestory_contracts::api::{PacketProbeDto, PacketProbeResolutionStatusDto};
-
-    let _env = hybrid_test_env();
-    let workspace = copy_tictactoe_workspace();
-    let storage_path = workspace.path().join(".cache").join("codestory.db");
-    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-    controller
-        .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path.clone())
-        .expect("open project");
-    controller
-        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect("publish complete core");
-
-    // A source file that exists on disk but that the published core does NOT
-    // contain: written after the index was published, so it is neither
-    // `indexed` nor `complete` in storage, and it is not policy-excluded.
-    let added = workspace.path().join("added_after_index.kt");
-    fs::write(&added, "fun addedAfterIndex(): Int { return 7 }\n").expect("write new source");
-
-    // 1. The probe layer — the very same orchestrator step that feeds
-    //    `covered_paths` — already knows this file is not covered.
-    let resolutions = resolve_packet_probes(
-        &controller,
-        vec![PacketProbeDto::ExactPath {
-            path: "added_after_index.kt".into(),
-        }],
-    );
-    println!("TMP_PROBE probe_status={:?}", resolutions[0].status);
-    assert_eq!(
-        resolutions[0].status,
-        PacketProbeResolutionStatusDto::ValidUncoveredPath,
-        "probe layer must see this file as uncovered"
-    );
-    let probe_paths = exact_packet_probe_paths(&resolutions);
-    println!("TMP_PROBE probe_paths={probe_paths:?}");
-    assert_eq!(probe_paths, vec!["added_after_index.kt".to_string()]);
-
-    // 2. The new observer, fed exactly those orchestrator paths, disagrees.
-    let observations = crate::source_coverage::observe_source_coverage(&controller, &probe_paths);
-    println!("TMP_PROBE observations={observations:?}");
-    assert_eq!(
-        observations[0].status,
-        codestory_contracts::api::SourceCoverageStatusDto::Indexed,
-        "FALLTHROUGH: an unindexed file is reported as Indexed"
-    );
-
-    // 3. Consequence: sufficiency is not capped.
-    let input = PacketCoverageInput::from_observations(&observations);
-    println!("TMP_PROBE caps_sufficiency={}", input.caps_sufficiency());
-    assert!(
-        !input.caps_sufficiency(),
-        "no cap fires for a file the index never covered"
-    );
-
-    // 4. Same for a path that does not exist at all anywhere.
-    let ghost = crate::source_coverage::observe_source_coverage(
-        &controller,
-        &["src/does/not/exist/anywhere.rs".to_string()],
-    );
-    println!("TMP_PROBE ghost={ghost:?}");
-    assert_eq!(
-        ghost[0].status,
-        codestory_contracts::api::SourceCoverageStatusDto::Indexed,
-        "FALLTHROUGH: a nonexistent path is reported as Indexed"
     );
 }

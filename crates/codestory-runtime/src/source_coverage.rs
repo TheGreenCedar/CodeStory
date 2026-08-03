@@ -11,6 +11,7 @@
 //! one reporting them as covered, which is the defect itself moved one layer up.
 
 use crate::AppController;
+use crate::index_coverage::stored_file_coverage_diagnostics;
 use codestory_contracts::api::{
     SourceCoverageNotEstablishedCauseDto, SourceCoverageObservationDto, SourceCoverageStatusDto,
 };
@@ -57,6 +58,16 @@ pub(crate) fn observe_source_coverage(
         }
     };
 
+    // `ParserPartial` is the one coverage reason that survives publication —
+    // both refresh gates refuse to commit on any other — so it is exactly the
+    // defect a served packet can rest on, and reporting such a file `Indexed`
+    // would contradict this contract's own definition of the word.
+    let diagnostics = stored_file_coverage_diagnostics(&project_root, &storage).unwrap_or_default();
+    let incomplete: Vec<(PathBuf, codestory_contracts::graph::FileCoverageReason)> = diagnostics
+        .iter()
+        .map(|diagnostic| (project_root.join(&diagnostic.path), diagnostic.reason))
+        .collect();
+
     // Resolved once, not per requested path: the comparison is by path identity
     // rather than by string, so each side has to be made absolute first.
     let excluded: Vec<(PathBuf, u64, u64)> = exclusions
@@ -70,10 +81,7 @@ pub(crate) fn observe_source_coverage(
         })
         .collect();
 
-    let tmp_probe_paths = deduped.len();
-    let tmp_probe_exclusions = excluded.len();
-    let tmp_probe_started = std::time::Instant::now();
-    let tmp_probe_result: Vec<SourceCoverageObservationDto> = deduped
+    deduped
         .into_iter()
         .map(|path| {
             let absolute = absolute_against(&project_root, path);
@@ -89,25 +97,30 @@ pub(crate) fn observe_source_coverage(
                     observed_size: Some(*observed_size),
                     byte_cap: Some(*byte_cap),
                 },
-                None => SourceCoverageObservationDto {
-                    path: path.clone(),
-                    status: SourceCoverageStatusDto::Indexed,
-                    reason: None,
-                    not_established_cause: None,
-                    observed_size: None,
-                    byte_cap: None,
+                None => match incomplete
+                    .iter()
+                    .find(|(defect_path, _)| same_workspace_path(defect_path, &absolute))
+                {
+                    Some((_, reason)) => SourceCoverageObservationDto {
+                        path: path.clone(),
+                        status: SourceCoverageStatusDto::Incomplete,
+                        reason: Some(*reason),
+                        not_established_cause: None,
+                        observed_size: None,
+                        byte_cap: None,
+                    },
+                    None => SourceCoverageObservationDto {
+                        path: path.clone(),
+                        status: SourceCoverageStatusDto::Indexed,
+                        reason: None,
+                        not_established_cause: None,
+                        observed_size: None,
+                        byte_cap: None,
+                    },
                 },
             }
         })
-        .collect();
-    eprintln!(
-        "TMP_PROBE source_coverage paths={} exclusions={} pair_stats={} elapsed_ms={:.3}",
-        tmp_probe_paths,
-        tmp_probe_exclusions,
-        2 * tmp_probe_paths * tmp_probe_exclusions,
-        tmp_probe_started.elapsed().as_secs_f64() * 1000.0
-    );
-    tmp_probe_result
+        .collect()
 }
 
 fn absolute_against(project_root: &Path, path: &str) -> PathBuf {
