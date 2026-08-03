@@ -38,16 +38,18 @@ use std::sync::OnceLock;
 use tree_sitter::{Node as TsNode, Tree};
 
 use super::LanguageExtraction;
+use super::typescript::{
+    collect_typescript_imported_type_bindings, typescript_property_belongs_to_owner,
+};
 use crate::{
     CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualReceiverCallSpec,
     ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey, ReceiverOwnerBinding,
-    collect_receiver_call_specs_in_callable, collect_typescript_imported_type_bindings,
-    declaration_name, enclosing_node_with_kind, js_like_callable_source_name,
-    js_ts_local_binding_visible_at_call, js_ts_visible_local_type_name, member_call_method_col,
+    collect_receiver_call_specs_in_callable, declaration_name, enclosing_node_with_kind,
+    js_like_callable_source_name, js_ts_local_binding_visible_at_call,
+    js_ts_visible_local_type_name, member_call_method_col,
     normalize_js_ts_private_receiver_surface, normalize_parameter_name,
     normalized_receiver_variable, receiver_call_belongs_to_callable, receiver_callsite_key,
-    same_ts_span, trimmed_node_text, ts_node_graph_span, typescript_property_belongs_to_owner,
-    walk_tree_nodes,
+    same_ts_span, trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
 };
 
 /// Callsite marker written onto edges produced from JavaScript member-call
@@ -68,6 +70,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
     member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
     graph_call_syntax: Some("js_member"),

@@ -5636,10 +5636,11 @@ mod tests {
             }
         }
 
-        // The registry is the source for Kotlin and TypeScript: it must agree
-        // with the marker the roster used to hold. `tsx` deliberately still
-        // answers from the local roster — it has no public language profile,
-        // and #1682 owns that row.
+        // The registry is the source for every migrated language, `tsx`
+        // included: it must agree with the marker the local roster used to
+        // hold. `jsx` is the one highlighter dialect with no registry row, so
+        // it still answers from the roster above — that split is what keeps
+        // the highlighter's dialect handling separate from language ownership.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("kotlin"),
             Some("//")
@@ -5650,7 +5651,9 @@ mod tests {
         );
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("tsx"),
-            None
+            Some("//")
+        );
+        assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("go"),
             Some("//")
         );
@@ -5687,16 +5690,17 @@ mod tests {
             typescript.contains("\x1b[90m// comment\x1b[0m"),
             "{typescript:?}"
         );
-        // Same for the `tsx` dialect. `typescript` and `jsx` must still come
-        // from the local roster, because their packages have not landed: a row
-        // that answered for them here would move rendering ownership early.
+        // `typescript` and the `tsx` dialect both answer from the registry now.
+        // `jsx` still must not: it is a highlighter dialect with no registered
+        // language behind it, so a row answering for it here would move
+        // rendering ownership to a surface that owns nothing.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("tsx"),
             Some("//")
         );
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("typescript"),
-            None
+            Some("//")
         );
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("jsx"),

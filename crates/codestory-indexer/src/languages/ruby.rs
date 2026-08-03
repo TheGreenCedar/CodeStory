@@ -41,11 +41,11 @@ use tree_sitter::{Node as TsNode, Tree};
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, LanguageRuleset, ManualReceiverCallSpec, ManualReceiverSource,
-    code_before_hash_comment, declaration_name, enclosing_node_with_kind, member_call_method_col,
-    normalize_type_surface, normalized_receiver_variable, quoted_literal_surface,
-    receiver_call_belongs_to_callable, same_ts_span, trimmed_node_text, ts_node_graph_span,
-    walk_tree_nodes,
+    CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec,
+    ManualReceiverSource, code_before_hash_comment, collect_enclosing_type_member_edges,
+    declaration_name, enclosing_node_with_kind, member_call_method_col, normalize_type_surface,
+    normalized_receiver_variable, quoted_literal_surface, receiver_call_belongs_to_callable,
+    same_ts_span, trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
 };
 
 /// Callsite marker written onto edges produced from Ruby member-call syntax.
@@ -65,6 +65,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    member_edge_specs: Some(member_edge_specs),
     receiver_call_specs: Some(receiver_call_specs),
     // `rules/ruby.scm` emits no `call_syntax`, so there is no rule-file value
     // for the registry to map; `annotate_ruby_member_call_placeholders` stamps
@@ -385,4 +386,19 @@ fn ruby_constructor_owner_surface(surface: &str) -> Option<String> {
     }
     let raw_owner = raw_owner.trim();
     normalize_type_surface(raw_owner)
+}
+
+/// The manual MEMBER-edge collector this language had in `lib.rs`.
+///
+/// `language_member_specs` consults the registry before its residual
+/// `match`, so once this row exists the old arm is unreachable. Leaving the
+/// field `None` would therefore drop ruby's MEMBER edges silently, with
+/// nothing in the arm itself to show it had stopped running.
+pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
+    collect_enclosing_type_member_edges(
+        tree,
+        source,
+        &["class", "module"],
+        &["method", "singleton_method"],
+    )
 }

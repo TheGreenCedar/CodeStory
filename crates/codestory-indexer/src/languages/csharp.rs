@@ -40,8 +40,9 @@ use tree_sitter::{Node as TsNode, Tree};
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualReceiverCallSpec,
-    ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey,
+    CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualMemberEdgeSpec,
+    ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
+    ReceiverCallSiteKey, collect_enclosing_type_member_edges,
     collect_receiver_call_specs_in_callable, declaration_name, descendant_by_field_name,
     enclosing_node_with_kind, first_descendant_with_kind, member_call_method_col,
     node_is_same_or_ancestor, normalize_parameter_name, normalize_type_surface,
@@ -68,6 +69,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    member_edge_specs: Some(member_edge_specs),
     receiver_call_specs: Some(receiver_call_specs),
     member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
     graph_call_syntax: Some("csharp_member"),
@@ -822,4 +824,23 @@ fn member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
         normalized_receiver_variable(receiver, source)?,
         trimmed_node_text(method, source)?,
     ))
+}
+
+/// The manual MEMBER-edge collector this language had in `lib.rs`.
+///
+/// `language_member_specs` consults the registry before its residual
+/// `match`, so once this row exists the old arm is unreachable. Leaving the
+/// field `None` would therefore drop csharp's MEMBER edges silently, with
+/// nothing in the arm itself to show it had stopped running.
+pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
+    collect_enclosing_type_member_edges(
+        tree,
+        source,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "struct_declaration",
+        ],
+        &["method_declaration"],
+    )
 }

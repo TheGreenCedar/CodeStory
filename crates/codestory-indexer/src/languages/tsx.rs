@@ -12,7 +12,7 @@
 //! Three TSX-adjacent surfaces are deliberately *not* here, and all three are
 //! shared with a language whose own S3 package has not landed:
 //!
-//! * `lib.rs::collect_typescript_receiver_call_edges`. TSX and TypeScript run
+//! * `languages::typescript::receiver_call_specs`. TSX and TypeScript run
 //!   the same receiver-call engine; the body belongs to TypeScript (#1681) and
 //!   this row only points at it. Copying it here would fork one engine into
 //!   two.
@@ -37,13 +37,13 @@
 //! the rendered projection of both TSX fixtures so the move stays output-equal.
 
 use super::LanguageExtraction;
-use crate::{CompiledLanguageRules, LanguageRuleset, TYPESCRIPT_TAGS_QUERY};
+use crate::{CompiledLanguageRules, LanguageRuleset};
 use std::sync::OnceLock;
 
 const GRAPH_QUERY: &str = include_str!("../../rules/tsx.graph.scm");
 
 /// TSX reuses TypeScript's tags query verbatim; it always has.
-const TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
+const TAGS_QUERY: &str = super::typescript::TAGS_QUERY;
 
 static RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
@@ -58,7 +58,8 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     tags_query: Some(TAGS_QUERY),
     compiled_rules: &RULES,
     // Shared with TypeScript; see the module doc.
-    receiver_call_specs: Some(crate::collect_typescript_receiver_call_edges),
+    member_edge_specs: None,
+    receiver_call_specs: Some(super::typescript::receiver_call_specs),
     // `ts_member` is TypeScript's marker, not TSX's; see the module doc.
     member_callsite_marker: None,
     graph_call_syntax: None,

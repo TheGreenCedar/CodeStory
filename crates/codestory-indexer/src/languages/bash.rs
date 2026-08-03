@@ -49,6 +49,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    member_edge_specs: None,
     receiver_call_specs: None,
     member_callsite_marker: None,
     graph_call_syntax: None,

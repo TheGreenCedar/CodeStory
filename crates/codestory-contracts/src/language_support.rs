@@ -1358,35 +1358,46 @@ mod tests {
                 profile.language_name
             );
         }
-        assert_eq!(line_comment_for_language("kotlin"), Some("//"));
-        assert_eq!(line_comment_for_language("bash"), Some("#"));
-        assert_eq!(line_comment_for_language("dart"), Some("//"));
-        assert_eq!(line_comment_for_language("csharp"), Some("//"));
-        assert_eq!(line_comment_for_language("php"), Some("//"));
-        assert_eq!(line_comment_for_language("ruby"), Some("#"));
-        assert_eq!(line_comment_for_language("go"), Some("//"));
-        assert_eq!(line_comment_for_language("rust"), Some("//"));
-        assert_eq!(line_comment_for_language("python"), Some("#"));
-        assert_eq!(line_comment_for_language("tsx"), Some("//"));
-        // The dialect row must not answer for the language it routes to: the
-        // `typescript` roster entry is #1681's to move.
+        // Every migrated language answers from this registry, and the marker
+        // has to be the language's own: `#` for the shell-comment family, `//`
+        // for the C-descended one. A wrong marker here dims the wrong span in
+        // every surface that renders a comment.
+        for (language, marker) in [
+            ("kotlin", "//"),
+            ("java", "//"),
+            ("cpp", "//"),
+            ("javascript", "//"),
+            ("typescript", "//"),
+            ("tsx", "//"),
+            ("python", "#"),
+            ("rust", "//"),
+            ("go", "//"),
+            ("ruby", "#"),
+            ("php", "//"),
+            ("csharp", "//"),
+            ("swift", "//"),
+            ("dart", "//"),
+            ("bash", "#"),
+        ] {
+            assert_eq!(
+                line_comment_for_language(language),
+                Some(marker),
+                "`{language}` must answer from the comment registry"
+            );
+        }
+
+        // `.tsx` routes to `typescript` as a public surface while keeping its
+        // own comment row under the dialect name the indexer dispatches on.
         assert_eq!(
             language_support_profile_for_ext("tsx").map(|profile| profile.language_name),
             Some("typescript")
         );
-        assert_eq!(line_comment_for_language("typescript"), None);
-        assert_eq!(line_comment_for_language("typescript"), Some("//"));
-        // `tsx` is an indexer-only dispatch name with no public profile, so it
-        // keeps answering from the CLI's own roster until #1682 lands.
-        assert_eq!(line_comment_for_language("tsx"), None);
-        assert_eq!(line_comment_for_language("java"), Some("//"));
-        assert_eq!(line_comment_for_language("cpp"), Some("//"));
-        assert_eq!(line_comment_for_language("javascript"), Some("//"));
-        assert_eq!(line_comment_for_language("swift"), None);
-        // `jsx` is a CLI highlighter dialect, not a registered language; it
-        // must keep answering from the CLI's own residual roster.
-        assert_eq!(line_comment_for_language("jsx"), Some("//"));
-        assert_eq!(line_comment_for_language("dart"), None);
+
+        // `jsx` is a CLI highlighter dialect, not a registered language, so it
+        // has no row here and must keep answering from the CLI's own roster.
+        // `c` has no comment row either; its highlighting is the CLI's.
+        assert_eq!(line_comment_for_language("jsx"), None);
+        assert_eq!(line_comment_for_language("c"), None);
     }
 
     #[test]

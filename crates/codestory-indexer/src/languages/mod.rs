@@ -322,12 +322,23 @@ mod tests {
         // indexer; that split is the reason `dispatch_names` exists.
         assert_eq!(tsx.language_name, "typescript");
         assert_eq!(tsx.dispatch_names, &["tsx"]);
-        assert!(extraction_for_language("typescript").is_none());
         assert_eq!(
             extraction_for_ext("tsx").map(|row| row.language_name),
             Some("typescript")
         );
-        assert!(extraction_for_ext("ts").is_none());
+
+        // TSX and TypeScript are two rows sharing one public language name.
+        // They must stay distinct: `.ts` and `.tsx` have different grammars and
+        // different rule files, so a single row answering both extensions would
+        // parse one of them with the wrong grammar.
+        let typescript = extraction_for_language("typescript").expect("typescript row");
+        assert_eq!(typescript.dispatch_names, &["typescript"]);
+        assert_eq!(
+            extraction_for_ext("ts").map(|row| row.ruleset),
+            Some(typescript.ruleset)
+        );
+        assert_ne!(tsx.ruleset, typescript.ruleset);
+        assert_ne!(tsx.graph_query, typescript.graph_query);
 
         // `promotes_type_member_functions_to_methods` was `matches!(name,
         // "swift" | "dart")` and `qualified_name_delimiter` was `"::"` only for
@@ -341,11 +352,16 @@ mod tests {
         assert!(!tsx.route_comments_are_c_style);
 
         // `rules/tsx.graph.scm` emits TypeScript's `ts_member` call syntax and
-        // shares its marker constant, so the marker is #1681's to move and the
-        // residual `lib.rs` arm must still be the one that answers.
+        // shares its marker constant rather than declaring its own. The TSX row
+        // therefore leaves both fields empty on purpose, and the lookup is
+        // answered by the TypeScript row — claiming the syntax here as well
+        // would give one `call_syntax` two owners.
         assert_eq!(tsx.member_callsite_marker, None);
         assert_eq!(tsx.graph_call_syntax, None);
-        assert_eq!(member_callsite_marker_for_call_syntax("ts_member"), None);
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("ts_member"),
+            Some(typescript::MEMBER_CALLSITE_MARKER)
+        );
 
         // TypeScript's receiver-call engine is shared, not copied.
         assert!(tsx.receiver_call_specs.is_some());

@@ -55,6 +55,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     compiled_rules: &RULES,
     // C has no manual receiver-call engine: `language_receiver_call_specs`
     // never had a `"c"` arm, so member calls come from the rule file alone.
+    member_edge_specs: None,
     receiver_call_specs: None,
     // ...and therefore no member-call syntax marker either. `rules/c.scm`
     // emits no `call_syntax`, so there is nothing for the marker match to key.

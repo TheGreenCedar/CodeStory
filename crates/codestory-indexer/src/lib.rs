@@ -123,7 +123,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 
 // Source of truth for live rule assets. Keep this registry aligned with
 // `get_language_for_ext` so dead rule files do not silently linger.
-const JAVA_GRAPH_QUERY: &str = include_str!("../rules/java.scm");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageRuleset {
@@ -7108,33 +7107,11 @@ fn language_member_specs(
     tree: &Tree,
     source: &str,
 ) -> Vec<ManualMemberEdgeSpec> {
-    // Registry first; the arms below are the languages that have not moved yet.
-    if let Some(extraction) = languages::extraction_for_language(language_name) {
-        return match extraction.member_edge_specs {
-            Some(collect) => collect(tree, source),
-            None => Vec::new(),
-        };
-    }
-    match language_name {
-        "ruby" => collect_enclosing_type_member_edges(
-            tree,
-            source,
-            &["class", "module"],
-            &["method", "singleton_method"],
-        ),
-        "php" => languages::php::member_edge_specs(tree, source),
-        "csharp" => collect_enclosing_type_member_edges(
-            tree,
-            source,
-            &[
-                "class_declaration",
-                "interface_declaration",
-                "struct_declaration",
-            ],
-            &["method_declaration"],
-        ),
-        _ => Vec::new(),
-    }
+    // Every language with a manual MEMBER-edge collector carries it on its
+    // registry row, so an unknown language simply has none.
+    languages::extraction_for_language(language_name)
+        .and_then(|extraction| extraction.member_edge_specs)
+        .map_or_else(Vec::new, |collect| collect(tree, source))
 }
 
 struct ManualMemberEdgeContext<'a> {
@@ -7200,19 +7177,11 @@ fn language_receiver_call_specs(
     tree: &Tree,
     source: &str,
 ) -> Vec<ManualReceiverCallSpec> {
-    // Registry first; the arms below are the languages that have not moved yet.
-    if let Some(extraction) = languages::extraction_for_language(language_name) {
-        return match extraction.receiver_call_specs {
-            Some(collect) => collect(tree, source),
-            None => Vec::new(),
-        };
-    }
-    match language_name {
-        // TSX has always run TypeScript's receiver-call engine; the engine
-        // moved into the registry row and #1682 takes over this arm.
-        "tsx" => languages::typescript::receiver_call_specs(tree, source),
-        _ => Vec::new(),
-    }
+    // Same for receiver-call engines: TSX shares TypeScript's, but it shares
+    // it through its registry row rather than through an arm here.
+    languages::extraction_for_language(language_name)
+        .and_then(|extraction| extraction.receiver_call_specs)
+        .map_or_else(Vec::new, |collect| collect(tree, source))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8641,21 +8610,18 @@ fn queue_qualified_child_names(
 }
 
 fn promotes_type_member_functions_to_methods(language_name: &str) -> bool {
-    // Registry first; `dart` is the unmigrated residue.
-    if let Some(extraction) = languages::extraction_for_language(language_name) {
-        return extraction.promotes_type_member_functions_to_methods;
-    }
-    matches!(language_name, "dart")
+    // Swift and Dart were the last two languages answering from the roster
+    // here; both have rows now, so nothing reaches past the registry.
+    languages::extraction_for_language(language_name)
+        .is_some_and(|extraction| extraction.promotes_type_member_functions_to_methods)
 }
 
 fn qualified_name_delimiter(language_name: &str) -> &'static str {
-    if let Some(extraction) = languages::extraction_for_language(language_name) {
-        return extraction.qualified_name_delimiter;
-    }
-    match language_name {
-        "rust" | "c" => "::",
-        _ => ".",
-    }
+    // `rust` and `c` were the two `::` languages left in the roster; both
+    // carry the delimiter on their rows now, and everything the registry does
+    // not know uses `.` exactly as it did before.
+    languages::extraction_for_language(language_name)
+        .map_or(".", |extraction| extraction.qualified_name_delimiter)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13643,15 +13609,12 @@ pub fn index_file(
                     "call_syntax" => {
                         if let Ok(raw) = val.as_str() {
                             let raw = raw.trim();
-                            // Registry first; the arms below are the languages
-                            // whose markers have not moved into `languages`.
+                            // Every rule file's `call_syntax` now resolves
+                            // through the registry; a syntax it does not know
+                            // leaves the marker as it was.
                             callsite_marker =
-                                match languages::member_callsite_marker_for_call_syntax(raw) {
-                                    Some(marker) => Some(marker),
-                                    None => match raw {
-                                        _ => callsite_marker,
-                                    },
-                                };
+                                languages::member_callsite_marker_for_call_syntax(raw)
+                                    .or(callsite_marker);
                         }
                     }
                     _ => {}
@@ -19265,7 +19228,7 @@ class Test {
                 .graph_query
         );
         assert_ne!(tsx.graph_query, ts.graph_query);
-        assert_eq!(tsx.tags_query, Some(TYPESCRIPT_TAGS_QUERY));
+        assert_eq!(tsx.tags_query, Some(languages::typescript::TAGS_QUERY));
         assert_eq!(tsx.tags_query, ts.tags_query);
         assert_ne!(tsx.graph_query, ts.graph_query);
 
@@ -21881,4 +21844,3 @@ export function handler() {
 }
 // TSX still reuses TypeScript's tags query verbatim; the asset moved into the
 // TypeScript registry row and #1682 takes ownership of this reference.
-const TSX_TAGS_QUERY: &str = languages::typescript::TAGS_QUERY;
