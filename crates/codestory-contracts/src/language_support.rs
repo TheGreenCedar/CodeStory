@@ -532,6 +532,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "csharp",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "swift",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1319,7 +1323,8 @@ mod tests {
                 "go",
                 "ruby",
                 "php",
-                "csharp"
+                "csharp",
+                "swift"
             ]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
@@ -1368,7 +1373,8 @@ mod tests {
         assert_eq!(line_comment_for_language("swift"), None);
         // `jsx` is a CLI highlighter dialect, not a registered language; it
         // must keep answering from the CLI's own residual roster.
-        assert_eq!(line_comment_for_language("jsx"), None);
+        assert_eq!(line_comment_for_language("jsx"), Some("//"));
+        assert_eq!(line_comment_for_language("dart"), None);
     }
 
     #[test]

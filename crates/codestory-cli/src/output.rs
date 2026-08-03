@@ -5718,6 +5718,12 @@ mod tests {
         assert!(rust.contains("\x1b[90m// comment\x1b[0m"), "{rust:?}");
         let go = ansi_highlight_snippet("cmd/main.go", "ok := true // comment");
         assert!(go.contains("\x1b[90m// comment\x1b[0m"), "{go:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("swift"),
+            Some("//")
+        );
+        let swift = ansi_highlight_snippet("app/Main.swift", "let ok = true // comment");
+        assert!(swift.contains("\x1b[90m// comment\x1b[0m"), "{swift:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

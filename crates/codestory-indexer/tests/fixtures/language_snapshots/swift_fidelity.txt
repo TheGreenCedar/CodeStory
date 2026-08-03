@@ -1,0 +1,40 @@
+node CLASS name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.swift:ConsoleNotifier line=7 col=1 end=11:2 file=FILE:<ROOT>/fidelity.swift@1
+node CLASS name=Event qn=Event canonical=<ROOT>/fidelity.swift:Event line=19 col=1 end=25:2 file=FILE:<ROOT>/fidelity.swift@1
+node CLASS name=Repository qn=Repository canonical=<ROOT>/fidelity.swift:Repository line=13 col=1 end=17:2 file=FILE:<ROOT>/fidelity.swift@1
+node CLASS name=Workflow qn=Workflow canonical=<ROOT>/fidelity.swift:Workflow line=27 col=1 end=37:2 file=FILE:<ROOT>/fidelity.swift@1
+node FILE name=<ROOT>/fidelity.swift qn=<ROOT>/fidelity.swift canonical=<ROOT>/fidelity.swift:<ROOT>/fidelity.swift:1 line=1 col=1 end=42:0 file=FILE:<ROOT>/fidelity.swift@1
+node FUNCTION name=orchestrateSwift qn=orchestrateSwift canonical=<ROOT>/fidelity.swift:orchestrateSwift#0 line=39 col=1 end=42:2 file=FILE:<ROOT>/fidelity.swift@1
+node INTERFACE name=Notifier qn=Notifier canonical=<ROOT>/fidelity.swift:Notifier line=3 col=1 end=5:2 file=FILE:<ROOT>/fidelity.swift@1
+node METHOD name=ConsoleNotifier.notify qn=ConsoleNotifier.notify canonical=<ROOT>/fidelity.swift:ConsoleNotifier.notify#0 line=8 col=5 end=10:6 file=FILE:<ROOT>/fidelity.swift@1
+node METHOD name=Notifier.notify qn=Notifier.notify canonical=<ROOT>/fidelity.swift:Notifier.notify#0 line=4 col=5 end=4:30 file=FILE:<ROOT>/fidelity.swift@1
+node METHOD name=Repository.save qn=Repository.save canonical=<ROOT>/fidelity.swift:Repository.save#0 line=14 col=5 end=16:6 file=FILE:<ROOT>/fidelity.swift@1
+node METHOD name=Workflow.decorate qn=Workflow.decorate canonical=<ROOT>/fidelity.swift:Workflow.decorate#0 line=34 col=5 end=36:6 file=FILE:<ROOT>/fidelity.swift@1
+node METHOD name=Workflow.run qn=Workflow.run canonical=<ROOT>/fidelity.swift:Workflow.run#0 line=28 col=5 end=32:6 file=FILE:<ROOT>/fidelity.swift@1
+node MODULE name=Foundation qn=Foundation canonical=<ROOT>/fidelity.swift:Foundation#0 line=1 col=8 end=1:18 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.swift:ConsoleNotifier#0 line=41 col=57 end=41:72 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=Event qn=Event canonical=<ROOT>/fidelity.swift:Event#0 line=41 col=25 end=41:30 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=Repository qn=Repository canonical=<ROOT>/fidelity.swift:Repository#0 line=41 col=88 end=41:98 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=Workflow qn=Workflow canonical=<ROOT>/fidelity.swift:Workflow#0 line=40 col=20 end=40:28 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.swift:decorate#0 line=31 col=9 end=31:17 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.swift:notify#0 line=29 col=18 end=29:24 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=print qn=print canonical=<ROOT>/fidelity.swift:print#0 line=9 col=9 end=9:14 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=print qn=print canonical=<ROOT>/fidelity.swift:print#1 line=15 col=9 end=15:14 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.swift:run#0 line=41 col=14 end=41:17 file=FILE:<ROOT>/fidelity.swift@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.swift:save#0 line=30 col=20 end=30:24 file=FILE:<ROOT>/fidelity.swift@1
+edge CALL src=FUNCTION:orchestrateSwift@39 dst=METHOD:Workflow.run@28 resolved_src=FUNCTION:orchestrateSwift@39 resolved_dst=METHOD:Workflow.run@28 line=41 confidence=1.0000 certainty=Certain callsite=h0:41:1:h1 candidates=[]
+edge CALL src=FUNCTION:orchestrateSwift@39 dst=UNKNOWN:ConsoleNotifier@41 resolved_src=FUNCTION:orchestrateSwift@39 resolved_dst=- line=41 confidence=- certainty=- callsite=h0:41:1:h2 candidates=[]
+edge CALL src=FUNCTION:orchestrateSwift@39 dst=UNKNOWN:Event@41 resolved_src=FUNCTION:orchestrateSwift@39 resolved_dst=- line=41 confidence=- certainty=- callsite=h0:41:1:h3 candidates=[]
+edge CALL src=FUNCTION:orchestrateSwift@39 dst=UNKNOWN:Repository@41 resolved_src=FUNCTION:orchestrateSwift@39 resolved_dst=- line=41 confidence=- certainty=- callsite=h0:41:1:h4 candidates=[]
+edge CALL src=FUNCTION:orchestrateSwift@39 dst=UNKNOWN:Workflow@40 resolved_src=FUNCTION:orchestrateSwift@39 resolved_dst=- line=40 confidence=- certainty=- callsite=h0:40:1:h5 candidates=[]
+edge CALL src=METHOD:ConsoleNotifier.notify@8 dst=UNKNOWN:print@9 resolved_src=METHOD:ConsoleNotifier.notify@8 resolved_dst=- line=9 confidence=- certainty=- callsite=h0:9:1:h6 candidates=[]
+edge CALL src=METHOD:Repository.save@14 dst=UNKNOWN:print@15 resolved_src=METHOD:Repository.save@14 resolved_dst=- line=15 confidence=- certainty=- callsite=h0:15:1:h7 candidates=[]
+edge CALL src=METHOD:Workflow.run@28 dst=METHOD:Notifier.notify@4 resolved_src=METHOD:Workflow.run@28 resolved_dst=METHOD:Notifier.notify@4 line=29 confidence=1.0000 certainty=Certain callsite=h0:29:1:h8 candidates=[]
+edge CALL src=METHOD:Workflow.run@28 dst=METHOD:Repository.save@14 resolved_src=METHOD:Workflow.run@28 resolved_dst=METHOD:Repository.save@14 line=30 confidence=1.0000 certainty=Certain callsite=h0:30:1:h9 candidates=[]
+edge CALL src=METHOD:Workflow.run@28 dst=UNKNOWN:decorate@31 resolved_src=METHOD:Workflow.run@28 resolved_dst=METHOD:Workflow.decorate@34 line=31 confidence=0.9500 certainty=Certain callsite=h0:31:1:h10 candidates=[]
+edge IMPORT src=MODULE:Foundation@1 dst=MODULE:Foundation@1 resolved_src=MODULE:Foundation@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@7 dst=INTERFACE:Notifier@3 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@7 dst=METHOD:ConsoleNotifier.notify@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@13 dst=METHOD:Repository.save@14 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@27 dst=METHOD:Workflow.decorate@34 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@27 dst=METHOD:Workflow.run@28 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Notifier@3 dst=METHOD:Notifier.notify@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

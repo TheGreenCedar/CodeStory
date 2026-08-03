@@ -25,6 +25,7 @@ pub(crate) mod javascript;
 pub(crate) mod kotlin;
 pub(crate) mod php;
 pub(crate) mod ruby;
+pub(crate) mod swift;
 pub(crate) mod typescript;
 
 use std::sync::OnceLock;
@@ -97,6 +98,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     ruby::EXTRACTION,
     php::EXTRACTION,
     csharp::EXTRACTION,
+    swift::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
