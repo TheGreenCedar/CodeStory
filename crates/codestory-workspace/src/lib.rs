@@ -2032,6 +2032,14 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Kotlin, "kotlin")
             | (&Language::Swift, "swift")
             | (&Language::Dart, "dart")
+            // Companion-extension source groups. These names never come back
+            // from `language_support_profile_for_ext`, so they cannot widen
+            // `registry_extension_matches_source_group`; they exist so the
+            // companion table can name a source group by language name.
+            | (&Language::Lua, "lua")
+            | (&Language::Svelte, "svelte")
+            | (&Language::Vue, "vue")
+            | (&Language::Astro, "astro")
             | (&Language::Sql, "sql")
             | (&Language::Html, "html")
             | (&Language::Css, "css")
@@ -2045,17 +2053,20 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
     )
 }
 
+/// Template and style extensions that a registered language's source group
+/// accepts without being a public claim of their own.
+///
+/// The (language, extension) cross product used to be spelled out here and
+/// repeated in the indexer and the CLI (ARCH-012); the extension table now
+/// lives in `codestory_contracts::language_support`.
 fn compatibility_extension_matches_source_group(extension: &str, language: &Language) -> bool {
-    matches!(
-        (language, extension),
-        (&Language::JavaScript, "svelte" | "vue" | "astro")
-            | (&Language::TypeScript, "svelte" | "vue" | "astro")
-            | (&Language::CSharp, "cshtml")
-            | (&Language::Lua, "lua")
-            | (&Language::Css, "scss" | "sass" | "less")
-            | (&Language::Svelte, "svelte")
-            | (&Language::Vue, "vue")
-            | (&Language::Astro, "astro")
+    codestory_contracts::language_support::companion_extension_profile(extension).is_some_and(
+        |profile| {
+            profile
+                .source_group_languages
+                .iter()
+                .any(|group| source_group_accepts_registry_language(language, group))
+        },
     )
 }
 
@@ -3481,6 +3492,98 @@ mod tests {
                 matches_source_group_language(Path::new(&file_name), &language),
                 "compatibility-only source extension should stay accepted by workspace discovery: {extension}"
             );
+        }
+    }
+
+    /// The registry-driven companion match must accept exactly the pairs the
+    /// hand-written cross product accepted — no more, no fewer.
+    ///
+    /// The positive direction alone is not enough: routing this through a
+    /// registry could widen discovery (a `.scss` file entering the JavaScript
+    /// source group, say), and discovery admission decides what gets indexed.
+    /// The expected set below is the pre-move table restated literally.
+    #[test]
+    fn companion_extension_source_groups_match_the_hand_written_cross_product() {
+        const EXPECTED: &[(&str, &[&str])] = &[
+            ("vue", &["JavaScript", "TypeScript", "Vue"]),
+            ("svelte", &["JavaScript", "TypeScript", "Svelte"]),
+            ("astro", &["JavaScript", "TypeScript", "Astro"]),
+            ("cshtml", &["CSharp"]),
+            ("lua", &["Lua"]),
+            ("scss", &["Css"]),
+            ("sass", &["Css"]),
+            ("less", &["Css"]),
+        ];
+        let all_languages = [
+            ("Cxx", Language::Cxx),
+            ("Java", Language::Java),
+            ("Python", Language::Python),
+            ("Rust", Language::Rust),
+            ("JavaScript", Language::JavaScript),
+            ("TypeScript", Language::TypeScript),
+            ("Go", Language::Go),
+            ("Ruby", Language::Ruby),
+            ("Php", Language::Php),
+            ("CSharp", Language::CSharp),
+            ("Kotlin", Language::Kotlin),
+            ("Swift", Language::Swift),
+            ("Dart", Language::Dart),
+            ("Lua", Language::Lua),
+            ("Sql", Language::Sql),
+            ("Html", Language::Html),
+            ("Css", Language::Css),
+            ("Bash", Language::Bash),
+            ("Shell", Language::Shell),
+            ("PowerShell", Language::PowerShell),
+            ("Markdown", Language::Markdown),
+            ("Yaml", Language::Yaml),
+            ("Toml", Language::Toml),
+            ("Json", Language::Json),
+            ("Svelte", Language::Svelte),
+            ("Vue", Language::Vue),
+            ("Astro", Language::Astro),
+        ];
+
+        let declared = codestory_contracts::language_support::COMPANION_EXTENSION_PROFILES
+            .iter()
+            .map(|profile| profile.extension)
+            .collect::<Vec<_>>();
+        let expected_extensions = EXPECTED
+            .iter()
+            .map(|(extension, _)| *extension)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared, expected_extensions,
+            "the companion registry gained or lost an extension"
+        );
+
+        for (extension, accepted) in EXPECTED {
+            for (name, language) in &all_languages {
+                let expected = accepted.contains(name);
+                assert_eq!(
+                    compatibility_extension_matches_source_group(extension, language),
+                    expected,
+                    "`{extension}` in the {name} source group"
+                );
+                // The same answer must hold through the public entry point, so
+                // the registry cannot leak in via the other branch either.
+                let file_name = format!("main.{extension}");
+                assert_eq!(
+                    matches_source_group_language(Path::new(&file_name), language),
+                    expected,
+                    "`main.{extension}` discovered for {name}"
+                );
+            }
+        }
+
+        // Extensions outside the companion table stay outside it.
+        for extension in ["kt", "rs", "txt", "cshtmlx", ""] {
+            for (_, language) in &all_languages {
+                assert!(
+                    !compatibility_extension_matches_source_group(extension, language),
+                    "`{extension}` must not be a companion extension"
+                );
+            }
         }
     }
 

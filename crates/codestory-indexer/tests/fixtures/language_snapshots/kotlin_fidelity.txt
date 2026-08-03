@@ -1,0 +1,49 @@
+node CLASS name=ConsoleNotifier qn=app.ConsoleNotifier canonical=<ROOT>/fidelity.kt:app.ConsoleNotifier line=9 col=1 end=13:2 file=FILE:<ROOT>/fidelity.kt@1
+node CLASS name=Event qn=app.Event canonical=<ROOT>/fidelity.kt:app.Event line=21 col=1 end=21:30 file=FILE:<ROOT>/fidelity.kt@1
+node CLASS name=Notifier qn=Notifier canonical=<ROOT>/fidelity.kt:Notifier line=9 col=25 end=9:33 file=FILE:<ROOT>/fidelity.kt@1
+node CLASS name=Repository qn=app.Repository canonical=<ROOT>/fidelity.kt:app.Repository line=15 col=1 end=19:2 file=FILE:<ROOT>/fidelity.kt@1
+node CLASS name=Workflow qn=app.Workflow canonical=<ROOT>/fidelity.kt:app.Workflow line=23 col=1 end=33:2 file=FILE:<ROOT>/fidelity.kt@1
+node FILE name=<ROOT>/fidelity.kt qn=<ROOT>/fidelity.kt canonical=<ROOT>/fidelity.kt:<ROOT>/fidelity.kt:1 line=1 col=1 end=39:0 file=FILE:<ROOT>/fidelity.kt@1
+node FUNCTION name=orchestrateKotlin qn=orchestrateKotlin canonical=<ROOT>/fidelity.kt:orchestrateKotlin#0 line=35 col=1 end=39:2 file=FILE:<ROOT>/fidelity.kt@1
+node INTERFACE name=Notifier qn=app.Notifier canonical=<ROOT>/fidelity.kt:app.Notifier line=5 col=1 end=7:2 file=FILE:<ROOT>/fidelity.kt@1
+node METHOD name=ConsoleNotifier.notify qn=app.ConsoleNotifier.notify canonical=<ROOT>/fidelity.kt:app.ConsoleNotifier.notify#0 line=10 col=5 end=12:6 file=FILE:<ROOT>/fidelity.kt@1
+node METHOD name=Notifier.notify qn=app.Notifier.notify canonical=<ROOT>/fidelity.kt:app.Notifier.notify#0 line=6 col=5 end=6:29 file=FILE:<ROOT>/fidelity.kt@1
+node METHOD name=Repository.save qn=app.Repository.save canonical=<ROOT>/fidelity.kt:app.Repository.save#0 line=16 col=5 end=18:6 file=FILE:<ROOT>/fidelity.kt@1
+node METHOD name=Workflow.decorate qn=app.Workflow.decorate canonical=<ROOT>/fidelity.kt:app.Workflow.decorate#0 line=30 col=5 end=32:6 file=FILE:<ROOT>/fidelity.kt@1
+node METHOD name=Workflow.run qn=app.Workflow.run canonical=<ROOT>/fidelity.kt:app.Workflow.run#0 line=24 col=5 end=28:6 file=FILE:<ROOT>/fidelity.kt@1
+node MODULE name=app qn=app canonical=<ROOT>/fidelity.kt:app#0 line=1 col=1 end=1:12 file=FILE:<ROOT>/fidelity.kt@1
+node MODULE name=kotlin.math.abs qn=kotlin.math.abs canonical=<ROOT>/fidelity.kt:kotlin.math.abs#0 line=3 col=8 end=3:23 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.kt:ConsoleNotifier#0 line=37 col=34 end=37:49 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=Event qn=Event canonical=<ROOT>/fidelity.kt:Event#0 line=37 col=18 end=37:23 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=Repository qn=Repository canonical=<ROOT>/fidelity.kt:Repository#0 line=37 col=53 end=37:63 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=Workflow qn=Workflow canonical=<ROOT>/fidelity.kt:Workflow#0 line=36 col=20 end=36:28 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=abs qn=abs canonical=<ROOT>/fidelity.kt:abs#0 line=38 col=5 end=38:8 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.kt:decorate#0 line=27 col=9 end=27:17 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.kt:notify#0 line=25 col=18 end=25:24 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=println qn=println canonical=<ROOT>/fidelity.kt:println#0 line=11 col=9 end=11:16 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=println qn=println canonical=<ROOT>/fidelity.kt:println#1 line=17 col=9 end=17:16 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.kt:run#0 line=37 col=14 end=37:17 file=FILE:<ROOT>/fidelity.kt@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.kt:save#0 line=26 col=20 end=26:24 file=FILE:<ROOT>/fidelity.kt@1
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=METHOD:Workflow.run@24 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=METHOD:Workflow.run@24 line=37 confidence=1.0000 certainty=Certain callsite=h0:37:1:h1 candidates=[]
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=UNKNOWN:ConsoleNotifier@37 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=- line=37 confidence=- certainty=- callsite=h0:37:1:h2 candidates=[]
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=UNKNOWN:Event@37 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=- line=37 confidence=- certainty=- callsite=h0:37:1:h3 candidates=[]
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=UNKNOWN:Repository@37 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=- line=37 confidence=- certainty=- callsite=h0:37:1:h4 candidates=[]
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=UNKNOWN:Workflow@36 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=- line=36 confidence=- certainty=- callsite=h0:36:1:h5 candidates=[]
+edge CALL src=FUNCTION:orchestrateKotlin@35 dst=UNKNOWN:abs@38 resolved_src=FUNCTION:orchestrateKotlin@35 resolved_dst=- line=38 confidence=- certainty=- callsite=h0:38:1:h6 candidates=[]
+edge CALL src=METHOD:ConsoleNotifier.notify@10 dst=UNKNOWN:println@11 resolved_src=METHOD:ConsoleNotifier.notify@10 resolved_dst=- line=11 confidence=- certainty=- callsite=h0:11:1:h7 candidates=[]
+edge CALL src=METHOD:Repository.save@16 dst=UNKNOWN:println@17 resolved_src=METHOD:Repository.save@16 resolved_dst=- line=17 confidence=- certainty=- callsite=h0:17:1:h8 candidates=[]
+edge CALL src=METHOD:Workflow.run@24 dst=METHOD:Notifier.notify@6 resolved_src=METHOD:Workflow.run@24 resolved_dst=METHOD:Notifier.notify@6 line=25 confidence=1.0000 certainty=Certain callsite=h0:25:1:h9 candidates=[]
+edge CALL src=METHOD:Workflow.run@24 dst=METHOD:Repository.save@16 resolved_src=METHOD:Workflow.run@24 resolved_dst=METHOD:Repository.save@16 line=26 confidence=1.0000 certainty=Certain callsite=h0:26:1:h10 candidates=[]
+edge CALL src=METHOD:Workflow.run@24 dst=UNKNOWN:decorate@27 resolved_src=METHOD:Workflow.run@24 resolved_dst=METHOD:Workflow.decorate@30 line=27 confidence=0.9500 certainty=Certain callsite=h0:27:1:h11 candidates=[]
+edge IMPORT src=MODULE:kotlin.math.abs@3 dst=MODULE:kotlin.math.abs@3 resolved_src=MODULE:kotlin.math.abs@3 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@9 dst=CLASS:Notifier@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@9 dst=METHOD:ConsoleNotifier.notify@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@15 dst=METHOD:Repository.save@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@23 dst=METHOD:Workflow.decorate@30 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@23 dst=METHOD:Workflow.run@24 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Notifier@5 dst=METHOD:Notifier.notify@6 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:app@1 dst=CLASS:ConsoleNotifier@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:app@1 dst=CLASS:Event@21 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:app@1 dst=CLASS:Repository@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:app@1 dst=CLASS:Workflow@23 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=MODULE:app@1 dst=INTERFACE:Notifier@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
