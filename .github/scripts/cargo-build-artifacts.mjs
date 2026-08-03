@@ -24,7 +24,7 @@ const SHIPPING_BINARIES = [
   },
 ];
 const FORBIDDEN_SHIPPING_FEATURES = new Map([
-  ["codestory-retrieval", new Set(["test-support"])],
+  ["codestory-retrieval", new Set(["benchmark-support", "test-support"])],
   ["codestory-runtime", new Set(["benchmark-support", "test-support"])],
 ]);
 const ARTIFACT_CONTRACT = {

@@ -4,3 +4,4 @@
 pub mod qualification;
 
 pub mod util;
+pub mod vector_backend_bakeoff;

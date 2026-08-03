@@ -1336,7 +1336,41 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-fn search_database(
+/// Read every published vector back out of a generation.
+///
+/// The bake-off builds candidate backends from exactly the bytes the shipped
+/// scan reads, so a candidate cannot be measured against a friendlier copy of
+/// the corpus than the incumbent gets.
+#[cfg(feature = "benchmark-support")]
+pub(crate) fn read_published_vectors_for_benchmark(
+    path: &Path,
+    embedding_dim: usize,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    let connection = open_read_only(path)?;
+    let mut statement =
+        connection.prepare("SELECT node_id, vector FROM vectors ORDER BY node_id ASC")?;
+    let mut rows = statement.query([])?;
+    let mut vectors = Vec::new();
+    while let Some(row) = rows.next()? {
+        let node_id: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        validate_vector_bytes(&node_id, &bytes, embedding_dim)?;
+        vectors.push((
+            node_id,
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    f32::from_bits(u32::from_le_bytes(
+                        chunk.try_into().expect("four-byte vector chunk"),
+                    ))
+                })
+                .collect(),
+        ));
+    }
+    Ok(vectors)
+}
+
+pub(crate) fn search_database(
     path: &Path,
     generation: &str,
     input_hash: &str,

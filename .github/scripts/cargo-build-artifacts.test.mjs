@@ -323,19 +323,26 @@ test("accepts an isolated shipping feature graph", () => {
   );
 });
 
-test("rejects retrieval test support in the shipping graph", () => {
-  const input = fixture();
-  featureMessage(input, "codestory-retrieval").features = ["test-support"];
-  refreshCargoJson(input);
+test("rejects retrieval benchmark or test support in the shipping graph", async (t) => {
+  // `benchmark-support` exposes the vector-backend bake-off measurement
+  // surface. It reaches the shipping graph only through a feature-unification
+  // mistake, which is exactly the mistake this contract exists to catch.
+  for (const feature of ["benchmark-support", "test-support"]) {
+    await t.test(feature, () => {
+      const input = fixture();
+      featureMessage(input, "codestory-retrieval").features = [feature];
+      refreshCargoJson(input);
 
-  assert.throws(
-    () =>
-      assertShippingFeatureContract({
-        jsonLines: input.jsonLines,
-        workspaceRoot: input.root,
-      }),
-    /forbidden feature codestory-retrieval\/test-support/u,
-  );
+      assert.throws(
+        () =>
+          assertShippingFeatureContract({
+            jsonLines: input.jsonLines,
+            workspaceRoot: input.root,
+          }),
+        new RegExp(`forbidden feature codestory-retrieval/${feature}`, "u"),
+      );
+    });
+  }
 });
 
 test("rejects runtime benchmark or test support in the shipping graph", async (t) => {
