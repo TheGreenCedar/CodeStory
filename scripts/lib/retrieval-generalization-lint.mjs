@@ -234,6 +234,35 @@ export function pendingClaimProfileProblem(declared, readSource) {
   return null;
 }
 
+const doubleQuotedLiteralAlternatives = 'b?r#*"[^"]*"#*|"(?:\\\\[\\s\\S]|[^"\\\\])*"';
+const backtickLiteralAlternative = "`(?:\\\\[\\s\\S]|[^`\\\\])*`";
+// Rust spells three unrelated things with `'`: a char literal (`'\n'`), a
+// lifetime (`&'static str`), and an apostrophe in prose (`this packet's own`).
+// Only the first is a literal. Reading `'...'` the way a single-quoted-*string*
+// language spells it makes every one of them an opening quote, so the scanner
+// pairs them off in file order: one lifetime swallows every string literal down
+// to the next apostrophe, and adding or removing a single apostrophe anywhere
+// -- in a comment, in prose -- re-pairs the rest of the file and silently
+// changes which literals the benchmark-marker passes can see. What the gate
+// reads then depends on apostrophe parity rather than on the code. A Rust char
+// literal is exactly one character or one escape wide, and that bound is what
+// no lifetime and no possessive can satisfy.
+const rustCharLiteralAlternative =
+  "'(?:\\\\(?:x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]{1,6}\\}|[^\\r\\n])|[^'\\\\\\r\\n])'";
+// Languages that really do quote strings with `'` -- YAML, shell, JavaScript --
+// keep the string reading, which the non-Rust passes and their fixtures rely on.
+const singleQuotedStringAlternative = "'(?:\\\\[\\s\\S]|[^'\\\\])*'";
+
+function staticLiteralPattern(extension) {
+  const singleQuoted = extension == null || extension === ".rs"
+    ? rustCharLiteralAlternative
+    : singleQuotedStringAlternative;
+  return new RegExp(
+    `(?:${doubleQuotedLiteralAlternatives}|${singleQuoted}|${backtickLiteralAlternative})`,
+    "g",
+  );
+}
+
 export function runRetrievalGeneralizationLint({
   repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
   productionRepositoryRoot = repositoryRoot,
@@ -2434,6 +2463,9 @@ function prepareProductionFile(filePath) {
   const production = productionSource(filePath);
   return {
     filePath,
+    // Stated rather than left undefined: it is what tells the literal scanner
+    // that `'` here is a char literal, not a string quote.
+    extension: ".rs",
     production,
     lines: production.split(/\r?\n/),
     literals: null,
@@ -2932,7 +2964,7 @@ function scanProductionCompactPatterns(
   const markerLower = marker.toLowerCase();
   const hits = [];
   if (prepared.literals == null) {
-    prepared.literals = staticStringLiteralSpans(production);
+    prepared.literals = staticStringLiteralSpans(production, prepared.extension);
   }
   const literals = prepared.literals;
   for (let start = 0; start < literals.length; start += 1) {
@@ -3012,7 +3044,7 @@ function compactMarkerOccurrences(compact, marker, allowSurroundingText, require
   return occurrences;
 }
 
-function staticStringLiteralSpans(text) {
+function staticStringLiteralSpans(text, extension) {
   const literals = [];
   const lineStarts = [0];
   for (let index = 0; index < text.length; index += 1) {
@@ -3021,7 +3053,7 @@ function staticStringLiteralSpans(text) {
     }
   }
 
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(extension);
   let match;
   while ((match = stringLiteral.exec(text)) != null) {
     literals.push({
@@ -3081,7 +3113,7 @@ function compactPatternHit(prepared, startLine, endLine, marker) {
 /// literal; `"storage", // still pending` loses only the note.
 function codeBeforeLineComment(line) {
   const spans = [];
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(".rs");
   let match;
   while ((match = stringLiteral.exec(line)) != null) {
     spans.push([match.index, match.index + match[0].length]);
@@ -3101,7 +3133,7 @@ function codeBeforeLineComment(line) {
 
 function staticStringLiteralsOnLine(line) {
   const literals = [];
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
+  const stringLiteral = staticLiteralPattern(".rs");
   let match;
   while ((match = stringLiteral.exec(line)) != null) {
     literals.push(match[0]);

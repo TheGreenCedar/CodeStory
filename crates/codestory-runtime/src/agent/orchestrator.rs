@@ -551,6 +551,13 @@ pub(crate) fn agent_packet(
         &plan.obligations,
     );
     append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
+    // Typed field, not `annotations`: readiness re-verification was previously
+    // invisible, which is what let one packet pay for several full content
+    // passes unnoticed. Publishing it here — before the trace summary is taken
+    // — reports the passes this packet's own operation performed.
+    answer.retrieval_trace.source_freshness_telemetry =
+        crate::source_freshness_telemetry_for_operation();
+
     let phase_started = Instant::now();
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
     append_packet_non_trace_phase(&mut answer, "trace_summary", phase_started);
@@ -5195,6 +5202,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8496,6 +8504,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -8927,6 +8936,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9014,6 +9024,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9092,6 +9103,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9315,6 +9327,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9392,6 +9405,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9463,6 +9477,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9517,6 +9532,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9568,6 +9584,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9621,6 +9638,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9676,6 +9694,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
@@ -9716,6 +9735,7 @@ mod tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,

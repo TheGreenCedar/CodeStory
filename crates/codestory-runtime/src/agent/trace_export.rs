@@ -286,6 +286,7 @@ mod tests {
                 packet_sidecar_diagnostics: Vec::new(),
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 retrieval_shadow: None,
             },
         }

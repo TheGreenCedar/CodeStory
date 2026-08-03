@@ -381,6 +381,7 @@ mod tests {
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
+                source_freshness_telemetry: None,
             },
         }
     }

@@ -264,6 +264,7 @@ mod golden_tests {
                 semantic_abstained_count: 0,
                 annotations: Vec::new(),
                 packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
                 steps: Vec::new(),
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,

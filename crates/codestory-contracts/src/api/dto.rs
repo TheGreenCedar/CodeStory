@@ -2510,6 +2510,28 @@ pub struct PacketClaimProfileTelemetryDto {
     pub claim_sources: Vec<PacketClaimSourceCountDto>,
 }
 
+/// Source-content work the public operation behind this response performed
+/// while deriving freshness verdicts.
+///
+/// Readiness verification hashes a stored file's content whenever its mtime
+/// still matches, and one operation derives freshness several times. These
+/// counters make that cost observable instead of invisible: on a warm,
+/// unchanged repository `content_hash_reads` is one pass over the indexed
+/// files and every later derivation shows up in `verdict_reuses`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourceFreshnessTelemetryDto {
+    /// Stored files whose content was read and hashed for a freshness verdict.
+    pub content_hash_reads: u32,
+    /// Freshness verdicts served from the operation-scoped verdict memo.
+    pub verdict_reuses: u32,
+    /// Strict-readiness fingerprint passes. Each reads the repository's
+    /// lexical source live off disk and streams both projection tables. This
+    /// is a measurement, not a bound: a warm packet over an unchanged
+    /// repository was measured at six passes, so treat any single-pass
+    /// expectation as unproven until it is enforced.
+    pub readiness_fingerprint_passes: u32,
+}
+
 /// How a retrieval annotation must be classified by packet consumers.
 ///
 /// This discriminant — never the annotation prose — decides whether an annotation counts as an
@@ -2602,6 +2624,9 @@ pub struct AgentRetrievalTraceDto {
     /// Typed claim-profile fire-rate telemetry, kept out of `annotations` by design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packet_claim_profile_telemetry: Option<PacketClaimProfileTelemetryDto>,
+    /// Typed source-freshness pass counters, kept out of `annotations` by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_freshness_telemetry: Option<SourceFreshnessTelemetryDto>,
     pub steps: Vec<AgentRetrievalStepDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packet_sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
@@ -3516,6 +3541,7 @@ mod packet_tests {
             semantic_abstained_count: 0,
             annotations: Vec::new(),
             packet_claim_profile_telemetry: None,
+            source_freshness_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: Some(RetrievalShadowDto {
@@ -3571,6 +3597,7 @@ mod packet_tests {
             policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
             total_latency_ms: 10,
             sla_target_ms: None,
+            source_freshness_telemetry: None,
             sla_missed: false,
             semantic_fallback_count: 0,
             semantic_fallbacks: Vec::new(),
@@ -3651,6 +3678,11 @@ mod packet_tests {
             semantic_abstained_count: 0,
             annotations: Vec::new(),
             packet_claim_profile_telemetry: Some(telemetry.clone()),
+            source_freshness_telemetry: Some(SourceFreshnessTelemetryDto {
+                content_hash_reads: 3,
+                verdict_reuses: 9,
+                readiness_fingerprint_passes: 1,
+            }),
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: None,
@@ -3658,6 +3690,15 @@ mod packet_tests {
 
         let value = serde_json::to_value(&trace).expect("serialize");
         assert_eq!(value["annotations"], serde_json::json!([]));
+        assert_eq!(
+            value["source_freshness_telemetry"],
+            serde_json::json!({
+                "content_hash_reads": 3,
+                "verdict_reuses": 9,
+                "readiness_fingerprint_passes": 1,
+            }),
+            "the pass counters are typed fields, never annotations"
+        );
         assert_eq!(
             value["packet_claim_profile_telemetry"]["profiles_skipped_invalid"],
             serde_json::json!(1)
