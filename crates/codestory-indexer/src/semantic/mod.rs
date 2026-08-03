@@ -410,9 +410,6 @@ fn dedicated_semantic_resolver(language: &str) -> Option<SemanticResolverKind> {
         "ruby" => Some(SemanticResolverKind::Ruby(RubySemanticResolver)),
         "php" => Some(SemanticResolverKind::Php(PhpSemanticResolver)),
         "csharp" => Some(SemanticResolverKind::CSharp(CSharpSemanticResolver)),
-        "bash" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "bash",
-        ))),
         _ => None,
     }
 }
@@ -587,7 +584,6 @@ fn language_family_bucket(language: &'static str) -> &'static str {
     match language {
         "c" => "native",
         "typescript" | "vue" | "svelte" | "astro" => "webscript",
-        "bash" => "bash",
         language if is_structural_language_name(language) => "structural",
         _ => language,
     }

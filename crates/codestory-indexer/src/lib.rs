@@ -124,7 +124,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 // Source of truth for live rule assets. Keep this registry aligned with
 // `get_language_for_ext` so dead rule files do not silently linger.
 const JAVA_GRAPH_QUERY: &str = include_str!("../rules/java.scm");
-const BASH_GRAPH_QUERY: &str = include_str!("../rules/bash.scm");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageRuleset {
@@ -333,9 +332,12 @@ impl LanguageRuleset {
             LanguageRuleset::Dart => Err(anyhow!(
                 "dart compiled rules are owned by the language registry"
             )),
-            LanguageRuleset::Bash => {
-                compiled_rules_cache(language, BASH_GRAPH_QUERY, None, &BASH_RULES)
-            }
+            // Answered by the registry above; the arm only exists because the
+            // match must stay exhaustive. Failing closed here rather than
+            // panicking keeps a future registry mistake a typed indexing error.
+            LanguageRuleset::Bash => Err(anyhow!(
+                "bash compiled rules are owned by the language registry"
+            )),
         }
     }
 }
@@ -365,8 +367,6 @@ fn compiled_rules_cache(
         .as_ref()
         .map_err(|message| anyhow!(message.clone()))
 }
-
-static BASH_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
     let role_priority = canonical_role_priority(definition.canonical_role);
@@ -19310,8 +19310,19 @@ class Test {
         assert!(dart.graph_query.contains("dart_member"));
         assert!(dart.tags_query.is_none());
 
+        // Bash moved into `languages::bash`; the config it hands back must
+        // still come back through the same extension lookup.
         let bash = get_language_for_ext("sh").expect("bash config");
-        assert_eq!(bash.graph_query, BASH_GRAPH_QUERY);
+        assert_eq!(bash.language_name, "bash");
+        assert_eq!(
+            bash.graph_query,
+            languages::extraction_for_ext("sh")
+                .expect("bash registry row")
+                .graph_query
+        );
+        assert!(bash.tags_query.is_none());
+        let bash_extension = get_language_for_ext("bash").expect("bash extension config");
+        assert_eq!(bash_extension.graph_query, bash.graph_query);
     }
 
     #[test]

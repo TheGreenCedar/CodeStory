@@ -16,6 +16,7 @@
 //! `registry_rows_do_not_shadow_unmigrated_languages` proves it — and the last
 //! package to land deletes the residual arms entirely.
 
+pub(crate) mod bash;
 pub(crate) mod c;
 pub(crate) mod cpp;
 pub(crate) mod csharp;
@@ -101,6 +102,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     csharp::EXTRACTION,
     swift::EXTRACTION,
     dart::EXTRACTION,
+    bash::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
@@ -468,6 +470,48 @@ mod tests {
         assert_eq!(
             extraction_for_ext("dart").map(|row| row.language_name),
             Some("dart")
+        );
+    }
+
+    /// The Bash row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`, `language_configs.rs` and `semantic/mod.rs`.
+    ///
+    /// This row is load-bearing in a way Kotlin's was not. Mutation testing on
+    /// the two Bash fixtures shows `language_extraction_snapshot` catches the
+    /// routing and rule-file fields (`extensions`, `graph_query`,
+    /// `language_name`) but is *blind* to six others, because shell has no
+    /// type-like owners, no owner-qualified names, no framework routes and no
+    /// receiver-qualified call form for the fixtures to exercise. Flipping
+    /// `promotes_type_member_functions_to_methods`, `qualified_name_delimiter`,
+    /// `route_comments_are_c_style`, `semantic_family`,
+    /// `uses_generic_semantic_resolver`, or wiring a foreign engine into
+    /// `receiver_call_specs` each leaves both goldens byte-identical. The
+    /// assertions below are the pre-move roster restated, so a registry row
+    /// that contradicted the god file fails here instead of shipping.
+    #[test]
+    fn bash_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let bash = extraction_for_language("bash").expect("bash row");
+        // `lib.rs::promotes_type_member_functions_to_methods` listed only
+        // `swift` and `dart`; Bash fell through to `false`.
+        assert!(!bash.promotes_type_member_functions_to_methods);
+        // `lib.rs::qualified_name_delimiter` gave `::` to rust/cpp/c only.
+        assert_eq!(bash.qualified_name_delimiter, ".");
+        // Bash was absent from `route_language_uses_c_style_comments`.
+        assert!(!bash.route_comments_are_c_style);
+        assert_eq!(bash.semantic_family, "bash");
+        assert!(bash.uses_generic_semantic_resolver);
+        // Shell has no member-call syntax and no manual receiver-call engine.
+        assert!(bash.receiver_call_specs.is_none());
+        assert!(bash.member_callsite_marker.is_none());
+        assert!(bash.graph_call_syntax.is_none());
+        assert!(bash.tags_query.is_none());
+        assert_eq!(
+            extraction_for_ext("sh").map(|row| row.language_name),
+            Some("bash")
+        );
+        assert_eq!(
+            extraction_for_ext("bash").map(|row| row.language_name),
+            Some("bash")
         );
     }
 }
