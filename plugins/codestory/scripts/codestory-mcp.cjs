@@ -2097,6 +2097,54 @@ function publicationStampSkew(stamp) {
   return null;
 }
 
+function publicationStampText(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text ? text : null;
+}
+
+// Mirrors `codestory_cli::runtime::codestory_publication_meta` for the one frame
+// the packaged path never delegates. The launcher answers `initialize` itself
+// and suppresses the runtime's own answer, so this is the only stamp a host
+// behind `plugins/codestory/.mcp.json` can read at handshake; without it the
+// packaged handshake is indistinguishable from a legacy v0 producer no matter
+// which contract the pinned runtime implements. The launcher authors the frame,
+// so the stamp describes the launcher's own knowledge: no publication identity
+// exists at session start, hence `served_from=contract_only`.
+function failOpenPublicationStamp(status) {
+  const plugin = isPlainObject(status?.plugin_runtime) ? status.plugin_runtime : {};
+  const cliVersion = publicationStampText(status?.cli_version);
+  // The launcher-provided half of the pinned pair: exactly the value
+  // `stdioRuntimeEnv` hands the runtime as `CODESTORY_PLUGIN_CLI_VERSION`.
+  const pluginCliVersion = publicationStampText(plugin.plugin_cli_version);
+  // `launcher` is the existing source token for "the launcher itself, with no
+  // resolved CLI behind it"; the fallback stays inside that vocabulary rather
+  // than inventing a value a consumer has never been told about.
+  const cliSource = publicationStampText(plugin.cli_source) || 'launcher';
+  return {
+    schema_version: publicationStampSchemaVersion,
+    minimum_compatible_schema_version: minimumCompatiblePublicationStampSchemaVersion,
+    served_from: 'contract_only',
+    publication: null,
+    core_publication: null,
+    retrieval_publication: null,
+    contract_runtime: {
+      cli_version: cliVersion,
+      plugin_version: publicationStampText(plugin.plugin_version),
+      plugin_cli_version: pluginCliVersion,
+      cli_source: cliSource,
+      // `null` is "cannot compare", not "mismatch": the launcher answers
+      // `initialize` before any runtime is required to exist, so an unresolved
+      // CLI must not be reported as a failed pin.
+      pinned_pair_matches: pluginCliVersion === null || cliVersion === null
+        ? null
+        : pluginCliVersion === cliVersion,
+      known_override_skew_channel: Boolean(publicationStampText(process.env.CODESTORY_CLI))
+        || cliSource === 'local_dev_override',
+    },
+    operation: { operation_id: null, attempt: null },
+  };
+}
+
 // The pair check the `CODESTORY_CLI` override otherwise bypasses: the runtime's
 // own `initialize` result must agree with the revision the launcher already
 // promised the host and must stamp a publication schema this launcher can read.
@@ -3206,6 +3254,10 @@ function pluginRuntimeForResolved(resolved) {
     cli_source: resolved.source,
     cli_path: resolved.path,
     cli_sha256: resolved.sha256,
+    // The launcher-provided half of the pinned pair, identical to the
+    // `CODESTORY_PLUGIN_CLI_VERSION` the runtime stamps back as
+    // `contract_runtime.plugin_cli_version`.
+    plugin_cli_version: resolved.cliVersion || resolved.version || null,
     build_source: resolved.buildSource,
     repo_ref: resolved.repoRef,
     source_package_sha256: resolved.sourcePackageSha256 || null,
@@ -4119,7 +4171,10 @@ function runFailOpenMcp(status, options = {}) {
           prompts: { listChanged: true },
         },
         serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
-        _meta: { codestory_protocol: negotiatedProtocol },
+        _meta: {
+          codestory_publication: failOpenPublicationStamp(liveStatus),
+          codestory_protocol: negotiatedProtocol,
+        },
       });
     } else if (request.method === 'tools/list') {
       response = jsonrpcResult(request.id, { tools });
@@ -4519,6 +4574,7 @@ if (require.main === module) {
       probeResolvedCli,
       probeManagedCliStdio,
       negotiateMcpProtocolVersion,
+      failOpenPublicationStamp,
       publicationStampSkew,
       runtimeWireContractSkew,
       supportedMcpProtocolVersions,

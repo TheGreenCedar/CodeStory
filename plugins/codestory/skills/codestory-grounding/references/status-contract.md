@@ -96,6 +96,10 @@ The `initialize` result carries the same stamp plus `_meta.codestory_protocol`,
 which reports the requested revision, the negotiated revision, every revision the
 server implements, and whether the two agree. The server answers with a revision
 it actually implements; it never echoes an unsupported one back as supported.
+Through the packaged plugin the launcher answers `initialize` for the host, so
+the handshake stamp is the launcher's: it is always `served_from=contract_only`
+and reports the response contract version and the pinned pair, never a
+publication identity. Read publication identities from a tool result.
 
 Local navigation is useful while broad search prepares, but it is not full
 retrieval proof. Trust a broad result only when the requested tool succeeds

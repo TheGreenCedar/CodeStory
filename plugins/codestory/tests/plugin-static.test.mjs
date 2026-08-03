@@ -3817,6 +3817,124 @@ test("mcp launcher owns initialize before handing off to the native runtime", as
   }
 });
 
+test("packaged initialize handshake carries the publication stamp the host reads", async () => {
+  // The launcher answers `initialize` itself and suppresses the runtime's own
+  // answer, so the runtime-side `initialize` stamp is invisible to a host wired
+  // through `plugins/codestory/.mcp.json`. This drives the packaged launcher as
+  // a process — the only path the plugin configures — and pins the claim the
+  // CHANGELOG and the shipped grounding skills make: the version is known at
+  // handshake, before the first tool call.
+  const version = await readPluginVersion();
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const initialize = {
+    jsonrpc: "2.0",
+    id: "initialize",
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "plugin-static", version: "1" },
+    },
+  };
+  const packagedInitializeResult = (env, cwd) => {
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd,
+      env,
+      input: `${JSON.stringify(initialize)}\n`,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim().split(/\r?\n/u)[0]);
+    assert.equal(response.id, "initialize");
+    return response.result;
+  };
+
+  // The documented `CODESTORY_CLI` override: a runtime is available and the
+  // launcher is about to hand the session off, yet the handshake it already
+  // answered is still the only stamp the host will ever see.
+  const overrideDataDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-"));
+  const overrideBinDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-bin-"));
+  try {
+    const cliPath = await writeNodeCli(
+      overrideBinDir,
+      [
+        "const args = process.argv.slice(2);",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] === 'serve') { setInterval(() => {}, 1000); }",
+        "else process.exit(2);",
+      ].join("\n"),
+    );
+    const overrideResult = packagedInitializeResult({
+      ...process.env,
+      CODESTORY_CLI: cliPath,
+      PLUGIN_DATA: overrideDataDir,
+      TEST_CODESTORY_VERSION: version,
+    }, overrideDataDir);
+
+    const stamp = overrideResult._meta?.codestory_publication;
+    assert.ok(
+      stamp,
+      "the packaged handshake must carry _meta.codestory_publication, not only _meta.codestory_protocol",
+    );
+    assert.deepEqual(stamp, {
+      schema_version: 2,
+      minimum_compatible_schema_version: 2,
+      served_from: "contract_only",
+      publication: null,
+      core_publication: null,
+      retrieval_publication: null,
+      contract_runtime: {
+        cli_version: version,
+        plugin_version: version,
+        plugin_cli_version: version,
+        cli_source: "local_dev_override",
+        pinned_pair_matches: true,
+        known_override_skew_channel: true,
+      },
+      operation: { operation_id: null, attempt: null },
+    });
+    // The launcher's own fail-closed reader must accept the launcher's own
+    // handshake: a stamp the pinned reader would refuse is not a stamp.
+    assert.equal(launcherTest.publicationStampSkew(stamp), null);
+    assert.equal(overrideResult._meta.codestory_protocol.negotiated, "2024-11-05");
+  } finally {
+    await rm(overrideDataDir, { recursive: true, force: true });
+    await rm(overrideBinDir, { recursive: true, force: true });
+  }
+
+  // Fail-open, no runtime at all: the host still learns the response contract
+  // it is talking to instead of reading an unstamped legacy v0 handshake.
+  const failOpenDataDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-failopen-"));
+  try {
+    const failOpenResult = packagedInitializeResult({
+      PLUGIN_DATA: "",
+      COPILOT_PLUGIN_DATA: "",
+      CODESTORY_PLUGIN_DATA: failOpenDataDir,
+      CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+      PATH: "",
+      ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+    }, repoRoot);
+
+    const stamp = failOpenResult._meta?.codestory_publication;
+    assert.ok(stamp, "the fail-open handshake must carry the stamp too");
+    assert.equal(stamp.schema_version, 2);
+    assert.equal(stamp.minimum_compatible_schema_version, 2);
+    assert.equal(stamp.served_from, "contract_only");
+    assert.equal(launcherTest.publicationStampSkew(stamp), null);
+    assert.equal(stamp.contract_runtime.cli_source, "managed_unavailable");
+    assert.equal(stamp.contract_runtime.cli_version, null);
+    assert.equal(
+      stamp.contract_runtime.pinned_pair_matches,
+      null,
+      "an unresolved CLI cannot be reported as a failed pin",
+    );
+    assert.equal(stamp.contract_runtime.known_override_skew_channel, false);
+  } finally {
+    await rm(failOpenDataDir, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher starts the multi-project stdio runtime through its bridge", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();

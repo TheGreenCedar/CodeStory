@@ -58,7 +58,16 @@ whether they agree in `_meta.codestory_protocol`. It never echoes an
 unimplemented revision back as supported.
 
 The launcher answers `initialize` for the host and suppresses the native
-process's own answer, so it is the only reader of that answer. It compares the
+process's own answer, so the answer the host reads at handshake is the
+launcher's. It stamps that answer with its own `_meta.codestory_publication`:
+the same schema and minimum-compatible versions the launcher pins, with
+`served_from=contract_only` because no publication identity exists at session
+start, and a `contract_runtime` recording the launcher's half of the pinned pair
+(`pinned_pair_matches` is `null` while no CLI is resolved, which is "cannot
+compare", not "mismatch"). Without that stamp the packaged handshake would read
+as a legacy v0 producer whatever the pinned runtime implements.
+
+Being the only reader of the native answer, the launcher compares the
 negotiated revision and the publication schema version against its pinned
 contract. A stamp that is absent (legacy v0), unreadable, older than the
 launcher's minimum, or newer than it understands refuses the handoff: the
