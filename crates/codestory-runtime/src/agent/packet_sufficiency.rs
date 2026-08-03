@@ -3183,6 +3183,188 @@ mod tests {
         );
     }
 
+    // TMP EXPERIMENT (revert): repo-cache display-path stripping vs coverage filter.
+    fn tmp_experiment_sufficiency(
+        project_root: &Path,
+        source_coverage: Vec<SourceCoverageObservationDto>,
+        file_path_for: &dyn Fn(&str) -> String,
+    ) -> PacketSufficiencyDto {
+        let question = "alpha -> omega";
+        let names = ["alpha", "omega", "RouteSupport"];
+        let edges = [("alpha", "omega")];
+        let mut answer = route_answer(question, &names, &edges);
+        answer.source_coverage = source_coverage;
+        for citation in &mut answer.citations {
+            citation.file_path = Some(file_path_for(&citation.display_name));
+        }
+        let graph_edges = answer
+            .graphs
+            .iter()
+            .flat_map(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => graph.edges.as_slice(),
+                _ => &[],
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for citation in &mut answer.citations {
+            citation.evidence_edge_ids = graph_edges
+                .iter()
+                .filter(|edge| edge.source == citation.node_id || edge.target == citation.node_id)
+                .map(|edge| edge.id.clone())
+                .collect();
+        }
+        let mut obligations =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        answer.retrieval_trace.packet_sidecar_diagnostics.extend(
+            obligations
+                .query_obligations
+                .iter()
+                .filter(|query| query.material)
+                .map(|query| PacketSidecarQueryDiagnosticDto {
+                    query: query.query.clone(),
+                    completion: PacketQueryCompletionDto::Completed,
+                    retrieval_mode: "full".to_string(),
+                    sidecar_query_ms: Some(1),
+                    candidate_resolution_ms: Some(0),
+                    total_elapsed_ms: Some(1),
+                    sidecar_stage_count: 1,
+                    sidecar_stage_total_ms: Some(1),
+                    batch_query_wall_ms: Some(1),
+                    candidate_count: 1,
+                    resolved_hit_count: 1,
+                    unresolved_candidate_count: 0,
+                    blocking_unresolved_candidate_count: 0,
+                    semantic_stage_timeout_zero_hits: false,
+                    semantic_abstained: false,
+                    diagnostic: None,
+                }),
+        );
+        let budget = budget_fixture();
+        finalize_packet_obligation_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut obligations,
+            &answer,
+            &budget,
+        );
+        build_packet_sufficiency_with_obligation_context(
+            project_root,
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &answer,
+            &budget,
+            &[],
+            &[],
+            &obligations,
+        )
+    }
+
+    /// One layout: `root_suffix` is where the project root sits under the temp
+    /// dir, `excluded_relative` is the excluded file relative to that root.
+    fn tmp_layout_leaks(label: &str, root_suffix: &str, excluded_relative: &str) -> bool {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join(root_suffix);
+        let excluded = root.join(excluded_relative);
+        std::fs::create_dir_all(excluded.parent().expect("parent")).expect("mkdir excluded");
+        std::fs::write(&excluded, "// excluded\n").expect("write excluded");
+        std::fs::create_dir_all(root.join("src/router")).expect("mkdir router");
+        for name in ["omega", "RouteSupport"] {
+            std::fs::write(root.join(format!("src/router/{name}.rs")), "// x\n")
+                .expect("write router");
+        }
+
+        let absolute_excluded = excluded.to_string_lossy().to_string();
+        let leaf = excluded
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let file_path_for = {
+            let absolute_excluded = absolute_excluded.clone();
+            let root = root.clone();
+            move |name: &str| {
+                if name == "alpha" {
+                    absolute_excluded.clone()
+                } else {
+                    root.join(format!("src/router/{name}.rs"))
+                        .to_string_lossy()
+                        .to_string()
+                }
+            }
+        };
+
+        let capped = tmp_experiment_sufficiency(
+            root.as_path(),
+            vec![SourceCoverageObservationDto {
+                path: absolute_excluded.clone(),
+                status: SourceCoverageStatusDto::PolicyExcluded,
+                reason: None,
+                not_established_cause: None,
+                observed_size: Some(1_500_000),
+                byte_cap: Some(1_048_576),
+            }],
+            &file_path_for,
+        );
+        let control = tmp_experiment_sufficiency(root.as_path(), Vec::new(), &file_path_for);
+
+        let display = packet_display_path(&absolute_excluded);
+        let leaked = capped
+            .open_next
+            .iter()
+            .chain(capped.follow_up_commands.iter())
+            .any(|entry| entry.contains(leaf.as_str()));
+        let control_offered = control
+            .open_next
+            .iter()
+            .any(|entry| entry.contains(leaf.as_str()));
+        println!(
+            "TMP [{label}] root_suffix={root_suffix} excluded={excluded_relative} \
+             display={display} capped_status={:?} control_offers_lead={control_offered} \
+             leaked={leaked}",
+            capped.status
+        );
+        println!("TMP [{label}] capped.open_next = {:#?}", capped.open_next);
+        assert!(
+            control_offered,
+            "[{label}] the control must offer the lead or the case proves nothing: {control:?}"
+        );
+        leaked
+    }
+
+    #[test]
+    fn tmp_experiment_layouts() {
+        // 1. Benchmark layout: the project root IS the cached repo checkout.
+        let benchmark = tmp_layout_leaks(
+            "project-root-is-cached-repo",
+            "codestory/target/repo-cache/repos/axios",
+            "lib/core/Axios.js",
+        );
+        // 2. Ordinary Windows-style checkout under `source/repos/<name>`.
+        let checkout = tmp_layout_leaks(
+            "project-root-is-repo-under-source-repos",
+            "Users/alber/source/repos/codestory",
+            "crates/codestory-cli/big.json",
+        );
+        // 3. Outer repo whose excluded file lives under a nested `repos/` dir.
+        let nested = tmp_layout_leaks(
+            "nested-repos-dir-inside-project",
+            "codestory",
+            "target/repo-cache/repos/axios/lib/core/Axios.js",
+        );
+        // 4. Project root is a subdirectory of a repo cloned under `repos/`.
+        let subdir = tmp_layout_leaks(
+            "project-root-is-subdir-of-repo-under-repos",
+            "home/me/repos/monorepo/services/api",
+            "src/big.json",
+        );
+        // 5. Plain path with no `repos/` segment at all.
+        let plain = tmp_layout_leaks("plain-checkout", "work/codestory", "crates/cli/big.json");
+        println!(
+            "TMP SUMMARY benchmark={benchmark} checkout={checkout} nested={nested} \
+             subdir={subdir} plain={plain}"
+        );
+    }
+
     fn assert_unresolved_route_order(sufficiency: &PacketSufficiencyDto) {
         assert_eq!(
             sufficiency.status,

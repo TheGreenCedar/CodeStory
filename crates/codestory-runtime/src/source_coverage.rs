@@ -70,7 +70,10 @@ pub(crate) fn observe_source_coverage(
         })
         .collect();
 
-    deduped
+    let tmp_probe_paths = deduped.len();
+    let tmp_probe_exclusions = excluded.len();
+    let tmp_probe_started = std::time::Instant::now();
+    let tmp_probe_result: Vec<SourceCoverageObservationDto> = deduped
         .into_iter()
         .map(|path| {
             let absolute = absolute_against(&project_root, path);
@@ -96,7 +99,15 @@ pub(crate) fn observe_source_coverage(
                 },
             }
         })
-        .collect()
+        .collect();
+    eprintln!(
+        "TMP_PROBE source_coverage paths={} exclusions={} pair_stats={} elapsed_ms={:.3}",
+        tmp_probe_paths,
+        tmp_probe_exclusions,
+        2 * tmp_probe_paths * tmp_probe_exclusions,
+        tmp_probe_started.elapsed().as_secs_f64() * 1000.0
+    );
+    tmp_probe_result
 }
 
 fn absolute_against(project_root: &Path, path: &str) -> PathBuf {
