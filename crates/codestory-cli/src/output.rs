@@ -4981,6 +4981,7 @@ mod tests {
     #[test]
     fn context_markdown_contract_includes_evidence_packet_shape() {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "build_packet".to_string(),
             summary: "Packet output is assembled from retrieved CLI evidence.".to_string(),
@@ -5126,6 +5127,7 @@ mod tests {
 
     fn well_grounded_packet_answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "answer-telemetry".to_string(),
             prompt: "Explain how the installer dispatches commands.".to_string(),
             summary: "The installer dispatches install, download, and use commands.".to_string(),
@@ -5913,6 +5915,7 @@ mod tests {
     #[test]
     fn context_markdown_surfaces_low_confidence_trace_gaps() {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "answer-1".to_string(),
             prompt: "weak_hit".to_string(),
             summary: "Retrieval was incomplete.".to_string(),

@@ -28,6 +28,7 @@ pub(super) fn sample_retrieval() -> RetrievalStateDto {
 
 pub(super) fn sample_agent_answer_with_graph(graph: GraphArtifactDto) -> AgentAnswerDto {
     AgentAnswerDto {
+        source_coverage: Vec::new(),
         answer_id: "context-test".to_string(),
         prompt: "capped_bundle".to_string(),
         summary: "Bundle summary".to_string(),
@@ -88,6 +89,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                 trace: Vec::new(),
             },
             answer: AgentAnswerDto {
+                source_coverage: Vec::new(),
                 answer_id: "answer-task-brief".to_string(),
                 prompt: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
                 summary: "Use the packet command path.".to_string(),

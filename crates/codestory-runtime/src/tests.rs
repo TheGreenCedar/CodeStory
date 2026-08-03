@@ -3637,6 +3637,151 @@ fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
     assert!(changed.observed_size > first_exclusion.observed_size);
 }
 
+/// CAP-1b: a partially parsed file is not "covered".
+///
+/// `ParserPartial` is the one coverage reason that survives publication — both
+/// refresh gates refuse to commit on any other — so it is precisely the defect
+/// a *served* packet can rest on. Reporting such a file `Indexed` would
+/// contradict this contract's own definition of the word, and would leave the
+/// half of the coverage surface that can actually occur doing nothing.
+#[test]
+fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let partial = workspace.path().join("job-store.ts");
+    fs::write(
+        &partial,
+        "declare function sql<T>(parts: TemplateStringsArray): T;\n\
+         export const row = sql<unknown>`SELECT 1`;\n",
+    )
+    .expect("write a source the parser only partly understands");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("a parser-partial file must not block publication");
+
+    let observations =
+        crate::source_coverage::observe_source_coverage(&controller, &["job-store.ts".to_string()]);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].status,
+        codestory_contracts::api::SourceCoverageStatusDto::Incomplete,
+        "a file with a recorded coverage defect is not covered: {observations:?}"
+    );
+    assert_eq!(
+        observations[0].reason,
+        Some(codestory_contracts::graph::FileCoverageReason::ParserPartial),
+        "{observations:?}"
+    );
+
+    let input =
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations);
+    assert!(
+        input.caps_sufficiency(),
+        "an incompletely parsed file must stop a packet claiming sufficiency"
+    );
+}
+
+/// CAP-1b: the production path from a citation's path to an exclusion row.
+///
+/// The unit tests for the cap set `source_coverage` directly, so they never
+/// exercise the matching — which is where this change could most easily do
+/// nothing at all. Exclusion rows store a workspace-relative `normalized_path`
+/// while citations carry whatever the retrieval layer produced, so a string
+/// comparison would match on some platforms and silently never match on
+/// others: plumbing complete, tests green, nothing ever capped.
+#[test]
+fn coverage_observation_matches_an_exclusion_by_path_identity() {
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let structural = workspace.path().join("docs").join("api.json");
+    fs::create_dir_all(structural.parent().expect("docs dir")).expect("create docs dir");
+    fs::write(&structural, vec![b'x'; 1_300_010]).expect("write oversized structural source");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+
+    // Every spelling a citation might carry for the same file must resolve to
+    // the one exclusion row.
+    for spelling in [
+        "docs/api.json".to_string(),
+        structural.to_string_lossy().to_string(),
+        format!(
+            ".{}docs{}api.json",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        ),
+    ] {
+        let observations = crate::source_coverage::observe_source_coverage(
+            &controller,
+            std::slice::from_ref(&spelling),
+        );
+        assert_eq!(observations.len(), 1, "{spelling}: {observations:?}");
+        assert_eq!(
+            observations[0].status,
+            codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
+            "spelling {spelling} must resolve to the exclusion row: {observations:?}"
+        );
+        assert_eq!(
+            observations[0].byte_cap,
+            Some(codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP),
+            "the observation must carry the cap that refused the file"
+        );
+    }
+
+    // And two spellings of one file are one file: the packet must not ship the
+    // same gap twice. This is why the dedup compares path identity rather than
+    // strings, like everything else here.
+    let duplicated = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &[
+            "docs/api.json".to_string(),
+            structural.to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(
+        duplicated.len(),
+        1,
+        "two spellings of one file must dedup: {duplicated:?}"
+    );
+
+    // Distinct files still get one observation each — the map-not-filter
+    // contract, which the dedup must not quietly break.
+    let distinct = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &["docs/api.json".to_string(), "game.kt".to_string()],
+    );
+    assert_eq!(distinct.len(), 2, "{distinct:?}");
+
+    // A file the index did cover must not be reported as excluded, or the cap
+    // would fire on every packet in the repository.
+    let covered =
+        crate::source_coverage::observe_source_coverage(&controller, &["game.kt".to_string()]);
+    assert_eq!(covered.len(), 1);
+    assert_eq!(
+        covered[0].status,
+        codestory_contracts::api::SourceCoverageStatusDto::Indexed,
+        "{covered:?}"
+    );
+}
+
 #[test]
 fn republishing_projections_keeps_a_structural_exclusion_publishable() {
     // `codestory retrieval republish-projections` is the documented no-reindex

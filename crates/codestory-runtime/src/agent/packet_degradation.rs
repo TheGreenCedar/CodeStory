@@ -355,6 +355,7 @@ mod tests {
 
     fn counter_answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-degradation-test".to_string(),
             prompt: "how does activation admit a lease".to_string(),
             summary: String::new(),

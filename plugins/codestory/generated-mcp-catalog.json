@@ -4198,6 +4198,10 @@
             },
             "type": "array"
           },
+          "freshness": {
+            "description": "Index freshness observation, when one was made.",
+            "type": "object"
+          },
           "graphs": {
             "description": "Graph artifacts.",
             "items": {
@@ -4223,6 +4227,17 @@
           },
           "sections": {
             "description": "Context sections.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "source_coverage": {
+            "description": "Coverage for the files this packet rested on, when any were checked.",
             "items": {
               "additionalProperties": true,
               "description": "Generic JSON object.",

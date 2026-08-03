@@ -1159,6 +1159,7 @@ mod tests {
 
     fn test_answer(prompt: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-claims-test".to_string(),
             prompt: prompt.to_string(),
             summary: "test answer".to_string(),

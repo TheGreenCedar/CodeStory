@@ -673,6 +673,126 @@ pub struct IndexFreshnessDto {
     pub samples: Vec<IndexFreshnessSampleDto>,
 }
 
+/// What the index knows about one source file it was asked about.
+///
+/// Deliberately inert, like [`IndexFreshnessDto`]: it carries no verdict about whether the file is
+/// usable and none about whether evidence over it is provable. Both are computed downstream by
+/// consumers reading this same observation.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourceCoverageObservationDto {
+    /// The path as the consumer asked about it, so a caller can match its own request.
+    pub path: String,
+    pub status: SourceCoverageStatusDto,
+    /// Set only when `status` is `Incomplete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<FileCoverageReason>,
+    /// Set only when `status` is `NotEstablished`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_established_cause: Option<SourceCoverageNotEstablishedCauseDto>,
+    /// Observed size and the cap that refused it, when the file was policy-excluded.
+    ///
+    /// Reported so a gap sentence can name numbers instead of a word. No verdict reads these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_cap: Option<u64>,
+}
+
+/// What the index established about one file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageStatusDto {
+    /// The file is in the published core with no recorded coverage defect.
+    Indexed,
+    /// A published policy exclusion refused the file before scheduling.
+    PolicyExcluded,
+    /// The file was indexed but a coverage reason was recorded against it.
+    Incomplete,
+    /// Coverage could not be determined; see `not_established_cause`.
+    NotEstablished,
+}
+
+/// Why a coverage lookup could not reach a verdict.
+///
+/// The same split [`IndexFreshnessNotCheckedCauseDto`] makes: `PublicationIncomplete` means there
+/// is no complete core to ask, which is a deliberate and recoverable state; `LookupUnavailable`
+/// means the query itself failed and proves nothing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageNotEstablishedCauseDto {
+    PublicationIncomplete,
+    LookupUnavailable,
+}
+
+/// Why a consumer must treat evidence over one file as unprovable.
+///
+/// [`SourceCoverageStatusDto`] describes what the *index* did. This describes what a consumer may
+/// conclude, and as with freshness those are different judgements — so this carries variants the
+/// producer cannot emit.
+///
+/// One deliberate divergence from [`FreshnessUnknownCauseDto`], and it is the whole asymmetry:
+/// that mapping takes an `Option` because *no freshness observation at all* is itself unknown and
+/// must cap. Coverage's takes a value, because an empty observation list means no path was
+/// checked, which is legitimate and must cap nothing. A failed lookup is carried per path as
+/// `NotEstablished` rather than by absence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverageUnprovableCauseDto {
+    /// A published policy exclusion refused the file, so the index never read it.
+    PolicyExcluded,
+    /// The file carries a recorded coverage defect.
+    IncompleteIndex,
+    /// There is no complete publication to ask about this file.
+    PublicationIncomplete,
+    /// The coverage lookup failed.
+    LookupUnavailable,
+    /// The observation reported `Incomplete` without naming a reason.
+    ReasonUnreported,
+    /// The observation reported `NotEstablished` without naming a cause.
+    CauseUnreported,
+}
+
+impl SourceCoverageUnprovableCauseDto {
+    /// Stable machine-readable identity for gap text and typed output fields.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::PolicyExcluded => "policy_excluded",
+            Self::IncompleteIndex => "incomplete_index",
+            Self::PublicationIncomplete => "publication_incomplete",
+            Self::LookupUnavailable => "lookup_unavailable",
+            Self::ReasonUnreported => "reason_unreported",
+            Self::CauseUnreported => "cause_unreported",
+        }
+    }
+
+    /// The unprovable cause an observation carries, or `None` when the file is covered.
+    ///
+    /// `Indexed` is the only verdict that establishes coverage. Everything else — including an
+    /// `Incomplete` that names no reason — is unprovable, because defaulting an unnamed defect to
+    /// covered is the exposure this type exists to close.
+    pub fn for_observation(observation: &SourceCoverageObservationDto) -> Option<Self> {
+        match observation.status {
+            SourceCoverageStatusDto::Indexed => None,
+            SourceCoverageStatusDto::PolicyExcluded => Some(Self::PolicyExcluded),
+            SourceCoverageStatusDto::Incomplete => Some(match observation.reason {
+                Some(_) => Self::IncompleteIndex,
+                None => Self::ReasonUnreported,
+            }),
+            SourceCoverageStatusDto::NotEstablished => {
+                Some(match observation.not_established_cause {
+                    Some(SourceCoverageNotEstablishedCauseDto::PublicationIncomplete) => {
+                        Self::PublicationIncomplete
+                    }
+                    Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable) => {
+                        Self::LookupUnavailable
+                    }
+                    None => Self::CauseUnreported,
+                })
+            }
+        }
+    }
+}
+
 /// Readiness goal being evaluated.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2649,6 +2769,13 @@ pub struct AgentAnswerDto {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<IndexFreshnessDto>,
+    /// Coverage for the files this answer actually touched.
+    ///
+    /// Empty means no path was checked, which is legitimate and caps nothing — the opposite of
+    /// `freshness`, where absence is itself an unknown. A failed lookup arrives here as a
+    /// `NotEstablished` observation rather than as an absent list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_coverage: Vec<SourceCoverageObservationDto>,
     pub sections: Vec<AgentResponseSectionDto>,
     pub citations: Vec<AgentCitationDto>,
     pub subgraph_ids: Vec<String>,

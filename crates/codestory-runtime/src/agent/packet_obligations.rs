@@ -1587,6 +1587,7 @@ mod tests {
 
     fn answer(citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "obligation-test".to_string(),
             prompt: INDEXING_QUESTION.to_string(),
             summary: "test".to_string(),

@@ -757,6 +757,7 @@ mod tests {
     /// producer stamped. Nothing here hand-builds an annotation.
     fn empty_answer() -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "ev6c".to_string(),
             prompt: "ev6c packet".to_string(),
             summary: String::new(),
