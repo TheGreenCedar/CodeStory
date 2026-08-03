@@ -1,0 +1,42 @@
+node CLASS name=ConsoleNotifier qn=App.ConsoleNotifier canonical=<ROOT>/fidelity.cs:App.ConsoleNotifier line=10 col=1 end=16:2 file=FILE:<ROOT>/fidelity.cs@1
+node CLASS name=Event qn=App.Event canonical=<ROOT>/fidelity.cs:App.Event line=26 col=1 end=34:2 file=FILE:<ROOT>/fidelity.cs@1
+node CLASS name=INotifier qn=INotifier canonical=<ROOT>/fidelity.cs:INotifier line=10 col=25 end=10:34 file=FILE:<ROOT>/fidelity.cs@1
+node CLASS name=Program qn=App.Program canonical=<ROOT>/fidelity.cs:App.Program line=60 col=1 end=66:2 file=FILE:<ROOT>/fidelity.cs@1
+node CLASS name=Repository qn=App.Repository canonical=<ROOT>/fidelity.cs:App.Repository line=18 col=1 end=24:2 file=FILE:<ROOT>/fidelity.cs@1
+node CLASS name=Workflow qn=App.Workflow canonical=<ROOT>/fidelity.cs:App.Workflow line=36 col=1 end=58:2 file=FILE:<ROOT>/fidelity.cs@1
+node FILE name=<ROOT>/fidelity.cs qn=<ROOT>/fidelity.cs canonical=<ROOT>/fidelity.cs:<ROOT>/fidelity.cs:1 line=1 col=1 end=66:0 file=FILE:<ROOT>/fidelity.cs@1
+node INTERFACE name=INotifier qn=App.INotifier canonical=<ROOT>/fidelity.cs:App.INotifier line=5 col=1 end=8:2 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=ConsoleNotifier.Notify qn=App.ConsoleNotifier.Notify canonical=<ROOT>/fidelity.cs:App.ConsoleNotifier.Notify#0 line=12 col=5 end=15:6 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=INotifier.Notify qn=App.INotifier.Notify canonical=<ROOT>/fidelity.cs:App.INotifier.Notify#0 line=7 col=5 end=7:28 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=Program.Main qn=App.Program.Main canonical=<ROOT>/fidelity.cs:App.Program.Main#0 line=62 col=5 end=65:6 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=Repository.Save qn=App.Repository.Save canonical=<ROOT>/fidelity.cs:App.Repository.Save#0 line=20 col=5 end=23:6 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=Workflow.Decorate qn=App.Workflow.Decorate canonical=<ROOT>/fidelity.cs:App.Workflow.Decorate#0 line=54 col=5 end=57:6 file=FILE:<ROOT>/fidelity.cs@1
+node METHOD name=Workflow.Run qn=App.Workflow.Run canonical=<ROOT>/fidelity.cs:App.Workflow.Run#0 line=47 col=5 end=52:6 file=FILE:<ROOT>/fidelity.cs@1
+node MODULE name=System qn=System canonical=<ROOT>/fidelity.cs:System#0 line=1 col=7 end=1:13 file=FILE:<ROOT>/fidelity.cs@1
+node NAMESPACE name=App qn=App canonical=<ROOT>/fidelity.cs:App#0 line=3 col=1 end=3:15 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=Decorate qn=Decorate canonical=<ROOT>/fidelity.cs:Decorate#0 line=51 col=9 end=51:17 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=Notify qn=Notify canonical=<ROOT>/fidelity.cs:Notify#0 line=49 col=18 end=49:24 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=Run qn=Run canonical=<ROOT>/fidelity.cs:Run#0 line=64 col=63 end=64:66 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=Save qn=Save canonical=<ROOT>/fidelity.cs:Save#0 line=50 col=20 end=50:24 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=WriteLine qn=WriteLine canonical=<ROOT>/fidelity.cs:WriteLine#0 line=14 col=17 end=14:26 file=FILE:<ROOT>/fidelity.cs@1
+node UNKNOWN name=WriteLine qn=WriteLine canonical=<ROOT>/fidelity.cs:WriteLine#1 line=22 col=17 end=22:26 file=FILE:<ROOT>/fidelity.cs@1
+edge CALL src=METHOD:ConsoleNotifier.Notify@12 dst=UNKNOWN:WriteLine@14 resolved_src=METHOD:ConsoleNotifier.Notify@12 resolved_dst=- line=14 confidence=- certainty=- callsite=h0:14:1:h1|syntax:csharp-member-call candidates=[]
+edge CALL src=METHOD:Program.Main@62 dst=METHOD:Workflow.Run@47 resolved_src=METHOD:Program.Main@62 resolved_dst=METHOD:Workflow.Run@47 line=64 confidence=1.0000 certainty=Certain callsite=h0:64:1:h2 candidates=[]
+edge CALL src=METHOD:Repository.Save@20 dst=UNKNOWN:WriteLine@22 resolved_src=METHOD:Repository.Save@20 resolved_dst=- line=22 confidence=- certainty=- callsite=h0:22:1:h3|syntax:csharp-member-call candidates=[]
+edge CALL src=METHOD:Workflow.Run@47 dst=METHOD:INotifier.Notify@7 resolved_src=METHOD:Workflow.Run@47 resolved_dst=METHOD:INotifier.Notify@7 line=49 confidence=1.0000 certainty=Certain callsite=h0:49:1:h4 candidates=[]
+edge CALL src=METHOD:Workflow.Run@47 dst=METHOD:Repository.Save@20 resolved_src=METHOD:Workflow.Run@47 resolved_dst=METHOD:Repository.Save@20 line=50 confidence=1.0000 certainty=Certain callsite=h0:50:1:h5 candidates=[]
+edge CALL src=METHOD:Workflow.Run@47 dst=UNKNOWN:Decorate@51 resolved_src=METHOD:Workflow.Run@47 resolved_dst=METHOD:Workflow.Decorate@54 line=51 confidence=0.9500 certainty=Certain callsite=h0:51:1:h6 candidates=[]
+edge IMPORT src=MODULE:System@1 dst=MODULE:System@1 resolved_src=MODULE:System@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@10 dst=CLASS:INotifier@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@10 dst=METHOD:ConsoleNotifier.Notify@12 resolved_src=- resolved_dst=- line=12 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Program@60 dst=METHOD:Program.Main@62 resolved_src=- resolved_dst=- line=62 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@18 dst=METHOD:Repository.Save@20 resolved_src=- resolved_dst=- line=20 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@36 dst=METHOD:Workflow.Decorate@54 resolved_src=- resolved_dst=- line=54 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@36 dst=METHOD:Workflow.Run@47 resolved_src=- resolved_dst=- line=47 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:INotifier@5 dst=METHOD:INotifier.Notify@7 resolved_src=- resolved_dst=- line=7 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=CLASS:ConsoleNotifier@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=CLASS:Event@26 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=CLASS:Program@60 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=CLASS:Repository@18 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=CLASS:Workflow@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:App@3 dst=INTERFACE:INotifier@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
