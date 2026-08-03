@@ -30,6 +30,12 @@ pub(crate) fn build_callable_projection_states(
             .or_default()
             .push(occurrence);
     }
+    // Sorted once per file so each callable can binary-search its own line
+    // window instead of scanning every occurrence in the file: that scan was
+    // 501M filter comparisons at 2 MB and 12.4B at 10 MB (#1820).
+    for file_occurrences in occurrences_by_file.values_mut() {
+        file_occurrences.sort_by_key(|occurrence| occurrence.location.start_line);
+    }
 
     let node_by_id = nodes
         .iter()
@@ -227,7 +233,17 @@ pub(crate) fn callable_relative_occurrence_parts(
     let Some(file_occurrences) = file_occurrences else {
         return Vec::new();
     };
-    let mut occurrence_parts = file_occurrences
+    // `file_occurrences` is sorted by start line, so everything this callable
+    // can own is one contiguous window. The lower bound is the first
+    // occurrence starting at or after the callable; the upper bound is the
+    // first starting past its end, which is sound because an occurrence never
+    // ends before it starts — anything starting past `end_line` must also end
+    // past it and so can never satisfy the predicate.
+    let first =
+        file_occurrences.partition_point(|occurrence| occurrence.location.start_line < start_line);
+    let past_last =
+        file_occurrences.partition_point(|occurrence| occurrence.location.start_line <= end_line);
+    let mut occurrence_parts = file_occurrences[first..past_last]
         .iter()
         .filter(|occurrence| {
             occurrence_belongs_to_callable_body(occurrence, node, start_line, end_line)
