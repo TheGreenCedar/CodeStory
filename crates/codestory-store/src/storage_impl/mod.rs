@@ -3741,6 +3741,17 @@ pub struct CallerProjectionRemovalSummary {
     pub removed_callable_projection_state_count: usize,
 }
 
+/// What a file-structural reposition repair removed.
+///
+/// Deliberately has no node, bookmark, or file-row counter: the repair exists
+/// precisely because it must not touch any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnownedProjectionRemovalSummary {
+    pub file_id: i64,
+    pub removed_edge_count: usize,
+    pub removed_occurrence_count: usize,
+}
+
 /// Lightweight symbol projection used by lexical search sidecars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchSymbolProjection {
@@ -7930,6 +7941,85 @@ impl Storage {
             removed_edge_count: removed_edges,
             removed_occurrence_count: removed_occurrences,
             removed_callable_projection_state_count,
+        })
+    }
+
+    /// Remove exactly the rows the file-structural fence owns.
+    ///
+    /// This is the third cleanup, between `delete_projection_for_callers` (the
+    /// rows of one changed callable) and `delete_file_projection` (the file and
+    /// every node in it, which is what destroys annotations). It exists so a
+    /// file whose unowned declarations only *moved* — a shifted import, a
+    /// shifted top-level constant, a shifted class header — can be repaired by
+    /// re-inserting those rows at their new positions instead of by deleting
+    /// the file.
+    ///
+    /// It deletes nothing keyed to a node: no `node`, no `bookmark_node`, no
+    /// `component_access`, no `file` row. The node table is upserted by id, so
+    /// positions self-heal there, and the caller is responsible for having
+    /// established that no node identity changed.
+    ///
+    /// Ownership is read off the stored `callable_projection_state` rows, which
+    /// still hold the *pre-edit* extents at this point — the same rows, and the
+    /// same containment test, `delete_projection_for_callers` uses. The
+    /// file-structural row is excluded by `node_id <> file_node_id`: it is not a
+    /// callable, and its extent is the whole file, so treating it as an owner
+    /// would protect every row in the file from the cleanup.
+    pub fn delete_unowned_projection_for_file(
+        &mut self,
+        file_node_id: i64,
+    ) -> Result<UnownedProjectionRemovalSummary, StorageError> {
+        let tx = self.conn.transaction()?;
+
+        // Mirror of `structural_projection_fence`'s occurrence arm: an
+        // occurrence is unowned when it is neither a projected callable's own
+        // definition nor inside a projected callable's recorded extent.
+        let removed_occurrences = tx.execute(
+            "DELETE FROM occurrence
+             WHERE file_node_id = ?1
+             AND element_id NOT IN (
+                SELECT node_id FROM callable_projection_state
+                WHERE file_id = ?1 AND node_id <> ?1
+             )
+             AND NOT EXISTS (
+                SELECT 1
+                FROM callable_projection_state cps
+                WHERE cps.file_id = ?1
+                AND cps.node_id <> ?1
+                AND occurrence.start_line >= cps.start_line
+                AND occurrence.end_line <= cps.end_line
+             )",
+            params![file_node_id],
+        )?;
+
+        // Mirror of the edge arm: an edge is unowned unless it is one of the
+        // two kinds the caller-scoped cleanup rewrites *and* a projected
+        // callable of this file sources it. Scoped to `file_node_id` because
+        // that is the set this file's parse re-emits.
+        let removed_edges = tx.execute(
+            &format!(
+                "DELETE FROM edge
+                 WHERE file_node_id = ?1
+                 AND NOT (
+                    kind IN ({}, {})
+                    AND source_node_id IN (
+                        SELECT node_id FROM callable_projection_state
+                        WHERE file_id = ?1 AND node_id <> ?1
+                    )
+                 )",
+                EdgeKind::CALL as i32,
+                EdgeKind::USAGE as i32
+            ),
+            params![file_node_id],
+        )?;
+
+        tx.commit()?;
+        self.invalidate_grounding_snapshots()?;
+
+        Ok(UnownedProjectionRemovalSummary {
+            file_id: file_node_id,
+            removed_edge_count: removed_edges,
+            removed_occurrence_count: removed_occurrences,
         })
     }
 

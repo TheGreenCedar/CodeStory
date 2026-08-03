@@ -44,6 +44,13 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+
+/// SRC-C2 fence classification: lives in its own file because
+/// `codestory-indexer`'s own source is indexed by
+/// `tests/integration.rs`, which fails once a file crosses the 1 MB
+/// oversized-source cap this crate enforces.
+#[cfg(test)]
+mod projection_fence_tests;
 pub mod resolution;
 pub mod semantic;
 pub mod structural;
@@ -803,7 +810,19 @@ const FILE_STRUCTURAL_SYMBOL_KEY: &str = "__file_structural__";
 enum ProjectionUpdateMode {
     InsertFresh,
     NoChanges,
-    Delta { changed_callers: Vec<NodeId> },
+    Delta {
+        changed_callers: Vec<NodeId>,
+    },
+    /// The file-structural fence moved without changing what it contains.
+    ///
+    /// Every unowned row kept its identity and only its span shifted, so the
+    /// rows the fence owns are deleted and re-inserted at their new positions
+    /// while the node table — and everything anchored to it — is left alone.
+    /// `changed_callers` is still repaired caller-scoped, exactly as in
+    /// `Delta`.
+    RepositionUnowned {
+        changed_callers: Vec<NodeId>,
+    },
     FullReplace,
 }
 
@@ -1349,6 +1368,17 @@ impl<'a> ProjectionWriter<'a> {
                 match update_mode {
                     ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
                     ProjectionUpdateMode::Delta { changed_callers } => {
+                        self.storage
+                            .delete_projection_for_callers(file_id, &changed_callers)
+                            .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
+                    }
+                    ProjectionUpdateMode::RepositionUnowned { changed_callers } => {
+                        // Order matters: the unowned cleanup reads ownership off
+                        // the stored callable rows, and the caller cleanup
+                        // deletes them.
+                        self.storage
+                            .delete_unowned_projection_for_file(file_id)
+                            .map_err(|e| anyhow!("Storage reposition cleanup error: {:?}", e))?;
                         self.storage
                             .delete_projection_for_callers(file_id, &changed_callers)
                             .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
@@ -20784,22 +20814,29 @@ pub(crate) fn build_callable_projection_states(
 
     if let Some(file_node) = nodes.iter().find(|node| node.kind == NodeKind::FILE) {
         let repaired_callables = CallableProjectionExtents::from_states(&states);
+        let fence = structural_projection_fence(
+            file_node.id,
+            nodes,
+            edges,
+            occurrences,
+            &node_by_id,
+            &repaired_callables,
+        );
         states.push(CallableProjectionState {
             file_id: file_node.id.0,
             symbol_key: FILE_STRUCTURAL_SYMBOL_KEY.to_string(),
             node_id: file_node.id,
-            signature_hash: callable_signature_hash(FILE_STRUCTURAL_SYMBOL_KEY),
+            // On a callable row this column is the identity the delta path
+            // cannot repair; on the file row it means the same thing for the
+            // unowned population, which is why the identity lives here rather
+            // than in a second row: a second row keyed to the same `node_id`
+            // would double every `callable_projection_state` join an annotation
+            // lookup makes against the FILE node.
+            signature_hash: fence.identity,
             // The file structural row is not a callable, so it carries no
             // normalized signature and can never satisfy a rebind probe.
             normalized_signature: None,
-            body_hash: structural_projection_hash(
-                file_node.id,
-                nodes,
-                edges,
-                occurrences,
-                &node_by_id,
-                &repaired_callables,
-            ),
+            body_hash: fence.detector,
             start_line: 1,
             end_line: file_node.end_line.unwrap_or(1),
         });
@@ -21120,15 +21157,48 @@ impl CallableProjectionExtents {
     }
 }
 
-fn structural_projection_hash(
+/// The two numbers the file-structural row carries.
+struct StructuralProjectionFence {
+    /// `body_hash`: the fence's change detector, and a **frozen wire format**.
+    /// A store written by an earlier release compares against this value
+    /// directly, so altering one part string would re-replace — and so strip
+    /// the annotations from — every file in every existing database.
+    detector: i64,
+    /// `signature_hash`: the same population with the repairable positions
+    /// taken out, which is what lets a pure shift be repaired in place instead
+    /// of read as churn.
+    identity: i64,
+}
+
+/// Stamp distinguishing one file-structural *identity* format from the next.
+///
+/// Embeds `CALLABLE_PROJECTION_FORMAT_STAMP`, so a callable-format bump
+/// invalidates this one too.
+const FILE_STRUCTURAL_IDENTITY_FORMAT_STAMP: &str = "file-structural-identity-format:1";
+
+/// The one unowned row class the reposition repair cannot fix.
+///
+/// `Store::delete_unowned_projection_for_file` removes the file's unowned edge
+/// rows by `file_node_id`, because that is the only column tying an edge row to
+/// the parse that will re-emit it. An unowned edge recorded against a
+/// *different* file — or against no file at all — is therefore never reached by
+/// that repair, and edge rows are insert-or-ignore, so a moved one would keep
+/// its old line forever. Those edges keep their line inside the identity hash,
+/// which routes them to `FullReplace`: the only cleanup that does reach them.
+fn edge_position_is_repairable_by_file(edge: &Edge, file_id: NodeId) -> bool {
+    edge.file_node_id == Some(file_id)
+}
+
+fn structural_projection_fence(
     file_id: NodeId,
     nodes: &[Node],
     edges: &[Edge],
     occurrences: &[Occurrence],
     node_by_id: &HashMap<NodeId, &Node>,
     repaired_callables: &CallableProjectionExtents,
-) -> i64 {
+) -> StructuralProjectionFence {
     let mut parts = Vec::new();
+    let mut identity_parts = Vec::new();
 
     for node in nodes {
         if node.id == file_id {
@@ -21143,10 +21213,9 @@ fn structural_projection_hash(
         } else {
             "node"
         };
-        parts.push(format!(
-            "{role}:{}:{qualified_name}:{}",
-            node.kind as i32, node.id.0
-        ));
+        let part = format!("{role}:{}:{qualified_name}:{}", node.kind as i32, node.id.0);
+        identity_parts.push(part.clone());
+        parts.push(part);
     }
 
     for edge in edges {
@@ -21154,27 +21223,26 @@ fn structural_projection_hash(
         {
             continue;
         }
-        let source_name = node_by_id
-            .get(&edge.source)
-            .map(|node| {
-                node.qualified_name
-                    .as_deref()
-                    .unwrap_or(node.serialized_name.as_str())
-            })
-            .unwrap_or_default();
-        let target_name = node_by_id
-            .get(&edge.target)
-            .map(|node| {
-                node.qualified_name
-                    .as_deref()
-                    .unwrap_or(node.serialized_name.as_str())
-            })
-            .unwrap_or_default();
-        parts.push(format!(
-            "edge:{}:{source_name}:{target_name}:{}",
-            edge.kind as i32,
-            edge.line.unwrap_or(0)
-        ));
+        let endpoint_name = |id: &NodeId| {
+            node_by_id
+                .get(id)
+                .map(|node| {
+                    node.qualified_name
+                        .as_deref()
+                        .unwrap_or(node.serialized_name.as_str())
+                })
+                .unwrap_or_default()
+        };
+        let source_name = endpoint_name(&edge.source);
+        let target_name = endpoint_name(&edge.target);
+        let kind = edge.kind as i32;
+        let line = edge.line.unwrap_or(0);
+        parts.push(format!("edge:{kind}:{source_name}:{target_name}:{line}"));
+        identity_parts.push(if edge_position_is_repairable_by_file(edge, file_id) {
+            format!("edge:{kind}:{source_name}:{target_name}")
+        } else {
+            format!("unrepairable-edge:{kind}:{source_name}:{target_name}:{line}")
+        });
     }
 
     for occurrence in occurrences {
@@ -21184,19 +21252,65 @@ fn structural_projection_hash(
         if repaired_callables.owns_occurrence(occurrence) {
             continue;
         }
+        let element = occurrence.element_id;
+        let kind = occurrence.kind as i32;
         parts.push(format!(
-            "occurrence:{}:{}:{}:{}:{}:{}",
-            occurrence.element_id,
-            occurrence.kind as i32,
+            "occurrence:{element}:{kind}:{}:{}:{}:{}",
             occurrence.location.start_line,
             occurrence.location.start_col,
             occurrence.location.end_line,
             occurrence.location.end_col
         ));
+        identity_parts.push(format!("occurrence:{element}:{kind}"));
     }
 
     parts.sort();
-    hash_parts(parts.iter().map(String::as_str))
+    identity_parts.sort();
+    StructuralProjectionFence {
+        detector: hash_parts(parts.iter().map(String::as_str)),
+        identity: hash_parts(
+            [
+                FILE_STRUCTURAL_IDENTITY_FORMAT_STAMP,
+                CALLABLE_PROJECTION_FORMAT_STAMP,
+            ]
+            .into_iter()
+            .chain(identity_parts.iter().map(String::as_str)),
+        ),
+    }
+}
+
+/// How the file-structural fence classifies one refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStructuralVerdict {
+    /// The fence saw nothing move and nothing change.
+    Unchanged,
+    /// Only repairable positions moved.
+    Repositioned,
+    /// The unowned population itself changed, or there is no identity evidence.
+    Replaced,
+}
+
+/// Read the stored file-structural row against the one just projected.
+///
+/// The upgrade from a store that predates the identity hash needs no migration
+/// and triggers no re-projection wave. Those rows hold
+/// `callable_signature_hash(FILE_STRUCTURAL_SYMBOL_KEY)` — one constant, the
+/// same for every file — which is not equal to any identity this function is
+/// handed, so a legacy row is read as churn and behaves exactly as it did
+/// before: `NoChanges` while the change detector agrees, `FullReplace` the
+/// moment it does not. The first edit to a file re-stamps it with a real
+/// identity, and only from then on can it be repositioned.
+fn classify_file_structural_fence(
+    existing: &CallableProjectionState,
+    current: &CallableProjectionState,
+) -> FileStructuralVerdict {
+    if current.body_hash == existing.body_hash {
+        return FileStructuralVerdict::Unchanged;
+    }
+    if existing.signature_hash != current.signature_hash {
+        return FileStructuralVerdict::Replaced;
+    }
+    FileStructuralVerdict::Repositioned
 }
 
 fn classify_projection_update(
@@ -21230,12 +21344,14 @@ fn classify_projection_update(
     }
 
     let mut changed_callers = Vec::new();
+    let mut fence = FileStructuralVerdict::Unchanged;
     for current_state in current {
         let Some(existing_state) = existing_by_key.get(current_state.symbol_key.as_str()) else {
             return ProjectionUpdateMode::FullReplace;
         };
         if current_state.symbol_key == FILE_STRUCTURAL_SYMBOL_KEY {
-            if current_state.body_hash != existing_state.body_hash {
+            fence = classify_file_structural_fence(existing_state, current_state);
+            if fence == FileStructuralVerdict::Replaced {
                 return ProjectionUpdateMode::FullReplace;
             }
             continue;
@@ -21248,10 +21364,15 @@ fn classify_projection_update(
         }
     }
 
-    if changed_callers.is_empty() {
-        ProjectionUpdateMode::NoChanges
-    } else {
-        ProjectionUpdateMode::Delta { changed_callers }
+    match fence {
+        FileStructuralVerdict::Replaced => ProjectionUpdateMode::FullReplace,
+        FileStructuralVerdict::Repositioned => {
+            ProjectionUpdateMode::RepositionUnowned { changed_callers }
+        }
+        FileStructuralVerdict::Unchanged if changed_callers.is_empty() => {
+            ProjectionUpdateMode::NoChanges
+        }
+        FileStructuralVerdict::Unchanged => ProjectionUpdateMode::Delta { changed_callers },
     }
 }
 
