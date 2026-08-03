@@ -105,7 +105,12 @@ function fixture({
     executable: artifact.executable,
     fresh: false,
   }));
-  for (const packageName of ["codestory-retrieval", "codestory-runtime"]) {
+  // Every crate the shipping feature gate speaks for has to be in the graph it inspects.
+  for (const packageName of [
+    "codestory-agent",
+    "codestory-retrieval",
+    "codestory-runtime",
+  ]) {
     const manifest = writePackageManifest(packageName);
     messages.push({
       reason: "compiler-artifact",
@@ -343,6 +348,42 @@ test("rejects retrieval benchmark or test support in the shipping graph", async 
       );
     });
   }
+});
+
+test("rejects agent test support in the shipping graph", () => {
+  // `codestory-agent/test-support` compiles the eval/holdout probe hooks that used to ride
+  // `#[cfg(test)]` inside codestory-runtime. Product builds never enable it, and the gate is
+  // what makes "never" checkable rather than asserted (#1673).
+  const input = fixture();
+  featureMessage(input, "codestory-agent").features = ["test-support"];
+  refreshCargoJson(input);
+
+  assert.throws(
+    () =>
+      assertShippingFeatureContract({
+        jsonLines: input.jsonLines,
+        workspaceRoot: input.root,
+      }),
+    /forbidden feature codestory-agent\/test-support/u,
+  );
+});
+
+test("refuses a shipping graph that never mentions a gated crate", () => {
+  // Absence is the failure the gate has to notice: a crate that vanishes from the graph produces
+  // no feature evidence, and "no evidence of the feature" must not read as "feature off".
+  const input = fixture();
+  const agent = featureMessage(input, "codestory-agent");
+  input.messages.splice(input.messages.indexOf(agent), 1);
+  refreshCargoJson(input);
+
+  assert.throws(
+    () =>
+      assertShippingFeatureContract({
+        jsonLines: input.jsonLines,
+        workspaceRoot: input.root,
+      }),
+    /shipping Cargo graph omitted feature evidence for codestory-agent/u,
+  );
 });
 
 test("rejects runtime benchmark or test support in the shipping graph", async (t) => {

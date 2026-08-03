@@ -30,6 +30,9 @@ on:
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
+      - scripts/native-fingerprint.mjs
+      - scripts/bump-version.mjs
+      - scripts/lib/workspace-members.mjs
       - scripts/tests/codestory-release-claims.test.mjs
       - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
@@ -103,6 +106,9 @@ on:
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
+      - scripts/native-fingerprint.mjs
+      - scripts/bump-version.mjs
+      - scripts/lib/workspace-members.mjs
       - scripts/tests/codestory-release-claims.test.mjs
       - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs

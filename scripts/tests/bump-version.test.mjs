@@ -14,10 +14,15 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { parsePublishedArchiveDigests } from "../lib/pinned-archive-digests.mjs";
+import { workspaceMemberNames } from "../lib/workspace-members.mjs";
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../..",
+);
+/// The fixture carries the real workspace's crates so a new crate cannot slip past these tests.
+const workspaceCrates = workspaceMemberNames(
+  readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8"),
 );
 const testPython = ["python", "python3"].find((candidate) => {
   try {
@@ -32,18 +37,13 @@ assert.ok(testPython, "bump-version tests require Python with tomllib");
 /// A minimal tree carrying every surface the script owns.
 function fixtureRoot(version) {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-bump-"));
-  const crates = [
-    "codestory-llama-sys",
-    "codestory-contracts",
-    "codestory-workspace",
-    "codestory-store",
-    "codestory-indexer",
-    "codestory-retrieval",
-    "codestory-agent",
-    "codestory-runtime",
-    "codestory-cli",
-    "codestory-bench",
-  ];
+  const crates = workspaceCrates;
+  writeFileSync(
+    path.join(root, "Cargo.toml"),
+    `[workspace]\nresolver = "2"\nmembers = [\n${crates
+      .map((crate) => `    "crates/${crate}",\n`)
+      .join("")}]\n`,
+  );
   for (const crate of crates) {
     const directory = path.join(root, "crates", crate);
     mkdirSync(directory, { recursive: true });
@@ -109,10 +109,12 @@ function fixtureRoot(version) {
     path.join(root, "scripts/bump-version.mjs"),
   );
   mkdirSync(path.join(root, "scripts/lib"), { recursive: true });
-  cpSync(
-    path.join(repositoryRoot, "scripts/lib/pinned-archive-digests.mjs"),
-    path.join(root, "scripts/lib/pinned-archive-digests.mjs"),
-  );
+  for (const module of ["pinned-archive-digests.mjs", "workspace-members.mjs"]) {
+    cpSync(
+      path.join(repositoryRoot, "scripts/lib", module),
+      path.join(root, "scripts/lib", module),
+    );
+  }
   mkdirSync(path.join(root, ".github/scripts"), { recursive: true });
   cpSync(
     path.join(repositoryRoot, ".github/scripts/check-codestory-release.py"),
