@@ -1405,7 +1405,7 @@ fn is_java_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::JAVA_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::java::MEMBER_CALLSITE_MARKER)
     })
 }
 
