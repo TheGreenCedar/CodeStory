@@ -394,7 +394,9 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         CLI_CONFIG,
         SettingKind::Integer,
         SettingAudience::Product,
-        "Largest source file, in bytes, the indexer will read; non-positive values keep the default.",
+        "Admission headroom in bytes for parser-backed sources; structural formats \
+         keep their own smaller bound. Not a cost bound. Non-positive values keep \
+         the default.",
     ),
     setting(
         INTERNAL_EMBEDDING_SERVER_EXECUTABLE_SHA256_ENV,

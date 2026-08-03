@@ -253,6 +253,7 @@ fn semantic_projection_source_policy_bridge_is_directional_and_cap_exact() {
     let legacy_runtime = SourceIndexPolicy {
         policy_version: LEGACY_OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: current.byte_cap,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: current.structural_unit_cap,
     };
     assert_eq!(
@@ -2951,6 +2952,7 @@ fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation()
     let excluding_policy = SourceIndexPolicy {
         policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
         byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+        structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
         structural_unit_cap: 2,
     };
     let excluding_controller = AppController::new_with_source_index_policy(
@@ -3387,6 +3389,7 @@ fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_r
         SourceIndexPolicy {
             policy_version: "oversized-source-v2".into(),
             byte_cap: 64,
+            structural_byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
             structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         },
     ] {
@@ -3425,9 +3428,16 @@ fn special_collector_growth_after_planning_cannot_publish() {
     fs::write(&source_path, "CREATE TABLE drifted (id INTEGER);\n")
         .expect("write below-cap structural source");
     let storage_path = workspace.path().join(".cache/codestory.db");
+    // The structural bound has to sit strictly below the parser headroom, or
+    // the generic guard refuses the grown file first and the collector bound
+    // this test is named for is never reached. With both at 64 the test passed
+    // while the structural guard was disabled.
     let controller = AppController::new_with_source_index_policy(
         test_sidecar_runtime_from_env(),
-        SourceIndexPolicy::oversized(64),
+        SourceIndexPolicy {
+            structural_byte_cap: 64,
+            ..SourceIndexPolicy::oversized(4_096)
+        },
     );
     controller
         .open_project_summary_with_storage_path(
@@ -3625,6 +3635,59 @@ fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
         .expect("changed Rust exclusion");
     assert_ne!(changed.content_hash, first_exclusion.content_hash);
     assert!(changed.observed_size > first_exclusion.observed_size);
+}
+
+#[test]
+fn republishing_projections_keeps_a_structural_exclusion_publishable() {
+    // `codestory retrieval republish-projections` is the documented no-reindex
+    // migration, and it rebinds every pinned exclusion row to the active
+    // policy. While all rows carried the parser headroom that rebinding was a
+    // no-op; once a structural row names its own smaller cap, stamping the
+    // headroom on it makes `observed_size > byte_cap` false, the row stops
+    // qualifying, and publication refuses it on every attempt with no
+    // re-index able to clear it.
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let structural = workspace.path().join("docs").join("api.json");
+    fs::create_dir_all(structural.parent().expect("docs dir")).expect("create docs dir");
+    // Between the structural bound and the parser headroom: excluded by
+    // planning, and only classified correctly if the per-kind cap is honoured.
+    fs::write(&structural, vec![b'x'; 1_300_010]).expect("write oversized structural source");
+
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+
+    {
+        let storage = Storage::open(&storage_path).expect("open complete core");
+        let rows = storage
+            .get_source_policy_exclusions()
+            .expect("read published exclusions");
+        let row = rows
+            .iter()
+            .find(|row| row.normalized_path.ends_with("api.json"))
+            .expect("the structural source must be published as an exclusion");
+        assert_eq!(
+            row.byte_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+            "the row must name the cap that refused it"
+        );
+    }
+
+    // The migration must survive being run, and run twice.
+    for attempt in 1..=2 {
+        controller
+            .republish_semantic_projections_blocking()
+            .unwrap_or_else(|error| panic!("republish attempt {attempt} failed: {error:?}"));
+    }
 }
 
 #[test]

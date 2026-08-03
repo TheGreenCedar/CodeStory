@@ -77,7 +77,17 @@ const MAX_COMMONDIR_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_ALTERNATES_BYTES: u64 = 1024 * 1024;
 const MAX_LOCAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_METADATA_TREE_ENTRIES: usize = 100_000;
-const MAX_REWRITE_BLOB_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
+/// gix `core.bigFileThreshold`, governing rename and similarity detection.
+///
+/// Deliberately NOT derived from the source cap. Its previous equality with
+/// that cap was an accident of value, and inheriting a source-admission change
+/// would silently alter rewrite detection in a subsystem with no relationship
+/// to source size — no failure, just different output.
+///
+/// The literal is the value it has always had, to the byte. Decoupling it must
+/// not move it: `1024 * 1024` would read more naturally here and would have
+/// changed rename detection by 48,576 bytes for no stated reason.
+const MAX_REWRITE_BLOB_BYTES: u64 = 1_000_000;
 const MAX_REWRITE_SIMILARITY_PERMUTATIONS: usize = 1_000;
 
 /// One problem that prevented a complete repository metadata observation.
@@ -2145,6 +2155,53 @@ mod tests {
         assert_eq!(changes[0].kind, RepositoryChangeKind::Renamed);
         assert_eq!(changes[0].path, b"renamed.rs".to_vec());
         assert_eq!(changes[0].previous_path, Some(b"lib.rs".to_vec()));
+    }
+
+    #[test]
+    fn probe_band_rename_detection() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        eprintln!("PROBE threshold = {MAX_REWRITE_BLOB_BYTES}");
+        for size in [990_000usize, 1_010_000usize, 1_100_000usize] {
+            let mut body: String = (0..size / 26)
+                .map(|i| format!("pub fn f{i:012}() {{}}\n"))
+                .collect();
+            while body.len() < size {
+                body.push('x');
+            }
+            assert_eq!(body.len(), size);
+            fs::write(project.path().join("lib.rs"), &body).expect("write big source");
+            git(project.path(), &["add", "lib.rs"]);
+            git(project.path(), &["commit", "-m", "big source"]);
+            git(project.path(), &["mv", "lib.rs", "renamed.rs"]);
+            let mut modified = body.clone();
+            modified.push_str("pub fn appended() {}\n");
+            fs::write(project.path().join("renamed.rs"), &modified).expect("modify renamed");
+            git(project.path(), &["add", "renamed.rs"]);
+
+            let changes = read_repository_changes(project.path(), RepositoryChangeScope::Staged)
+                .expect("read staged");
+            eprintln!(
+                "PROBE size={} blob={} -> {:?}",
+                body.len(),
+                modified.len(),
+                changes
+                    .iter()
+                    .map(|c| (
+                        String::from_utf8_lossy(&c.path).to_string(),
+                        c.kind,
+                        c.previous_path
+                            .as_ref()
+                            .map(|p| String::from_utf8_lossy(p).to_string())
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            git(project.path(), &["mv", "renamed.rs", "lib.rs"]);
+            fs::write(project.path().join("lib.rs"), "pub fn run() {}\n").expect("reset");
+            git(project.path(), &["add", "-A"]);
+            git(project.path(), &["commit", "-m", "reset"]);
+        }
     }
 
     #[test]

@@ -9,7 +9,11 @@ use std::io::Read;
 use std::path::Path;
 
 pub(crate) use codestory_contracts::config_registry::HYBRID_RETRIEVAL_ENABLED_ENV;
-pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 = 1_000_000;
+/// Derived from the source cap: a file the indexer admits must also be
+/// readable as semantic document text, or it lands in the graph with symbols
+/// and is silently absent from every body-backed answer.
+pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 =
+    codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 
 /// Whether hybrid lexical/semantic ranking is on for this process.

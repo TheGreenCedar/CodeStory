@@ -814,7 +814,12 @@ fn read_source_policy_exclusion_rollback_identity(
                 || record.core_generation_id != identity.core_generation_id
                 || record.core_run_id != identity.core_run_id
                 || record.policy_version != identity.policy_version
-                || record.byte_cap != identity.byte_cap
+                // As at publication and validation: a row names the cap that
+                // refused it, which for a structural format sits below the
+                // policy headroom the identity carries. Only a row claiming
+                // more headroom than was published is invalid.
+                || record.byte_cap == 0
+                || record.byte_cap > identity.byte_cap
                 || record.structural_unit_cap != identity.structural_unit_cap
                 || !format.qualifies(record)
         })
@@ -8943,12 +8948,18 @@ impl Storage {
                     .all(|value| value.is_ascii_hexdigit())
                 || candidate.observed_size > i64::MAX as u64
                 || candidate.observed_unit_count > i64::MAX as u64
-                || !((candidate.observed_size > policy.byte_cap
+                // Evaluated against the candidate's own cap, matching
+                // `SourcePolicyExclusionPublicationFormat::qualifies`. A row's
+                // `byte_cap` is the cap that refused *this* source, which for a
+                // structural format sits below the policy headroom; only the
+                // headroom itself is a global bound, so it is checked as one.
+                || !((candidate.observed_size > candidate.byte_cap
                     && candidate.observed_unit_count == 0)
-                    || (candidate.observed_size <= policy.byte_cap
-                        && candidate.observed_unit_count > policy.structural_unit_cap))
+                    || (candidate.observed_size <= candidate.byte_cap
+                        && candidate.observed_unit_count > candidate.structural_unit_cap))
                 || candidate.policy_version != policy.policy_version
-                || candidate.byte_cap != policy.byte_cap
+                || candidate.byte_cap == 0
+                || candidate.byte_cap > policy.byte_cap
                 || candidate.structural_unit_cap != policy.structural_unit_cap
             {
                 return Err(StorageError::Other(format!(
@@ -9109,7 +9120,15 @@ impl Storage {
                     || record.core_generation_id != manifest.core_generation_id
                     || record.core_run_id != manifest.core_run_id
                     || record.policy_version != manifest.policy_version
-                    || record.byte_cap != manifest.byte_cap
+                    // A row names the cap that refused it, which for a
+                    // structural format is below the manifest's headroom. Only
+                    // a row claiming *more* headroom than was published is
+                    // invalid. The manifest-versus-policy check above stays a
+                    // strict equality: the headroom itself is a policy
+                    // dimension, and its equality is what forces republication
+                    // when the cap moves.
+                    || record.byte_cap == 0
+                    || record.byte_cap > manifest.byte_cap
                     || record.structural_unit_cap != manifest.structural_unit_cap
                     || !format.qualifies(record)
             })
