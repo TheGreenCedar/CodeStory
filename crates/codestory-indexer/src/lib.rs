@@ -65,7 +65,6 @@ use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
 
 pub(crate) const CSHARP_MEMBER_CALLSITE_MARKER: &str = "syntax:csharp-member-call";
-pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
 pub(crate) const DART_MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
 pub(crate) const SWIFT_MEMBER_CALLSITE_MARKER: &str = "syntax:swift-member-call";
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -128,7 +127,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 // Source of truth for live rule assets. Keep this registry aligned with
 // `get_language_for_ext` so dead rule files do not silently linger.
 const JAVA_GRAPH_QUERY: &str = include_str!("../rules/java.scm");
-const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
 const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
 const DART_GRAPH_QUERY: &str = include_str!("../rules/dart.scm");
@@ -316,9 +314,12 @@ impl LanguageRuleset {
             LanguageRuleset::Ruby => Err(anyhow!(
                 "ruby compiled rules are owned by the language registry"
             )),
-            LanguageRuleset::Php => {
-                compiled_rules_cache(language, PHP_GRAPH_QUERY, None, &PHP_RULES)
-            }
+            // Answered by the registry above; the arm only exists because the
+            // match must stay exhaustive. Failing closed here rather than
+            // panicking keeps a future registry mistake a typed indexing error.
+            LanguageRuleset::Php => Err(anyhow!(
+                "php compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::CSharp => {
                 compiled_rules_cache(language, CSHARP_GRAPH_QUERY, None, &CSHARP_RULES)
             }
@@ -370,7 +371,6 @@ fn compiled_rules_cache(
         .map_err(|message| anyhow!(message.clone()))
 }
 
-static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static DART_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -4395,7 +4395,7 @@ struct CallPlaceholderMarkerAnnotation<'a> {
 fn receiver_annotation_required_callsite_marker(language_name: &str) -> Option<&'static str> {
     match language_name {
         "python" => Some(languages::python::MEMBER_CALLSITE_MARKER),
-        "php" => Some(PHP_MEMBER_CALLSITE_MARKER),
+        "php" => Some(languages::php::MEMBER_CALLSITE_MARKER),
         _ => None,
     }
 }
@@ -7127,7 +7127,7 @@ fn language_member_specs(
             &["class", "module"],
             &["method", "singleton_method"],
         ),
-        "php" => collect_php_member_edges(tree, source),
+        "php" => languages::php::member_edge_specs(tree, source),
         "csharp" => collect_enclosing_type_member_edges(
             tree,
             source,
@@ -7216,7 +7216,6 @@ fn language_receiver_call_specs(
         // TSX has always run TypeScript's receiver-call engine; the engine
         // moved into the registry row and #1682 takes over this arm.
         "tsx" => languages::typescript::receiver_call_specs(tree, source),
-        "php" => collect_php_receiver_call_edges(tree, source),
         "csharp" => collect_csharp_receiver_call_edges(tree, source),
         "swift" => collect_swift_receiver_call_edges(tree, source),
         "dart" => collect_dart_receiver_call_edges(tree, source),
@@ -7758,681 +7757,6 @@ fn first_descendant_with_kind<'tree>(node: TsNode<'tree>, kind: &str) -> Option<
         }
     }
     None
-}
-
-fn collect_php_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
-    let mut edges = collect_enclosing_type_member_edges(
-        tree,
-        source,
-        &[
-            "class_declaration",
-            "interface_declaration",
-            "trait_declaration",
-        ],
-        &["method_declaration"],
-    );
-    edges.extend(collect_php_namespace_member_edges(tree, source));
-    edges
-}
-
-fn collect_php_namespace_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
-    let mut edges = Vec::new();
-    let root = tree.root_node();
-    walk_tree_nodes(root, &mut |namespace| {
-        if namespace.kind() != "namespace_definition" {
-            return;
-        }
-        let Some(body) = namespace.child_by_field_name("body") else {
-            return;
-        };
-        collect_php_namespace_member_edges_in_scope(namespace, body, source, &mut edges);
-    });
-
-    let mut current_namespace = None;
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() == "namespace_definition" {
-            current_namespace = child.child_by_field_name("body").is_none().then_some(child);
-            continue;
-        }
-        let Some(namespace) = current_namespace else {
-            continue;
-        };
-        collect_php_namespace_member_edge(namespace, child, source, &mut edges);
-    }
-
-    edges
-}
-
-fn collect_php_namespace_member_edges_in_scope(
-    namespace: TsNode<'_>,
-    scope: TsNode<'_>,
-    source: &str,
-    edges: &mut Vec<ManualMemberEdgeSpec>,
-) {
-    let mut cursor = scope.walk();
-    for child in scope.named_children(&mut cursor) {
-        collect_php_namespace_member_edge(namespace, child, source, edges);
-    }
-}
-
-fn collect_php_namespace_member_edge(
-    namespace: TsNode<'_>,
-    child: TsNode<'_>,
-    source: &str,
-    edges: &mut Vec<ManualMemberEdgeSpec>,
-) {
-    if !matches!(child.kind(), "class_declaration" | "interface_declaration") {
-        return;
-    }
-    let Some(source_name) = declaration_name(namespace, source) else {
-        return;
-    };
-    let Some(target_name) = declaration_name(child, source) else {
-        return;
-    };
-    edges.push(ManualMemberEdgeSpec {
-        source_name,
-        target_name,
-        source_span: ts_node_graph_span(namespace),
-        target_span: ts_node_graph_span(child),
-        line: Some(child.start_position().row as u32 + 1),
-    });
-}
-
-fn collect_php_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
-    let mut edges = Vec::new();
-    let root = tree.root_node();
-    walk_tree_nodes(tree.root_node(), &mut |callable| {
-        if !matches!(
-            callable.kind(),
-            "function_definition" | "method_declaration"
-        ) {
-            return;
-        }
-        let Some(source_name) = declaration_name(callable, source) else {
-            return;
-        };
-        let visible_type_names = collect_php_visible_type_binding_names(root, callable, source);
-        let imported_type_bindings =
-            collect_php_visible_imported_type_bindings(root, callable, source, &visible_type_names);
-        let call_source = ManualReceiverSource {
-            name: &source_name,
-            span: ts_node_graph_span(callable),
-        };
-        let mut local_receiver_callsites = HashSet::new();
-        collect_php_local_receiver_call_specs(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            &visible_type_names,
-            &imported_type_bindings,
-            &mut local_receiver_callsites,
-            &mut edges,
-        );
-        let receiver_types = collect_php_parameter_types(callable, source);
-        if receiver_types.is_empty() {
-            return;
-        }
-        let start = edges.len();
-        collect_receiver_call_specs_in_callable(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            &receiver_types,
-            php_member_call,
-            false,
-            &mut edges,
-        );
-        let mut parameter_specs = edges.split_off(start);
-        parameter_specs
-            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
-        for spec in &mut parameter_specs {
-            if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
-                spec.owner_name = binding.owner_name.clone();
-                spec.owner_module = Some(binding.module_name.clone());
-            }
-        }
-        edges.extend(parameter_specs);
-    });
-    edges
-}
-
-fn collect_php_local_receiver_call_specs(
-    callable: TsNode<'_>,
-    source: &str,
-    call_source: ManualReceiverSource<'_>,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
-) {
-    walk_tree_nodes(callable, &mut |node| {
-        let Some((receiver_name, method_name)) = php_member_call(node, source) else {
-            return;
-        };
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
-        let owner = php_self_receiver_owner(callable, &receiver_name, source)
-            .map(Some)
-            .or_else(|| {
-                php_field_receiver_owner(
-                    callable,
-                    &receiver_name,
-                    source,
-                    visible_type_names,
-                    imported_type_bindings,
-                )
-                .map(Some)
-            })
-            .or_else(|| {
-                php_direct_new_owner_surface(
-                    &receiver_name,
-                    visible_type_names,
-                    imported_type_bindings,
-                )
-                .map(Some)
-            })
-            .or_else(|| {
-                php_visible_local_receiver_owner(
-                    callable,
-                    node,
-                    &receiver_name,
-                    source,
-                    visible_type_names,
-                    imported_type_bindings,
-                )
-            });
-        let Some(owner) = owner else {
-            return;
-        };
-        let method_col = member_call_method_col(node, source, &method_name);
-        local_receiver_callsites.insert(ReceiverCallSiteKey {
-            receiver_name: receiver_name.clone(),
-            method_name: method_name.clone(),
-            line: Some(node.start_position().row as u32 + 1),
-            method_col,
-        });
-        if let Some((owner_name, owner_module)) = owner {
-            edges.push(ManualReceiverCallSpec {
-                source_name: call_source.name.to_string(),
-                source_span: call_source.span,
-                receiver_name,
-                owner_name,
-                owner_module,
-                method_name,
-                method_col,
-                line: Some(node.start_position().row as u32 + 1),
-                allow_global_fallback: false,
-            });
-        }
-    });
-}
-
-fn php_self_receiver_owner(
-    callable: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-) -> OptionalReceiverOwnerBinding {
-    if receiver_name != "this" {
-        return None;
-    }
-    let owner_node = enclosing_node_with_kind(
-        callable,
-        &[
-            "class_declaration",
-            "interface_declaration",
-            "trait_declaration",
-        ],
-    )?;
-    let owner_name = declaration_name(owner_node, source)?;
-    Some((owner_name, None))
-}
-
-fn php_field_receiver_owner(
-    callable: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    let field_name = receiver_name.strip_prefix("this->")?.trim();
-    let class_node = enclosing_node_with_kind(callable, &["class_declaration"])?;
-    let mut field_bindings = Vec::new();
-    walk_tree_nodes(class_node, &mut |node| {
-        if !matches!(
-            node.kind(),
-            "property_declaration" | "property_promotion_parameter"
-        ) {
-            return;
-        }
-        if !enclosing_node_with_kind(node, &["class_declaration"])
-            .is_some_and(|owner| same_ts_span(owner, class_node))
-        {
-            return;
-        }
-        let Some(surface) = trimmed_node_text(node, source) else {
-            return;
-        };
-        for (binding_name, owner) in
-            php_typed_member_bindings_surface(&surface, visible_type_names, imported_type_bindings)
-        {
-            if binding_name == field_name {
-                field_bindings.push(owner);
-            }
-        }
-    });
-    field_bindings.sort();
-    field_bindings.dedup();
-    if field_bindings.len() == 1 {
-        Some(field_bindings.remove(0))
-    } else {
-        None
-    }
-}
-
-fn php_typed_member_bindings_surface(
-    surface: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> Vec<(String, ReceiverOwnerBinding)> {
-    let surface = surface
-        .split('=')
-        .next()
-        .unwrap_or(surface)
-        .trim()
-        .trim_end_matches([';', ','])
-        .trim();
-    let Some((type_side, _)) = surface.split_once('$') else {
-        return Vec::new();
-    };
-    let Some(raw_type) = type_side
-        .split_whitespace()
-        .last()
-        .filter(|token| !php_member_modifier_token(token))
-    else {
-        return Vec::new();
-    };
-    let Some(owner) =
-        php_receiver_owner_from_type(raw_type, visible_type_names, imported_type_bindings)
-    else {
-        return Vec::new();
-    };
-
-    surface
-        .split('$')
-        .skip(1)
-        .filter_map(|part| {
-            let name = part
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect::<String>();
-            normalize_parameter_name(&name).map(|name| (name, owner.clone()))
-        })
-        .collect()
-}
-
-fn php_member_modifier_token(token: &str) -> bool {
-    matches!(
-        token,
-        "public" | "protected" | "private" | "readonly" | "static" | "var" | "final" | "abstract"
-    )
-}
-
-fn php_visible_local_receiver_owner(
-    callable: TsNode<'_>,
-    call_node: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> Option<OptionalReceiverOwnerBinding> {
-    let mut visible_bindings = Vec::new();
-    walk_tree_nodes(callable, &mut |node| {
-        if node.kind() != "assignment_expression" {
-            return;
-        }
-        if !receiver_call_belongs_to_callable(node, callable)
-            || node.end_byte() > call_node.start_byte()
-        {
-            return;
-        }
-        let Some(left_node) = node.child_by_field_name("left") else {
-            return;
-        };
-        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
-            return;
-        }
-        let owner = node.child_by_field_name("right").and_then(|right_node| {
-            php_direct_new_owner(
-                right_node,
-                source,
-                visible_type_names,
-                imported_type_bindings,
-            )
-        });
-        visible_bindings.push((node.end_byte(), owner));
-    });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
-}
-
-fn php_direct_new_owner(
-    node: TsNode<'_>,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    trimmed_node_text(node, source)
-        .as_deref()
-        .and_then(|surface| {
-            php_direct_new_owner_surface(surface, visible_type_names, imported_type_bindings)
-        })
-}
-
-fn php_direct_new_owner_surface(
-    surface: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    let surface = surface
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim();
-    let rest = surface.strip_prefix("new ")?;
-    let type_surface = rest.split(['(', '{']).next().unwrap_or(rest).trim();
-    if type_surface.contains('\\') {
-        return None;
-    }
-    php_receiver_owner_from_type(type_surface, visible_type_names, imported_type_bindings)
-}
-
-fn php_receiver_owner_from_type(
-    raw_type: &str,
-    visible_type_names: &HashSet<String>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    let raw_type = raw_type.trim().trim_start_matches('?').trim();
-    if raw_type.contains('\\') || raw_type.contains('|') || raw_type.contains('&') {
-        return None;
-    }
-    let owner_name = normalize_type_surface(raw_type)?;
-    if visible_type_names.contains(&owner_name) {
-        return Some((owner_name, None));
-    }
-    if let Some(binding) = imported_type_bindings.get(&owner_name) {
-        return Some((
-            binding.owner_name.clone(),
-            Some(binding.module_name.clone()),
-        ));
-    }
-    None
-}
-
-fn collect_php_visible_imported_type_bindings(
-    root: TsNode<'_>,
-    callable: TsNode<'_>,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-) -> HashMap<String, ImportedTypeBinding> {
-    let mut bindings = HashMap::new();
-    let mut duplicates = HashSet::new();
-
-    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_definition"])
-        && let Some(body) = namespace.child_by_field_name("body")
-    {
-        collect_php_imported_type_bindings_in_scope(
-            body,
-            source,
-            visible_type_names,
-            &mut bindings,
-            &mut duplicates,
-        );
-    } else {
-        let (start_byte, end_byte) = php_unbracketed_namespace_segment(root, callable);
-        collect_php_imported_type_bindings_in_root_segment(
-            root,
-            source,
-            visible_type_names,
-            &mut bindings,
-            &mut duplicates,
-            start_byte,
-            end_byte,
-        );
-    }
-
-    bindings
-}
-
-fn collect_php_imported_type_bindings_in_scope(
-    scope: TsNode<'_>,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-    bindings: &mut HashMap<String, ImportedTypeBinding>,
-    duplicates: &mut HashSet<String>,
-) {
-    let mut cursor = scope.walk();
-    for statement in scope.named_children(&mut cursor) {
-        if statement.kind() != "namespace_use_declaration" {
-            continue;
-        }
-        let Some(statement_surface) = trimmed_node_text(statement, source) else {
-            continue;
-        };
-        for (owner_name, local_name, module_name) in
-            php_import_type_binding_names(&statement_surface)
-        {
-            if visible_type_names.contains(&local_name) || duplicates.contains(&local_name) {
-                continue;
-            }
-            if bindings.contains_key(&local_name) {
-                bindings.remove(&local_name);
-                duplicates.insert(local_name);
-                continue;
-            }
-            bindings.insert(
-                local_name,
-                ImportedTypeBinding {
-                    module_name,
-                    owner_name,
-                },
-            );
-        }
-    }
-}
-
-fn collect_php_imported_type_bindings_in_root_segment(
-    root: TsNode<'_>,
-    source: &str,
-    visible_type_names: &HashSet<String>,
-    bindings: &mut HashMap<String, ImportedTypeBinding>,
-    duplicates: &mut HashSet<String>,
-    start_byte: usize,
-    end_byte: usize,
-) {
-    let mut cursor = root.walk();
-    for statement in root.named_children(&mut cursor) {
-        if statement.start_byte() < start_byte || statement.start_byte() >= end_byte {
-            continue;
-        }
-        if statement.kind() != "namespace_use_declaration" {
-            continue;
-        }
-        let Some(statement_surface) = trimmed_node_text(statement, source) else {
-            continue;
-        };
-        for (owner_name, local_name, module_name) in
-            php_import_type_binding_names(&statement_surface)
-        {
-            if visible_type_names.contains(&local_name) || duplicates.contains(&local_name) {
-                continue;
-            }
-            if bindings.contains_key(&local_name) {
-                bindings.remove(&local_name);
-                duplicates.insert(local_name);
-                continue;
-            }
-            bindings.insert(
-                local_name,
-                ImportedTypeBinding {
-                    module_name,
-                    owner_name,
-                },
-            );
-        }
-    }
-}
-
-fn collect_php_visible_type_binding_names(
-    root: TsNode<'_>,
-    callable: TsNode<'_>,
-    source: &str,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
-    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_definition"])
-        && let Some(body) = namespace.child_by_field_name("body")
-    {
-        collect_php_type_binding_names_in_scope(body, source, &mut names);
-    } else {
-        let (start_byte, end_byte) = php_unbracketed_namespace_segment(root, callable);
-        collect_php_type_binding_names_in_root_segment(
-            root, source, &mut names, start_byte, end_byte,
-        );
-    }
-    names
-}
-
-fn collect_php_type_binding_names_in_scope(
-    scope: TsNode<'_>,
-    source: &str,
-    names: &mut HashSet<String>,
-) {
-    let mut cursor = scope.walk();
-    for child in scope.named_children(&mut cursor) {
-        if matches!(child.kind(), "class_declaration" | "interface_declaration")
-            && let Some(name) = declaration_name(child, source)
-        {
-            names.insert(name);
-        }
-    }
-}
-
-fn collect_php_type_binding_names_in_root_segment(
-    root: TsNode<'_>,
-    source: &str,
-    names: &mut HashSet<String>,
-    start_byte: usize,
-    end_byte: usize,
-) {
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.start_byte() < start_byte || child.start_byte() >= end_byte {
-            continue;
-        }
-        if matches!(child.kind(), "class_declaration" | "interface_declaration")
-            && let Some(name) = declaration_name(child, source)
-        {
-            names.insert(name);
-        }
-    }
-}
-
-fn php_unbracketed_namespace_segment(root: TsNode<'_>, node: TsNode<'_>) -> (usize, usize) {
-    let mut start_byte = root.start_byte();
-    let mut end_byte = root.end_byte();
-    let node_start = node.start_byte();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() != "namespace_definition" || child.child_by_field_name("body").is_some() {
-            continue;
-        }
-        if node_start < child.start_byte() {
-            end_byte = child.start_byte();
-            break;
-        }
-        start_byte = child.end_byte();
-        end_byte = root.end_byte();
-    }
-    (start_byte, end_byte)
-}
-
-fn php_import_type_binding_names(statement: &str) -> Vec<(String, String, String)> {
-    let Some(rest) = statement.strip_prefix("use") else {
-        return Vec::new();
-    };
-    let rest = rest.trim().trim_end_matches(';').trim();
-    if starts_with_case_insensitive_keyword(rest, "function")
-        || starts_with_case_insensitive_keyword(rest, "const")
-        || rest.contains('{')
-    {
-        return Vec::new();
-    }
-
-    split_top_level_parameters(rest)
-        .into_iter()
-        .filter_map(|part| php_import_type_binding_name(&part))
-        .collect()
-}
-
-fn php_import_type_binding_name(import_surface: &str) -> Option<(String, String, String)> {
-    let import_surface = import_surface.trim();
-    if starts_with_case_insensitive_keyword(import_surface, "function")
-        || starts_with_case_insensitive_keyword(import_surface, "const")
-    {
-        return None;
-    }
-    let (module_surface, alias_surface) =
-        split_case_insensitive_alias(import_surface, "as").unwrap_or((import_surface, ""));
-    let (owner_name, module_name) = php_imported_owner_module_name(module_surface)?;
-    let local_name = if alias_surface.trim().is_empty() {
-        owner_name.clone()
-    } else {
-        normalize_parameter_name(alias_surface)?
-    };
-    Some((owner_name, local_name, module_name))
-}
-
-fn split_case_insensitive_alias<'a>(surface: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
-    let mut tokens = surface.split_whitespace();
-    let module_surface = tokens.next()?;
-    let separator = tokens.next()?;
-    let alias_surface = tokens.next()?;
-    if tokens.next().is_some() || !separator.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    Some((module_surface, alias_surface))
-}
-
-fn starts_with_case_insensitive_keyword(surface: &str, keyword: &str) -> bool {
-    let mut parts = surface.split_whitespace();
-    parts
-        .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case(keyword))
-}
-
-fn php_imported_owner_module_name(raw_module: &str) -> Option<(String, String)> {
-    let module = raw_module.trim().trim_start_matches('\\').trim();
-    if module.is_empty()
-        || module.contains('*')
-        || module.contains('|')
-        || module.split_whitespace().count() != 1
-    {
-        return None;
-    }
-    let (namespace, owner_name) = module.rsplit_once('\\')?;
-    let owner_name = normalize_parameter_name(owner_name)?;
-    if namespace.trim().is_empty() {
-        return None;
-    }
-    Some((owner_name.clone(), format!("{namespace}.{owner_name}")))
 }
 
 fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
@@ -10179,37 +9503,6 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
         .is_some_and(|nearest| nearest.kind() == callable.kind() && same_ts_span(nearest, callable))
 }
 
-fn collect_php_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
-    let mut receiver_types = HashMap::new();
-    let Some(parameters) = callable.child_by_field_name("parameters") else {
-        return receiver_types;
-    };
-    walk_tree_nodes(parameters, &mut |node| {
-        if !matches!(
-            node.kind(),
-            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter"
-        ) {
-            return;
-        }
-        let Some(type_node) = node.child_by_field_name("type") else {
-            return;
-        };
-        let Some(raw_type) = trimmed_node_text(type_node, source) else {
-            return;
-        };
-        let Some(owner_name) = normalize_type_surface(&raw_type) else {
-            return;
-        };
-        let Some(name_node) = node.child_by_field_name("name") else {
-            return;
-        };
-        if let Some(name) = normalized_receiver_variable(name_node, source) {
-            receiver_types.insert(name, owner_name);
-        }
-    });
-    receiver_types
-}
-
 fn collect_csharp_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
     let mut receiver_types = HashMap::new();
     let Some(parameters) = callable.child_by_field_name("parameters") else {
@@ -10624,21 +9917,6 @@ fn normalize_parameter_name(raw: &str) -> Option<String> {
         .trim_start_matches('$')
         .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
     (!cleaned.is_empty()).then(|| cleaned.to_string())
-}
-
-fn php_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if !matches!(
-        node.kind(),
-        "member_call_expression" | "nullsafe_member_call_expression"
-    ) {
-        return None;
-    }
-    let receiver = node.child_by_field_name("object")?;
-    let method = node.child_by_field_name("name")?;
-    Some((
-        normalized_receiver_variable(receiver, source)?,
-        trimmed_node_text(method, source)?,
-    ))
 }
 
 fn csharp_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
@@ -13173,7 +12451,7 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
     }
     matches!(
         language_name,
-        "typescript" | "php" | "csharp" | "dart" | "vue" | "astro"
+        "typescript" | "csharp" | "dart" | "vue" | "astro"
     )
 }
 
@@ -16314,7 +15592,6 @@ pub fn index_file(
                                     Some(marker) => Some(marker),
                                     None => match raw {
                                         "csharp_member" => Some(CSHARP_MEMBER_CALLSITE_MARKER),
-                                        "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
                                         "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
                                         "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),
                                         _ => callsite_marker,

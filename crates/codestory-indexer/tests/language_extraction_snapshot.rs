@@ -162,6 +162,16 @@ const CASES: &[SnapshotCase] = &[
         tictactoe_source: include_str!("fixtures/tictactoe/ruby_tictactoe.rb"),
         tictactoe_golden: include_str!("fixtures/language_snapshots/ruby_tictactoe.txt"),
     },
+    SnapshotCase {
+        language: "php",
+        extension: "php",
+        fidelity_filename: "fidelity.php",
+        fidelity_source: include_str!("fixtures/fidelity_lab/php_fidelity_lab.php"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/php_fidelity.txt"),
+        tictactoe_filename: "game.php",
+        tictactoe_source: include_str!("fixtures/tictactoe/php_tictactoe.php"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/php_tictactoe.txt"),
+    },
 ];
 
 #[test]

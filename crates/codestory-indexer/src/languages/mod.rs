@@ -22,6 +22,7 @@ pub(crate) mod go;
 pub(crate) mod java;
 pub(crate) mod javascript;
 pub(crate) mod kotlin;
+pub(crate) mod php;
 pub(crate) mod ruby;
 pub(crate) mod typescript;
 
@@ -93,6 +94,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     rust::EXTRACTION,
     go::EXTRACTION,
     ruby::EXTRACTION,
+    php::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
