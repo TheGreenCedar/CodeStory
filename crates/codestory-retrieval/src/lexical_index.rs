@@ -1450,8 +1450,13 @@ pub(crate) fn make_test_file_writable(path: &Path) {
 
 /// A file the indexer admits but this lane drops is indexed-but-unfindable: it
 /// lands in the graph with symbols, is absent from the FTS shard, and nothing
-/// reports an error — strict readiness still says Full. Asserted at compile
-/// time so a future cap change cannot ship without confronting it.
+/// reports an error — strict readiness still says Full.
+///
+/// The assertion below compares two compile-time constants, so it catches a
+/// future *default* bump that forgets this lane. It cannot see the runtime
+/// override: the indexer gates on `SourceIndexPolicy.byte_cap`, which
+/// `CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP` raises without an upper clamp, and
+/// closing that needs the policy plumbed here (#1823).
 const _: () = assert!(
     MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
     "the lexical lane must admit every file the indexer does"

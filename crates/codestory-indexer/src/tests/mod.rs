@@ -1247,6 +1247,61 @@ fn incremental_incomplete_result_preserves_previous_projection() -> Result<()> {
 }
 
 #[test]
+fn a_structural_source_over_the_structural_bound_is_refused_below_the_parser_headroom() -> Result<()>
+{
+    // The structural bound only does work when it sits *below* the parser
+    // headroom, which is exactly the shipped configuration and exactly what no
+    // existing test reached: every other test sets both caps to the same tiny
+    // value, so the generic guard refuses the file first and the structural
+    // branch is never entered. Disabling the structural bound left the whole
+    // suite green.
+    //
+    // Two guards enforce this and they are deliberately redundant — a metadata
+    // check before the read, and the collector's own bound on the decoded
+    // source. This asserts the observable outcome rather than either branch,
+    // so it survives one being refactored away and fails when both are gone.
+    use codestory_workspace::RefreshInfo;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("schema.sql");
+    std::fs::write(
+        &path,
+        "CREATE TABLE wide (id INTEGER, name TEXT, note TEXT);\n",
+    )?;
+    let observed = std::fs::metadata(&path)?.len();
+
+    let refresh = RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![path.clone()],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut storage = Storage::new_in_memory()?;
+    let bus = EventBus::new();
+
+    WorkspaceIndexer::new(dir.path().to_path_buf())
+        .with_source_index_policy(SourceIndexPolicy {
+            structural_byte_cap: observed - 1,
+            ..SourceIndexPolicy::oversized(observed * 16)
+        })
+        .run_incremental(&mut storage, &refresh, &bus, None)?;
+
+    let file = storage
+        .get_file_by_path(&path)?
+        .expect("the refused file still gets a metadata row");
+    assert!(
+        storage.get_errors(None)?.iter().any(|error| {
+            error.file_id == Some(NodeId(file.id))
+                && error.coverage_reason == Some(FileCoverageReason::Oversized)
+                && error.message.contains(&format!("{}", observed - 1))
+        }),
+        "the refusal must name the structural bound that produced it, not the \
+         parser headroom the file is comfortably inside"
+    );
+    Ok(())
+}
+
+#[test]
 fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> Result<()> {
     let dir = tempdir()?;
     let path = dir.path().join("changed.rs");
