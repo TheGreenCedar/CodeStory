@@ -3183,11 +3183,6 @@ mod tests {
         );
     }
 
-    // TMP EXPERIMENT (revert): repo-cache display-path stripping vs coverage filter.
-
-    /// One layout: `root_suffix` is where the project root sits under the temp
-    /// dir, `excluded_relative` is the excluded file relative to that root.
-
     fn assert_unresolved_route_order(sufficiency: &PacketSufficiencyDto) {
         assert_eq!(
             sufficiency.status,
