@@ -2,12 +2,35 @@
 //!
 //! A receipt records that one expensive validation of an *immutable* artifact
 //! succeeded. It is only reusable while the native identity of every file the
-//! validation examined is byte-for-byte the same observation it was sealed to:
-//! same presence, same length, same modification and inode-change instants,
-//! same device/inode, same read-only bit. Replacement, truncation, in-place
-//! rewriting, and the appearance of a SQLite sidecar all break the seal, so a
-//! generation that was damaged after its first validation re-validates instead
-//! of hiding behind the earlier verdict.
+//! validation examined is the same observation it was sealed to: same presence,
+//! same length, same modification and inode-change instants, same device/inode,
+//! same read-only bit. Where the platform reports all of that — see the limit
+//! below — replacement, truncation, in-place rewriting, and the appearance of a
+//! SQLite sidecar all break the seal, so a generation damaged after its first
+//! validation re-validates instead of hiding behind the earlier verdict.
+//!
+//! **A seal is only as strong as the metadata the platform reports, and one
+//! shipped platform reports less.** The paragraph above holds in full on Unix,
+//! where `std::fs` exposes a device/inode pair and an inode-change instant.
+//! Windows exposes neither through `std::fs`, so a seal taken there compares
+//! presence, length, the creation and modification instants, and the read-only
+//! bit — nothing that records *that the bytes were rewritten*. A writer that
+//! rewrites an artifact in place without changing its length and then restores
+//! the modification time produces an observation identical to the sealed one,
+//! and the receipt answers for bytes it never read. The same is true of a
+//! replacement whose length, creation, and modification instants all match.
+//! [`SealFidelity`] names which of the two a given observation is, and
+//! [`ArtifactSeal::fidelity`] reports it. This is a stated limit of the
+//! receipt, not an accident of it: on a
+//! [`SealFidelity::TimestampsOnly`] platform a receipt proves the artifact was
+//! not casually touched; it does not prove the bytes are the ones the
+//! validation read. Nothing that must detect deliberate corruption may rest on
+//! a receipt alone there. Concretely, a consumer whose verdict is receipted
+//! carries the limit forward: on a timestamps-only platform an artifact
+//! rewritten in place at the same length, with its modification time restored,
+//! keeps answering with the verdict this process already sealed for it. What
+//! bounds that is the receipt's process-local lifetime, not the seal — the next
+//! process re-reads the bytes.
 //!
 //! Two rules are structural rather than conventional:
 //!
@@ -75,6 +98,33 @@ impl fmt::Display for ArtifactSealError {
 }
 
 impl std::error::Error for ArtifactSealError {}
+
+/// How much a present artifact's seal can distinguish.
+///
+/// This is a property of the observation, not of the caller: it is read off the
+/// native metadata the platform actually reported for that file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealFidelity {
+    /// The observation carries a device/inode pair and an inode-change instant.
+    ///
+    /// A rewrite in place breaks the seal even when the writer keeps the length
+    /// and restores the modification time afterwards, and a replacement breaks
+    /// it even when the replacement's bytes and timestamps match. Unix reports
+    /// this.
+    InodeChangeTracked,
+    /// The observation carries only presence, length, the creation and
+    /// modification instants, and the read-only bit.
+    ///
+    /// Windows is this platform: `std::fs` reports no device/inode pair and no
+    /// inode-change instant there, so nothing in the seal records that an
+    /// artifact's bytes were rewritten. A same-length rewrite in place that
+    /// restores the modification time is indistinguishable from the sealed
+    /// observation, and so is a replacement that matches every field. The
+    /// residual guarantee is real but narrower: a change in presence, length,
+    /// creation instant, modification instant, or the read-only bit still
+    /// breaks the seal.
+    TimestampsOnly,
+}
 
 /// Native identity of one artifact at a single observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +199,28 @@ impl ArtifactSeal {
     /// Whether the artifact existed as a regular file when it was sealed.
     pub fn is_present(&self) -> bool {
         matches!(self.presence, SealPresence::Present { .. })
+    }
+
+    /// How much this observation can distinguish, or `None` when the artifact
+    /// was absent.
+    ///
+    /// Absence has no weaker form — an absent artifact that reappears always
+    /// breaks the seal — so the question only applies to a present one.
+    pub fn fidelity(&self) -> Option<SealFidelity> {
+        match self.presence {
+            SealPresence::Absent => None,
+            SealPresence::Present {
+                inode,
+                inode_change_nanos,
+                ..
+            } => Some(
+                if inode != 0 && inode_change_nanos != TIMESTAMP_UNAVAILABLE {
+                    SealFidelity::InodeChangeTracked
+                } else {
+                    SealFidelity::TimestampsOnly
+                },
+            ),
+        }
     }
 
     /// Observe every artifact in order, or report the first that cannot be
@@ -252,6 +324,12 @@ where
     /// describe a state the validation actually observed end to end.
     ///
     /// A failed validation removes any receipt for `key` and is never cached.
+    ///
+    /// "Still holds" means what [`SealFidelity`] says it means on this
+    /// platform. Where the observation is
+    /// [`SealFidelity::TimestampsOnly`] — Windows — a same-length in-place
+    /// rewrite that restores the modification time still satisfies the seal and
+    /// is answered from the receipt.
     pub fn validate_sealed<E>(
         &self,
         key: K,
@@ -376,6 +454,45 @@ mod tests {
         }
     }
 
+    /// The declared fidelity has to match the platform the build is for.
+    ///
+    /// This is the statement the two detection tests below branch on. Pinning
+    /// it separately keeps the pair honest: over-claiming
+    /// [`SealFidelity::InodeChangeTracked`] on a platform that cannot deliver
+    /// it would otherwise only surface as a silent receipt reuse of corrupted
+    /// bytes.
+    #[test]
+    fn a_present_artifact_reports_the_fidelity_its_platform_actually_provides() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let artifact = dir.path().join("shard.sqlite3");
+        write(&artifact, "generation-a");
+        let fidelity = ArtifactSeal::observe(&artifact)
+            .expect("seal the artifact")
+            .fidelity();
+
+        #[cfg(unix)]
+        assert_eq!(
+            fidelity,
+            Some(SealFidelity::InodeChangeTracked),
+            "Unix reports a device/inode pair and an inode-change instant"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            fidelity,
+            Some(SealFidelity::TimestampsOnly),
+            "Windows `std::fs` reports no device/inode pair and no inode-change instant; \
+             claiming otherwise would let a corrupted generation answer from its receipt"
+        );
+
+        assert_eq!(
+            ArtifactSeal::observe(&dir.path().join("absent.sqlite3"))
+                .expect("seal an absent artifact")
+                .fidelity(),
+            None,
+            "absence has no weaker form"
+        );
+    }
+
     #[test]
     fn an_unchanged_artifact_is_validated_once_and_reused() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -408,13 +525,26 @@ mod tests {
         );
     }
 
+    /// The seal's strength against a deliberate in-place rewrite, stated
+    /// exactly as far as the platform can carry it.
+    ///
+    /// This test used to assert detection unconditionally. It runs only where
+    /// `codestory-contracts` tests run — Linux and macOS — so the assertion was
+    /// never contradicted, while the same code on Windows answers the rewritten
+    /// artifact from the earlier receipt. Both outcomes are pinned here against
+    /// the fidelity the observation itself reports, so neither platform's
+    /// behaviour can drift and neither can be claimed for the other.
     #[test]
-    fn in_place_corruption_that_restores_the_modification_time_still_breaks_the_seal() {
+    fn an_in_place_rewrite_that_restores_the_modification_time_is_detected_only_at_full_fidelity() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let artifact = dir.path().join("shard.sqlite3");
         write(&artifact, "generation-a");
         let pinned_modified = 1_700_000_000_000_000_000;
         set_modified(&artifact, pinned_modified);
+        let fidelity = ArtifactSeal::observe(&artifact)
+            .expect("seal the artifact")
+            .fidelity()
+            .expect("a present artifact reports its fidelity");
         let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
         let validator = CountingValidator::new();
         let artifacts = vec![artifact.clone()];
@@ -433,29 +563,73 @@ mod tests {
             .validate_sealed(artifact.clone(), &artifacts, || validator.ok("damaged"))
             .expect("re-validate after in-place corruption");
 
-        assert_eq!(
-            after, "damaged",
-            "corrupted bytes must not be answered from the earlier receipt"
-        );
-        assert_eq!(validator.runs.get(), 2);
-        assert_eq!(
-            cache.stats(&artifact),
-            Some(ReceiptStats {
-                validations: 2,
-                reuses: 0,
-                invalidations: 1,
-            })
-        );
+        match fidelity {
+            SealFidelity::InodeChangeTracked => {
+                assert_eq!(
+                    after, "damaged",
+                    "corrupted bytes must not be answered from the earlier receipt"
+                );
+                assert_eq!(validator.runs.get(), 2);
+                assert_eq!(
+                    cache.stats(&artifact),
+                    Some(ReceiptStats {
+                        validations: 2,
+                        reuses: 0,
+                        invalidations: 1,
+                    })
+                );
+            }
+            SealFidelity::TimestampsOnly => {
+                // The stated limit, asserted rather than assumed: nothing in
+                // the observation changed, so the receipt answers for bytes it
+                // never read.
+                assert_eq!(
+                    after, "healthy",
+                    "a timestamps-only seal cannot see a same-length rewrite"
+                );
+                assert_eq!(validator.runs.get(), 1);
+                assert_eq!(
+                    cache.stats(&artifact),
+                    Some(ReceiptStats {
+                        validations: 1,
+                        reuses: 1,
+                        invalidations: 0,
+                    })
+                );
+
+                // What the platform does still guarantee: a rewrite that
+                // changes the length breaks the seal.
+                write(&artifact, "generation-X-longer");
+                set_modified(&artifact, pinned_modified);
+                cache
+                    .validate_sealed(artifact.clone(), &artifacts, || validator.ok("resized"))
+                    .expect("re-validate after a length change");
+                assert_eq!(validator.runs.get(), 2);
+            }
+        }
     }
 
+    /// Replacement detection, stated exactly as far as the platform can carry
+    /// it.
+    ///
+    /// A timestamps-only observation carries no file identity, so whether a
+    /// byte-identical replacement is noticed there depends on whether the new
+    /// file happens to inherit the old creation instant — which on NTFS it
+    /// sometimes does. The contract therefore claims nothing about that case
+    /// on such a platform, and this test claims nothing either; it pins the
+    /// residual guarantee instead.
     #[test]
-    fn replacing_the_artifact_with_identical_bytes_breaks_the_seal() {
+    fn replacing_the_artifact_with_identical_bytes_is_detected_only_at_full_fidelity() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let artifact = dir.path().join("shard.sqlite3");
         let replacement = dir.path().join("shard.sqlite3.new");
         write(&artifact, "generation-a");
         let pinned_modified = 1_700_000_000_000_000_000;
         set_modified(&artifact, pinned_modified);
+        let fidelity = ArtifactSeal::observe(&artifact)
+            .expect("seal the artifact")
+            .fidelity()
+            .expect("a present artifact reports its fidelity");
         let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
         let validator = CountingValidator::new();
         let artifacts = vec![artifact.clone()];
@@ -472,11 +646,29 @@ mod tests {
             .validate_sealed(artifact.clone(), &artifacts, || validator.ok("rebuilt"))
             .expect("re-validate after replacement");
 
-        assert_eq!(
-            validator.runs.get(),
-            2,
-            "a replaced file is a different artifact even when its bytes match"
-        );
+        match fidelity {
+            SealFidelity::InodeChangeTracked => assert_eq!(
+                validator.runs.get(),
+                2,
+                "a replaced file is a different artifact even when its bytes match"
+            ),
+            SealFidelity::TimestampsOnly => {
+                // The residual guarantee: a replacement that does not restore
+                // the modification time is still refused.
+                let runs_after_identical_replacement = validator.runs.get();
+                write(&replacement, "generation-a");
+                set_modified(&replacement, pinned_modified + 1);
+                std::fs::rename(&replacement, &artifact).expect("replace artifact again");
+                cache
+                    .validate_sealed(artifact.clone(), &artifacts, || validator.ok("rebuilt"))
+                    .expect("re-validate after a retimed replacement");
+                assert_eq!(
+                    validator.runs.get(),
+                    runs_after_identical_replacement + 1,
+                    "a timestamps-only seal must still refuse a replacement it can see"
+                );
+            }
+        }
     }
 
     #[test]
