@@ -47,16 +47,28 @@ struct SnapshotCase {
     tictactoe_golden: &'static str,
 }
 
-const CASES: &[SnapshotCase] = &[SnapshotCase {
-    language: "kotlin",
-    extension: "kt",
-    fidelity_filename: "fidelity.kt",
-    fidelity_source: include_str!("fixtures/fidelity_lab/kotlin_fidelity_lab.kt"),
-    fidelity_golden: include_str!("fixtures/language_snapshots/kotlin_fidelity.txt"),
-    tictactoe_filename: "game.kt",
-    tictactoe_source: include_str!("fixtures/tictactoe/kotlin_tictactoe.kt"),
-    tictactoe_golden: include_str!("fixtures/language_snapshots/kotlin_tictactoe.txt"),
-}];
+const CASES: &[SnapshotCase] = &[
+    SnapshotCase {
+        language: "kotlin",
+        extension: "kt",
+        fidelity_filename: "fidelity.kt",
+        fidelity_source: include_str!("fixtures/fidelity_lab/kotlin_fidelity_lab.kt"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/kotlin_fidelity.txt"),
+        tictactoe_filename: "game.kt",
+        tictactoe_source: include_str!("fixtures/tictactoe/kotlin_tictactoe.kt"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/kotlin_tictactoe.txt"),
+    },
+    SnapshotCase {
+        language: "bash",
+        extension: "sh",
+        fidelity_filename: "fidelity.sh",
+        fidelity_source: include_str!("fixtures/fidelity_lab/bash_fidelity_lab.sh"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/bash_fidelity.txt"),
+        tictactoe_filename: "game.sh",
+        tictactoe_source: include_str!("fixtures/tictactoe/bash_tictactoe.sh"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/bash_tictactoe.txt"),
+    },
+];
 
 #[test]
 fn moved_language_rules_keep_the_fidelity_lab_projection_byte_identical() -> Result<()> {

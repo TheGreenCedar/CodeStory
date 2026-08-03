@@ -1,0 +1,28 @@
+node FILE name=<ROOT>/fidelity.sh qn=<ROOT>/fidelity.sh canonical=<ROOT>/fidelity.sh:<ROOT>/fidelity.sh:1 line=1 col=1 end=29:0 file=FILE:<ROOT>/fidelity.sh@1
+node FUNCTION name=decorate qn=decorate canonical=<ROOT>/fidelity.sh:decorate#0 line=13 col=1 end=16:2 file=FILE:<ROOT>/fidelity.sh@1
+node FUNCTION name=notify qn=notify canonical=<ROOT>/fidelity.sh:notify#0 line=3 col=1 end=6:2 file=FILE:<ROOT>/fidelity.sh@1
+node FUNCTION name=orchestrate_bash qn=orchestrate_bash canonical=<ROOT>/fidelity.sh:orchestrate_bash#0 line=25 col=1 end=27:2 file=FILE:<ROOT>/fidelity.sh@1
+node FUNCTION name=run qn=run canonical=<ROOT>/fidelity.sh:run#0 line=18 col=1 end=23:2 file=FILE:<ROOT>/fidelity.sh@1
+node FUNCTION name=save qn=save canonical=<ROOT>/fidelity.sh:save#0 line=8 col=1 end=11:2 file=FILE:<ROOT>/fidelity.sh@1
+node MODULE name=./logger.sh qn=./logger.sh canonical=<ROOT>/fidelity.sh:./logger.sh#0 line=1 col=8 end=1:19 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.sh:decorate#1 line=22 col=3 end=22:11 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.sh:notify#1 line=20 col=3 end=20:9 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=orchestrate_bash qn=orchestrate_bash canonical=<ROOT>/fidelity.sh:orchestrate_bash#1 line=29 col=1 end=29:17 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=printf qn=printf canonical=<ROOT>/fidelity.sh:printf#0 line=5 col=3 end=5:9 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=printf qn=printf canonical=<ROOT>/fidelity.sh:printf#1 line=10 col=3 end=10:9 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=printf qn=printf canonical=<ROOT>/fidelity.sh:printf#2 line=15 col=3 end=15:9 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.sh:run#1 line=26 col=3 end=26:6 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.sh:save#1 line=21 col=3 end=21:7 file=FILE:<ROOT>/fidelity.sh@1
+node UNKNOWN name=source qn=source canonical=<ROOT>/fidelity.sh:source#0 line=1 col=1 end=1:7 file=FILE:<ROOT>/fidelity.sh@1
+node VARIABLE name=event qn=event canonical=<ROOT>/fidelity.sh:event#0 line=4 col=3 end=4:13 file=FILE:<ROOT>/fidelity.sh@1
+node VARIABLE name=event qn=event canonical=<ROOT>/fidelity.sh:event#1 line=9 col=3 end=9:13 file=FILE:<ROOT>/fidelity.sh@1
+node VARIABLE name=event qn=event canonical=<ROOT>/fidelity.sh:event#2 line=14 col=3 end=14:13 file=FILE:<ROOT>/fidelity.sh@1
+node VARIABLE name=event qn=event canonical=<ROOT>/fidelity.sh:event#3 line=19 col=3 end=19:13 file=FILE:<ROOT>/fidelity.sh@1
+edge CALL src=FUNCTION:decorate@13 dst=UNKNOWN:printf@15 resolved_src=FUNCTION:decorate@13 resolved_dst=- line=15 confidence=- certainty=- callsite=h0:15:1:h1 candidates=[]
+edge CALL src=FUNCTION:notify@3 dst=UNKNOWN:printf@5 resolved_src=FUNCTION:notify@3 resolved_dst=- line=5 confidence=- certainty=- callsite=h0:5:1:h2 candidates=[]
+edge CALL src=FUNCTION:orchestrate_bash@25 dst=UNKNOWN:run@26 resolved_src=FUNCTION:orchestrate_bash@25 resolved_dst=FUNCTION:run@18 line=26 confidence=0.9500 certainty=Certain callsite=h0:26:1:h3 candidates=[]
+edge CALL src=FUNCTION:run@18 dst=UNKNOWN:decorate@22 resolved_src=FUNCTION:run@18 resolved_dst=FUNCTION:decorate@13 line=22 confidence=0.9500 certainty=Certain callsite=h0:22:1:h4 candidates=[]
+edge CALL src=FUNCTION:run@18 dst=UNKNOWN:notify@20 resolved_src=FUNCTION:run@18 resolved_dst=FUNCTION:notify@3 line=20 confidence=0.9500 certainty=Certain callsite=h0:20:1:h5 candidates=[]
+edge CALL src=FUNCTION:run@18 dst=UNKNOWN:save@21 resolved_src=FUNCTION:run@18 resolved_dst=FUNCTION:save@8 line=21 confidence=0.9500 certainty=Certain callsite=h0:21:1:h6 candidates=[]
+edge CALL src=FUNCTION:save@8 dst=UNKNOWN:printf@10 resolved_src=FUNCTION:save@8 resolved_dst=- line=10 confidence=- certainty=- callsite=h0:10:1:h7 candidates=[]
+edge IMPORT src=MODULE:./logger.sh@1 dst=MODULE:./logger.sh@1 resolved_src=MODULE:./logger.sh@1 resolved_dst=- line=1 confidence=- certainty=- callsite=- candidates=[]

@@ -416,9 +416,6 @@ fn dedicated_semantic_resolver(language: &str) -> Option<SemanticResolverKind> {
         "dart" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
             "dart",
         ))),
-        "bash" => Some(SemanticResolverKind::Generic(GenericSemanticResolver::new(
-            "bash",
-        ))),
         _ => None,
     }
 }
@@ -602,7 +599,6 @@ fn language_family_bucket(language: &'static str) -> &'static str {
         "csharp" => "csharp",
         "swift" => "swift",
         "dart" => "dart",
-        "bash" => "bash",
         language if is_structural_language_name(language) => "structural",
         _ => language,
     }

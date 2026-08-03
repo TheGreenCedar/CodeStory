@@ -144,7 +144,6 @@ const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
 const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
 const DART_GRAPH_QUERY: &str = include_str!("../rules/dart.scm");
-const BASH_GRAPH_QUERY: &str = include_str!("../rules/bash.scm");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageRuleset {
@@ -339,9 +338,12 @@ impl LanguageRuleset {
             LanguageRuleset::Dart => {
                 compiled_rules_cache(language, DART_GRAPH_QUERY, None, &DART_RULES)
             }
-            LanguageRuleset::Bash => {
-                compiled_rules_cache(language, BASH_GRAPH_QUERY, None, &BASH_RULES)
-            }
+            // Answered by the registry above; the arm only exists because the
+            // match must stay exhaustive. Failing closed here rather than
+            // panicking keeps a future registry mistake a typed indexing error.
+            LanguageRuleset::Bash => Err(anyhow!(
+                "bash compiled rules are owned by the language registry"
+            )),
         }
     }
 }
@@ -386,7 +388,6 @@ static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::ne
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static DART_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static BASH_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
     let role_priority = canonical_role_priority(definition.canonical_role);
@@ -25757,8 +25758,19 @@ class Test {
         let dart = get_language_for_ext("dart").expect("dart config");
         assert_eq!(dart.graph_query, DART_GRAPH_QUERY);
 
+        // Bash moved into `languages::bash`; the config it hands back must
+        // still come back through the same extension lookup.
         let bash = get_language_for_ext("sh").expect("bash config");
-        assert_eq!(bash.graph_query, BASH_GRAPH_QUERY);
+        assert_eq!(bash.language_name, "bash");
+        assert_eq!(
+            bash.graph_query,
+            languages::extraction_for_ext("sh")
+                .expect("bash registry row")
+                .graph_query
+        );
+        assert!(bash.tags_query.is_none());
+        let bash_extension = get_language_for_ext("bash").expect("bash extension config");
+        assert_eq!(bash_extension.graph_query, bash.graph_query);
     }
 
     #[test]

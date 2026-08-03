@@ -3940,7 +3940,7 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     // extraction package has not landed yet (ARCH-012 roster burn-down).
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
-            "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
+            "python" | "ruby" | "toml" | "yaml" => Some("#"),
             "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
             | "cpp" | "dart" | "php" | "swift" => Some("//"),
             _ => None,
