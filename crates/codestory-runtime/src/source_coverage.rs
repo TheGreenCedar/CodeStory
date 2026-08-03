@@ -70,13 +70,18 @@ pub(crate) fn observe_source_coverage(
 
     // Resolved once, not per requested path: the comparison is by path identity
     // rather than by string, so each side has to be made absolute first.
-    let excluded: Vec<(PathBuf, u64, u64)> = exclusions
+    // The sizes are carried only for a byte-bound exclusion. A structural
+    // source refused for its *unit* count has `observed_size <= byte_cap`, so
+    // rendering "N bytes exceeds the M byte cap" for it would state something
+    // false about a file the index did read. Those rows get the plain sentence.
+    let excluded: Vec<(PathBuf, Option<(u64, u64)>)> = exclusions
         .iter()
         .map(|record| {
+            let byte_bound =
+                record.observed_size > record.byte_cap && record.observed_unit_count == 0;
             (
                 project_root.join(&record.normalized_path),
-                record.observed_size,
-                record.byte_cap,
+                byte_bound.then_some((record.observed_size, record.byte_cap)),
             )
         })
         .collect();
@@ -87,15 +92,15 @@ pub(crate) fn observe_source_coverage(
             let absolute = absolute_against(&project_root, path);
             match excluded
                 .iter()
-                .find(|(excluded_path, _, _)| same_workspace_path(excluded_path, &absolute))
+                .find(|(excluded_path, _)| same_workspace_path(excluded_path, &absolute))
             {
-                Some((_, observed_size, byte_cap)) => SourceCoverageObservationDto {
+                Some((_, sizes)) => SourceCoverageObservationDto {
                     path: path.clone(),
                     status: SourceCoverageStatusDto::PolicyExcluded,
                     reason: None,
                     not_established_cause: None,
-                    observed_size: Some(*observed_size),
-                    byte_cap: Some(*byte_cap),
+                    observed_size: sizes.map(|(observed_size, _)| observed_size),
+                    byte_cap: sizes.map(|(_, byte_cap)| byte_cap),
                 },
                 None => match incomplete
                     .iter()

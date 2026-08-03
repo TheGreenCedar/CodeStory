@@ -189,6 +189,25 @@ mod tests {
         assert!(input.gaps()[0].contains("lookup_unavailable"));
     }
 
+    /// A structural source refused for its *unit* count has
+    /// `observed_size <= byte_cap`, so a byte-overrun sentence would state
+    /// something false about a file the index did read. The producer withholds
+    /// the sizes for those rows; this pins that the renderer then says nothing
+    /// numeric rather than something wrong.
+    #[test]
+    fn a_gap_without_sizes_makes_no_claim_about_bytes() {
+        let input = PacketCoverageInput::from_observations(&[observation(
+            "db/structure.sql",
+            SourceCoverageStatusDto::PolicyExcluded,
+        )]);
+        let gap = &input.gaps()[0];
+        assert!(gap.contains("db/structure.sql"), "{gap}");
+        assert!(
+            !gap.contains("bytes exceeds"),
+            "a unit-bound exclusion must not claim a byte overrun: {gap}"
+        );
+    }
+
     #[test]
     fn an_exclusion_gap_names_the_size_and_the_cap() {
         let mut observation = observation("data/big.json", SourceCoverageStatusDto::PolicyExcluded);

@@ -525,6 +525,15 @@ pub(crate) fn agent_packet(
         answer
             .citations
             .iter()
+            // Only citations that could carry a proof-bearing claim. A citation
+            // minted `eligible_for_sufficiency: false` — the SQL-schema and
+            // generic-shape appenders mint several — cannot make a packet
+            // Sufficient, so letting it cap would degrade ordinary answers for
+            // evidence they never rested on. Route B, the hole this closes, is
+            // eligible by construction.
+            .filter(|citation| {
+                crate::agent::packet_evidence::citation_sufficiency_eligible(citation)
+            })
             .filter_map(|citation| citation.file_path.clone()),
     );
     answer.source_coverage =
