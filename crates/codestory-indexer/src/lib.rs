@@ -4260,11 +4260,48 @@ fn access_kind_from_graph_access(value: &str) -> Option<AccessKind> {
     }
 }
 
-fn source_line(source: &str, line: u32) -> Option<&str> {
-    if line == 0 {
-        return None;
+/// Byte offsets of each line start, built once per file.
+///
+/// `source.lines().nth(n)` walks from byte zero on every call, and
+/// `infer_access_from_source` calls it up to twice for every graph node — so
+/// the cost was O(nodes x bytes) and measured at 66% of a 2 MB Rust index and
+/// 36% of TypeScript (#1820). The offsets make each lookup O(line length).
+///
+/// The boundaries must match `str::lines()` exactly, because these lines feed
+/// visibility classification and therefore the projected access of every
+/// member. `lines()` splits on `\n`, strips one trailing `\r`, and does not
+/// yield a final empty line for a source that ends in a newline.
+struct LineOffsets {
+    starts: Vec<usize>,
+}
+
+impl LineOffsets {
+    fn new(source: &str) -> Self {
+        let bytes = source.as_bytes();
+        let mut starts =
+            Vec::with_capacity(bytes.iter().filter(|byte| **byte == b'\n').count() + 1);
+        starts.push(0);
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                starts.push(index + 1);
+            }
+        }
+        // A trailing newline opens no line: `"a\n".lines()` yields just `"a"`.
+        if starts.last() == Some(&bytes.len()) {
+            starts.pop();
+        }
+        Self { starts }
     }
-    source.lines().nth((line - 1) as usize)
+
+    /// The 1-based `line`, with its terminator stripped, or `None` past the end.
+    fn line<'a>(&self, source: &'a str, line: u32) -> Option<&'a str> {
+        let start = *self.starts.get(line.checked_sub(1)? as usize)?;
+        let end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |offset| start + offset);
+        let text = &source[start..end];
+        Some(text.strip_suffix('\r').unwrap_or(text))
+    }
 }
 
 fn classify_keyword_access(text: &str) -> Option<AccessKind> {
@@ -5316,15 +5353,38 @@ fn apply_rust_receiver_call_hints(
         return;
     }
 
-    for hint in hints {
-        for node in unique_nodes.values_mut() {
-            if node.kind == NodeKind::UNKNOWN
-                && node.serialized_name == hint.method_name
-                && node.start_line == Some(hint.start_line)
-                && node.start_col == Some(hint.start_col)
-            {
-                node.serialized_name = hint.qualified_method_name.clone();
-                node.qualified_name = Some(hint.qualified_method_name.clone());
+    // Both operands grow with file size, so the original nested scan was
+    // O(hints x nodes) and measured at 20% of a 2 MB Rust index (#1820).
+    // Indexing the unresolved nodes by call site makes it O(hints + nodes).
+    let mut unresolved_by_site: HashMap<(&str, u32, u32), Vec<NodeId>> = HashMap::new();
+    for (id, node) in unique_nodes.iter() {
+        if node.kind != NodeKind::UNKNOWN {
+            continue;
+        }
+        let (Some(start_line), Some(start_col)) = (node.start_line, node.start_col) else {
+            continue;
+        };
+        unresolved_by_site
+            .entry((node.serialized_name.as_str(), start_line, start_col))
+            .or_default()
+            .push(*id);
+    }
+    let matched = hints
+        .iter()
+        .filter_map(|hint| {
+            let key = (hint.method_name.as_str(), hint.start_line, hint.start_col);
+            // Taken, not read: once a site is rewritten its nodes carry the
+            // qualified name and can no longer match this key, which is what
+            // the sequential scan did by re-reading `serialized_name`.
+            unresolved_by_site.remove(&key).map(|ids| (hint, ids))
+        })
+        .map(|(hint, ids)| (hint.qualified_method_name.clone(), ids))
+        .collect::<Vec<_>>();
+    for (qualified_method_name, ids) in matched {
+        for id in ids {
+            if let Some(node) = unique_nodes.get_mut(&id) {
+                node.serialized_name = qualified_method_name.clone();
+                node.qualified_name = Some(qualified_method_name.clone());
             }
         }
     }
@@ -8443,6 +8503,7 @@ fn infer_access_from_source(
     language_name: &str,
     tree: &Tree,
     source: &str,
+    lines: &LineOffsets,
     start_line: u32,
     kind: NodeKind,
 ) -> Option<AccessKind> {
@@ -8457,7 +8518,7 @@ fn infer_access_from_source(
         return None;
     }
 
-    if let Some(line_text) = source_line(source, start_line) {
+    if let Some(line_text) = lines.line(source, start_line) {
         let access = match language_name {
             "rust" => classify_rust_visibility(line_text),
             _ => classify_keyword_access(line_text),
@@ -8468,7 +8529,7 @@ fn infer_access_from_source(
     }
     if let Some(prev_line) = start_line
         .checked_sub(1)
-        .and_then(|line| source_line(source, line))
+        .and_then(|line| lines.line(source, line))
     {
         let access = match language_name {
             "rust" => classify_rust_visibility(prev_line),
@@ -13376,6 +13437,7 @@ pub fn index_file(
 
     // 1. First pass: Create nodes and a temporary mapping from GraphNodeId -> OurNodeId
     let mut graph_to_node_id = HashMap::new();
+    let line_offsets = LineOffsets::new(source);
     let mut unique_nodes: HashMap<NodeId, Node> = HashMap::new();
     let mut component_access_by_node_id: HashMap<NodeId, AccessKind> = HashMap::new();
     let mut canonical_role_by_node_id = HashMap::<NodeId, CanonicalNodeRole>::new();
@@ -13534,6 +13596,7 @@ pub fn index_file(
                     language_config.language_name,
                     &tree,
                     source,
+                    &line_offsets,
                     start_line,
                     kind,
                 )
