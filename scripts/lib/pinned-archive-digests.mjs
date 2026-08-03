@@ -34,7 +34,25 @@ export function parsePublishedArchiveDigests(source, version) {
   );
 }
 
-export function requirePinnedArchiveDigest(pin, target, observedDigest) {
+/// The only lane whose pin can lawfully carry archive digests.
+export const SOURCE_PIN_LANE = "plugin";
+
+/// Hold a provisioned archive against the digest the SOURCE PIN carries.
+///
+/// The plugin fast lane pins an ALREADY PUBLISHED CLI, so its `cli-version.json` names archives
+/// that exist and `bump-version.mjs` fills them in. The native lane's pin names the release that
+/// is about to be built from the very tree holding the pin, so `bump-version.mjs` deletes
+/// `archives` there by design. Running this assertion on a native pin is not a stricter check, it
+/// is a check that can only fail -- which is why `lane` is required with no default: a caller that
+/// forgets to say which lane it is cannot silently fall into the plugin one.
+export function requirePinnedArchiveDigest({ pin, target, observedDigest, lane }) {
+  if (lane !== SOURCE_PIN_LANE) {
+    throw new Error(
+      `only the ${SOURCE_PIN_LANE} lane may assert a source-pinned archive digest, not ` +
+        `${JSON.stringify(lane)}: a lawful native pin carries none, and the native lane's archive ` +
+        `digests are owned by the release manifest`,
+    );
+  }
   const pinnedDigest = pin?.archives?.[target];
   if (typeof pinnedDigest !== "string" || !SHA256.test(pinnedDigest)) {
     throw new Error(`CLI pin has no valid ${target} archive digest`);

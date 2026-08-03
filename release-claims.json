@@ -1518,7 +1518,16 @@
           "installer": "codex_marketplace_deferred_fixture",
           "live_catalog_revision": false
         }
-      ]
+      ],
+      "recovery": {
+        "id": "recovered",
+        "previous_pin_outputs": [
+          "previous_marketplace_revision",
+          "previous_plugin_sha",
+          "previous_plugin_version"
+        ],
+        "automatic_restore": false
+      }
     },
     "lost_runner_rerun": {
       "workflow": "lost-runner-rerun.yml",

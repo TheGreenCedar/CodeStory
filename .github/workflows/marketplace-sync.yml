@@ -97,6 +97,7 @@ jobs:
           repositories: AgentPluginMarketplace
 
       - name: Point the catalog at the published release
+        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -107,4 +108,28 @@ jobs:
           node .github/scripts/publish-marketplace-catalog.mjs \
             --source-repository "$GITHUB_WORKSPACE" \
             --commit "$INPUT_COMMIT" \
-            --version "$INPUT_VERSION"
+            --version "$INPUT_VERSION" \
+            --github-output "$GITHUB_OUTPUT"
+
+      # A catalog moved by this workflow is not a catalog moved by the release that published the
+      # plugin, and the two must stay distinguishable: the release lane's own runs record published
+      # or deferred, and this one records recovered. The pin it replaced travels with it, so the
+      # operator who ran a recovery can undo that recovery the same way.
+      - name: Record catalog recovery identity
+        shell: bash
+        env:
+          CATALOG_DELIVERY: recovered
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_VERSION: ${{ inputs.version }}
+          MARKETPLACE_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
+          PREVIOUS_REVISION: ${{ steps.publish.outputs.previous_marketplace_revision }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$MARKETPLACE_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Catalog recovery must resolve an immutable catalog revision."
+            exit 1
+          fi
+          echo "Catalog delivery state: $CATALOG_DELIVERY (codestory $INPUT_VERSION at $INPUT_COMMIT, catalog $MARKETPLACE_REVISION)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Rollback target: codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $PREVIOUS_REVISION)." >> "$GITHUB_STEP_SUMMARY"

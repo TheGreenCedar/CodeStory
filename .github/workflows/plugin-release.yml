@@ -157,9 +157,11 @@ jobs:
       # The launcher provisions the pinned, already-published CLI over the real
       # github_release path, which is the one place the pin's content addressing
       # is enforced. A digest drift between the pin and the published archive
-      # fails here, before anything is tagged.
+      # fails here, before anything is tagged. The lane is stated rather than
+      # defaulted: this lane owns the source pin, and the native lane -- whose pin
+      # lawfully carries no archive digests -- must never run that assertion.
       - name: Provision the pinned CLI end to end
-        run: node scripts/prove-plugin-pinned-provision.mjs --timeout-ms 1200000
+        run: node scripts/prove-plugin-pinned-provision.mjs --lane plugin --timeout-ms 1200000
 
   publish:
     needs: [preflight, plugin-proof]
@@ -206,6 +208,11 @@ jobs:
     outputs:
       catalog_published: ${{ steps.delivery.outputs.catalog_published }}
       marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
+      # What the catalog served before this run moved it. A catalog move with no recorded
+      # predecessor is a move nobody can undo, so the rollback target travels with the state.
+      previous_marketplace_revision: ${{ steps.delivery.outputs.previous_marketplace_revision }}
+      previous_plugin_sha: ${{ steps.delivery.outputs.previous_plugin_sha }}
+      previous_plugin_version: ${{ steps.delivery.outputs.previous_plugin_version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -245,6 +252,9 @@ jobs:
           TOKEN_OUTCOME: ${{ steps.token.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PREVIOUS_REVISION: ${{ steps.publish.outputs.previous_marketplace_revision }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
           RECOVERY_WORKFLOW: marketplace-sync.yml
         run: |
           set -euo pipefail
@@ -256,10 +266,19 @@ jobs:
             catalog_published=true
             marketplace_revision="$PUBLISHED_REVISION"
           fi
-          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
-          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          # The rollback target is recorded whatever happened. On a published run it names the
+          # release a restore would return to; on a deferred run it names the release the catalog
+          # is still serving.
+          {
+            echo "catalog_published=$catalog_published"
+            echo "marketplace_revision=$marketplace_revision"
+            echo "previous_marketplace_revision=$PREVIOUS_REVISION"
+            echo "previous_plugin_sha=$PREVIOUS_PLUGIN_SHA"
+            echo "previous_plugin_version=$PREVIOUS_PLUGIN_VERSION"
+          } >> "$GITHUB_OUTPUT"
           if [ "$catalog_published" = "true" ]; then
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            echo "Rollback target: codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $PREVIOUS_REVISION), restorable with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a

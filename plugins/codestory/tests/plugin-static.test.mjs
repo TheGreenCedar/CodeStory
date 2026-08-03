@@ -12,6 +12,12 @@ import { once } from "node:events";
 import { deflateRawSync, gunzipSync, gzipSync } from "node:zlib";
 import { PassThrough, Writable } from "node:stream";
 import { EventEmitter } from "node:events";
+import {
+  RELEASE_MANIFEST_ASSET,
+  RELEASE_MANIFEST_DOMAIN,
+  RELEASE_MANIFEST_SCHEMA_VERSION,
+  buildReleaseManifest,
+} from "../../../scripts/lib/release-manifest.mjs";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
@@ -455,6 +461,7 @@ function managedReleaseManifest(version, executablePath, sha256) {
     archive: archiveName,
     archive_url: `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}/${archiveName}`,
     archive_sha256: "0".repeat(64),
+    archive_bytes: 4096,
     target,
     stdio_initialize_verified: true,
   };
@@ -4704,6 +4711,248 @@ test("managed cli quarantines corrupt installs, retains two, and fails closed on
       /managed_cli_quarantine_failed:EPERM/u,
     );
     await access(lockedDir);
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+// The plugin ships without scripts/, so the launcher carries its own copy of the release-manifest
+// schema. Two copies of a contract drift, so the shipped one is held against the generator's.
+function releaseManifestFixture(version, target, archiveName, archiveBytes, archiveSha256) {
+  const filler = (filename) => ({ filename, bytes: 1024, sha256: "e".repeat(64) });
+  const archives = {
+    "macos-arm64": filler(`codestory-cli-v${version}-macos-arm64.tar.gz`),
+    "linux-x64": filler(`codestory-cli-v${version}-linux-x64.tar.gz`),
+    "windows-x64": filler(`codestory-cli-v${version}-windows-x64.zip`),
+  };
+  archives[target] = { filename: archiveName, bytes: archiveBytes, sha256: archiveSha256 };
+  return buildReleaseManifest({
+    version,
+    tag: `v${version}`,
+    commit: "a".repeat(40),
+    archives,
+  });
+}
+
+function releaseFixtureTarget(version) {
+  const { archiveName } = releaseAssetForPlatform(version);
+  return {
+    archiveName,
+    target: archiveName
+      .slice(`codestory-cli-v${version}-`.length)
+      .replace(/\.(?:zip|tar\.gz)$/u, ""),
+  };
+}
+
+async function writeReleaseManifestFile(releaseDir, manifest) {
+  await writeFile(
+    join(releaseDir, RELEASE_MANIFEST_ASSET),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+test("the launcher's release-manifest schema matches the generator's", async () => {
+  const version = await readPluginVersion();
+  const { archiveName, target } = releaseFixtureTarget(version);
+  assert.equal(launcherTest.RELEASE_MANIFEST_ASSET, RELEASE_MANIFEST_ASSET);
+  assert.equal(launcherTest.RELEASE_MANIFEST_DOMAIN, RELEASE_MANIFEST_DOMAIN);
+  assert.equal(launcherTest.RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_MANIFEST_SCHEMA_VERSION);
+  const manifest = releaseManifestFixture(version, target, archiveName, 2048, "b".repeat(64));
+  assert.deepEqual(launcherTest.releaseManifestArchiveEntry(manifest, version, target), {
+    filename: archiveName,
+    bytes: 2048,
+    sha256: "b".repeat(64),
+  });
+  // A manifest that is well formed for a DIFFERENT release describes intact bytes of the wrong
+  // release, which is the substitution the identity binding exists to refuse.
+  assert.throws(
+    () => launcherTest.releaseManifestArchiveEntry(manifest, "0.0.1", target),
+    /release_manifest_invalid:release_identity/u,
+  );
+  for (const [mutate, reason] of [
+    [(m) => ({ ...m, domain: "codestory.something-else" }), /domain/u],
+    [(m) => ({ ...m, schema_version: 2 }), /schema_version/u],
+    [(m) => ({ ...m, commit: "not-a-commit" }), /commit/u],
+    [(m) => ({ ...m, archives: { ...m.archives, [target]: undefined } }), /target/u],
+    [
+      (m) => ({ ...m, archives: { ...m.archives, [target]: { ...m.archives[target], bytes: 0 } } }),
+      /bytes/u,
+    ],
+    [
+      (m) => ({
+        ...m,
+        archives: { ...m.archives, [target]: { ...m.archives[target], sha256: "nope" } },
+      }),
+      /sha256/u,
+    ],
+  ]) {
+    assert.throws(
+      () => launcherTest.releaseManifestArchiveEntry(mutate(manifest), version, target),
+      reason,
+    );
+  }
+});
+
+test("managed provisioning binds the archive to the release manifest before extraction", { timeout: 30000 }, async () => {
+  const version = await readPluginVersion();
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-manifest-bind-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-manifest-release-"));
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const { target } = releaseFixtureTarget(version);
+    const archiveBytes = (await stat(fixture.archivePath)).size;
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+
+    await writeReleaseManifestFile(
+      releaseDir,
+      releaseManifestFixture(version, target, fixture.archiveName, archiveBytes, fixture.archiveSha256),
+    );
+    const warnings = [];
+    const resolved = await launcherTest.provisionManagedCli(dataDir, version, warnings);
+    assert.ok(resolved.path);
+    assert.equal(warnings.includes("managed_cli_publication:release_manifest_bound"), true, warnings.join(","));
+    const published = JSON.parse(
+      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
+    );
+    assert.equal(published.archive_sha256, fixture.archiveSha256);
+    assert.equal(published.archive_bytes, archiveBytes);
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+// Ordering, not just refusal. The archive here is unextractable rubbish whose SHA256SUMS entry is
+// honest, so whichever check runs first names the failure: a manifest mismatch means the binding
+// ran BEFORE extraction, and the matching-manifest control proves the same bytes really do blow up
+// in the extractor, so the first assertion is not passing for some unrelated reason.
+test("a disagreeing release manifest stops provisioning before the archive is extracted", { timeout: 30000 }, async () => {
+  const version = await readPluginVersion();
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-manifest-order-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-manifest-order-release-"));
+  try {
+    const { archiveName, target } = releaseFixtureTarget(version);
+    const rubbish = Buffer.from("this is not an archive\n".repeat(64), "utf8");
+    const archivePath = join(releaseDir, archiveName);
+    await writeFile(archivePath, rubbish);
+    const archiveSha256 = createHash("sha256").update(rubbish).digest("hex");
+    await writeFile(join(releaseDir, "SHA256SUMS.txt"), `${archiveSha256}  ${archiveName}\n`, "utf8");
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+
+    await writeReleaseManifestFile(
+      releaseDir,
+      releaseManifestFixture(version, target, archiveName, rubbish.length, "c".repeat(64)),
+    );
+    await assert.rejects(
+      () => launcherTest.provisionManagedCli(dataDir, version, []),
+      new RegExp(`release_manifest_archive_mismatch:${archiveName.replace(/\./gu, "\\.")}:sha256`, "u"),
+    );
+
+    await writeReleaseManifestFile(
+      releaseDir,
+      releaseManifestFixture(version, target, archiveName, rubbish.length + 1, archiveSha256),
+    );
+    await assert.rejects(
+      () => launcherTest.provisionManagedCli(dataDir, version, []),
+      new RegExp(`release_manifest_archive_mismatch:${archiveName.replace(/\./gu, "\\.")}:bytes`, "u"),
+    );
+
+    // Control: with a manifest that agrees, the same bytes reach the extractor and fail there.
+    await writeReleaseManifestFile(
+      releaseDir,
+      releaseManifestFixture(version, target, archiveName, rubbish.length, archiveSha256),
+    );
+    await assert.rejects(
+      () => launcherTest.provisionManagedCli(dataDir, version, []),
+      (error) => {
+        assert.equal(/release_manifest/u.test(error.message), false, error.message);
+        return true;
+      },
+    );
+    assert.equal(fs.existsSync(join(dataDir, "codestory-cli", version)), false);
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+// The manifest is read with the checksum file, before the archive transfer. Proving that costs
+// nothing extra: the release directory here has no archive at all, so whichever fetch runs first
+// names the failure. A release-identity refusal means the manifest was read before the download
+// was attempted; an asset-fetch failure would mean it was not.
+test("a manifest for another release is refused before the archive is downloaded", { timeout: 30000 }, async () => {
+  const version = await readPluginVersion();
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-manifest-early-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-manifest-early-release-"));
+  try {
+    const { archiveName, target } = releaseFixtureTarget(version);
+    await writeFile(join(releaseDir, "SHA256SUMS.txt"), `${"d".repeat(64)}  ${archiveName}\n`, "utf8");
+    // A well-formed manifest, for the wrong release.
+    const other = "9.9.9";
+    const otherName = archiveName.replace(`v${version}`, `v${other}`);
+    await writeReleaseManifestFile(
+      releaseDir,
+      releaseManifestFixture(other, target, otherName, 1024, "d".repeat(64)),
+    );
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+    await assert.rejects(
+      () => launcherTest.provisionManagedCli(dataDir, version, []),
+      /release_manifest_invalid:release_identity/u,
+    );
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+// Releases published before the manifest existed carry none. That is a stated gap in the
+// containment -- recorded as a warning so status and doctor can see it -- and not an agreement.
+test("a release with no manifest provisions with the absence recorded, not assumed away", { timeout: 30000 }, async () => {
+  const version = await readPluginVersion();
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-manifest-absent-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-manifest-absent-release-"));
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+    const warnings = [];
+    const resolved = await launcherTest.provisionManagedCli(dataDir, version, warnings);
+    assert.ok(resolved.path);
+    assert.equal(
+      warnings.some((warning) => warning.startsWith("managed_cli_publication:release_manifest_absent:")),
+      true,
+      warnings.join(","),
+    );
+    assert.equal(warnings.includes("managed_cli_publication:release_manifest_bound"), false);
   } finally {
     if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
     else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;

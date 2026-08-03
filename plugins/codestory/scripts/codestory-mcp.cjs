@@ -169,6 +169,87 @@ function pinnedArchiveSha256(target) {
   return typeof digest === 'string' ? digest.toLowerCase() : null;
 }
 
+// The native lane's archive-digest owner, published beside the archives it describes.
+//
+// A native release's archive digests cannot be pinned in source: the archives are built FROM the
+// source tree that would carry them. The release generates this manifest from the archives it just
+// built, so the digests exist without the circularity. The schema below mirrors
+// scripts/lib/release-manifest.mjs; the plugin ships without that directory, and
+// plugin-static.test.mjs holds the two copies against each other.
+//
+// Containment, not authentication: until the manifest is signed it arrives over the same channel
+// as the archive, so it detects corruption and drift, not a channel that lies consistently.
+const RELEASE_MANIFEST_ASSET = 'codestory-release-manifest.json';
+const RELEASE_MANIFEST_DOMAIN = 'codestory.release-manifest';
+const RELEASE_MANIFEST_SCHEMA_VERSION = 1;
+
+function releaseManifestArchiveEntry(manifest, version, target) {
+  if (!isPlainObject(manifest)) throw new Error('release_manifest_invalid:not_an_object');
+  if (manifest.domain !== RELEASE_MANIFEST_DOMAIN) {
+    throw new Error('release_manifest_invalid:domain');
+  }
+  if (manifest.schema_version !== RELEASE_MANIFEST_SCHEMA_VERSION) {
+    throw new Error('release_manifest_invalid:schema_version');
+  }
+  // A manifest for a different release is a valid manifest for the wrong bytes, which is exactly
+  // the substitution a digest check is supposed to stop.
+  if (manifest.version !== version || manifest.tag !== `v${version}`) {
+    throw new Error('release_manifest_invalid:release_identity');
+  }
+  if (!/^[0-9a-f]{40}$/u.test(String(manifest.commit || ''))) {
+    throw new Error('release_manifest_invalid:commit');
+  }
+  if (!isPlainObject(manifest.archives)) throw new Error('release_manifest_invalid:archives');
+  const entry = manifest.archives[target];
+  if (!isPlainObject(entry)) throw new Error('release_manifest_invalid:target');
+  if (entry.filename !== archiveName(version, target)) {
+    throw new Error('release_manifest_invalid:filename');
+  }
+  if (!Number.isSafeInteger(entry.bytes) || entry.bytes <= 0) {
+    throw new Error('release_manifest_invalid:bytes');
+  }
+  if (!/^[0-9a-f]{64}$/u.test(String(entry.sha256 || ''))) {
+    throw new Error('release_manifest_invalid:sha256');
+  }
+  return entry;
+}
+
+// Fetched with the checksum file, before the archive transfer, so a manifest that is malformed or
+// describes another release stops the provision without paying for a multi-hundred-megabyte
+// download first. A release published before this manifest existed carries none: the absence is
+// recorded as a warning rather than treated as agreement, and the containment for those releases
+// stays what it was -- SHA256SUMS.txt plus the source pin when the pin carries digests.
+async function fetchReleaseManifestEntry(version, target, tempRoot, warnings) {
+  const manifestPath = path.join(tempRoot, RELEASE_MANIFEST_ASSET);
+  try {
+    await fetchReleaseFile(version, RELEASE_MANIFEST_ASSET, manifestPath);
+  } catch (error) {
+    warnings.push(`managed_cli_publication:release_manifest_absent:${managedCliFailureCode(error)}`);
+    return null;
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    throw new Error('release_manifest_invalid:json');
+  }
+  return releaseManifestArchiveEntry(manifest, version, target);
+}
+
+// Held against the downloaded bytes BEFORE extraction, because extraction is the first step that
+// acts on what the release channel supplied.
+function bindArchiveToReleaseManifest(entry, observed, warnings) {
+  if (!entry) return null;
+  if (entry.sha256 !== observed.sha256) {
+    throw new Error(`release_manifest_archive_mismatch:${entry.filename}:sha256`);
+  }
+  if (entry.bytes !== observed.bytes) {
+    throw new Error(`release_manifest_archive_mismatch:${entry.filename}:bytes`);
+  }
+  warnings.push('managed_cli_publication:release_manifest_bound');
+  return entry;
+}
+
 function pluginCacheVersion() {
   const parent = path.basename(path.dirname(pluginRoot)).toLowerCase();
   return parent === 'codestory' ? path.basename(pluginRoot) : null;
@@ -329,12 +410,18 @@ function expectedArchiveHash(sumsText, name) {
   throw new Error(`SHA256SUMS.txt did not contain ${name}`);
 }
 
+// The checksum file and the release manifest are both small metadata documents; only the archive
+// gets the archive-sized ceiling and the archive-sized clock.
+function releaseMetadataFile(name) {
+  return name === 'SHA256SUMS.txt' || name === RELEASE_MANIFEST_ASSET;
+}
+
 function releaseFileMaxBytes(name) {
-  return name === 'SHA256SUMS.txt' ? managedCliChecksumMaxBytes : managedCliArchiveMaxBytes;
+  return releaseMetadataFile(name) ? managedCliChecksumMaxBytes : managedCliArchiveMaxBytes;
 }
 
 function releaseFileTotalTimeoutMs(name) {
-  return name === 'SHA256SUMS.txt' ? releaseChecksumTotalTimeoutMs : releaseArchiveTotalTimeoutMs;
+  return releaseMetadataFile(name) ? releaseChecksumTotalTimeoutMs : releaseArchiveTotalTimeoutMs;
 }
 
 // A single mutable record of what provisioning is currently doing. Tool calls answered while the
@@ -2032,7 +2119,9 @@ function verifyPublishedManagedCli(
     manifest.archive !== expectedAsset ||
     manifest.target !== expectedTarget ||
     manifest.stdio_initialize_verified !== true ||
-    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || ''))
+    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || '')) ||
+    !Number.isSafeInteger(manifest.archive_bytes) ||
+    manifest.archive_bytes <= 0
   ) {
     return { verified: false, reason: 'manifest_release_metadata_invalid' };
   }
@@ -2339,6 +2428,9 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     const resumeBytes = partialDownloadBytes(archivePartialPath);
     if (resumeBytes > 0) warnings.push(`managed_cli_publication:resume_bytes:${resumeBytes}`);
     await fetchReleaseFile(version, 'SHA256SUMS.txt', sumsPath);
+    // Both metadata documents are read before the archive transfer starts, so a manifest that is
+    // malformed or belongs to another release costs one small request rather than a full download.
+    const releaseManifestEntry = await fetchReleaseManifestEntry(version, target, tempRoot, warnings);
     const archiveUrl = await fetchReleaseFile(version, asset, archivePath, {
       partialPath: archivePartialPath,
     });
@@ -2357,6 +2449,10 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
         throw new Error(`archive_pin_mismatch:${asset}`);
       }
     }
+    // The native lane's digest authority, held against the downloaded bytes before extraction:
+    // extraction is the first step that acts on what the release channel supplied.
+    const archiveBytes = fs.statSync(archivePath).size;
+    bindArchiveToReleaseManifest(releaseManifestEntry, { sha256: actual, bytes: archiveBytes }, warnings);
     extractArchive(archivePath, extractDir);
 
     stagingDir = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
@@ -2374,6 +2470,10 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
         ? archiveUrl
         : `explicit-package:${actual}`,
       archive_sha256: actual,
+      // Recorded so the pre-publish native provision proof can hold the provisioned archive
+      // against BOTH fields the release manifest carries. A length the manifest records and
+      // nothing reads is a field that cannot fail.
+      archive_bytes: archiveBytes,
       target,
       provisioned_at: new Date().toISOString(),
       stdio_initialize_verified: true,
@@ -4370,6 +4470,12 @@ if (require.main === module) {
       pinnedCliContract,
       pinnedCliVersion,
       pinnedArchiveSha256,
+      RELEASE_MANIFEST_ASSET,
+      RELEASE_MANIFEST_DOMAIN,
+      RELEASE_MANIFEST_SCHEMA_VERSION,
+      releaseManifestArchiveEntry,
+      fetchReleaseManifestEntry,
+      bindArchiveToReleaseManifest,
       publishDownloadedFile,
       managedCliDownloadCacheDir,
       removeManagedCliDownloadCache,

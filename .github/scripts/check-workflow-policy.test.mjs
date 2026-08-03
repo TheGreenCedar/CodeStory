@@ -6844,14 +6844,14 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
         uses: `actions/github-script@${fullSha}`,
         with: { script: 'console.log("${{ inputs.commit }}")' },
       });
-    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    }, /jobs\.sync\.steps\.6 must not splice a dispatch input into an action input/u],
     ["a pinned action takes the unvalidated spelling of the input", workflow => {
       workflow.jobs.sync.steps.push({
         name: "Report the dispatched commit",
         uses: `actions/github-script@${fullSha}`,
         with: { script: 'console.log("${{ github.event.inputs.commit }}")' },
       });
-    }, /jobs\.sync\.steps\.5 must not splice a dispatch input into an action input/u],
+    }, /jobs\.sync\.steps\.6 must not splice a dispatch input into an action input/u],
     // `$NAME` and `${NAME}` are the same read, so a binding assertion that only sees the bare form
     // is evaded by writing the brace form and deleting the bindings.
     ["a brace-form read loses both of its env bindings", workflow => {
@@ -6871,7 +6871,7 @@ test("marketplace sync keeps dispatch inputs out of script text", async (t) => {
         env: { INPUT_COMMIT: "${{ github.event.inputs.commit }}" },
         run: "echo bound\n",
       });
-    }, /jobs\.sync\.steps\.5 must bind INPUT_COMMIT/u],
+    }, /jobs\.sync\.steps\.6 must bind INPUT_COMMIT/u],
     // Job-level `env:` is below every step's own binding check, so the unvalidated spelling is
     // refused by name wherever it appears rather than only where a step declares it.
     ["the unvalidated spelling hides in job-level env", workflow => {
@@ -8121,7 +8121,16 @@ function runCatalogDeliveryOutcome(environment, [file, jobName] = catalogOutcome
   const step = draftStep(loadWorkflows().get(file).jobs[jobName], "Record catalog delivery outcome");
   // Every GitHub expression in this step lives in env, so the body is executable bash.
   assert.ok(!step.run.includes("${{"), "delivery outcome body must not embed workflow expressions");
-  return runStepBash(step.run, { RECOVERY_WORKFLOW: step.env.RECOVERY_WORKFLOW, ...environment });
+  // The workflow declares every one of these in `env:`, so they exist -- possibly empty -- for the
+  // real step. Defaulting them here keeps the harness's environment the one the workflow provides
+  // rather than a laxer one.
+  return runStepBash(step.run, {
+    RECOVERY_WORKFLOW: step.env.RECOVERY_WORKFLOW,
+    PREVIOUS_REVISION: "",
+    PREVIOUS_PLUGIN_SHA: "",
+    PREVIOUS_PLUGIN_VERSION: "",
+    ...environment,
+  });
 }
 
 function runCatalogDeliveryState(environment, [file, jobName] = catalogStateLanes[0]) {
@@ -8144,19 +8153,37 @@ function repositoryHead() {
 
 test("a release records catalog publication only when the catalog push actually landed", () => {
   const revision = "a".repeat(40);
+  const previousRevision = "b".repeat(40);
+  const previousSha = "c".repeat(40);
+  // The rollback target the catalog move recorded. It is the pin the catalog was serving, so it
+  // must survive into the job's outputs whether the move landed or not -- a published run needs it
+  // to restore, and a deferred run needs it to say what the catalog is still serving.
+  const previousPin = {
+    PREVIOUS_REVISION: previousRevision,
+    PREVIOUS_PLUGIN_SHA: previousSha,
+    PREVIOUS_PLUGIN_VERSION: "0.16.2",
+  };
+  const recordedPin = {
+    previous_marketplace_revision: previousRevision,
+    previous_plugin_sha: previousSha,
+    previous_plugin_version: "0.16.2",
+  };
 
   for (const lane of catalogOutcomeLanes) {
     const published = runCatalogDeliveryOutcome({
       TOKEN_OUTCOME: "success",
       PUBLISH_OUTCOME: "success",
       PUBLISHED_REVISION: revision,
+      ...previousPin,
     }, lane);
     assert.equal(published.status, 0, published.stderr);
     assert.deepEqual(published.outputs, {
       catalog_published: "true",
       marketplace_revision: revision,
+      ...recordedPin,
     }, lane.join("/"));
     assert.doesNotMatch(published.stdout, /::warning::/u, lane.join("/"));
+    assert.match(published.summary, /Rollback target: codestory 0\.16\.2 at c{40}/u, lane.join("/"));
   }
 
   // Each of these is a real way this job has failed or could fail. None may report published, and
@@ -8183,17 +8210,37 @@ test("a release records catalog publication only when the catalog push actually 
   ];
   for (const lane of catalogOutcomeLanes) {
     for (const [label, environment] of deferrals) {
-      const deferred = runCatalogDeliveryOutcome(environment, lane);
+      const deferred = runCatalogDeliveryOutcome({ ...previousPin, ...environment }, lane);
       const where = `${lane.join("/")}: ${label}`;
       assert.equal(deferred.status, 0, `${where}: ${deferred.stderr}`);
       assert.deepEqual(deferred.outputs, {
         catalog_published: "false",
         marketplace_revision: "",
+        ...recordedPin,
       }, where);
       assert.match(deferred.stdout, /::warning::Catalog publication deferred/u, where);
       assert.match(deferred.stdout, /marketplace-sync\.yml/u, where);
       assert.match(deferred.summary, /DEFERRED/u, where);
+      // A deferred run never announces a rollback target: the catalog did not move, so there is
+      // nothing to restore and nothing may read as if there were.
+      assert.doesNotMatch(deferred.summary, /Rollback target/u, where);
     }
+
+    // The credential never minted, so the push step was skipped and recorded no pin at all. The
+    // absent pin must travel as absent rather than be filled in with something invented.
+    const unrecorded = runCatalogDeliveryOutcome({
+      TOKEN_OUTCOME: "failure",
+      PUBLISH_OUTCOME: "",
+      PUBLISHED_REVISION: "",
+    }, lane);
+    assert.equal(unrecorded.status, 0, unrecorded.stderr);
+    assert.deepEqual(unrecorded.outputs, {
+      catalog_published: "false",
+      marketplace_revision: "",
+      previous_marketplace_revision: "",
+      previous_plugin_sha: "",
+      previous_plugin_version: "",
+    }, lane.join("/"));
   }
 });
 
