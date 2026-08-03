@@ -1,0 +1,58 @@
+node CLASS name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.cpp:ConsoleNotifier line=11 col=1 end=20:2 file=FILE:<ROOT>/fidelity.cpp@1
+node CLASS name=Event qn=Event canonical=<ROOT>/fidelity.cpp:Event line=35 col=1 end=37:2 file=FILE:<ROOT>/fidelity.cpp@1
+node CLASS name=Notifier qn=Notifier canonical=<ROOT>/fidelity.cpp:Notifier line=5 col=1 end=9:2 file=FILE:<ROOT>/fidelity.cpp@1
+node CLASS name=Repository qn=Repository canonical=<ROOT>/fidelity.cpp:Repository line=23 col=1 end=33:2 file=FILE:<ROOT>/fidelity.cpp@1
+node CLASS name=Workflow qn=Workflow canonical=<ROOT>/fidelity.cpp:Workflow line=39 col=1 end=61:2 file=FILE:<ROOT>/fidelity.cpp@1
+node FIELD name=Event::name qn=Event::name canonical=<ROOT>/fidelity.cpp:Event::name#0 line=36 col=17 end=36:21 file=FILE:<ROOT>/fidelity.cpp@1
+node FILE name=<ROOT>/fidelity.cpp qn=<ROOT>/fidelity.cpp canonical=<ROOT>/fidelity.cpp:<ROOT>/fidelity.cpp:1 line=1 col=1 end=68:0 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=ConsoleNotifier::notifyEvent qn=ConsoleNotifier::notifyEvent canonical=<ROOT>/fidelity.cpp:ConsoleNotifier::notifyEvent#0 line=13 col=5 end=15:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=ConsoleNotifier::writeLog qn=ConsoleNotifier::writeLog canonical=<ROOT>/fidelity.cpp:ConsoleNotifier::writeLog#0 line=17 col=5 end=19:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Notifier::~Notifier qn=Notifier::~Notifier canonical=<ROOT>/fidelity.cpp:Notifier::~Notifier#0 line=7 col=5 end=7:35 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Repository::save qn=Repository::save canonical=<ROOT>/fidelity.cpp:Repository::save#0 line=25 col=5 end=27:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Repository::track qn=Repository::track canonical=<ROOT>/fidelity.cpp:Repository::track#0 line=29 col=5 end=32:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Workflow::decorate qn=Workflow::decorate canonical=<ROOT>/fidelity.cpp:Workflow::decorate#0 line=58 col=5 end=60:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Workflow::run qn=Workflow::run canonical=<ROOT>/fidelity.cpp:Workflow::run#0 line=46 col=5 end=51:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=Workflow::runAsync qn=Workflow::runAsync canonical=<ROOT>/fidelity.cpp:Workflow::runAsync#0 line=53 col=5 end=56:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=identity qn=identity canonical=<ROOT>/fidelity.cpp:identity#0 line=42 col=5 end=44:6 file=FILE:<ROOT>/fidelity.cpp@1
+node FUNCTION name=orchestrate_cpp qn=orchestrate_cpp canonical=<ROOT>/fidelity.cpp:orchestrate_cpp#0 line=63 col=1 end=68:2 file=FILE:<ROOT>/fidelity.cpp@1
+node METHOD name=Notifier::notifyEvent qn=Notifier::notifyEvent canonical=<ROOT>/fidelity.cpp:Notifier::notifyEvent#0 line=8 col=5 end=8:60 file=FILE:<ROOT>/fidelity.cpp@1
+node MODULE name=<functional> qn=<functional> canonical=<ROOT>/fidelity.cpp:<functional>#0 line=2 col=10 end=2:22 file=FILE:<ROOT>/fidelity.cpp@1
+node MODULE name=<future> qn=<future> canonical=<ROOT>/fidelity.cpp:<future>#0 line=1 col=10 end=1:18 file=FILE:<ROOT>/fidelity.cpp@1
+node MODULE name=<string> qn=<string> canonical=<ROOT>/fidelity.cpp:<string>#0 line=3 col=10 end=3:18 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=async qn=async canonical=<ROOT>/fidelity.cpp:async#0 line=55 col=21 end=55:26 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.cpp:decorate#0 line=50 col=9 end=50:17 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.cpp:decorate#1 line=55 col=45 end=55:53 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=identity qn=identity canonical=<ROOT>/fidelity.cpp:identity#1 line=47 col=24 end=47:32 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=mapper qn=mapper canonical=<ROOT>/fidelity.cpp:mapper#0 line=43 col=16 end=43:22 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=notifyEvent qn=notifyEvent canonical=<ROOT>/fidelity.cpp:notifyEvent#0 line=48 col=18 end=48:29 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.cpp:run#0 line=54 col=9 end=54:12 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.cpp:run#1 line=67 col=14 end=67:17 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.cpp:save#0 line=49 col=20 end=49:24 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=track qn=track canonical=<ROOT>/fidelity.cpp:track#0 line=26 col=9 end=26:14 file=FILE:<ROOT>/fidelity.cpp@1
+node UNKNOWN name=writeLog qn=writeLog canonical=<ROOT>/fidelity.cpp:writeLog#0 line=14 col=9 end=14:17 file=FILE:<ROOT>/fidelity.cpp@1
+edge CALL src=FUNCTION:ConsoleNotifier::notifyEvent@13 dst=UNKNOWN:writeLog@14 resolved_src=FUNCTION:ConsoleNotifier::notifyEvent@13 resolved_dst=FUNCTION:ConsoleNotifier::writeLog@17 line=14 confidence=0.9500 certainty=Certain callsite=h0:14:1:h1 candidates=[]
+edge CALL src=FUNCTION:Repository::save@25 dst=UNKNOWN:track@26 resolved_src=FUNCTION:Repository::save@25 resolved_dst=FUNCTION:Repository::track@29 line=26 confidence=0.9500 certainty=Certain callsite=h0:26:1:h2 candidates=[]
+edge CALL src=FUNCTION:Workflow::run@46 dst=FUNCTION:Repository::save@25 resolved_src=FUNCTION:Workflow::run@46 resolved_dst=FUNCTION:Repository::save@25 line=49 confidence=1.0000 certainty=Certain callsite=h0:49:1:h3 candidates=[]
+edge CALL src=FUNCTION:Workflow::run@46 dst=METHOD:Notifier::notifyEvent@8 resolved_src=FUNCTION:Workflow::run@46 resolved_dst=METHOD:Notifier::notifyEvent@8 line=48 confidence=1.0000 certainty=Certain callsite=h0:48:1:h4 candidates=[]
+edge CALL src=FUNCTION:Workflow::run@46 dst=UNKNOWN:decorate@50 resolved_src=FUNCTION:Workflow::run@46 resolved_dst=FUNCTION:Workflow::decorate@58 line=50 confidence=0.9500 certainty=Certain callsite=h0:50:1:h5 candidates=[]
+edge CALL src=FUNCTION:Workflow::run@46 dst=UNKNOWN:identity@47 resolved_src=FUNCTION:Workflow::run@46 resolved_dst=FUNCTION:identity@42 line=47 confidence=0.9500 certainty=Certain callsite=h0:47:1:h6 candidates=[]
+edge CALL src=FUNCTION:Workflow::runAsync@53 dst=UNKNOWN:async@55 resolved_src=FUNCTION:Workflow::runAsync@53 resolved_dst=- line=55 confidence=- certainty=- callsite=h0:55:1:h7 candidates=[]
+edge CALL src=FUNCTION:Workflow::runAsync@53 dst=UNKNOWN:decorate@55 resolved_src=FUNCTION:Workflow::runAsync@53 resolved_dst=FUNCTION:Workflow::decorate@58 line=55 confidence=0.9500 certainty=Certain callsite=h0:55:1:h8 candidates=[]
+edge CALL src=FUNCTION:Workflow::runAsync@53 dst=UNKNOWN:run@54 resolved_src=FUNCTION:Workflow::runAsync@53 resolved_dst=FUNCTION:Workflow::run@46 line=54 confidence=0.9500 certainty=Certain callsite=h0:54:1:h9 candidates=[]
+edge CALL src=FUNCTION:identity@42 dst=UNKNOWN:mapper@43 resolved_src=FUNCTION:identity@42 resolved_dst=- line=43 confidence=- certainty=- callsite=h0:43:1:h10 candidates=[]
+edge CALL src=FUNCTION:orchestrate_cpp@63 dst=FUNCTION:Workflow::run@46 resolved_src=FUNCTION:orchestrate_cpp@63 resolved_dst=FUNCTION:Workflow::run@46 line=67 confidence=1.0000 certainty=Certain callsite=h0:67:1:h11 candidates=[]
+edge IMPORT src=MODULE:<functional>@2 dst=MODULE:<functional>@2 resolved_src=MODULE:<functional>@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:<future>@1 dst=MODULE:<future>@1 resolved_src=MODULE:<future>@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:<string>@3 dst=MODULE:<string>@3 resolved_src=MODULE:<string>@3 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@11 dst=CLASS:Notifier@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@11 dst=FUNCTION:ConsoleNotifier::notifyEvent@13 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@11 dst=FUNCTION:ConsoleNotifier::writeLog@17 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Event@35 dst=FIELD:Event::name@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Notifier@5 dst=FUNCTION:Notifier::~Notifier@7 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Notifier@5 dst=METHOD:Notifier::notifyEvent@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@23 dst=FUNCTION:Repository::save@25 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@23 dst=FUNCTION:Repository::track@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@39 dst=FUNCTION:Workflow::decorate@58 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@39 dst=FUNCTION:Workflow::run@46 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@39 dst=FUNCTION:Workflow::runAsync@53 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge TYPE_ARGUMENT src=CLASS:Repository@23 dst=CLASS:Event@35 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

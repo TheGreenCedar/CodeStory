@@ -591,7 +591,7 @@ fn language_family_bucket(language: &'static str) -> &'static str {
         return extraction.semantic_family;
     }
     match language {
-        "c" | "cpp" => "native",
+        "c" => "native",
         "javascript" | "typescript" | "vue" | "svelte" | "astro" => "webscript",
         "python" => "python",
         "rust" => "rust",
