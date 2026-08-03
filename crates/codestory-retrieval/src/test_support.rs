@@ -148,11 +148,8 @@ pub fn publish_zero_dense_pinned_query_fixture(
         serde_json::to_vec_pretty(&index).context("serialize pinned query fixture SCIP index")?,
     )
     .context("write pinned query fixture SCIP index")?;
-    std::fs::write(
-        scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
-        format!("codestory-scip-v1\nrevision={revision}\n"),
-    )
-    .context("write pinned query fixture SCIP marker")?;
+    crate::scip_index::write_scip_index_marker(&scip_dir, &revision)
+        .context("write pinned query fixture SCIP marker")?;
     std::fs::write(scip_dir.join("revision.txt"), format!("{revision}\n"))
         .context("write pinned query fixture SCIP revision")?;
     manifest.scip_revision = Some(revision);

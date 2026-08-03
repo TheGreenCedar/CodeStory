@@ -1,7 +1,8 @@
 use crate::config::SidecarLayout;
 use crate::scip_index::{
-    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_INDEX_FILE, SCIP_SYMBOLS_FILE, ScipSymbolLookup,
-    ScipSymbolRecord, load_fresh_scip_symbols, load_scip_symbols, reference_defect,
+    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, SCIP_SYMBOLS_FILE,
+    ScipIndexMarkerError, ScipSymbolLookup, ScipSymbolRecord, load_fresh_scip_symbols,
+    load_scip_symbols, parse_scip_index_marker, reference_defect,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -11,6 +12,9 @@ use std::path::Path;
 /// enters fusion with.
 const SCIP_ADJACENCY_ANCHOR_LIMIT: usize = 4;
 const SCIP_ADJACENCY_SCORE: f32 = 0.65;
+
+/// Artifact status meaning "the graph lane is ready to serve".
+const SCIP_READY_STATUS: &str = "ready";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScipAvailability {
@@ -52,26 +56,27 @@ impl ScipClient {
                 detail: "scip project dir exists but empty (indexers not run)".into(),
             };
         }
-        if project_dir.join("index.scip.stub").is_file() {
+        if project_dir.join(SCIP_STUB_MARKER_FILE).is_file() {
             return ScipHealthProbe {
                 availability: ScipAvailability::Unavailable {
                     reason: "scip_stub".into(),
                 },
                 artifact_count: artifacts,
-                detail: "stub SCIP artifacts only (index.scip.stub present)".into(),
+                detail: format!("stub SCIP artifacts only ({SCIP_STUB_MARKER_FILE} present)"),
             };
         }
         let revision = read_scip_revision(&project_dir).unwrap_or_else(|| "stub-v1".into());
         let artifact_status = scip_artifact_status(&project_dir, &revision, generation);
         let is_stub_revision = revision == "stub-v1" || artifact_status == "scip_stub";
         ScipHealthProbe {
+            // Only the ready status admits the lane. Every other status — the
+            // ones that existed and the ones content validation added — is
+            // reported as its own unavailable reason.
             availability: if is_stub_revision {
                 ScipAvailability::Unavailable {
                     reason: "scip_stub".into(),
                 }
-            } else if artifact_status == "scip_stale"
-                || artifact_status == "scip_imported_diagnostic_only"
-            {
+            } else if artifact_status != SCIP_READY_STATUS {
                 ScipAvailability::Unavailable {
                     reason: artifact_status.into(),
                 }
@@ -492,11 +497,20 @@ fn read_scip_revision(dir: &Path) -> Option<String> {
 
 fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) -> &'static str {
     if !project_dir.join(SCIP_SYMBOLS_FILE).is_file()
-        || !project_dir.join(SCIP_INDEX_FILE).is_file()
         || !project_dir.join("revision.txt").is_file()
-        || project_dir.join("index.scip.stub").is_file()
+        || project_dir.join(SCIP_STUB_MARKER_FILE).is_file()
     {
         return "scip_stub";
+    }
+    // A present `index.scip` is not evidence until it parses and names this
+    // revision. Each defect reports its own typed code so the generation falls
+    // through to a rebuild carrying why, instead of publishing as a healthy
+    // graph lane. Absence keeps its existing stub reason.
+    if let Err(error) = parse_scip_index_marker(project_dir, revision) {
+        return match error {
+            ScipIndexMarkerError::Missing => "scip_stub",
+            damaged => damaged.code(),
+        };
     }
     load_scip_symbols(project_dir)
         .ok()
@@ -507,7 +521,7 @@ fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) ->
                 return "scip_stale";
             }
             if index.contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
-                "ready"
+                SCIP_READY_STATUS
             } else {
                 "scip_imported_diagnostic_only"
             }
@@ -519,10 +533,11 @@ mod tests {
     use super::*;
     use crate::candidate::{CandidateHit, CandidateSource};
     use crate::scip_index::{
-        SCIP_DEFINITION_ROLE, SCIP_IMPORTED_PROOF_PROVENANCE,
+        SCIP_DEFINITION_ROLE, SCIP_IMPORTED_PROOF_PROVENANCE, SCIP_INDEX_FILE,
         SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE, SCIP_REFERENCE_ROLE, ScipPackageIdentity,
-        ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex,
+        ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex, write_scip_index_marker,
     };
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
@@ -548,7 +563,7 @@ mod tests {
         .expect("write symbols");
         std::fs::write(project_dir.join("revision.txt"), format!("{revision}\n"))
             .expect("revision");
-        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n").expect("index");
+        write_scip_index_marker(project_dir, revision).expect("index marker");
     }
 
     fn graph_definition_proofs(symbols: &[ScipSymbolRecord]) -> Vec<ScipProofRecord> {
@@ -808,7 +823,7 @@ mod tests {
         let project_dir = layout.scip_project_dir(project_id);
         std::fs::create_dir_all(&project_dir).expect("scip dir");
         std::fs::write(project_dir.join("revision.txt"), "graph-test\n").expect("revision");
-        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n").expect("index");
+        write_scip_index_marker(&project_dir, "graph-test").expect("index marker");
 
         let probe = ScipClient::health_probe(&layout, project_id);
 
@@ -1199,5 +1214,99 @@ mod tests {
         )
         .expect_err("adjacency scan should observe cancellation");
         assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    fn graph_projection_fixture(root: &TempDir, revision: &str) -> (SidecarLayout, PathBuf) {
+        let layout = adjacency_layout(root);
+        let project_dir = layout.scip_project_dir("project");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let symbols = vec![ScipSymbolRecord {
+            node_id: Some("1".into()),
+            path: "src/lib.rs".into(),
+            symbol: "alpha".into(),
+            start_line: 1,
+            end_line: 1,
+        }];
+        let proofs = graph_definition_proofs(&symbols);
+        write_scip_index(
+            &project_dir,
+            "project",
+            revision,
+            ScipProofAdapterContract::graph_projection(revision),
+            symbols,
+            proofs,
+        );
+        (layout, project_dir)
+    }
+
+    #[test]
+    fn a_truncated_index_scip_marker_cannot_report_a_ready_graph_lane() {
+        let root = TempDir::new().expect("root");
+        let (layout, project_dir) = graph_projection_fixture(&root, "graph-test");
+        assert_eq!(
+            ScipClient::health_probe(&layout, "project").availability,
+            ScipAvailability::Ready {
+                revision: "graph-test".into()
+            },
+            "the intact fixture must be ready, or the corruption below proves nothing"
+        );
+
+        // Present, non-empty, and completely useless: exactly the artifact the
+        // old `.is_file()` check published as healthy.
+        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "\0\0\0\0").expect("truncate marker");
+
+        assert_eq!(
+            ScipClient::health_probe(&layout, "project").availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_index_marker_header_unrecognized".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_index_scip_marker_from_another_generation_cannot_report_a_ready_graph_lane() {
+        let root = TempDir::new().expect("root");
+        let (layout, project_dir) = graph_projection_fixture(&root, "graph-test");
+
+        write_scip_index_marker(&project_dir, "graph-someone-else").expect("stale marker");
+
+        assert_eq!(
+            ScipClient::health_probe(&layout, "project").availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_index_marker_revision_mismatch".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_index_scip_marker_without_a_revision_line_cannot_report_a_ready_graph_lane() {
+        let root = TempDir::new().expect("root");
+        let (layout, project_dir) = graph_projection_fixture(&root, "graph-test");
+
+        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n")
+            .expect("header-only marker");
+
+        assert_eq!(
+            ScipClient::health_probe(&layout, "project").availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_index_marker_revision_missing".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_deleted_index_scip_marker_still_reports_as_a_stub() {
+        let root = TempDir::new().expect("root");
+        let (layout, project_dir) = graph_projection_fixture(&root, "graph-test");
+
+        std::fs::remove_file(project_dir.join(SCIP_INDEX_FILE)).expect("remove marker");
+
+        assert_eq!(
+            ScipClient::health_probe(&layout, "project").availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_stub".into()
+            },
+            "absence keeps its existing reason; only present-but-damaged is new"
+        );
     }
 }

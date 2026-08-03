@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
+use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
+use codestory_contracts::validation_receipts::SealedReceiptCache;
 use codestory_store::{FileRole, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -18,6 +20,28 @@ const LEGACY_STUB_MARKER: &str = ".zoekt-stub";
 const MAX_FILE_BYTES: u64 = 1_000_000;
 const MAX_CANDIDATES: usize = 4_096;
 const COVERAGE_PATH_SAMPLE: usize = 32;
+
+/// How many published lexical generations may hold a sealed health receipt at
+/// once.
+///
+/// A runtime works on one project generation at a time and keeps at most the
+/// outgoing one alive beside it, so the live cardinality is a handful; the
+/// bound exists to make the memory ceiling hard, not to force turnover. A
+/// receipt is one metadata row, so the whole cache at capacity is tens of
+/// kilobytes. Reaching the bound clears the cache, which costs a re-scan and
+/// never changes a verdict.
+const LEXICAL_SHARD_RECEIPT_CAPACITY: usize = 256;
+
+/// Sealed deep-verification receipts for immutable lexical shards.
+///
+/// The receipt records what a shard *is* — its self-consistent metadata row —
+/// after a full integrity pass. It never records whether that shard satisfies
+/// a particular caller's expectations; those comparisons are cheap and re-run
+/// on every probe. The seal covers the shard database and every SQLite sidecar
+/// identity the registry owns, so an in-place rewrite, a replacement, or a
+/// stray write-ahead log invalidates the receipt instead of hiding behind it.
+static LEXICAL_SHARD_RECEIPTS: SealedReceiptCache<PathBuf, LexicalShardMetadata> =
+    SealedReceiptCache::new(LEXICAL_SHARD_RECEIPT_CAPACITY);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LexicalCoverage {
@@ -212,12 +236,14 @@ pub fn build_lexical_shard(
             expected,
             |visit| scan_lexical_documents(project_root, storage_path, storage_path, visit),
         )?;
-        validate_lexical_database(
-            &temp_path,
+        // The staged file is about to be renamed away, so its verdict is not
+        // receiptable: seal the published identity, never the temporary one.
+        let staged = verify_lexical_database_contents(&temp_path)?;
+        match_lexical_shard_expectations(
+            &staged,
             project_id,
             sidecar_input_hash,
             Some((expected.file_count, expected.hash.as_str())),
-            true,
         )?;
         publish_immutable_lexical_database(&temp_path, &index_path)?;
         Ok(rebuilt)
@@ -298,7 +324,6 @@ pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &s
         project_id,
         expected_sidecar_input_hash,
         None,
-        false,
     )
     .is_ok()
 }
@@ -315,7 +340,6 @@ pub fn shard_matches_lexical_input(
         sidecar_generation,
         expected_sidecar_input_hash,
         Some((expected_file_count, expected_hash)),
-        true,
     )
     .is_ok()
 }
@@ -330,9 +354,19 @@ pub fn lexical_shard_coverage(
         sidecar_generation,
         expected_sidecar_input_hash,
         None,
-        false,
     )?
     .coverage)
+}
+
+/// Sealed-receipt accounting for one shard, for tests that must prove the deep
+/// verification ran exactly as often as the seal allowed.
+#[cfg(test)]
+pub(crate) fn lexical_shard_receipt_stats(
+    lexical_data_dir: &Path,
+    sidecar_generation: &str,
+) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
+    LEXICAL_SHARD_RECEIPTS
+        .stats(&shard_dir_for(lexical_data_dir, sidecar_generation).join(LEXICAL_INDEX_FILE))
 }
 
 #[cfg(test)]
@@ -656,47 +690,56 @@ where
     Ok(actual)
 }
 
+/// Deep-verify one immutable lexical shard, reusing a sealed receipt when the
+/// shard's native identity is unchanged, then check the caller's expectations
+/// against the receipted metadata.
+///
+/// The two halves are deliberately separate. The deep half scans the whole FTS
+/// mirror and is a fact about the artifact, so it is receiptable. The
+/// expectation half is three string comparisons that depend on the caller, so
+/// it runs every time and can never be answered from a receipt.
 fn validate_lexical_database(
     path: &Path,
     expected_project_id: &str,
     expected_sidecar_input_hash: &str,
     expected_lexical: Option<(u32, &str)>,
-    quick_check: bool,
 ) -> Result<LexicalShardMetadata> {
+    let metadata = LEXICAL_SHARD_RECEIPTS.validate_sealed(
+        path.to_path_buf(),
+        &sqlite_file_with_sidecars(path),
+        || verify_lexical_database_contents(path),
+    )?;
+    match_lexical_shard_expectations(
+        &metadata,
+        expected_project_id,
+        expected_sidecar_input_hash,
+        expected_lexical,
+    )?;
+    Ok(metadata)
+}
+
+/// The receiptable half: everything that depends only on the shard's own bytes.
+///
+/// `quick_check` is unconditional here. It used to be opt-in so that the cheap
+/// callers could skip it, but with the verdict sealed to native identity the
+/// page-level check is paid once per generation, and the strongest verdict is
+/// the only one worth sealing.
+fn verify_lexical_database_contents(path: &Path) -> Result<LexicalShardMetadata> {
     if !path.is_file() {
         bail!("lexical SQLite shard is missing");
     }
     let connection = open_read_only(path)?;
-    validate_open_database(
-        &connection,
-        expected_project_id,
-        expected_sidecar_input_hash,
-        expected_lexical,
-        quick_check,
-        &|| false,
-    )
+    verify_open_database_contents(&connection, &|| false)
 }
 
-fn validate_open_database(
+fn verify_open_database_contents(
     connection: &Connection,
-    expected_project_id: &str,
-    expected_sidecar_input_hash: &str,
-    expected_lexical: Option<(u32, &str)>,
-    quick_check: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
-    let metadata = validate_open_database_metadata(
-        connection,
-        expected_project_id,
-        expected_sidecar_input_hash,
-        expected_lexical,
-        cancelled,
-    )?;
-    if quick_check {
-        let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-        if check != "ok" {
-            bail!("lexical SQLite shard failed quick_check: {check}");
-        }
+    let metadata = read_open_database_metadata(connection, cancelled)?;
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        bail!("lexical SQLite shard failed quick_check: {check}");
     }
     let actual_count: u32 =
         connection.query_row("SELECT count(*) FROM lexical_documents", [], |row| {
@@ -751,6 +794,24 @@ fn validate_open_database_metadata(
     expected_lexical: Option<(u32, &str)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
+    let metadata = read_open_database_metadata(connection, cancelled)?;
+    match_lexical_shard_expectations(
+        &metadata,
+        expected_project_id,
+        expected_sidecar_input_hash,
+        expected_lexical,
+    )?;
+    Ok(metadata)
+}
+
+/// Read the shard's own metadata row and check it is internally consistent.
+///
+/// Nothing here depends on the caller, which is what makes the verdict
+/// receiptable.
+fn read_open_database_metadata(
+    connection: &Connection,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LexicalShardMetadata> {
     if cancelled() {
         bail!("lexical search cancelled");
     }
@@ -803,12 +864,6 @@ fn validate_open_database_metadata(
     if version != LEXICAL_INDEX_VERSION {
         bail!("lexical SQLite shard version is not current");
     }
-    if metadata.project_id != expected_project_id {
-        bail!("lexical SQLite shard project id does not match its generation directory");
-    }
-    if metadata.sidecar_input_hash != expected_sidecar_input_hash {
-        bail!("lexical SQLite shard does not match the sidecar input hash");
-    }
     if metadata.binding_sha256
         != metadata_binding(
             &metadata.project_id,
@@ -820,12 +875,28 @@ fn validate_open_database_metadata(
     {
         bail!("lexical SQLite shard metadata binding is invalid");
     }
+    Ok(metadata)
+}
+
+/// The caller-dependent half: never receipted, always re-checked.
+fn match_lexical_shard_expectations(
+    metadata: &LexicalShardMetadata,
+    expected_project_id: &str,
+    expected_sidecar_input_hash: &str,
+    expected_lexical: Option<(u32, &str)>,
+) -> Result<()> {
+    if metadata.project_id != expected_project_id {
+        bail!("lexical SQLite shard project id does not match its generation directory");
+    }
+    if metadata.sidecar_input_hash != expected_sidecar_input_hash {
+        bail!("lexical SQLite shard does not match the sidecar input hash");
+    }
     if let Some((file_count, lexical_hash)) = expected_lexical
         && (metadata.file_count != file_count || metadata.lexical_hash != lexical_hash)
     {
         bail!("lexical SQLite shard does not match current lexical input");
     }
-    Ok(metadata)
+    Ok(())
 }
 
 fn open_read_only(path: &Path) -> Result<Connection> {
@@ -1991,14 +2062,18 @@ mod tests {
             let mut deep_validation_micros = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
-                validate_lexical_database(
-                    &index_path,
+                // Measure the uncached scan on purpose: the sealed receipt
+                // would answer every repeat and report the cost of a HashMap
+                // lookup instead of the corpus pass this fixture reports.
+                let metadata =
+                    verify_lexical_database_contents(&index_path).expect("deep validation");
+                match_lexical_shard_expectations(
+                    &metadata,
                     &generation,
                     "benchmark-input",
                     Some((fingerprint.file_count, fingerprint.hash.as_str())),
-                    true,
                 )
-                .expect("deep validation");
+                .expect("deep validation expectations");
                 deep_validation_micros.push(started.elapsed().as_micros() as u64);
             }
 
@@ -2109,5 +2184,157 @@ mod tests {
         });
         hits.truncate(limit);
         hits
+    }
+
+    fn shard_modified_nanos(index: &Path) -> u64 {
+        std::fs::metadata(index)
+            .expect("shard metadata")
+            .modified()
+            .expect("shard mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("shard mtime after epoch")
+            .as_nanos() as u64
+    }
+
+    fn restore_shard_modified_nanos(index: &Path, nanos: u64) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(index)
+            .expect("open shard to restore times");
+        let restored = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos);
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(restored)
+                .set_accessed(restored),
+        )
+        .expect("restore shard times");
+    }
+
+    #[test]
+    fn repeated_probes_of_one_generation_deep_scan_the_shard_once() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-reuse", "input");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        assert_eq!(
+            lexical_shard_receipt_stats(data.path(), "receipt-reuse"),
+            None,
+            "publishing a shard must not seal a receipt; only a read path may"
+        );
+
+        // Exactly the pair a single health probe performs, then the finalize
+        // fence's stricter check over the same generation.
+        assert!(shard_has_lexical_index(&shard, "input"));
+        lexical_shard_coverage(data.path(), "receipt-reuse", "input").expect("coverage");
+        assert!(shard_matches_lexical_input(
+            data.path(),
+            "receipt-reuse",
+            fingerprint.file_count,
+            &fingerprint.hash,
+            "input",
+        ));
+
+        let stats = lexical_shard_receipt_stats(data.path(), "receipt-reuse")
+            .expect("a successful deep verification seals a receipt");
+        assert_eq!(
+            (stats.validations, stats.reuses, stats.invalidations),
+            (1, 2, 0),
+            "three probes of one unchanged generation must scan the FTS mirror once"
+        );
+    }
+
+    #[test]
+    fn a_sealed_receipt_cannot_hide_in_place_corruption_of_its_shard() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        std::fs::write(project.path().join("other.rs"), "fn unrelated() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-seal", "input");
+        let index = shard.join(LEXICAL_INDEX_FILE);
+
+        lexical_shard_coverage(data.path(), "receipt-seal", "input")
+            .expect("healthy generation verifies");
+        assert!(
+            lexical_shard_receipt_stats(data.path(), "receipt-seal").is_some(),
+            "the healthy verdict must be sealed, or corruption below proves nothing"
+        );
+
+        // Rewrite the shard where it lies, keeping the forged text the same
+        // length as the document it shadows, then put the modification time
+        // back: exactly what a restore-in-place or a torn write leaves behind,
+        // and invisible to a length-and-mtime check.
+        let published = std::fs::metadata(&index).expect("shard metadata");
+        let modified = shard_modified_nanos(&index);
+        let length = published.len();
+        let permissions = published.permissions();
+        make_test_file_writable(&index);
+        let connection = Connection::open(&index).expect("open writable");
+        connection
+            .execute(
+                "UPDATE lexical_fts SET content = 'fn unrelated() {;'
+                 WHERE rowid = (SELECT id FROM lexical_documents WHERE path = 'other.rs')",
+                [],
+            )
+            .expect("forge FTS row");
+        drop(connection);
+        restore_shard_modified_nanos(&index, modified);
+        std::fs::set_permissions(&index, permissions.clone()).expect("restore shard permissions");
+        let corrupted = std::fs::metadata(&index).expect("shard metadata");
+        assert_eq!(
+            shard_modified_nanos(&index),
+            modified,
+            "the corruption must be invisible to a modification-time check"
+        );
+        assert_eq!(
+            corrupted.len(),
+            length,
+            "the corruption must be invisible to a file-length check"
+        );
+        assert_eq!(
+            corrupted.permissions().readonly(),
+            permissions.readonly(),
+            "the corruption must be invisible to a permission check"
+        );
+
+        let after = lexical_shard_coverage(data.path(), "receipt-seal", "input");
+
+        assert!(
+            after.is_err(),
+            "the sealed receipt answered for bytes that no longer exist: {after:?}"
+        );
+        assert!(
+            format!("{:#}", after.expect_err("corrupt shard"))
+                .contains("FTS rows do not match immutable documents"),
+            "the re-run deep scan must report the corruption it found"
+        );
+        assert!(!shard_has_lexical_index(&shard, "input"));
+        assert_eq!(
+            lexical_shard_receipt_stats(data.path(), "receipt-seal"),
+            None,
+            "a failed verification must leave no receipt behind"
+        );
+    }
+
+    #[test]
+    fn rebuilding_a_damaged_generation_in_place_reseals_it_as_healthy() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "receipt-repair", "input");
+        let index = shard.join(LEXICAL_INDEX_FILE);
+        lexical_shard_coverage(data.path(), "receipt-repair", "input").expect("healthy");
+
+        make_test_file_writable(&index);
+        std::fs::write(&index, b"not sqlite").expect("corrupt shard");
+        assert!(lexical_shard_coverage(data.path(), "receipt-repair", "input").is_err());
+
+        // The same generation id rebuilt in place: this is the self-repair the
+        // finalize fall-through reaches.
+        let _repaired = build(project.path(), data.path(), "receipt-repair", "input");
+
+        lexical_shard_coverage(data.path(), "receipt-repair", "input")
+            .expect("the repaired generation verifies again");
+        assert!(shard_has_lexical_index(&shard, "input"));
     }
 }
