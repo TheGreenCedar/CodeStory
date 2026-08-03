@@ -1429,7 +1429,7 @@ fn is_ruby_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::RUBY_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::ruby::MEMBER_CALLSITE_MARKER)
     })
 }
 

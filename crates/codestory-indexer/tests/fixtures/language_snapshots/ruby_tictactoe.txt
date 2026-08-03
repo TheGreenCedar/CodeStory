@@ -1,0 +1,131 @@
+node CLASS name=ArtificialPlayer qn=ArtificialPlayer canonical=game.rb:ArtificialPlayer line=62 col=1 end=72:4 file=FILE:game.rb@1
+node CLASS name=Field qn=Field canonical=game.rb:Field line=20 col=1 end=48:4 file=FILE:game.rb@1
+node CLASS name=GameObject qn=GameObject canonical=game.rb:GameObject line=15 col=1 end=18:4 file=FILE:game.rb@1
+node CLASS name=HumanPlayer qn=HumanPlayer canonical=game.rb:HumanPlayer line=56 col=1 end=60:4 file=FILE:game.rb@1
+node CLASS name=Player qn=Player canonical=game.rb:Player line=50 col=1 end=54:4 file=FILE:game.rb@1
+node CLASS name=TicTacToe qn=TicTacToe canonical=game.rb:TicTacToe line=74 col=1 end=81:4 file=FILE:game.rb@1
+node FILE name=game.rb qn=game.rb canonical=game.rb:game.rb:1 line=1 col=1 end=85:0 file=FILE:game.rb@1
+node METHOD name=ArtificialPlayer.minMax qn=ArtificialPlayer.minMax canonical=game.rb:ArtificialPlayer.minMax#0 line=63 col=3 end=66:6 file=FILE:game.rb@1
+node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.rb:ArtificialPlayer.turn#0 line=68 col=3 end=71:6 file=FILE:game.rb@1
+node METHOD name=Field.initialize qn=Field.initialize canonical=game.rb:Field.initialize#0 line=21 col=3 end=24:6 file=FILE:game.rb@1
+node METHOD name=Field.makeMove qn=Field.makeMove canonical=game.rb:Field.makeMove#0 line=41 col=3 end=47:6 file=FILE:game.rb@1
+node METHOD name=Field.opponent qn=Field.opponent canonical=game.rb:Field.opponent#0 line=26 col=3 end=30:6 file=FILE:game.rb@1
+node METHOD name=Field.sameInRow qn=Field.sameInRow canonical=game.rb:Field.sameInRow#0 line=32 col=3 end=39:6 file=FILE:game.rb@1
+node METHOD name=GameObject.announce qn=GameObject.announce canonical=game.rb:GameObject.announce#0 line=16 col=3 end=17:6 file=FILE:game.rb@1
+node METHOD name=HumanPlayer.turn qn=HumanPlayer.turn canonical=game.rb:HumanPlayer.turn#0 line=57 col=3 end=59:6 file=FILE:game.rb@1
+node METHOD name=Player.turn qn=Player.turn canonical=game.rb:Player.turn#0 line=51 col=3 end=53:6 file=FILE:game.rb@1
+node METHOD name=TicTacToe.run qn=TicTacToe.run canonical=game.rb:TicTacToe.run#0 line=75 col=3 end=80:6 file=FILE:game.rb@1
+node METHOD name=numberIn qn=numberIn canonical=game.rb:numberIn#0 line=3 col=1 end=5:4 file=FILE:game.rb@1
+node METHOD name=numberOut qn=numberOut canonical=game.rb:numberOut#0 line=7 col=1 end=9:4 file=FILE:game.rb@1
+node METHOD name=stringOut qn=stringOut canonical=game.rb:stringOut#0 line=11 col=1 end=13:4 file=FILE:game.rb@1
+node MODULE name="random" qn="random" canonical=game.rb:"random"#0 line=1 col=9 end=1:17 file=FILE:game.rb@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.rb:makeMove#0 line=58 col=11 end=58:19 file=FILE:game.rb@1
+node UNKNOWN name=minMax qn=minMax canonical=game.rb:minMax#0 line=65 col=5 end=65:11 file=FILE:game.rb@1
+node UNKNOWN name=minMax qn=minMax canonical=game.rb:minMax#1 line=69 col=5 end=69:11 file=FILE:game.rb@1
+node UNKNOWN name=new qn=new canonical=game.rb:new#0 line=22 col=34 end=22:37 file=FILE:game.rb@1
+node UNKNOWN name=new qn=new canonical=game.rb:new#1 line=76 col=20 end=76:23 file=FILE:game.rb@1
+node UNKNOWN name=new qn=new canonical=game.rb:new#2 line=84 col=13 end=84:16 file=FILE:game.rb@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.rb:numberIn#1 line=77 col=5 end=77:13 file=FILE:game.rb@1
+node UNKNOWN name=print qn=print canonical=game.rb:print#0 line=8 col=3 end=8:8 file=FILE:game.rb@1
+node UNKNOWN name=print qn=print canonical=game.rb:print#1 line=12 col=3 end=12:8 file=FILE:game.rb@1
+node UNKNOWN name=rand qn=rand canonical=game.rb:rand#0 line=79 col=12 end=79:16 file=FILE:game.rb@1
+node UNKNOWN name=require qn=require canonical=game.rb:require#0 line=1 col=1 end=1:8 file=FILE:game.rb@1
+node UNKNOWN name=run qn=run canonical=game.rb:run#0 line=84 col=17 end=84:20 file=FILE:game.rb@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.rb:sameInRow#0 line=45 col=5 end=45:14 file=FILE:game.rb@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.rb:stringOut#1 line=78 col=5 end=78:14 file=FILE:game.rb@1
+node UNKNOWN name=times qn=times canonical=game.rb:times#0 line=35 col=7 end=35:12 file=FILE:game.rb@1
+edge CALL src=METHOD:ArtificialPlayer.minMax@63 dst=UNKNOWN:minMax@65 resolved_src=- resolved_dst=- line=65 confidence=- certainty=- callsite=h0:65:5:h1 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.turn@68 dst=UNKNOWN:minMax@69 resolved_src=- resolved_dst=- line=69 confidence=- certainty=- callsite=h0:69:5:h2 candidates=[]
+edge CALL src=METHOD:Field.initialize@21 dst=UNKNOWN:new@22 resolved_src=- resolved_dst=- line=22 confidence=- certainty=- callsite=h0:22:19:h3 candidates=[]
+edge CALL src=METHOD:Field.initialize@21 dst=UNKNOWN:new@22 resolved_src=- resolved_dst=- line=22 confidence=- certainty=- callsite=h0:22:34:h3 candidates=[]
+edge CALL src=METHOD:Field.makeMove@41 dst=UNKNOWN:sameInRow@45 resolved_src=- resolved_dst=- line=45 confidence=- certainty=- callsite=h0:45:5:h4 candidates=[]
+edge CALL src=METHOD:Field.sameInRow@32 dst=UNKNOWN:times@35 resolved_src=- resolved_dst=- line=35 confidence=- certainty=- callsite=h0:35:7:h5|syntax:ruby-member-call candidates=[]
+edge CALL src=METHOD:HumanPlayer.turn@57 dst=UNKNOWN:makeMove@58 resolved_src=- resolved_dst=- line=58 confidence=- certainty=- callsite=h0:58:11:h6|syntax:ruby-member-call candidates=[]
+edge CALL src=METHOD:TicTacToe.run@75 dst=UNKNOWN:new@76 resolved_src=- resolved_dst=- line=76 confidence=- certainty=- callsite=h0:76:20:h7 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@75 dst=UNKNOWN:numberIn@77 resolved_src=- resolved_dst=- line=77 confidence=- certainty=- callsite=h0:77:5:h8 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@75 dst=UNKNOWN:rand@79 resolved_src=- resolved_dst=- line=79 confidence=- certainty=- callsite=h0:79:12:h9|syntax:ruby-member-call candidates=[]
+edge CALL src=METHOD:TicTacToe.run@75 dst=UNKNOWN:stringOut@78 resolved_src=- resolved_dst=- line=78 confidence=- certainty=- callsite=h0:78:5:h10 candidates=[]
+edge CALL src=METHOD:numberOut@7 dst=UNKNOWN:print@8 resolved_src=- resolved_dst=- line=8 confidence=- certainty=- callsite=h0:8:3:h11 candidates=[]
+edge CALL src=METHOD:stringOut@11 dst=UNKNOWN:print@12 resolved_src=- resolved_dst=- line=12 confidence=- certainty=- callsite=h0:12:3:h12 candidates=[]
+edge IMPORT src=MODULE:"random"@1 dst=MODULE:"random"@1 resolved_src=- resolved_dst=- line=1 confidence=- certainty=- callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@62 dst=CLASS:Player@50 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Field@20 dst=CLASS:GameObject@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:HumanPlayer@56 dst=CLASS:Player@50 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:TicTacToe@74 dst=CLASS:GameObject@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@62 dst=METHOD:ArtificialPlayer.minMax@63 resolved_src=- resolved_dst=- line=63 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@62 dst=METHOD:ArtificialPlayer.turn@68 resolved_src=- resolved_dst=- line=68 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@20 dst=METHOD:Field.initialize@21 resolved_src=- resolved_dst=- line=21 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@20 dst=METHOD:Field.makeMove@41 resolved_src=- resolved_dst=- line=41 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@20 dst=METHOD:Field.opponent@26 resolved_src=- resolved_dst=- line=26 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@20 dst=METHOD:Field.sameInRow@32 resolved_src=- resolved_dst=- line=32 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:GameObject@15 dst=METHOD:GameObject.announce@16 resolved_src=- resolved_dst=- line=16 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@56 dst=METHOD:HumanPlayer.turn@57 resolved_src=- resolved_dst=- line=57 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Player@50 dst=METHOD:Player.turn@51 resolved_src=- resolved_dst=- line=51 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@74 dst=METHOD:TicTacToe.run@75 resolved_src=- resolved_dst=- line=75 confidence=- certainty=Certain callsite=- candidates=[]
+file path=game.rb language=ruby lines=85 complete=true role=Source
+occurrence element=CLASS:ArtificialPlayer@62 kind=DEFINITION span=62:1-72:4
+occurrence element=CLASS:Field@20 kind=DEFINITION span=20:1-48:4
+occurrence element=CLASS:GameObject@15 kind=DEFINITION span=15:1-18:4
+occurrence element=CLASS:GameObject@15 kind=DEFINITION span=20:15-20:25
+occurrence element=CLASS:GameObject@15 kind=DEFINITION span=74:19-74:29
+occurrence element=CLASS:HumanPlayer@56 kind=DEFINITION span=56:1-60:4
+occurrence element=CLASS:Player@50 kind=DEFINITION span=50:1-54:4
+occurrence element=CLASS:Player@50 kind=DEFINITION span=56:21-56:27
+occurrence element=CLASS:Player@50 kind=DEFINITION span=62:26-62:32
+occurrence element=CLASS:TicTacToe@74 kind=DEFINITION span=74:1-81:4
+occurrence element=METHOD:ArtificialPlayer.minMax@63 kind=DEFINITION span=63:3-66:6
+occurrence element=METHOD:ArtificialPlayer.turn@68 kind=DEFINITION span=68:3-71:6
+occurrence element=METHOD:Field.initialize@21 kind=DEFINITION span=21:3-24:6
+occurrence element=METHOD:Field.makeMove@41 kind=DEFINITION span=41:3-47:6
+occurrence element=METHOD:Field.opponent@26 kind=DEFINITION span=26:3-30:6
+occurrence element=METHOD:Field.sameInRow@32 kind=DEFINITION span=32:3-39:6
+occurrence element=METHOD:GameObject.announce@16 kind=DEFINITION span=16:3-17:6
+occurrence element=METHOD:HumanPlayer.turn@57 kind=DEFINITION span=57:3-59:6
+occurrence element=METHOD:Player.turn@51 kind=DEFINITION span=51:3-53:6
+occurrence element=METHOD:TicTacToe.run@75 kind=DEFINITION span=75:3-80:6
+occurrence element=METHOD:numberIn@3 kind=DEFINITION span=3:1-5:4
+occurrence element=METHOD:numberOut@7 kind=DEFINITION span=7:1-9:4
+occurrence element=METHOD:stringOut@11 kind=DEFINITION span=11:1-13:4
+occurrence element=MODULE:"random"@1 kind=DEFINITION span=1:9-1:17
+occurrence element=UNKNOWN:makeMove@58 kind=DEFINITION span=58:11-58:19
+occurrence element=UNKNOWN:minMax@65 kind=DEFINITION span=65:5-65:11
+occurrence element=UNKNOWN:minMax@69 kind=DEFINITION span=69:5-69:11
+occurrence element=UNKNOWN:new@22 kind=DEFINITION span=22:34-22:37
+occurrence element=UNKNOWN:new@76 kind=DEFINITION span=76:20-76:23
+occurrence element=UNKNOWN:new@84 kind=DEFINITION span=84:13-84:16
+occurrence element=UNKNOWN:numberIn@77 kind=DEFINITION span=77:5-77:13
+occurrence element=UNKNOWN:print@12 kind=DEFINITION span=12:3-12:8
+occurrence element=UNKNOWN:print@8 kind=DEFINITION span=8:3-8:8
+occurrence element=UNKNOWN:rand@79 kind=DEFINITION span=79:12-79:16
+occurrence element=UNKNOWN:require@1 kind=DEFINITION span=1:1-1:8
+occurrence element=UNKNOWN:run@84 kind=DEFINITION span=84:17-84:20
+occurrence element=UNKNOWN:sameInRow@45 kind=DEFINITION span=45:5-45:14
+occurrence element=UNKNOWN:stringOut@78 kind=DEFINITION span=78:5-78:14
+occurrence element=UNKNOWN:times@35 kind=DEFINITION span=35:7-35:12
+access node=METHOD:ArtificialPlayer.minMax@63 kind=Public
+access node=METHOD:ArtificialPlayer.turn@68 kind=Public
+access node=METHOD:Field.initialize@21 kind=Public
+access node=METHOD:Field.makeMove@41 kind=Public
+access node=METHOD:Field.opponent@26 kind=Public
+access node=METHOD:Field.sameInRow@32 kind=Public
+access node=METHOD:GameObject.announce@16 kind=Public
+access node=METHOD:HumanPlayer.turn@57 kind=Public
+access node=METHOD:Player.turn@51 kind=Public
+access node=METHOD:TicTacToe.run@75 kind=Public
+access node=METHOD:numberIn@3 kind=Public
+access node=METHOD:numberOut@7 kind=Public
+access node=METHOD:stringOut@11 kind=Public
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:ArtificialPlayer.minMax", node_id: NodeId(-2305454530479827731), signature_hash: 2816889471617643129, normalized_signature: Some("shape:3892327511108441983"), body_hash: -672599015500449883, start_line: 63, end_line: 66 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:ArtificialPlayer.turn", node_id: NodeId(-2216272334490518232), signature_hash: 5754064973517794814, normalized_signature: Some("shape:783417546980888174"), body_hash: 5681829404713968296, start_line: 68, end_line: 71 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:Field.initialize", node_id: NodeId(-1270925165430776420), signature_hash: -9120393158106245982, normalized_signature: Some("shape:6360098408552140898"), body_hash: -4137518291482918327, start_line: 21, end_line: 24 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:Field.makeMove", node_id: NodeId(7658723807322863601), signature_hash: -7686617887134063555, normalized_signature: Some("shape:4191619700394149013"), body_hash: 5685978943429425826, start_line: 41, end_line: 47 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:Field.opponent", node_id: NodeId(-5247767992258324109), signature_hash: 5718448952121283431, normalized_signature: Some("outline:-5087212818695232478"), body_hash: -2851369941469327825, start_line: 26, end_line: 30 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:Field.sameInRow", node_id: NodeId(-1596154395995987253), signature_hash: 8317776364922746511, normalized_signature: Some("shape:6173194982228443029"), body_hash: 3075336871449158430, start_line: 32, end_line: 39 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:GameObject.announce", node_id: NodeId(2566414094649540464), signature_hash: 6265382829821424686, normalized_signature: Some("outline:-5084398068927579993"), body_hash: -1904460546639563293, start_line: 16, end_line: 17 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(-5309813005216789555), signature_hash: -1551097434895889655, normalized_signature: Some("shape:4546493373888983564"), body_hash: 6582402943341370509, start_line: 57, end_line: 59 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:Player.turn", node_id: NodeId(-3476264032076398104), signature_hash: -1091959065548758310, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -7593047486753193641, start_line: 51, end_line: 53 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:TicTacToe.run", node_id: NodeId(6558845360998134269), signature_hash: 5136661510898306809, normalized_signature: Some("shape:-7720857568580268095"), body_hash: -3744663677110146298, start_line: 75, end_line: 80 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:numberIn", node_id: NodeId(-5001430822321770114), signature_hash: 378904191093197768, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -6870881889205310903, start_line: 3, end_line: 5 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:numberOut", node_id: NodeId(4135351678322494333), signature_hash: 7734359841249861705, normalized_signature: Some("shape:-761404221283775011"), body_hash: -6350574982772305127, start_line: 7, end_line: 9 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "14:stringOut", node_id: NodeId(5151016081776191281), signature_hash: 4766693839703088001, normalized_signature: Some("shape:-2085153621185569755"), body_hash: -7393721029465409886, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: 8159992984445929388, symbol_key: "__file_structural__", node_id: NodeId(8159992984445929388), signature_hash: 553768115714561381, normalized_signature: None, body_hash: 7018471151357077143, start_line: 1, end_line: 85 }

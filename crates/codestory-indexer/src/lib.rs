@@ -62,7 +62,6 @@ pub(crate) const CPP_MEMBER_CALLSITE_MARKER: &str = "syntax:cpp-member-call";
 pub(crate) const GO_SELECTOR_CALLSITE_MARKER: &str = "syntax:go-selector-call";
 pub(crate) const JAVA_MEMBER_CALLSITE_MARKER: &str = "syntax:java-member-call";
 pub(crate) const CSHARP_MEMBER_CALLSITE_MARKER: &str = "syntax:csharp-member-call";
-pub(crate) const RUBY_MEMBER_CALLSITE_MARKER: &str = "syntax:ruby-member-call";
 pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
 pub(crate) const JS_MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
 pub(crate) const TS_MEMBER_CALLSITE_MARKER: &str = "syntax:ts-member-call";
@@ -139,7 +138,6 @@ const TSX_TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
 const CPP_GRAPH_QUERY: &str = include_str!("../rules/cpp.scm");
 const C_GRAPH_QUERY: &str = include_str!("../rules/c.scm");
 const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
-const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
 const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
@@ -318,9 +316,10 @@ impl LanguageRuleset {
             }
             LanguageRuleset::C => compiled_rules_cache(language, C_GRAPH_QUERY, None, &C_RULES),
             LanguageRuleset::Go => compiled_rules_cache(language, GO_GRAPH_QUERY, None, &GO_RULES),
-            LanguageRuleset::Ruby => {
-                compiled_rules_cache(language, RUBY_GRAPH_QUERY, None, &RUBY_RULES)
-            }
+            // Answered by the registry above; see the Kotlin arm below.
+            LanguageRuleset::Ruby => Err(anyhow!(
+                "ruby compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::Php => {
                 compiled_rules_cache(language, PHP_GRAPH_QUERY, None, &PHP_RULES)
             }
@@ -381,7 +380,6 @@ static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::ne
 static CPP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static C_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -7597,7 +7595,6 @@ fn language_receiver_call_specs(
         "typescript" | "tsx" => collect_typescript_receiver_call_edges(tree, source),
         "java" => collect_java_receiver_call_edges(tree, source),
         "go" => collect_go_receiver_call_edges(tree, source),
-        "ruby" => collect_ruby_receiver_call_edges(tree, source),
         "php" => collect_php_receiver_call_edges(tree, source),
         "csharp" => collect_csharp_receiver_call_edges(tree, source),
         "cpp" => collect_cpp_receiver_call_edges(tree, source),
@@ -7757,7 +7754,7 @@ fn annotate_ruby_member_call_placeholders(
     flags: IndexFeatureFlags,
 ) {
     walk_tree_nodes(tree.root_node(), &mut |node| {
-        let Some((_, method_name)) = ruby_receiver_call(node, source) else {
+        let Some((_, method_name)) = languages::ruby::member_call(node, source) else {
             return;
         };
         annotate_call_placeholder_marker(
@@ -7769,7 +7766,7 @@ fn annotate_ruby_member_call_placeholders(
                 line: Some(node.start_position().row as u32 + 1),
                 method_col: member_call_method_col(node, source, &method_name),
                 method_name: &method_name,
-                marker: RUBY_MEMBER_CALLSITE_MARKER,
+                marker: languages::ruby::MEMBER_CALLSITE_MARKER,
             },
         );
     });
@@ -13454,162 +13451,6 @@ fn dart_signature_for_body<'tree>(body: TsNode<'tree>) -> Option<TsNode<'tree>> 
     previous_named_sibling_with_kind(body, &["method_signature", "function_signature"])
 }
 
-fn collect_ruby_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
-    let mut edges = Vec::new();
-    let require_relative_module = ruby_single_require_relative_module(source);
-    let local_type_names = collect_ruby_file_type_names(tree.root_node(), source);
-    walk_tree_nodes(tree.root_node(), &mut |callable| {
-        if !matches!(callable.kind(), "method" | "singleton_method") {
-            return;
-        }
-        let Some(source_name) = declaration_name(callable, source) else {
-            return;
-        };
-        collect_ruby_precise_receiver_call_specs(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: &source_name,
-                span: ts_node_graph_span(callable),
-            },
-            require_relative_module.as_deref(),
-            &local_type_names,
-            &mut edges,
-        );
-    });
-    edges
-}
-
-fn collect_ruby_precise_receiver_call_specs(
-    callable: TsNode<'_>,
-    source: &str,
-    call_source: ManualReceiverSource<'_>,
-    require_relative_module: Option<&str>,
-    local_type_names: &HashSet<String>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
-) {
-    walk_tree_nodes(callable, &mut |node| {
-        let Some((receiver_name, method_name)) = ruby_receiver_call(node, source) else {
-            return;
-        };
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
-        let owner_name = if let Some(owner_name) = ruby_constructor_owner_surface(&receiver_name) {
-            owner_name
-        } else if let Some(owner) =
-            ruby_visible_local_receiver_owner(callable, node, &receiver_name, source)
-        {
-            let Some(owner_name) = owner else {
-                return;
-            };
-            owner_name
-        } else if receiver_name.starts_with('@') {
-            let Some(owner_name) =
-                ruby_instance_variable_receiver_owner(callable, &receiver_name, source)
-            else {
-                return;
-            };
-            owner_name
-        } else {
-            return;
-        };
-        let owner_module =
-            ruby_receiver_owner_module(&owner_name, require_relative_module, local_type_names);
-        let method_col = member_call_method_col(node, source, &method_name);
-        edges.push(ManualReceiverCallSpec {
-            source_name: call_source.name.to_string(),
-            source_span: call_source.span,
-            receiver_name,
-            owner_name,
-            owner_module,
-            method_name,
-            method_col,
-            line: Some(node.start_position().row as u32 + 1),
-            allow_global_fallback: false,
-        });
-    });
-}
-
-fn ruby_receiver_owner_module(
-    owner_name: &str,
-    require_relative_module: Option<&str>,
-    local_type_names: &HashSet<String>,
-) -> Option<String> {
-    if local_type_names.contains(owner_name) {
-        return None;
-    }
-    require_relative_module.map(str::to_string)
-}
-
-fn collect_ruby_file_type_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
-    walk_tree_nodes(root, &mut |node| match node.kind() {
-        "class" | "module" => {
-            if let Some(name) = declaration_name(node, source) {
-                names.insert(name);
-            }
-        }
-        "assignment" => {
-            if ruby_assignment_is_top_level(node)
-                && let Some(name) = node
-                    .child_by_field_name("left")
-                    .and_then(|left| trimmed_node_text(left, source))
-                    .and_then(|name| ruby_constant_name(&name))
-            {
-                names.insert(name);
-            }
-        }
-        _ => {}
-    });
-    names
-}
-
-fn ruby_assignment_is_top_level(node: TsNode<'_>) -> bool {
-    enclosing_node_with_kind(node, &["method", "singleton_method", "class", "module"]).is_none()
-}
-
-fn ruby_constant_name(raw: &str) -> Option<String> {
-    let name = raw.trim();
-    if name.contains("::") || name.contains('.') || name.starts_with('@') || name.starts_with('$') {
-        return None;
-    }
-    let first = name.chars().next()?;
-    first.is_uppercase().then(|| name.to_string())
-}
-
-fn ruby_single_require_relative_module(source: &str) -> Option<String> {
-    let mut modules = source
-        .lines()
-        .filter(|line| !line.starts_with(char::is_whitespace))
-        .filter_map(ruby_require_relative_module_from_line)
-        .collect::<Vec<_>>();
-    modules.sort();
-    modules.dedup();
-    if modules.len() == 1 {
-        modules.pop()
-    } else {
-        None
-    }
-}
-
-fn ruby_require_relative_module_from_line(line: &str) -> Option<String> {
-    let line = code_before_hash_comment(line).trim();
-    let rest = line
-        .strip_prefix("require_relative")
-        .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))?
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim();
-    let module_name = quoted_literal_surface(rest)?;
-    if module_name.starts_with("./") || module_name.starts_with("../") {
-        Some(module_name.to_string())
-    } else {
-        Some(format!("./{module_name}"))
-    }
-}
-
 fn quoted_literal_surface(surface: &str) -> Option<&str> {
     let mut chars = surface.chars();
     let quote = chars.next()?;
@@ -13618,74 +13459,6 @@ fn quoted_literal_surface(surface: &str) -> Option<&str> {
     }
     let end = surface[quote.len_utf8()..].find(quote)? + quote.len_utf8();
     Some(&surface[quote.len_utf8()..end])
-}
-
-fn ruby_instance_variable_receiver_owner(
-    callable: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-) -> Option<String> {
-    let class_node = enclosing_node_with_kind(callable, &["class"])?;
-    let mut owner_names: Vec<Option<String>> = Vec::new();
-    walk_tree_nodes(class_node, &mut |node| {
-        if !ruby_assignment_like_kind(node.kind()) {
-            return;
-        }
-        if !enclosing_node_with_kind(node, &["class"])
-            .is_some_and(|owner| same_ts_span(owner, class_node))
-        {
-            return;
-        }
-        if !ruby_assignment_matches_receiver_domain(node, callable, class_node) {
-            return;
-        }
-        let Some(left_node) = node.child_by_field_name("left") else {
-            return;
-        };
-        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
-            return;
-        }
-        let owner_name = if node.kind() == "operator_assignment" {
-            None
-        } else {
-            node.child_by_field_name("right")
-                .and_then(|right_node| ruby_constructor_owner(right_node, source))
-        };
-        owner_names.push(owner_name);
-    });
-    let mut concrete_owners = owner_names.into_iter().collect::<Option<Vec<_>>>()?;
-    concrete_owners.sort();
-    concrete_owners.dedup();
-    if concrete_owners.len() == 1 {
-        concrete_owners.pop()
-    } else {
-        None
-    }
-}
-
-fn ruby_assignment_like_kind(kind: &str) -> bool {
-    matches!(kind, "assignment" | "operator_assignment")
-}
-
-fn ruby_assignment_matches_receiver_domain(
-    assignment: TsNode<'_>,
-    callable: TsNode<'_>,
-    class_node: TsNode<'_>,
-) -> bool {
-    let enclosing_method = enclosing_node_with_kind(assignment, &["method", "singleton_method"]);
-    match callable.kind() {
-        "method" => enclosing_method.is_some_and(|method| {
-            method.kind() == "method"
-                && enclosing_node_with_kind(method, &["class"])
-                    .is_some_and(|owner| same_ts_span(owner, class_node))
-        }),
-        "singleton_method" => enclosing_method.is_none_or(|method| {
-            method.kind() == "singleton_method"
-                && enclosing_node_with_kind(method, &["class"])
-                    .is_some_and(|owner| same_ts_span(owner, class_node))
-        }),
-        _ => false,
-    }
 }
 
 fn collect_receiver_call_specs_in_callable(
@@ -13910,40 +13683,6 @@ fn collect_csharp_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap
         }
     });
     receiver_types
-}
-
-fn ruby_visible_local_receiver_owner(
-    callable: TsNode<'_>,
-    call_node: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-) -> Option<Option<String>> {
-    let mut visible_bindings = Vec::new();
-    walk_tree_nodes(callable, &mut |node| {
-        if !ruby_assignment_like_kind(node.kind()) {
-            return;
-        }
-        if !receiver_call_belongs_to_callable(node, callable)
-            || node.end_byte() > call_node.start_byte()
-        {
-            return;
-        }
-        let Some(left_node) = node.child_by_field_name("left") else {
-            return;
-        };
-        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
-            return;
-        }
-        let owner_name = if node.kind() == "operator_assignment" {
-            None
-        } else {
-            node.child_by_field_name("right")
-                .and_then(|right_node| ruby_constructor_owner(right_node, source))
-        };
-        visible_bindings.push((node.end_byte(), owner_name));
-    });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
 }
 
 fn collect_python_receiver_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
@@ -14454,19 +14193,6 @@ fn java_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> 
     ))
 }
 
-fn ruby_receiver_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if node.kind() != "call" {
-        return None;
-    }
-    let receiver = node.child_by_field_name("receiver")?;
-    let method = node.child_by_field_name("method")?;
-    let method_name = trimmed_node_text(method, source)?;
-    if method_name == "new" {
-        return None;
-    }
-    Some((normalized_receiver_variable(receiver, source)?, method_name))
-}
-
 fn typescript_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call_expression" {
         return None;
@@ -14684,29 +14410,6 @@ fn dart_callable_name(node: TsNode<'_>, source: &str) -> Option<String> {
     descendant_by_field_name(node, "name")
         .or_else(|| first_descendant_with_kind(node, "identifier"))
         .and_then(|name_node| trimmed_node_text(name_node, source))
-}
-
-fn ruby_constructor_owner(node: TsNode<'_>, source: &str) -> Option<String> {
-    if node.kind() != "call" {
-        return None;
-    }
-    let method = node.child_by_field_name("method")?;
-    if trimmed_node_text(method, source).as_deref() != Some("new") {
-        return None;
-    }
-    let receiver = node.child_by_field_name("receiver")?;
-    let raw_owner = trimmed_node_text(receiver, source)?;
-    normalize_type_surface(&raw_owner)
-}
-
-fn ruby_constructor_owner_surface(surface: &str) -> Option<String> {
-    let surface = surface.trim();
-    let (raw_owner, suffix) = surface.split_once(".new")?;
-    if !(suffix.is_empty() || suffix.starts_with('(') && suffix.ends_with(')')) {
-        return None;
-    }
-    let raw_owner = raw_owner.trim();
-    normalize_type_surface(raw_owner)
 }
 
 fn normalized_receiver_variable(node: TsNode<'_>, source: &str) -> Option<String> {
