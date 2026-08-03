@@ -5651,6 +5651,8 @@ mod tests {
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("tsx"),
             None
+            codestory_contracts::language_support::line_comment_for_language("go"),
+            Some("//")
         );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
@@ -5714,6 +5716,8 @@ mod tests {
         );
         let rust = ansi_highlight_snippet("src/main.rs", "let ok = true; // comment");
         assert!(rust.contains("\x1b[90m// comment\x1b[0m"), "{rust:?}");
+        let go = ansi_highlight_snippet("cmd/main.go", "ok := true // comment");
+        assert!(go.contains("\x1b[90m// comment\x1b[0m"), "{go:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

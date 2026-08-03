@@ -18,6 +18,7 @@
 
 pub(crate) mod c;
 pub(crate) mod cpp;
+pub(crate) mod go;
 pub(crate) mod java;
 pub(crate) mod javascript;
 pub(crate) mod kotlin;
@@ -27,7 +28,7 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Language, Tree};
 
-use crate::{CompiledLanguageRules, LanguageRuleset, ManualReceiverCallSpec};
+use crate::{CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec};
 
 /// Everything the indexer knows about one migrated language.
 ///
@@ -53,6 +54,11 @@ pub(crate) struct LanguageExtraction {
     pub(crate) tags_query: Option<&'static str>,
     /// Process-wide cache for the compiled graph/tags rules.
     pub(crate) compiled_rules: &'static OnceLock<Result<CompiledLanguageRules, String>>,
+    /// Manual MEMBER-edge collector, when the language has one. Added by the
+    /// first migrated language that owns one (Go); Kotlin's rules produce
+    /// MEMBER edges from the rule file alone and its row is `None`, which is
+    /// exactly what the residual `_ => Vec::new()` arm gave it.
+    pub(crate) member_edge_specs: Option<fn(&Tree, &str) -> Vec<ManualMemberEdgeSpec>>,
     /// Manual receiver-call collector, when the language has one.
     pub(crate) receiver_call_specs: Option<fn(&Tree, &str) -> Vec<ManualReceiverCallSpec>>,
     /// Callsite marker for edges produced from member-call syntax.
@@ -84,6 +90,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     tsx::EXTRACTION,
     python::EXTRACTION,
     rust::EXTRACTION,
+    go::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
@@ -167,7 +174,7 @@ mod tests {
                     *dispatch_name == extraction.language_name
                         || language_support_profile_for_language_name(dispatch_name).is_none(),
                     "{} claims dispatch name `{dispatch_name}`, which the public registry \
-                     assigns to another language",
+                    assigns to another language",
                     extraction.language_name
                 );
             }
@@ -398,6 +405,34 @@ mod tests {
         assert_eq!(
             extraction_for_ext("rs").map(|row| row.language_name),
             Some("rust")
+        );
+    }
+
+    /// The Go row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`. Go differs from Kotlin on three of them —
+    /// it does *not* promote type-member functions to methods, it does *not*
+    /// use the generic semantic resolver, and it owns a manual MEMBER-edge
+    /// collector — and each wrong value is a silent projection change that no
+    /// threshold test would catch.
+    #[test]
+    fn go_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let go = extraction_for_language("go").expect("go row");
+        assert!(!go.promotes_type_member_functions_to_methods);
+        assert_eq!(go.qualified_name_delimiter, ".");
+        assert!(go.route_comments_are_c_style);
+        assert_eq!(go.semantic_family, "go");
+        assert!(!go.uses_generic_semantic_resolver);
+        assert_eq!(go.member_callsite_marker, Some("syntax:go-selector-call"));
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("go_selector"),
+            Some("syntax:go-selector-call")
+        );
+        assert!(go.receiver_call_specs.is_some());
+        assert!(go.member_edge_specs.is_some());
+        assert!(go.tags_query.is_none());
+        assert_eq!(
+            extraction_for_ext("go").map(|row| row.language_name),
+            Some("go")
         );
     }
 }

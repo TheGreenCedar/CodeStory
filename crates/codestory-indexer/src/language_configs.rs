@@ -30,7 +30,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     match (profile.language_name, ext.as_str()) {
         // `ts`/`mts`/`cts` are answered by the registry above; `tsx` keeps its
         // own grammar and rule file until #1682 gives it a registry row.
-        ("go", _) => Some(go()),
         ("ruby", _) => Some(ruby()),
         ("php", _) => Some(php()),
         ("csharp", _) => Some(csharp()),
@@ -39,16 +38,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("bash", _) => Some(bash()),
         _ => None,
     }
-}
-
-fn go() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_go::LANGUAGE.into(),
-        "go",
-        GO_GRAPH_QUERY,
-        None,
-        LanguageRuleset::Go,
-    )
 }
 
 fn ruby() -> LanguageConfig {
