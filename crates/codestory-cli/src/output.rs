@@ -3941,8 +3941,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            "rust" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp" | "cpp" | "dart"
+            | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5631,14 +5631,29 @@ mod tests {
             }
         }
 
-        // The registry is the source for Kotlin: it must agree with the marker
-        // the roster used to hold.
+        // The registry is the source for Kotlin and TypeScript: it must agree
+        // with the marker the roster used to hold. `tsx` deliberately still
+        // answers from the local roster — it has no public language profile,
+        // and #1682 owns that row.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("kotlin"),
             Some("//")
         );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("typescript"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("tsx"),
+            None
+        );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+        let typescript = ansi_highlight_snippet("src/app.ts", "const ok = true; // comment");
+        assert!(
+            typescript.contains("\x1b[90m// comment\x1b[0m"),
+            "{typescript:?}"
+        );
     }
 
     /// Component dialects resolve through the companion-extension registry and

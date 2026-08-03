@@ -592,7 +592,7 @@ fn language_family_bucket(language: &'static str) -> &'static str {
     }
     match language {
         "c" | "cpp" => "native",
-        "javascript" | "typescript" | "vue" | "svelte" | "astro" => "webscript",
+        "javascript" | "vue" | "svelte" | "astro" => "webscript",
         "python" => "python",
         "rust" => "rust",
         "java" => "java",

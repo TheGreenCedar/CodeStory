@@ -1345,7 +1345,7 @@ fn is_ts_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::TS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::typescript::MEMBER_CALLSITE_MARKER)
     })
 }
 
