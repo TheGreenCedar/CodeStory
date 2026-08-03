@@ -108,6 +108,20 @@ const CASES: &[SnapshotCase] = &[
         tictactoe_source: include_str!("fixtures/tictactoe/typescript_tictactoe.ts"),
         tictactoe_golden: include_str!("fixtures/language_snapshots/typescript_tictactoe.txt"),
     },
+    // TSX is the one row whose fixtures are new rather than reused: the
+    // `fidelity_lab` and `tictactoe` corpora only carried a `.ts` file, and a
+    // `.ts` fixture proves nothing about the TSX grammar, the `tsx.graph.scm`
+    // rule file, or the JSX usage edges that only a `.tsx` extension turns on.
+    SnapshotCase {
+        language: "tsx",
+        extension: "tsx",
+        fidelity_filename: "fidelity.tsx",
+        fidelity_source: include_str!("fixtures/fidelity_lab/tsx_fidelity_lab.tsx"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/tsx_fidelity.txt"),
+        tictactoe_filename: "game.tsx",
+        tictactoe_source: include_str!("fixtures/tictactoe/tsx_tictactoe.tsx"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/tsx_tictactoe.txt"),
+    },
 ];
 
 #[test]

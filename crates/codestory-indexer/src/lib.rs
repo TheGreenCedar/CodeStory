@@ -133,7 +133,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 const PYTHON_GRAPH_QUERY: &str = include_str!("../rules/python.scm");
 const RUST_GRAPH_QUERY: &str = include_str!("../rules/rust.graph.scm");
 const RUST_TAGS_QUERY: &str = include_str!("../rules/rust.tags.scm");
-const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
 const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
 const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
@@ -308,9 +307,10 @@ impl LanguageRuleset {
             LanguageRuleset::TypeScript => Err(anyhow!(
                 "typescript compiled rules are owned by the language registry"
             )),
-            LanguageRuleset::Tsx => {
-                compiled_rules_cache(language, TSX_GRAPH_QUERY, Some(TSX_TAGS_QUERY), &TSX_RULES)
-            }
+            // Answered by the registry above; see the `Kotlin` arm below.
+            LanguageRuleset::Tsx => Err(anyhow!(
+                "tsx compiled rules are owned by the language registry"
+            )),
             // Answered by the registry above; see the `Kotlin` arm below.
             LanguageRuleset::Cpp => Err(anyhow!(
                 "cpp compiled rules are owned by the language registry"
@@ -375,7 +375,6 @@ fn compiled_rules_cache(
 
 static PYTHON_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -23825,9 +23824,19 @@ class Test {
         assert!(ts.graph_query.contains("ts_member"));
         assert!(ts.tags_query.is_some());
 
+        // TSX's rule files moved into `languages::tsx`; the config must still
+        // come back through the same extension lookup, still on the TSX
+        // grammar, and still sharing TypeScript's tags query.
         let tsx = get_language_for_ext("tsx").expect("tsx config");
-        assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
-        assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
+        assert_eq!(tsx.language_name, "typescript");
+        assert_eq!(
+            tsx.graph_query,
+            languages::extraction_for_ext("tsx")
+                .expect("tsx registry row")
+                .graph_query
+        );
+        assert_ne!(tsx.graph_query, ts.graph_query);
+        assert_eq!(tsx.tags_query, Some(TYPESCRIPT_TAGS_QUERY));
         assert_eq!(tsx.tags_query, ts.tags_query);
         assert_ne!(tsx.graph_query, ts.graph_query);
 

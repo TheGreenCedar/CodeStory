@@ -81,6 +81,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     c::EXTRACTION,
     javascript::EXTRACTION,
     typescript::EXTRACTION,
+    tsx::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
@@ -283,4 +284,54 @@ mod tests {
             Some("c")
         );
     }
+
+    /// The TSX row must keep the exact facts the god file gave the dispatch
+    /// name `tsx`, including the three that are `false`/`None` on purpose.
+    ///
+    /// Every value below was read off a `match` arm — or off the *absence* of
+    /// one — before the move. The absences are the dangerous half: nothing
+    /// else in the suite notices if a row silently starts promoting member
+    /// functions to methods, claims a call syntax that belongs to TypeScript,
+    /// or joins the framework-route comment roster.
+    #[test]
+    fn tsx_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let tsx = extraction_for_language("tsx").expect("tsx row");
+
+        // `.tsx` is `typescript` to the outside world and `tsx` inside the
+        // indexer; that split is the reason `dispatch_names` exists.
+        assert_eq!(tsx.language_name, "typescript");
+        assert_eq!(tsx.dispatch_names, &["tsx"]);
+        assert!(extraction_for_language("typescript").is_none());
+        assert_eq!(
+            extraction_for_ext("tsx").map(|row| row.language_name),
+            Some("typescript")
+        );
+        assert!(extraction_for_ext("ts").is_none());
+
+        // `promotes_type_member_functions_to_methods` was `matches!(name,
+        // "swift" | "dart")` and `qualified_name_delimiter` was `"::"` only for
+        // `rust`/`cpp`/`c`; neither ever matched `tsx`.
+        assert!(!tsx.promotes_type_member_functions_to_methods);
+        assert_eq!(tsx.qualified_name_delimiter, ".");
+        // The framework-route comment roster reaches languages by their public
+        // registry name, so `tsx` was never in it. This deliberately disagrees
+        // with the CLI highlighter, which does render `tsx` comments; they are
+        // separate facts with separate owners.
+        assert!(!tsx.route_comments_are_c_style);
+
+        // `rules/tsx.graph.scm` emits TypeScript's `ts_member` call syntax and
+        // shares its marker constant, so the marker is #1681's to move and the
+        // residual `lib.rs` arm must still be the one that answers.
+        assert_eq!(tsx.member_callsite_marker, None);
+        assert_eq!(tsx.graph_call_syntax, None);
+        assert_eq!(member_callsite_marker_for_call_syntax("ts_member"), None);
+
+        // TypeScript's receiver-call engine is shared, not copied.
+        assert!(tsx.receiver_call_specs.is_some());
+        assert!(tsx.tags_query.is_some());
+        assert!(tsx.graph_query.contains("ts_member"));
+        assert!(!tsx.uses_generic_semantic_resolver);
+        assert_eq!(tsx.semantic_family, "webscript");
+    }
 }
+pub(crate) mod tsx;

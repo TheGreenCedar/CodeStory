@@ -32,7 +32,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("rust", _) => Some(rust()),
         // `ts`/`mts`/`cts` are answered by the registry above; `tsx` keeps its
         // own grammar and rule file until #1682 gives it a registry row.
-        ("typescript", "tsx") => Some(tsx()),
         ("go", _) => Some(go()),
         ("ruby", _) => Some(ruby()),
         ("php", _) => Some(php()),
@@ -61,16 +60,6 @@ fn rust() -> LanguageConfig {
         RUST_GRAPH_QUERY,
         Some(RUST_TAGS_QUERY),
         LanguageRuleset::Rust,
-    )
-}
-
-fn tsx() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "typescript",
-        TSX_GRAPH_QUERY,
-        Some(TSX_TAGS_QUERY),
-        LanguageRuleset::Tsx,
     )
 }
 

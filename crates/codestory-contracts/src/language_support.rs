@@ -470,6 +470,10 @@ pub fn companion_surface_language(ext: &str) -> Option<&'static str> {
 /// languages whose consumer roster deliberately differs from their real syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageCommentProfile {
+    /// The name consumers actually spell. Usually a registry language name,
+    /// but a dialect that only the indexer and the highlighter distinguish
+    /// (`tsx`) is keyed by that dialect, because that is the string the
+    /// consumer roster held.
     pub language_name: &'static str,
     pub line_comment: &'static str,
 }
@@ -493,6 +497,15 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
     },
     LanguageCommentProfile {
         language_name: "typescript",
+        line_comment: "//",
+    },
+    // `tsx` is not a registry language — the registry routes `.tsx` to
+    // `typescript` — but it is the indexer's dispatch name for the JSX-aware
+    // TypeScript config and the CLI highlighter's own dialect string. The row
+    // covers that dialect only; `typescript` itself stays with the consumer
+    // roster until #1681.
+    LanguageCommentProfile {
+        language_name: "tsx",
         line_comment: "//",
     },
 ];
@@ -1270,11 +1283,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["kotlin", "java", "cpp", "javascript", "typescript"]
+            vec!["kotlin", "java", "cpp", "javascript", "typescript", "tsx"]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
-                language_support_profile_for_language_name(profile.language_name).is_some(),
+                language_support_profile_for_language_name(
+                    profile.language_name
+                ).is_some(
+                )
+                // `tsx` is a dialect, not a registered surface: the registry
+                // routes `.tsx` to `typescript`. It is keyed here under its
+                // own name because that is the string the indexer dispatches
+                // on and the CLI highlighter renders, and because
+                // `typescript` itself has not migrated.
+                || profile.language_name == "tsx",
                 "`{}` has no public language profile",
                 profile.language_name
             );
@@ -1285,6 +1307,14 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("tsx"), Some("//"));
+        // The dialect row must not answer for the language it routes to: the
+        // `typescript` roster entry is #1681's to move.
+        assert_eq!(
+            language_support_profile_for_ext("tsx").map(|profile| profile.language_name),
+            Some("typescript")
+        );
+        assert_eq!(line_comment_for_language("typescript"), None);
         assert_eq!(line_comment_for_language("typescript"), Some("//"));
         // `tsx` is an indexer-only dispatch name with no public profile, so it
         // keeps answering from the CLI's own roster until #1682 lands.
