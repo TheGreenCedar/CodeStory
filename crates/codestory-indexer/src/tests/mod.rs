@@ -1246,6 +1246,52 @@ fn incremental_incomplete_result_preserves_previous_projection() -> Result<()> {
     Ok(())
 }
 
+/// `LineOffsets` replaced `source.lines().nth()` in the visibility classifier,
+/// so any disagreement with `str::lines()` silently changes the projected
+/// access of a member — no panic, no error row, just a different graph. This
+/// pins every boundary case rather than trusting the two to agree.
+#[test]
+fn line_offsets_agree_with_str_lines_on_every_boundary_shape() {
+    for source in [
+        "",
+        "\n",
+        "\n\n",
+        "a",
+        "a\n",
+        "a\nb",
+        "a\nb\n",
+        "a\r\nb\r\n",
+        "a\r\nb",
+        "\r\n",
+        "pub fn a() {}\n\nprivate:\n  int x;\n",
+        "trailing spaces   \nand a tab\t\n",
+        "unicode: héllo wörld\nsecond ünicode line\n",
+        "no trailing newline at all",
+    ] {
+        let offsets = super::LineOffsets::new(source);
+        let expected: Vec<&str> = source.lines().collect();
+        for (index, want) in expected.iter().enumerate() {
+            let line = u32::try_from(index + 1).expect("line number");
+            assert_eq!(
+                offsets.line(source, line),
+                Some(*want),
+                "line {line} of {source:?}"
+            );
+        }
+        assert_eq!(
+            offsets.line(source, 0),
+            None,
+            "line numbers are 1-based; 0 must not resolve for {source:?}"
+        );
+        let past_end = u32::try_from(expected.len() + 1).expect("line number");
+        assert_eq!(
+            offsets.line(source, past_end),
+            None,
+            "reading past the last line of {source:?} must be None, not empty"
+        );
+    }
+}
+
 #[test]
 fn a_structural_source_over_the_structural_bound_is_refused_below_the_parser_headroom() -> Result<()>
 {
