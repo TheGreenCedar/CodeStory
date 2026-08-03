@@ -2483,6 +2483,21 @@ pub struct PacketClaimProfileTelemetryDto {
     pub pending_profiles: u32,
     /// Ratchet ceiling for `pending_profiles`.
     pub pending_ratchet: u32,
+    /// Registry rows the versioned-data loader refused, and therefore never served claims from.
+    ///
+    /// The loader fails closed, so a refusal always shrinks the registry. Publishing the count
+    /// keeps a packet that answered from a partially loaded registry distinguishable from one
+    /// that answered from the whole registry and found nothing.
+    #[serde(default)]
+    pub rejected_profiles: u32,
+    /// Distinct static codes for the refused rows. A count says the registry shrank; these say
+    /// why, which is the difference between a document typo and a document written for another
+    /// binary. Static slugs only — no repository text ever enters this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_reasons: Vec<String>,
+    /// Static code of a whole-document refusal, present only when the registry loaded empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_error: Option<String>,
     /// Citations offered to the profile layer while assembling the packet.
     pub citations_considered: u32,
     /// Distinct profiles that emitted at least one claim.
@@ -3598,11 +3613,14 @@ mod packet_tests {
         // confidence. Claim-profile counters are always present, so they get their own typed
         // field and must never be published as annotations at all.
         let telemetry = PacketClaimProfileTelemetryDto {
-            contract_version: 1,
+            contract_version: 2,
             registered_profiles: 20,
-            contracted_profiles: 4,
-            pending_profiles: 16,
-            pending_ratchet: 16,
+            contracted_profiles: 7,
+            pending_profiles: 13,
+            pending_ratchet: 13,
+            rejected_profiles: 0,
+            rejected_reasons: Vec::new(),
+            registry_error: None,
             citations_considered: 3,
             profiles_fired: 2,
             profiles_skipped_invalid: 1,
@@ -3664,6 +3682,25 @@ mod packet_tests {
         let parsed_legacy: AgentRetrievalTraceDto =
             serde_json::from_value(legacy).expect("deserialize legacy trace");
         assert!(parsed_legacy.packet_claim_profile_telemetry.is_none());
+
+        // A contract-version-1 telemetry payload predates the loader counters. It still reads,
+        // and it reads as "nothing refused" rather than as unknown, so a stored v1 trace keeps
+        // its meaning next to a v2 one.
+        let v1_shaped: PacketClaimProfileTelemetryDto = serde_json::from_value(serde_json::json!({
+            "contract_version": 1,
+            "registered_profiles": 20,
+            "contracted_profiles": 4,
+            "pending_profiles": 16,
+            "pending_ratchet": 16,
+            "citations_considered": 1,
+            "profiles_fired": 0,
+            "profiles_skipped_invalid": 0,
+        }))
+        .expect("deserialize a contract-version-1 telemetry payload");
+        assert_eq!(v1_shaped.contract_version, 1);
+        assert_eq!(v1_shaped.rejected_profiles, 0);
+        assert_eq!(v1_shaped.rejected_reasons, Vec::<String>::new());
+        assert_eq!(v1_shaped.registry_error, None);
     }
 
     #[test]

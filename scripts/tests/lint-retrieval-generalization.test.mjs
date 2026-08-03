@@ -380,6 +380,13 @@ test("the full hostile matrix shares one policy load and never writes into the c
   for (const fileName of ["search_plan.rs", "search_scoring.rs", "search_terms.rs"]) {
     write(rustRoot, fileName, "pub fn neutral_default_surface() {}\n");
   }
+  // The claim-profile registry is a required production *data* file: the `.rs` walk never
+  // reaches it, so the lint seeds it by name and refuses to run when it is absent.
+  write(
+    rustRoot,
+    path.join("agent", "data", "claim_profiles.v2.json"),
+    '{ "schema_version": 2, "pending_ratchet": 0, "profiles": [] }\n',
+  );
   write(retrievalRoot, "lib.rs", "pub fn neutral_retrieval_surface() {}\n");
   write(
     extraRustRoot,
@@ -1168,19 +1175,33 @@ function syntheticInventory() {
   };
 }
 
+function syntheticBurnDownEntry(profile) {
+  return {
+    profile,
+    issue: "https://github.com/TheGreenCedar/CodeStory/issues/1674",
+    evidence:
+      `Measured fire triple for ${profile}: fires on the fitted family, fires on a second `
+      + "file type with a different claim, and measures zero on the helper.",
+  };
+}
+
 function syntheticClaimProfileRatchet() {
   return {
-    file: "crates/codestory-runtime/src/agent/packet_claim_profiles.rs",
-    declaration: "SourceClaimProductProfile::pending(",
+    file: "crates/codestory-runtime/src/agent/data/claim_profiles.v2.json",
+    declaration: '"status": "pending_migration"',
     count: 3,
+    ratchet_ceiling: 5,
     issue: "https://github.com/TheGreenCedar/CodeStory/issues/1573",
     reason: PENDING_SURFACE_REASON,
+    burn_down: [
+      syntheticBurnDownEntry("example-one"),
+      syntheticBurnDownEntry("example-two"),
+    ],
   };
 }
 
 function syntheticProfileRegistry(pendingCount) {
-  return "SourceClaimProductProfile::pending(SourceClaimProfile::Example),\n"
-    .repeat(pendingCount);
+  return '{ "status": "pending_migration" },\n'.repeat(pendingCount);
 }
 
 test("an exact pending inventory reports no totals problem", () => {
@@ -1249,4 +1270,97 @@ test("a malformed claim-profile ratchet fails closed", () => {
       /pending_claim_profiles must declare/u,
     );
   }
+});
+
+test("the claim-profile ratchet cannot be declared above its own ceiling", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  for (const ceiling of [declared.count - 1, undefined, "5", 5.5]) {
+    assert.match(
+      pendingClaimProfileProblem({ ...declared, ratchet_ceiling: ceiling }, registry) ?? "",
+      /must declare ratchet_ceiling as an integer at or above count/u,
+    );
+  }
+});
+
+test("every profile between the ceiling and the count needs a burn-down entry", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = (count) => () => syntheticProfileRegistry(count);
+
+  // Lowering the count without recording the migration that lowered it fails.
+  assert.match(
+    pendingClaimProfileProblem({ ...declared, count: 2 }, registry(2)) ?? "",
+    /ratchet_ceiling 5 and count 2 but lists 2 burn_down entr\(ies\)/u,
+  );
+  // So does deleting a recorded migration to make room for a new uncontracted profile.
+  assert.match(
+    pendingClaimProfileProblem(
+      { ...declared, burn_down: [syntheticBurnDownEntry("example-one")] },
+      registry(declared.count),
+    ) ?? "",
+    /ratchet_ceiling 5 and count 3 but lists 1 burn_down entr\(ies\)/u,
+  );
+  // A ledger that is not a ledger fails before the arithmetic does.
+  assert.match(
+    pendingClaimProfileProblem({ ...declared, burn_down: undefined }, registry(declared.count))
+      ?? "",
+    /must declare burn_down as the ledger of migrations/u,
+  );
+});
+
+test("a burn-down entry without measured evidence and an owning issue fails", () => {
+  const declared = syntheticClaimProfileRatchet();
+  const registry = () => syntheticProfileRegistry(declared.count);
+  const good = syntheticBurnDownEntry("example-one");
+  for (
+    const broken of [
+      { ...good, evidence: "measured" },
+      { ...good, evidence: undefined },
+      { ...good, profile: "" },
+      { ...good, issue: "https://example.com/issues/1" },
+      "example-one",
+      null,
+    ]
+  ) {
+    assert.match(
+      pendingClaimProfileProblem(
+        { ...declared, burn_down: [broken, syntheticBurnDownEntry("example-two")] },
+        registry,
+      ) ?? "",
+      /needs the profile it retired, the issue that retired it, and at least \d+ characters of measured evidence/u,
+    );
+  }
+
+  assert.match(
+    pendingClaimProfileProblem(
+      {
+        ...declared,
+        burn_down: [
+          syntheticBurnDownEntry("example-one"),
+          syntheticBurnDownEntry("example-one"),
+        ],
+      },
+      registry,
+    ) ?? "",
+    /lists example-one twice; one migration is one entry/u,
+  );
+});
+
+test("the shipped claim-profile ratchet is the shipped registry document", () => {
+  // The synthetic cases above prove the rule; this one proves the rule is pointed at the
+  // registry that actually ships, so moving the profiles to data cannot leave the ratchet
+  // counting a declaration no production file spells any more.
+  const inventory = JSON.parse(
+    fs.readFileSync(
+      path.join(repositoryRoot, "scripts", "retrieval-generalization-pending.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    pendingClaimProfileProblem(
+      inventory.pending_claim_profiles,
+      (file) => fs.readFileSync(path.join(repositoryRoot, file), "utf8"),
+    ),
+    null,
+  );
 });

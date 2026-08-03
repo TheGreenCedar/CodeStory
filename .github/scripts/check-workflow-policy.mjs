@@ -156,7 +156,9 @@ export function retrievalGeneralizationSuitePolicyViolations(
     existsSync: 1,
     mkdirSync: 6,
     mkdtempSync: 1,
-    readFileSync: 4,
+    // Two of these read the shipped pending inventory and the registry document it points at,
+    // so the claim-profile ratchet is checked against the tree that ships, not a synthetic one.
+    readFileSync: 6,
     readdirSync: 4,
     readlinkSync: 1,
     rmSync: 1,
@@ -170,8 +172,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
     );
   }
   const fixtureFilesystemShapeIsExact =
-    fsReferenceCount === 21
-    && filesystemMemberReferences.length === 19
+    fsReferenceCount === 23
+    && filesystemMemberReferences.length === 21
     && Object.entries(expectedFilesystemMemberCounts).every(
       ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
     )
@@ -199,11 +201,11 @@ export function retrievalGeneralizationSuitePolicyViolations(
     "taskRoot",
   ]);
   const syntheticWritesStayInRegisteredRoots =
-    writeReferenceCount === 14
+    writeReferenceCount === 15
     && writeFirstArguments.length === writeReferenceCount
     && writeFirstArguments.every((root) => registeredWriteRoots.has(root));
   const fixturePathReferenceShapeIsExact =
-    repositoryRootReferenceCount === 12
+    repositoryRootReferenceCount === 14
     && fixtureRootReferenceCount === 10
     && productionRepositoryRootReferenceCount === 4;
   const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;

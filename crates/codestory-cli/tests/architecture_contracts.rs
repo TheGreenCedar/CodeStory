@@ -1647,19 +1647,36 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
     // run in the shipped build and skip the profile it rejects.
     let profiles = read("crates/codestory-runtime/src/agent/packet_claim_profiles.rs");
     let production = production_source_prefix(&profiles);
-    assert!(
-        !production.contains("debug_assert"),
-        "claim-profile contract validation must not be compiled out of release builds"
-    );
+    let registry = read("crates/codestory-runtime/src/agent/packet_claim_profile_registry.rs");
+    let registry_production = production_source_prefix(&registry);
+    for source in [&production, &registry_production] {
+        assert!(
+            !source.contains("debug_assert"),
+            "claim-profile contract validation must not be compiled out of release builds"
+        );
+    }
     for required in [
-        "-> Result<(), SourceClaimProfileContractViolation>",
-        "enum SourceClaimProfileContractViolation",
         "telemetry.record_profile_skipped(profile_id, violation.code());",
-        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+        // The registry is versioned data now, and the loader is the only way in.
+        "include_str!(\"data/claim_profiles.v2.json\")",
     ] {
         assert!(
             production.contains(required),
             "packet claim-profile registry must keep runtime validate-or-skip: missing {required}"
+        );
+    }
+    for required in [
+        "-> Result<(), ClaimProfileContractViolation>",
+        "enum ClaimProfileContractViolation",
+        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize",
+        // Every load failure removes profiles; none may add one.
+        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::Malformed)",
+        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::SchemaVersionMismatch)",
+        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::RatchetAboveCeiling)",
+    ] {
+        assert!(
+            registry_production.contains(required),
+            "packet claim-profile loader must stay typed and fail closed: missing {required}"
         );
     }
 

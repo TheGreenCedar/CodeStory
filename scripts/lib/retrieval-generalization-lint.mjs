@@ -166,6 +166,13 @@ export function pendingInventoryTotalsProblem(inventory) {
 // The inventory states how many are left and the lint counts the declarations,
 // so a new uncontracted profile cannot land without raising a stated number and
 // migrating one cannot land without lowering it.
+//
+// `count` alone is a number somebody can retype. `ratchet_ceiling` is the
+// high-water this burn-down started from, and `burn_down` has to name one
+// evidence-backed migration for every profile between the ceiling and the
+// count. That makes the fall auditable in both directions: lowering the count
+// without adding a ledger entry fails, and quietly deleting a ledger entry to
+// make room for a new uncontracted profile fails too.
 export function pendingClaimProfileProblem(declared, readSource) {
   if (
     typeof declared !== "object" || declared == null || Array.isArray(declared)
@@ -180,6 +187,40 @@ export function pendingClaimProfileProblem(declared, readSource) {
     return "pending_claim_profiles must declare file, declaration, a non-negative count, a "
       + `reason of at least ${pendingSurfaceReasonFloor} characters, and the issue tracking the `
       + "migration";
+  }
+  if (!Number.isInteger(declared.ratchet_ceiling) || declared.ratchet_ceiling < declared.count) {
+    return "pending_claim_profiles must declare ratchet_ceiling as an integer at or above "
+      + `count; got ${JSON.stringify(declared.ratchet_ceiling)} against ${declared.count}`;
+  }
+  const ledger = declared.burn_down;
+  if (!Array.isArray(ledger)) {
+    return "pending_claim_profiles must declare burn_down as the ledger of migrations that "
+      + "carried the count down from ratchet_ceiling";
+  }
+  const retired = new Set();
+  for (const entry of ledger) {
+    if (
+      typeof entry !== "object" || entry == null || Array.isArray(entry)
+      || typeof entry.profile !== "string" || entry.profile.trim().length === 0
+      || typeof entry.evidence !== "string"
+      || entry.evidence.trim().length < pendingSurfaceReasonFloor
+      || typeof entry.issue !== "string"
+      || !pendingSurfaceIssuePattern.test(entry.issue.trim())
+    ) {
+      return "every pending_claim_profiles.burn_down entry needs the profile it retired, the "
+        + `issue that retired it, and at least ${pendingSurfaceReasonFloor} characters of `
+        + "measured evidence";
+    }
+    if (retired.has(entry.profile.trim())) {
+      return `pending_claim_profiles.burn_down lists ${entry.profile.trim()} twice; one `
+        + "migration is one entry";
+    }
+    retired.add(entry.profile.trim());
+  }
+  if (ledger.length !== declared.ratchet_ceiling - declared.count) {
+    return `pending_claim_profiles declares ratchet_ceiling ${declared.ratchet_ceiling} and `
+      + `count ${declared.count} but lists ${ledger.length} burn_down entr(ies); the ratchet `
+      + "only falls through migrations this ledger accounts for";
   }
   const source = readSource(declared.file);
   if (source == null) {
@@ -543,6 +584,34 @@ const guardedRequiredProductionOnlyFiles = [
   path.join(repoRoot, "crates", "codestory-runtime", "src", "search_terms.rs"),
 ];
 
+// Production data documents that are not Rust. The directory walk collects
+// `.rs` only, so a claim registry that moved out of a Rust array and into a
+// checked-in document would leave the scan the day it moved -- and the document
+// is exactly where a corpus symbol would next be spelled. These are seeded by
+// name and carry the same banned-pattern pass as the code beside them.
+const requiredProductionDataFiles = [
+  path.join(
+    productionRepoRoot,
+    "crates",
+    "codestory-runtime",
+    "src",
+    "agent",
+    "data",
+    "claim_profiles.v2.json",
+  ),
+];
+const guardedRequiredProductionDataFiles = [
+  path.join(
+    repoRoot,
+    "crates",
+    "codestory-runtime",
+    "src",
+    "agent",
+    "data",
+    "claim_profiles.v2.json",
+  ),
+];
+
 // Term extraction decides which words become queries, so a word table there is
 // the injection this lint exists to catch. The language-level stopword list is
 // the one table that cannot encode a repository: it names question filler.
@@ -566,7 +635,7 @@ const configuredDefaultScanRoots = defaultScanRoots == null
 // what the guarded-path dump declares by name, and a dump that names a file the
 // tree no longer has would hand CI a trigger for a path that cannot fire.
 const missingRequiredPaths = usesDefaultScanRoots && defaultScanRoots == null
-  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
+  ? [...requiredScanDirs, ...requiredProductionOnlyFiles, ...requiredProductionDataFiles]
     .filter((requiredPath) => !existsSync(requiredPath))
   : [];
 if (missingRequiredPaths.length > 0) {
@@ -656,6 +725,7 @@ function guardedPathDocument() {
     ]),
     productionFiles: asRepoPaths([
       ...guardedRequiredProductionOnlyFiles,
+      ...guardedRequiredProductionDataFiles,
       benchmarkEvalProbeSourcePath,
     ]),
     // Corpus the bans are derived from. All three eval roots, not just the task
@@ -3275,6 +3345,11 @@ const observedPendingSurfaces = new Map();
 const scanFiles = new Set();
 for (const root of scanDirs) {
   for (const filePath of walkRustProductionFiles(root, { excludeCfgTestModuleBodies: true })) {
+    scanFiles.add(filePath);
+  }
+}
+if (usesDefaultScanRoots && defaultScanRoots == null) {
+  for (const filePath of requiredProductionDataFiles) {
     scanFiles.add(filePath);
   }
 }

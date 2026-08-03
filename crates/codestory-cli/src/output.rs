@@ -2441,7 +2441,7 @@ fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -
         .find(|entry| entry.source == PacketClaimSourceDto::SourceProfile)
         .map(|entry| entry.claims)
         .unwrap_or(0);
-    format!(
+    let mut summary = format!(
         "claim profiles: contract_version={} fired={}/{} skipped_invalid={} pending={}/{} citations_considered={} source_profile_claims={}",
         telemetry.contract_version,
         telemetry.profiles_fired,
@@ -2451,7 +2451,23 @@ fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -
         telemetry.pending_ratchet,
         telemetry.citations_considered,
         source_claims,
-    )
+    );
+    // The registry loads from checked-in data and fails closed, so a refusal answers from a
+    // smaller registry than the one this build ships. Reported only when it happened: a
+    // `rejected=0` on every packet is noise, and a silent refusal is the failure this exists for.
+    if telemetry.rejected_profiles > 0 {
+        summary.push_str(&format!(" rejected={}", telemetry.rejected_profiles));
+        if !telemetry.rejected_reasons.is_empty() {
+            summary.push_str(&format!(
+                " rejected_reasons={}",
+                telemetry.rejected_reasons.join(",")
+            ));
+        }
+    }
+    if let Some(error) = telemetry.registry_error.as_deref() {
+        summary.push_str(&format!(" registry_error={error}"));
+    }
+    summary
 }
 
 fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'static str {
@@ -5050,11 +5066,14 @@ mod tests {
 
     fn claim_profile_telemetry_fixture() -> PacketClaimProfileTelemetryDto {
         PacketClaimProfileTelemetryDto {
-            contract_version: 1,
+            contract_version: 2,
             registered_profiles: 20,
-            contracted_profiles: 4,
-            pending_profiles: 16,
-            pending_ratchet: 16,
+            contracted_profiles: 7,
+            pending_profiles: 13,
+            pending_ratchet: 13,
+            rejected_profiles: 0,
+            rejected_reasons: Vec::new(),
+            registry_error: None,
             citations_considered: 3,
             profiles_fired: 2,
             // A healthy packet routinely reports skips: a profile whose runtime contract does
@@ -5198,8 +5217,12 @@ mod tests {
         );
         // Fire rates stay observable, but as an observation about the run rather than a gap.
         assert!(
-            markdown.contains("claim profiles: contract_version=1 fired=2/20 skipped_invalid=1"),
+            markdown.contains("claim profiles: contract_version=2 fired=2/20 skipped_invalid=1"),
             "claim-profile fire rates must be reported under what_was_checked:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains("rejected=") && !markdown.contains("registry_error="),
+            "a registry that loaded whole must not report a loader refusal:\n{markdown}"
         );
         assert_order(&markdown, "what_was_checked:", "gaps_uncertainty:");
         let gaps_block = markdown
@@ -5324,6 +5347,38 @@ mod tests {
             agent_gap_notes(&answer),
             vec![format!("trace annotation: {text}")],
             "a gap-kind annotation must be reported verbatim as an evidence gap"
+        );
+    }
+
+    #[test]
+    fn a_refused_claim_profile_registry_is_visible_to_the_operator() {
+        // The registry loads from checked-in data and fails closed. A refusal answers from a
+        // smaller registry than this build ships, which is indistinguishable from "the profiles
+        // ran and stayed quiet" unless the refusal itself is printed.
+        let mut answer = well_grounded_packet_answer();
+        let mut telemetry = claim_profile_telemetry_fixture();
+        telemetry.rejected_profiles = 2;
+        telemetry.rejected_reasons = vec![
+            "unknown_profile_id".to_string(),
+            "missing_contract".to_string(),
+        ];
+        telemetry.registry_error = Some("schema_version_mismatch".to_string());
+        answer.retrieval_trace.packet_claim_profile_telemetry = Some(telemetry);
+
+        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
+        assert!(
+            markdown.contains(
+                "rejected=2 rejected_reasons=unknown_profile_id,missing_contract \
+                 registry_error=schema_version_mismatch"
+            ),
+            "a refused registry must be reported under what_was_checked:\n{markdown}"
+        );
+        // It is an observation about the run, not an evidence gap: routing it through the gap
+        // channel would downgrade confidence by substring match, which EV-6 established as wrong.
+        assert!(
+            agent_gap_notes(&answer).is_empty(),
+            "a loader refusal must not be published as an evidence annotation: {:?}",
+            agent_gap_notes(&answer)
         );
     }
 
