@@ -535,8 +535,13 @@ mod tests {
     use crate::scip_index::{
         SCIP_DEFINITION_ROLE, SCIP_IMPORTED_PROOF_PROVENANCE, SCIP_INDEX_FILE,
         SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE, SCIP_REFERENCE_ROLE, ScipPackageIdentity,
-        ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex, write_scip_index_marker,
+        ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex,
+        emit_scip_artifacts_from_store, write_scip_index_marker,
     };
+    use codestory_contracts::graph::{
+        Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty,
+    };
+    use codestory_store::{FileInfo, FileRole, Store};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
@@ -1307,6 +1312,201 @@ mod tests {
                 reason: "scip_stub".into()
             },
             "absence keeps its existing reason; only present-but-damaged is new"
+        );
+    }
+
+    /// Two unrelated `Handler` symbols, in different files and on different
+    /// graph nodes, each with its own outgoing and incoming call.
+    ///
+    /// `src/alpha/handler.rs`: `Handler` (node 2) calls `alpha_route`
+    /// (node 3); `alpha_caller` (node 4) calls `Handler`; `alpha_route` also
+    /// calls `alpha_leaf` (node 9), an edge in the anchor's own file that the
+    /// anchor node is not an endpoint of.
+    /// `src/beta/handler.rs`: `Handler` (node 6) calls `beta_route`
+    /// (node 7); `beta_caller` (node 8) calls `Handler`.
+    ///
+    /// The display-name collision is real, not hand-written: the emitter
+    /// projects `node.qualified_name` when it is set and `node.serialized_name`
+    /// otherwise, so two same-named nodes without qualified names publish one
+    /// display name across two files.
+    fn shared_display_name_store(project: &TempDir) -> std::path::PathBuf {
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        let mut nodes = Vec::new();
+        for (file_id, relative_path) in
+            [(1_i64, "src/alpha/handler.rs"), (5, "src/beta/handler.rs")]
+        {
+            storage
+                .insert_file(&FileInfo {
+                    id: file_id,
+                    path: project.path().join(relative_path),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 90,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert file");
+            nodes.push(Node {
+                id: NodeId(file_id),
+                kind: NodeKind::FILE,
+                serialized_name: relative_path.to_string(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: None,
+                start_line: Some(1),
+                start_col: Some(0),
+                end_line: Some(90),
+                end_col: Some(0),
+            });
+        }
+        for (id, file_id, name, line) in [
+            (2_i64, 1_i64, "Handler", 10_u32),
+            (3, 1, "alpha_route", 30),
+            (4, 1, "alpha_caller", 50),
+            (6, 5, "Handler", 10),
+            (7, 5, "beta_route", 30),
+            (8, 5, "beta_caller", 50),
+            (9, 1, "alpha_leaf", 70),
+        ] {
+            nodes.push(Node {
+                id: NodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name.to_string(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(NodeId(file_id)),
+                start_line: Some(line),
+                start_col: Some(0),
+                end_line: Some(line + 5),
+                end_col: Some(0),
+            });
+        }
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+        let edges = [
+            (1_i64, 2_i64, 3_i64, 1_i64),
+            (2, 4, 2, 1),
+            (3, 6, 7, 5),
+            (4, 8, 6, 5),
+            (5, 3, 9, 1),
+        ]
+        .into_iter()
+        .map(|(edge_id, source, target, file_id)| Edge {
+            id: EdgeId(edge_id),
+            source: NodeId(source),
+            target: NodeId(target),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(file_id)),
+            line: Some(12),
+            resolved_source: Some(NodeId(source)),
+            resolved_target: Some(NodeId(target)),
+            confidence: Some(1.0),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: Some(format!("call:{source}->{target}")),
+            candidate_targets: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+        storage.insert_edges_batch(&edges).expect("insert edges");
+        drop(storage);
+        storage_path
+    }
+
+    #[test]
+    fn stage_two_adjacency_follows_the_anchor_node_not_a_shared_display_name() {
+        let project = TempDir::new().expect("project");
+        let storage_path = shared_display_name_store(&project);
+        let root = TempDir::new().expect("root");
+        let layout = adjacency_layout(&root);
+        let project_dir = layout.scip_project_dir("generation-a");
+        emit_scip_artifacts_from_store(&storage_path, &project_dir, "generation-a")
+            .expect("emit scip")
+            .expect("revision");
+
+        let index = load_scip_symbols(&project_dir)
+            .expect("load scip")
+            .expect("index");
+        let handlers = index
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.symbol == "Handler")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|symbol| (
+                    symbol.node_id.clone().unwrap_or_default(),
+                    symbol.path.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2".to_string(), "src/alpha/handler.rs".to_string()),
+                ("6".to_string(), "src/beta/handler.rs".to_string()),
+            ],
+            "the fixture only pins node identity if the artifact really carries \
+             one display name on two nodes in two files: {:#?}",
+            index.symbols
+        );
+        assert_eq!(
+            index
+                .proofs
+                .iter()
+                .filter(|proof| proof.is_reference())
+                .map(|proof| (
+                    proof.node_id.clone().unwrap_or_default(),
+                    proof.target_node_id.clone().unwrap_or_default()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2".to_string(), "3".to_string()),
+                ("3".to_string(), "9".to_string()),
+                ("4".to_string(), "2".to_string()),
+                ("6".to_string(), "7".to_string()),
+                ("8".to_string(), "6".to_string()),
+            ],
+            "every reference the anchor must not pick up has to be admissible \
+             on its own, so only the anchor's node identity can separate them: \
+             {:#?}",
+            index.proofs
+        );
+
+        let mut anchor = CandidateHit::with_source(
+            "src/alpha/handler.rs",
+            Some("Handler".into()),
+            0.9,
+            CandidateSource::Lexical,
+        );
+        anchor.node_id = Some("2".into());
+
+        let hits = ScipClient::expand_reference_adjacency(&layout, "generation-a", &[anchor], 8)
+            .expect("expand");
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (
+                    hit.symbol_name.clone().unwrap_or_default(),
+                    hit.node_id.clone().unwrap_or_default(),
+                    hit.file_path.clone(),
+                    hit.scip_hop_distance
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "alpha_route".to_string(),
+                    "3".to_string(),
+                    "src/alpha/handler.rs".to_string(),
+                    Some(1)
+                ),
+                (
+                    "alpha_caller".to_string(),
+                    "4".to_string(),
+                    "src/alpha/handler.rs".to_string(),
+                    Some(1)
+                ),
+            ],
+            "only references the anchor node is an endpoint of are adjacent: not \
+             those of the homonymous `Handler` on node 6, and not `alpha_route`'s \
+             own call inside the anchor's file: {hits:#?}"
         );
     }
 }
