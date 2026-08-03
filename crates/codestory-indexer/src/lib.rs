@@ -1286,6 +1286,13 @@ impl<'a> ProjectionWriter<'a> {
                     .existing_projection_file_ids
                     .contains(&exclusion.file_id)
             {
+                // This removal's affected callers are deliberately not folded
+                // into the resolution scope. A policy exclusion only ever
+                // removes a structural file, and no structural removal is yet
+                // known to strand a caller the resolution pass would repair;
+                // the plan-driven removal in `run_with_policy_exclusions` is
+                // the one that does. The store reports the callers either way,
+                // so carrying them is a one-line union once such a case exists.
                 self.storage
                     .delete_files_batch(&[exclusion.file_id])
                     .map_err(|error| anyhow!("Storage policy-exclusion cleanup error: {error}"))?;
@@ -1807,13 +1814,20 @@ impl WorkspaceIndexer {
             });
         }
 
+        // Removal clears the resolution of every surviving edge that pointed
+        // into a removed file. Those callers are not in `files_to_index`, so
+        // without carrying them forward the resolution scope would skip them
+        // and a deleted preferred definition would leave its callers dangling
+        // until the next full rebuild.
+        let mut removal_affected_caller_file_ids: HashSet<i64> = HashSet::new();
         if plan.mode == codestory_workspace::BuildMode::Incremental
             && !plan.files_to_remove.is_empty()
         {
             let cleanup_started = Instant::now();
-            storage
+            let removal = storage
                 .delete_files_batch(&plan.files_to_remove)
                 .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+            removal_affected_caller_file_ids.extend(removal.affected_caller_file_ids);
             stats.cleanup_ms = stats
                 .cleanup_ms
                 .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
@@ -1831,15 +1845,22 @@ impl WorkspaceIndexer {
         let (resolution_scope_file_ids, expanded_resolution_scope_files) =
             if plan.mode == codestory_workspace::BuildMode::Incremental {
                 let mut file_ids = Self::collect_touched_file_ids(&root, &plan.files_to_index);
+                // Expansion looks for callers unblocked by *new* definitions, so
+                // it runs against the touched set only; the removal's affected
+                // callers are unioned in afterwards and widen nothing else.
                 let expanded = Self::extend_resolution_scope_for_matching_unresolved_targets(
                     storage,
                     &mut file_ids,
                 )?;
+                file_ids.extend(removal_affected_caller_file_ids.iter().copied());
                 (file_ids, expanded)
             } else {
                 (HashSet::new(), 0)
             };
-        if had_edges || expanded_resolution_scope_files > 0 {
+        if had_edges
+            || expanded_resolution_scope_files > 0
+            || !removal_affected_caller_file_ids.is_empty()
+        {
             let resolver = resolution::ResolutionPass::new();
             let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
@@ -28039,6 +28060,257 @@ export function handler() {
                 .iter()
                 .all(|edge| edge.kind != EdgeKind::CALL || edge.target != endpoint),
             "trailing comments should not create endpoint call edges"
+        );
+        Ok(())
+    }
+
+    /// A graph shaped like a prior incremental run left it: one caller resolved
+    /// into a preferred definition, an equally-named fallback definition in a
+    /// third file, and an unrelated file whose own call never resolved.
+    struct RemovalScopeFixture {
+        caller_file_id: i64,
+        preferred_file_id: i64,
+        fallback_definition_id: NodeId,
+        caller_edge_id: EdgeId,
+        untouched_edge_id: EdgeId,
+        untouched_path: PathBuf,
+    }
+
+    fn seed_removal_scope_fixture(
+        storage: &mut Storage,
+        root: &Path,
+    ) -> Result<RemovalScopeFixture> {
+        let caller_path = root.join("caller.rs");
+        let preferred_path = root.join("preferred.rs");
+        let fallback_path = root.join("fallback.rs");
+        let untouched_path = root.join("untouched.rs");
+
+        let file_ids = [
+            &caller_path,
+            &preferred_path,
+            &fallback_path,
+            &untouched_path,
+        ]
+        .map(|path| WorkspaceIndexer::canonical_file_node_id_for_path(path));
+        let [
+            caller_file_id,
+            preferred_file_id,
+            fallback_file_id,
+            untouched_file_id,
+        ] = file_ids;
+
+        let mut nodes = Vec::new();
+        for (file_id, path) in file_ids.iter().zip([
+            &caller_path,
+            &preferred_path,
+            &fallback_path,
+            &untouched_path,
+        ]) {
+            storage.insert_file(&codestory_store::FileInfo {
+                id: *file_id,
+                path: path.clone(),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 4,
+                file_role: codestory_store::FileRole::Source,
+            })?;
+            nodes.push(Node {
+                id: NodeId(*file_id),
+                kind: NodeKind::FILE,
+                serialized_name: path.to_string_lossy().to_string(),
+                ..Default::default()
+            });
+        }
+
+        let caller_id = NodeId(910_001);
+        let call_placeholder_id = NodeId(910_002);
+        let preferred_definition_id = NodeId(920_001);
+        let fallback_definition_id = NodeId(930_001);
+        let untouched_caller_id = NodeId(940_001);
+        let untouched_placeholder_id = NodeId(940_002);
+        nodes.extend([
+            Node {
+                id: caller_id,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "use_shared_target".to_string(),
+                qualified_name: Some("use_shared_target".to_string()),
+                file_node_id: Some(NodeId(caller_file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: call_placeholder_id,
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "shared_target".to_string(),
+                start_line: Some(2),
+                ..Default::default()
+            },
+            Node {
+                id: preferred_definition_id,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "shared_target".to_string(),
+                qualified_name: Some("shared_target".to_string()),
+                file_node_id: Some(NodeId(preferred_file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: fallback_definition_id,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "shared_target".to_string(),
+                qualified_name: Some("shared_target".to_string()),
+                file_node_id: Some(NodeId(fallback_file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: untouched_caller_id,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "lonely_caller".to_string(),
+                qualified_name: Some("lonely_caller".to_string()),
+                file_node_id: Some(NodeId(untouched_file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: untouched_placeholder_id,
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "shared_target".to_string(),
+                start_line: Some(2),
+                ..Default::default()
+            },
+        ]);
+        storage.insert_nodes_batch(&nodes)?;
+
+        let caller_edge_id = EdgeId(950_001);
+        let untouched_edge_id = EdgeId(950_002);
+        storage.insert_edges_batch(&[
+            Edge {
+                id: caller_edge_id,
+                source: caller_id,
+                target: call_placeholder_id,
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(caller_file_id)),
+                resolved_target: Some(preferred_definition_id),
+                confidence: Some(0.95),
+                certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+                candidate_targets: vec![preferred_definition_id],
+                ..Default::default()
+            },
+            Edge {
+                id: untouched_edge_id,
+                source: untouched_caller_id,
+                target: untouched_placeholder_id,
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(untouched_file_id)),
+                ..Default::default()
+            },
+        ])?;
+
+        Ok(RemovalScopeFixture {
+            caller_file_id,
+            preferred_file_id,
+            fallback_definition_id,
+            caller_edge_id,
+            untouched_edge_id,
+            untouched_path,
+        })
+    }
+
+    fn resolved_target_of(storage: &Storage, edge_id: EdgeId) -> Result<Option<NodeId>> {
+        Ok(storage
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == edge_id)
+            .unwrap_or_else(|| panic!("edge {edge_id:?} must survive the run"))
+            .resolved_target)
+    }
+
+    #[test]
+    fn removing_a_preferred_definition_re_resolves_its_callers_to_a_fallback() -> Result<()> {
+        let dir = tempdir()?;
+        let mut storage = Storage::new_in_memory()?;
+        let fixture = seed_removal_scope_fixture(&mut storage, dir.path())?;
+
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: Vec::new(),
+            files_to_remove: vec![fixture.preferred_file_id],
+            existing_file_ids: HashMap::new(),
+        };
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert!(
+            stats.resolution_ran,
+            "a removal-only plan still has callers to repair"
+        );
+        assert_eq!(
+            resolved_target_of(&storage, fixture.caller_edge_id)?,
+            Some(fixture.fallback_definition_id),
+            "the caller of the removed definition must re-resolve to the surviving one"
+        );
+        assert_eq!(
+            resolved_target_of(&storage, fixture.untouched_edge_id)?,
+            None,
+            "a caller outside the removal's blast radius must stay out of scope"
+        );
+        assert_eq!(
+            stats.unresolved_calls_start, 1,
+            "the scope must be the removal's affected callers, not the whole graph"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_affected_callers_join_an_already_scoped_incremental_run() -> Result<()> {
+        let dir = tempdir()?;
+        let mut storage = Storage::new_in_memory()?;
+        let fixture = seed_removal_scope_fixture(&mut storage, dir.path())?;
+        // A real file is scheduled for indexing, so the run is scoped to it and
+        // would otherwise never look at the removal's caller file.
+        let scheduled = dir.path().join("scheduled.rs");
+        std::fs::write(
+            &scheduled,
+            "pub fn scheduled_symbol() { shared_target(); }\n",
+        )?;
+
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![scheduled.clone()],
+            files_to_remove: vec![fixture.preferred_file_id],
+            existing_file_ids: HashMap::new(),
+        };
+        WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert_eq!(
+            resolved_target_of(&storage, fixture.caller_edge_id)?,
+            Some(fixture.fallback_definition_id),
+            "a scoped incremental run must still repair the removal's callers"
+        );
+        assert_eq!(
+            resolved_target_of(&storage, fixture.untouched_edge_id)?,
+            None,
+            "the scope must not silently widen to files nothing touched"
+        );
+        assert!(
+            storage.get_file_by_path(&fixture.untouched_path)?.is_some(),
+            "the untouched file must remain in the store"
+        );
+        assert!(
+            storage.get_node(NodeId(fixture.caller_file_id))?.is_some(),
+            "the caller file must survive the removal"
         );
         Ok(())
     }

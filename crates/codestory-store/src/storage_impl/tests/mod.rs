@@ -8428,7 +8428,292 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
     let remaining_states = storage.get_callable_projection_states_for_file(file_a_id)?;
     assert_eq!(remaining_states.len(), 1);
     assert_eq!(remaining_states[0].node_id, caller_in_a.id);
+    assert_eq!(summary.affected_caller_file_ids, vec![file_a_id]);
 
+    Ok(())
+}
+
+/// File ids used by the deletion-scope fixture below.
+const REMOVAL_FIXTURE_CALLER_FILE: i64 = 1_001;
+const REMOVAL_FIXTURE_PREFERRED_FILE: i64 = 2_001;
+const REMOVAL_FIXTURE_SECOND_FILE: i64 = 3_001;
+const REMOVAL_FIXTURE_BYSTANDER_FILE: i64 = 4_001;
+const REMOVAL_FIXTURE_THIRD_FILE: i64 = 5_001;
+
+/// A caller file resolved into two removable definition files, plus a
+/// bystander file that never points at anything removable and owns a bookmark.
+fn removal_scope_fixture() -> Result<Storage, StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let definition_files = [
+        (REMOVAL_FIXTURE_PREFERRED_FILE, "src/preferred.rs"),
+        (REMOVAL_FIXTURE_SECOND_FILE, "src/second.rs"),
+        (REMOVAL_FIXTURE_THIRD_FILE, "src/third.rs"),
+    ];
+    for (file_id, path) in [
+        (REMOVAL_FIXTURE_CALLER_FILE, "src/caller.rs"),
+        (REMOVAL_FIXTURE_BYSTANDER_FILE, "src/bystander.rs"),
+    ]
+    .into_iter()
+    .chain(definition_files)
+    {
+        storage.insert_file(&FileInfo {
+            id: file_id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        })?;
+    }
+
+    let mut nodes = Vec::new();
+    for (file_id, path) in [
+        (REMOVAL_FIXTURE_CALLER_FILE, "src/caller.rs"),
+        (REMOVAL_FIXTURE_BYSTANDER_FILE, "src/bystander.rs"),
+    ]
+    .into_iter()
+    .chain(definition_files)
+    {
+        nodes.push(Node {
+            id: NodeId(file_id),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string(),
+            ..Default::default()
+        });
+    }
+    // One caller and one call-site placeholder per removable definition.
+    let mut edges = Vec::new();
+    for (index, (file_id, _)) in definition_files.iter().enumerate() {
+        let caller_id = 10_001 + (index as i64) * 10;
+        let placeholder_id = caller_id + 1;
+        let definition_id = file_id + 100;
+        nodes.push(Node {
+            id: NodeId(caller_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("caller_{index}"),
+            file_node_id: Some(NodeId(REMOVAL_FIXTURE_CALLER_FILE)),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(placeholder_id),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: format!("target_{index}"),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(definition_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("target_{index}"),
+            file_node_id: Some(NodeId(*file_id)),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(30_001 + index as i64),
+            source: NodeId(caller_id),
+            target: NodeId(placeholder_id),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(REMOVAL_FIXTURE_CALLER_FILE)),
+            resolved_target: Some(NodeId(definition_id)),
+            confidence: Some(0.91),
+            certainty: Some(ResolutionCertainty::Certain),
+            candidate_targets: vec![NodeId(definition_id)],
+            ..Default::default()
+        });
+    }
+    // The bystander resolves only inside itself, so no removal can touch it.
+    nodes.push(Node {
+        id: NodeId(40_101),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "bystander_caller".to_string(),
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        ..Default::default()
+    });
+    nodes.push(Node {
+        id: NodeId(40_102),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "bystander_target".to_string(),
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        ..Default::default()
+    });
+    edges.push(Edge {
+        id: EdgeId(30_900),
+        source: NodeId(40_101),
+        target: NodeId(40_102),
+        kind: EdgeKind::CALL,
+        file_node_id: Some(NodeId(REMOVAL_FIXTURE_BYSTANDER_FILE)),
+        resolved_target: Some(NodeId(40_102)),
+        confidence: Some(0.99),
+        certainty: Some(ResolutionCertainty::Certain),
+        candidate_targets: vec![NodeId(40_102)],
+        ..Default::default()
+    });
+
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let category_id = storage.create_bookmark_category("Favorites")?;
+    storage.add_bookmark(category_id, NodeId(40_102), Some("user note"))?;
+    Ok(storage)
+}
+
+fn bookmarked_node_ids(storage: &Storage) -> Result<Vec<i64>, StorageError> {
+    let mut stmt = storage
+        .conn
+        .prepare("SELECT node_id FROM bookmark_node ORDER BY node_id")?;
+    let mut rows = stmt.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        ids.push(row.get::<_, i64>(0)?);
+    }
+    Ok(ids)
+}
+
+fn commits_during_removal(file_ids: &[i64]) -> Result<usize, StorageError> {
+    let mut storage = removal_scope_fixture()?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&commits);
+    storage.conn.commit_hook(Some(move || {
+        observed.fetch_add(1, AtomicOrdering::SeqCst);
+        false
+    }))?;
+    storage.delete_files_batch(file_ids)?;
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+    for file_id in file_ids {
+        assert!(
+            storage.get_node(NodeId(*file_id))?.is_none(),
+            "the measured batch must really have removed file {file_id}"
+        );
+    }
+    Ok(commits.load(AtomicOrdering::SeqCst))
+}
+
+#[test]
+fn batch_removal_reports_only_the_callers_it_unresolved() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+
+    let removal = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_SECOND_FILE])?;
+
+    assert_eq!(
+        removal.affected_caller_file_ids,
+        vec![REMOVAL_FIXTURE_CALLER_FILE],
+        "the caller file that lost two resolutions must be reported exactly once, \
+         and the bystander must not appear"
+    );
+    let resolved_by_edge = storage
+        .get_edges()?
+        .into_iter()
+        .map(|edge| (edge.id, edge.resolved_target))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_001)),
+        Some(&None),
+        "the call into the first removed file must have lost its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_002)),
+        Some(&None),
+        "the call into the second removed file must have lost its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_003)),
+        Some(&Some(NodeId(REMOVAL_FIXTURE_THIRD_FILE + 100))),
+        "a call into a file the batch did not remove must keep its resolution"
+    );
+    assert_eq!(
+        resolved_by_edge.get(&EdgeId(30_900)),
+        Some(&Some(NodeId(40_102))),
+        "the bystander's resolution must survive untouched"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_reports_a_removed_file_as_a_caller_of_no_one() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+
+    // Removing the definition alone reports the caller file...
+    let reported = storage.delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE])?;
+    assert_eq!(
+        reported.affected_caller_file_ids,
+        vec![REMOVAL_FIXTURE_CALLER_FILE]
+    );
+
+    // ...but removing the caller in the same batch leaves nothing to re-resolve.
+    let mut storage = removal_scope_fixture()?;
+    let removal = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_CALLER_FILE])?;
+    assert_eq!(
+        removal.affected_caller_file_ids,
+        Vec::<i64>::new(),
+        "a file removed by the same batch cannot be an affected caller"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_commits_and_invalidates_once_per_batch() -> Result<(), StorageError> {
+    let single = commits_during_removal(&[REMOVAL_FIXTURE_PREFERRED_FILE])?;
+    let triple = commits_during_removal(&[
+        REMOVAL_FIXTURE_PREFERRED_FILE,
+        REMOVAL_FIXTURE_SECOND_FILE,
+        REMOVAL_FIXTURE_THIRD_FILE,
+    ])?;
+
+    assert!(single > 0, "the measurement must observe real commits");
+    assert_eq!(
+        single, triple,
+        "removal cost per batch must not scale with the number of removed files: \
+         one hoisted transaction plus one snapshot invalidation"
+    );
+    Ok(())
+}
+
+#[test]
+fn batch_removal_rolls_back_every_file_when_one_fails() -> Result<(), StorageError> {
+    let mut storage = removal_scope_fixture()?;
+    storage.conn.execute_batch(&format!(
+        "CREATE TEMP TRIGGER refuse_second_removal
+         BEFORE DELETE ON file
+         WHEN OLD.id = {REMOVAL_FIXTURE_SECOND_FILE}
+         BEGIN SELECT RAISE(ABORT, 'refuse this removal'); END;"
+    ))?;
+    let before = storage.get_stats()?;
+    let bookmarks_before = bookmarked_node_ids(&storage)?;
+    assert_eq!(bookmarks_before, vec![40_102]);
+
+    let error = storage
+        .delete_files_batch(&[REMOVAL_FIXTURE_PREFERRED_FILE, REMOVAL_FIXTURE_SECOND_FILE])
+        .expect_err("the trigger must fail the batch");
+    assert!(
+        format!("{error}").contains("refuse this removal"),
+        "unexpected failure: {error}"
+    );
+
+    assert!(
+        storage
+            .get_node(NodeId(REMOVAL_FIXTURE_PREFERRED_FILE))?
+            .is_some(),
+        "the first file's removal must roll back with the failed batch"
+    );
+    assert!(
+        storage
+            .get_node(NodeId(REMOVAL_FIXTURE_PREFERRED_FILE + 100))?
+            .is_some(),
+        "the first file's symbols must roll back with the failed batch"
+    );
+    assert_eq!(
+        storage.get_stats()?.node_count,
+        before.node_count,
+        "a failed batch must leave the graph exactly as it was"
+    );
+    assert_eq!(
+        bookmarked_node_ids(&storage)?,
+        bookmarks_before,
+        "a failed batch must not destroy user-authored bookmarks"
+    );
     Ok(())
 }
 
@@ -9022,6 +9307,130 @@ fn test_trail_production_scope_excludes_test_callers() -> Result<(), StorageErro
     assert_eq!(include_tests.edges.len(), 1);
 
     Ok(())
+}
+
+#[test]
+fn trail_production_scope_honours_every_classified_test_or_bench_marker() -> Result<(), StorageError>
+{
+    // Paths the file-role classifier already calls Test or Benchmark. Caller
+    // scoping used to carry its own shorter marker list, so these leaked into
+    // production-only trails even though the same store classified their files
+    // as tests or benchmarks.
+    let caller_files = [
+        "crates/engine/benchmarks/run.rs",
+        "crates/engine/benchmark/run.rs",
+        "src/spec/thing.rs",
+        "src/fixtures/thing.rs",
+        "pkg/util_test.py",
+        "web/widget.spec.ts",
+        "app/__test__/one.ts",
+        "node_modules/dep/test/dep.js",
+    ];
+    for path in caller_files {
+        assert!(
+            FileRole::path_is_test_or_bench(path),
+            "{path} must be recognised as a test or benchmark path"
+        );
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    let mut nodes = vec![
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ];
+    let mut edges = Vec::new();
+    for (index, path) in caller_files.iter().enumerate() {
+        let file_id = 200 + index as i64;
+        let caller_id = 300 + index as i64;
+        let placeholder_id = 400 + index as i64;
+        nodes.push(Node {
+            id: NodeId(file_id),
+            kind: NodeKind::FILE,
+            serialized_name: (*path).to_string(),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(caller_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("caller_{index}"),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+        nodes.push(Node {
+            id: NodeId(placeholder_id),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "target".to_string(),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+        edges.push(Edge {
+            id: EdgeId(500 + index as i64),
+            source: NodeId(caller_id),
+            target: NodeId(placeholder_id),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(1)),
+            file_node_id: Some(NodeId(file_id)),
+            ..Default::default()
+        });
+    }
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+
+    let config = |caller_scope| TrailConfig {
+        root_id: NodeId(1),
+        mode: TrailMode::Neighborhood,
+        target_id: None,
+        depth: 1,
+        direction: TrailDirection::Incoming,
+        caller_scope,
+        edge_filter: vec![EdgeKind::CALL],
+        show_utility_calls: true,
+        node_filter: Vec::new(),
+        max_nodes: 50,
+    };
+
+    let production_only = storage.get_trail(&config(TrailCallerScope::ProductionOnly))?;
+    let leaked = production_only
+        .edges
+        .iter()
+        .map(|edge| edge.id)
+        .collect::<Vec<_>>();
+    assert!(
+        leaked.is_empty(),
+        "test and benchmark callers leaked into a production-only trail: {leaked:?}"
+    );
+
+    let include_tests = storage.get_trail(&config(TrailCallerScope::IncludeTestsAndBenches))?;
+    assert_eq!(
+        include_tests.edges.len(),
+        caller_files.len(),
+        "every caller must still be reachable when tests and benches are included"
+    );
+    Ok(())
+}
+
+#[test]
+fn classified_role_precedence_does_not_hide_a_vendored_test_from_caller_scoping() {
+    // Role precedence answers "what is this file for" and reports the stronger
+    // Vendor role; caller scoping answers "may this caller count as production"
+    // and must still refuse. One rule set, two deliberately different questions.
+    let vendored_test = "node_modules/dep/test/dep.js";
+    assert_eq!(
+        FileRole::classify_path(Path::new(vendored_test)),
+        FileRole::Vendor
+    );
+    assert!(FileRole::path_is_test_or_bench(vendored_test));
 }
 
 #[test]
