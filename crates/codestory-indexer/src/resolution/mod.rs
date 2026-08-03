@@ -1417,7 +1417,7 @@ fn is_csharp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::CSHARP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::csharp::MEMBER_CALLSITE_MARKER)
     })
 }
 

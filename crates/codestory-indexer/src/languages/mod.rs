@@ -18,6 +18,7 @@
 
 pub(crate) mod c;
 pub(crate) mod cpp;
+pub(crate) mod csharp;
 pub(crate) mod go;
 pub(crate) mod java;
 pub(crate) mod javascript;
@@ -95,6 +96,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     go::EXTRACTION,
     ruby::EXTRACTION,
     php::EXTRACTION,
+    csharp::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.
