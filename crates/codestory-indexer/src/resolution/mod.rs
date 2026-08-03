@@ -1369,7 +1369,7 @@ fn is_dart_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::DART_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::dart::MEMBER_CALLSITE_MARKER)
     })
 }
 

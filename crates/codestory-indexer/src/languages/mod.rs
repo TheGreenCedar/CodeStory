@@ -16,6 +16,7 @@
 //! `registry_rows_do_not_shadow_unmigrated_languages` proves it — and the last
 //! package to land deletes the residual arms entirely.
 
+pub(crate) mod dart;
 pub(crate) mod kotlin;
 
 use std::sync::OnceLock;
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, dart::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {
@@ -235,6 +236,31 @@ mod tests {
         assert_eq!(
             extraction_for_ext("kts").map(|row| row.language_name),
             Some("kotlin")
+        );
+    }
+
+    /// The Dart row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`. Same reasoning as the Kotlin case above: these
+    /// values used to live in separate match statements, and a wrong value
+    /// here is a silent projection change that no threshold test would catch.
+    #[test]
+    fn dart_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let dart = extraction_for_language("dart").expect("dart row");
+        assert!(dart.promotes_type_member_functions_to_methods);
+        assert_eq!(dart.qualified_name_delimiter, ".");
+        assert!(dart.route_comments_are_c_style);
+        assert_eq!(dart.semantic_family, "dart");
+        assert!(dart.uses_generic_semantic_resolver);
+        assert_eq!(dart.member_callsite_marker, Some("syntax:dart-member-call"));
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("dart_member"),
+            Some("syntax:dart-member-call")
+        );
+        assert!(dart.receiver_call_specs.is_some());
+        assert!(dart.tags_query.is_none());
+        assert_eq!(
+            extraction_for_ext("dart").map(|row| row.language_name),
+            Some("dart")
         );
     }
 }

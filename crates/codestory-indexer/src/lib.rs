@@ -66,7 +66,6 @@ pub(crate) const RUBY_MEMBER_CALLSITE_MARKER: &str = "syntax:ruby-member-call";
 pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
 pub(crate) const JS_MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
 pub(crate) const TS_MEMBER_CALLSITE_MARKER: &str = "syntax:ts-member-call";
-pub(crate) const DART_MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
 pub(crate) const SWIFT_MEMBER_CALLSITE_MARKER: &str = "syntax:swift-member-call";
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
 pub(crate) const RECEIVER_MODULE_CALLSITE_PREFIX: &str = "receiver-module:";
@@ -143,7 +142,6 @@ const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
 const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
-const DART_GRAPH_QUERY: &str = include_str!("../rules/dart.scm");
 const BASH_GRAPH_QUERY: &str = include_str!("../rules/bash.scm");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,9 +334,9 @@ impl LanguageRuleset {
             LanguageRuleset::Swift => {
                 compiled_rules_cache(language, SWIFT_GRAPH_QUERY, None, &SWIFT_RULES)
             }
-            LanguageRuleset::Dart => {
-                compiled_rules_cache(language, DART_GRAPH_QUERY, None, &DART_RULES)
-            }
+            LanguageRuleset::Dart => Err(anyhow!(
+                "dart compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::Bash => {
                 compiled_rules_cache(language, BASH_GRAPH_QUERY, None, &BASH_RULES)
             }
@@ -385,7 +383,6 @@ static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::n
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static DART_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static BASH_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 
 fn tag_definition_priority(definition: &TagDefinition) -> (u8, u8, u8) {
@@ -7398,8 +7395,11 @@ fn language_precise_call_specs(
     tree: &Tree,
     source: &str,
 ) -> Vec<ManualPreciseCallSpec> {
+    // Dart is the only language with a precise-call collector, so
+    // `LanguageExtraction` has no field for one; the arm calls into the
+    // migrated module rather than into a body still living here.
     match language_name {
-        "dart" => collect_dart_direct_call_edges(tree, source),
+        "dart" => languages::dart::direct_call_specs(tree, source),
         _ => Vec::new(),
     }
 }
@@ -7602,7 +7602,6 @@ fn language_receiver_call_specs(
         "csharp" => collect_csharp_receiver_call_edges(tree, source),
         "cpp" => collect_cpp_receiver_call_edges(tree, source),
         "swift" => collect_swift_receiver_call_edges(tree, source),
-        "dart" => collect_dart_receiver_call_edges(tree, source),
         _ => Vec::new(),
     }
 }
@@ -13028,74 +13027,6 @@ fn swift_type_import_qualifier(raw_type: &str) -> Option<String> {
     normalize_parameter_name(qualifier)
 }
 
-fn collect_dart_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
-    let mut edges = Vec::new();
-    let import_alias_bindings = collect_dart_import_alias_bindings(source);
-    walk_tree_nodes(tree.root_node(), &mut |body| {
-        if body.kind() != "function_body" {
-            return;
-        }
-        let Some(signature) = dart_signature_for_body(body) else {
-            return;
-        };
-        let Some(source_name) = dart_callable_name(signature, source) else {
-            return;
-        };
-        let call_source = ManualReceiverSource {
-            name: &source_name,
-            span: ts_node_graph_span(signature),
-        };
-        let receiver_types = collect_prefix_parameter_types(signature, source);
-        let mut local_receiver_callsites = HashSet::new();
-        collect_dart_precise_receiver_call_specs(
-            body,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            DartReceiverContext {
-                parameter_receiver_types: &receiver_types,
-                import_alias_bindings: &import_alias_bindings,
-            },
-            &mut local_receiver_callsites,
-            &mut edges,
-        );
-        if !receiver_types.is_empty() {
-            let receiver_modules =
-                collect_dart_parameter_type_modules(signature, source, &import_alias_bindings);
-            let start = edges.len();
-            collect_receiver_call_specs_in_callable(
-                body,
-                source,
-                ManualReceiverSource {
-                    name: call_source.name,
-                    span: call_source.span,
-                },
-                &receiver_types,
-                dart_member_call,
-                false,
-                &mut edges,
-            );
-            let mut parameter_specs = edges.split_off(start);
-            parameter_specs
-                .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
-            for spec in &mut parameter_specs {
-                if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
-                    spec.owner_module = Some(module_name.clone());
-                }
-            }
-            edges.extend(parameter_specs);
-        }
-    });
-    edges
-}
-
-struct DartReceiverContext<'a> {
-    parameter_receiver_types: &'a HashMap<String, String>,
-    import_alias_bindings: &'a HashMap<String, String>,
-}
-
 fn receiver_callsite_key(spec: &ManualReceiverCallSpec) -> ReceiverCallSiteKey {
     ReceiverCallSiteKey {
         receiver_name: spec.receiver_name.clone(),
@@ -13103,355 +13034,6 @@ fn receiver_callsite_key(spec: &ManualReceiverCallSpec) -> ReceiverCallSiteKey {
         line: spec.line,
         method_col: spec.method_col,
     }
-}
-
-fn collect_dart_precise_receiver_call_specs(
-    body: TsNode<'_>,
-    source: &str,
-    call_source: ManualReceiverSource<'_>,
-    context: DartReceiverContext<'_>,
-    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
-) {
-    walk_tree_nodes(body, &mut |node| {
-        let Some((receiver_name, method_name)) = dart_member_call(node, source) else {
-            return;
-        };
-        if !receiver_call_belongs_to_callable(node, body) {
-            return;
-        }
-        let method_col = member_call_method_col(node, source, &method_name);
-        let callsite_key = ReceiverCallSiteKey {
-            receiver_name: receiver_name.clone(),
-            method_name: method_name.clone(),
-            line: Some(node.start_position().row as u32 + 1),
-            method_col,
-        };
-
-        if let Some(owner) =
-            dart_visible_local_receiver_owner(body, node, &receiver_name, source, &context)
-        {
-            local_receiver_callsites.insert(callsite_key);
-            if let Some((owner_name, owner_module)) = owner {
-                edges.push(ManualReceiverCallSpec {
-                    source_name: call_source.name.to_string(),
-                    source_span: call_source.span,
-                    receiver_name,
-                    owner_name,
-                    owner_module,
-                    method_name,
-                    method_col,
-                    line: Some(node.start_position().row as u32 + 1),
-                    allow_global_fallback: false,
-                });
-            }
-            return;
-        }
-
-        let owner = if let Some(owner) = dart_self_receiver_owner(body, &receiver_name, source) {
-            Some(owner)
-        } else if !context
-            .parameter_receiver_types
-            .contains_key(&receiver_name)
-        {
-            dart_property_receiver_owner(body, &receiver_name, source, &context)
-        } else {
-            None
-        };
-        let Some((owner_name, owner_module)) = owner else {
-            return;
-        };
-        edges.push(ManualReceiverCallSpec {
-            source_name: call_source.name.to_string(),
-            source_span: call_source.span,
-            receiver_name,
-            owner_name,
-            owner_module,
-            method_name,
-            method_col,
-            line: Some(node.start_position().row as u32 + 1),
-            allow_global_fallback: false,
-        });
-    });
-}
-
-fn dart_self_receiver_owner(
-    body: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-) -> OptionalReceiverOwnerBinding {
-    if receiver_name != "this" {
-        return None;
-    }
-    let owner_node = enclosing_node_with_kind(body, &["class_definition"])?;
-    let owner_name = declaration_name(owner_node, source)?;
-    Some((owner_name, None))
-}
-
-fn dart_visible_local_receiver_owner(
-    body: TsNode<'_>,
-    call_node: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    context: &DartReceiverContext<'_>,
-) -> Option<OptionalReceiverOwnerBinding> {
-    let mut visible_bindings = Vec::new();
-    walk_tree_nodes(body, &mut |node| {
-        if node.kind() != "initialized_variable_definition" {
-            return;
-        }
-        if !receiver_call_belongs_to_callable(node, body)
-            || node.end_byte() > call_node.start_byte()
-        {
-            return;
-        }
-        let Some(binding_name) = dart_variable_binding_name(node, source) else {
-            return;
-        };
-        if binding_name != receiver_name || !dart_local_binding_visible_at_call(node, call_node) {
-            return;
-        }
-        visible_bindings.push((
-            node.end_byte(),
-            dart_initialized_constructor_owner(node, source, context),
-        ));
-    });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner_name)| owner_name)
-}
-
-fn dart_property_receiver_owner(
-    body: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let field_name = receiver_name
-        .strip_prefix("this.")
-        .unwrap_or(receiver_name)
-        .trim();
-    if field_name == "this" || field_name.contains('.') {
-        return None;
-    }
-    let owner_node = enclosing_node_with_kind(body, &["class_definition"])?;
-    let mut property_bindings = Vec::new();
-    walk_tree_nodes(owner_node, &mut |node| {
-        if !matches!(
-            node.kind(),
-            "initialized_variable_definition" | "field_signature" | "declaration"
-        ) || !dart_property_belongs_to_owner(node, owner_node)
-        {
-            return;
-        }
-        let Some((binding_name, raw_type)) = dart_typed_variable_binding(node, source) else {
-            return;
-        };
-        if binding_name != field_name {
-            return;
-        }
-        if let Some(owner) = dart_receiver_owner_from_type(&raw_type, context) {
-            property_bindings.push(owner);
-        }
-    });
-    property_bindings.sort();
-    property_bindings.dedup();
-    if property_bindings.len() == 1 {
-        Some(property_bindings.remove(0))
-    } else {
-        None
-    }
-}
-
-fn dart_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
-    let mut current = property.parent();
-    while let Some(candidate) = current {
-        if same_ts_span(candidate, owner_node) {
-            return true;
-        }
-        if candidate.kind() == "function_body" || candidate.kind() == "class_definition" {
-            return false;
-        }
-        current = candidate.parent();
-    }
-    false
-}
-
-fn dart_variable_binding_name(node: TsNode<'_>, source: &str) -> Option<String> {
-    if let Some(name) = node
-        .child_by_field_name("name")
-        .and_then(|name| trimmed_node_text(name, source))
-        .as_deref()
-        .and_then(normalize_parameter_name)
-    {
-        return Some(name);
-    }
-    let surface = trimmed_node_text(node, source)?;
-    let head = surface
-        .split('=')
-        .next()
-        .unwrap_or(surface.as_str())
-        .trim_end_matches(';')
-        .trim();
-    head.split_whitespace()
-        .last()
-        .and_then(normalize_parameter_name)
-}
-
-fn dart_typed_variable_binding(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    let binding_name = dart_variable_binding_name(node, source)?;
-    let surface = trimmed_node_text(node, source)?;
-    let head = surface
-        .split('=')
-        .next()
-        .unwrap_or(surface.as_str())
-        .trim_end_matches(';')
-        .trim();
-    let tokens = head
-        .split_whitespace()
-        .filter(|token| {
-            !matches!(
-                *token,
-                "abstract"
-                    | "covariant"
-                    | "external"
-                    | "final"
-                    | "late"
-                    | "static"
-                    | "const"
-                    | "var"
-                    | "required"
-            )
-        })
-        .collect::<Vec<_>>();
-    if tokens.len() < 2 {
-        return None;
-    }
-    let raw_type = tokens[..tokens.len() - 1].join(" ");
-    Some((binding_name, raw_type))
-}
-
-fn dart_receiver_owner_from_type(
-    raw_type: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let owner_name = normalize_type_surface(raw_type)?;
-    if let Some(qualifier) = dart_type_import_qualifier(raw_type) {
-        let module_name = context.import_alias_bindings.get(&qualifier)?;
-        return Some((owner_name, Some(module_name.clone())));
-    }
-    Some((owner_name, None))
-}
-
-fn dart_initialized_constructor_owner(
-    node: TsNode<'_>,
-    source: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    if let Some(owner_name) = node
-        .child_by_field_name("value")
-        .and_then(|value| dart_constructor_owner(value, source, context))
-    {
-        return Some(owner_name);
-    }
-    let surface = trimmed_node_text(node, source)?;
-    let (_, value_surface) = surface.split_once('=')?;
-    dart_constructor_owner_surface(value_surface, context)
-}
-
-fn dart_constructor_owner(
-    value: TsNode<'_>,
-    source: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    trimmed_node_text(value, source)
-        .as_deref()
-        .and_then(|surface| dart_constructor_owner_surface(surface, context))
-}
-
-fn dart_constructor_owner_surface(
-    surface: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let surface = surface.trim().trim_end_matches(';').trim();
-    let surface = surface
-        .strip_prefix("const ")
-        .or_else(|| surface.strip_prefix("new "))
-        .unwrap_or(surface)
-        .trim();
-    let (constructor_name, _) = surface.split_once('(')?;
-    dart_constructor_owner_from_type_surface(constructor_name, context)
-}
-
-fn dart_constructor_owner_from_type_surface(
-    type_surface: &str,
-    context: &DartReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let type_surface = type_surface.trim();
-    if type_surface.contains("::") {
-        return None;
-    }
-    let owner_name = normalize_type_surface(type_surface)?;
-    if !owner_name
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase())
-    {
-        return None;
-    }
-    if let Some(qualifier) = dart_type_import_qualifier(type_surface) {
-        let module_name = context.import_alias_bindings.get(&qualifier)?;
-        return Some((owner_name, Some(module_name.clone())));
-    }
-    if type_surface.contains('.') {
-        return None;
-    }
-    Some((owner_name, None))
-}
-
-fn dart_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
-    let Some(binding_scope) = dart_lexical_scope(binding) else {
-        return false;
-    };
-    let Some(call_scope) = dart_lexical_scope(call_node) else {
-        return false;
-    };
-    node_is_same_or_ancestor(binding_scope, call_scope)
-}
-
-fn dart_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
-    enclosing_node_with_kind(node, &["block", "function_body"])
-}
-
-fn collect_dart_direct_call_edges(tree: &Tree, source: &str) -> Vec<ManualPreciseCallSpec> {
-    let mut edges = Vec::new();
-    walk_tree_nodes(tree.root_node(), &mut |body| {
-        if body.kind() != "function_body" {
-            return;
-        }
-        let Some(signature) = dart_signature_for_body(body) else {
-            return;
-        };
-        let Some(source_name) = dart_callable_name(signature, source) else {
-            return;
-        };
-        let source_span = ts_node_graph_span(signature);
-        walk_tree_nodes(body, &mut |node| {
-            let Some(target_name) = dart_direct_call(node, source) else {
-                return;
-            };
-            edges.push(ManualPreciseCallSpec {
-                source_name: source_name.clone(),
-                source_span,
-                target_name,
-                line: Some(node.start_position().row as u32 + 1),
-            });
-        });
-    });
-    edges
-}
-
-fn dart_signature_for_body<'tree>(body: TsNode<'tree>) -> Option<TsNode<'tree>> {
-    previous_named_sibling_with_kind(body, &["method_signature", "function_signature"])
 }
 
 fn collect_ruby_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
@@ -14071,143 +13653,6 @@ fn collect_prefix_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap
     receiver_types
 }
 
-fn collect_dart_parameter_type_modules(
-    callable: TsNode<'_>,
-    source: &str,
-    import_alias_bindings: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut receiver_modules = HashMap::new();
-    let Some(parameters) = signature_parameter_surface(callable, source) else {
-        return receiver_modules;
-    };
-    for parameter in split_top_level_parameters(&parameters) {
-        let parameter = parameter
-            .split('=')
-            .next()
-            .unwrap_or(parameter.as_str())
-            .trim();
-        let tokens = parameter
-            .split_whitespace()
-            .filter(|token| !matches!(*token, "final" | "const" | "var" | "required"))
-            .collect::<Vec<_>>();
-        if tokens.len() < 2 {
-            continue;
-        }
-        let Some(receiver_name) =
-            normalize_parameter_name(tokens.last().copied().unwrap_or_default())
-        else {
-            continue;
-        };
-        let raw_type = tokens[..tokens.len() - 1].join(" ");
-        let Some(qualifier) = dart_type_import_qualifier(&raw_type) else {
-            continue;
-        };
-        let Some(module_name) = import_alias_bindings.get(&qualifier) else {
-            continue;
-        };
-        receiver_modules.insert(receiver_name, module_name.clone());
-    }
-    receiver_modules
-}
-
-fn dart_type_import_qualifier(raw_type: &str) -> Option<String> {
-    if raw_type.contains('|') || raw_type.contains('&') {
-        return None;
-    }
-    let surface = raw_type.trim().trim_end_matches('?').trim();
-    let base = surface
-        .split(['<', '[', '('])
-        .next()
-        .unwrap_or(surface)
-        .trim();
-    let (qualifier, _) = base.rsplit_once('.')?;
-    normalize_parameter_name(qualifier)
-}
-
-fn collect_dart_import_alias_bindings(source: &str) -> HashMap<String, String> {
-    let mut bindings = HashMap::new();
-    let mut duplicates = HashSet::new();
-    for statement in dart_import_statements(source) {
-        let Some(module_name) = dart_import_module_name(&statement) else {
-            continue;
-        };
-        let Some(alias) = dart_import_alias_name(&statement) else {
-            continue;
-        };
-        if duplicates.contains(&alias) {
-            continue;
-        }
-        if bindings.contains_key(&alias) {
-            bindings.remove(&alias);
-            duplicates.insert(alias);
-            continue;
-        }
-        bindings.insert(alias, module_name);
-    }
-    bindings
-}
-
-fn dart_import_statements(source: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut collecting = false;
-
-    for raw_line in source.lines() {
-        let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if !collecting {
-            if !line.starts_with("import ") {
-                continue;
-            }
-            current.clear();
-            current.push_str(line);
-            if line.contains(';') {
-                statements.push(current.clone());
-            } else {
-                collecting = true;
-            }
-            continue;
-        }
-
-        current.push(' ');
-        current.push_str(line);
-        if line.contains(';') {
-            statements.push(current.clone());
-            current.clear();
-            collecting = false;
-        }
-    }
-
-    statements
-}
-
-fn dart_import_module_name(statement: &str) -> Option<String> {
-    let rest = statement.strip_prefix("import")?.trim();
-    let quote = rest.chars().find(|ch| matches!(*ch, '"' | '\''))?;
-    let start = rest.find(quote)? + quote.len_utf8();
-    let end = rest[start..].find(quote)? + start;
-    let module_name = rest[start..end].trim();
-    (!module_name.is_empty()).then(|| module_name.to_string())
-}
-
-fn dart_import_alias_name(statement: &str) -> Option<String> {
-    let mut tokens = statement
-        .trim_end_matches(';')
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    while let Some(token) = tokens.pop() {
-        if token == "as" {
-            return None;
-        }
-        if tokens.last().copied() == Some("as") {
-            return normalize_parameter_name(token);
-        }
-    }
-    None
-}
-
 /// The grammar's own parameter-list node for a callable, when it has one.
 ///
 /// Every vendored grammar that models parameters exposes the list either
@@ -14579,75 +14024,6 @@ fn normalized_swift_receiver_surface(raw: &str) -> Option<String> {
     normalize_parameter_name(receiver)
 }
 
-fn dart_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if !matches!(node.kind(), "expression_statement" | "return_statement") {
-        return None;
-    }
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let separator = callable.rfind('.')?;
-    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
-    let method = callable[separator + 1..]
-        .trim()
-        .trim_start_matches('?')
-        .trim();
-    Some((
-        normalized_dart_receiver_surface(receiver)?,
-        normalize_parameter_name(method)?,
-    ))
-}
-
-fn normalized_dart_receiver_surface(raw: &str) -> Option<String> {
-    let receiver = raw
-        .rsplit([' ', '\t', '\n', '\r', '(', '[', '{'])
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or(raw)
-        .trim()
-        .trim_end_matches('?')
-        .trim();
-    if receiver.contains('.') {
-        let cleaned = receiver
-            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
-            .trim();
-        let valid = cleaned
-            .split('.')
-            .all(|part| normalize_parameter_name(part).is_some());
-        return (valid && !cleaned.is_empty()).then(|| cleaned.to_string());
-    }
-    normalize_parameter_name(receiver)
-}
-
-fn dart_direct_call(node: TsNode<'_>, source: &str) -> Option<String> {
-    if !matches!(node.kind(), "expression_statement" | "return_statement") {
-        return None;
-    }
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    if callable.contains('.') {
-        return None;
-    }
-    let callable = callable
-        .strip_prefix("return")
-        .map(str::trim)
-        .unwrap_or(callable);
-    callable
-        .split_whitespace()
-        .last()
-        .and_then(normalize_parameter_name)
-}
-
 fn surface_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     let text = trimmed_node_text(node, source)?;
     let callable = text
@@ -14678,12 +14054,6 @@ fn normalized_receiver_surface(raw: &str) -> Option<String> {
         .trim_end_matches('?')
         .trim();
     normalize_parameter_name(terminal)
-}
-
-fn dart_callable_name(node: TsNode<'_>, source: &str) -> Option<String> {
-    descendant_by_field_name(node, "name")
-        .or_else(|| first_descendant_with_kind(node, "identifier"))
-        .and_then(|name_node| trimmed_node_text(name_node, source))
 }
 
 fn ruby_constructor_owner(node: TsNode<'_>, source: &str) -> Option<String> {
@@ -15201,11 +14571,11 @@ fn queue_qualified_child_names(
 }
 
 fn promotes_type_member_functions_to_methods(language_name: &str) -> bool {
-    // Registry first; `swift` and `dart` are the unmigrated residue.
+    // Registry first; `swift` is the unmigrated residue.
     if let Some(extraction) = languages::extraction_for_language(language_name) {
         return extraction.promotes_type_member_functions_to_methods;
     }
-    matches!(language_name, "swift" | "dart")
+    matches!(language_name, "swift")
 }
 
 fn qualified_name_delimiter(language_name: &str) -> &'static str {
@@ -17072,16 +16442,7 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
     }
     matches!(
         language_name,
-        "javascript"
-            | "typescript"
-            | "java"
-            | "rust"
-            | "go"
-            | "php"
-            | "csharp"
-            | "dart"
-            | "vue"
-            | "astro"
+        "javascript" | "typescript" | "java" | "rust" | "go" | "php" | "csharp" | "vue" | "astro"
     )
 }
 
@@ -20231,7 +19592,6 @@ pub fn index_file(
                                         "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
                                         "js_member" => Some(JS_MEMBER_CALLSITE_MARKER),
                                         "ts_member" => Some(TS_MEMBER_CALLSITE_MARKER),
-                                        "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
                                         "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),
                                         _ => callsite_marker,
                                     },
@@ -25754,8 +25114,18 @@ class Test {
         let swift = get_language_for_ext("swift").expect("swift config");
         assert_eq!(swift.graph_query, SWIFT_GRAPH_QUERY);
 
+        // Dart's rule file moved into `languages::dart`; the config must still
+        // come back through the same extension lookup.
         let dart = get_language_for_ext("dart").expect("dart config");
-        assert_eq!(dart.graph_query, DART_GRAPH_QUERY);
+        assert_eq!(dart.language_name, "dart");
+        assert_eq!(
+            dart.graph_query,
+            languages::extraction_for_ext("dart")
+                .expect("dart registry row")
+                .graph_query
+        );
+        assert!(dart.graph_query.contains("dart_member"));
+        assert!(dart.tags_query.is_none());
 
         let bash = get_language_for_ext("sh").expect("bash config");
         assert_eq!(bash.graph_query, BASH_GRAPH_QUERY);
