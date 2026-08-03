@@ -746,7 +746,283 @@ pub(crate) fn packet_file_stem_matches_query(query: &str, path: Option<&str>) ->
 mod tests {
     use super::*;
     use crate::agent::packet_plan::build_packet_plan;
-    use codestory_contracts::api::{PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto};
+    use codestory_contracts::api::{
+        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto,
+        PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto, RetrievalAnnotationKindDto,
+    };
+
+    /// EV-6c (#1775) helpers. Every gap producer in this module writes onto the answer's
+    /// retrieval trace, so the tests below drive the real production entry points
+    /// (`run_packet_planned_subqueries`, `run_packet_anchor_probes`) and read back the kind the
+    /// producer stamped. Nothing here hand-builds an annotation.
+    fn empty_answer() -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "ev6c".to_string(),
+            prompt: "ev6c packet".to_string(),
+            summary: String::new(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "ev6c".to_string(),
+                retrieval_publication: None,
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 0,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
+                annotations: Vec::new(),
+                packet_claim_profile_telemetry: None,
+                source_freshness_telemetry: None,
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    fn ev6c_limits() -> PacketBudgetLimitsDto {
+        PacketBudgetLimitsDto {
+            max_anchors: 8,
+            max_files: 8,
+            max_snippets: 8,
+            max_trail_edges: 8,
+            max_output_bytes: 64_000,
+        }
+    }
+
+    fn ev6c_plan() -> PacketPlanDto {
+        PacketPlanDto {
+            task_class: PacketTaskClassDto::RouteTracing,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Trace how StringUtils normalizes request routes".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "StringUtils".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "CharSequenceUtils".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+            ],
+            probe_resolutions: Vec::new(),
+            obligations: Default::default(),
+            trace: Vec::new(),
+        }
+    }
+
+    /// Every annotation the run produced, as `(kind, text)`, in emission order.
+    fn classified(answer: &AgentAnswerDto) -> Vec<(RetrievalAnnotationKindDto, String)> {
+        answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .map(|annotation| (annotation.kind, annotation.text.clone()))
+            .collect()
+    }
+
+    fn kind_of(answer: &AgentAnswerDto, prefix: &str) -> RetrievalAnnotationKindDto {
+        let matches = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .filter(|annotation| annotation.text.starts_with(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one annotation starting with `{prefix}`, got {:?}",
+            classified(answer)
+        );
+        matches[0].kind
+    }
+
+    #[test]
+    fn packet_subqueries_skipped_by_budget_is_published_as_an_evidence_gap() {
+        // EV-6c (#1775). A tiny budget means the planned subqueries never ran, so the evidence
+        // they would have produced is genuinely absent. Reclassifying this producer as an
+        // observation would leave `agent_confidence` at high for a packet that skipped its
+        // supplemental retrieval outright.
+        let mut answer = empty_answer();
+        run_packet_planned_subqueries(
+            &AppController::new(),
+            &ev6c_plan(),
+            PacketBudgetModeDto::Tiny,
+            &ev6c_limits(),
+            false,
+            PacketLatencyBudget::new(Some(120_000)),
+            &[],
+            &mut answer,
+        )
+        .expect("skipping subqueries on a tiny budget is not an error");
+
+        assert_eq!(
+            classified(&answer),
+            vec![(
+                RetrievalAnnotationKindDto::Gap,
+                "packet_subqueries skipped budget=tiny".to_string()
+            )],
+            "the skipped-subquery producer must publish an evidence gap"
+        );
+    }
+
+    #[test]
+    fn failed_fused_subquery_batch_is_published_as_an_evidence_gap() {
+        // EV-6c (#1775). The fused batch failing means none of the planned subqueries returned
+        // evidence. The sibling `packet_subqueries fused_batch=` note on the same path is
+        // routine telemetry, so this also pins that the two are not classified alike.
+        let mut answer = empty_answer();
+        let error = run_packet_planned_subqueries(
+            &AppController::new(),
+            &ev6c_plan(),
+            PacketBudgetModeDto::Compact,
+            &ev6c_limits(),
+            false,
+            PacketLatencyBudget::new(Some(120_000)),
+            &[],
+            &mut answer,
+        )
+        .expect_err("an unopened controller cannot serve a fused packet batch");
+        assert!(
+            !error.message.is_empty(),
+            "fail-closed batch error must carry a reason"
+        );
+
+        assert_eq!(
+            kind_of(&answer, "packet_fused_subquery_batch_failed error="),
+            RetrievalAnnotationKindDto::Gap,
+            "a failed subquery batch is missing evidence, not telemetry: {:?}",
+            classified(&answer)
+        );
+        assert_eq!(
+            kind_of(&answer, "packet_subqueries fused_batch="),
+            RetrievalAnnotationKindDto::Observation,
+            "batch sizing is routine telemetry: {:?}",
+            classified(&answer)
+        );
+    }
+
+    #[test]
+    fn anchor_probes_skipped_by_budget_are_published_as_an_evidence_gap() {
+        // EV-6c (#1775). Anchor probes never dispatched: the anchors they would have found are
+        // absent from the packet, so the reason string must ride a `Gap`.
+        let mut answer = empty_answer();
+        run_packet_anchor_expansion(
+            &AppController::new(),
+            &ev6c_plan(),
+            PacketBudgetModeDto::Tiny,
+            &ev6c_limits(),
+            false,
+            PacketLatencyBudget::new(Some(120_000)),
+            &[],
+            &mut answer,
+        )
+        .expect("skipping anchor probes on a tiny budget is not an error");
+
+        assert_eq!(
+            classified(&answer),
+            vec![(
+                RetrievalAnnotationKindDto::Gap,
+                "packet_anchor_probes skipped reason=budget=tiny".to_string()
+            )],
+            "the skipped-anchor-probe producer must publish an evidence gap"
+        );
+    }
+
+    #[test]
+    fn anchor_probes_dropped_for_latency_are_published_as_an_evidence_gap() {
+        // EV-6c (#1775). The other reason this producer fires: the latency budget was already
+        // spent. This is the reclassification that would hurt most — an answer that silently
+        // dropped its anchor expansion to hit an SLA must not also report clean confidence.
+        let mut answer = empty_answer();
+        answer.retrieval_trace.total_latency_ms = 5_000;
+        run_packet_anchor_expansion(
+            &AppController::new(),
+            &ev6c_plan(),
+            PacketBudgetModeDto::Compact,
+            &ev6c_limits(),
+            false,
+            PacketLatencyBudget::new(Some(1_000)),
+            &[],
+            &mut answer,
+        )
+        .expect("dropping anchor probes for latency is not an error");
+
+        assert_eq!(
+            classified(&answer),
+            vec![(
+                RetrievalAnnotationKindDto::Gap,
+                "packet_anchor_probes skipped reason=latency_budget_exhausted".to_string()
+            )],
+            "an SLA-driven anchor-probe drop must publish an evidence gap"
+        );
+        assert!(
+            answer.retrieval_trace.sla_missed,
+            "the latency-driven drop must also record the missed SLA"
+        );
+    }
+
+    #[test]
+    fn failed_anchor_probes_are_published_as_evidence_gaps_per_query() {
+        // EV-6c (#1775). One gap per unanswered probe query, so the packet cannot claim the
+        // anchors it asked for.
+        let plan = ev6c_plan();
+        let expected_queries = packet_anchor_probe_queries(&plan);
+        assert!(
+            !expected_queries.is_empty(),
+            "fixture plan must yield anchor probe queries"
+        );
+
+        let mut answer = empty_answer();
+        run_packet_anchor_expansion(
+            &AppController::new(),
+            &plan,
+            PacketBudgetModeDto::Compact,
+            &ev6c_limits(),
+            false,
+            PacketLatencyBudget::new(Some(120_000)),
+            &[],
+            &mut answer,
+        )
+        .expect_err("an unopened controller cannot serve anchor probes");
+
+        let failures = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .filter(|annotation| {
+                annotation
+                    .text
+                    .starts_with("packet_anchor_probe_failed query=")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            expected_queries.len(),
+            "every unanswered probe query must be reported: {:?}",
+            classified(&answer)
+        );
+        for failure in failures {
+            assert_eq!(
+                failure.kind,
+                RetrievalAnnotationKindDto::Gap,
+                "a probe query that returned no evidence is a gap: {}",
+                failure.text
+            );
+        }
+    }
 
     #[test]
     fn packet_latency_budget_preserves_advertised_range_and_default() {

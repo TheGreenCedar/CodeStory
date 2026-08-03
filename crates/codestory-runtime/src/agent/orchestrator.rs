@@ -13330,6 +13330,72 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_retrieval_records_its_annotation_as_an_evidence_gap() {
+        // EV-6c (#1775). The complement of the observation test above, driven through the real
+        // `execute_retrieval` rather than a hand-built annotation. Retrieval refusing to serve
+        // is the strongest possible evidence gap: the packet has no retrieval evidence at all.
+        // If this producer were reclassified as an observation, `agent_gap_notes` would drop it
+        // and a packet built on a refused retrieval would still report clean confidence.
+        let controller = AppController::new();
+        let req = AgentAskRequest {
+            prompt: "Trace how the router dispatches a request".to_string(),
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Auto,
+            focus_node_id: None,
+            max_results: Some(5),
+            response_mode: AgentResponseModeDto::default(),
+            latency_budget_ms: Some(120_000),
+            include_evidence: false,
+            hybrid_weights: None,
+        };
+        let resolved_profile = resolve_profile(&req.prompt, &req.retrieval_profile);
+        let mut trace = TraceRecorder::new(Some(120_000));
+
+        let outcome = execute_retrieval(
+            &controller,
+            &req,
+            &req.prompt,
+            Instant::now(),
+            &resolved_profile,
+            &mut trace,
+        );
+        assert!(
+            outcome.is_err(),
+            "a controller with no open project must fail closed rather than serve"
+        );
+
+        let published = trace.finish(
+            "ev6c-fail-closed".to_string(),
+            AgentRetrievalPresetDto::Architecture,
+            AgentRetrievalPolicyModeDto::CompletenessFirst,
+        );
+        let fail_closed = published
+            .annotations
+            .iter()
+            .find(|annotation| {
+                annotation
+                    .text
+                    .starts_with("retrieval_primary unavailable=true")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "fail-closed retrieval must annotate the trace: {:?}",
+                    published.annotations
+                )
+            });
+        assert_eq!(
+            fail_closed.kind,
+            RetrievalAnnotationKindDto::Gap,
+            "the fail-closed retrieval annotation must be an evidence gap: {}",
+            fail_closed.text
+        );
+        assert!(
+            fail_closed.is_gap(),
+            "the DTO predicate consumers read must agree: {}",
+            fail_closed.text
+        );
+    }
+
+    #[test]
     fn explicit_file_scoped_probe_citation_cannot_promote_sufficiency() {
         let root = packet_temp_root("explicit-source-probe-sufficiency");
         let _ = std::fs::remove_dir_all(&root);
