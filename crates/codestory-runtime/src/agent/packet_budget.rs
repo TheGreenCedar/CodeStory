@@ -919,7 +919,7 @@ mod tests {
                 .retrieval_trace
                 .annotations
                 .iter()
-                .any(|annotation| annotation.contains("canonical trace annotation"))
+                .any(|annotation| annotation.text.contains("canonical trace annotation"))
         );
     }
 
@@ -1237,10 +1237,12 @@ mod tests {
         packet.answer.retrieval_trace.total_latency_ms = 123;
         packet.answer.retrieval_trace.sla_target_ms = Some(1_000);
         packet.answer.retrieval_trace.sla_missed = true;
-        packet.answer.retrieval_trace.annotations = vec![format!(
-            "canonical trace annotation {}",
-            "answer-retained ".repeat(repeat)
-        )];
+        packet.answer.retrieval_trace.annotations = vec![
+            codestory_contracts::api::RetrievalAnnotationDto::observation(format!(
+                "canonical trace annotation {}",
+                "answer-retained ".repeat(repeat)
+            )),
+        ];
         packet.answer.retrieval_trace.steps = vec![
             AgentRetrievalStepDto {
                 kind: AgentRetrievalStepKindDto::Search,

@@ -13,10 +13,11 @@ use codestory_contracts::api::{
     GraphArtifactDto, GroundingOrientationConfidenceDto, GroundingOrientationUncertaintyDto,
     GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketClaimProfileTelemetryDto,
     PacketClaimSourceDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
-    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
+    RetrievalAnnotationKindDto, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto,
+    SearchHit, SearchHitOrigin, SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto,
+    SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto, SearchPlanChannelDto,
+    SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto,
+    TrailContextDto, TrailStoryDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto};
@@ -2299,10 +2300,10 @@ fn agent_gap_notes(answer: &AgentAnswerDto) -> Vec<String> {
         .retrieval_trace
         .annotations
         .iter()
-        .filter(|annotation| is_gap_annotation(annotation))
+        .filter(|annotation| annotation.kind == RetrievalAnnotationKindDto::Gap)
         .take(EVIDENCE_PREVIEW_LIMIT)
     {
-        gaps.push(format!("trace annotation: {annotation}"));
+        gaps.push(format!("trace annotation: {}", annotation.text));
     }
     for step in answer
         .retrieval_trace
@@ -2430,9 +2431,9 @@ fn citation_needs_untrusted_repo_label(citation: &AgentCitationDto) -> bool {
 /// Render claim-profile fire rates for the `what_was_checked` block.
 ///
 /// This telemetry is always present on a packet, so it is reported as an observation about the
-/// retrieval run — never through `retrieval_trace.annotations`, which
-/// [`is_gap_annotation`] scans for evidence gaps. Telemetry routed through that channel is
-/// classified as a gap on every packet and permanently downgrades confidence.
+/// retrieval run rather than as a trace annotation. Annotations are the evidence channel:
+/// `Gap`-kind entries downgrade confidence, so always-on telemetry never belongs there even as
+/// an `Observation`.
 fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -> String {
     let source_claims = telemetry
         .claim_sources
@@ -2451,30 +2452,6 @@ fn claim_profile_telemetry_summary(telemetry: &PacketClaimProfileTelemetryDto) -
         telemetry.citations_considered,
         source_claims,
     )
-}
-
-/// Classify a free-text retrieval annotation as an evidence gap.
-///
-/// Only genuine evidence notes may reach this function. Always-on telemetry must travel on its
-/// own typed trace field (see [`claim_profile_telemetry_summary`]): the match below is a
-/// substring heuristic, so any routine annotation containing one of these words would be
-/// reported as a gap and downgrade packet confidence on every answer.
-fn is_gap_annotation(annotation: &str) -> bool {
-    let lower = annotation.to_ascii_lowercase();
-    [
-        "fallback",
-        "gap",
-        "low confidence",
-        "missing",
-        "no relevant",
-        "skipped",
-        "truncated",
-        "uncertain",
-        "unavailable",
-        "weak",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn format_retrieval_fallback_reason(reason: RetrievalFallbackReasonDto) -> &'static str {
@@ -4184,9 +4161,10 @@ mod tests {
         EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse, GroundingBudgetDto,
         GroundingCoverageDto, GroundingFileDigestDto, GroundingOrientationDto,
         GroundingSnapshotDto, GroundingSymbolDigestDto, IndexFreshnessDto, NodeDetailsDto, NodeId,
-        NodeKind, RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto,
-        RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchPlanNextActionDto,
-        SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto, TrailStoryStepDto,
+        NodeKind, RetrievalAnnotationDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+        RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin,
+        SearchPlanNextActionDto, SemanticModeDto, StorageStatsDto, TrailContextDto, TrailStoryDto,
+        TrailStoryStepDto,
     };
     use serde_json::json;
     use std::path::Path;
@@ -5020,7 +4998,9 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
-                annotations: vec!["semantic retrieval ready".to_string()],
+                annotations: vec![RetrievalAnnotationDto::observation(
+                    "semantic retrieval ready",
+                )],
                 packet_claim_profile_telemetry: None,
                 steps: vec![AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
@@ -5184,7 +5164,7 @@ mod tests {
     #[test]
     fn claim_profile_telemetry_keeps_a_clean_packet_at_high_ready_confidence() {
         // Regression: the always-on claim-profile counters were published as free-text
-        // `retrieval_trace.annotations`. `is_gap_annotation` substring-matches "skipped", so
+        // `retrieval_trace.annotations`, which is the evidence-gap channel, so
         // every packet reported the telemetry as an evidence gap and `agent_confidence` fell
         // from high to medium (operator status ready -> review) universally. Telemetry now
         // rides its own typed field and must not touch the gap channel.
@@ -5231,6 +5211,119 @@ mod tests {
                 && !gaps_block.contains("skipped_invalid")
                 && !gaps_block.contains("profiles_fired"),
             "claim-profile telemetry must never appear as an evidence gap:\n{gaps_block}"
+        );
+    }
+
+    /// Every word the retired `is_gap_annotation` substring heuristic matched on.
+    ///
+    /// Kept verbatim so the observation fixture below is a worst case for the old classifier:
+    /// any single one of these used to force the annotation into the gap channel.
+    const LEGACY_GAP_MARKER_WORDS: [&str; 10] = [
+        "fallback",
+        "gap",
+        "low confidence",
+        "missing",
+        "no relevant",
+        "skipped",
+        "truncated",
+        "uncertain",
+        "unavailable",
+        "weak",
+    ];
+
+    fn annotation_containing_every_legacy_gap_marker() -> String {
+        format!(
+            "packet_candidate_trace rows=`{}`",
+            LEGACY_GAP_MARKER_WORDS.join(" ")
+        )
+    }
+
+    #[test]
+    fn observation_annotation_carrying_every_legacy_gap_marker_word_leaves_confidence_unchanged() {
+        // EV-6b: confidence used to be decided by lowercasing annotation prose and looking for
+        // ten English words. Routine telemetry echoes prompt text, file paths, symbol names, and
+        // user bookmark comments, so wording alone silently downgraded packets. Classification
+        // now reads the typed kind and nothing else.
+        let baseline = well_grounded_packet_answer();
+        let (baseline_confidence, baseline_reasons) = agent_confidence(&baseline);
+        assert_eq!(
+            baseline_confidence, "high",
+            "fixture must start from a clean high-confidence packet"
+        );
+
+        let text = annotation_containing_every_legacy_gap_marker();
+        for marker in LEGACY_GAP_MARKER_WORDS {
+            assert!(
+                text.to_ascii_lowercase().contains(marker),
+                "observation fixture must contain the legacy marker `{marker}`: {text}"
+            );
+        }
+
+        let mut answer = well_grounded_packet_answer();
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(text.clone()));
+
+        let (confidence, reasons) = agent_confidence(&answer);
+        assert_eq!(
+            confidence, "high",
+            "an observation-kind annotation must not move confidence: {reasons:?}"
+        );
+        assert_eq!(
+            reasons, baseline_reasons,
+            "an observation-kind annotation must not add a gap reason"
+        );
+        assert_eq!(operator_status_from_confidence(confidence), "ready");
+        assert_eq!(
+            agent_gap_notes(&answer),
+            Vec::<String>::new(),
+            "an observation-kind annotation is never an evidence gap"
+        );
+
+        let markdown = render_context_markdown(Path::new("C:/repo"), &answer);
+        assert!(
+            markdown.contains("status: ready"),
+            "observation-carrying packet must stay ready:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("trace annotation: {text}")),
+            "observation prose must not be rendered as an evidence gap:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn gap_annotation_downgrades_confidence_even_without_any_legacy_marker_word() {
+        // Paired with the observation case above: the typed kind is what decides, so a gap whose
+        // wording contains none of the ten retired marker words must still downgrade. Without
+        // this the observation test would pass for a classifier that simply never reports gaps.
+        let baseline = well_grounded_packet_answer();
+        assert_eq!(agent_confidence(&baseline).0, "high");
+
+        let text = "cited source range was never read back for verification";
+        for marker in LEGACY_GAP_MARKER_WORDS {
+            assert!(
+                !text.to_ascii_lowercase().contains(marker),
+                "gap fixture must avoid the legacy marker `{marker}`: {text}"
+            );
+        }
+
+        let mut answer = well_grounded_packet_answer();
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::gap(text));
+
+        let (confidence, reasons) = agent_confidence(&answer);
+        assert_eq!(
+            confidence, "medium",
+            "a gap-kind annotation must downgrade confidence: {reasons:?}"
+        );
+        assert_eq!(operator_status_from_confidence(confidence), "review");
+        assert_eq!(
+            agent_gap_notes(&answer),
+            vec![format!("trace annotation: {text}")],
+            "a gap-kind annotation must be reported verbatim as an evidence gap"
         );
     }
 
@@ -5623,7 +5716,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 semantic_stage_timeout_zero_hits: 0,
                 semantic_abstained_count: 0,
-                annotations: vec!["weak hits after fallback".to_string()],
+                annotations: vec![RetrievalAnnotationDto::gap("weak hits after fallback")],
                 packet_claim_profile_telemetry: None,
                 steps: vec![
                     AgentRetrievalStepDto {

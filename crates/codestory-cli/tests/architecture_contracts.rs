@@ -1255,11 +1255,10 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
 
 #[test]
 fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation_channel() {
-    // `retrieval_trace.annotations` is an evidence channel: `codestory-cli`'s
-    // `is_gap_annotation` substring-matches it for gap markers and downgrades packet
-    // confidence when one hits. Always-on telemetry published there matched on "skipped" and
-    // moved every packet from high/ready to medium/review. The counters must therefore be
-    // structurally separated from evidence text, not merely worded around the heuristic.
+    // `retrieval_trace.annotations` is an evidence channel: `Gap`-kind entries downgrade packet
+    // confidence. Always-on telemetry published there was classified as a gap on every packet and
+    // moved every answer from high/ready to medium/review. The counters must therefore be
+    // structurally separated from evidence text, not merely reclassified as observations.
     let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
     let telemetry_production = production_source_prefix(&telemetry);
     assert!(
@@ -1435,5 +1434,125 @@ fn the_release_model_embedding_gate_keys_on_the_profile_not_debug_info() {
     assert!(
         build_script.contains("profile_requires_embedded_model(profile.as_deref())"),
         "the gate must route the profile through the shared decision this test compiles"
+    );
+}
+
+/// Every word the retired `is_gap_annotation` heuristic substring-matched.
+const RETIRED_ANNOTATION_PROSE_MARKERS: [&str; 10] = [
+    "fallback",
+    "gap",
+    "low confidence",
+    "missing",
+    "no relevant",
+    "skipped",
+    "truncated",
+    "uncertain",
+    "unavailable",
+    "weak",
+];
+
+#[test]
+fn retrieval_annotations_are_classified_by_typed_kind_not_by_prose() {
+    // EV-6b (#1746). `is_gap_annotation` lowercased annotation text and looked for ten English
+    // words to decide whether an annotation was an evidence gap; a match downgraded
+    // `agent_confidence` from high/ready to medium/review. Annotations interpolate prompt text,
+    // file paths, symbol names, error messages, and user bookmark comments, so reported
+    // confidence depended on wording rather than on evidence. Classification now reads only the
+    // typed kind on the DTO.
+    let dto = read("crates/codestory-contracts/src/api/dto.rs");
+    let dto_production = production_source(&dto);
+    assert!(
+        dto_production.contains("pub enum RetrievalAnnotationKindDto"),
+        "retrieval annotations must carry a typed kind enum"
+    );
+    for variant in ["    Gap,", "    Observation,"] {
+        assert!(
+            dto_production.contains(variant),
+            "retrieval annotation kind must be exactly Gap | Observation: missing `{variant}`"
+        );
+    }
+    assert!(
+        dto_production.contains("pub annotations: Vec<RetrievalAnnotationDto>"),
+        "the retrieval trace annotation channel must be typed, not Vec<String>"
+    );
+
+    let output = read("crates/codestory-cli/src/output.rs");
+    let output_production = production_source(&output);
+    assert!(
+        !output_production.contains("is_gap_annotation"),
+        "the prose gap classifier must be gone from confidence rendering"
+    );
+    assert!(
+        output_production.contains("annotation.kind == RetrievalAnnotationKindDto::Gap"),
+        "gap notes must select annotations by typed kind"
+    );
+
+    // The confidence path must not reach for annotation prose at all. `agent_gap_notes` is the
+    // only place annotations feed a confidence decision, so pin the whole function body.
+    let gap_notes = source_between(
+        output_production.as_str(),
+        "fn agent_gap_notes(",
+        "\nfn append_retrieval_gap_notes(",
+    );
+    assert!(
+        !gap_notes.contains("to_ascii_lowercase") && !gap_notes.contains("to_lowercase"),
+        "confidence gap notes must never lowercase annotation prose:\n{gap_notes}"
+    );
+    for marker in RETIRED_ANNOTATION_PROSE_MARKERS {
+        assert!(
+            !gap_notes.contains(&format!("\"{marker}\"")),
+            "confidence gap notes must not substring-match the retired prose marker `{marker}`"
+        );
+    }
+
+    // Every producer states the kind at the push site. Nothing may reach the channel through an
+    // untyped `String`, and no helper may infer the kind for a caller.
+    for path in [
+        "crates/codestory-runtime/src/agent/trace.rs",
+        "crates/codestory-runtime/src/agent/orchestrator.rs",
+        "crates/codestory-runtime/src/agent/packet_batch.rs",
+        "crates/codestory-runtime/src/agent/packet_capping.rs",
+        "crates/codestory-runtime/src/agent/packet_trace.rs",
+        "crates/codestory-cli/src/app/agent_context/context.rs",
+        "crates/codestory-cli/src/stdio_transport.rs",
+    ] {
+        let source = read(path);
+        let dense = production_source(&source)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("");
+        let mut cursor = 0usize;
+        while let Some(offset) = dense[cursor..].find("annotations.push(") {
+            let after = cursor + offset + "annotations.push(".len();
+            let rest = &dense[after..];
+            assert!(
+                rest.starts_with("RetrievalAnnotationDto::gap(")
+                    || rest.starts_with("RetrievalAnnotationDto::observation(")
+                    || rest.starts_with(
+                        "codestory_contracts::api::RetrievalAnnotationDto::observation("
+                    )
+                    || rest.starts_with("codestory_contracts::api::RetrievalAnnotationDto::gap("),
+                "{path} pushes a retrieval annotation without naming its kind: {}",
+                &rest[..rest.len().min(80)]
+            );
+            cursor = after;
+        }
+    }
+
+    // `TraceRecorder` is the runtime's own annotation front door: it must expose one entry point
+    // per kind, not a single `annotate` that leaves the classification to a downstream reader.
+    let recorder = production_source(&read("crates/codestory-runtime/src/agent/trace.rs"));
+    for required in [
+        "fn annotate_gap(&mut self, message: impl Into<String>)",
+        "fn observe(&mut self, message: impl Into<String>)",
+    ] {
+        assert!(
+            recorder.contains(required),
+            "TraceRecorder must expose a per-kind annotation entry point: missing `{required}`"
+        );
+    }
+    assert!(
+        !recorder.contains("fn annotate(&mut self"),
+        "the kind-less TraceRecorder::annotate entry point must stay retired"
     );
 }

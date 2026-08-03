@@ -4076,11 +4076,13 @@ fn handle_stdio_context(
             hybrid_weights: None,
         })
         .map(|mut result| {
-            result.retrieval_trace.annotations.push(format!(
-                "context_target node={} label=`{}`",
-                focus_node_id.0,
-                target_label.replace('`', "'")
-            ));
+            result.retrieval_trace.annotations.push(
+                codestory_contracts::api::RetrievalAnnotationDto::observation(format!(
+                    "context_target node={} label=`{}`",
+                    focus_node_id.0,
+                    target_label.replace('`', "'")
+                )),
+            );
             serde_json::json!({"result": context_packet_json(&result)})
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
