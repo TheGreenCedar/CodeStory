@@ -12,9 +12,9 @@ use crate::services::{
 };
 use crate::workspace_state::runtime_workspace_manifest;
 use crate::{
-    ACTIVE_CORE_READ, ActiveCoreRead, ActiveCoreReadGuard, AppController, AppState, ReadStorage,
-    RuntimeProcessConfig, SidecarQueryCacheState, SourceObserverState, Storage,
-    clear_search_engine, publish_search_engine,
+    ACTIVE_CORE_READ, ActiveCoreRead, ActiveCoreReadGuard, AppController, AppState,
+    ObservedSourceEpoch, ReadStorage, RuntimeProcessConfig, SidecarQueryCacheState,
+    SourceObserverState, Storage, clear_search_engine, publish_search_engine,
 };
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexFreshnessDto, ProjectSummary, RetrievalStateDto,
@@ -324,6 +324,7 @@ impl AppController {
     ) -> Option<Arc<codestory_workspace::filesystem_observer::FilesystemObserverSession>> {
         use codestory_workspace::filesystem_observer::FilesystemObserverSession;
 
+        let storage_path = self.require_storage_path().ok();
         let mut state = self.source_observer.lock();
         if state.root.as_deref() != Some(root) {
             *state = SourceObserverState {
@@ -343,7 +344,19 @@ impl AppController {
         if state.refused.is_some() {
             return None;
         }
-        match FilesystemObserverSession::arm(root) {
+        // The recursive watch cannot be narrowed at the kernel, so the storage cache — which this
+        // process itself writes on every read — is excluded on arrival alongside the discovery
+        // exclusions the filter already carries.
+        let mut scope =
+            codestory_workspace::filesystem_observer::ObservedScopeFilter::source_default();
+        if let Some(storage_root) = storage_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            scope = scope.ignoring_root(storage_root);
+        }
+        match FilesystemObserverSession::arm_with_scope(root, scope) {
             Ok(session) => {
                 let session = Arc::new(session);
                 state.session = Some(Arc::clone(&session));
@@ -360,6 +373,24 @@ impl AppController {
                 None
             }
         }
+    }
+
+    /// What the observer over `root` can say about the working tree at this instant.
+    ///
+    /// This is the value a ready lease carries so a later probe has something that *moves* when
+    /// the tree does. `None` means the observer cannot back a claim about this root at all — no
+    /// notifier, an unsupported filesystem, or a session that has already taken a sticky loss —
+    /// and a lease stamped `None` keeps exactly the EV-7 answer it had before.
+    pub(crate) fn observed_source_epoch(&self, root: &Path) -> Option<ObservedSourceEpoch> {
+        let session = self.source_observer_session(root)?;
+        if session.gap().is_some() {
+            return None;
+        }
+        Some(ObservedSourceEpoch {
+            session_id: session.identity().session_id().to_string(),
+            backend: session.identity().backend().id(),
+            epoch: session.epoch(),
+        })
     }
 
     /// Install a caller-driven observer session so a test can script the racing window.

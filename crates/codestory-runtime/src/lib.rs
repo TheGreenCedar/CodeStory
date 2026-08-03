@@ -596,6 +596,19 @@ pub(crate) struct SourceObserverState {
     arm_requests: u64,
 }
 
+/// What one armed observer session said about a root at a single moment.
+///
+/// The session id pins *which* observer made the claim, because a re-armed session knows nothing
+/// about the window before it. The epoch is the part that moves: it counts every mutation the
+/// scope filter admitted, so two readings that agree are a positive statement that no admitted
+/// path changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedSourceEpoch {
+    session_id: String,
+    backend: &'static str,
+    epoch: codestory_workspace::filesystem_observer::ObserverEpoch,
+}
+
 #[derive(Debug)]
 pub(crate) struct SidecarQueryCacheState {
     generation: u64,

@@ -583,6 +583,16 @@ where
     let mut changed_file_count = changes.changed_file_count;
     let mut samples = changes.samples;
     let mut reason = None;
+    if let Some(gap) = coverage.as_ref().and_then(FilesystemObserverCoverage::gap) {
+        // The only symptom of a self-disabling observer is that reads keep saying `Fresh`. An
+        // operator asking why a repository is never observed needs the gap id to answer it.
+        tracing::debug!(
+            root = %root.display(),
+            gap = gap.id(),
+            detail = %gap.detail(),
+            "freshness observation sealed indeterminate; the scan verdict stands unchanged"
+        );
+    }
     if status == IndexFreshnessStatusDto::Fresh
         && let Some(escalation) = observer_escalation(
             root,

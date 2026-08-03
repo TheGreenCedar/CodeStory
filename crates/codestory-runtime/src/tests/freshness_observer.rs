@@ -40,7 +40,7 @@ impl ObserverEventSource for ScriptedObserver {
     }
 }
 
-fn scripted_session(
+pub(crate) fn scripted_session(
     root: &Path,
     script: impl FnMut(usize) -> Vec<ObservedFilesystemEvent> + Send + 'static,
 ) -> FilesystemObserverSession {
@@ -164,6 +164,45 @@ fn a_write_that_races_the_scan_is_reported_stale_instead_of_fresh() {
 }
 
 #[test]
+fn the_scan_runs_inside_the_window_the_observer_sealed() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let racing_path = project.source.clone();
+    // Every other case in this file scripts events by drain index, and a drain index cannot tell
+    // arm-then-scan apart from scan-then-arm: the seal drains either way. This one moves the
+    // working tree at the instant the window opens and reports nothing at all, so the only thing
+    // that can turn the verdict is the scan reading bytes the window opened over. A scan that
+    // already finished before the window opened reads the published bytes and answers `Fresh`.
+    let session = scripted_session(project.root(), move |drain| {
+        if drain == 0 {
+            std::fs::write(&racing_path, "pub fn wrote_at_the_seam() {}\n").expect("seam write");
+        }
+        Vec::new()
+    });
+
+    let freshness = project.freshness(FreshnessObservation::Observed(&session));
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Stale,
+        "the scan must run inside the window, so a write that lands as the window opens is one \
+         the scan itself has to read"
+    );
+    assert_eq!(freshness.changed_file_count, 1);
+    assert_eq!(
+        freshness.reason, None,
+        "the scan caught this one on its own; nothing was escalated"
+    );
+    assert_eq!(
+        freshness
+            .samples
+            .iter()
+            .map(|sample| sample.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![Path::new("src").join("lib.rs").to_string_lossy().as_ref()]
+    );
+}
+
+#[test]
 fn a_dirty_path_whose_bytes_did_not_move_stays_fresh() {
     let _env = hybrid_test_env();
     let project = ObservedProject::publish();
@@ -251,8 +290,11 @@ fn churn_outside_the_admitted_tree_never_escalates() {
     let project = ObservedProject::publish();
     let build_output = project.root().join("target");
     let git_directory = project.root().join(".git");
+    let attachments = project.root().join("attachments");
     // A build and a checkout running alongside a scan must not leave freshness permanently
-    // escalated over paths discovery never admitted.
+    // escalated over paths discovery never admitted. `attachments/` is the case the observer's own
+    // scope filter does not cover: it is an ordinary directory the session accounts for, and only
+    // the plan knows discovery admitted nothing inside it.
     let session = scripted_session(project.root(), move |drain| {
         if drain == 0 {
             return Vec::new();
@@ -265,6 +307,8 @@ fn churn_outside_the_admitted_tree_never_escalates() {
             ),
             mutated(&git_directory, MutationScope::Directory),
             mutated(&git_directory.join("index"), MutationScope::File),
+            mutated(&attachments, MutationScope::Directory),
+            mutated(&attachments.join("photo.bin"), MutationScope::File),
         ]
     });
 
@@ -330,6 +374,42 @@ fn a_window_that_lost_events_falls_back_to_the_scan_verdict() {
 }
 
 #[test]
+fn a_session_that_lost_coverage_stamps_no_certainty_on_a_ready_lease() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let covered = Arc::new(AtomicBool::new(true));
+    let gate = Arc::clone(&covered);
+    let session = scripted_session(project.root(), move |_| {
+        if gate.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        vec![ObservedFilesystemEvent::CoverageLost {
+            detail: "queue overflow".to_string(),
+        }]
+    });
+    project
+        .controller
+        .install_source_observer_for_test(project.root(), Arc::new(session));
+    assert!(
+        project
+            .controller
+            .observed_source_epoch(project.root())
+            .is_some(),
+        "a covering session is what lets a lease carry a falsifiable source claim"
+    );
+
+    // Losing coverage does not degrade the verdict — the scan verdict is the declared floor — but
+    // it must degrade the *lease*, which would otherwise keep quoting an epoch the observer can no
+    // longer stand behind.
+    covered.store(false, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        project.controller.observed_source_epoch(project.root()),
+        None,
+        "an epoch from a session that admits it missed something is not evidence"
+    );
+}
+
+#[test]
 fn serving_reads_arm_an_observer_and_observational_reads_do_not() {
     let _env = hybrid_test_env();
     let project = ObservedProject::publish();
@@ -358,6 +438,80 @@ fn serving_reads_arm_an_observer_and_observational_reads_do_not() {
     assert!(
         project.controller.source_observer_requests_for_test() > 0,
         "the admission that authorises serving must be the one that arms the observer"
+    );
+}
+
+/// A session that escalates every window it seals, without moving a single byte on disk.
+///
+/// A directory-scoped mutation names no file to rehash, so the scan verdict stays `Fresh` on its
+/// own and the observer is the only thing that can refuse. That is what makes these tests measure
+/// the consequence rather than the arming: nothing but the escalation can turn them red.
+fn escalating_session(root: &Path, quiet_drains: usize) -> FilesystemObserverSession {
+    let source_directory = root.join("src");
+    scripted_session(root, move |drain| {
+        if drain < quiet_drains {
+            return Vec::new();
+        }
+        vec![mutated(&source_directory, MutationScope::Directory)]
+    })
+}
+
+#[test]
+fn an_escalated_verdict_refuses_the_public_operation_before_its_body_runs() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    let session = escalating_session(project.root(), 1);
+    project
+        .controller
+        .install_source_observer_for_test(project.root(), Arc::new(session));
+
+    let service = crate::services::PublicOperationService::new(project.controller.clone());
+    let builds = std::cell::Cell::new(0usize);
+    let error = service
+        .run_with_cancel("symbols", Arc::new(AtomicBool::new(false)), || {
+            builds.set(builds.get() + 1);
+            Ok(())
+        })
+        .expect_err("an observer-escalated verdict must refuse the operation, not just be counted");
+
+    assert_eq!(
+        error.code, "project_unavailable",
+        "the admission before the operation body is the one that has to refuse"
+    );
+    assert_eq!(
+        builds.get(),
+        0,
+        "a refusal that lets the response get built is not a refusal"
+    );
+}
+
+#[test]
+fn an_escalated_verdict_refuses_the_public_operation_after_its_body_runs() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish();
+    // Quiet across the first admission's window (its arm and its seal), then escalating: the
+    // mutation lands while the operation body is running, which only the read after the body can
+    // catch.
+    let session = escalating_session(project.root(), 2);
+    project
+        .controller
+        .install_source_observer_for_test(project.root(), Arc::new(session));
+
+    let service = crate::services::PublicOperationService::new(project.controller.clone());
+    let builds = std::cell::Cell::new(0usize);
+    let error = service
+        .run_with_cancel("symbols", Arc::new(AtomicBool::new(false)), || {
+            builds.set(builds.get() + 1);
+            Ok(())
+        })
+        .expect_err("a response built over a tree that moved under it must not be served");
+
+    assert_eq!(error.code, "project_unavailable");
+    assert_eq!(
+        builds.get(),
+        1,
+        "the first attempt ran and was refused after the fact; its bounded retry was refused \
+         before running again"
     );
 }
 

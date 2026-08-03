@@ -15,9 +15,18 @@
 //! keeps whatever verdict it computed without the observer. That fallback is the permanent floor
 //! beneath this module, not a temporary state.
 //!
-//! Losses are sticky. Once a session has missed anything it can never seal `Proven` again,
-//! because a backend that dropped one event has no way to tell the caller what it dropped.
-//! Recovering certainty requires arming a new session, which carries a new identity.
+//! Backend losses are sticky. Once a notifier has told a session it missed something, that
+//! session can never seal `Proven` again: a backend that dropped one event has no way to say what
+//! it dropped, and on inotify the descriptors for subtrees created during the overflow were never
+//! installed. Recovering certainty requires arming a new session, which carries a new identity.
+//!
+//! Losses the session inflicts on *itself* are not sticky, because it knows exactly what they
+//! cost. An overflowed per-window accumulator and an overlapping window each seal one window
+//! indeterminate and clear when every window closes: the accumulator is per-window by
+//! construction and the next caller re-reads the tree anyway, so nothing carries forward.
+//!
+//! Churn is filtered on arrival by [`ObservedScopeFilter`] rather than downstream, so a build
+//! writing `target/` cannot spend the observation budget of a scan it was never going to affect.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -36,8 +45,21 @@ pub type ObserverEpoch = u64;
 /// Paths one session accumulates inside a single window before it declares a hole.
 ///
 /// The bound exists so a runaway writer cannot grow observer state without limit. Exhausting it
-/// is a loss of coverage like any other: the window seals indeterminate and the caller falls back.
+/// seals *that* window indeterminate and the caller falls back — but unlike a dropped kernel
+/// event it is not a permanent loss. The accumulator is per-window by construction, and the next
+/// window's caller re-reads the tree anyway, so the session recovers as soon as a window closes.
 pub const FILESYSTEM_OBSERVER_DIRTY_PATH_CAP: usize = 4_096;
+
+/// Directory names whose churn under a watched root can never be admitted source.
+///
+/// A recursive watch over a project root sees everything: a build writing `target/`, a checkout
+/// rewriting `.git/`, a package install unpacking `node_modules/`. None of it can ever reach a
+/// freshness verdict, because discovery excludes those trees by default — so charging them
+/// against the observation budget spends the whole window's accounting on paths the caller is
+/// about to throw away. The names mirror `default_source_exclude_patterns`, which is what
+/// discovery actually applies.
+const OBSERVER_IGNORED_DIRECTORY_NAMES: &[&str] =
+    &[".git", "node_modules", "target", "dist", "build"];
 
 /// Which notifier produced a session's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +186,70 @@ impl FilesystemObserverGap {
     }
 }
 
+/// Which observed paths one session accounts for at all.
+///
+/// The filter runs *before* anything is charged: an ignored path advances no epoch, occupies no
+/// accumulator slot, and consumes no budget. That ordering is the whole point. A recursive watch
+/// cannot be narrowed at the kernel, so the only place churn can be dropped is on arrival, and
+/// dropping it after the budget has already been spent would let a single `cargo build` overlapping
+/// one scan exhaust a 4096-path window on paths the escalation logic discards anyway.
+///
+/// Dropping is safe in exactly one direction: a path this filter refuses can never be admitted
+/// source, so refusing it can only ever *lower* the number of mutations a window reports. It can
+/// never manufacture a mutation, and it can never hide one a caller could have acted on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedScopeFilter {
+    ignored_directory_names: BTreeSet<String>,
+    ignored_roots: BTreeSet<PathBuf>,
+}
+
+impl ObservedScopeFilter {
+    /// Account for every path under the watched root.
+    pub fn observe_everything() -> Self {
+        Self::default()
+    }
+
+    /// Account for everything discovery could admit, and nothing else.
+    pub fn source_default() -> Self {
+        Self {
+            ignored_directory_names: OBSERVER_IGNORED_DIRECTORY_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            ignored_roots: BTreeSet::new(),
+        }
+    }
+
+    /// Also ignore one absolute subtree, such as the storage-owned cache directory.
+    #[must_use]
+    pub fn ignoring_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.ignored_roots.insert(root.into());
+        self
+    }
+
+    /// Whether `path` under `root` can possibly name something discovery admitted.
+    pub fn admits(&self, root: &Path, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(root) else {
+            // A recursive watch reports nothing outside its root; anything that arrives anyway
+            // names no file inside the project and can carry no verdict.
+            return false;
+        };
+        if self
+            .ignored_roots
+            .iter()
+            .any(|ignored| path.starts_with(ignored))
+        {
+            return false;
+        }
+        !relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| self.ignored_directory_names.contains(name))
+        })
+    }
+}
+
 /// What a mutation implies about the scope a caller must re-examine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationScope {
@@ -210,7 +296,10 @@ impl ProvenCoverage {
         self.sealed_epoch
     }
 
-    /// No mutation at all was observed while the caller's scan ran.
+    /// No mutation the scope filter admits was observed while the caller's scan ran.
+    ///
+    /// Churn the filter refuses — `target/`, `.git/`, the storage cache — never counted, so a
+    /// build running alongside a scan still leaves the window quiet.
     pub fn is_quiet(&self) -> bool {
         self.armed_epoch == self.sealed_epoch
     }
@@ -267,7 +356,15 @@ struct SessionState {
     epoch: ObserverEpoch,
     dirty: BTreeSet<PathBuf>,
     rescan: BTreeSet<PathBuf>,
+    /// Losses the session can never come back from. A backend that dropped one event cannot say
+    /// what it dropped, and on inotify the descriptors for subtrees created during the overflow
+    /// were never installed, so nothing later re-establishes coverage.
     gap: Option<FilesystemObserverGap>,
+    /// The current window overflowed its own accumulator. Cleared when every window closes,
+    /// because the accumulator is per-window and the next caller re-reads the tree regardless.
+    budget_exhausted: bool,
+    /// How many windows this session has overflowed. Diagnostic only, never control flow.
+    budget_exhaustions: u64,
     open_windows: usize,
     contended: bool,
     source: Box<dyn ObserverEventSource>,
@@ -282,6 +379,7 @@ struct SessionState {
 pub struct FilesystemObserverSession {
     identity: FilesystemObserverIdentity,
     canonical_root: PathBuf,
+    scope: ObservedScopeFilter,
     state: Mutex<SessionState>,
 }
 
@@ -299,7 +397,15 @@ impl FilesystemObserverSession {
     ///
     /// Fails closed with a typed gap when the filesystem is unsupported or the notifier refuses.
     pub fn arm(root: &Path) -> Result<Self, FilesystemObserverGap> {
-        Self::arm_with_filesystem(root, &probe_host_filesystem(root))
+        Self::arm_with_scope(root, ObservedScopeFilter::source_default())
+    }
+
+    /// Arm the platform notifier over `root`, accounting only for paths `scope` admits.
+    pub fn arm_with_scope(
+        root: &Path,
+        scope: ObservedScopeFilter,
+    ) -> Result<Self, FilesystemObserverGap> {
+        Self::arm_with_filesystem_and_scope(root, &probe_host_filesystem(root), scope)
     }
 
     /// Arm the platform notifier over `root` against a filesystem description the caller already
@@ -311,12 +417,22 @@ impl FilesystemObserverSession {
         root: &Path,
         observed: &ObservedFilesystem,
     ) -> Result<Self, FilesystemObserverGap> {
+        Self::arm_with_filesystem_and_scope(root, observed, ObservedScopeFilter::source_default())
+    }
+
+    /// Arm against a caller-supplied filesystem description and scope filter.
+    pub fn arm_with_filesystem_and_scope(
+        root: &Path,
+        observed: &ObservedFilesystem,
+        scope: ObservedScopeFilter,
+    ) -> Result<Self, FilesystemObserverGap> {
         classify_observed_filesystem(root, observed)?;
         let source = native_event_source(root)?;
         Ok(Self::from_source(
             FilesystemObserverBackend::Native,
             root,
             Box::new(source),
+            scope,
         ))
     }
 
@@ -325,13 +441,29 @@ impl FilesystemObserverSession {
     /// Test-only: production always arms the platform notifier through [`Self::arm`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn arm_with_source(root: &Path, source: Box<dyn ObserverEventSource>) -> Self {
-        Self::from_source(FilesystemObserverBackend::Injected, root, source)
+        Self::from_source(
+            FilesystemObserverBackend::Injected,
+            root,
+            source,
+            ObservedScopeFilter::source_default(),
+        )
+    }
+
+    /// Arm a session over a caller-supplied event source and scope filter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn arm_with_source_and_scope(
+        root: &Path,
+        source: Box<dyn ObserverEventSource>,
+        scope: ObservedScopeFilter,
+    ) -> Self {
+        Self::from_source(FilesystemObserverBackend::Injected, root, source, scope)
     }
 
     fn from_source(
         backend: FilesystemObserverBackend,
         root: &Path,
         source: Box<dyn ObserverEventSource>,
+        scope: ObservedScopeFilter,
     ) -> Self {
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         Self {
@@ -341,11 +473,14 @@ impl FilesystemObserverSession {
                 session_id: Uuid::new_v4().to_string(),
             },
             canonical_root,
+            scope,
             state: Mutex::new(SessionState {
                 epoch: 0,
                 dirty: BTreeSet::new(),
                 rescan: BTreeSet::new(),
                 gap: None,
+                budget_exhausted: false,
+                budget_exhaustions: 0,
                 open_windows: 0,
                 contended: false,
                 source,
@@ -356,6 +491,20 @@ impl FilesystemObserverSession {
     /// Identity of this armed session.
     pub fn identity(&self) -> &FilesystemObserverIdentity {
         &self.identity
+    }
+
+    /// Which observed paths this session accounts for.
+    pub fn scope(&self) -> &ObservedScopeFilter {
+        &self.scope
+    }
+
+    /// How many windows this session has overflowed its per-window path budget.
+    ///
+    /// Exhaustion is otherwise invisible from outside — the symptom is that reads keep returning
+    /// whatever the unobserved scan said — so an operator asking "why is this repository never
+    /// observed" needs a number to look at.
+    pub fn budget_exhaustion_count(&self) -> u64 {
+        self.lock().budget_exhaustions
     }
 
     /// Mutations absorbed so far, after taking whatever the notifier has queued.
@@ -369,6 +518,9 @@ impl FilesystemObserverSession {
     }
 
     /// The sticky gap this session has fallen into, if any.
+    ///
+    /// Per-window losses — an overflowed accumulator, an overlapping window — are not sticky and
+    /// never appear here; they are reported by the window that suffered them and nowhere else.
     pub fn gap(&self) -> Option<FilesystemObserverGap> {
         let mut state = self.lock();
         self.absorb(&mut state);
@@ -388,6 +540,7 @@ impl FilesystemObserverSession {
             if state.open_windows == 0 {
                 state.dirty.clear();
                 state.rescan.clear();
+                state.budget_exhausted = false;
             } else {
                 // Two windows sharing one accumulator can each attribute the other's quiet
                 // stretches to itself. Neither may claim proof.
@@ -402,15 +555,22 @@ impl FilesystemObserverSession {
             self.absorb(&mut state);
             state.open_windows = state.open_windows.saturating_sub(1);
             let contended = state.contended;
+            let exhausted = state.budget_exhausted;
             if state.open_windows == 0 {
                 state.contended = false;
+                state.budget_exhausted = false;
             }
-            match (contended, state.gap.clone()) {
-                (_, Some(gap)) => FilesystemObserverCoverage::Indeterminate { gap },
-                (true, None) => FilesystemObserverCoverage::Indeterminate {
+            match (contended, exhausted, state.gap.clone()) {
+                (_, _, Some(gap)) => FilesystemObserverCoverage::Indeterminate { gap },
+                (true, _, None) => FilesystemObserverCoverage::Indeterminate {
                     gap: FilesystemObserverGap::ConcurrentObservation,
                 },
-                (false, None) => FilesystemObserverCoverage::Proven(ProvenCoverage {
+                (false, true, None) => FilesystemObserverCoverage::Indeterminate {
+                    gap: FilesystemObserverGap::ObservationBudgetExhausted {
+                        limit: FILESYSTEM_OBSERVER_DIRTY_PATH_CAP,
+                    },
+                },
+                (false, false, None) => FilesystemObserverCoverage::Proven(ProvenCoverage {
                     identity: self.identity.clone(),
                     armed_epoch,
                     sealed_epoch: state.epoch,
@@ -437,18 +597,22 @@ impl FilesystemObserverSession {
     fn apply(&self, state: &mut SessionState, event: ObservedFilesystemEvent) {
         match event {
             ObservedFilesystemEvent::Mutated { path, scope } => {
-                state.epoch = state.epoch.saturating_add(1);
                 let path = self.rebase_observed_path(path);
+                // Admission first, budget second. A path no caller can act on must not advance
+                // the epoch, must not occupy an accumulator slot, and must not spend the window.
+                if !self.scope.admits(&self.identity.root, &path) {
+                    return;
+                }
+                state.epoch = state.epoch.saturating_add(1);
                 let set = match scope {
                     MutationScope::File => &mut state.dirty,
                     MutationScope::Directory => &mut state.rescan,
                 };
                 if set.len() >= FILESYSTEM_OBSERVER_DIRTY_PATH_CAP && !set.contains(&path) {
-                    state
-                        .gap
-                        .get_or_insert(FilesystemObserverGap::ObservationBudgetExhausted {
-                            limit: FILESYSTEM_OBSERVER_DIRTY_PATH_CAP,
-                        });
+                    if !state.budget_exhausted {
+                        state.budget_exhausted = true;
+                        state.budget_exhaustions = state.budget_exhaustions.saturating_add(1);
+                    }
                     return;
                 }
                 set.insert(path);
@@ -1013,6 +1177,111 @@ mod tests {
         assert_eq!(
             coverage.gap().map(FilesystemObserverGap::id),
             Some("observer_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_is_a_per_window_loss_the_next_window_recovers_from() {
+        // The permanently-disabled observer is the failure this guards: a single build overlapping
+        // one scan must not silently switch the feature off for the rest of the process.
+        let (session, sender) = scripted(Path::new("/repo"));
+        let (_, exhausted) = session.observe_window(|| {
+            for index in 0..=FILESYSTEM_OBSERVER_DIRTY_PATH_CAP {
+                sender
+                    .send(mutated(
+                        &format!("/repo/src/file{index}.rs"),
+                        MutationScope::File,
+                    ))
+                    .expect("scripted source must accept the event");
+            }
+        });
+        assert_eq!(
+            exhausted.gap().map(FilesystemObserverGap::id),
+            Some("observer_budget_exhausted")
+        );
+        assert_eq!(session.budget_exhaustion_count(), 1);
+        assert_eq!(
+            session.gap(),
+            None,
+            "overflowing our own accumulator is not a backend loss and must not stick"
+        );
+
+        let (_, recovered) = session.observe_window(|| {
+            sender
+                .send(mutated("/repo/src/lib.rs", MutationScope::File))
+                .expect("scripted source must accept the event");
+        });
+        let proven = recovered
+            .proven()
+            .expect("the window after an overflow accounts for itself completely");
+        assert_eq!(
+            proven.dirty_paths().iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/repo/src/lib.rs")]
+        );
+        assert_eq!(session.budget_exhaustion_count(), 1);
+    }
+
+    #[test]
+    fn ignored_churn_never_reaches_the_epoch_or_the_budget() {
+        // A build and a checkout produce more paths than the whole budget. Charging them before
+        // the admission filter would seal every overlapping window indeterminate.
+        let (session, sender) = scripted(Path::new("/repo"));
+        let (_, coverage) = session.observe_window(|| {
+            for index in 0..=FILESYSTEM_OBSERVER_DIRTY_PATH_CAP {
+                sender
+                    .send(mutated(
+                        &format!("/repo/target/debug/artifact{index}.o"),
+                        MutationScope::File,
+                    ))
+                    .expect("scripted source must accept the event");
+                sender
+                    .send(mutated(
+                        &format!("/repo/.git/objects/{index}"),
+                        MutationScope::File,
+                    ))
+                    .expect("scripted source must accept the event");
+                sender
+                    .send(mutated(
+                        &format!("/repo/node_modules/dep{index}/index.js"),
+                        MutationScope::File,
+                    ))
+                    .expect("scripted source must accept the event");
+            }
+            sender
+                .send(mutated("/repo/src/lib.rs", MutationScope::File))
+                .expect("scripted source must accept the event");
+        });
+        let proven = coverage
+            .proven()
+            .expect("churn discovery excludes may not exhaust the observation budget");
+        assert_eq!(session.budget_exhaustion_count(), 0);
+        assert_eq!(
+            proven.dirty_paths().iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/repo/src/lib.rs")],
+            "only paths discovery could admit are accounted for"
+        );
+        assert_eq!(
+            proven.sealed_epoch(),
+            proven.armed_epoch() + 1,
+            "ignored churn advances no epoch, so a lease cannot be invalidated by a build"
+        );
+    }
+
+    #[test]
+    fn an_ignored_root_covers_the_storage_cache_the_runtime_owns() {
+        let scope = ObservedScopeFilter::source_default().ignoring_root("/repo/.cache");
+        assert!(scope.admits(Path::new("/repo"), Path::new("/repo/src/lib.rs")));
+        assert!(scope.admits(Path::new("/repo"), Path::new("/repo")));
+        assert!(!scope.admits(Path::new("/repo"), Path::new("/repo/.cache/codestory.db")));
+        assert!(!scope.admits(Path::new("/repo"), Path::new("/repo/target/debug/main")));
+        assert!(!scope.admits(Path::new("/repo"), Path::new("/repo/a/.git/index")));
+        assert!(
+            !scope.admits(Path::new("/repo"), Path::new("/elsewhere/lib.rs")),
+            "a recursive watch reports nothing outside its root; anything that arrives is noise"
+        );
+        assert!(
+            ObservedScopeFilter::observe_everything()
+                .admits(Path::new("/repo"), Path::new("/repo/target/debug/main"))
         );
     }
 

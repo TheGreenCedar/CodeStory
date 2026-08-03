@@ -114,7 +114,7 @@ use tempfile::{TempDir, tempdir};
 mod activation_coverage_tests;
 
 #[path = "tests/freshness_observer.rs"]
-mod freshness_observer_tests;
+pub(crate) mod freshness_observer_tests;
 #[path = "tests/repo_text.rs"]
 mod repo_text_tests;
 #[path = "tests/search_intent.rs"]
