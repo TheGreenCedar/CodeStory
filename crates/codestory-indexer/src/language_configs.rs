@@ -2,8 +2,8 @@ use super::{
     BASH_GRAPH_QUERY, C_GRAPH_QUERY, CPP_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY,
     GO_GRAPH_QUERY, JAVA_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset,
     PHP_GRAPH_QUERY, PYTHON_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY,
-    SWIFT_GRAPH_QUERY, TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY,
-    TYPESCRIPT_TAGS_QUERY, languages, make_language_config,
+    SWIFT_GRAPH_QUERY, TYPESCRIPT_GRAPH_QUERY, TYPESCRIPT_TAGS_QUERY, languages,
+    make_language_config,
 };
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext, normalize_extension,
@@ -33,7 +33,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("java", _) => Some(java()),
         ("rust", _) => Some(rust()),
         ("javascript", _) => Some(javascript()),
-        ("typescript", "tsx") => Some(tsx()),
         ("typescript", _) => Some(typescript()),
         ("cpp", _) => Some(cpp()),
         ("c", _) => Some(c()),
@@ -95,16 +94,6 @@ fn typescript() -> LanguageConfig {
         TYPESCRIPT_GRAPH_QUERY,
         Some(TYPESCRIPT_TAGS_QUERY),
         LanguageRuleset::TypeScript,
-    )
-}
-
-fn tsx() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "typescript",
-        TSX_GRAPH_QUERY,
-        Some(TSX_TAGS_QUERY),
-        LanguageRuleset::Tsx,
     )
 }
 

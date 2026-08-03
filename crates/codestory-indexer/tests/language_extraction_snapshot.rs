@@ -47,16 +47,32 @@ struct SnapshotCase {
     tictactoe_golden: &'static str,
 }
 
-const CASES: &[SnapshotCase] = &[SnapshotCase {
-    language: "kotlin",
-    extension: "kt",
-    fidelity_filename: "fidelity.kt",
-    fidelity_source: include_str!("fixtures/fidelity_lab/kotlin_fidelity_lab.kt"),
-    fidelity_golden: include_str!("fixtures/language_snapshots/kotlin_fidelity.txt"),
-    tictactoe_filename: "game.kt",
-    tictactoe_source: include_str!("fixtures/tictactoe/kotlin_tictactoe.kt"),
-    tictactoe_golden: include_str!("fixtures/language_snapshots/kotlin_tictactoe.txt"),
-}];
+const CASES: &[SnapshotCase] = &[
+    SnapshotCase {
+        language: "kotlin",
+        extension: "kt",
+        fidelity_filename: "fidelity.kt",
+        fidelity_source: include_str!("fixtures/fidelity_lab/kotlin_fidelity_lab.kt"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/kotlin_fidelity.txt"),
+        tictactoe_filename: "game.kt",
+        tictactoe_source: include_str!("fixtures/tictactoe/kotlin_tictactoe.kt"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/kotlin_tictactoe.txt"),
+    },
+    // TSX is the one row whose fixtures are new rather than reused: the
+    // `fidelity_lab` and `tictactoe` corpora only carried a `.ts` file, and a
+    // `.ts` fixture proves nothing about the TSX grammar, the `tsx.graph.scm`
+    // rule file, or the JSX usage edges that only a `.tsx` extension turns on.
+    SnapshotCase {
+        language: "tsx",
+        extension: "tsx",
+        fidelity_filename: "fidelity.tsx",
+        fidelity_source: include_str!("fixtures/fidelity_lab/tsx_fidelity_lab.tsx"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/tsx_fidelity.txt"),
+        tictactoe_filename: "game.tsx",
+        tictactoe_source: include_str!("fixtures/tictactoe/tsx_tictactoe.tsx"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/tsx_tictactoe.txt"),
+    },
+];
 
 #[test]
 fn moved_language_rules_keep_the_fidelity_lab_projection_byte_identical() -> Result<()> {

@@ -3941,8 +3941,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            "rust" | "typescript" | "javascript" | "jsx" | "go" | "java" | "csharp" | "cpp"
+            | "dart" | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5572,8 +5572,8 @@ mod tests {
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
-    /// Kotlin's comment marker now comes from the language registry rather than
-    /// the local roster, and every other language must be unmoved.
+    /// Kotlin's and TSX's comment markers now come from the language registry
+    /// rather than the local roster, and every other language must be unmoved.
     ///
     /// Asserting only "Kotlin still dims `//`" would pass with the registry
     /// lookup deleted, because the local roster used to answer for Kotlin too.
@@ -5639,6 +5639,24 @@ mod tests {
         );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+
+        // Same for the `tsx` dialect. `typescript` and `jsx` must still come
+        // from the local roster, because their packages have not landed: a row
+        // that answered for them here would move rendering ownership early.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("tsx"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("typescript"),
+            None
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("jsx"),
+            None
+        );
+        let tsx = ansi_highlight_snippet("app/View.tsx", "const ok = true; // comment");
+        assert!(tsx.contains("\x1b[90m// comment\x1b[0m"), "{tsx:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

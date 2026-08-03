@@ -134,8 +134,6 @@ const RUST_TAGS_QUERY: &str = include_str!("../rules/rust.tags.scm");
 const JAVASCRIPT_GRAPH_QUERY: &str = include_str!("../rules/javascript.scm");
 const TYPESCRIPT_GRAPH_QUERY: &str = include_str!("../rules/typescript.graph.scm");
 const TYPESCRIPT_TAGS_QUERY: &str = include_str!("../rules/typescript.tags.scm");
-const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
-const TSX_TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
 const CPP_GRAPH_QUERY: &str = include_str!("../rules/cpp.scm");
 const C_GRAPH_QUERY: &str = include_str!("../rules/c.scm");
 const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
@@ -310,9 +308,10 @@ impl LanguageRuleset {
                 Some(TYPESCRIPT_TAGS_QUERY),
                 &TYPESCRIPT_RULES,
             ),
-            LanguageRuleset::Tsx => {
-                compiled_rules_cache(language, TSX_GRAPH_QUERY, Some(TSX_TAGS_QUERY), &TSX_RULES)
-            }
+            // Answered by the registry above; see the `Kotlin` arm below.
+            LanguageRuleset::Tsx => Err(anyhow!(
+                "tsx compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::Cpp => {
                 compiled_rules_cache(language, CPP_GRAPH_QUERY, None, &CPP_RULES)
             }
@@ -377,7 +376,6 @@ static JAVA_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::n
 static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static JAVASCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CPP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static C_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -7594,7 +7592,7 @@ fn language_receiver_call_specs(
     match language_name {
         "javascript" => collect_javascript_receiver_call_edges(tree, source),
         "python" => collect_python_receiver_call_edges(tree, source),
-        "typescript" | "tsx" => collect_typescript_receiver_call_edges(tree, source),
+        "typescript" => collect_typescript_receiver_call_edges(tree, source),
         "java" => collect_java_receiver_call_edges(tree, source),
         "go" => collect_go_receiver_call_edges(tree, source),
         "ruby" => collect_ruby_receiver_call_edges(tree, source),
@@ -25732,9 +25730,19 @@ class Test {
         assert_eq!(ts.graph_query, TYPESCRIPT_GRAPH_QUERY);
         assert_eq!(ts.tags_query, Some(TYPESCRIPT_TAGS_QUERY));
 
+        // TSX's rule files moved into `languages::tsx`; the config must still
+        // come back through the same extension lookup, still on the TSX
+        // grammar, and still sharing TypeScript's tags query.
         let tsx = get_language_for_ext("tsx").expect("tsx config");
-        assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
-        assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
+        assert_eq!(tsx.language_name, "typescript");
+        assert_eq!(
+            tsx.graph_query,
+            languages::extraction_for_ext("tsx")
+                .expect("tsx registry row")
+                .graph_query
+        );
+        assert_ne!(tsx.graph_query, ts.graph_query);
+        assert_eq!(tsx.tags_query, Some(TYPESCRIPT_TAGS_QUERY));
 
         // Kotlin's rule file moved into `languages::kotlin`; the config must
         // still come back through the same extension lookup.
