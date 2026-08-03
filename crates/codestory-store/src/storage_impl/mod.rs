@@ -174,6 +174,8 @@ pub struct CorePromotionStats {
     pub candidate_bytes: u64,
     pub previous_live_bytes: Option<u64>,
     pub rollback_backup_bytes: Option<u64>,
+    /// Which post-restore identity fence the promotion actually satisfied.
+    pub promoted_validation: PromotedValidation,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -206,6 +208,7 @@ impl CorePromotionDurations {
         candidate_bytes: u64,
         previous_live_bytes: Option<u64>,
         rollback_backup_bytes: Option<u64>,
+        promoted_validation: PromotedValidation,
     ) -> CorePromotionStats {
         let total_ms = duration_ms(total);
         let lock_recovery_ms = duration_ms(self.lock_recovery);
@@ -250,6 +253,7 @@ impl CorePromotionDurations {
             candidate_bytes,
             previous_live_bytes,
             rollback_backup_bytes,
+            promoted_validation,
         }
     }
 }
@@ -1067,18 +1071,31 @@ fn promotion_database_image(path: &Path) -> Result<Option<PromotionDatabaseImage
 }
 
 /// How the post-restore fence was satisfied for one promotion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromotedValidation {
+///
+/// This is reported, not merely logged, because whether a promotion can prove
+/// the published file byte-identical to the candidate it validated is the
+/// property any replacement for whole-database restore has to keep. A design
+/// that assembles the live image in place — a staged delta or an
+/// attached-database apply — never produces a file identical to a
+/// pre-validated candidate, so it can only ever report `Revalidated`. Without
+/// this field the difference is invisible in telemetry and the promotion fence
+/// could be weakened without any measurement moving.
+///
+/// `Revalidated` is the default because it is the weaker claim: an unset or
+/// older payload must not read as a proven byte-identical publication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromotedValidation {
     /// The restored file is byte-identical to the validated candidate, so the
     /// candidate's receipt covers it.
     ReusedCandidateReceipt,
     /// The restored file could not be proven identical, so it was validated in
     /// full.
+    #[default]
     Revalidated,
 }
 
 impl PromotedValidation {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ReusedCandidateReceipt => "reused_candidate_receipt",
             Self::Revalidated => "revalidated",
@@ -6140,6 +6157,7 @@ impl Storage {
             candidate_bytes,
             previous_live_bytes,
             rollback_backup_bytes,
+            promoted_validation,
         ))
     }
 
