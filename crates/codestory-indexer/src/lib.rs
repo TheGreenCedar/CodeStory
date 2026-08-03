@@ -140,7 +140,6 @@ const TYPESCRIPT_GRAPH_QUERY: &str = include_str!("../rules/typescript.graph.scm
 const TYPESCRIPT_TAGS_QUERY: &str = include_str!("../rules/typescript.tags.scm");
 const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
 const TSX_TAGS_QUERY: &str = TYPESCRIPT_TAGS_QUERY;
-const C_GRAPH_QUERY: &str = include_str!("../rules/c.scm");
 const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
 const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
@@ -321,7 +320,6 @@ impl LanguageRuleset {
             LanguageRuleset::Cpp => Err(anyhow!(
                 "cpp compiled rules are owned by the language registry"
             )),
-            LanguageRuleset::C => compiled_rules_cache(language, C_GRAPH_QUERY, None, &C_RULES),
             LanguageRuleset::Go => compiled_rules_cache(language, GO_GRAPH_QUERY, None, &GO_RULES),
             LanguageRuleset::Ruby => {
                 compiled_rules_cache(language, RUBY_GRAPH_QUERY, None, &RUBY_RULES)
@@ -332,11 +330,14 @@ impl LanguageRuleset {
             LanguageRuleset::CSharp => {
                 compiled_rules_cache(language, CSHARP_GRAPH_QUERY, None, &CSHARP_RULES)
             }
-            // Answered by the registry above; the arm only exists because the
+            // Answered by the registry above; these arms only exist because the
             // match must stay exhaustive. Failing closed here rather than
             // panicking keeps a future registry mistake a typed indexing error.
             LanguageRuleset::Kotlin => Err(anyhow!(
                 "kotlin compiled rules are owned by the language registry"
+            )),
+            LanguageRuleset::C => Err(anyhow!(
+                "c compiled rules are owned by the language registry"
             )),
             LanguageRuleset::Swift => {
                 compiled_rules_cache(language, SWIFT_GRAPH_QUERY, None, &SWIFT_RULES)
@@ -382,7 +383,6 @@ static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::n
 static JAVASCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static C_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -538,13 +538,7 @@ fn infer_header_language_config(
     if use_cpp {
         cpp_language_config()
     } else {
-        make_language_config(
-            tree_sitter_c::LANGUAGE.into(),
-            "c",
-            C_GRAPH_QUERY,
-            None,
-            LanguageRuleset::C,
-        )
+        c_language_config()
     }
 }
 
@@ -553,6 +547,22 @@ fn infer_header_language_config(
 /// `h` is routed to `c` by the public registry, so this path cannot go through
 /// `get_language_for_ext`; it names the C++ registry row directly. The row is a
 /// `const`, so there is nothing to fail closed on.
+/// Parser config for C, built from its registry row.
+///
+/// The extension route reaches the same row through
+/// `language_configs::get_language_for_ext`; this seam exists because a bare
+/// `.h` is decided by compilation-database evidence rather than by extension.
+fn c_language_config() -> LanguageConfig {
+    let extraction = &languages::c::EXTRACTION;
+    make_language_config(
+        (extraction.parser_language)(),
+        extraction.language_name,
+        extraction.graph_query,
+        extraction.tags_query,
+        extraction.ruleset,
+    )
+}
+
 fn cpp_language_config() -> LanguageConfig {
     let extraction = &languages::cpp::EXTRACTION;
     make_language_config(
