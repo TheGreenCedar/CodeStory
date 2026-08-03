@@ -16,6 +16,7 @@
 //! `registry_rows_do_not_shadow_unmigrated_languages` proves it — and the last
 //! package to land deletes the residual arms entirely.
 
+pub(crate) mod javascript;
 pub(crate) mod kotlin;
 
 use std::sync::OnceLock;
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, javascript::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {

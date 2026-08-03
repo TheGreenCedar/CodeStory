@@ -3941,8 +3941,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            "rust" | "typescript" | "tsx" | "jsx" | "go" | "java" | "csharp" | "cpp" | "dart"
+            | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5572,8 +5572,9 @@ mod tests {
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
-    /// Kotlin's comment marker now comes from the language registry rather than
-    /// the local roster, and every other language must be unmoved.
+    /// Kotlin's and JavaScript's comment markers now come from the language
+    /// registry rather than the local roster, and every other language must be
+    /// unmoved.
     ///
     /// Asserting only "Kotlin still dims `//`" would pass with the registry
     /// lookup deleted, because the local roster used to answer for Kotlin too.
@@ -5639,6 +5640,25 @@ mod tests {
         );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+
+        // Same for JavaScript. `jsx` is a highlighter dialect with no registry
+        // profile, so it must keep answering from the roster above; that split
+        // is what the `("javascript", ..)` / `("jsx", ..)` rows guard.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("javascript"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("jsx"),
+            None
+        );
+        let javascript = ansi_highlight_snippet("app/main.js", "const ok = true // comment");
+        assert!(
+            javascript.contains("\x1b[90m// comment\x1b[0m"),
+            "{javascript:?}"
+        );
+        let jsx = ansi_highlight_snippet("app/View.jsx", "const ok = true // comment");
+        assert!(jsx.contains("\x1b[90m// comment\x1b[0m"), "{jsx:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

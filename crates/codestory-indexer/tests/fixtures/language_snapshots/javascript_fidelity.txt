@@ -1,0 +1,64 @@
+node CLASS name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.js:ConsoleNotifier line=10 col=7 end=10:22 file=FILE:<ROOT>/fidelity.js@1
+node CLASS name=Notifier qn=Notifier canonical=<ROOT>/fidelity.js:Notifier line=4 col=7 end=4:15 file=FILE:<ROOT>/fidelity.js@1
+node CLASS name=Repository qn=Repository canonical=<ROOT>/fidelity.js:Repository line=20 col=7 end=20:17 file=FILE:<ROOT>/fidelity.js@1
+node CLASS name=Workflow qn=Workflow canonical=<ROOT>/fidelity.js:Workflow line=30 col=7 end=30:15 file=FILE:<ROOT>/fidelity.js@1
+node FILE name=<ROOT>/fidelity.js qn=<ROOT>/fidelity.js canonical=<ROOT>/fidelity.js:<ROOT>/fidelity.js:1 line=1 col=1 end=55:0 file=FILE:<ROOT>/fidelity.js@1
+node FUNCTION name=orchestrateJs qn=orchestrateJs canonical=<ROOT>/fidelity.js:orchestrateJs#0 line=52 col=8 end=55:2 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=ConsoleNotifier.notify qn=ConsoleNotifier.notify canonical=<ROOT>/fidelity.js:ConsoleNotifier.notify#0 line=11 col=5 end=13:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=ConsoleNotifier.writeLog qn=ConsoleNotifier.writeLog canonical=<ROOT>/fidelity.js:ConsoleNotifier.writeLog#0 line=15 col=5 end=17:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Notifier.notify qn=Notifier.notify canonical=<ROOT>/fidelity.js:Notifier.notify#0 line=5 col=5 end=7:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Repository.save qn=Repository.save canonical=<ROOT>/fidelity.js:Repository.save#0 line=21 col=5 end=23:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Repository.track qn=Repository.track canonical=<ROOT>/fidelity.js:Repository.track#0 line=25 col=5 end=27:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Workflow.decorate qn=Workflow.decorate canonical=<ROOT>/fidelity.js:Workflow.decorate#0 line=47 col=5 end=49:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Workflow.identity qn=Workflow.identity canonical=<ROOT>/fidelity.js:Workflow.identity#0 line=31 col=5 end=33:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Workflow.run qn=Workflow.run canonical=<ROOT>/fidelity.js:Workflow.run#0 line=35 col=5 end=40:6 file=FILE:<ROOT>/fidelity.js@1
+node METHOD name=Workflow.runAsync qn=Workflow.runAsync canonical=<ROOT>/fidelity.js:Workflow.runAsync#0 line=42 col=5 end=45:6 file=FILE:<ROOT>/fidelity.js@1
+node MODULE name="fs" qn="fs" canonical=<ROOT>/fidelity.js:"fs"#0 line=1 col=42 end=1:46 file=FILE:<ROOT>/fidelity.js@1
+node MODULE name="path" qn="path" canonical=<ROOT>/fidelity.js:"path"#0 line=2 col=34 end=2:40 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=String qn=String canonical=<ROOT>/fidelity.js:String#0 line=48 col=36 end=48:42 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.js:decorate#0 line=39 col=14 end=39:22 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=identity qn=identity canonical=<ROOT>/fidelity.js:identity#0 line=36 col=29 end=36:37 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=join qn=join canonical=<ROOT>/fidelity.js:join#0 line=2 col=10 end=2:14 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=mapper qn=mapper canonical=<ROOT>/fidelity.js:mapper#0 line=32 col=16 end=32:22 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=notify qn=notify canonical=<ROOT>/fidelity.js:notify#0 line=37 col=18 end=37:24 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=pathJoin qn=pathJoin canonical=<ROOT>/fidelity.js:pathJoin#0 line=2 col=18 end=2:26 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=pathJoin qn=pathJoin canonical=<ROOT>/fidelity.js:pathJoin#1 line=48 col=16 end=48:24 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=readFile qn=readFile canonical=<ROOT>/fidelity.js:readFile#0 line=1 col=26 end=1:34 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=readFileSync qn=readFileSync canonical=<ROOT>/fidelity.js:readFileSync#0 line=1 col=10 end=1:22 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=resolve qn=resolve canonical=<ROOT>/fidelity.js:resolve#0 line=44 col=23 end=44:30 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.js:run#0 line=43 col=14 end=43:17 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=run qn=run canonical=<ROOT>/fidelity.js:run#1 line=54 col=14 end=54:17 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=save qn=save canonical=<ROOT>/fidelity.js:save#0 line=38 col=20 end=38:24 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=track qn=track canonical=<ROOT>/fidelity.js:track#0 line=22 col=14 end=22:19 file=FILE:<ROOT>/fidelity.js@1
+node UNKNOWN name=writeLog qn=writeLog canonical=<ROOT>/fidelity.js:writeLog#0 line=12 col=14 end=12:22 file=FILE:<ROOT>/fidelity.js@1
+edge CALL src=FUNCTION:orchestrateJs@52 dst=CLASS:ConsoleNotifier@10 resolved_src=FUNCTION:orchestrateJs@52 resolved_dst=- line=54 confidence=- certainty=- callsite=h0:54:1:h1 candidates=[]
+edge CALL src=FUNCTION:orchestrateJs@52 dst=CLASS:Repository@20 resolved_src=FUNCTION:orchestrateJs@52 resolved_dst=- line=54 confidence=- certainty=- callsite=h0:54:1:h2 candidates=[]
+edge CALL src=FUNCTION:orchestrateJs@52 dst=CLASS:Workflow@30 resolved_src=FUNCTION:orchestrateJs@52 resolved_dst=- line=53 confidence=- certainty=- callsite=h0:53:1:h3 candidates=[]
+edge CALL src=FUNCTION:orchestrateJs@52 dst=METHOD:Workflow.run@35 resolved_src=FUNCTION:orchestrateJs@52 resolved_dst=METHOD:Workflow.run@35 line=54 confidence=1.0000 certainty=Certain callsite=h0:54:1:h4 candidates=[]
+edge CALL src=METHOD:ConsoleNotifier.notify@11 dst=METHOD:ConsoleNotifier.writeLog@15 resolved_src=METHOD:ConsoleNotifier.notify@11 resolved_dst=METHOD:ConsoleNotifier.writeLog@15 line=12 confidence=1.0000 certainty=Certain callsite=h0:12:1:h5 candidates=[]
+edge CALL src=METHOD:Repository.save@21 dst=METHOD:Repository.track@25 resolved_src=METHOD:Repository.save@21 resolved_dst=METHOD:Repository.track@25 line=22 confidence=1.0000 certainty=Certain callsite=h0:22:1:h6 candidates=[]
+edge CALL src=METHOD:Workflow.decorate@47 dst=UNKNOWN:String@48 resolved_src=METHOD:Workflow.decorate@47 resolved_dst=- line=48 confidence=- certainty=- callsite=h0:48:1:h7 candidates=[]
+edge CALL src=METHOD:Workflow.decorate@47 dst=UNKNOWN:pathJoin@48 resolved_src=METHOD:Workflow.decorate@47 resolved_dst=- line=48 confidence=- certainty=- callsite=h0:48:1:h8 candidates=[]
+edge CALL src=METHOD:Workflow.identity@31 dst=UNKNOWN:mapper@32 resolved_src=METHOD:Workflow.identity@31 resolved_dst=- line=32 confidence=- certainty=- callsite=h0:32:1:h9 candidates=[]
+edge CALL src=METHOD:Workflow.run@35 dst=METHOD:Workflow.decorate@47 resolved_src=METHOD:Workflow.run@35 resolved_dst=METHOD:Workflow.decorate@47 line=39 confidence=1.0000 certainty=Certain callsite=h0:39:1:h10 candidates=[]
+edge CALL src=METHOD:Workflow.run@35 dst=METHOD:Workflow.identity@31 resolved_src=METHOD:Workflow.run@35 resolved_dst=METHOD:Workflow.identity@31 line=36 confidence=1.0000 certainty=Certain callsite=h0:36:1:h11 candidates=[]
+edge CALL src=METHOD:Workflow.run@35 dst=UNKNOWN:notify@37 resolved_src=METHOD:Workflow.run@35 resolved_dst=- line=37 confidence=- certainty=- callsite=h0:37:1:h12|syntax:js-member-call candidates=[]
+edge CALL src=METHOD:Workflow.run@35 dst=UNKNOWN:save@38 resolved_src=METHOD:Workflow.run@35 resolved_dst=- line=38 confidence=- certainty=- callsite=h0:38:1:h13|syntax:js-member-call candidates=[]
+edge CALL src=METHOD:Workflow.runAsync@42 dst=METHOD:Workflow.run@35 resolved_src=METHOD:Workflow.runAsync@42 resolved_dst=METHOD:Workflow.run@35 line=43 confidence=1.0000 certainty=Certain callsite=h0:43:1:h4 candidates=[]
+edge CALL src=METHOD:Workflow.runAsync@42 dst=UNKNOWN:resolve@44 resolved_src=METHOD:Workflow.runAsync@42 resolved_dst=- line=44 confidence=- certainty=- callsite=h0:44:1:h14|syntax:js-member-call candidates=[]
+edge IMPORT src=MODULE:"fs"@1 dst=MODULE:"fs"@1 resolved_src=MODULE:"fs"@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:"path"@2 dst=MODULE:"path"@2 resolved_src=MODULE:"path"@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:join@2 dst=MODULE:"path"@2 resolved_src=UNKNOWN:join@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:pathJoin@2 dst=MODULE:"path"@2 resolved_src=UNKNOWN:pathJoin@2 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:readFile@1 dst=MODULE:"fs"@1 resolved_src=UNKNOWN:readFile@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:readFileSync@1 dst=MODULE:"fs"@1 resolved_src=UNKNOWN:readFileSync@1 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ConsoleNotifier@10 dst=CLASS:Notifier@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@10 dst=METHOD:ConsoleNotifier.notify@11 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ConsoleNotifier@10 dst=METHOD:ConsoleNotifier.writeLog@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Notifier@4 dst=METHOD:Notifier.notify@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@20 dst=METHOD:Repository.save@21 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Repository@20 dst=METHOD:Repository.track@25 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@30 dst=METHOD:Workflow.decorate@47 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@30 dst=METHOD:Workflow.identity@31 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@30 dst=METHOD:Workflow.run@35 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@30 dst=METHOD:Workflow.runAsync@42 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

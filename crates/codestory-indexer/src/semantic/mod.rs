@@ -592,7 +592,7 @@ fn language_family_bucket(language: &'static str) -> &'static str {
     }
     match language {
         "c" | "cpp" => "native",
-        "javascript" | "typescript" | "vue" | "svelte" | "astro" => "webscript",
+        "typescript" | "vue" | "svelte" | "astro" => "webscript",
         "python" => "python",
         "rust" => "rust",
         "java" => "java",
@@ -866,6 +866,57 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![21_i64], "kotlin caller candidates: {out:?}");
         assert_eq!(language_family_bucket("kotlin"), "kotlin");
+        Ok(())
+    }
+
+    /// JavaScript keeps sharing the `webscript` family after the bucket moved
+    /// into the extraction registry.
+    ///
+    /// The single-file projection snapshots cannot see this field at all, and
+    /// asserting the registry value would be a tautology, so this drives the
+    /// filter instead: a JavaScript caller must still reach a same-named
+    /// TypeScript declaration (they share `webscript`) while a Kotlin
+    /// declaration stays out of reach. Giving JavaScript its own bucket would
+    /// silently drop the TypeScript candidate and no other test would notice.
+    #[test]
+    fn javascript_keeps_sharing_the_webscript_family_after_the_registry_move() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        create_node_table(&conn)?;
+        insert_file_node(&conn, 1, "caller.js")?;
+        insert_file_node(&conn, 2, "helper.ts")?;
+        insert_file_node(&conn, 3, "Helper.kt")?;
+        for (id, file_id) in [(30_i64, 2_i64), (31_i64, 3_i64)] {
+            conn.execute(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    NodeKind::FUNCTION as i32,
+                    "persistRecord",
+                    "persistRecord",
+                    file_id,
+                    5_i64
+                ],
+            )?;
+        }
+
+        let index = SemanticCandidateIndex::load(&conn, &[NodeKind::FUNCTION as i32])?;
+        let out = resolve_call_candidates(
+            &index,
+            &[NodeKind::FUNCTION as i32],
+            "persistRecord",
+            Some(1),
+            detect_language(Some("caller.js")),
+            0.82,
+            0.70,
+        )?;
+
+        let ids = out
+            .iter()
+            .map(|candidate| candidate.target_node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![30_i64], "javascript caller candidates: {out:?}");
+        assert_eq!(language_family_bucket("javascript"), "webscript");
         Ok(())
     }
 
