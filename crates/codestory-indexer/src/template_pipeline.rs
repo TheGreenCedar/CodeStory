@@ -42,26 +42,22 @@ pub struct TemplatePrepareResult {
     pub style_blocks: Vec<StyleBlockRange>,
 }
 
+/// Surface language of a template file, from the companion-extension registry.
+///
+/// The extension list used to be repeated here and at three other call sites
+/// (ARCH-012). `codestory_contracts::language_support` owns it now.
+pub fn template_surface_language(path: &Path) -> Option<&'static str> {
+    let ext = path.extension().and_then(|value| value.to_str())?;
+    codestory_contracts::language_support::companion_surface_language(ext)
+}
+
 pub fn template_kind_for_path(path: &Path) -> Option<TemplateKind> {
-    let ext = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    match template_surface_language(path)? {
         "vue" => Some(TemplateKind::Vue),
         "svelte" => Some(TemplateKind::Svelte),
         "astro" => Some(TemplateKind::Astro),
         _ => None,
     }
-}
-
-pub fn template_surface_language(path: &Path) -> Option<&'static str> {
-    template_kind_for_path(path).map(|kind| match kind {
-        TemplateKind::Vue => "vue",
-        TemplateKind::Svelte => "svelte",
-        TemplateKind::Astro => "astro",
-    })
 }
 
 pub fn prepare_template_source(kind: TemplateKind, source: &str) -> TemplatePrepareResult {
@@ -393,6 +389,42 @@ mod tests {
     use super::*;
     use crate::{get_language_for_ext, index_file};
     use std::path::Path;
+
+    /// Template routing must stay the exact three-dialect set it was before it
+    /// started reading the companion-extension registry.
+    ///
+    /// Widening it would send new file types through script blanking, and
+    /// `semantic::detect_language` reports whatever `template_surface_language`
+    /// returns, so a stray row here would attribute files to a language with no
+    /// parser behind it.
+    #[test]
+    fn template_routing_covers_exactly_the_blanked_component_dialects() {
+        for (path, kind, surface) in [
+            ("app/Widget.vue", Some(TemplateKind::Vue), Some("vue")),
+            ("app/Widget.VUE", Some(TemplateKind::Vue), Some("vue")),
+            (
+                "app/Widget.svelte",
+                Some(TemplateKind::Svelte),
+                Some("svelte"),
+            ),
+            ("app/Page.astro", Some(TemplateKind::Astro), Some("astro")),
+            ("app/Page.cshtml", None, None),
+            ("styles/app.scss", None, None),
+            ("styles/app.sass", None, None),
+            ("styles/app.less", None, None),
+            ("scripts/tool.lua", None, None),
+            ("app/Main.kt", None, None),
+            ("app/main.js", None, None),
+            ("Makefile", None, None),
+        ] {
+            assert_eq!(template_kind_for_path(Path::new(path)), kind, "{path}");
+            assert_eq!(
+                template_surface_language(Path::new(path)),
+                surface,
+                "{path}"
+            );
+        }
+    }
 
     fn symbol_line_col(result: &crate::IndexResult, name: &str) -> Option<(u32, u32)> {
         result

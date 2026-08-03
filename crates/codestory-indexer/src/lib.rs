@@ -43,6 +43,7 @@ pub mod compilation_database;
 mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
+mod languages;
 pub mod resolution;
 pub mod semantic;
 pub mod structural;
@@ -65,7 +66,6 @@ pub(crate) const RUBY_MEMBER_CALLSITE_MARKER: &str = "syntax:ruby-member-call";
 pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
 pub(crate) const JS_MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
 pub(crate) const TS_MEMBER_CALLSITE_MARKER: &str = "syntax:ts-member-call";
-pub(crate) const KOTLIN_MEMBER_CALLSITE_MARKER: &str = "syntax:kotlin-member-call";
 pub(crate) const DART_MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
 pub(crate) const SWIFT_MEMBER_CALLSITE_MARKER: &str = "syntax:swift-member-call";
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -142,12 +142,11 @@ const GO_GRAPH_QUERY: &str = include_str!("../rules/go.scm");
 const RUBY_GRAPH_QUERY: &str = include_str!("../rules/ruby.scm");
 const PHP_GRAPH_QUERY: &str = include_str!("../rules/php.scm");
 const CSHARP_GRAPH_QUERY: &str = include_str!("../rules/csharp.scm");
-const KOTLIN_GRAPH_QUERY: &str = include_str!("../rules/kotlin.scm");
 const SWIFT_GRAPH_QUERY: &str = include_str!("../rules/swift.scm");
 const DART_GRAPH_QUERY: &str = include_str!("../rules/dart.scm");
 const BASH_GRAPH_QUERY: &str = include_str!("../rules/bash.scm");
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageRuleset {
     Python,
     Java,
@@ -279,6 +278,16 @@ impl LanguageConfig {
 
 impl LanguageRuleset {
     fn compiled_rules(&self, language: Language) -> Result<&'static CompiledLanguageRules> {
+        // Registry first: a migrated language carries its rule file and cache in
+        // `languages::<lang>`. The arms below are the not-yet-migrated residue.
+        if let Some(extraction) = languages::extraction_for_ruleset(*self) {
+            return compiled_rules_cache(
+                language,
+                extraction.graph_query,
+                extraction.tags_query,
+                extraction.compiled_rules,
+            );
+        }
         match self {
             LanguageRuleset::Python => {
                 compiled_rules_cache(language, PYTHON_GRAPH_QUERY, None, &PYTHON_RULES)
@@ -318,9 +327,12 @@ impl LanguageRuleset {
             LanguageRuleset::CSharp => {
                 compiled_rules_cache(language, CSHARP_GRAPH_QUERY, None, &CSHARP_RULES)
             }
-            LanguageRuleset::Kotlin => {
-                compiled_rules_cache(language, KOTLIN_GRAPH_QUERY, None, &KOTLIN_RULES)
-            }
+            // Answered by the registry above; the arm only exists because the
+            // match must stay exhaustive. Failing closed here rather than
+            // panicking keeps a future registry mistake a typed indexing error.
+            LanguageRuleset::Kotlin => Err(anyhow!(
+                "kotlin compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::Swift => {
                 compiled_rules_cache(language, SWIFT_GRAPH_QUERY, None, &SWIFT_RULES)
             }
@@ -372,7 +384,6 @@ static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new
 static RUBY_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static PHP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static CSHARP_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static KOTLIN_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static SWIFT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static DART_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static BASH_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -7552,6 +7563,13 @@ fn language_receiver_call_specs(
     tree: &Tree,
     source: &str,
 ) -> Vec<ManualReceiverCallSpec> {
+    // Registry first; the arms below are the languages that have not moved yet.
+    if let Some(extraction) = languages::extraction_for_language(language_name) {
+        return match extraction.receiver_call_specs {
+            Some(collect) => collect(tree, source),
+            None => Vec::new(),
+        };
+    }
     match language_name {
         "javascript" => collect_javascript_receiver_call_edges(tree, source),
         "python" => collect_python_receiver_call_edges(tree, source),
@@ -7561,7 +7579,6 @@ fn language_receiver_call_specs(
         "ruby" => collect_ruby_receiver_call_edges(tree, source),
         "php" => collect_php_receiver_call_edges(tree, source),
         "csharp" => collect_csharp_receiver_call_edges(tree, source),
-        "kotlin" => collect_kotlin_receiver_call_edges(tree, source),
         "cpp" => collect_cpp_receiver_call_edges(tree, source),
         "swift" => collect_swift_receiver_call_edges(tree, source),
         "dart" => collect_dart_receiver_call_edges(tree, source),
@@ -12027,374 +12044,6 @@ fn csharp_plain_namespace_import_type_module(
     Some(format!("{namespace_name}.{owner_name}"))
 }
 
-fn collect_kotlin_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
-    let mut edges = Vec::new();
-    let root = tree.root_node();
-    let top_level_type_names = collect_kotlin_top_level_type_binding_names(root, source);
-    let has_wildcard_import = has_kotlin_wildcard_import(root, source);
-    let imported_type_bindings =
-        collect_kotlin_imported_type_bindings(root, source, &top_level_type_names);
-    walk_tree_nodes(tree.root_node(), &mut |callable| {
-        if callable.kind() != "function_declaration" {
-            return;
-        }
-        let Some(source_name) = declaration_name(callable, source) else {
-            return;
-        };
-        let source_span = ts_node_graph_span(callable);
-        let parameter_receiver_types = collect_colon_parameter_types(callable, source);
-        let mut local_receiver_callsites = HashSet::new();
-        collect_kotlin_precise_receiver_call_specs(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: &source_name,
-                span: source_span,
-            },
-            KotlinReceiverContext {
-                parameter_receiver_types: &parameter_receiver_types,
-                imported_type_bindings: &imported_type_bindings,
-                top_level_type_names: &top_level_type_names,
-                has_wildcard_import,
-            },
-            &mut local_receiver_callsites,
-            &mut edges,
-        );
-        if !parameter_receiver_types.is_empty() {
-            let start = edges.len();
-            collect_receiver_call_specs_in_callable(
-                callable,
-                source,
-                ManualReceiverSource {
-                    name: &source_name,
-                    span: source_span,
-                },
-                &parameter_receiver_types,
-                kotlin_member_call,
-                false,
-                &mut edges,
-            );
-            let mut parameter_specs = edges.split_off(start);
-            parameter_specs
-                .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
-            for spec in &mut parameter_specs {
-                if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
-                    spec.owner_name = binding.owner_name.clone();
-                    spec.owner_module = Some(binding.module_name.clone());
-                } else if has_wildcard_import && !top_level_type_names.contains(&spec.owner_name) {
-                    spec.owner_module = Some("*".to_string());
-                }
-            }
-            edges.extend(parameter_specs);
-        }
-    });
-    edges
-}
-
-struct KotlinReceiverContext<'a> {
-    parameter_receiver_types: &'a HashMap<String, String>,
-    imported_type_bindings: &'a HashMap<String, ImportedTypeBinding>,
-    top_level_type_names: &'a HashSet<String>,
-    has_wildcard_import: bool,
-}
-
-fn collect_kotlin_precise_receiver_call_specs(
-    callable: TsNode<'_>,
-    source: &str,
-    call_source: ManualReceiverSource<'_>,
-    context: KotlinReceiverContext<'_>,
-    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
-) {
-    walk_tree_nodes(callable, &mut |node| {
-        let Some((receiver_name, method_name)) = kotlin_member_call(node, source) else {
-            return;
-        };
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
-        let method_col = member_call_method_col(node, source, &method_name);
-        let callsite_key = ReceiverCallSiteKey {
-            receiver_name: receiver_name.clone(),
-            method_name: method_name.clone(),
-            line: Some(node.start_position().row as u32 + 1),
-            method_col,
-        };
-
-        if let Some(owner) =
-            kotlin_visible_local_receiver_owner(callable, node, &receiver_name, source, &context)
-        {
-            local_receiver_callsites.insert(callsite_key);
-            if let Some((owner_name, owner_module)) = owner {
-                edges.push(ManualReceiverCallSpec {
-                    source_name: call_source.name.to_string(),
-                    source_span: call_source.span,
-                    receiver_name,
-                    owner_name,
-                    owner_module,
-                    method_name,
-                    method_col,
-                    line: Some(node.start_position().row as u32 + 1),
-                    allow_global_fallback: false,
-                });
-            }
-            return;
-        }
-
-        let owner =
-            if let Some(owner) = kotlin_self_receiver_owner(callable, &receiver_name, source) {
-                Some(owner)
-            } else if !context
-                .parameter_receiver_types
-                .contains_key(&receiver_name)
-            {
-                kotlin_property_receiver_owner(callable, &receiver_name, source, &context)
-            } else {
-                None
-            };
-        let Some((owner_name, owner_module)) = owner else {
-            return;
-        };
-        edges.push(ManualReceiverCallSpec {
-            source_name: call_source.name.to_string(),
-            source_span: call_source.span,
-            receiver_name,
-            owner_name,
-            owner_module,
-            method_name,
-            method_col,
-            line: Some(node.start_position().row as u32 + 1),
-            allow_global_fallback: false,
-        });
-    });
-}
-
-fn kotlin_self_receiver_owner(
-    callable: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-) -> OptionalReceiverOwnerBinding {
-    if receiver_name != "this" {
-        return None;
-    }
-    let owner_node =
-        enclosing_node_with_kind(callable, &["class_declaration", "object_declaration"])?;
-    let owner_name = declaration_name(owner_node, source)?;
-    Some((owner_name, None))
-}
-
-fn kotlin_visible_local_receiver_owner(
-    callable: TsNode<'_>,
-    call_node: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> Option<OptionalReceiverOwnerBinding> {
-    let mut visible_bindings = Vec::new();
-    walk_tree_nodes(callable, &mut |node| {
-        if !kotlin_local_declaration_candidate(node) {
-            return;
-        }
-        if !receiver_call_belongs_to_callable(node, callable)
-            || node.end_byte() > call_node.start_byte()
-        {
-            return;
-        }
-        let Some(surface) = trimmed_node_text(node, source) else {
-            return;
-        };
-        let Some((binding_name, owner)) = kotlin_local_receiver_binding(&surface, context) else {
-            return;
-        };
-        if binding_name != receiver_name || !kotlin_local_binding_visible_at_call(node, call_node) {
-            return;
-        }
-        visible_bindings.push((node.end_byte(), owner));
-    });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
-}
-
-fn kotlin_property_receiver_owner(
-    callable: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let field_name = receiver_name
-        .strip_prefix("this.")
-        .unwrap_or(receiver_name)
-        .trim();
-    if field_name == "this" || field_name.contains('.') {
-        return None;
-    }
-    let owner_node =
-        enclosing_node_with_kind(callable, &["class_declaration", "object_declaration"])?;
-    let mut property_bindings = Vec::new();
-    for (binding_name, owner) in
-        kotlin_primary_constructor_property_bindings(owner_node, source, context)
-    {
-        if binding_name == field_name
-            && let Some(owner) = owner
-        {
-            property_bindings.push(owner);
-        }
-    }
-    walk_tree_nodes(owner_node, &mut |node| {
-        if node.kind() != "property_declaration"
-            || !kotlin_property_belongs_to_owner(node, owner_node)
-        {
-            return;
-        }
-        for (binding_name, owner) in
-            kotlin_property_declaration_receiver_bindings(node, source, context)
-        {
-            if binding_name == field_name
-                && let Some(owner) = owner
-            {
-                property_bindings.push(owner);
-            }
-        }
-    });
-    property_bindings.sort();
-    property_bindings.dedup();
-    if property_bindings.len() == 1 {
-        Some(property_bindings.remove(0))
-    } else {
-        None
-    }
-}
-
-fn kotlin_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
-    let mut current = property.parent();
-    while let Some(candidate) = current {
-        if same_ts_span(candidate, owner_node) {
-            return true;
-        }
-        if candidate.kind() == "function_declaration"
-            || matches!(candidate.kind(), "class_declaration" | "object_declaration")
-        {
-            return false;
-        }
-        current = candidate.parent();
-    }
-    false
-}
-
-/// Property bindings declared in a Kotlin class's primary constructor.
-///
-/// The surface used to be the class text up to its first `{`, scanned from the
-/// first `(`. An annotated declaration puts that `(` inside the annotation:
-/// `@Table(name = "users") data class User(val id: Long)` yielded `name =
-/// "users"` and the class lost every primary-constructor binding (CR-009). The
-/// grammar keeps `primary_constructor` as its own child, after `modifiers`.
-fn kotlin_primary_constructor_property_bindings(
-    owner_node: TsNode<'_>,
-    source: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> Vec<(String, OptionalReceiverOwnerBinding)> {
-    let mut cursor = owner_node.walk();
-    let parameters = owner_node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "primary_constructor")
-        .and_then(callable_parameter_list_node)
-        .and_then(|node| trimmed_node_text(node, source))
-        .map(|text| {
-            text.strip_prefix('(')
-                .and_then(|inner| inner.strip_suffix(')'))
-                .unwrap_or(text.as_str())
-                .to_string()
-        })
-        .or_else(|| {
-            let owner_surface = trimmed_node_text(owner_node, source)?;
-            let head = owner_surface
-                .split('{')
-                .next()
-                .unwrap_or(owner_surface.as_str());
-            signature_parameter_surface_text(head)
-        });
-    let Some(parameters) = parameters else {
-        return Vec::new();
-    };
-    split_top_level_parameters(&parameters)
-        .into_iter()
-        .filter_map(|parameter| {
-            let (name_side, type_side) = parameter.split_once(':')?;
-            if !kotlin_property_parameter_name_side(name_side) {
-                return None;
-            }
-            let binding_name = parameter_name_before_colon(name_side)?;
-            let owner =
-                kotlin_receiver_owner_from_type(&parameter_type_after_colon(type_side), context);
-            Some((binding_name, owner))
-        })
-        .collect()
-}
-
-fn signature_parameter_surface_text(text: &str) -> Option<String> {
-    let start = text.find('(')?;
-    let mut depth = 0usize;
-    let mut parameter_start = None;
-    for (index, ch) in text.char_indices().skip_while(|(index, _)| *index < start) {
-        match ch {
-            '(' => {
-                depth = depth.saturating_add(1);
-                if depth == 1 {
-                    parameter_start = Some(index + ch.len_utf8());
-                }
-            }
-            ')' => {
-                if depth == 1 {
-                    let parameter_start = parameter_start?;
-                    return Some(text[parameter_start..index].to_string());
-                }
-                depth = depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn kotlin_property_parameter_name_side(name_side: &str) -> bool {
-    name_side
-        .split_whitespace()
-        .any(|token| matches!(token, "val" | "var"))
-}
-
-fn kotlin_property_declaration_receiver_bindings(
-    node: TsNode<'_>,
-    source: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> Vec<(String, OptionalReceiverOwnerBinding)> {
-    trimmed_node_text(node, source)
-        .as_deref()
-        .and_then(|surface| kotlin_typed_property_binding(surface, context))
-        .into_iter()
-        .collect()
-}
-
-fn kotlin_local_declaration_candidate(node: TsNode<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "property_declaration" | "variable_declaration" | "local_declaration"
-    )
-}
-
-fn kotlin_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
-    let Some(binding_scope) = kotlin_lexical_scope(binding) else {
-        return false;
-    };
-    let Some(call_scope) = kotlin_lexical_scope(call_node) else {
-        return false;
-    };
-    node_is_same_or_ancestor(binding_scope, call_scope)
-}
-
-fn kotlin_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
-    enclosing_node_with_kind(node, &["block", "function_body"])
-}
-
 fn node_is_same_or_ancestor(ancestor: TsNode<'_>, node: TsNode<'_>) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
@@ -12404,202 +12053,6 @@ fn node_is_same_or_ancestor(ancestor: TsNode<'_>, node: TsNode<'_>) -> bool {
         current = candidate.parent();
     }
     false
-}
-
-fn kotlin_local_receiver_binding(
-    surface: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> Option<(String, OptionalReceiverOwnerBinding)> {
-    let surface = surface.trim().trim_end_matches(';').trim();
-    let rest = surface
-        .strip_prefix("val ")
-        .or_else(|| surface.strip_prefix("var "))?
-        .trim();
-    let (binding_surface, value_surface) = rest.split_once('=')?;
-    let binding_name = binding_surface
-        .split(':')
-        .next()
-        .unwrap_or(binding_surface)
-        .split_whitespace()
-        .next()
-        .and_then(normalize_parameter_name)?;
-    let constructor_surface = value_surface.trim();
-    let Some((constructor_name, _)) = constructor_surface.split_once('(') else {
-        return Some((binding_name, None));
-    };
-    let constructor_name = constructor_name.trim();
-    if constructor_name.contains('.') || constructor_name.contains("::") {
-        return Some((binding_name, None));
-    }
-    let Some(owner_name) = normalize_type_surface(constructor_name) else {
-        return Some((binding_name, None));
-    };
-    if !owner_name
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase())
-    {
-        return Some((binding_name, None));
-    }
-    let owner = kotlin_receiver_owner_from_constructor_name(&owner_name, context);
-    Some((binding_name, owner))
-}
-
-fn kotlin_receiver_owner_from_constructor_name(
-    constructor_name: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    if context.top_level_type_names.contains(constructor_name) {
-        return Some((constructor_name.to_string(), None));
-    }
-    if let Some(binding) = context.imported_type_bindings.get(constructor_name) {
-        return Some((
-            binding.owner_name.clone(),
-            Some(binding.module_name.clone()),
-        ));
-    }
-    Some((constructor_name.to_string(), None))
-}
-
-fn kotlin_typed_property_binding(
-    surface: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> Option<(String, OptionalReceiverOwnerBinding)> {
-    let surface = surface
-        .split('=')
-        .next()
-        .unwrap_or(surface)
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let rest = surface
-        .rsplit_once(" val ")
-        .map(|(_, rest)| rest)
-        .or_else(|| surface.rsplit_once(" var ").map(|(_, rest)| rest))
-        .or_else(|| surface.strip_prefix("val "))
-        .or_else(|| surface.strip_prefix("var "))?
-        .trim();
-    let (name_side, type_side) = rest.split_once(':')?;
-    let binding_name = parameter_name_before_colon(name_side)?;
-    let owner = kotlin_receiver_owner_from_type(&parameter_type_after_colon(type_side), context);
-    Some((binding_name, owner))
-}
-
-fn kotlin_receiver_owner_from_type(
-    raw_type: &str,
-    context: &KotlinReceiverContext<'_>,
-) -> OptionalReceiverOwnerBinding {
-    let owner_name = normalize_type_surface(raw_type)?;
-    if context.top_level_type_names.contains(&owner_name) {
-        return Some((owner_name, None));
-    }
-    if let Some(binding) = context.imported_type_bindings.get(&owner_name) {
-        return Some((
-            binding.owner_name.clone(),
-            Some(binding.module_name.clone()),
-        ));
-    }
-    if context.has_wildcard_import {
-        return Some((owner_name, Some("*".to_string())));
-    }
-    Some((owner_name, None))
-}
-
-fn collect_kotlin_imported_type_bindings(
-    root: TsNode<'_>,
-    source: &str,
-    top_level_bindings: &HashSet<String>,
-) -> HashMap<String, ImportedTypeBinding> {
-    let mut bindings = HashMap::new();
-    let mut duplicates = HashSet::new();
-    let mut cursor = root.walk();
-
-    for statement in root.named_children(&mut cursor) {
-        if statement.kind() != "import" {
-            continue;
-        }
-        let Some((owner_name, local_name, module_name)) =
-            kotlin_import_type_binding_names(statement, source)
-        else {
-            continue;
-        };
-        if top_level_bindings.contains(&local_name) || duplicates.contains(&local_name) {
-            continue;
-        }
-        if bindings.contains_key(&local_name) {
-            bindings.remove(&local_name);
-            duplicates.insert(local_name);
-            continue;
-        }
-        bindings.insert(
-            local_name,
-            ImportedTypeBinding {
-                module_name,
-                owner_name,
-            },
-        );
-    }
-
-    bindings
-}
-
-fn has_kotlin_wildcard_import(root: TsNode<'_>, source: &str) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor)
-        .filter(|statement| statement.kind() == "import")
-        .filter_map(|statement| trimmed_node_text(statement, source))
-        .any(|surface| {
-            surface
-                .strip_prefix("import")
-                .map(|rest| rest.trim().trim_end_matches(';').trim().ends_with(".*"))
-                .unwrap_or(false)
-        })
-}
-
-fn collect_kotlin_top_level_type_binding_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if matches!(
-            child.kind(),
-            "class_declaration" | "object_declaration" | "type_alias"
-        ) && let Some(name) = declaration_name(child, source)
-        {
-            names.insert(name);
-        }
-    }
-    names
-}
-
-fn kotlin_import_type_binding_names(
-    statement: TsNode<'_>,
-    source: &str,
-) -> Option<(String, String, String)> {
-    let surface = trimmed_node_text(statement, source)?;
-    let rest = surface
-        .strip_prefix("import")?
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    if rest.is_empty() || rest.ends_with(".*") || rest.contains('*') {
-        return None;
-    }
-
-    let (module_surface, alias_surface) = rest
-        .rsplit_once(" as ")
-        .map(|(module, alias)| (module.trim(), Some(alias.trim())))
-        .unwrap_or((rest, None));
-    if !module_surface.contains('.') || module_surface.split_whitespace().count() != 1 {
-        return None;
-    }
-    let owner_name = module_surface
-        .rsplit('.')
-        .next()
-        .and_then(normalize_parameter_name)?;
-    let local_name = alias_surface
-        .and_then(normalize_parameter_name)
-        .unwrap_or_else(|| owner_name.clone());
-    Some((owner_name, local_name, module_surface.to_string()))
 }
 
 fn collect_cpp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
@@ -15033,58 +14486,6 @@ fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
         .join(".")
 }
 
-/// Receiver and member of one Kotlin member call, read from the grammar.
-///
-/// The text scan this replaces cut the callee at the first `(` and then split
-/// on the last `.` of what remained, which is wrong for the two most idiomatic
-/// Kotlin call shapes (CR-010). A trailing lambda has no parentheses at all, so
-/// `user.apply { this.name = n }` split on the dot inside the lambda body and
-/// produced the receiver `user.apply { this`. A chain such as
-/// `repo.findAll().filter { … }` truncated at the first `(` and reported the
-/// outer `.filter` call as `repo.findAll`, duplicating the inner call and
-/// losing the outer one. `call_expression` keeps its callee as its first child
-/// and a member callee is a `navigation_expression`, so both shapes read
-/// directly off the tree.
-fn kotlin_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if node.kind() != "call_expression" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let callee = node.named_children(&mut cursor).next()?;
-    if callee.kind() != "navigation_expression" {
-        return None;
-    }
-    let mut callee_cursor = callee.walk();
-    let callee_children = callee
-        .named_children(&mut callee_cursor)
-        .collect::<Vec<_>>();
-    let receiver = callee_children.first()?;
-    let member = callee_children.last()?;
-    if receiver.id() == member.id() {
-        return None;
-    }
-    let receiver_text = trimmed_node_text(*receiver, source)?;
-    let member_text = trimmed_node_text(*member, source)?;
-    Some((
-        normalized_kotlin_receiver_surface(receiver_text.trim_end_matches('?'))?,
-        normalize_parameter_name(member_text.trim_start_matches('?'))?,
-    ))
-}
-
-fn normalized_kotlin_receiver_surface(raw: &str) -> Option<String> {
-    let receiver = raw.trim().trim_end_matches('?').trim();
-    if receiver.contains('.') {
-        let cleaned = receiver
-            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
-            .trim();
-        let valid = cleaned
-            .split('.')
-            .all(|part| normalize_parameter_name(part).is_some());
-        return (valid && !cleaned.is_empty()).then(|| cleaned.to_string());
-    }
-    normalize_parameter_name(receiver)
-}
-
 fn cpp_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call_expression" {
         return None;
@@ -15779,10 +15180,17 @@ fn queue_qualified_child_names(
 }
 
 fn promotes_type_member_functions_to_methods(language_name: &str) -> bool {
-    matches!(language_name, "kotlin" | "swift" | "dart")
+    // Registry first; `swift` and `dart` are the unmigrated residue.
+    if let Some(extraction) = languages::extraction_for_language(language_name) {
+        return extraction.promotes_type_member_functions_to_methods;
+    }
+    matches!(language_name, "swift" | "dart")
 }
 
 fn qualified_name_delimiter(language_name: &str) -> &'static str {
+    if let Some(extraction) = languages::extraction_for_language(language_name) {
+        return extraction.qualified_name_delimiter;
+    }
     match language_name {
         "rust" | "cpp" | "c" => "::",
         _ => ".",
@@ -16850,16 +16258,18 @@ pub fn is_text_only_candidate_path(path: &Path) -> bool {
 }
 
 fn text_only_language_name(path: &Path) -> &'static str {
-    match path
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
+        .to_ascii_lowercase();
+    // Component dialects come from the companion-extension registry.
+    if let Some(surface) =
+        codestory_contracts::language_support::companion_surface_language(&extension)
     {
-        "svelte" => "svelte",
-        "vue" => "vue",
-        "astro" => "astro",
+        return surface;
+    }
+    match extension.as_str() {
         "go" => "go",
         "rb" => "ruby",
         "php" => "php",
@@ -17636,6 +17046,9 @@ fn route_code_lines(language_name: &str, source: &str) -> Vec<String> {
 }
 
 fn route_language_uses_c_style_comments(language_name: &str) -> bool {
+    if let Some(extraction) = languages::extraction_for_language(language_name) {
+        return extraction.route_comments_are_c_style;
+    }
     matches!(
         language_name,
         "javascript"
@@ -17645,7 +17058,6 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
             | "go"
             | "php"
             | "csharp"
-            | "kotlin"
             | "dart"
             | "vue"
             | "astro"
@@ -20781,20 +20193,28 @@ pub fn index_file(
                     }
                     "call_syntax" => {
                         if let Ok(raw) = val.as_str() {
-                            callsite_marker = match raw.trim() {
-                                "python_attribute" => Some(PYTHON_ATTRIBUTE_CALLSITE_MARKER),
-                                "cpp_member" => Some(CPP_MEMBER_CALLSITE_MARKER),
-                                "go_selector" => Some(GO_SELECTOR_CALLSITE_MARKER),
-                                "java_member" => Some(JAVA_MEMBER_CALLSITE_MARKER),
-                                "csharp_member" => Some(CSHARP_MEMBER_CALLSITE_MARKER),
-                                "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
-                                "js_member" => Some(JS_MEMBER_CALLSITE_MARKER),
-                                "ts_member" => Some(TS_MEMBER_CALLSITE_MARKER),
-                                "kotlin_member" => Some(KOTLIN_MEMBER_CALLSITE_MARKER),
-                                "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
-                                "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),
-                                _ => callsite_marker,
-                            };
+                            let raw = raw.trim();
+                            // Registry first; the arms below are the languages
+                            // whose markers have not moved into `languages`.
+                            callsite_marker =
+                                match languages::member_callsite_marker_for_call_syntax(raw) {
+                                    Some(marker) => Some(marker),
+                                    None => match raw {
+                                        "python_attribute" => {
+                                            Some(PYTHON_ATTRIBUTE_CALLSITE_MARKER)
+                                        }
+                                        "cpp_member" => Some(CPP_MEMBER_CALLSITE_MARKER),
+                                        "go_selector" => Some(GO_SELECTOR_CALLSITE_MARKER),
+                                        "java_member" => Some(JAVA_MEMBER_CALLSITE_MARKER),
+                                        "csharp_member" => Some(CSHARP_MEMBER_CALLSITE_MARKER),
+                                        "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
+                                        "js_member" => Some(JS_MEMBER_CALLSITE_MARKER),
+                                        "ts_member" => Some(TS_MEMBER_CALLSITE_MARKER),
+                                        "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
+                                        "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),
+                                        _ => callsite_marker,
+                                    },
+                                };
                         }
                     }
                     _ => {}
@@ -26295,8 +25715,20 @@ class Test {
         assert_eq!(tsx.graph_query, TSX_GRAPH_QUERY);
         assert_eq!(tsx.tags_query, Some(TSX_TAGS_QUERY));
 
+        // Kotlin's rule file moved into `languages::kotlin`; the config must
+        // still come back through the same extension lookup.
         let kotlin = get_language_for_ext("kt").expect("kotlin config");
-        assert_eq!(kotlin.graph_query, KOTLIN_GRAPH_QUERY);
+        assert_eq!(kotlin.language_name, "kotlin");
+        assert_eq!(
+            kotlin.graph_query,
+            languages::extraction_for_ext("kt")
+                .expect("kotlin registry row")
+                .graph_query
+        );
+        assert!(kotlin.graph_query.contains("kotlin_member"));
+        assert!(kotlin.tags_query.is_none());
+        let kotlin_script = get_language_for_ext("kts").expect("kotlin script config");
+        assert_eq!(kotlin_script.graph_query, kotlin.graph_query);
 
         let swift = get_language_for_ext("swift").expect("swift config");
         assert_eq!(swift.graph_query, SWIFT_GRAPH_QUERY);
@@ -28313,6 +27745,37 @@ func (r *Route) Get(name string) interface{} { return r.namedRoutes[name] }
             mux_library_routes.is_empty(),
             "plain mux library methods should not be indexed as framework routes: {mux_library_routes:?}"
         );
+    }
+
+    /// Kotlin route scanning keeps stripping C-style comments after the
+    /// language's comment style moved into the extraction registry.
+    ///
+    /// `route_comments_are_c_style` is now a registry field rather than a name
+    /// in a `matches!` roster. Asserting the field's value alone would be a
+    /// tautology, so this drives the behaviour it controls: a commented-out
+    /// ktor route must not become a product route claim.
+    #[test]
+    fn kotlin_route_scanning_still_strips_c_style_comments() {
+        let source = r#"
+import io.ktor.server.routing.*
+fun Application.module() {
+  routing {
+    get("/ktor/live") { }
+    // get("/ktor/line-commented") { }
+    /*
+    post("/ktor/block-commented") { }
+    */
+  }
+}
+"#;
+        let routes = collect_framework_routes(Path::new("Routing.kt"), "kotlin", source);
+        let paths = routes
+            .iter()
+            .map(|route| route.path.as_str())
+            .collect::<HashSet<_>>();
+        assert!(paths.contains("/ktor/live"), "{routes:?}");
+        assert!(!paths.contains("/ktor/line-commented"), "{routes:?}");
+        assert!(!paths.contains("/ktor/block-commented"), "{routes:?}");
     }
 
     #[test]

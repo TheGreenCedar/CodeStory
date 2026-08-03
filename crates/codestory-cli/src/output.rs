@@ -3936,12 +3936,15 @@ fn ansi_highlight_snippet(path: &str, snippet: &str) -> String {
 }
 
 fn ansi_highlight_line(language: &str, line: &str) -> String {
-    let comment_marker = match language {
-        "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-        "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "kotlin"
-        | "csharp" | "cpp" | "dart" | "php" | "swift" => Some("//"),
-        _ => None,
-    };
+    // Registry first; the arms below are the languages whose per-language
+    // extraction package has not landed yet (ARCH-012 roster burn-down).
+    let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
+        .or(match language {
+            "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
+            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
+            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            _ => None,
+        });
     let Some(marker) = comment_marker else {
         return ansi_highlight_code(language, line);
     };
@@ -4109,12 +4112,18 @@ fn snippet_language(path: &str) -> &'static str {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    // Component dialects come from the companion-extension registry; `tsx` and
+    // `jsx` stay local because they are highlighter dialects, not registered
+    // surfaces (both route to typescript/javascript in the language registry).
+    if let Some(surface) =
+        codestory_contracts::language_support::companion_surface_language(&extension)
+    {
+        return surface;
+    }
+
     match extension.as_str() {
         "tsx" => "tsx",
         "jsx" => "jsx",
-        "svelte" => "svelte",
-        "vue" => "vue",
-        "astro" => "astro",
         "json" => "json",
         "toml" => "toml",
         "md" | "mdx" => "markdown",
@@ -5561,6 +5570,104 @@ mod tests {
 
         let bash = ansi_highlight_snippet("scripts/bootstrap.sh", "echo ok # comment");
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
+    }
+
+    /// Kotlin's comment marker now comes from the language registry rather than
+    /// the local roster, and every other language must be unmoved.
+    ///
+    /// Asserting only "Kotlin still dims `//`" would pass with the registry
+    /// lookup deleted, because the local roster used to answer for Kotlin too.
+    /// The table below is the pre-move roster restated, so a registry row that
+    /// contradicted a consumer would fail here rather than change rendering.
+    #[test]
+    fn comment_markers_stay_identical_after_the_registry_lookup() {
+        const EXPECTED: &[(&str, Option<&str>)] = &[
+            ("kotlin", Some("//")),
+            ("bash", Some("#")),
+            ("python", Some("#")),
+            ("ruby", Some("#")),
+            ("toml", Some("#")),
+            ("yaml", Some("#")),
+            ("rust", Some("//")),
+            ("typescript", Some("//")),
+            ("tsx", Some("//")),
+            ("javascript", Some("//")),
+            ("jsx", Some("//")),
+            ("go", Some("//")),
+            ("java", Some("//")),
+            ("csharp", Some("//")),
+            ("cpp", Some("//")),
+            ("dart", Some("//")),
+            ("php", Some("//")),
+            ("swift", Some("//")),
+            // Deliberately absent from the roster before and after the move.
+            ("c", None),
+            ("html", None),
+            ("css", None),
+            ("sql", None),
+            ("markdown", None),
+            ("json", None),
+            ("vue", None),
+            ("svelte", None),
+            ("astro", None),
+            ("", None),
+        ];
+        for (language, marker) in EXPECTED {
+            let highlighted = ansi_highlight_line(language, "value // slash # hash");
+            match marker {
+                Some("//") => assert!(
+                    highlighted.contains("\x1b[90m// slash # hash\x1b[0m"),
+                    "{language} should dim from the first `//`: {highlighted:?}"
+                ),
+                Some("#") => assert!(
+                    highlighted.contains("\x1b[90m# hash\x1b[0m"),
+                    "{language} should dim from the first `#`: {highlighted:?}"
+                ),
+                Some(other) => panic!("unexpected marker {other}"),
+                None => assert!(
+                    !highlighted.contains("\x1b[90m"),
+                    "{language} must not dim a comment: {highlighted:?}"
+                ),
+            }
+        }
+
+        // The registry is the source for Kotlin: it must agree with the marker
+        // the roster used to hold.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("kotlin"),
+            Some("//")
+        );
+        let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
+        assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+    }
+
+    /// Component dialects resolve through the companion-extension registry and
+    /// every other snippet language is unchanged.
+    #[test]
+    fn snippet_languages_stay_identical_after_the_registry_lookup() {
+        for (path, expected) in [
+            ("app/Component.vue", "vue"),
+            ("app/Component.svelte", "svelte"),
+            ("app/Page.astro", "astro"),
+            ("app/View.tsx", "tsx"),
+            ("app/View.jsx", "jsx"),
+            ("data/config.json", "json"),
+            ("Cargo.toml", "toml"),
+            ("docs/guide.md", "markdown"),
+            ("docs/guide.mdx", "markdown"),
+            ("ci/build.yml", "yaml"),
+            ("ci/build.yaml", "yaml"),
+            ("app/Main.kt", "kotlin"),
+            ("app/Main.kts", "kotlin"),
+            ("src/lib.rs", "rust"),
+            ("src/app.ts", "typescript"),
+            // No public profile and no companion row: no highlighting.
+            ("app/Page.cshtml", ""),
+            ("styles/app.scss", ""),
+            ("notes.txt", ""),
+        ] {
+            assert_eq!(snippet_language(path), expected, "{path}");
+        }
     }
 
     #[test]
