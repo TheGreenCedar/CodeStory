@@ -4070,4 +4070,256 @@ mod tests {
             "a damaged lexical shard must fall through to the rebuild"
         );
     }
+
+    /// One published, live-healthy generation plus everything needed to drive
+    /// finalize and retention against it.
+    #[cfg(feature = "test-support")]
+    struct PublishedGeneration {
+        project: TempDir,
+        _cache: TempDir,
+        _storage_dir: TempDir,
+        storage_path: PathBuf,
+        runtime: SidecarRuntimeConfig,
+        manifest: RetrievalIndexManifest,
+        scip_dir: PathBuf,
+    }
+
+    /// Publish a complete zero-dense generation through the same fixture the
+    /// rollback contracts use, in a live store carrying a complete core
+    /// publication.
+    #[cfg(feature = "test-support")]
+    fn publish_live_generation() -> PublishedGeneration {
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn handler() {}").expect("source");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let store = Store::open(&storage_path).expect("open storage");
+        store
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish core identity");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        let manifest = crate::test_support::publish_zero_dense_pinned_query_fixture(
+            project.path(),
+            &storage_path,
+            &runtime,
+        )
+        .expect("publish live generation");
+        let generation = manifest
+            .sidecar_generation
+            .clone()
+            .expect("fixture generation");
+        let scip_dir = runtime.layout.scip_project_dir(&generation);
+        PublishedGeneration {
+            project,
+            _cache: cache,
+            _storage_dir: storage_dir,
+            storage_path,
+            runtime,
+            manifest,
+            scip_dir,
+        }
+    }
+
+    /// The finalize phases a whole pass emitted.
+    ///
+    /// The reuse branch returns before the first phase, so an empty phase list
+    /// *is* the reuse decision as the product renders it: no lexical, semantic,
+    /// or graph work was scheduled. Every rebuild announces `lexical sidecar`
+    /// first. Both passes stop at the publication fence in this environment —
+    /// there is no per-user embedding server — which is downstream of the
+    /// decision under test and identical for both legs.
+    #[cfg(feature = "test-support")]
+    fn finalize_phases(fixture: &PublishedGeneration) -> (Vec<&'static str>, String) {
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let collect = std::rc::Rc::clone(&phases);
+        let outcome = finalize_index_for_runtime_with_progress(
+            fixture.project.path(),
+            &fixture.storage_path,
+            &fixture.runtime,
+            move |phase| collect.borrow_mut().push(phase),
+        );
+        let rendered = match outcome {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(error) => format!("{error:#}"),
+        };
+        let emitted = phases.borrow().clone();
+        (emitted, rendered)
+    }
+
+    /// Everything upstream of the reuse gate still admits this generation.
+    ///
+    /// Without this the rebuild leg below could pass for the wrong reason: a
+    /// staleness verdict or a failed evidence validation reaches the same
+    /// rebuild through a different door. Damaging `index.scip` must leave both
+    /// of those admitting, so the fall-through is attributable to the live
+    /// probe and to nothing else.
+    #[cfg(feature = "test-support")]
+    fn assert_reuse_gate_is_the_only_refusal(fixture: &PublishedGeneration) {
+        let storage = Store::open(&fixture.storage_path).expect("open storage");
+        assert_eq!(
+            crate::generation::manifest_unavailable_reason_for_runtime(
+                &fixture.manifest.project_id,
+                &storage,
+                &fixture.manifest,
+                &fixture.runtime,
+            ),
+            None,
+            "the stored manifest must still be current, or the rebuild proves nothing"
+        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("load core publication")
+            .expect("complete core publication");
+        let residency =
+            crate::embeddings::acquire_product_embedding_residency_for_runtime(&fixture.runtime)
+                .expect("acquire test residency");
+        let device = crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &fixture.runtime.layout,
+            &storage,
+            &fixture.manifest,
+            &publication,
+            &fixture.runtime,
+            &device,
+            residency.identity(),
+        )
+        .expect("deep generation evidence must still validate");
+        let status = probe_sidecar_health_for_runtime(
+            &fixture.runtime.layout,
+            &fixture.manifest.project_id,
+            Some(fixture.manifest.clone()),
+            &device,
+            &fixture.runtime,
+        );
+        assert_eq!(
+            status.retrieval_mode, "full",
+            "the manifest still classifies full, which is why `retrieval_mode` could never refuse"
+        );
+        assert!(
+            status.degraded_reason.is_some(),
+            "the live probe must be the one thing that refuses"
+        );
+    }
+
+    /// Reverting the finalize reuse gate to the manifest-class comparison has
+    /// to fail here.
+    ///
+    /// The earlier assertions in this module pin
+    /// `unchanged_generation_is_reusable` itself; nothing pinned that the
+    /// finalize pass consults it, so restoring the manifest-class comparison at
+    /// the call site left the whole suite green. This drives the real entry
+    /// point and reads the decision off the phases the product emits.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_rebuilds_an_unchanged_generation_whose_graph_artifact_was_damaged() {
+        let _env = crate::test_support::env_lock();
+        let fixture = publish_live_generation();
+
+        let (healthy_phases, healthy_outcome) = finalize_phases(&fixture);
+        assert!(
+            healthy_phases.is_empty(),
+            "an intact unchanged generation must still be reused without rebuilding: \
+             {healthy_phases:?} ({healthy_outcome})"
+        );
+
+        std::fs::write(
+            fixture.scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
+            b"\0\0\0\0",
+        )
+        .expect("damage the graph marker in place");
+        assert_reuse_gate_is_the_only_refusal(&fixture);
+
+        let (damaged_phases, damaged_outcome) = finalize_phases(&fixture);
+        assert!(
+            damaged_phases.starts_with(&["lexical sidecar"]),
+            "a generation damaged after publication must fall through to the rebuild: \
+             {damaged_phases:?} ({damaged_outcome})"
+        );
+        assert!(
+            damaged_phases.contains(&"graph artifact"),
+            "the rebuild must reach the graph lane that was damaged: \
+             {damaged_phases:?} ({damaged_outcome})"
+        );
+    }
+
+    /// Reverting the rollback verification gate to `retrieval_mode != "full"`
+    /// has to fail here.
+    ///
+    /// `prepare_generation_retention` is the only writer of the rollback
+    /// pointer. Its fence deep-validates vector bytes, producer evidence, and
+    /// anchor coverage — none of which read the graph lane — so a generation
+    /// whose graph artifact was damaged after publication passes every other
+    /// check and is refused only by the live probe.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rollback_selection_refuses_a_candidate_whose_live_graph_lane_is_damaged() {
+        let _env = crate::test_support::env_lock();
+        let fixture = publish_live_generation();
+        let active_hash = "b".repeat(64);
+        let active = crate::test_support::retrieval_manifest_fixture(
+            &fixture.manifest.project_id,
+            &active_hash,
+        );
+        let select = |storage: &Store| {
+            let residency = crate::embeddings::acquire_product_embedding_residency_for_runtime(
+                &fixture.runtime,
+            )
+            .expect("acquire test residency");
+            let device =
+                crate::embeddings::embedding_device_readiness_for_runtime(&fixture.runtime);
+            let producer_compatibility_identity = vector_producer_compatibility_identity(
+                &device,
+                residency.identity(),
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            )
+            .expect("producer compatibility identity");
+            let context = GenerationRetentionContext {
+                runtime: &fixture.runtime,
+                layout: &fixture.runtime.layout,
+                workspace_id: "workspace",
+                previous_manifest: Some(&fixture.manifest),
+                embedding_device: &device,
+                embedding_residency: residency,
+                producer_compatibility_identity,
+            };
+            prepare_generation_retention(&context, &fixture.manifest.project_id, &active, storage)
+                .expect("prepare retention")
+                .verified_previous
+        };
+
+        let storage = Store::open(&fixture.storage_path).expect("open candidate storage");
+        assert!(
+            select(&storage).is_some(),
+            "a live-healthy generation must still be recorded as a verified rollback target"
+        );
+        drop(storage);
+
+        std::fs::write(
+            fixture.scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
+            b"\0\0\0\0",
+        )
+        .expect("damage the graph marker in place");
+        assert_reuse_gate_is_the_only_refusal(&fixture);
+
+        let storage = Store::open(&fixture.storage_path).expect("open damaged storage");
+        assert!(
+            select(&storage).is_none(),
+            "a damaged generation must not be recorded as a verified rollback target"
+        );
+    }
 }

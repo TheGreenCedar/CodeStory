@@ -1990,3 +1990,74 @@ fn retrieval_annotations_are_classified_by_typed_kind_not_by_prose() {
         "the kind-less TraceRecorder::annotate entry point must stay retired"
     );
 }
+
+/// A sealed receipt must not claim more than the platform it runs on delivers.
+///
+/// READY-C (#1654) shipped `validation_receipts` documenting that "replacement,
+/// truncation, in-place rewriting ... all break the seal", and two tests
+/// asserting exactly that. Neither statement holds on Windows: `std::fs`
+/// reports no device/inode pair and no inode-change instant there, so a
+/// same-length rewrite that restores the modification time produces an
+/// identical observation and is answered from the receipt. Nothing contradicted
+/// the claim because `codestory-contracts` tests run only on Linux and macOS —
+/// the Windows lanes in `source-proof.yml` build `codestory-workspace` and
+/// `codestory-llama-sys` test targets only. The limit is therefore stated, in
+/// the contract and in the docs, and this is what keeps it stated.
+#[test]
+fn the_sealed_receipt_states_its_windows_limit_in_the_contract_and_the_docs() {
+    let receipts = read("crates/codestory-contracts/src/validation_receipts.rs");
+    let production = production_source(&receipts);
+    for required in [
+        "pub enum SealFidelity",
+        "    InodeChangeTracked,",
+        "    TimestampsOnly,",
+        "pub fn fidelity(&self) -> Option<SealFidelity>",
+    ] {
+        assert!(
+            production.contains(required),
+            "the receipt must report how much its observation can distinguish: missing `{required}`"
+        );
+    }
+
+    // The module contract and the enum variant that carries the weaker case
+    // both have to name the platform. "Some platforms report less" is the
+    // implying-away this replaced.
+    let module_contract = production
+        .split("\nuse std::collections::HashMap;")
+        .next()
+        .expect("module doc comment precedes the imports");
+    assert!(
+        module_contract.contains("Windows"),
+        "the receipt's module contract must name the platform whose seals are weaker"
+    );
+    let timestamps_only_doc = source_between(
+        &production,
+        "    /// The observation carries only",
+        "    TimestampsOnly,",
+    );
+    assert!(
+        timestamps_only_doc.contains("Windows"),
+        "the timestamps-only variant must name the platform it describes"
+    );
+
+    for (path, anchor) in [
+        (
+            "docs/architecture/subsystems/contracts.md",
+            "## Sealed validation receipts and their platform limit",
+        ),
+        (
+            "docs/architecture/subsystems/retrieval.md",
+            "#sealed-validation-receipts-and-their-platform-limit",
+        ),
+    ] {
+        let doc = read(path);
+        assert!(
+            doc.contains(anchor),
+            "{path} must carry the receipt platform limit: missing `{anchor}`"
+        );
+        assert!(
+            doc.contains("Windows"),
+            "{path} must name the platform the receipt is weaker on"
+        );
+    }
+}

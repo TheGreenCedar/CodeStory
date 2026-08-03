@@ -54,6 +54,22 @@ server drains before replacement; active work or leases return typed retry
 state. Clients never choose another endpoint, kill a remembered PID, or fall
 back to an in-process engine.
 
+Two promotions can put a previously published generation back into service:
+finalize reusing an unchanged generation, and retention recording a verified
+rollback pointer. Both require the live probe verdict
+(`RetrievalStatusReport::is_live_ready`), never the stored manifest's
+`retrieval_mode`, which is overridden to `full` for every published manifest and
+so can never refuse. A generation damaged after publication is rebuilt in place
+rather than republished, and is not recorded as a rollback target.
+
+Health probes cache the immutable half of lexical deep verification as a sealed
+validation receipt, and inherit its platform limit, stated in
+[the contracts subsystem](contracts.md#sealed-validation-receipts-and-their-platform-limit):
+on Windows a same-length in-place rewrite that restores the modification time
+still satisfies the seal, so within one process the probe keeps answering with
+the lexical verdict it already sealed. Receipts are process-local, so the next
+process re-reads the bytes; nothing persists a stale verdict across a restart.
+
 Retrieval finalization holds an embedding residency lease across candidate
 build, validation, and publication. Manifest compatibility uses the stable
 producer contract assembled from retrieval-owned model, pooling, normalization,
@@ -76,7 +92,9 @@ a live publication fence and is not persisted as vector compatibility.
 ## Failure signatures
 
 - a query resolves numeric IDs against a different core publication;
-- `retrieval_mode=full` is treated as live engine proof;
+- `retrieval_mode=full` is treated as live engine proof, or gates reuse or
+  rollback verification;
+- a sealed receipt is treated as proof that an artifact's bytes are intact;
 - deep row validation runs on every query;
 - cleanup recurses from a previously validated pathname;
 - a project silently reconfigures or bypasses the per-user server.
