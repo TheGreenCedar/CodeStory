@@ -452,14 +452,14 @@ fn assemble_packet_sufficiency_with_probe_context(
     let unprovable_paths = coverage.unprovable_paths();
     if !unprovable_paths.is_empty() {
         // Leads arrive as `packet_display_path` output, which strips a named
-        // repository root — `target/repo-cache/repos/axios/lib/core/Axios.js`
-        // becomes `lib/core/Axios.js`. Joining the project root back onto that
+        // repository root: a path under a cached checkout keeps only its
+        // in-repository suffix. Joining the project root back onto that suffix
         // yields a path that does not exist, so a path-identity comparison
-        // reports "different file" and the lead survives, defeating this
-        // filter for exactly the repo-cache packets it matters most for.
-        // Comparing display form to display form keeps both sides in the same
-        // vocabulary; the identity comparison stays as the fallback for leads
-        // that were never stripped.
+        // reports "different file" and the lead survives — leaving this filter
+        // inert for exactly the cached-repository packets where the re-probe
+        // loop it prevents actually bites. Comparing display form to display
+        // form keeps both sides in one vocabulary; the identity comparison
+        // stays as the fallback for leads that were never stripped.
         let unprovable_display = unprovable_paths
             .iter()
             .map(|path| packet_display_path(path))
