@@ -5,7 +5,7 @@ use crate::structural::blanking::{
 };
 use crate::{get_language_for_ext, index_file};
 use codestory_contracts::graph::{EdgeId, EdgeKind, NodeId, NodeKind};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use super::common::{
@@ -20,8 +20,15 @@ pub(crate) fn collect_html_entities(
     storage: &mut IntermediateStorage,
 ) {
     let path_key = path.to_string_lossy();
-    let mut region_nodes: HashMap<u32, NodeId> = HashMap::new();
+    // Anchor parents are persisted inside `structural_edge_id`, so an arbitrary
+    // choice is not merely cosmetic: it makes the emitted edge set differ
+    // between two indexings of identical bytes (CR-013). `HashMap::values()`
+    // yields `RandomState` order, so both lookups below moved with the hash
+    // seed. Keyed maps ordered by line make the nearest enclosing region — the
+    // parent the old `.last()` was reaching for — a deterministic choice.
+    let mut region_nodes: BTreeMap<u32, NodeId> = BTreeMap::new();
     let mut id_nodes: HashMap<String, NodeId> = HashMap::new();
+    let mut id_nodes_by_line: BTreeMap<u32, NodeId> = BTreeMap::new();
 
     for (line_idx, line_text) in source.lines().enumerate() {
         let line_number = line_idx as u32 + 1;
@@ -44,7 +51,8 @@ pub(crate) fn collect_html_entities(
                 StructuralSourceSpan::token(line_number, id_start, id.len()),
             );
             id_nodes.insert(id.clone(), node_id);
-            if let Some(region_id) = region_nodes.values().last().copied() {
+            id_nodes_by_line.entry(line_number).or_insert(node_id);
+            if let Some(region_id) = nearest_at_or_above(&region_nodes, line_number) {
                 push_member_edge(storage, file_id, region_id, node_id, line_number);
             } else {
                 push_member_edge(storage, file_id, file_id, node_id, line_number);
@@ -67,10 +75,8 @@ pub(crate) fn collect_html_entities(
                     end_col: Some(class_name.len().max(1) as u32),
                 });
             }
-            let host_id = region_nodes
-                .get(&line_number)
-                .copied()
-                .or_else(|| id_nodes.values().copied().next())
+            let host_id = nearest_at_or_above(&region_nodes, line_number)
+                .or_else(|| nearest_at_or_above(&id_nodes_by_line, line_number))
                 .unwrap_or(file_id);
             push_usage_edge(storage, file_id, host_id, css_id, line_number);
         }
@@ -88,6 +94,11 @@ pub(crate) fn collect_html_entities(
     }
 
     delegate_script_blocks(path, source, file_id, storage);
+}
+
+/// The entry whose line is closest to `line` without passing it.
+fn nearest_at_or_above(nodes: &BTreeMap<u32, NodeId>, line: u32) -> Option<NodeId> {
+    nodes.range(..=line).next_back().map(|(_, id)| *id)
 }
 
 fn maybe_region_node(
@@ -296,15 +307,45 @@ fn merge_delegated_script_graph(
     }
 }
 
+/// True when `index` begins an attribute name rather than ending one.
+///
+/// The scan looks for a literal `id=` or `class=`, which also matches the tail
+/// of `data-testid=`, `data-id=`, `uid=`, and every other attribute whose name
+/// merely ends in those letters (CR-012). HTML attribute names are separated
+/// from what precedes them by whitespace, the opening `<tag`, or a quote that
+/// closed the previous value, so anything that could continue a name — an
+/// ASCII alphanumeric, `-`, `_`, `:`, `.`, or `@` — disqualifies the match.
+fn starts_attribute_name(line: &str, index: usize) -> bool {
+    let Some(previous) = line[..index].chars().next_back() else {
+        return true;
+    };
+    !(previous.is_ascii_alphanumeric() || matches!(previous, '-' | '_' | ':' | '.' | '@' | '$'))
+}
+
+fn find_attribute_start(lower: &str, line: &str, from: usize, name: &str) -> Option<usize> {
+    let spaced = format!("{name} =");
+    let equals = format!("{name}=");
+    let mut search = from;
+    while search <= lower.len() {
+        let rel = lower[search..]
+            .find(&equals)
+            .into_iter()
+            .chain(lower[search..].find(&spaced))
+            .min()?;
+        let index = search + rel;
+        if starts_attribute_name(line, index) {
+            return Some(index);
+        }
+        search = index + name.len();
+    }
+    None
+}
+
 fn extract_html_ids(line: &str) -> Vec<(String, usize)> {
     let mut ids = Vec::new();
     let lower = line.to_ascii_lowercase();
     let mut search = 0usize;
-    while let Some(rel) = lower[search..]
-        .find("id=")
-        .or_else(|| lower[search..].find("id ="))
-    {
-        let idx = search + rel;
+    while let Some(idx) = find_attribute_start(&lower, line, search, "id") {
         let rest = &line[idx..];
         if let Some((value, value_start)) = extract_attr_value(rest)
             && !value.is_empty()
@@ -320,11 +361,7 @@ fn extract_html_classes(line: &str) -> Vec<String> {
     let mut classes = Vec::new();
     let lower = line.to_ascii_lowercase();
     let mut search = 0usize;
-    while let Some(rel) = lower[search..]
-        .find("class=")
-        .or_else(|| lower[search..].find("class ="))
-    {
-        let idx = search + rel;
+    while let Some(idx) = find_attribute_start(&lower, line, search, "class") {
         let rest = &line[idx..];
         if let Some((value, _)) = extract_attr_value(rest) {
             for class_name in value.split_whitespace() {
@@ -391,5 +428,132 @@ mod tests {
                 .iter()
                 .any(|n| n.canonical_id.as_deref() == Some("css:class:layout"))
         );
+    }
+
+    fn collect(source: &str) -> IntermediateStorage {
+        let mut storage = IntermediateStorage::default();
+        collect_html_entities(Path::new("index.html"), source, NodeId(99), &mut storage);
+        storage
+    }
+
+    fn canonical_ids(storage: &IntermediateStorage) -> Vec<String> {
+        let mut ids = storage
+            .nodes
+            .iter()
+            .filter_map(|node| node.canonical_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn only_a_real_id_attribute_mints_an_entity() {
+        let storage = collect(
+            r#"<main id="app">
+  <button data-testid="login-submit" data-id="row-7" class="btn">Go</button>
+  <input uid="u-1" aria-labelledby="app" id="search">
+</main>"#,
+        );
+        let ids = canonical_ids(&storage);
+        for expected in ["html:id:app", "html:id:search"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "`{expected}` is a real id attribute: {ids:?}"
+            );
+        }
+        for forbidden in [
+            "html:id:login-submit",
+            "html:id:row-7",
+            "html:id:u-1",
+            "html:id:app-labelled",
+        ] {
+            assert!(
+                !ids.contains(&forbidden.to_string()),
+                "`{forbidden}` comes from an attribute that merely ends in `id`: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_real_class_attribute_mints_a_css_usage() {
+        let storage = collect(
+            r#"<main class="layout">
+  <div data-class="ghost" ng-class="dynamic">x</div>
+</main>"#,
+        );
+        let ids = canonical_ids(&storage);
+        assert!(ids.contains(&"css:class:layout".to_string()), "{ids:?}");
+        for forbidden in ["css:class:ghost", "css:class:dynamic"] {
+            assert!(
+                !ids.contains(&forbidden.to_string()),
+                "`{forbidden}` comes from an attribute that merely ends in `class`: {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_parents_are_the_nearest_enclosing_region_on_every_run() {
+        // Two regions and two ids, so the parent choice is ambiguous unless it
+        // is anchored: the old `HashMap::values().last()` picked whichever the
+        // hash seed happened to yield.
+        let source = r#"<section id="first">
+  <p>one</p>
+</section>
+<article id="second">
+  <p class="two">two</p>
+</article>"#;
+        let baseline = collect(source);
+        let region_by_id = baseline
+            .nodes
+            .iter()
+            .filter_map(|node| Some((node.id, node.canonical_id.clone()?)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let describe = |storage: &IntermediateStorage| {
+            let mut rows = storage
+                .edges
+                .iter()
+                .map(|edge| {
+                    format!(
+                        "{:?}:{}->{}",
+                        edge.kind,
+                        region_by_id
+                            .get(&edge.source)
+                            .cloned()
+                            .unwrap_or_else(|| edge.source.0.to_string()),
+                        region_by_id
+                            .get(&edge.target)
+                            .cloned()
+                            .unwrap_or_else(|| edge.target.0.to_string())
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+
+        let baseline_edges = describe(&baseline);
+        assert!(
+            baseline_edges
+                .iter()
+                .any(|row| row == "MEMBER:html:region:index.html:1->html:id:first"),
+            "the id on the section line belongs to that section: {baseline_edges:?}"
+        );
+        assert!(
+            baseline_edges
+                .iter()
+                .any(|row| row == "MEMBER:html:region:index.html:4->html:id:second"),
+            "the id on the article line belongs to that article: {baseline_edges:?}"
+        );
+
+        // Repeated indexing of identical bytes must emit an identical edge set;
+        // the parent is baked into `structural_edge_id`, so drift here is
+        // persisted churn.
+        for _ in 0..16 {
+            assert_eq!(
+                describe(&collect(source)),
+                baseline_edges,
+                "identical source must produce an identical edge set"
+            );
+        }
     }
 }

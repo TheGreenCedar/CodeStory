@@ -21,12 +21,85 @@ struct LocatedQualifiedName {
     len: usize,
 }
 
+/// Blank out SQL comments while preserving every byte offset.
+///
+/// The collector is line-oriented and records exact byte spans, so comments are
+/// overwritten with spaces rather than removed: `-- CREATE TABLE old_users (id
+/// INT);` used to mint a real table node with a MEMBER edge and inline column
+/// fields, and prose like `-- create table statements below` used to mint a
+/// table called `statements` (CR-011). Quoting is tracked so a `--` or `/*`
+/// inside a string literal or a quoted identifier is left alone, and block
+/// comments carry their state across lines.
+fn mask_sql_comments(source: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scan {
+        Code,
+        Quoted(u8),
+        BlockComment,
+    }
+
+    let bytes = source.as_bytes();
+    // Every byte of a masked run is overwritten, so a multi-byte character
+    // inside a comment becomes that many spaces and the result stays valid
+    // UTF-8 at exactly the original length.
+    let mut output = bytes.to_vec();
+    let mut state = Scan::Code;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            Scan::Code => match (byte, next) {
+                (b'-', Some(b'-')) => {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        output[index] = b' ';
+                        index += 1;
+                    }
+                }
+                (b'/', Some(b'*')) => {
+                    state = Scan::BlockComment;
+                    output[index] = b' ';
+                    output[index + 1] = b' ';
+                    index += 2;
+                }
+                (b'\'', _) | (b'"', _) | (b'`', _) => {
+                    state = Scan::Quoted(byte);
+                    index += 1;
+                }
+                _ => index += 1,
+            },
+            Scan::Quoted(quote) => {
+                if byte == quote {
+                    state = Scan::Code;
+                }
+                index += 1;
+            }
+            Scan::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    output[index] = b' ';
+                    output[index + 1] = b' ';
+                    state = Scan::Code;
+                    index += 2;
+                } else {
+                    if byte != b'\n' && byte != b'\r' {
+                        output[index] = b' ';
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+    String::from_utf8(output).unwrap_or_else(|_| source.to_string())
+}
+
 pub(crate) fn collect_sql_entities(
     path: &Path,
     source: &str,
     file_id: NodeId,
     storage: &mut IntermediateStorage,
 ) {
+    let masked = mask_sql_comments(source);
+    let source = masked.as_str();
     let default_schema = infer_default_schema(source);
     let schema_nodes = collect_schemas(source, file_id, storage, &default_schema);
     let mut tables: HashMap<String, NodeId> = HashMap::new();
@@ -199,10 +272,38 @@ fn default_schema_node(file_id: NodeId, storage: &mut IntermediateStorage, schem
     push_synthetic_structural_node(storage, file_id, NodeKind::NAMESPACE, schema, &canonical)
 }
 
+/// Byte offsets on this line at which a SQL statement can begin.
+///
+/// One offset for the first non-whitespace byte, and one after every `;`.
+/// Anything else on the line is inside a statement.
+fn statement_start_offsets(line: &str) -> Vec<usize> {
+    let mut offsets = vec![skip_ascii_whitespace(line, 0)];
+    for (index, byte) in line.as_bytes().iter().enumerate() {
+        if *byte == b';' {
+            offsets.push(skip_ascii_whitespace(line, index + 1));
+        }
+    }
+    offsets.retain(|offset| *offset < line.len());
+    offsets
+}
+
+/// Locate `keyword` only where a statement starts.
+///
+/// The lookup used to be an unanchored `find`, so any line mentioning the
+/// keyword produced a schema object: a string literal holding dynamic DDL, a
+/// `COMMENT ON` body, a continuation line quoting the phrase (CR-011). Comment
+/// masking removes one source of those; anchoring removes the rest. `CREATE
+/// INDEX` is unaffected — `parse_create_index` was already anchored separately.
 fn parse_qualified_name_after_keyword(line: &str, keyword: &str) -> Option<LocatedQualifiedName> {
     let lower = line.to_ascii_lowercase();
     let keyword_lower = keyword.to_ascii_lowercase();
-    let idx = lower.find(&keyword_lower)?;
+    let idx = statement_start_offsets(line).into_iter().find(|offset| {
+        lower[*offset..].starts_with(&keyword_lower)
+            && line
+                .as_bytes()
+                .get(offset + keyword.len())
+                .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
+    })?;
     let mut start = skip_ascii_whitespace(line, idx + keyword.len());
     if line[start..]
         .to_ascii_uppercase()
@@ -445,6 +546,118 @@ CREATE INDEX users_email_idx ON app.users (email);
         assert_eq!(
             &source.lines().next().unwrap().as_bytes()[start..end],
             b"app"
+        );
+    }
+
+    fn canonical_ids(storage: &IntermediateStorage) -> Vec<String> {
+        let mut ids = storage
+            .nodes
+            .iter()
+            .filter_map(|node| node.canonical_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn collect(source: &str) -> IntermediateStorage {
+        let mut storage = IntermediateStorage::default();
+        collect_sql_entities(Path::new("schema.sql"), source, NodeId(7), &mut storage);
+        storage
+    }
+
+    #[test]
+    fn commented_out_and_quoted_ddl_produce_no_schema_objects() {
+        let live = collect("CREATE TABLE app.users (id INT, email TEXT);\n");
+        let live_ids = canonical_ids(&live);
+        assert!(
+            live_ids.contains(&"sql:table:app.users".to_string()),
+            "live DDL must still be collected: {live_ids:?}"
+        );
+        assert!(
+            live_ids.contains(&"sql:column:app.users.id".to_string()),
+            "live inline columns must still be collected: {live_ids:?}"
+        );
+
+        let commented = collect(concat!(
+            "-- CREATE TABLE app.old_users (id INT);\n",
+            "-- create table statements below\n",
+            "/* CREATE TABLE app.block_users (id INT);\n",
+            "   CREATE VIEW app.block_view AS SELECT 1; */\n",
+            "EXECUTE 'CREATE TABLE app.dynamic_users (id INT)';\n",
+            "COMMENT ON TABLE app.users IS 'CREATE FUNCTION app.fake()';\n",
+        ));
+        let commented_ids = canonical_ids(&commented);
+        for forbidden in [
+            "sql:table:app.old_users",
+            "sql:table:public.statements",
+            "sql:table:app.block_users",
+            "sql:view:app.block_view",
+            "sql:table:app.dynamic_users",
+            "sql:func:app.fake",
+        ] {
+            assert!(
+                !commented_ids.contains(&forbidden.to_string()),
+                "`{forbidden}` must not be minted from a comment or a string literal: \
+                 {commented_ids:?}"
+            );
+        }
+        assert!(
+            !commented
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::FIELD),
+            "no inline columns may be minted from commented-out DDL: {commented_ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_hide_the_statement_it_follows() {
+        let storage = collect(
+            "CREATE TABLE app.users (id INT); -- CREATE TABLE app.ghost (id INT);\n\
+             CREATE TABLE app.orders (id INT); /* note */\n",
+        );
+        let ids = canonical_ids(&storage);
+        assert!(ids.contains(&"sql:table:app.users".to_string()), "{ids:?}");
+        assert!(ids.contains(&"sql:table:app.orders".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"sql:table:app.ghost".to_string()), "{ids:?}");
+    }
+
+    #[test]
+    fn comment_masking_preserves_every_byte_offset() {
+        let source = "CREATE TABLE app.users (id INT); -- naïve note\n/* ünicode */\n";
+        let masked = mask_sql_comments(source);
+        assert_eq!(masked.len(), source.len());
+        assert_eq!(masked.lines().count(), source.lines().count());
+        assert!(masked.starts_with("CREATE TABLE app.users (id INT);"));
+        assert!(
+            masked
+                .lines()
+                .next()
+                .expect("first line")
+                .trim_end()
+                .ends_with(';'),
+            "the comment tail must be blanked, not shortened: {masked:?}"
+        );
+        assert!(
+            masked
+                .lines()
+                .nth(1)
+                .expect("second line")
+                .trim()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_quoted_comment_marker_is_not_a_comment() {
+        let masked = mask_sql_comments("SELECT '-- not a comment' AS note; -- real\n");
+        assert!(
+            masked.contains("'-- not a comment'"),
+            "string literals keep their contents: {masked:?}"
+        );
+        assert!(
+            !masked.contains("real"),
+            "the real comment is still blanked: {masked:?}"
         );
     }
 }
