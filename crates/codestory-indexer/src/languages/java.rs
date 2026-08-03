@@ -61,6 +61,7 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
     member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
     graph_call_syntax: Some("java_member"),

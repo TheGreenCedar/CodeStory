@@ -1,0 +1,31 @@
+node FILE name=<ROOT>/fidelity.go qn=<ROOT>/fidelity.go canonical=<ROOT>/fidelity.go:<ROOT>/fidelity.go:1 line=1 col=1 end=43:0 file=FILE:<ROOT>/fidelity.go@1
+node FUNCTION name=decorate qn=decorate canonical=<ROOT>/fidelity.go:decorate#1 line=36 col=1 end=38:2 file=FILE:<ROOT>/fidelity.go@1
+node FUNCTION name=orchestrateGo qn=orchestrateGo canonical=<ROOT>/fidelity.go:orchestrateGo#0 line=40 col=1 end=43:2 file=FILE:<ROOT>/fidelity.go@1
+node METHOD name=ConsoleNotifier.Notify qn=ConsoleNotifier.Notify canonical=<ROOT>/fidelity.go:ConsoleNotifier.Notify#0 line=11 col=1 end=13:2 file=FILE:<ROOT>/fidelity.go@1
+node METHOD name=Notifier.Notify qn=Notifier.Notify canonical=<ROOT>/fidelity.go:Notifier.Notify#0 line=6 col=2 end=6:15 file=FILE:<ROOT>/fidelity.go@1
+node METHOD name=Repository.Save qn=Repository.Save canonical=<ROOT>/fidelity.go:Repository.Save#0 line=17 col=1 end=19:2 file=FILE:<ROOT>/fidelity.go@1
+node METHOD name=Workflow.Run qn=Workflow.Run canonical=<ROOT>/fidelity.go:Workflow.Run#0 line=30 col=1 end=34:2 file=FILE:<ROOT>/fidelity.go@1
+node MODULE name="fmt" qn="fmt" canonical=<ROOT>/fidelity.go:"fmt"#0 line=3 col=8 end=3:13 file=FILE:<ROOT>/fidelity.go@1
+node MODULE name=main qn=main canonical=<ROOT>/fidelity.go:main#0 line=1 col=1 end=1:13 file=FILE:<ROOT>/fidelity.go@1
+node STRUCT name=ConsoleNotifier qn=ConsoleNotifier canonical=<ROOT>/fidelity.go:ConsoleNotifier line=9 col=1 end=9:30 file=FILE:<ROOT>/fidelity.go@1
+node STRUCT name=Event qn=Event canonical=<ROOT>/fidelity.go:Event line=21 col=1 end=23:2 file=FILE:<ROOT>/fidelity.go@1
+node STRUCT name=Notifier qn=Notifier canonical=<ROOT>/fidelity.go:Notifier line=5 col=1 end=7:2 file=FILE:<ROOT>/fidelity.go@1
+node STRUCT name=Repository qn=Repository canonical=<ROOT>/fidelity.go:Repository line=15 col=1 end=15:25 file=FILE:<ROOT>/fidelity.go@1
+node STRUCT name=Workflow qn=Workflow canonical=<ROOT>/fidelity.go:Workflow line=25 col=1 end=28:2 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Notify qn=Notify canonical=<ROOT>/fidelity.go:Notify#0 line=31 col=13 end=31:19 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Println qn=Println canonical=<ROOT>/fidelity.go:Println#0 line=12 col=6 end=12:13 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Println qn=Println canonical=<ROOT>/fidelity.go:Println#1 line=18 col=6 end=18:13 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Run qn=Run canonical=<ROOT>/fidelity.go:Run#0 line=42 col=11 end=42:14 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Save qn=Save canonical=<ROOT>/fidelity.go:Save#0 line=32 col=9 end=32:13 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=decorate qn=decorate canonical=<ROOT>/fidelity.go:decorate#0 line=33 col=2 end=33:10 file=FILE:<ROOT>/fidelity.go@1
+edge CALL src=FUNCTION:orchestrateGo@40 dst=METHOD:Workflow.Run@30 resolved_src=FUNCTION:orchestrateGo@40 resolved_dst=METHOD:Workflow.Run@30 line=42 confidence=1.0000 certainty=Certain callsite=h0:42:1:h1 candidates=[]
+edge CALL src=METHOD:ConsoleNotifier.Notify@11 dst=UNKNOWN:Println@12 resolved_src=METHOD:ConsoleNotifier.Notify@11 resolved_dst=- line=12 confidence=- certainty=- callsite=h0:12:1:h2|syntax:go-selector-call candidates=[]
+edge CALL src=METHOD:Repository.Save@17 dst=UNKNOWN:Println@18 resolved_src=METHOD:Repository.Save@17 resolved_dst=- line=18 confidence=- certainty=- callsite=h0:18:1:h3|syntax:go-selector-call candidates=[]
+edge CALL src=METHOD:Workflow.Run@30 dst=METHOD:Notifier.Notify@6 resolved_src=METHOD:Workflow.Run@30 resolved_dst=METHOD:Notifier.Notify@6 line=31 confidence=1.0000 certainty=Certain callsite=h0:31:1:h4 candidates=[]
+edge CALL src=METHOD:Workflow.Run@30 dst=METHOD:Repository.Save@17 resolved_src=METHOD:Workflow.Run@30 resolved_dst=METHOD:Repository.Save@17 line=32 confidence=1.0000 certainty=Certain callsite=h0:32:1:h5 candidates=[]
+edge CALL src=METHOD:Workflow.Run@30 dst=UNKNOWN:decorate@33 resolved_src=METHOD:Workflow.Run@30 resolved_dst=FUNCTION:decorate@36 line=33 confidence=0.9500 certainty=Certain callsite=h0:33:1:h6 candidates=[]
+edge IMPORT src=MODULE:"fmt"@3 dst=MODULE:"fmt"@3 resolved_src=MODULE:"fmt"@3 resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ConsoleNotifier@9 dst=METHOD:ConsoleNotifier.Notify@11 resolved_src=- resolved_dst=- line=11 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Notifier@5 dst=METHOD:Notifier.Notify@6 resolved_src=- resolved_dst=- line=6 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Repository@15 dst=METHOD:Repository.Save@17 resolved_src=- resolved_dst=- line=17 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Workflow@25 dst=METHOD:Workflow.Run@30 resolved_src=- resolved_dst=- line=30 confidence=- certainty=Certain callsite=- candidates=[]

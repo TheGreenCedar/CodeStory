@@ -1,0 +1,100 @@
+node FILE name=game.sh qn=game.sh canonical=game.sh:game.sh:1 line=1 col=1 end=55:0 file=FILE:game.sh@1
+node FUNCTION name=main qn=main canonical=game.sh:main#0 line=51 col=1 end=53:2 file=FILE:game.sh@1
+node FUNCTION name=makeMove qn=makeMove canonical=game.sh:makeMove#0 line=21 col=1 end=30:2 file=FILE:game.sh@1
+node FUNCTION name=minMax qn=minMax canonical=game.sh:minMax#0 line=36 col=1 end=43:2 file=FILE:game.sh@1
+node FUNCTION name=numberIn qn=numberIn canonical=game.sh:numberIn#0 line=3 col=1 end=5:2 file=FILE:game.sh@1
+node FUNCTION name=numberOut qn=numberOut canonical=game.sh:numberOut#0 line=7 col=1 end=9:2 file=FILE:game.sh@1
+node FUNCTION name=run qn=run canonical=game.sh:run#0 line=45 col=1 end=49:2 file=FILE:game.sh@1
+node FUNCTION name=sameInRow qn=sameInRow canonical=game.sh:sameInRow#0 line=15 col=1 end=19:2 file=FILE:game.sh@1
+node FUNCTION name=stringOut qn=stringOut canonical=game.sh:stringOut#0 line=11 col=1 end=13:2 file=FILE:game.sh@1
+node FUNCTION name=turn qn=turn canonical=game.sh:turn#0 line=32 col=1 end=34:2 file=FILE:game.sh@1
+node MODULE name=./random.sh qn=./random.sh canonical=game.sh:./random.sh#0 line=1 col=8 end=1:19 file=FILE:game.sh@1
+node UNKNOWN name=echo qn=echo canonical=game.sh:echo#0 line=4 col=3 end=4:7 file=FILE:game.sh@1
+node UNKNOWN name=echo qn=echo canonical=game.sh:echo#1 line=18 col=3 end=18:7 file=FILE:game.sh@1
+node UNKNOWN name=echo qn=echo canonical=game.sh:echo#2 line=29 col=3 end=29:7 file=FILE:game.sh@1
+node UNKNOWN name=echo qn=echo canonical=game.sh:echo#3 line=39 col=5 end=39:9 file=FILE:game.sh@1
+node UNKNOWN name=main qn=main canonical=game.sh:main#1 line=55 col=1 end=55:5 file=FILE:game.sh@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.sh:makeMove#1 line=33 col=3 end=33:11 file=FILE:game.sh@1
+node UNKNOWN name=minMax qn=minMax canonical=game.sh:minMax#1 line=42 col=3 end=42:9 file=FILE:game.sh@1
+node UNKNOWN name=minMax qn=minMax canonical=game.sh:minMax#2 line=48 col=3 end=48:9 file=FILE:game.sh@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.sh:numberIn#1 line=46 col=3 end=46:11 file=FILE:game.sh@1
+node UNKNOWN name=printf qn=printf canonical=game.sh:printf#0 line=8 col=3 end=8:9 file=FILE:game.sh@1
+node UNKNOWN name=printf qn=printf canonical=game.sh:printf#1 line=12 col=3 end=12:9 file=FILE:game.sh@1
+node UNKNOWN name=return qn=return canonical=game.sh:return#0 line=26 col=5 end=26:11 file=FILE:game.sh@1
+node UNKNOWN name=return qn=return canonical=game.sh:return#1 line=40 col=5 end=40:11 file=FILE:game.sh@1
+node UNKNOWN name=run qn=run canonical=game.sh:run#1 line=52 col=3 end=52:6 file=FILE:game.sh@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.sh:sameInRow#1 line=28 col=3 end=28:12 file=FILE:game.sh@1
+node UNKNOWN name=source qn=source canonical=game.sh:source#0 line=1 col=1 end=1:7 file=FILE:game.sh@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.sh:stringOut#1 line=47 col=3 end=47:12 file=FILE:game.sh@1
+node VARIABLE name=amount qn=amount canonical=game.sh:amount#0 line=17 col=3 end=17:14 file=FILE:game.sh@1
+node VARIABLE name=col qn=col canonical=game.sh:col#0 line=23 col=3 end=23:11 file=FILE:game.sh@1
+node VARIABLE name=depth qn=depth canonical=game.sh:depth#0 line=37 col=3 end=37:13 file=FILE:game.sh@1
+node VARIABLE name=row qn=row canonical=game.sh:row#0 line=22 col=3 end=22:11 file=FILE:game.sh@1
+node VARIABLE name=token qn=token canonical=game.sh:token#0 line=16 col=3 end=16:13 file=FILE:game.sh@1
+node VARIABLE name=token qn=token canonical=game.sh:token#1 line=24 col=3 end=24:13 file=FILE:game.sh@1
+edge CALL src=FUNCTION:main@51 dst=UNKNOWN:run@52 resolved_src=- resolved_dst=- line=52 confidence=- certainty=- callsite=h0:52:1:h1 candidates=[]
+edge CALL src=FUNCTION:makeMove@21 dst=UNKNOWN:echo@29 resolved_src=- resolved_dst=- line=29 confidence=- certainty=- callsite=h0:29:1:h2 candidates=[]
+edge CALL src=FUNCTION:makeMove@21 dst=UNKNOWN:return@26 resolved_src=- resolved_dst=- line=26 confidence=- certainty=- callsite=h0:26:1:h3 candidates=[]
+edge CALL src=FUNCTION:makeMove@21 dst=UNKNOWN:sameInRow@28 resolved_src=- resolved_dst=- line=28 confidence=- certainty=- callsite=h0:28:1:h4 candidates=[]
+edge CALL src=FUNCTION:minMax@36 dst=UNKNOWN:echo@39 resolved_src=- resolved_dst=- line=39 confidence=- certainty=- callsite=h0:39:1:h5 candidates=[]
+edge CALL src=FUNCTION:minMax@36 dst=UNKNOWN:minMax@42 resolved_src=- resolved_dst=- line=42 confidence=- certainty=- callsite=h0:42:1:h6 candidates=[]
+edge CALL src=FUNCTION:minMax@36 dst=UNKNOWN:return@40 resolved_src=- resolved_dst=- line=40 confidence=- certainty=- callsite=h0:40:1:h7 candidates=[]
+edge CALL src=FUNCTION:numberIn@3 dst=UNKNOWN:echo@4 resolved_src=- resolved_dst=- line=4 confidence=- certainty=- callsite=h0:4:1:h8 candidates=[]
+edge CALL src=FUNCTION:numberOut@7 dst=UNKNOWN:printf@8 resolved_src=- resolved_dst=- line=8 confidence=- certainty=- callsite=h0:8:1:h9 candidates=[]
+edge CALL src=FUNCTION:run@45 dst=UNKNOWN:minMax@48 resolved_src=- resolved_dst=- line=48 confidence=- certainty=- callsite=h0:48:1:h10 candidates=[]
+edge CALL src=FUNCTION:run@45 dst=UNKNOWN:numberIn@46 resolved_src=- resolved_dst=- line=46 confidence=- certainty=- callsite=h0:46:1:h11 candidates=[]
+edge CALL src=FUNCTION:run@45 dst=UNKNOWN:stringOut@47 resolved_src=- resolved_dst=- line=47 confidence=- certainty=- callsite=h0:47:1:h12 candidates=[]
+edge CALL src=FUNCTION:sameInRow@15 dst=UNKNOWN:echo@18 resolved_src=- resolved_dst=- line=18 confidence=- certainty=- callsite=h0:18:1:h13 candidates=[]
+edge CALL src=FUNCTION:stringOut@11 dst=UNKNOWN:printf@12 resolved_src=- resolved_dst=- line=12 confidence=- certainty=- callsite=h0:12:1:h14 candidates=[]
+edge CALL src=FUNCTION:turn@32 dst=UNKNOWN:makeMove@33 resolved_src=- resolved_dst=- line=33 confidence=- certainty=- callsite=h0:33:1:h15 candidates=[]
+edge IMPORT src=MODULE:./random.sh@1 dst=MODULE:./random.sh@1 resolved_src=- resolved_dst=- line=1 confidence=- certainty=- callsite=- candidates=[]
+file path=game.sh language=bash lines=55 complete=true role=Source
+occurrence element=FUNCTION:main@51 kind=DEFINITION span=51:1-53:2
+occurrence element=FUNCTION:makeMove@21 kind=DEFINITION span=21:1-30:2
+occurrence element=FUNCTION:minMax@36 kind=DEFINITION span=36:1-43:2
+occurrence element=FUNCTION:numberIn@3 kind=DEFINITION span=3:1-5:2
+occurrence element=FUNCTION:numberOut@7 kind=DEFINITION span=7:1-9:2
+occurrence element=FUNCTION:run@45 kind=DEFINITION span=45:1-49:2
+occurrence element=FUNCTION:sameInRow@15 kind=DEFINITION span=15:1-19:2
+occurrence element=FUNCTION:stringOut@11 kind=DEFINITION span=11:1-13:2
+occurrence element=FUNCTION:turn@32 kind=DEFINITION span=32:1-34:2
+occurrence element=MODULE:./random.sh@1 kind=DEFINITION span=1:8-1:19
+occurrence element=UNKNOWN:echo@18 kind=DEFINITION span=18:3-18:7
+occurrence element=UNKNOWN:echo@29 kind=DEFINITION span=29:3-29:7
+occurrence element=UNKNOWN:echo@39 kind=DEFINITION span=39:5-39:9
+occurrence element=UNKNOWN:echo@4 kind=DEFINITION span=4:3-4:7
+occurrence element=UNKNOWN:main@55 kind=DEFINITION span=55:1-55:5
+occurrence element=UNKNOWN:makeMove@33 kind=DEFINITION span=33:3-33:11
+occurrence element=UNKNOWN:minMax@42 kind=DEFINITION span=42:3-42:9
+occurrence element=UNKNOWN:minMax@48 kind=DEFINITION span=48:3-48:9
+occurrence element=UNKNOWN:numberIn@46 kind=DEFINITION span=46:3-46:11
+occurrence element=UNKNOWN:printf@12 kind=DEFINITION span=12:3-12:9
+occurrence element=UNKNOWN:printf@8 kind=DEFINITION span=8:3-8:9
+occurrence element=UNKNOWN:return@26 kind=DEFINITION span=26:5-26:11
+occurrence element=UNKNOWN:return@40 kind=DEFINITION span=40:5-40:11
+occurrence element=UNKNOWN:run@52 kind=DEFINITION span=52:3-52:6
+occurrence element=UNKNOWN:sameInRow@28 kind=DEFINITION span=28:3-28:12
+occurrence element=UNKNOWN:source@1 kind=DEFINITION span=1:1-1:7
+occurrence element=UNKNOWN:stringOut@47 kind=DEFINITION span=47:3-47:12
+occurrence element=VARIABLE:amount@17 kind=DEFINITION span=17:3-17:14
+occurrence element=VARIABLE:col@23 kind=DEFINITION span=23:3-23:11
+occurrence element=VARIABLE:depth@37 kind=DEFINITION span=37:3-37:13
+occurrence element=VARIABLE:row@22 kind=DEFINITION span=22:3-22:11
+occurrence element=VARIABLE:token@16 kind=DEFINITION span=16:3-16:13
+occurrence element=VARIABLE:token@24 kind=DEFINITION span=24:3-24:13
+access node=VARIABLE:amount@17 kind=Public
+access node=VARIABLE:col@23 kind=Public
+access node=VARIABLE:depth@37 kind=Public
+access node=VARIABLE:row@22 kind=Public
+access node=VARIABLE:token@16 kind=Public
+access node=VARIABLE:token@24 kind=Public
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:main", node_id: NodeId(-3635321003423131788), signature_hash: -4671339478033693080, normalized_signature: Some("shape:6083604196958491942"), body_hash: 760610733551956591, start_line: 51, end_line: 53 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:makeMove", node_id: NodeId(-2515598397687256798), signature_hash: 5173406897340347930, normalized_signature: Some("shape:-1235026875210414673"), body_hash: 9149177360853350432, start_line: 21, end_line: 30 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:minMax", node_id: NodeId(7081801660925780151), signature_hash: -8051465974728078519, normalized_signature: Some("shape:-9198897625861577702"), body_hash: 6006497835269164092, start_line: 36, end_line: 43 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberIn", node_id: NodeId(-5905922039771045421), signature_hash: 2477812878330356949, normalized_signature: Some("shape:-7083630050789299289"), body_hash: 5561877708812231360, start_line: 3, end_line: 5 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberOut", node_id: NodeId(-7934113418855399154), signature_hash: -1579019679195996938, normalized_signature: Some("shape:4534084180875376373"), body_hash: -5825159797702543837, start_line: 7, end_line: 9 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:run", node_id: NodeId(690218248480803604), signature_hash: 5222842858713591688, normalized_signature: Some("shape:8445692896744983391"), body_hash: -8886277489832578549, start_line: 45, end_line: 49 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:sameInRow", node_id: NodeId(5861375836366715686), signature_hash: 954397003606297678, normalized_signature: Some("shape:-8036842316825594099"), body_hash: 1566588196809705519, start_line: 15, end_line: 19 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:stringOut", node_id: NodeId(-4261065684697691790), signature_hash: -5818630870471287222, normalized_signature: Some("shape:8953728298715117053"), body_hash: -1270341848088446665, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:turn", node_id: NodeId(-8531347618660569562), signature_hash: -3321651350975386290, normalized_signature: Some("shape:-4838422319707821228"), body_hash: -2554722678388236973, start_line: 32, end_line: 34 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "__file_structural__", node_id: NodeId(3699121416828224428), signature_hash: 6443036107887619124, normalized_signature: None, body_hash: 2836811500587000585, start_line: 1, end_line: 55 }

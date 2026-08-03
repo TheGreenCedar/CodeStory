@@ -1,0 +1,112 @@
+node FILE name=game.go qn=game.go canonical=game.go:game.go:1 line=1 col=1 end=98:0 file=FILE:game.go@1
+node FUNCTION name=main qn=main canonical=game.go:main#1 line=95 col=1 end=98:2 file=FILE:game.go@1
+node FUNCTION name=numberIn qn=numberIn canonical=game.go:numberIn#0 line=8 col=1 end=10:2 file=FILE:game.go@1
+node FUNCTION name=numberOut qn=numberOut canonical=game.go:numberOut#0 line=12 col=1 end=14:2 file=FILE:game.go@1
+node FUNCTION name=stringOut qn=stringOut canonical=game.go:stringOut#0 line=16 col=1 end=18:2 file=FILE:game.go@1
+node METHOD name=ArtificialPlayer.minMax qn=ArtificialPlayer.minMax canonical=game.go:ArtificialPlayer.minMax#0 line=72 col=1 end=77:2 file=FILE:game.go@1
+node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.go:ArtificialPlayer.turn#0 line=79 col=1 end=82:2 file=FILE:game.go@1
+node METHOD name=Field.makeMove qn=Field.makeMove canonical=game.go:Field.makeMove#0 line=50 col=1 end=58:2 file=FILE:game.go@1
+node METHOD name=Field.opponent qn=Field.opponent canonical=game.go:Field.opponent#0 line=29 col=1 end=37:2 file=FILE:game.go@1
+node METHOD name=Field.sameInRow qn=Field.sameInRow canonical=game.go:Field.sameInRow#0 line=39 col=1 end=48:2 file=FILE:game.go@1
+node METHOD name=GameObject.announce qn=GameObject.announce canonical=game.go:GameObject.announce#0 line=22 col=1 end=22:32 file=FILE:game.go@1
+node METHOD name=HumanPlayer.turn qn=HumanPlayer.turn canonical=game.go:HumanPlayer.turn#0 line=66 col=1 end=68:2 file=FILE:game.go@1
+node METHOD name=Player.turn qn=Player.turn canonical=game.go:Player.turn#0 line=61 col=2 end=61:36 file=FILE:game.go@1
+node METHOD name=TicTacToe.run qn=TicTacToe.run canonical=game.go:TicTacToe.run#0 line=88 col=1 end=93:2 file=FILE:game.go@1
+node MODULE name="fmt" qn="fmt" canonical=game.go:"fmt"#0 line=4 col=2 end=4:7 file=FILE:game.go@1
+node MODULE name="math/rand" qn="math/rand" canonical=game.go:"math/rand"#0 line=5 col=2 end=5:13 file=FILE:game.go@1
+node MODULE name=main qn=main canonical=game.go:main#0 line=1 col=1 end=1:13 file=FILE:game.go@1
+node STRUCT name=ArtificialPlayer qn=ArtificialPlayer canonical=game.go:ArtificialPlayer line=70 col=1 end=70:31 file=FILE:game.go@1
+node STRUCT name=Field qn=Field canonical=game.go:Field line=24 col=1 end=27:2 file=FILE:game.go@1
+node STRUCT name=GameObject qn=GameObject canonical=game.go:GameObject line=20 col=1 end=20:25 file=FILE:game.go@1
+node STRUCT name=HumanPlayer qn=HumanPlayer canonical=game.go:HumanPlayer line=64 col=1 end=64:26 file=FILE:game.go@1
+node STRUCT name=Player qn=Player canonical=game.go:Player line=60 col=1 end=62:2 file=FILE:game.go@1
+node STRUCT name=TicTacToe qn=TicTacToe canonical=game.go:TicTacToe line=84 col=1 end=86:2 file=FILE:game.go@1
+node UNKNOWN name=Intn qn=Intn canonical=game.go:Intn#0 line=92 col=7 end=92:11 file=FILE:game.go@1
+node UNKNOWN name=Print qn=Print canonical=game.go:Print#0 line=13 col=6 end=13:11 file=FILE:game.go@1
+node UNKNOWN name=Print qn=Print canonical=game.go:Print#1 line=17 col=6 end=17:11 file=FILE:game.go@1
+node UNKNOWN name=make qn=make canonical=game.go:make#0 line=89 col=25 end=89:29 file=FILE:game.go@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.go:makeMove#0 line=67 col=15 end=67:23 file=FILE:game.go@1
+node UNKNOWN name=minMax qn=minMax canonical=game.go:minMax#0 line=76 col=11 end=76:17 file=FILE:game.go@1
+node UNKNOWN name=minMax qn=minMax canonical=game.go:minMax#1 line=80 col=4 end=80:10 file=FILE:game.go@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.go:numberIn#1 line=90 col=2 end=90:10 file=FILE:game.go@1
+node UNKNOWN name=run qn=run canonical=game.go:run#0 line=97 col=7 end=97:10 file=FILE:game.go@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.go:sameInRow#0 line=56 col=4 end=56:13 file=FILE:game.go@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.go:stringOut#1 line=91 col=2 end=91:11 file=FILE:game.go@1
+edge CALL src=FUNCTION:main@95 dst=METHOD:TicTacToe.run@88 resolved_src=- resolved_dst=METHOD:TicTacToe.run@88 line=97 confidence=1.0000 certainty=Certain callsite=h0:97:1:h1 candidates=[]
+edge CALL src=FUNCTION:numberOut@12 dst=UNKNOWN:Print@13 resolved_src=- resolved_dst=- line=13 confidence=- certainty=- callsite=h0:13:1:h2|syntax:go-selector-call candidates=[]
+edge CALL src=FUNCTION:stringOut@16 dst=UNKNOWN:Print@17 resolved_src=- resolved_dst=- line=17 confidence=- certainty=- callsite=h0:17:1:h3|syntax:go-selector-call candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.turn@79 dst=METHOD:ArtificialPlayer.minMax@72 resolved_src=- resolved_dst=METHOD:ArtificialPlayer.minMax@72 line=80 confidence=1.0000 certainty=Certain callsite=h0:80:1:h4 candidates=[]
+edge CALL src=METHOD:Field.makeMove@50 dst=METHOD:Field.sameInRow@39 resolved_src=- resolved_dst=METHOD:Field.sameInRow@39 line=56 confidence=1.0000 certainty=Certain callsite=h0:56:1:h5 candidates=[]
+edge CALL src=METHOD:HumanPlayer.turn@66 dst=METHOD:Field.makeMove@50 resolved_src=- resolved_dst=METHOD:Field.makeMove@50 line=67 confidence=1.0000 certainty=Certain callsite=h0:67:1:h6 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@88 dst=UNKNOWN:Intn@92 resolved_src=- resolved_dst=- line=92 confidence=- certainty=- callsite=h0:92:1:h7|syntax:go-selector-call candidates=[]
+edge CALL src=METHOD:TicTacToe.run@88 dst=UNKNOWN:make@89 resolved_src=- resolved_dst=- line=89 confidence=- certainty=- callsite=h0:89:1:h8 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@88 dst=UNKNOWN:numberIn@90 resolved_src=- resolved_dst=- line=90 confidence=- certainty=- callsite=h0:90:1:h9 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@88 dst=UNKNOWN:stringOut@91 resolved_src=- resolved_dst=- line=91 confidence=- certainty=- callsite=h0:91:1:h10 candidates=[]
+edge IMPORT src=MODULE:"fmt"@4 dst=MODULE:"fmt"@4 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:"math/rand"@5 dst=MODULE:"math/rand"@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@70 dst=METHOD:ArtificialPlayer.minMax@72 resolved_src=- resolved_dst=- line=72 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@70 dst=METHOD:ArtificialPlayer.turn@79 resolved_src=- resolved_dst=- line=79 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@24 dst=METHOD:Field.makeMove@50 resolved_src=- resolved_dst=- line=50 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@24 dst=METHOD:Field.opponent@29 resolved_src=- resolved_dst=- line=29 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@24 dst=METHOD:Field.sameInRow@39 resolved_src=- resolved_dst=- line=39 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:GameObject@20 dst=METHOD:GameObject.announce@22 resolved_src=- resolved_dst=- line=22 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@64 dst=METHOD:HumanPlayer.turn@66 resolved_src=- resolved_dst=- line=66 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Player@60 dst=METHOD:Player.turn@61 resolved_src=- resolved_dst=- line=61 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:TicTacToe@84 dst=METHOD:TicTacToe.run@88 resolved_src=- resolved_dst=- line=88 confidence=- certainty=Certain callsite=- candidates=[]
+file path=game.go language=go lines=98 complete=true role=Source
+occurrence element=FUNCTION:main@95 kind=DEFINITION span=95:1-98:2
+occurrence element=FUNCTION:numberIn@8 kind=DEFINITION span=8:1-10:2
+occurrence element=FUNCTION:numberOut@12 kind=DEFINITION span=12:1-14:2
+occurrence element=FUNCTION:stringOut@16 kind=DEFINITION span=16:1-18:2
+occurrence element=METHOD:ArtificialPlayer.minMax@72 kind=DEFINITION span=72:1-77:2
+occurrence element=METHOD:ArtificialPlayer.turn@79 kind=DEFINITION span=79:1-82:2
+occurrence element=METHOD:Field.makeMove@50 kind=DEFINITION span=50:1-58:2
+occurrence element=METHOD:Field.opponent@29 kind=DEFINITION span=29:1-37:2
+occurrence element=METHOD:Field.sameInRow@39 kind=DEFINITION span=39:1-48:2
+occurrence element=METHOD:GameObject.announce@22 kind=DEFINITION span=22:1-22:32
+occurrence element=METHOD:HumanPlayer.turn@66 kind=DEFINITION span=66:1-68:2
+occurrence element=METHOD:Player.turn@61 kind=DEFINITION span=61:2-61:36
+occurrence element=METHOD:TicTacToe.run@88 kind=DEFINITION span=88:1-93:2
+occurrence element=MODULE:"fmt"@4 kind=DEFINITION span=4:2-4:7
+occurrence element=MODULE:"math/rand"@5 kind=DEFINITION span=5:2-5:13
+occurrence element=MODULE:main@1 kind=DEFINITION span=1:1-1:13
+occurrence element=STRUCT:ArtificialPlayer@70 kind=DEFINITION span=70:1-70:31
+occurrence element=STRUCT:Field@24 kind=DEFINITION span=24:1-27:2
+occurrence element=STRUCT:GameObject@20 kind=DEFINITION span=20:1-20:25
+occurrence element=STRUCT:HumanPlayer@64 kind=DEFINITION span=64:1-64:26
+occurrence element=STRUCT:Player@60 kind=DEFINITION span=60:1-62:2
+occurrence element=STRUCT:TicTacToe@84 kind=DEFINITION span=84:1-86:2
+occurrence element=UNKNOWN:Intn@92 kind=DEFINITION span=92:7-92:11
+occurrence element=UNKNOWN:Print@13 kind=DEFINITION span=13:6-13:11
+occurrence element=UNKNOWN:Print@17 kind=DEFINITION span=17:6-17:11
+occurrence element=UNKNOWN:make@89 kind=DEFINITION span=89:25-89:29
+occurrence element=UNKNOWN:makeMove@67 kind=DEFINITION span=67:15-67:23
+occurrence element=UNKNOWN:minMax@76 kind=DEFINITION span=76:11-76:17
+occurrence element=UNKNOWN:minMax@80 kind=DEFINITION span=80:4-80:10
+occurrence element=UNKNOWN:numberIn@90 kind=DEFINITION span=90:2-90:10
+occurrence element=UNKNOWN:run@97 kind=DEFINITION span=97:7-97:10
+occurrence element=UNKNOWN:sameInRow@56 kind=DEFINITION span=56:4-56:13
+occurrence element=UNKNOWN:stringOut@91 kind=DEFINITION span=91:2-91:11
+access node=METHOD:ArtificialPlayer.minMax@72 kind=Public
+access node=METHOD:ArtificialPlayer.turn@79 kind=Public
+access node=METHOD:Field.makeMove@50 kind=Public
+access node=METHOD:Field.opponent@29 kind=Public
+access node=METHOD:Field.sameInRow@39 kind=Public
+access node=METHOD:GameObject.announce@22 kind=Public
+access node=METHOD:HumanPlayer.turn@66 kind=Public
+access node=METHOD:Player.turn@61 kind=Public
+access node=METHOD:TicTacToe.run@88 kind=Public
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:main", node_id: NodeId(-7701807741696418100), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-8097269470219391812"), body_hash: 7649160330512063217, start_line: 95, end_line: 98 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:numberIn", node_id: NodeId(-5458843576889243136), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 7819804390695130296, start_line: 8, end_line: 10 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:numberOut", node_id: NodeId(8650796649741548235), signature_hash: -1579019679195996938, normalized_signature: Some("shape:6494744104446376511"), body_hash: -3664118331073172199, start_line: 12, end_line: 14 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:stringOut", node_id: NodeId(2890021218222218907), signature_hash: -5818630870471287222, normalized_signature: Some("shape:-4171357402576902801"), body_hash: 6563995274820913865, start_line: 16, end_line: 18 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:ArtificialPlayer.minMax", node_id: NodeId(-4752009928134637621), signature_hash: 2816889471617643129, normalized_signature: Some("shape:7252598355569294271"), body_hash: -3893025900751997511, start_line: 72, end_line: 77 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:ArtificialPlayer.turn", node_id: NodeId(-3059775494361641910), signature_hash: 5754064973517794814, normalized_signature: Some("shape:6536110741441658288"), body_hash: 512579226939742730, start_line: 79, end_line: 82 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:Field.makeMove", node_id: NodeId(-3427862867751260553), signature_hash: -7686617887134063555, normalized_signature: Some("shape:8226940670190187613"), body_hash: -4053878199630013218, start_line: 50, end_line: 58 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:Field.opponent", node_id: NodeId(-8366382801925705643), signature_hash: 5718448952121283431, normalized_signature: Some("outline:-5075390869670978506"), body_hash: 6370433801870713149, start_line: 29, end_line: 37 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:Field.sameInRow", node_id: NodeId(-2266150577301757827), signature_hash: 8317776364922746511, normalized_signature: Some("outline:-5076516769578077345"), body_hash: 5488410606900878281, start_line: 39, end_line: 48 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:GameObject.announce", node_id: NodeId(-7584130302283939542), signature_hash: 6265382829821424686, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -9184305782704489594, start_line: 22, end_line: 22 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(3997570138104193539), signature_hash: -1551097434895889655, normalized_signature: Some("shape:-5975803393761620842"), body_hash: 3887084545519181443, start_line: 66, end_line: 68 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:Player.turn", node_id: NodeId(7007379194437988318), signature_hash: -1091959065548758310, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 3722172886773608007, start_line: 61, end_line: 61 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "14:TicTacToe.run", node_id: NodeId(-2351823062342898013), signature_hash: 5136661510898306809, normalized_signature: Some("shape:6988561129212029927"), body_hash: -7082128133548912827, start_line: 88, end_line: 93 }
+callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "__file_structural__", node_id: NodeId(7318852721560449636), signature_hash: -5295635799887043044, normalized_signature: None, body_hash: -6401511314156261294, start_line: 1, end_line: 98 }

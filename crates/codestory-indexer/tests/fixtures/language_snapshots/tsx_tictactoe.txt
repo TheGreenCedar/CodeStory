@@ -1,0 +1,244 @@
+node CLASS name=ArtificialPlayer qn=ArtificialPlayer canonical=game.tsx:ArtificialPlayer line=100 col=7 end=100:23 file=FILE:game.tsx@1
+node CLASS name=Field qn=Field canonical=game.tsx:Field line=51 col=7 end=51:12 file=FILE:game.tsx@1
+node CLASS name=GameObject qn=GameObject canonical=game.tsx:GameObject line=45 col=7 end=45:17 file=FILE:game.tsx@1
+node CLASS name=TicTacToe qn=TicTacToe canonical=game.tsx:TicTacToe line=125 col=14 end=125:23 file=FILE:game.tsx@1
+node FIELD name=cells qn=cells canonical=game.tsx:cells#0 line=35 col=23 end=35:28 file=FILE:game.tsx@1
+node FIELD name=className qn=className canonical=game.tsx:className#0 line=29 col=13 end=29:22 file=FILE:game.tsx@1
+node FIELD name=col qn=col canonical=game.tsx:col#0 line=8 col=3 end=8:6 file=FILE:game.tsx@1
+node FIELD name=field qn=field canonical=game.tsx:field#0 line=126 col=11 end=126:16 file=FILE:game.tsx@1
+node FIELD name=game qn=game canonical=game.tsx:game#0 line=150 col=32 end=150:36 file=FILE:game.tsx@1
+node FIELD name=grid qn=grid canonical=game.tsx:grid#0 line=52 col=11 end=52:15 file=FILE:game.tsx@1
+node FIELD name=left qn=left canonical=game.tsx:left#0 line=53 col=11 end=53:15 file=FILE:game.tsx@1
+node FIELD name=move qn=move canonical=game.tsx:move#0 line=13 col=3 end=13:7 file=FILE:game.tsx@1
+node FIELD name=onClick qn=onClick canonical=game.tsx:onClick#0 line=29 col=30 end=29:37 file=FILE:game.tsx@1
+node FIELD name=onPick qn=onPick canonical=game.tsx:onPick#0 line=14 col=3 end=14:9 file=FILE:game.tsx@1
+node FIELD name=opponent qn=opponent canonical=game.tsx:opponent#0 line=127 col=11 end=127:19 file=FILE:game.tsx@1
+node FIELD name=row qn=row canonical=game.tsx:row#0 line=7 col=3 end=7:6 file=FILE:game.tsx@1
+node FIELD name=value qn=value canonical=game.tsx:value#0 line=12 col=3 end=12:8 file=FILE:game.tsx@1
+node FILE name=game.tsx qn=game.tsx canonical=game.tsx:game.tsx:1 line=1 col=1 end=164:0 file=FILE:game.tsx@1
+node FUNCTION name=Board qn=Board canonical=game.tsx:Board#0 line=150 col=8 end=159:2 file=FILE:game.tsx@1
+node FUNCTION name=Cell qn=Cell canonical=game.tsx:Cell#0 line=27 col=1 end=33:2 file=FILE:game.tsx@1
+node FUNCTION name=Row qn=Row canonical=game.tsx:Row#0 line=35 col=1 end=43:2 file=FILE:game.tsx@1
+node FUNCTION name=button qn=button canonical=game.tsx:button#0 line=29 col=6 end=29:12 file=FILE:game.tsx@1
+node FUNCTION name=div qn=div canonical=game.tsx:div#0 line=37 col=6 end=37:9 file=FILE:game.tsx@1
+node FUNCTION name=main qn=main canonical=game.tsx:main#0 line=153 col=6 end=153:10 file=FILE:game.tsx@1
+node FUNCTION name=main qn=main canonical=game.tsx:main#1 line=161 col=8 end=164:2 file=FILE:game.tsx@1
+node FUNCTION name=tokenLabel qn=tokenLabel canonical=game.tsx:tokenLabel#0 line=17 col=1 end=25:2 file=FILE:game.tsx@1
+node INTERFACE name=CellProps qn=CellProps canonical=game.tsx:CellProps line=11 col=11 end=11:20 file=FILE:game.tsx@1
+node METHOD name=ArtificialPlayer.evaluate qn=ArtificialPlayer.evaluate canonical=game.tsx:ArtificialPlayer.evaluate#0 line=101 col=3 end=106:4 file=FILE:game.tsx@1
+node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.tsx:ArtificialPlayer.turn#0 line=108 col=3 end=122:4 file=FILE:game.tsx@1
+node METHOD name=Field.clearMove qn=Field.clearMove canonical=game.tsx:Field.clearMove#0 line=91 col=3 end=97:4 file=FILE:game.tsx@1
+node METHOD name=Field.constructor qn=Field.constructor canonical=game.tsx:Field.constructor#0 line=55 col=3 end=63:4 file=FILE:game.tsx@1
+node METHOD name=Field.inRange qn=Field.inRange canonical=game.tsx:Field.inRange#0 line=65 col=3 end=67:4 file=FILE:game.tsx@1
+node METHOD name=Field.isDraw qn=Field.isDraw canonical=game.tsx:Field.isDraw#0 line=73 col=3 end=75:4 file=FILE:game.tsx@1
+node METHOD name=Field.isEmpty qn=Field.isEmpty canonical=game.tsx:Field.isEmpty#0 line=69 col=3 end=71:4 file=FILE:game.tsx@1
+node METHOD name=Field.makeMove qn=Field.makeMove canonical=game.tsx:Field.makeMove#0 line=81 col=3 end=89:4 file=FILE:game.tsx@1
+node METHOD name=Field.rows qn=Field.rows canonical=game.tsx:Field.rows#0 line=77 col=3 end=79:4 file=FILE:game.tsx@1
+node METHOD name=GameObject.announce qn=GameObject.announce canonical=game.tsx:GameObject.announce#0 line=46 col=3 end=48:4 file=FILE:game.tsx@1
+node METHOD name=TicTacToe.board qn=TicTacToe.board canonical=game.tsx:TicTacToe.board#0 line=145 col=3 end=147:4 file=FILE:game.tsx@1
+node METHOD name=TicTacToe.constructor qn=TicTacToe.constructor canonical=game.tsx:TicTacToe.constructor#0 line=129 col=3 end=133:4 file=FILE:game.tsx@1
+node METHOD name=TicTacToe.pick qn=TicTacToe.pick canonical=game.tsx:TicTacToe.pick#0 line=135 col=3 end=143:4 file=FILE:game.tsx@1
+node MODULE name="./helper" qn="./helper" canonical=game.tsx:"./helper"#0 line=2 col=24 end=2:34 file=FILE:game.tsx@1
+node MODULE name="./random" qn="./random" canonical=game.tsx:"./random"#0 line=1 col=27 end=1:37 file=FILE:game.tsx@1
+node TYPEDEF name=Move qn=Move canonical=game.tsx:Move line=6 col=1 end=9:3 file=FILE:game.tsx@1
+node TYPEDEF name=Token qn=Token canonical=game.tsx:Token line=4 col=1 end=4:24 file=FILE:game.tsx@1
+node UNKNOWN name=announce qn=announce canonical=game.tsx:announce#0 line=142 col=10 end=142:18 file=FILE:game.tsx@1
+node UNKNOWN name=board qn=board canonical=game.tsx:board#0 line=151 col=27 end=151:32 file=FILE:game.tsx@1
+node UNKNOWN name=clearMove qn=clearMove canonical=game.tsx:clearMove#0 line=141 col=16 end=141:25 file=FILE:game.tsx@1
+node UNKNOWN name=evaluate qn=evaluate canonical=game.tsx:evaluate#0 line=114 col=28 end=114:36 file=FILE:game.tsx@1
+node UNKNOWN name=helper qn=helper canonical=game.tsx:helper#0 line=2 col=10 end=2:16 file=FILE:game.tsx@1
+node UNKNOWN name=helper qn=helper canonical=game.tsx:helper#1 line=47 col=5 end=47:11 file=FILE:game.tsx@1
+node UNKNOWN name=inRange qn=inRange canonical=game.tsx:inRange#0 line=82 col=15 end=82:22 file=FILE:game.tsx@1
+node UNKNOWN name=inRange qn=inRange canonical=game.tsx:inRange#1 line=92 col=15 end=92:22 file=FILE:game.tsx@1
+node UNKNOWN name=isDraw qn=isDraw canonical=game.tsx:isDraw#0 line=87 col=10 end=87:16 file=FILE:game.tsx@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.tsx:isEmpty#0 line=82 col=38 end=82:45 file=FILE:game.tsx@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.tsx:isEmpty#1 line=92 col=37 end=92:44 file=FILE:game.tsx@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=game.tsx:isEmpty#2 line=102 col=16 end=102:23 file=FILE:game.tsx@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.tsx:makeMove#0 line=136 col=21 end=136:29 file=FILE:game.tsx@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.tsx:makeMove#1 line=140 col=16 end=140:24 file=FILE:game.tsx@1
+node UNKNOWN name=onPick qn=onPick canonical=game.tsx:onPick#1 line=29 col=51 end=29:57 file=FILE:game.tsx@1
+node UNKNOWN name=pick qn=pick canonical=game.tsx:pick#0 line=154 col=65 end=154:69 file=FILE:game.tsx@1
+node UNKNOWN name=pick qn=pick canonical=game.tsx:pick#1 line=155 col=65 end=155:69 file=FILE:game.tsx@1
+node UNKNOWN name=pick qn=pick canonical=game.tsx:pick#2 line=156 col=65 end=156:69 file=FILE:game.tsx@1
+node UNKNOWN name=pick qn=pick canonical=game.tsx:pick#3 line=163 col=8 end=163:12 file=FILE:game.tsx@1
+node UNKNOWN name=randomInt qn=randomInt canonical=game.tsx:randomInt#0 line=1 col=10 end=1:19 file=FILE:game.tsx@1
+node UNKNOWN name=randomInt qn=randomInt canonical=game.tsx:randomInt#1 line=105 col=12 end=105:21 file=FILE:game.tsx@1
+node UNKNOWN name=rows qn=rows canonical=game.tsx:rows#0 line=146 col=23 end=146:27 file=FILE:game.tsx@1
+node UNKNOWN name=tokenLabel qn=tokenLabel canonical=game.tsx:tokenLabel#1 line=30 col=8 end=30:18 file=FILE:game.tsx@1
+node UNKNOWN name=turn qn=turn canonical=game.tsx:turn#0 line=139 col=33 end=139:37 file=FILE:game.tsx@1
+edge CALL src=FUNCTION:Board@150 dst=FUNCTION:Row@35 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=h0:154:1:h1 candidates=[]
+edge CALL src=FUNCTION:Board@150 dst=FUNCTION:Row@35 resolved_src=- resolved_dst=- line=155 confidence=- certainty=- callsite=h0:155:1:h1 candidates=[]
+edge CALL src=FUNCTION:Board@150 dst=FUNCTION:Row@35 resolved_src=- resolved_dst=- line=156 confidence=- certainty=- callsite=h0:156:1:h1 candidates=[]
+edge CALL src=FUNCTION:Board@150 dst=FUNCTION:main@153 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=h0:0:1:h2 candidates=[]
+edge CALL src=FUNCTION:Board@150 dst=UNKNOWN:board@151 resolved_src=- resolved_dst=- line=151 confidence=- certainty=- callsite=h0:151:1:h3|syntax:ts-member-call candidates=[]
+edge CALL src=FUNCTION:Board@150 dst=UNKNOWN:pick@154 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=h0:154:1:h4|syntax:ts-member-call candidates=[]
+edge CALL src=FUNCTION:Cell@27 dst=FUNCTION:button@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=h0:0:1:h5 candidates=[]
+edge CALL src=FUNCTION:Cell@27 dst=UNKNOWN:tokenLabel@30 resolved_src=- resolved_dst=- line=30 confidence=- certainty=- callsite=h0:30:1:h6 candidates=[]
+edge CALL src=FUNCTION:Row@35 dst=FUNCTION:Cell@27 resolved_src=- resolved_dst=- line=38 confidence=- certainty=- callsite=h0:38:1:h7 candidates=[]
+edge CALL src=FUNCTION:Row@35 dst=FUNCTION:Cell@27 resolved_src=- resolved_dst=- line=39 confidence=- certainty=- callsite=h0:39:1:h7 candidates=[]
+edge CALL src=FUNCTION:Row@35 dst=FUNCTION:Cell@27 resolved_src=- resolved_dst=- line=40 confidence=- certainty=- callsite=h0:40:1:h7 candidates=[]
+edge CALL src=FUNCTION:Row@35 dst=FUNCTION:div@37 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=h0:0:1:h8 candidates=[]
+edge CALL src=FUNCTION:button@29 dst=UNKNOWN:onPick@29 resolved_src=- resolved_dst=- line=29 confidence=- certainty=- callsite=h0:29:1:h9|syntax:ts-member-call candidates=[]
+edge CALL src=FUNCTION:main@153 dst=CLASS:TicTacToe@125 resolved_src=- resolved_dst=- line=162 confidence=- certainty=- callsite=h0:162:1:h10 candidates=[]
+edge CALL src=FUNCTION:main@161 dst=METHOD:TicTacToe.pick@135 resolved_src=- resolved_dst=METHOD:TicTacToe.pick@135 line=163 confidence=1.0000 certainty=Certain callsite=h0:163:1:h11 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.evaluate@101 dst=METHOD:Field.isEmpty@69 resolved_src=- resolved_dst=METHOD:Field.isEmpty@69 line=102 confidence=1.0000 certainty=Certain callsite=h0:102:1:h12 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.turn@108 dst=METHOD:ArtificialPlayer.evaluate@101 resolved_src=- resolved_dst=METHOD:ArtificialPlayer.evaluate@101 line=114 confidence=1.0000 certainty=Certain callsite=h0:114:1:h13 candidates=[]
+edge CALL src=METHOD:Field.clearMove@91 dst=METHOD:Field.inRange@65 resolved_src=- resolved_dst=METHOD:Field.inRange@65 line=92 confidence=1.0000 certainty=Certain callsite=h0:92:1:h14 candidates=[]
+edge CALL src=METHOD:Field.clearMove@91 dst=METHOD:Field.isEmpty@69 resolved_src=- resolved_dst=METHOD:Field.isEmpty@69 line=92 confidence=1.0000 certainty=Certain callsite=h0:92:1:h12 candidates=[]
+edge CALL src=METHOD:Field.constructor@55 dst=CLASS:ArtificialPlayer@100 resolved_src=- resolved_dst=- line=132 confidence=- certainty=- callsite=h0:132:1:h15 candidates=[]
+edge CALL src=METHOD:Field.constructor@55 dst=CLASS:Field@51 resolved_src=- resolved_dst=- line=131 confidence=- certainty=- callsite=h0:131:1:h16 candidates=[]
+edge CALL src=METHOD:Field.makeMove@81 dst=METHOD:Field.inRange@65 resolved_src=- resolved_dst=METHOD:Field.inRange@65 line=82 confidence=1.0000 certainty=Certain callsite=h0:82:1:h14 candidates=[]
+edge CALL src=METHOD:Field.makeMove@81 dst=METHOD:Field.isDraw@73 resolved_src=- resolved_dst=METHOD:Field.isDraw@73 line=87 confidence=1.0000 certainty=Certain callsite=h0:87:1:h17 candidates=[]
+edge CALL src=METHOD:Field.makeMove@81 dst=METHOD:Field.isEmpty@69 resolved_src=- resolved_dst=METHOD:Field.isEmpty@69 line=82 confidence=1.0000 certainty=Certain callsite=h0:82:1:h12 candidates=[]
+edge CALL src=METHOD:TicTacToe.board@145 dst=METHOD:Field.rows@77 resolved_src=- resolved_dst=METHOD:Field.rows@77 line=146 confidence=1.0000 certainty=Certain callsite=h0:146:1:h18 candidates=[]
+edge CALL src=METHOD:TicTacToe.pick@135 dst=METHOD:ArtificialPlayer.turn@108 resolved_src=- resolved_dst=METHOD:ArtificialPlayer.turn@108 line=139 confidence=1.0000 certainty=Certain callsite=h0:139:1:h19 candidates=[]
+edge CALL src=METHOD:TicTacToe.pick@135 dst=METHOD:Field.clearMove@91 resolved_src=- resolved_dst=METHOD:Field.clearMove@91 line=141 confidence=1.0000 certainty=Certain callsite=h0:141:1:h20 candidates=[]
+edge CALL src=METHOD:TicTacToe.pick@135 dst=METHOD:Field.makeMove@81 resolved_src=- resolved_dst=METHOD:Field.makeMove@81 line=136 confidence=1.0000 certainty=Certain callsite=h0:136:1:h21 candidates=[]
+edge CALL src=METHOD:TicTacToe.pick@135 dst=METHOD:Field.makeMove@81 resolved_src=- resolved_dst=METHOD:Field.makeMove@81 line=140 confidence=1.0000 certainty=Certain callsite=h0:140:1:h21 candidates=[]
+edge CALL src=METHOD:TicTacToe.pick@135 dst=UNKNOWN:announce@142 resolved_src=- resolved_dst=- line=142 confidence=- certainty=- callsite=h0:142:1:h22|syntax:ts-member-call candidates=[]
+edge CALL src=UNKNOWN:helper@47 dst=UNKNOWN:helper@2 resolved_src=- resolved_dst=- line=47 confidence=- certainty=- callsite=h0:47:1:h23 candidates=[]
+edge CALL src=UNKNOWN:pick@155 dst=UNKNOWN:pick@154 resolved_src=- resolved_dst=- line=155 confidence=- certainty=- callsite=h0:155:1:h24|syntax:ts-member-call candidates=[]
+edge CALL src=UNKNOWN:pick@156 dst=UNKNOWN:pick@154 resolved_src=- resolved_dst=- line=156 confidence=- certainty=- callsite=h0:156:1:h25|syntax:ts-member-call candidates=[]
+edge CALL src=UNKNOWN:randomInt@105 dst=UNKNOWN:randomInt@1 resolved_src=- resolved_dst=- line=105 confidence=- certainty=- callsite=h0:105:1:h26 candidates=[]
+edge IMPORT src=MODULE:"./helper"@2 dst=MODULE:"./helper"@2 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=MODULE:"./random"@1 dst=MODULE:"./random"@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:helper@2 dst=MODULE:"./helper"@2 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge IMPORT src=UNKNOWN:randomInt@1 dst=MODULE:"./random"@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@100 dst=CLASS:GameObject@45 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Field@51 dst=CLASS:GameObject@45 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:TicTacToe@125 dst=CLASS:GameObject@45 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@100 dst=METHOD:ArtificialPlayer.evaluate@101 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@100 dst=METHOD:ArtificialPlayer.turn@108 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.clearMove@91 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.constructor@55 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.inRange@65 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.isDraw@73 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.isEmpty@69 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.makeMove@81 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@51 dst=METHOD:Field.rows@77 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:GameObject@45 dst=METHOD:GameObject.announce@46 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@125 dst=METHOD:TicTacToe.board@145 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@125 dst=METHOD:TicTacToe.constructor@129 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@125 dst=METHOD:TicTacToe.pick@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge USAGE src=FUNCTION:Board@150 dst=FIELD:cells@35 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Board@150 dst=FIELD:className@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Board@150 dst=FIELD:onPick@14 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Board@150 dst=FIELD:row@7 resolved_src=- resolved_dst=- line=154 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Cell@27 dst=FIELD:className@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Cell@27 dst=FIELD:onClick@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Row@35 dst=FIELD:className@29 resolved_src=- resolved_dst=- line=0 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Row@35 dst=FIELD:move@13 resolved_src=- resolved_dst=- line=38 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Row@35 dst=FIELD:onPick@14 resolved_src=- resolved_dst=- line=38 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=FUNCTION:Row@35 dst=FIELD:value@12 resolved_src=- resolved_dst=- line=38 confidence=- certainty=- callsite=- candidates=[]
+file path=game.tsx language=typescript lines=164 complete=true role=Source
+occurrence element=CLASS:ArtificialPlayer@100 kind=DEFINITION span=100:7-100:23
+occurrence element=CLASS:Field@51 kind=DEFINITION span=51:7-51:12
+occurrence element=CLASS:GameObject@45 kind=DEFINITION span=100:32-100:42
+occurrence element=CLASS:GameObject@45 kind=DEFINITION span=125:32-125:42
+occurrence element=CLASS:GameObject@45 kind=DEFINITION span=45:7-45:17
+occurrence element=CLASS:GameObject@45 kind=DEFINITION span=51:21-51:31
+occurrence element=CLASS:TicTacToe@125 kind=DEFINITION span=125:14-125:23
+occurrence element=FIELD:cells@35 kind=DEFINITION span=35:23-35:28
+occurrence element=FIELD:className@29 kind=DEFINITION span=29:13-29:22
+occurrence element=FIELD:col@8 kind=DEFINITION span=8:3-8:6
+occurrence element=FIELD:field@126 kind=DEFINITION span=126:11-126:16
+occurrence element=FIELD:game@150 kind=DEFINITION span=150:32-150:36
+occurrence element=FIELD:grid@52 kind=DEFINITION span=52:11-52:15
+occurrence element=FIELD:left@53 kind=DEFINITION span=53:11-53:15
+occurrence element=FIELD:move@13 kind=DEFINITION span=13:3-13:7
+occurrence element=FIELD:onClick@29 kind=DEFINITION span=29:30-29:37
+occurrence element=FIELD:onPick@14 kind=DEFINITION span=14:3-14:9
+occurrence element=FIELD:opponent@127 kind=DEFINITION span=127:11-127:19
+occurrence element=FIELD:row@7 kind=DEFINITION span=7:3-7:6
+occurrence element=FIELD:value@12 kind=DEFINITION span=12:3-12:8
+occurrence element=FUNCTION:Board@150 kind=DEFINITION span=150:8-159:2
+occurrence element=FUNCTION:Cell@27 kind=DEFINITION span=27:1-33:2
+occurrence element=FUNCTION:Row@35 kind=DEFINITION span=35:1-43:2
+occurrence element=FUNCTION:button@29 kind=DEFINITION span=29:6-29:12
+occurrence element=FUNCTION:div@37 kind=DEFINITION span=37:6-37:9
+occurrence element=FUNCTION:main@153 kind=DEFINITION span=153:6-153:10
+occurrence element=FUNCTION:main@161 kind=DEFINITION span=161:8-164:2
+occurrence element=FUNCTION:tokenLabel@17 kind=DEFINITION span=17:1-25:2
+occurrence element=INTERFACE:CellProps@11 kind=DEFINITION span=11:11-11:20
+occurrence element=METHOD:ArtificialPlayer.evaluate@101 kind=DEFINITION span=101:3-106:4
+occurrence element=METHOD:ArtificialPlayer.turn@108 kind=DEFINITION span=108:3-122:4
+occurrence element=METHOD:Field.clearMove@91 kind=DEFINITION span=91:3-97:4
+occurrence element=METHOD:Field.constructor@55 kind=DEFINITION span=55:3-63:4
+occurrence element=METHOD:Field.inRange@65 kind=DEFINITION span=65:3-67:4
+occurrence element=METHOD:Field.isDraw@73 kind=DEFINITION span=73:3-75:4
+occurrence element=METHOD:Field.isEmpty@69 kind=DEFINITION span=69:3-71:4
+occurrence element=METHOD:Field.makeMove@81 kind=DEFINITION span=81:3-89:4
+occurrence element=METHOD:Field.rows@77 kind=DEFINITION span=77:3-79:4
+occurrence element=METHOD:GameObject.announce@46 kind=DEFINITION span=46:3-48:4
+occurrence element=METHOD:TicTacToe.board@145 kind=DEFINITION span=145:3-147:4
+occurrence element=METHOD:TicTacToe.constructor@129 kind=DEFINITION span=129:3-133:4
+occurrence element=METHOD:TicTacToe.pick@135 kind=DEFINITION span=135:3-143:4
+occurrence element=MODULE:"./helper"@2 kind=DEFINITION span=2:24-2:34
+occurrence element=MODULE:"./random"@1 kind=DEFINITION span=1:27-1:37
+occurrence element=TYPEDEF:Move@6 kind=DEFINITION span=6:1-9:3
+occurrence element=TYPEDEF:Token@4 kind=DEFINITION span=4:1-4:24
+occurrence element=UNKNOWN:announce@142 kind=DEFINITION span=142:10-142:18
+occurrence element=UNKNOWN:board@151 kind=DEFINITION span=151:27-151:32
+occurrence element=UNKNOWN:clearMove@141 kind=DEFINITION span=141:16-141:25
+occurrence element=UNKNOWN:evaluate@114 kind=DEFINITION span=114:28-114:36
+occurrence element=UNKNOWN:helper@2 kind=DEFINITION span=2:10-2:16
+occurrence element=UNKNOWN:helper@47 kind=DEFINITION span=47:5-47:11
+occurrence element=UNKNOWN:inRange@82 kind=DEFINITION span=82:15-82:22
+occurrence element=UNKNOWN:inRange@92 kind=DEFINITION span=92:15-92:22
+occurrence element=UNKNOWN:isDraw@87 kind=DEFINITION span=87:10-87:16
+occurrence element=UNKNOWN:isEmpty@102 kind=DEFINITION span=102:16-102:23
+occurrence element=UNKNOWN:isEmpty@82 kind=DEFINITION span=82:38-82:45
+occurrence element=UNKNOWN:isEmpty@92 kind=DEFINITION span=92:37-92:44
+occurrence element=UNKNOWN:makeMove@136 kind=DEFINITION span=136:21-136:29
+occurrence element=UNKNOWN:makeMove@140 kind=DEFINITION span=140:16-140:24
+occurrence element=UNKNOWN:onPick@29 kind=DEFINITION span=29:51-29:57
+occurrence element=UNKNOWN:pick@154 kind=DEFINITION span=154:65-154:69
+occurrence element=UNKNOWN:pick@155 kind=DEFINITION span=155:65-155:69
+occurrence element=UNKNOWN:pick@156 kind=DEFINITION span=156:65-156:69
+occurrence element=UNKNOWN:pick@163 kind=DEFINITION span=163:8-163:12
+occurrence element=UNKNOWN:randomInt@1 kind=DEFINITION span=1:10-1:19
+occurrence element=UNKNOWN:randomInt@105 kind=DEFINITION span=105:12-105:21
+occurrence element=UNKNOWN:rows@146 kind=DEFINITION span=146:23-146:27
+occurrence element=UNKNOWN:tokenLabel@30 kind=DEFINITION span=30:8-30:18
+occurrence element=UNKNOWN:turn@139 kind=DEFINITION span=139:33-139:37
+access node=FIELD:className@29 kind=Public
+access node=FIELD:field@126 kind=Private
+access node=FIELD:grid@52 kind=Private
+access node=FIELD:left@53 kind=Private
+access node=FIELD:onClick@29 kind=Public
+access node=FIELD:opponent@127 kind=Private
+access node=METHOD:ArtificialPlayer.evaluate@101 kind=Public
+access node=METHOD:ArtificialPlayer.turn@108 kind=Public
+access node=METHOD:Field.clearMove@91 kind=Public
+access node=METHOD:Field.constructor@55 kind=Public
+access node=METHOD:Field.inRange@65 kind=Public
+access node=METHOD:Field.isDraw@73 kind=Public
+access node=METHOD:Field.isEmpty@69 kind=Public
+access node=METHOD:Field.makeMove@81 kind=Public
+access node=METHOD:Field.rows@77 kind=Public
+access node=METHOD:GameObject.announce@46 kind=Public
+access node=METHOD:TicTacToe.board@145 kind=Public
+access node=METHOD:TicTacToe.constructor@129 kind=Public
+access node=METHOD:TicTacToe.pick@135 kind=Public
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:Board", node_id: NodeId(-58527397445540665), signature_hash: -9010421034474908197, normalized_signature: Some("shape:4935451048788435828"), body_hash: 5703596668956645134, start_line: 150, end_line: 159 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:Cell", node_id: NodeId(-8438377986514056141), signature_hash: 3832958115132467035, normalized_signature: Some("shape:4535241117014538077"), body_hash: 5159021474496144376, start_line: 27, end_line: 33 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:Row", node_id: NodeId(-6889767165843046629), signature_hash: -6253407580123594297, normalized_signature: Some("shape:6504831437327793549"), body_hash: 8949892768696320399, start_line: 35, end_line: 43 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:button", node_id: NodeId(-4348506163033861125), signature_hash: -9120599125457830493, normalized_signature: Some("shape:5796145517636365347"), body_hash: -5783418087970544966, start_line: 29, end_line: 29 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:div", node_id: NodeId(-2809348445563293116), signature_hash: -935513631673984014, normalized_signature: Some("outline:-1793518511152586733"), body_hash: -8888091842825138237, start_line: 37, end_line: 37 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:main", node_id: NodeId(4616488697868602066), signature_hash: -4671339478033693080, normalized_signature: Some("shape:5983920156585348712"), body_hash: -2045356737158685207, start_line: 153, end_line: 153 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:main", node_id: NodeId(4616489797380230277), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-1550258063606445053"), body_hash: 8990146851857213756, start_line: 161, end_line: 164 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "13:tokenLabel", node_id: NodeId(2951362405926791418), signature_hash: 2453353863296413412, normalized_signature: Some("outline:-1800836860548445349"), body_hash: -4156896032434162540, start_line: 17, end_line: 25 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:ArtificialPlayer.evaluate", node_id: NodeId(881930982258325029), signature_hash: -3339369090062122330, normalized_signature: Some("shape:-554031375901977189"), body_hash: -164477342352592581, start_line: 101, end_line: 106 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:ArtificialPlayer.turn", node_id: NodeId(3095714670153480157), signature_hash: 5754064973517794814, normalized_signature: Some("shape:-6793771729218438093"), body_hash: -4793678948938790680, start_line: 108, end_line: 122 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.clearMove", node_id: NodeId(6587492490135750297), signature_hash: -3022140259302478, normalized_signature: Some("shape:-319005352343789277"), body_hash: 6512185859257839242, start_line: 91, end_line: 97 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.constructor", node_id: NodeId(5206607837022258193), signature_hash: 6795144599545714474, normalized_signature: Some("shape:-7984952471233951053"), body_hash: -6877708281523338280, start_line: 55, end_line: 63 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.inRange", node_id: NodeId(-7650018926874321663), signature_hash: -8452809604799432690, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3074377517147720922, start_line: 65, end_line: 67 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.isDraw", node_id: NodeId(-8681875340098141653), signature_hash: 7260325517996505566, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3587177011067932241, start_line: 73, end_line: 75 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.isEmpty", node_id: NodeId(-5151356892953044696), signature_hash: -7303087957103600159, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -1616556938663478118, start_line: 69, end_line: 71 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.makeMove", node_id: NodeId(-3544969137293475530), signature_hash: -7686617887134063555, normalized_signature: Some("shape:1877073300841969243"), body_hash: -5475615297966182806, start_line: 81, end_line: 89 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:Field.rows", node_id: NodeId(3578150512697395940), signature_hash: -8575155791985719677, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 3196776792474126508, start_line: 77, end_line: 79 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:GameObject.announce", node_id: NodeId(-4910525915264931675), signature_hash: 6265382829821424686, normalized_signature: Some("shape:1053352375547529618"), body_hash: -2140526456050809445, start_line: 46, end_line: 48 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:TicTacToe.board", node_id: NodeId(-2538822715498621591), signature_hash: 809848471190349994, normalized_signature: Some("shape:1723644308566149600"), body_hash: -7107333460881112177, start_line: 145, end_line: 147 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:TicTacToe.constructor", node_id: NodeId(4582267099969079345), signature_hash: -9167033954688097950, normalized_signature: Some("outline:-5087212818695232478"), body_hash: -2657224169385267888, start_line: 129, end_line: 133 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "14:TicTacToe.pick", node_id: NodeId(2718943774471667888), signature_hash: -2396742236410006141, normalized_signature: Some("shape:3656790944212650451"), body_hash: -9086931632419372472, start_line: 135, end_line: 143 }
+callable_state CallableProjectionState { file_id: 4615304419513614810, symbol_key: "__file_structural__", node_id: NodeId(4615304419513614810), signature_hash: 5673844257354394517, normalized_signature: None, body_hash: -4496094463774549978, start_line: 1, end_line: 164 }

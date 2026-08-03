@@ -1309,7 +1309,7 @@ fn is_python_dotted_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::python::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1321,7 +1321,7 @@ fn is_cpp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::CPP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::cpp::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1333,7 +1333,7 @@ fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::JS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::javascript::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1345,7 +1345,7 @@ fn is_ts_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::TS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::typescript::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1369,7 +1369,7 @@ fn is_dart_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::DART_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::dart::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1381,7 +1381,7 @@ fn is_swift_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opti
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::SWIFT_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::swift::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1393,7 +1393,7 @@ fn is_go_selector_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::GO_SELECTOR_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::go::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1417,7 +1417,7 @@ fn is_csharp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::CSHARP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::csharp::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1429,7 +1429,7 @@ fn is_ruby_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Optio
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::RUBY_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::ruby::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -1441,7 +1441,7 @@ fn is_php_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::PHP_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::php::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -3939,7 +3939,10 @@ mod tests {
 
     #[test]
     fn test_python_dotted_placeholders_do_not_create_semantic_request_keys() {
-        let dotted_identity = format!("2:10:2:14|{}", crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER);
+        let dotted_identity = format!(
+            "2:10:2:14|{}",
+            crate::languages::python::MEMBER_CALLSITE_MARKER
+        );
         let dotted_lookup = SemanticEdgeLookup {
             edge_kind: EdgeKind::CALL,
             file_id: Some(1),

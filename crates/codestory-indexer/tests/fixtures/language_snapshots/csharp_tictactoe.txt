@@ -1,0 +1,137 @@
+node CLASS name=ArtificialPlayer qn=TicTacToe.ArtificialPlayer canonical=game.cs:TicTacToe.ArtificialPlayer line=62 col=1 end=75:2 file=FILE:game.cs@1
+node CLASS name=Entry qn=TicTacToe.Entry canonical=game.cs:TicTacToe.Entry line=5 col=1 end=12:2 file=FILE:game.cs@1
+node CLASS name=Field qn=TicTacToe.Field canonical=game.cs:TicTacToe.Field line=19 col=1 end=50:2 file=FILE:game.cs@1
+node CLASS name=GameObject qn=GameObject canonical=game.cs:GameObject line=19 col=15 end=19:25 file=FILE:game.cs@1
+node CLASS name=GameObject qn=TicTacToe.GameObject canonical=game.cs:TicTacToe.GameObject line=14 col=1 end=17:2 file=FILE:game.cs@1
+node CLASS name=HumanPlayer qn=TicTacToe.HumanPlayer canonical=game.cs:TicTacToe.HumanPlayer line=57 col=1 end=60:2 file=FILE:game.cs@1
+node CLASS name=Player qn=Player canonical=game.cs:Player line=57 col=21 end=57:27 file=FILE:game.cs@1
+node CLASS name=Program qn=TicTacToe.Program canonical=game.cs:TicTacToe.Program line=89 col=1 end=95:2 file=FILE:game.cs@1
+node CLASS name=TicTacToe qn=TicTacToe.TicTacToe canonical=game.cs:TicTacToe.TicTacToe line=77 col=1 end=87:2 file=FILE:game.cs@1
+node FILE name=game.cs qn=game.cs canonical=game.cs:game.cs:1 line=1 col=1 end=95:0 file=FILE:game.cs@1
+node INTERFACE name=Player qn=TicTacToe.Player canonical=game.cs:TicTacToe.Player line=52 col=1 end=55:2 file=FILE:game.cs@1
+node METHOD name=ArtificialPlayer.minMax qn=TicTacToe.ArtificialPlayer.minMax canonical=game.cs:TicTacToe.ArtificialPlayer.minMax#0 line=64 col=5 end=68:6 file=FILE:game.cs@1
+node METHOD name=ArtificialPlayer.turn qn=TicTacToe.ArtificialPlayer.turn canonical=game.cs:TicTacToe.ArtificialPlayer.turn#0 line=70 col=5 end=74:6 file=FILE:game.cs@1
+node METHOD name=Entry.numberIn qn=TicTacToe.Entry.numberIn canonical=game.cs:TicTacToe.Entry.numberIn#0 line=7 col=5 end=7:39 file=FILE:game.cs@1
+node METHOD name=Entry.numberOut qn=TicTacToe.Entry.numberOut canonical=game.cs:TicTacToe.Entry.numberOut#0 line=9 col=5 end=9:65 file=FILE:game.cs@1
+node METHOD name=Entry.stringOut qn=TicTacToe.Entry.stringOut canonical=game.cs:TicTacToe.Entry.stringOut#0 line=11 col=5 end=11:72 file=FILE:game.cs@1
+node METHOD name=Field.makeMove qn=TicTacToe.Field.makeMove canonical=game.cs:TicTacToe.Field.makeMove#0 line=42 col=5 end=49:6 file=FILE:game.cs@1
+node METHOD name=Field.opponent qn=TicTacToe.Field.opponent canonical=game.cs:TicTacToe.Field.opponent#0 line=24 col=5 end=29:6 file=FILE:game.cs@1
+node METHOD name=Field.sameInRow qn=TicTacToe.Field.sameInRow canonical=game.cs:TicTacToe.Field.sameInRow#0 line=31 col=5 end=40:6 file=FILE:game.cs@1
+node METHOD name=GameObject.announce qn=TicTacToe.GameObject.announce canonical=game.cs:TicTacToe.GameObject.announce#0 line=16 col=5 end=16:31 file=FILE:game.cs@1
+node METHOD name=HumanPlayer.turn qn=TicTacToe.HumanPlayer.turn canonical=game.cs:TicTacToe.HumanPlayer.turn#0 line=59 col=5 end=59:77 file=FILE:game.cs@1
+node METHOD name=Player.turn qn=TicTacToe.Player.turn canonical=game.cs:TicTacToe.Player.turn#0 line=54 col=5 end=54:39 file=FILE:game.cs@1
+node METHOD name=Program.Main qn=TicTacToe.Program.Main canonical=game.cs:TicTacToe.Program.Main#0 line=91 col=5 end=94:6 file=FILE:game.cs@1
+node METHOD name=TicTacToe.run qn=TicTacToe.TicTacToe.run canonical=game.cs:TicTacToe.TicTacToe.run#0 line=81 col=5 end=86:6 file=FILE:game.cs@1
+node MODULE name=System qn=System canonical=game.cs:System#0 line=1 col=7 end=1:13 file=FILE:game.cs@1
+node NAMESPACE name=TicTacToe qn=TicTacToe canonical=game.cs:TicTacToe#0 line=3 col=1 end=3:21 file=FILE:game.cs@1
+node UNKNOWN name=Next qn=Next canonical=game.cs:Next#0 line=85 col=22 end=85:26 file=FILE:game.cs@1
+node UNKNOWN name=Write qn=Write canonical=game.cs:Write#0 line=9 col=54 end=9:59 file=FILE:game.cs@1
+node UNKNOWN name=Write qn=Write canonical=game.cs:Write#1 line=11 col=59 end=11:64 file=FILE:game.cs@1
+node UNKNOWN name=makeMove qn=makeMove canonical=game.cs:makeMove#0 line=59 col=55 end=59:63 file=FILE:game.cs@1
+node UNKNOWN name=minMax qn=minMax canonical=game.cs:minMax#0 line=67 col=16 end=67:22 file=FILE:game.cs@1
+node UNKNOWN name=minMax qn=minMax canonical=game.cs:minMax#1 line=72 col=9 end=72:15 file=FILE:game.cs@1
+node UNKNOWN name=numberIn qn=numberIn canonical=game.cs:numberIn#0 line=83 col=9 end=83:17 file=FILE:game.cs@1
+node UNKNOWN name=run qn=run canonical=game.cs:run#0 line=93 col=25 end=93:28 file=FILE:game.cs@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=game.cs:sameInRow#0 line=47 col=9 end=47:18 file=FILE:game.cs@1
+node UNKNOWN name=stringOut qn=stringOut canonical=game.cs:stringOut#0 line=84 col=9 end=84:18 file=FILE:game.cs@1
+edge CALL src=METHOD:ArtificialPlayer.minMax@64 dst=UNKNOWN:minMax@67 resolved_src=- resolved_dst=- line=67 confidence=- certainty=- callsite=h0:67:1:h1 candidates=[]
+edge CALL src=METHOD:ArtificialPlayer.turn@70 dst=UNKNOWN:minMax@72 resolved_src=- resolved_dst=- line=72 confidence=- certainty=- callsite=h0:72:1:h2 candidates=[]
+edge CALL src=METHOD:Entry.numberOut@9 dst=UNKNOWN:Write@9 resolved_src=- resolved_dst=- line=9 confidence=- certainty=- callsite=h0:9:1:h3|syntax:csharp-member-call candidates=[]
+edge CALL src=METHOD:Entry.stringOut@11 dst=UNKNOWN:Write@11 resolved_src=- resolved_dst=- line=11 confidence=- certainty=- callsite=h0:11:1:h4|syntax:csharp-member-call candidates=[]
+edge CALL src=METHOD:Field.makeMove@42 dst=UNKNOWN:sameInRow@47 resolved_src=- resolved_dst=- line=47 confidence=- certainty=- callsite=h0:47:1:h5 candidates=[]
+edge CALL src=METHOD:HumanPlayer.turn@59 dst=METHOD:Field.makeMove@42 resolved_src=- resolved_dst=METHOD:Field.makeMove@42 line=59 confidence=1.0000 certainty=Certain callsite=h0:59:1:h6 candidates=[]
+edge CALL src=METHOD:Program.Main@91 dst=METHOD:TicTacToe.run@81 resolved_src=- resolved_dst=METHOD:TicTacToe.run@81 line=93 confidence=1.0000 certainty=Certain callsite=h0:93:1:h7 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@81 dst=UNKNOWN:Next@85 resolved_src=- resolved_dst=- line=85 confidence=- certainty=- callsite=h0:85:1:h8|syntax:csharp-member-call candidates=[]
+edge CALL src=METHOD:TicTacToe.run@81 dst=UNKNOWN:numberIn@83 resolved_src=- resolved_dst=- line=83 confidence=- certainty=- callsite=h0:83:1:h9 candidates=[]
+edge CALL src=METHOD:TicTacToe.run@81 dst=UNKNOWN:stringOut@84 resolved_src=- resolved_dst=- line=84 confidence=- certainty=- callsite=h0:84:1:h10 candidates=[]
+edge IMPORT src=MODULE:System@1 dst=MODULE:System@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@62 dst=CLASS:Player@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:Field@19 dst=CLASS:GameObject@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:HumanPlayer@57 dst=CLASS:Player@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:TicTacToe@77 dst=CLASS:GameObject@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@62 dst=METHOD:ArtificialPlayer.minMax@64 resolved_src=- resolved_dst=- line=64 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:ArtificialPlayer@62 dst=METHOD:ArtificialPlayer.turn@70 resolved_src=- resolved_dst=- line=70 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Entry@5 dst=METHOD:Entry.numberIn@7 resolved_src=- resolved_dst=- line=7 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Entry@5 dst=METHOD:Entry.numberOut@9 resolved_src=- resolved_dst=- line=9 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Entry@5 dst=METHOD:Entry.stringOut@11 resolved_src=- resolved_dst=- line=11 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.makeMove@42 resolved_src=- resolved_dst=- line=42 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.opponent@24 resolved_src=- resolved_dst=- line=24 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.sameInRow@31 resolved_src=- resolved_dst=- line=31 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:GameObject@14 dst=METHOD:GameObject.announce@16 resolved_src=- resolved_dst=- line=16 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:HumanPlayer@57 dst=METHOD:HumanPlayer.turn@59 resolved_src=- resolved_dst=- line=59 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Program@89 dst=METHOD:Program.Main@91 resolved_src=- resolved_dst=- line=91 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:TicTacToe@77 dst=METHOD:TicTacToe.run@81 resolved_src=- resolved_dst=- line=81 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Player@52 dst=METHOD:Player.turn@54 resolved_src=- resolved_dst=- line=54 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:ArtificialPlayer@62 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:Entry@5 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:Field@19 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:GameObject@14 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:HumanPlayer@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:Program@89 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=CLASS:TicTacToe@77 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=NAMESPACE:TicTacToe@3 dst=INTERFACE:Player@52 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+file path=game.cs language=csharp lines=95 complete=true role=Source
+occurrence element=CLASS:ArtificialPlayer@62 kind=DEFINITION span=62:1-75:2
+occurrence element=CLASS:Entry@5 kind=DEFINITION span=5:1-12:2
+occurrence element=CLASS:Field@19 kind=DEFINITION span=19:1-50:2
+occurrence element=CLASS:GameObject@14 kind=DEFINITION span=14:1-17:2
+occurrence element=CLASS:GameObject@19 kind=DEFINITION span=19:15-19:25
+occurrence element=CLASS:GameObject@19 kind=DEFINITION span=77:19-77:29
+occurrence element=CLASS:HumanPlayer@57 kind=DEFINITION span=57:1-60:2
+occurrence element=CLASS:Player@57 kind=DEFINITION span=57:21-57:27
+occurrence element=CLASS:Player@57 kind=DEFINITION span=62:26-62:32
+occurrence element=CLASS:Program@89 kind=DEFINITION span=89:1-95:2
+occurrence element=CLASS:TicTacToe@77 kind=DEFINITION span=77:1-87:2
+occurrence element=INTERFACE:Player@52 kind=DEFINITION span=52:1-55:2
+occurrence element=METHOD:ArtificialPlayer.minMax@64 kind=DEFINITION span=64:5-68:6
+occurrence element=METHOD:ArtificialPlayer.turn@70 kind=DEFINITION span=70:5-74:6
+occurrence element=METHOD:Entry.numberIn@7 kind=DEFINITION span=7:5-7:39
+occurrence element=METHOD:Entry.numberOut@9 kind=DEFINITION span=9:5-9:65
+occurrence element=METHOD:Entry.stringOut@11 kind=DEFINITION span=11:5-11:72
+occurrence element=METHOD:Field.makeMove@42 kind=DEFINITION span=42:5-49:6
+occurrence element=METHOD:Field.opponent@24 kind=DEFINITION span=24:5-29:6
+occurrence element=METHOD:Field.sameInRow@31 kind=DEFINITION span=31:5-40:6
+occurrence element=METHOD:GameObject.announce@16 kind=DEFINITION span=16:5-16:31
+occurrence element=METHOD:HumanPlayer.turn@59 kind=DEFINITION span=59:5-59:77
+occurrence element=METHOD:Player.turn@54 kind=DEFINITION span=54:5-54:39
+occurrence element=METHOD:Program.Main@91 kind=DEFINITION span=91:5-94:6
+occurrence element=METHOD:TicTacToe.run@81 kind=DEFINITION span=81:5-86:6
+occurrence element=MODULE:System@1 kind=DEFINITION span=1:7-1:13
+occurrence element=NAMESPACE:TicTacToe@3 kind=DEFINITION span=3:1-3:21
+occurrence element=UNKNOWN:Next@85 kind=DEFINITION span=85:22-85:26
+occurrence element=UNKNOWN:Write@11 kind=DEFINITION span=11:59-11:64
+occurrence element=UNKNOWN:Write@9 kind=DEFINITION span=9:54-9:59
+occurrence element=UNKNOWN:makeMove@59 kind=DEFINITION span=59:55-59:63
+occurrence element=UNKNOWN:minMax@67 kind=DEFINITION span=67:16-67:22
+occurrence element=UNKNOWN:minMax@72 kind=DEFINITION span=72:9-72:15
+occurrence element=UNKNOWN:numberIn@83 kind=DEFINITION span=83:9-83:17
+occurrence element=UNKNOWN:run@93 kind=DEFINITION span=93:25-93:28
+occurrence element=UNKNOWN:sameInRow@47 kind=DEFINITION span=47:9-47:18
+occurrence element=UNKNOWN:stringOut@84 kind=DEFINITION span=84:9-84:18
+access node=METHOD:ArtificialPlayer.minMax@64 kind=Public
+access node=METHOD:ArtificialPlayer.turn@70 kind=Public
+access node=METHOD:Entry.numberIn@7 kind=Public
+access node=METHOD:Entry.numberOut@9 kind=Public
+access node=METHOD:Entry.stringOut@11 kind=Public
+access node=METHOD:Field.makeMove@42 kind=Public
+access node=METHOD:Field.opponent@24 kind=Public
+access node=METHOD:Field.sameInRow@31 kind=Public
+access node=METHOD:GameObject.announce@16 kind=Public
+access node=METHOD:HumanPlayer.turn@59 kind=Public
+access node=METHOD:Player.turn@54 kind=Public
+access node=METHOD:Program.Main@91 kind=Public
+access node=METHOD:TicTacToe.run@81 kind=Public
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.ArtificialPlayer.minMax", node_id: NodeId(7108669997747801593), signature_hash: -6859643847646628701, normalized_signature: Some("shape:-5214998425855285347"), body_hash: 2205173710252016340, start_line: 64, end_line: 68 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.ArtificialPlayer.turn", node_id: NodeId(-5661085132611577372), signature_hash: -8495276445739008764, normalized_signature: Some("shape:7214214337654523224"), body_hash: -9170360749925723292, start_line: 70, end_line: 74 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Entry.numberIn", node_id: NodeId(-687243495063825396), signature_hash: 7451437964847320644, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 5444404973161422656, start_line: 7, end_line: 7 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Entry.numberOut", node_id: NodeId(-4066344450434599153), signature_hash: -120690074726253779, normalized_signature: Some("shape:-7457871306607555406"), body_hash: 7571895495448816808, start_line: 9, end_line: 9 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Entry.stringOut", node_id: NodeId(6678940929812972327), signature_hash: 1862124401237021021, normalized_signature: Some("shape:2398812939689888903"), body_hash: 6701094687250850807, start_line: 11, end_line: 11 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Field.makeMove", node_id: NodeId(4317265166839831061), signature_hash: -7015829758109473257, normalized_signature: Some("shape:8119955625319402259"), body_hash: -1334377611310628259, start_line: 42, end_line: 49 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Field.opponent", node_id: NodeId(969129940693695079), signature_hash: 6548377796614971309, normalized_signature: Some("outline:-5088338718602331317"), body_hash: 5251096572863768587, start_line: 24, end_line: 29 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Field.sameInRow", node_id: NodeId(-2901175799295301921), signature_hash: 577240268869951381, normalized_signature: Some("outline:-5076516769578077345"), body_hash: -5244954332064752916, start_line: 31, end_line: 40 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.GameObject.announce", node_id: NodeId(645227896478755548), signature_hash: 8159730552014832428, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 8531919261620110747, start_line: 16, end_line: 16 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.HumanPlayer.turn", node_id: NodeId(-4978749755948042879), signature_hash: -4935815070297363741, normalized_signature: Some("shape:5589369014147450932"), body_hash: 169098942575673493, start_line: 59, end_line: 59 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Player.turn", node_id: NodeId(-6909578004992844148), signature_hash: -918494154596152668, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -3279514674455531587, start_line: 54, end_line: 54 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.Program.Main", node_id: NodeId(4725640995634422955), signature_hash: -2730285500303265287, normalized_signature: Some("shape:1777490568426759250"), body_hash: 925251880699237174, start_line: 91, end_line: 94 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "14:TicTacToe.TicTacToe.run", node_id: NodeId(280548510384068481), signature_hash: 2105959521563754291, normalized_signature: Some("shape:3055474732710350770"), body_hash: 6582672620173791328, start_line: 81, end_line: 86 }
+callable_state CallableProjectionState { file_id: -5683999385624523804, symbol_key: "__file_structural__", node_id: NodeId(-5683999385624523804), signature_hash: -7856443779021000465, normalized_signature: None, body_hash: -8394551515805288016, start_line: 1, end_line: 95 }

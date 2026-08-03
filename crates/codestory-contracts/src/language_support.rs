@@ -470,6 +470,10 @@ pub fn companion_surface_language(ext: &str) -> Option<&'static str> {
 /// languages whose consumer roster deliberately differs from their real syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageCommentProfile {
+    /// The name consumers actually spell. Usually a registry language name,
+    /// but a dialect that only the indexer and the highlighter distinguish
+    /// (`tsx`) is keyed by that dialect, because that is the string the
+    /// consumer roster held.
     pub language_name: &'static str,
     pub line_comment: &'static str,
 }
@@ -482,6 +486,63 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
     LanguageCommentProfile {
         language_name: "java",
         line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "cpp",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "javascript",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "typescript",
+        line_comment: "//",
+    },
+    // `tsx` is not a registry language — the registry routes `.tsx` to
+    // `typescript` — but it is the indexer's dispatch name for the JSX-aware
+    // TypeScript config and the CLI highlighter's own dialect string. The row
+    // covers that dialect only; `typescript` itself stays with the consumer
+    // roster until #1681.
+    LanguageCommentProfile {
+        language_name: "tsx",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "python",
+        line_comment: "#",
+    },
+    LanguageCommentProfile {
+        language_name: "rust",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "go",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "ruby",
+        line_comment: "#",
+    },
+    LanguageCommentProfile {
+        language_name: "php",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "csharp",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "swift",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "dart",
+        line_comment: "//",
+    },
+    LanguageCommentProfile {
+        language_name: "bash",
+        line_comment: "#",
     },
 ];
 
@@ -1232,11 +1293,16 @@ mod tests {
         for profile in COMPANION_EXTENSION_PROFILES {
             for language in profile.source_group_languages {
                 assert!(
-                    language_support_profile_for_language_name(language).is_some()
-                        || surface_names.contains(language)
-                        // `lua` has no registered profile at all; it exists
-                        // only as a workspace source-group compatibility name.
-                        || *language == "lua",
+                    language_support_profile_for_language_name(
+                        language
+                    ).is_some(
+                    )
+                    || surface_names.contains(
+                        language
+                    )
+                    // `lua` has no registered profile at all; it exists
+                    // only as a workspace source-group compatibility name.
+                    || *language == "lua",
                     "`{}` names unknown source group `{language}`",
                     profile.extension
                 );
@@ -1251,10 +1317,38 @@ mod tests {
             .iter()
             .map(|profile| profile.language_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["kotlin", "java"]);
+        assert_eq!(
+            names,
+            vec![
+                "kotlin",
+                "java",
+                "cpp",
+                "javascript",
+                "typescript",
+                "tsx",
+                "python",
+                "rust",
+                "go",
+                "ruby",
+                "php",
+                "csharp",
+                "swift",
+                "dart",
+                "bash"
+            ]
+        );
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
-                language_support_profile_for_language_name(profile.language_name).is_some(),
+                language_support_profile_for_language_name(
+                    profile.language_name
+                ).is_some(
+                )
+                // `tsx` is a dialect, not a registered surface: the registry
+                // routes `.tsx` to `typescript`. It is keyed here under its
+                // own name because that is the string the indexer dispatches
+                // on and the CLI highlighter renders, and because
+                // `typescript` itself has not migrated.
+                || profile.language_name == "tsx",
                 "`{}` has no public language profile",
                 profile.language_name
             );
@@ -1264,9 +1358,46 @@ mod tests {
                 profile.language_name
             );
         }
-        assert_eq!(line_comment_for_language("kotlin"), Some("//"));
-        assert_eq!(line_comment_for_language("java"), Some("//"));
-        assert_eq!(line_comment_for_language("swift"), None);
+        // Every migrated language answers from this registry, and the marker
+        // has to be the language's own: `#` for the shell-comment family, `//`
+        // for the C-descended one. A wrong marker here dims the wrong span in
+        // every surface that renders a comment.
+        for (language, marker) in [
+            ("kotlin", "//"),
+            ("java", "//"),
+            ("cpp", "//"),
+            ("javascript", "//"),
+            ("typescript", "//"),
+            ("tsx", "//"),
+            ("python", "#"),
+            ("rust", "//"),
+            ("go", "//"),
+            ("ruby", "#"),
+            ("php", "//"),
+            ("csharp", "//"),
+            ("swift", "//"),
+            ("dart", "//"),
+            ("bash", "#"),
+        ] {
+            assert_eq!(
+                line_comment_for_language(language),
+                Some(marker),
+                "`{language}` must answer from the comment registry"
+            );
+        }
+
+        // `.tsx` routes to `typescript` as a public surface while keeping its
+        // own comment row under the dialect name the indexer dispatches on.
+        assert_eq!(
+            language_support_profile_for_ext("tsx").map(|profile| profile.language_name),
+            Some("typescript")
+        );
+
+        // `jsx` is a CLI highlighter dialect, not a registered language, so it
+        // has no row here and must keep answering from the CLI's own roster.
+        // `c` has no comment row either; its highlighting is the CLI's.
+        assert_eq!(line_comment_for_language("jsx"), None);
+        assert_eq!(line_comment_for_language("c"), None);
     }
 
     #[test]

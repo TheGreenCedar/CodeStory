@@ -3945,9 +3945,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     // extraction package has not landed yet (ARCH-012 roster burn-down).
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
-            "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "csharp" | "cpp"
-            | "dart" | "php" | "swift" => Some("//"),
+            "python" | "toml" | "yaml" => Some("#"),
+            "rust" | "jsx" | "go" | "csharp" | "cpp" | "dart" | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5577,8 +5576,9 @@ mod tests {
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
-    /// Kotlin's comment marker now comes from the language registry rather than
-    /// the local roster, and every other language must be unmoved.
+    /// Kotlin's and JavaScript's comment markers now come from the language
+    /// registry rather than the local roster, and every other language must be
+    /// unmoved.
     ///
     /// Asserting only "Kotlin still dims `//`" would pass with the registry
     /// lookup deleted, because the local roster used to answer for Kotlin too.
@@ -5636,14 +5636,98 @@ mod tests {
             }
         }
 
-        // The registry is the source for Kotlin: it must agree with the marker
-        // the roster used to hold.
+        // The registry is the source for every migrated language, `tsx`
+        // included: it must agree with the marker the local roster used to
+        // hold. `jsx` is the one highlighter dialect with no registry row, so
+        // it still answers from the roster above — that split is what keeps
+        // the highlighter's dialect handling separate from language ownership.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("kotlin"),
             Some("//")
         );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("typescript"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("tsx"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("go"),
+            Some("//")
+        );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+
+        // Same for C++, whose roster row moved into the registry with S3-CPP.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("cpp"),
+            Some("//")
+        );
+        let cpp = ansi_highlight_snippet("src/main.cpp", "int ok = 1; // comment");
+        assert!(cpp.contains("\x1b[90m// comment\x1b[0m"), "{cpp:?}");
+        // Same for JavaScript. `jsx` is a highlighter dialect with no registry
+        // profile, so it must keep answering from the roster above; that split
+        // is what the `("javascript", ..)` / `("jsx", ..)` rows guard.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("javascript"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("jsx"),
+            None
+        );
+        let javascript = ansi_highlight_snippet("app/main.js", "const ok = true // comment");
+        assert!(
+            javascript.contains("\x1b[90m// comment\x1b[0m"),
+            "{javascript:?}"
+        );
+        let jsx = ansi_highlight_snippet("app/View.jsx", "const ok = true // comment");
+        assert!(jsx.contains("\x1b[90m// comment\x1b[0m"), "{jsx:?}");
+        let typescript = ansi_highlight_snippet("src/app.ts", "const ok = true; // comment");
+        assert!(
+            typescript.contains("\x1b[90m// comment\x1b[0m"),
+            "{typescript:?}"
+        );
+        // `typescript` and the `tsx` dialect both answer from the registry now.
+        // `jsx` still must not: it is a highlighter dialect with no registered
+        // language behind it, so a row answering for it here would move
+        // rendering ownership to a surface that owns nothing.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("tsx"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("typescript"),
+            Some("//")
+        );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("jsx"),
+            None
+        );
+        let tsx = ansi_highlight_snippet("app/View.tsx", "const ok = true; // comment");
+        assert!(tsx.contains("\x1b[90m// comment\x1b[0m"), "{tsx:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("python"),
+            Some("#")
+        );
+        let python = ansi_highlight_snippet("app/main.py", "ok = True  # comment");
+        assert!(python.contains("\x1b[90m# comment\x1b[0m"), "{python:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("rust"),
+            Some("//")
+        );
+        let rust = ansi_highlight_snippet("src/main.rs", "let ok = true; // comment");
+        assert!(rust.contains("\x1b[90m// comment\x1b[0m"), "{rust:?}");
+        let go = ansi_highlight_snippet("cmd/main.go", "ok := true // comment");
+        assert!(go.contains("\x1b[90m// comment\x1b[0m"), "{go:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("swift"),
+            Some("//")
+        );
+        let swift = ansi_highlight_snippet("app/Main.swift", "let ok = true // comment");
+        assert!(swift.contains("\x1b[90m// comment\x1b[0m"), "{swift:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and
