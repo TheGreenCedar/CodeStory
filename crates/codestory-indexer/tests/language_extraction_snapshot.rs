@@ -122,6 +122,16 @@ const CASES: &[SnapshotCase] = &[
         tictactoe_source: include_str!("fixtures/tictactoe/tsx_tictactoe.tsx"),
         tictactoe_golden: include_str!("fixtures/language_snapshots/tsx_tictactoe.txt"),
     },
+    SnapshotCase {
+        language: "python",
+        extension: "py",
+        fidelity_filename: "fidelity.py",
+        fidelity_source: include_str!("fixtures/fidelity_lab/python_fidelity_lab.py"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/python_fidelity.txt"),
+        tictactoe_filename: "game.py",
+        tictactoe_source: include_str!("fixtures/tictactoe/python_tictactoe.py"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/python_tictactoe.txt"),
+    },
 ];
 
 #[test]

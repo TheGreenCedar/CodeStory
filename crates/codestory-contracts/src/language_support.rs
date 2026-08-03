@@ -508,6 +508,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "tsx",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "python",
+        line_comment: "#",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1283,7 +1287,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["kotlin", "java", "cpp", "javascript", "typescript", "tsx"]
+            vec![
+                "kotlin",
+                "java",
+                "cpp",
+                "javascript",
+                "typescript",
+                "tsx",
+                "python"
+            ]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
@@ -1307,6 +1319,7 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("python"), Some("#"));
         assert_eq!(line_comment_for_language("tsx"), Some("//"));
         // The dialect row must not answer for the language it routes to: the
         // `typescript` roster entry is #1681's to move.

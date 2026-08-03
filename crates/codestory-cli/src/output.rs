@@ -3945,7 +3945,7 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     // extraction package has not landed yet (ARCH-012 roster burn-down).
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
-            "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
+            "bash" | "ruby" | "toml" | "yaml" => Some("#"),
             "rust" | "jsx" | "go" | "csharp" | "cpp" | "dart" | "php" | "swift" => Some("//"),
             _ => None,
         });
@@ -5702,6 +5702,12 @@ mod tests {
         );
         let tsx = ansi_highlight_snippet("app/View.tsx", "const ok = true; // comment");
         assert!(tsx.contains("\x1b[90m// comment\x1b[0m"), "{tsx:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("python"),
+            Some("#")
+        );
+        let python = ansi_highlight_snippet("app/main.py", "ok = True  # comment");
+        assert!(python.contains("\x1b[90m# comment\x1b[0m"), "{python:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

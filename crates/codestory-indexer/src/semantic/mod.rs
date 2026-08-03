@@ -593,7 +593,6 @@ fn language_family_bucket(language: &'static str) -> &'static str {
     match language {
         "c" => "native",
         "typescript" | "vue" | "svelte" | "astro" => "webscript",
-        "python" => "python",
         "rust" => "rust",
         "go" => "go",
         "ruby" => "ruby",
