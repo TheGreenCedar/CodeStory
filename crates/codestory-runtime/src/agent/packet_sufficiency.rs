@@ -451,10 +451,27 @@ fn assemble_packet_sufficiency_with_probe_context(
     // can never cover is not a lead.
     let unprovable_paths = coverage.unprovable_paths();
     if !unprovable_paths.is_empty() {
+        // Leads arrive as `packet_display_path` output, which strips a named
+        // repository root — `target/repo-cache/repos/axios/lib/core/Axios.js`
+        // becomes `lib/core/Axios.js`. Joining the project root back onto that
+        // yields a path that does not exist, so a path-identity comparison
+        // reports "different file" and the lead survives, defeating this
+        // filter for exactly the repo-cache packets it matters most for.
+        // Comparing display form to display form keeps both sides in the same
+        // vocabulary; the identity comparison stays as the fallback for leads
+        // that were never stripped.
+        let unprovable_display = unprovable_paths
+            .iter()
+            .map(|path| packet_display_path(path))
+            .collect::<Vec<_>>();
         open_next_paths.retain(|path| {
-            !unprovable_paths
+            let display = packet_display_path(path);
+            !unprovable_display
                 .iter()
-                .any(|unprovable| packet_paths_match_exact_probe(project_root, unprovable, path))
+                .any(|unprovable| unprovable == &display)
+                && !unprovable_paths.iter().any(|unprovable| {
+                    packet_paths_match_exact_probe(project_root, unprovable, path)
+                })
         });
     }
     let blocking_follow_up_probe_queries = packet_interleave_follow_up_queries(

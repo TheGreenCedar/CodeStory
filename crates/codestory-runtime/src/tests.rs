@@ -3718,8 +3718,9 @@ fn coverage_observation_matches_an_exclusion_by_path_identity() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
 
-    // Every spelling a citation might carry for the same file.
-    let spellings = vec![
+    // Every spelling a citation might carry for the same file must resolve to
+    // the one exclusion row.
+    for spelling in [
         "docs/api.json".to_string(),
         structural.to_string_lossy().to_string(),
         format!(
@@ -3727,27 +3728,47 @@ fn coverage_observation_matches_an_exclusion_by_path_identity() {
             std::path::MAIN_SEPARATOR,
             std::path::MAIN_SEPARATOR
         ),
-    ];
-    let observations = crate::source_coverage::observe_source_coverage(&controller, &spellings);
-
-    assert_eq!(
-        observations.len(),
-        spellings.len(),
-        "the observer maps rather than filters: {observations:?}"
-    );
-    for observation in &observations {
+    ] {
+        let observations = crate::source_coverage::observe_source_coverage(
+            &controller,
+            std::slice::from_ref(&spelling),
+        );
+        assert_eq!(observations.len(), 1, "{spelling}: {observations:?}");
         assert_eq!(
-            observation.status,
+            observations[0].status,
             codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
-            "spelling {} must resolve to the same exclusion row: {observation:?}",
-            observation.path
+            "spelling {spelling} must resolve to the exclusion row: {observations:?}"
         );
         assert_eq!(
-            observation.byte_cap,
+            observations[0].byte_cap,
             Some(codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP),
             "the observation must carry the cap that refused the file"
         );
     }
+
+    // And two spellings of one file are one file: the packet must not ship the
+    // same gap twice. This is why the dedup compares path identity rather than
+    // strings, like everything else here.
+    let duplicated = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &[
+            "docs/api.json".to_string(),
+            structural.to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(
+        duplicated.len(),
+        1,
+        "two spellings of one file must dedup: {duplicated:?}"
+    );
+
+    // Distinct files still get one observation each — the map-not-filter
+    // contract, which the dedup must not quietly break.
+    let distinct = crate::source_coverage::observe_source_coverage(
+        &controller,
+        &["docs/api.json".to_string(), "game.kt".to_string()],
+    );
+    assert_eq!(distinct.len(), 2, "{distinct:?}");
 
     // A file the index did cover must not be reported as excluded, or the cap
     // would fire on every packet in the repository.

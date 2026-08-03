@@ -26,27 +26,57 @@ pub(crate) fn observe_source_coverage(
     controller: &AppController,
     paths: &[String],
 ) -> Vec<SourceCoverageObservationDto> {
-    let mut deduped: Vec<&String> = Vec::new();
-    for path in paths {
-        if !deduped.iter().any(|seen| seen.as_str() == path.as_str()) {
-            deduped.push(path);
-        }
-    }
-    if deduped.is_empty() {
+    if paths.is_empty() {
         return Vec::new();
     }
 
+    // Before the project root is known there is nothing to resolve against, so
+    // this one branch falls back to a raw-string dedup.
     let Ok(project_root) = controller.require_project_root() else {
+        let mut unique: Vec<&String> = Vec::new();
+        for path in paths {
+            if !unique.iter().any(|seen| seen.as_str() == path.as_str()) {
+                unique.push(path);
+            }
+        }
         return not_established(
-            &deduped,
+            &unique,
             SourceCoverageNotEstablishedCauseDto::LookupUnavailable,
         );
     };
-    let Ok(storage) = controller.open_storage_read_only() else {
-        return not_established(
-            &deduped,
-            SourceCoverageNotEstablishedCauseDto::LookupUnavailable,
-        );
+
+    // Deduped by resolved identity, not by string: `exact_packet_probe_paths`
+    // yields a project-relative spelling while a citation carries an absolute
+    // one, so a string comparison lets two spellings of one file through and
+    // the packet ships the same gap twice.
+    let mut deduped: Vec<&String> = Vec::new();
+    for path in paths {
+        let absolute = absolute_against(&project_root, path);
+        if !deduped
+            .iter()
+            .any(|seen| same_workspace_path(&absolute_against(&project_root, seen), &absolute))
+        {
+            deduped.push(path);
+        }
+    }
+
+    // These two are not the same judgement, and EV-78's split is the reason to
+    // keep them apart: no published core yet is a deliberate, recoverable state,
+    // while a failed query establishes nothing about anything.
+    let storage = match controller.open_storage_read_only() {
+        Ok(storage) => storage,
+        Err(error) if error.code == "project_unavailable" => {
+            return not_established(
+                &deduped,
+                SourceCoverageNotEstablishedCauseDto::PublicationIncomplete,
+            );
+        }
+        Err(_) => {
+            return not_established(
+                &deduped,
+                SourceCoverageNotEstablishedCauseDto::LookupUnavailable,
+            );
+        }
     };
     let exclusions = match storage.get_source_policy_exclusions() {
         Ok(exclusions) => exclusions,
