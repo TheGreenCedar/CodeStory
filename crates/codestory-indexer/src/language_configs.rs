@@ -1,9 +1,9 @@
 use super::{
     BASH_GRAPH_QUERY, C_GRAPH_QUERY, CPP_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY,
     GO_GRAPH_QUERY, JAVA_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset,
-    PHP_GRAPH_QUERY, PYTHON_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY,
-    SWIFT_GRAPH_QUERY, TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY,
-    TYPESCRIPT_TAGS_QUERY, languages, make_language_config,
+    PHP_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY, SWIFT_GRAPH_QUERY,
+    TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY, TYPESCRIPT_TAGS_QUERY, languages,
+    make_language_config,
 };
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext, normalize_extension,
@@ -29,7 +29,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     }
 
     match (profile.language_name, ext.as_str()) {
-        ("python", _) => Some(python()),
         ("java", _) => Some(java()),
         ("rust", _) => Some(rust()),
         ("javascript", _) => Some(javascript()),
@@ -46,16 +45,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("bash", _) => Some(bash()),
         _ => None,
     }
-}
-
-fn python() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_python::LANGUAGE.into(),
-        "python",
-        PYTHON_GRAPH_QUERY,
-        None,
-        LanguageRuleset::Python,
-    )
 }
 
 fn java() -> LanguageConfig {

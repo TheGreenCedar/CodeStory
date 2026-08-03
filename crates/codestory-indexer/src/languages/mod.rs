@@ -17,6 +17,7 @@
 //! package to land deletes the residual arms entirely.
 
 pub(crate) mod kotlin;
+pub(crate) mod python;
 
 use std::sync::OnceLock;
 
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, python::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {
@@ -235,6 +236,40 @@ mod tests {
         assert_eq!(
             extraction_for_ext("kts").map(|row| row.language_name),
             Some("kotlin")
+        );
+    }
+
+    /// The Python row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`. Python's values differ from Kotlin's on two of
+    /// them, which is precisely why they have to be pinned: `promotes_type_...`
+    /// was false because the rule file already projects a class body's
+    /// `function_definition` as a METHOD, and `route_comments_are_c_style` was
+    /// false because Python comments are `#`.
+    #[test]
+    fn python_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let python = extraction_for_language("python").expect("python row");
+        assert!(!python.promotes_type_member_functions_to_methods);
+        assert_eq!(python.qualified_name_delimiter, ".");
+        assert!(!python.route_comments_are_c_style);
+        assert_eq!(python.semantic_family, "python");
+        assert!(!python.uses_generic_semantic_resolver);
+        assert_eq!(
+            python.member_callsite_marker,
+            Some("syntax:python-attribute-call")
+        );
+        assert_eq!(
+            member_callsite_marker_for_call_syntax("python_attribute"),
+            Some("syntax:python-attribute-call")
+        );
+        assert!(python.receiver_call_specs.is_some());
+        assert!(python.tags_query.is_none());
+        assert_eq!(
+            extraction_for_ext("py").map(|row| row.language_name),
+            Some("python")
+        );
+        assert_eq!(
+            extraction_for_ext("pyi").map(|row| row.language_name),
+            Some("python")
         );
     }
 }

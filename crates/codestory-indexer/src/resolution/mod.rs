@@ -1309,7 +1309,7 @@ fn is_python_dotted_call_placeholder(edge_kind: EdgeKind, callsite_identity: Opt
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::python::MEMBER_CALLSITE_MARKER)
     })
 }
 
@@ -3939,7 +3939,10 @@ mod tests {
 
     #[test]
     fn test_python_dotted_placeholders_do_not_create_semantic_request_keys() {
-        let dotted_identity = format!("2:10:2:14|{}", crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER);
+        let dotted_identity = format!(
+            "2:10:2:14|{}",
+            crate::languages::python::MEMBER_CALLSITE_MARKER
+        );
         let dotted_lookup = SemanticEdgeLookup {
             edge_kind: EdgeKind::CALL,
             file_id: Some(1),
