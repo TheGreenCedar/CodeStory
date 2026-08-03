@@ -483,6 +483,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "java",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "cpp",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1232,11 +1236,16 @@ mod tests {
         for profile in COMPANION_EXTENSION_PROFILES {
             for language in profile.source_group_languages {
                 assert!(
-                    language_support_profile_for_language_name(language).is_some()
-                        || surface_names.contains(language)
-                        // `lua` has no registered profile at all; it exists
-                        // only as a workspace source-group compatibility name.
-                        || *language == "lua",
+                    language_support_profile_for_language_name(
+                        language
+                    ).is_some(
+                    )
+                    || surface_names.contains(
+                        language
+                    )
+                    // `lua` has no registered profile at all; it exists
+                    // only as a workspace source-group compatibility name.
+                    || *language == "lua",
                     "`{}` names unknown source group `{language}`",
                     profile.extension
                 );
@@ -1251,7 +1260,7 @@ mod tests {
             .iter()
             .map(|profile| profile.language_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["kotlin", "java"]);
+        assert_eq!(names, vec!["kotlin", "java", "cpp"]);
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
                 language_support_profile_for_language_name(profile.language_name).is_some(),
@@ -1266,6 +1275,7 @@ mod tests {
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
         assert_eq!(line_comment_for_language("java"), Some("//"));
+        assert_eq!(line_comment_for_language("cpp"), Some("//"));
         assert_eq!(line_comment_for_language("swift"), None);
     }
 

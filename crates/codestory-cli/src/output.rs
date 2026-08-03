@@ -5644,6 +5644,14 @@ mod tests {
         );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+
+        // Same for C++, whose roster row moved into the registry with S3-CPP.
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("cpp"),
+            Some("//")
+        );
+        let cpp = ansi_highlight_snippet("src/main.cpp", "int ok = 1; // comment");
+        assert!(cpp.contains("\x1b[90m// comment\x1b[0m"), "{cpp:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

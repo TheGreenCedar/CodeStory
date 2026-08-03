@@ -16,6 +16,7 @@
 //! `registry_rows_do_not_shadow_unmigrated_languages` proves it — and the last
 //! package to land deletes the residual arms entirely.
 
+pub(crate) mod cpp;
 pub(crate) mod java;
 pub(crate) mod kotlin;
 
@@ -70,7 +71,8 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, java::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] =
+    &[kotlin::EXTRACTION, java::EXTRACTION, cpp::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {

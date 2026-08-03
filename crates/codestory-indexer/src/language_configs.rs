@@ -1,6 +1,6 @@
 use super::{
-    BASH_GRAPH_QUERY, C_GRAPH_QUERY, CPP_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY,
-    GO_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset, PHP_GRAPH_QUERY,
+    BASH_GRAPH_QUERY, C_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY, GO_GRAPH_QUERY,
+    JAVA_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset, PHP_GRAPH_QUERY,
     PYTHON_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY, SWIFT_GRAPH_QUERY,
     TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY, TYPESCRIPT_TAGS_QUERY, languages,
     make_language_config,
@@ -34,7 +34,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("javascript", _) => Some(javascript()),
         ("typescript", "tsx") => Some(tsx()),
         ("typescript", _) => Some(typescript()),
-        ("cpp", _) => Some(cpp()),
         ("c", _) => Some(c()),
         ("go", _) => Some(go()),
         ("ruby", _) => Some(ruby()),
@@ -94,16 +93,6 @@ fn tsx() -> LanguageConfig {
         TSX_GRAPH_QUERY,
         Some(TSX_TAGS_QUERY),
         LanguageRuleset::Tsx,
-    )
-}
-
-fn cpp() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_cpp::LANGUAGE.into(),
-        "cpp",
-        CPP_GRAPH_QUERY,
-        None,
-        LanguageRuleset::Cpp,
     )
 }
 
