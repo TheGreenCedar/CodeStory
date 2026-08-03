@@ -536,6 +536,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "swift",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "dart",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1324,7 +1328,8 @@ mod tests {
                 "ruby",
                 "php",
                 "csharp",
-                "swift"
+                "swift",
+                "dart"
             ]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
@@ -1349,6 +1354,7 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("dart"), Some("//"));
         assert_eq!(line_comment_for_language("csharp"), Some("//"));
         assert_eq!(line_comment_for_language("php"), Some("//"));
         assert_eq!(line_comment_for_language("ruby"), Some("#"));

@@ -192,6 +192,16 @@ const CASES: &[SnapshotCase] = &[
         tictactoe_source: include_str!("fixtures/tictactoe/swift_tictactoe.swift"),
         tictactoe_golden: include_str!("fixtures/language_snapshots/swift_tictactoe.txt"),
     },
+    SnapshotCase {
+        language: "dart",
+        extension: "dart",
+        fidelity_filename: "fidelity.dart",
+        fidelity_source: include_str!("fixtures/fidelity_lab/dart_fidelity_lab.dart"),
+        fidelity_golden: include_str!("fixtures/language_snapshots/dart_fidelity.txt"),
+        tictactoe_filename: "game.dart",
+        tictactoe_source: include_str!("fixtures/tictactoe/dart_tictactoe.dart"),
+        tictactoe_golden: include_str!("fixtures/language_snapshots/dart_tictactoe.txt"),
+    },
 ];
 
 #[test]
