@@ -3942,7 +3942,7 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
             "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            | "cpp" | "dart" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
