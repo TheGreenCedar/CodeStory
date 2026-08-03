@@ -1571,6 +1571,19 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("retrieval_version", "Retrieval version."),
         SchemaProperty::array("graphs", "Graph artifacts.", &GENERIC_OBJECT_SCHEMA),
         SchemaProperty::object("retrieval_trace", "Retrieval trace and summary."),
+        // Both are optional on the wire and both were already being emitted:
+        // this schema is `additionalProperties: false`, so leaving them
+        // undeclared published a contract the tool itself violates. `freshness`
+        // has been emitted undeclared since EV-78.
+        SchemaProperty::object(
+            "freshness",
+            "Index freshness observation, when one was made.",
+        ),
+        SchemaProperty::array(
+            "source_coverage",
+            "Coverage for the files this packet rested on, when any were checked.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
     ],
     &[
         "packet_id",
@@ -2478,5 +2491,61 @@ mod tests {
         );
         assert_eq!(budget["minimum"], 1_000);
         assert_eq!(budget["maximum"], 120_000);
+    }
+
+    /// The context packet must not emit a field its own published schema
+    /// forbids.
+    ///
+    /// `CONTEXT_PACKET_SCHEMA` is `additionalProperties: false`, and
+    /// `context_packet_json` serializes the whole `AgentAnswerDto`, so every
+    /// optional field added to that DTO silently becomes a schema violation. It
+    /// happened twice before anyone noticed — `freshness` since EV-78 and
+    /// `source_coverage` — because nothing compared the two.
+    #[test]
+    fn the_context_packet_emits_only_fields_its_schema_declares() {
+        let declared = CONTEXT_PACKET_SCHEMA.declared_property_names();
+        let mut answer = codestory_contracts::api::AgentAnswerDto {
+            answer_id: "packet".to_string(),
+            prompt: "question".to_string(),
+            summary: "summary".to_string(),
+            freshness: None,
+            source_coverage: Vec::new(),
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: serde_json::from_value(serde_json::json!({
+                "request_id": "r",
+                "resolved_profile": "architecture",
+                "policy_mode": "latency_first",
+                "total_latency_ms": 0,
+                "steps": [],
+            }))
+            .expect("minimal retrieval trace"),
+        };
+        // Populate the optional fields: they are `skip_serializing_if`, so an
+        // empty fixture would pass while a real packet failed.
+        answer.source_coverage = vec![codestory_contracts::api::SourceCoverageObservationDto {
+            path: "data/big.json".to_string(),
+            status: codestory_contracts::api::SourceCoverageStatusDto::PolicyExcluded,
+            reason: None,
+            not_established_cause: None,
+            observed_size: Some(2),
+            byte_cap: Some(1),
+        }];
+
+        let packet = crate::output::context_packet_json(&answer);
+        let emitted = packet.as_object().expect("packet object");
+        let undeclared = emitted
+            .keys()
+            .filter(|key| !declared.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "the packet emits {undeclared:?}, which its published output schema \
+             forbids: declared = {declared:?}"
+        );
     }
 }
