@@ -3,6 +3,13 @@
 //! The module is a third of the file, and `lib.rs` was a few commits from
 //! crossing the oversized-source cap it enforces on other repositories
 //! (#1801). Nothing here changed but its location.
+//!
+//! It lives under a `tests/` directory rather than as a flat `tests.rs`
+//! because the retrieval-generalization lint excludes any path with a
+//! `tests` segment from every pass, while its corpus pass deliberately
+//! still reads out-of-line `#[cfg(test)]` module bodies. As a flat file
+//! this module's Go fixtures leaked `mux` into the derived corpus names
+//! and silently stopped the hostile-literal ban firing for it.
 
 use super::*;
 use rusqlite::types::Value;
