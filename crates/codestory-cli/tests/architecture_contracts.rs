@@ -296,6 +296,154 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
     );
 }
 
+/// Packet planning lives in `codestory-agent`, and the crate DAG is what keeps
+/// it from growing the powers it was extracted away from.
+///
+/// The dependency half is the load-bearing one: a planning crate that cannot
+/// name `codestory-store`, `codestory-retrieval`, `codestory-indexer`,
+/// `codestory-workspace`, or `codestory-runtime` cannot open storage, execute
+/// retrieval, activate or retry a publication, or move readiness, because none
+/// of those types exist for it. Everything it may know about pinned runtime
+/// state arrives through `codestory_agent::PinnedReader`, which the runtime
+/// implements.
+///
+/// The location half stops the extraction from being quietly undone: a planning
+/// module copied back under `crates/codestory-runtime/src/agent/` would regain
+/// the whole runtime namespace without anyone editing a manifest.
+#[test]
+fn agent_planning_crate_owns_planning_and_depends_on_contracts_only() {
+    let dependencies = dependency_names("crates/codestory-agent/Cargo.toml");
+    let workspace_dependencies = dependencies
+        .iter()
+        .filter(|name| name.starts_with("codestory-"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        workspace_dependencies,
+        BTreeSet::from(["codestory-contracts".to_string()]),
+        "codestory-agent plans against the contract types only; it reaches pinned \
+         runtime state through PinnedReader, never through a producer crate"
+    );
+
+    for module in [
+        "packet_citations.rs",
+        "packet_evidence_carriers.rs",
+        "packet_evidence_roles.rs",
+        "packet_flow_requirements.rs",
+        "packet_scoring.rs",
+        "packet_terms.rs",
+        "pinned_reader.rs",
+        "planning.rs",
+        "text.rs",
+    ] {
+        assert!(
+            repo_root()
+                .join("crates/codestory-agent/src")
+                .join(module)
+                .is_file(),
+            "planning module {module} belongs to codestory-agent"
+        );
+        assert!(
+            !repo_root()
+                .join("crates/codestory-runtime/src/agent")
+                .join(module)
+                .is_file(),
+            "planning module {module} must not exist a second time inside the runtime crate"
+        );
+    }
+
+    // Planning reads. It never writes persisted state, and it never takes the
+    // advisory locks that guard state it does not own.
+    let agent_source = production_source(&read_source_tree("crates/codestory-agent/src"));
+    for forbidden in [
+        "fs::write",
+        "fs::create_dir",
+        "fs::remove_file",
+        "fs::remove_dir",
+        "fs::rename",
+        "OpenOptions",
+        "bounded_locks",
+        "owned_artifacts",
+    ] {
+        assert!(
+            !agent_source.contains(forbidden),
+            "codestory-agent must not spell {forbidden}: planning owns no persisted state"
+        );
+    }
+}
+
+/// The eval/holdout probe hooks used to ride `#[cfg(test)]` inside
+/// `codestory-runtime`, so a runtime unit test saw them and a product build did
+/// not. They now live in `codestory-agent`, where `#[cfg(test)]` means "the
+/// agent crate's own tests" and would silently switch the hooks off for every
+/// runtime test that used to have them — quietly moving fidelity/eval output.
+///
+/// The `test-support` feature restores the old truth table, and this pins both
+/// halves of it: `codestory-runtime` turns the feature on for its tests, and no
+/// product dependency edge turns it on at all.
+#[test]
+fn agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds() {
+    let agent_manifest = manifest("crates/codestory-agent/Cargo.toml");
+    assert!(
+        agent_manifest
+            .get("features")
+            .and_then(|features| features.get("test-support"))
+            .is_some(),
+        "codestory-agent must declare the test-support feature the eval hooks hang from"
+    );
+
+    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
+    let dev_features = runtime_manifest
+        .get("dev-dependencies")
+        .and_then(|table| table.get("codestory-agent"))
+        .and_then(|entry| entry.get("features"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        dev_features.contains("test-support"),
+        "codestory-runtime's tests must compile codestory-agent with test-support, or the eval \
+         probe hooks that used to be cfg(test) inside the runtime disappear from them"
+    );
+
+    for consumer in [
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+        "crates/codestory-bench/Cargo.toml",
+    ] {
+        let consumer_manifest = manifest(consumer);
+        let features = consumer_manifest
+            .get("dependencies")
+            .and_then(|table| table.get("codestory-agent"))
+            .and_then(|entry| entry.get("features"))
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            !features.contains(&"test-support"),
+            "{consumer} must not enable codestory-agent/test-support on a product dependency edge"
+        );
+    }
+
+    // The hook itself has to hang from that feature, not from a bare cfg(test)
+    // that no longer reaches the runtime's test build.
+    let packet_scoring = read("crates/codestory-agent/src/packet_scoring.rs");
+    assert!(
+        packet_scoring.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\nuse crate::eval_probes::eval_citation_rank_adjustment;"
+        ) && packet_scoring.contains(
+            "    #[cfg(any(test, feature = \"test-support\"))]\n    {\n        score = eval_citation_rank_adjustment("
+        ),
+        "the citation rank eval hook must be gated on test-support, not on cfg(test) alone"
+    );
+}
+
 #[test]
 fn runtime_crate_depends_on_v2_surfaces_only() {
     let dependencies = dependency_names("crates/codestory-runtime/Cargo.toml");
@@ -1128,6 +1276,7 @@ fn production_sources() -> Vec<(String, String)> {
         "crates/codestory-store/src",
         "crates/codestory-indexer/src",
         "crates/codestory-retrieval/src",
+        "crates/codestory-agent/src",
         "crates/codestory-runtime/src",
         "crates/codestory-cli/src",
     ];
@@ -1146,7 +1295,7 @@ fn production_sources() -> Vec<(String, String)> {
             // production (its `evalOnlyProductionFiles` set) and bans product
             // paths from depending on it, so it cannot also be a production
             // surface here: the two boundaries must name the same thing.
-            if relative == "crates/codestory-runtime/src/agent/eval_probes.rs"
+            if relative == "crates/codestory-agent/src/eval_probes.rs"
                 || relative.split('/').any(|part| part == "tests")
                 || relative.ends_with("/tests.rs")
                 || relative.ends_with("/test_support.rs")
@@ -1611,6 +1760,7 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
     let producer_crates = [
         "crates/codestory-workspace/src",
         "crates/codestory-store/src",
+        "crates/codestory-agent/src",
         "crates/codestory-runtime/src",
         "crates/codestory-cli/src",
         "crates/codestory-retrieval/src",

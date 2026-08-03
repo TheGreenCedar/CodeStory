@@ -361,11 +361,22 @@ test("the full hostile matrix shares one policy load and never writes into the c
     "codestory-retrieval",
     "src",
   );
+  // Packet planning moved to its own crate; it carries the same full ban set as
+  // the runtime and retrieval slices it was cut out of, so the hostile matrix
+  // has to stand up that root as well or the lint fails closed on a missing
+  // required scan path before it reaches a single finding.
+  const agentRoot = path.join(
+    productionRepositoryRoot,
+    "crates",
+    "codestory-agent",
+    "src",
+  );
   const extraRustRoot = path.join(fixtureRoot, "extra-rust");
   const nonRustRoot = path.join(fixtureRoot, "non-rust");
   const taskRoot = path.join(fixtureRoot, "tasks");
   fs.mkdirSync(rustRoot, { recursive: true });
   fs.mkdirSync(retrievalRoot, { recursive: true });
+  fs.mkdirSync(agentRoot, { recursive: true });
   fs.mkdirSync(extraRustRoot);
   fs.mkdirSync(nonRustRoot);
   fs.mkdirSync(taskRoot);
@@ -839,8 +850,8 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
     }
     assert.deepEqual(
       result.scanDirs,
-      [rustRoot, retrievalRoot, extraRustRoot],
-      "the canonical runtime/retrieval defaults must remain present before the additive extra root",
+      [agentRoot, rustRoot, retrievalRoot, extraRustRoot],
+      "the canonical agent/runtime/retrieval defaults must remain present before the additive extra root",
     );
     assert.ok(
       findingFor(result, "deep/new/ranking_scope_probe_generated.rs"),

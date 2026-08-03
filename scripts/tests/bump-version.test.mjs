@@ -39,6 +39,7 @@ function fixtureRoot(version) {
     "codestory-store",
     "codestory-indexer",
     "codestory-retrieval",
+    "codestory-agent",
     "codestory-runtime",
     "codestory-cli",
     "codestory-bench",

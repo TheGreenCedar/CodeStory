@@ -53,11 +53,13 @@
 //! and output methods hang off the site object itself, so the subject is read from the name where
 //! every other carrier here reads it.
 
-use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 
 fn terminal(citation: &AgentCitationDto) -> String {
-    normalize_identifier(&crate::terminal_symbol_segment(&citation.display_name))
+    normalize_identifier(&crate::text::terminal_symbol_segment(
+        &citation.display_name,
+    ))
 }
 
 /// The last `::`/`.`/`/` segment of a symbol name with its original casing intact. Case carries
@@ -197,7 +199,7 @@ fn names_token_prefix(citation: &AgentCitationDto, prefixes: &[&str]) -> bool {
 /// library rather than the word "client", and nothing in a name separates it from a
 /// `FrameKind.request` somewhere else in the repository. It is recorded as a family in
 /// `COMPOUND_EVIDENCE_SURFACE` rather than left for the next reviewer to find again.
-pub(crate) fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
         && belongs_to_http_client(citation)
         && matches!(
@@ -234,7 +236,7 @@ fn belongs_to_http_client(citation: &AgentCitationDto) -> bool {
 }
 
 /// The step that turns a configured request into a transport-ready one.
-pub(crate) fn citation_owns_client_request_finalization(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_client_request_finalization(citation: &AgentCitationDto) -> bool {
     if !owns_behavior(citation) || !belongs_to_http_client(citation) {
         return false;
     }
@@ -244,7 +246,7 @@ pub(crate) fn citation_owns_client_request_finalization(citation: &AgentCitation
 }
 
 /// The boundary where a transport response becomes a value the caller can read.
-pub(crate) fn citation_owns_client_response_materialization(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_client_response_materialization(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && names_token(citation, &["response", "responses"])
         && (names_token(
@@ -299,7 +301,7 @@ fn names_a_hook(citation: &AgentCitationDto) -> bool {
         .is_some_and(|next| next.is_ascii_uppercase())
 }
 
-pub(crate) fn citation_owns_hook_public_export(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_hook_public_export(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
         && is_script_surface(citation)
         && names_a_hook(citation)
@@ -309,7 +311,7 @@ pub(crate) fn citation_owns_hook_public_export(citation: &AgentCitationDto) -> b
 /// Serializing *the cache key*. Being a `serialize*` function on a script surface is the shape of
 /// every `serializeSettings`, `serializeForm` and `serializeQueryString` ever written; the
 /// requirement is about the key, so the key has to be named.
-pub(crate) fn citation_owns_hook_key_serialization(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_hook_key_serialization(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && is_script_surface(citation)
         && names_token(citation, &["key", "keys"])
@@ -320,7 +322,7 @@ pub(crate) fn citation_owns_hook_key_serialization(citation: &AgentCitationDto) 
 /// The helper that holds cache state, not any method that touches a cache. `Cache.put` and
 /// `Cache.get` are the cache's own API on every cache in every repository; this requirement is the
 /// hook library's helper *around* one, so the anchor has to name the helper.
-pub(crate) fn citation_owns_hook_cache_helper(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_hook_cache_helper(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && is_script_surface(citation)
         && names_token(citation, &["cache", "caches"])
@@ -330,7 +332,7 @@ pub(crate) fn citation_owns_hook_cache_helper(citation: &AgentCitationDto) -> bo
         ) || names_token_prefix(citation, &["make", "creat", "init"]))
 }
 
-pub(crate) fn citation_owns_hook_mutation_flow(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_hook_mutation_flow(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && is_script_surface(citation)
         && names_token_prefix(citation, &["mutat"])
@@ -359,7 +361,7 @@ fn is_stylesheet(citation: &AgentCitationDto) -> bool {
     path_has_any_extension(citation, &[".css", ".scss", ".sass", ".less"])
 }
 
-pub(crate) fn citation_owns_html_app_shell(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_html_app_shell(citation: &AgentCitationDto) -> bool {
     is_markup_document(citation)
         && names_token(
             citation,
@@ -369,15 +371,15 @@ pub(crate) fn citation_owns_html_app_shell(citation: &AgentCitationDto) -> bool 
         )
 }
 
-pub(crate) fn citation_owns_css_structure(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_css_structure(citation: &AgentCitationDto) -> bool {
     is_stylesheet(citation)
 }
 
-pub(crate) fn citation_owns_css_animation_entrypoint(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_css_animation_entrypoint(citation: &AgentCitationDto) -> bool {
     is_stylesheet(citation) && names_token(citation, &["import", "use", "forward"])
 }
 
-pub(crate) fn citation_owns_css_animation_structure(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_css_animation_structure(citation: &AgentCitationDto) -> bool {
     is_stylesheet(citation)
         // Sibling of `css_animation_entrypoint`. `@import "animations/base"` names the animation
         // directory, so without this an import closed the structure requirement too.
@@ -464,7 +466,7 @@ fn is_form_constraint_markup(citation: &AgentCitationDto) -> bool {
     is_markup_document(citation) && names_or_path_token(citation, FORM_SUBSYSTEM_WORDS)
 }
 
-pub(crate) fn citation_owns_form_native_constraint(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_form_native_constraint(citation: &AgentCitationDto) -> bool {
     (is_form_validation_surface(citation) || is_form_constraint_markup(citation))
         && names_token(
             citation,
@@ -481,7 +483,7 @@ pub(crate) fn citation_owns_form_native_constraint(citation: &AgentCitationDto) 
         )
 }
 
-pub(crate) fn citation_owns_form_custom_validation(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_form_custom_validation(citation: &AgentCitationDto) -> bool {
     is_form_validation_surface(citation)
         && (names_token(
             citation,
@@ -495,7 +497,7 @@ pub(crate) fn citation_owns_form_custom_validation(citation: &AgentCitationDto) 
         ) || names_token_prefix(citation, &["customvalid", "checkvalid", "reportvalid"]))
 }
 
-pub(crate) fn citation_owns_form_submit_guard(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_form_submit_guard(citation: &AgentCitationDto) -> bool {
     is_form_validation_surface(citation)
         && (names_token(citation, &["submit", "submits", "preventdefault"])
             || names_token_prefix(citation, &["submitt"]))
@@ -513,7 +515,7 @@ fn is_shell_script(citation: &AgentCitationDto) -> bool {
         || path.ends_with("install")
 }
 
-pub(crate) fn citation_owns_shell_installer_bootstrap(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_shell_installer_bootstrap(citation: &AgentCitationDto) -> bool {
     is_shell_script(citation)
         && names_token_prefix(
             citation,
@@ -521,13 +523,13 @@ pub(crate) fn citation_owns_shell_installer_bootstrap(citation: &AgentCitationDt
         )
 }
 
-pub(crate) fn citation_owns_shell_function_dispatch(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_shell_function_dispatch(citation: &AgentCitationDto) -> bool {
     is_shell_script(citation)
         && (names_token(citation, &["use", "run", "exec", "case"])
             || names_token_prefix(citation, &["dispatch", "command", "exec"]))
 }
 
-pub(crate) fn citation_owns_shell_completion(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_shell_completion(citation: &AgentCitationDto) -> bool {
     is_shell_script(citation)
         && names_token_prefix(citation, &["completion", "compgen", "complete", "alias"])
 }
@@ -586,7 +588,7 @@ fn names_io_operation(citation: &AgentCitationDto) -> bool {
 }
 
 /// The buffer itself — where bytes live between a source and a sink.
-pub(crate) fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && names_buffer(citation)
         && !names_io_operation(citation)
@@ -601,7 +603,7 @@ pub(crate) fn citation_owns_buffer_storage(citation: &AgentCitationDto) -> bool 
 /// citation combine with unrelated database and telemetry operations to close the whole flow.
 /// The positive surface remains operations named on the storage object itself, which carry both
 /// factors in one citation.
-pub(crate) fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_buffer_read_write(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && names_io_operation(citation) && names_the_buffer_itself(citation)
 }
 
@@ -627,7 +629,7 @@ fn belongs_to_logging(citation: &AgentCitationDto) -> bool {
 /// `createUserRecord` that happens to sit in `src/logging/` is still a database row, and letting
 /// the directory supply the subsystem is how an off-subject symbol inside a flow's own folder
 /// closes that flow's requirement.
-pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && {
         let tokens = name_tokens(citation);
         has_token(&tokens, &["log", "logs", "logger", "loggers", "logging"])
@@ -650,7 +652,7 @@ pub(crate) fn citation_owns_log_record_creation(citation: &AgentCitationDto) -> 
 /// one as a record-pipeline subject let an HTTP handler combine with real record-creation evidence
 /// and close the whole logging flow. A proof-bearing handler anchor therefore says both whose
 /// handler it is and which processing step it owns.
-pub(crate) fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_log_handler_processing(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && belongs_to_logging(citation) && {
         let tokens = name_tokens(citation);
         let names_a_handler = has_token(&tokens, &["handler", "handlers"]);
@@ -726,7 +728,7 @@ fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
 /// it is gone with the directory. It cannot narrow anything now: "site" was itself the first entry
 /// in that list, so every name `belongs_to_site_build` accepts satisfies it. Leaving it in would
 /// read as a second factor and be none.
-pub(crate) fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && belongs_to_site_build(citation) && {
         let tokens = name_tokens(citation);
         has_token(
@@ -737,7 +739,7 @@ pub(crate) fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool 
     }
 }
 
-pub(crate) fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_site_build(citation)
         // Sibling of `site_lifecycle`, which excludes these same three stems, so one anchor cannot
@@ -799,7 +801,7 @@ fn names_mapper_configuration(citation: &AgentCitationDto) -> bool {
     names_token_prefix(citation, &["config", "profile", "option"])
 }
 
-pub(crate) fn citation_owns_mapper_configuration(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_mapper_configuration(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_object_mapper(citation)
         && names_mapper_configuration(citation)
@@ -809,7 +811,7 @@ pub(crate) fn citation_owns_mapper_configuration(citation: &AgentCitationDto) ->
 /// The plan a mapper executes. "mapper" and "mapping" are absent from the step list on purpose:
 /// they are what `belongs_to_object_mapper` already asks for, so listing them here let a symbol
 /// named nothing but `Mapper` satisfy both of this carrier's factors at once.
-pub(crate) fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_mapper_execution(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_object_mapper(citation)
         && !names_mapper_configuration(citation)
@@ -852,7 +854,7 @@ fn belongs_to_runtime_formatting(citation: &AgentCitationDto) -> bool {
 }
 
 /// The type-erased argument store a runtime formatter reads from.
-pub(crate) fn citation_owns_format_arguments(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_format_arguments(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation) && {
         let tokens = name_tokens(citation);
         has_token(&tokens, RUNTIME_FORMAT_ARGUMENT_WORDS)
@@ -867,7 +869,7 @@ pub(crate) fn citation_owns_format_arguments(citation: &AgentCitationDto) -> boo
 /// The error/fallback path a runtime formatter takes when an argument cannot be formatted. This is
 /// the only carrier for `FlowRole::ErrorOrFallback`; without it the role would ask for evidence no
 /// packet could ever cite.
-pub(crate) fn citation_owns_formatter_fallback(citation: &AgentCitationDto) -> bool {
+pub fn citation_owns_formatter_fallback(citation: &AgentCitationDto) -> bool {
     owns_behavior(citation)
         && belongs_to_runtime_formatting(citation)
         && names_token_prefix(
@@ -894,7 +896,7 @@ pub(crate) fn citation_owns_formatter_fallback(citation: &AgentCitationDto) -> b
 // ---------------------------------------------------------------------------
 
 /// Indexing: discovering files, extracting symbols, and persisting them.
-pub(crate) fn flow_belongs_to_indexing(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_indexing(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -921,7 +923,7 @@ pub(crate) fn flow_belongs_to_indexing(citation: &AgentCitationDto) -> bool {
 }
 
 /// A server receiving and routing an inbound request.
-pub(crate) fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -965,7 +967,7 @@ pub(crate) fn flow_belongs_to_server_request(citation: &AgentCitationDto) -> boo
 }
 
 /// A client assembling and issuing an outbound request.
-pub(crate) fn flow_belongs_to_client_request(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_client_request(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -997,7 +999,7 @@ pub(crate) fn flow_belongs_to_client_request(citation: &AgentCitationDto) -> boo
 }
 
 /// Where a request leaves the process and a response comes back.
-pub(crate) fn flow_belongs_to_request_terminal(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_request_terminal(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1022,7 +1024,7 @@ pub(crate) fn flow_belongs_to_request_terminal(citation: &AgentCitationDto) -> b
 }
 
 /// A URL session and the delegate callbacks it drives.
-pub(crate) fn flow_belongs_to_url_session(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_url_session(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1048,7 +1050,7 @@ pub(crate) fn flow_belongs_to_url_session(citation: &AgentCitationDto) -> bool {
 }
 
 /// Bringing a command server up.
-pub(crate) fn flow_belongs_to_command_server(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_command_server(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1067,7 +1069,7 @@ pub(crate) fn flow_belongs_to_command_server(citation: &AgentCitationDto) -> boo
 }
 
 /// The loop that waits for readiness and fires callbacks.
-pub(crate) fn flow_belongs_to_event_loop(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_event_loop(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1078,7 +1080,7 @@ pub(crate) fn flow_belongs_to_event_loop(citation: &AgentCitationDto) -> bool {
 }
 
 /// Reading a command off the wire.
-pub(crate) fn flow_belongs_to_network_input(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_network_input(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1103,7 +1105,7 @@ pub(crate) fn flow_belongs_to_network_input(citation: &AgentCitationDto) -> bool
 /// "dispatch"/"dispatcher" are absent: the role classifier grants `RequestDispatch` and
 /// `CommandDispatch` from that same word, so listing it here let one word answer both "is this the
 /// command subsystem" and "is this its dispatch step". A command dispatcher says "command".
-pub(crate) fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1113,7 +1115,7 @@ pub(crate) fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> b
 }
 
 /// Planning and running a search.
-pub(crate) fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
     names_token(
         citation,
         &[
@@ -1125,7 +1127,7 @@ pub(crate) fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
 
 /// A schema requirement is proved by the schema file, so here the file *is* the subsystem: a `.sql`
 /// anchor has no identifier of its own to scope by.
-pub(crate) fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
+pub fn flow_belongs_to_sql_schema(citation: &AgentCitationDto) -> bool {
     path_has_any_extension(citation, &[".sql"])
 }
 

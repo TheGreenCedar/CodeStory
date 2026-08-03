@@ -154,7 +154,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
   )].map((match) => match[1]);
   const expectedFilesystemMemberCounts = {
     existsSync: 1,
-    mkdirSync: 6,
+    mkdirSync: 7,
     mkdtempSync: 1,
     // Two of these read the shipped pending inventory and the registry document it points at,
     // so the claim-profile ratchet is checked against the tree that ships, not a synthetic one.
@@ -172,8 +172,8 @@ export function retrievalGeneralizationSuitePolicyViolations(
     );
   }
   const fixtureFilesystemShapeIsExact =
-    fsReferenceCount === 23
-    && filesystemMemberReferences.length === 21
+    fsReferenceCount === 24
+    && filesystemMemberReferences.length === 22
     && Object.entries(expectedFilesystemMemberCounts).every(
       ([name, count]) => (filesystemMemberCounts.get(name) ?? 0) === count,
     )
@@ -183,6 +183,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
       "fs.writeFileSync(destination, contents);",
       "fs.mkdirSync(rustRoot, { recursive: true });",
       "fs.mkdirSync(retrievalRoot, { recursive: true });",
+      "fs.mkdirSync(agentRoot, { recursive: true });",
       "fs.mkdirSync(extraRustRoot);",
       "fs.mkdirSync(nonRustRoot);",
       "fs.mkdirSync(taskRoot);",
@@ -207,7 +208,7 @@ export function retrievalGeneralizationSuitePolicyViolations(
   const fixturePathReferenceShapeIsExact =
     repositoryRootReferenceCount === 14
     && fixtureRootReferenceCount === 10
-    && productionRepositoryRootReferenceCount === 4;
+    && productionRepositoryRootReferenceCount === 5;
   const protectedRetrievalWorkflow = `.github/workflows/${retrievalFile}`;
   const retainedDynamicImportFixtures = [
     "await import(harness);",

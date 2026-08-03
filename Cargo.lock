@@ -521,6 +521,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codestory-agent"
+version = "0.16.3"
+dependencies = [
+ "codestory-contracts",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codestory-bench"
 version = "0.16.3"
 dependencies = [
@@ -676,6 +685,7 @@ name = "codestory-runtime"
 version = "0.16.3"
 dependencies = [
  "anyhow",
+ "codestory-agent",
  "codestory-contracts",
  "codestory-indexer",
  "codestory-retrieval",

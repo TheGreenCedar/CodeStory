@@ -1,7 +1,7 @@
-use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::AgentCitationDto;
 
-pub(crate) fn packet_citation_matching_display<'a>(
+pub fn packet_citation_matching_display<'a>(
     citations: &'a [AgentCitationDto],
     display_needle: &str,
 ) -> Option<&'a AgentCitationDto> {
@@ -11,7 +11,7 @@ pub(crate) fn packet_citation_matching_display<'a>(
         .find(|citation| normalize_identifier(&citation.display_name) == needle)
 }
 
-pub(crate) fn packet_citation_matching_path_and_display<'a>(
+pub fn packet_citation_matching_path_and_display<'a>(
     citations: &'a [AgentCitationDto],
     path_needle: &str,
     display_needle: &str,
@@ -30,7 +30,7 @@ pub(crate) fn packet_citation_matching_path_and_display<'a>(
     })
 }
 
-pub(crate) fn packet_command_crate_sources_contain_all(
+pub fn packet_command_crate_sources_contain_all(
     citations: &[AgentCitationDto],
     crate_segment: &str,
     groups: &[&[&str]],
@@ -54,7 +54,7 @@ pub(crate) fn packet_command_crate_sources_contain_all(
         })
 }
 
-pub(crate) fn packet_citation_path_contains_crate_segment(
+pub fn packet_citation_path_contains_crate_segment(
     citation: &AgentCitationDto,
     crate_segment: &str,
 ) -> bool {
@@ -77,7 +77,7 @@ pub(crate) fn packet_citation_path_contains_crate_segment(
         .unwrap_or(false)
 }
 
-pub(crate) fn packet_citation_source_text(citation: &AgentCitationDto) -> Option<String> {
+pub fn packet_citation_source_text(citation: &AgentCitationDto) -> Option<String> {
     let path = citation.file_path.as_deref()?;
     std::fs::read_to_string(path).ok()
 }

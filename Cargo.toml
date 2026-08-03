@@ -7,6 +7,7 @@ members = [
     "crates/codestory-store",
     "crates/codestory-indexer",
     "crates/codestory-retrieval",
+    "crates/codestory-agent",
     "crates/codestory-runtime",
     "crates/codestory-cli",
     "crates/codestory-bench",
@@ -21,6 +22,7 @@ codestory-workspace = { path = "crates/codestory-workspace" }
 codestory-store = { path = "crates/codestory-store" }
 codestory-indexer = { path = "crates/codestory-indexer" }
 codestory-retrieval = { path = "crates/codestory-retrieval" }
+codestory-agent = { path = "crates/codestory-agent" }
 codestory-runtime = { path = "crates/codestory-runtime" }
 codestory-cli = { path = "crates/codestory-cli" }
 

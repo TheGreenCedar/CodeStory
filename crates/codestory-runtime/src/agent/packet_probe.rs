@@ -2,11 +2,12 @@ use crate::AppController;
 use crate::agent::citation::to_citation_from_hit;
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
 use crate::target_resolution::{TargetResolution, TargetSelection, search_hit_matches_exact_file};
+use codestory_agent::{PinnedReader, admit_continuation_probe};
 use codestory_contracts::api::{
-    AgentCitationDto, NodeId, NodeKind, PACKET_PROBE_CONTRACT_VERSION, PacketEvidenceResolutionDto,
-    PacketEvidenceTierDto, PacketProbeAmbiguityCandidateDto, PacketProbeDto,
-    PacketProbeRejectionCodeDto, PacketProbeRejectionDto, PacketProbeResolutionDto,
-    PacketProbeResolutionStatusDto, SearchHit, SearchHitOrigin,
+    AgentCitationDto, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    PacketProbeAmbiguityCandidateDto, PacketProbeDto, PacketProbeRejectionCodeDto,
+    PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto, SearchHit,
+    SearchHitOrigin,
 };
 use codestory_workspace::{
     ProjectRelativePathResolution, project_identity_v3, resolve_project_relative_path,
@@ -513,6 +514,36 @@ fn probe_status_for_hit(
     }
 }
 
+/// The runtime's implementation of planning's read-only seam.
+///
+/// Every method is an owned read of an identity the current public operation
+/// already pinned. Nothing here opens storage, activates a publication, or
+/// retries one, and a missing pin is reported as `None` so the planning side
+/// refuses rather than guesses.
+struct ControllerPinnedReader<'a> {
+    controller: &'a AppController,
+}
+
+impl PinnedReader for ControllerPinnedReader<'_> {
+    fn pinned_project_id(&self) -> Option<String> {
+        self.controller
+            .require_project_root()
+            .ok()
+            .map(|root| project_identity_v3(&root).project_id)
+    }
+
+    fn pinned_core_generation_id(&self) -> Option<String> {
+        self.controller
+            .active_core_publication()
+            .map(|publication| publication.generation_id)
+    }
+
+    fn pinned_retrieval_generation(&self) -> Option<String> {
+        active_pinned_retrieval_publication(self.controller)
+            .map(|publication| publication.retrieval_generation)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_continuation_probe(
     controller: &AppController,
@@ -525,64 +556,20 @@ fn resolve_continuation_probe(
     symbol_id: Option<&str>,
     query: &str,
 ) -> PacketProbeResolutionDto {
-    if contract_version != PACKET_PROBE_CONTRACT_VERSION {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::IncompatibleContinuation,
-            format!(
-                "continuation contract {contract_version} is incompatible with {}",
-                PACKET_PROBE_CONTRACT_VERSION
-            ),
-        );
-    }
-    let Ok(project_root) = controller.require_project_root() else {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::StaleContinuation,
-            "continuation requires an open project",
-        );
+    let query = match admit_continuation_probe(
+        &ControllerPinnedReader { controller },
+        contract_version,
+        project_id,
+        core_generation_id,
+        retrieval_generation,
+        query,
+    ) {
+        Ok(query) => query,
+        Err(refusal) => {
+            return rejected_resolution(input_index, probe, refusal.code(), refusal.message());
+        }
     };
-    if project_id != project_identity_v3(&project_root).project_id {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::StaleContinuation,
-            "continuation belongs to a different project",
-        );
-    }
-    if controller
-        .active_core_publication()
-        .is_none_or(|publication| publication.generation_id != core_generation_id)
-    {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::StaleContinuation,
-            "continuation core generation is no longer selected",
-        );
-    }
-    if let Some(expected) = retrieval_generation
-        && active_pinned_retrieval_publication(controller)
-            .is_none_or(|publication| publication.retrieval_generation != expected)
-    {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::StaleContinuation,
-            "continuation retrieval generation is no longer selected",
-        );
-    }
-    let query = query.trim();
-    if query.is_empty() {
-        return rejected_resolution(
-            input_index,
-            probe,
-            PacketProbeRejectionCodeDto::MalformedProbe,
-            "continuation query must not be empty",
-        );
-    }
+    let query = query.as_str();
     if let Some(symbol_id) = symbol_id {
         let mut resolution = resolve_symbol_id_probe(controller, input_index, probe, symbol_id);
         if resolution.status == PacketProbeResolutionStatusDto::IndexedSymbol {
@@ -702,6 +689,7 @@ fn display_relative_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::PACKET_PROBE_CONTRACT_VERSION;
     use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind as CoreNodeKind};
     use codestory_store::{FileInfo, FileRole, Store};
     use std::path::PathBuf;
@@ -1165,6 +1153,123 @@ mod tests {
                     .as_ref()
                     .map(|rejection| rejection.code),
                 Some(PacketProbeRejectionCodeDto::StaleContinuation)
+            );
+        }
+    }
+
+    /// Continuation admission moved into `codestory-agent` behind `PinnedReader`,
+    /// so the runtime now *renders* a refusal the planning crate decided. This
+    /// pins the rendered wire pair — code and message — at the layer a caller
+    /// actually receives it, for every refusal a real controller can reach.
+    #[test]
+    fn continuation_refusals_render_the_same_wire_code_and_message_as_before_extraction() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_empty_store(&project);
+        let project_id = project_identity_v3(project.path()).project_id;
+        let rootless = AppController::new();
+
+        let continuation = |contract_version: u32,
+                            project_id: &str,
+                            core_generation_id: &str,
+                            retrieval_generation: Option<&str>,
+                            query: &str| {
+            PacketProbeDto::Continuation {
+                contract_version,
+                project_id: project_id.to_string(),
+                core_generation_id: core_generation_id.to_string(),
+                retrieval_generation: retrieval_generation.map(str::to_string),
+                symbol_id: None,
+                query: query.to_string(),
+            }
+        };
+
+        let resolutions = resolve_packet_probes(
+            &controller,
+            vec![
+                continuation(
+                    PACKET_PROBE_CONTRACT_VERSION + 1,
+                    &project_id,
+                    "generation",
+                    None,
+                    "AppController",
+                ),
+                continuation(
+                    PACKET_PROBE_CONTRACT_VERSION,
+                    "different-project",
+                    "generation",
+                    None,
+                    "AppController",
+                ),
+                continuation(
+                    PACKET_PROBE_CONTRACT_VERSION,
+                    &project_id,
+                    "stale-generation",
+                    Some("retrieval-generation"),
+                    "AppController",
+                ),
+            ],
+        );
+        let rootless_resolutions = resolve_packet_probes(
+            &rootless,
+            vec![continuation(
+                PACKET_PROBE_CONTRACT_VERSION,
+                &project_id,
+                "generation",
+                None,
+                "AppController",
+            )],
+        );
+
+        let rendered = |resolution: &PacketProbeResolutionDto| {
+            let rejection = resolution
+                .rejection
+                .as_ref()
+                .expect("a refused continuation carries a rejection");
+            (rejection.code, rejection.message.clone())
+        };
+
+        assert_eq!(
+            rendered(&resolutions[0]),
+            (
+                PacketProbeRejectionCodeDto::IncompatibleContinuation,
+                format!(
+                    "continuation contract {} is incompatible with {PACKET_PROBE_CONTRACT_VERSION}",
+                    PACKET_PROBE_CONTRACT_VERSION + 1
+                )
+            )
+        );
+        assert_eq!(
+            rendered(&resolutions[1]),
+            (
+                PacketProbeRejectionCodeDto::StaleContinuation,
+                "continuation belongs to a different project".to_string()
+            )
+        );
+        // No core publication is pinned here, so the core check refuses before
+        // the retrieval generation this probe also names is ever consulted.
+        assert_eq!(
+            rendered(&resolutions[2]),
+            (
+                PacketProbeRejectionCodeDto::StaleContinuation,
+                "continuation core generation is no longer selected".to_string()
+            )
+        );
+        assert_eq!(
+            rendered(&rootless_resolutions[0]),
+            (
+                PacketProbeRejectionCodeDto::StaleContinuation,
+                "continuation requires an open project".to_string()
+            )
+        );
+        for resolution in resolutions.iter().chain(rootless_resolutions.iter()) {
+            assert_eq!(
+                resolution.status,
+                PacketProbeResolutionStatusDto::Rejected,
+                "a refused continuation must not resolve to a reusable probe"
+            );
+            assert!(
+                resolution.normalized_query.is_none() && resolution.symbol_id.is_none(),
+                "a refused continuation must not carry a query or symbol forward"
             );
         }
     }

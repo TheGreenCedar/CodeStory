@@ -111,14 +111,14 @@
         "runmain": 2
       }
     },
-    "crates/codestory-runtime/src/agent/packet_evidence_carriers.rs": {
+    "crates/codestory-agent/src/packet_evidence_carriers.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "The stylesheet carrier lists the words a CSS animation is written with, and one of them collides with a benchmark marker: `animated` is the class name Animate.css and its imitators ship, so a stylesheet whose only anchor is that class would stop closing the animation structure step without it. It goes when a stylesheet requirement is decided from the at-rules the indexer already extracts rather than from a word list.",
       "markers": {
         "animated": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_evidence_roles.rs": {
+    "crates/codestory-agent/src/packet_evidence_roles.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Evidence-role assignment matches holdout file names to decide whether a citation is a route, a client, or a model. The role has to come from the indexed symbol kind instead.",
       "markers": {
@@ -135,7 +135,7 @@
         "source_group": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_flow_requirements.rs": {
+    "crates/codestory-agent/src/packet_flow_requirements.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Flow requirements enumerate holdout DOM and validation identifiers to decide a flow is covered. Deriving the requirement from the question's own terms is the replacement.",
       "markers": {
@@ -198,7 +198,7 @@
         "wsgiapp": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_scoring.rs": {
+    "crates/codestory-agent/src/packet_scoring.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Citation ranking contains explicit per-file boosts for holdout paths, including path.ends_with checks on corpus file names. This is the largest single benchmark-shaped surface left and the ranking has to be rebuilt on structural signals.",
       "markers": {
@@ -297,7 +297,7 @@
         "wsgiapp": 1
       }
     },
-    "crates/codestory-runtime/src/agent/packet_terms.rs": {
+    "crates/codestory-agent/src/packet_terms.rs": {
       "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
       "reason": "Prompt term expansion carries holdout language and API vocabulary. It is the packet-path twin of the search-plan term tables this branch removes and needs the same treatment with packet quality evidence.",
       "markers": {
