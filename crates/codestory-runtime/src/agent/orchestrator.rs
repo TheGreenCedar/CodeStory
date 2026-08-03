@@ -361,6 +361,7 @@ pub(crate) fn agent_ask(
     let summary = summarize_response(&resolved_profile, &bundle);
 
     Ok(AgentAnswerDto {
+        source_coverage: Vec::new(),
         answer_id: request_id,
         prompt,
         summary,
@@ -513,6 +514,21 @@ pub(crate) fn agent_packet(
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
     let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
+
+    // Observed here, after every filesystem citation appender has run, because
+    // the uncapped route is a *cited* file rather than a probed one: a required
+    // file-scoped citation is minted `eligible_for_sufficiency`, so a packet
+    // could rest a proof-bearing claim on a file the index refused. Driving
+    // this off probe paths alone would leave exactly that route uncovered.
+    let mut covered_paths = exact_probe_paths.clone();
+    covered_paths.extend(
+        answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.clone()),
+    );
+    answer.source_coverage =
+        crate::source_coverage::observe_source_coverage(controller, &covered_paths);
     let phase_started = Instant::now();
     let budget = apply_packet_budget_with_extra(
         &project_root,
@@ -5173,6 +5189,7 @@ mod tests {
 
     fn packet_answer_fixture(question: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-fixture".to_string(),
             prompt: question.to_string(),
             summary: "Fixture packet is covered by cited anchors.".to_string(),
@@ -8472,6 +8489,7 @@ mod tests {
     fn packet_supported_claims_use_generic_evidence_roles() {
         let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "generic-fixture".to_string(),
             prompt: "Explain the packet evidence roles.".to_string(),
             summary: "Generic evidence roles are covered.".to_string(),
@@ -8887,6 +8905,7 @@ mod tests {
         let exec_lib_path = exec_lib.to_string_lossy().to_string();
         let event_jsonl_path = event_jsonl.to_string_lossy().to_string();
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "exec-fixture".to_string(),
             prompt: "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.".to_string(),
             summary: "Exec flow evidence is covered.".to_string(),
@@ -9001,6 +9020,7 @@ mod tests {
         .expect("write temp exec lib");
         let exec_lib_path = exec_lib.to_string_lossy().to_string();
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "source-definition-fixture".to_string(),
             prompt: "Explain how `codex exec --json` flows from the exec runtime into app-server thread start requests and JSONL event output.".to_string(),
             summary: "Exec flow evidence is covered.".to_string(),
@@ -9047,6 +9067,7 @@ mod tests {
     fn packet_supported_claims_include_indexing_storage_flow_specific_claims() {
         let _eval_probes = EvalProbesGuard::enabled();
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "indexing-storage-fixture".to_string(),
             prompt: "Explain project source-group indexing into storage.".to_string(),
             summary: "Indexing and storage evidence is covered.".to_string(),
@@ -9286,6 +9307,7 @@ mod tests {
     #[test]
     fn production_packet_claims_do_not_synthesize_local_real_template_claims() {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "indexing-storage-production-fixture".to_string(),
             prompt: "Explain project source-group indexing into storage.".to_string(),
             summary: "Indexing and storage evidence is covered.".to_string(),
@@ -9356,6 +9378,7 @@ mod tests {
     #[test]
     fn packet_supported_claims_include_vscode_workbench_extension_host_claims() {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "vscode-fixture".to_string(),
             prompt: "Explain VS Code workbench extension-host command execution.".to_string(),
             summary: "VS Code workbench flow evidence is covered.".to_string(),
@@ -9432,6 +9455,7 @@ mod tests {
     #[test]
     fn packet_supported_claims_include_payload_public_content_flow_claims() {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "payload-fixture".to_string(),
             prompt: "Explain Payload posts comments RSS and Elsewhere feed.".to_string(),
             summary: "Payload public content flow evidence is covered.".to_string(),
@@ -9504,6 +9528,7 @@ mod tests {
     fn packet_ranking_prefers_payload_collections_over_component_and_preview_fillers() {
         let question = "Explain how Payload collections, post rendering, comment submission, RSS, and the Elsewhere feed connect.";
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "payload-rank-fixture".to_string(),
             prompt: question.to_string(),
             summary: "Payload public content flow evidence is covered.".to_string(),
@@ -9558,6 +9583,7 @@ mod tests {
     fn packet_ranking_demotes_test_paths_without_fixture_specific_boosts() {
         let question = "Trace route dispatch through a handler.";
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "rank-fixture".to_string(),
             prompt: question.to_string(),
             summary: "Route evidence is covered by cited anchors.".to_string(),
@@ -9599,6 +9625,7 @@ mod tests {
     fn packet_ranking_demotes_test_named_source_helpers_for_production_prompts() {
         let question = "Explain runtime orchestration and search projection in the indexing flow.";
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "rank-test-symbols".to_string(),
             prompt: question.to_string(),
             summary: "Runtime evidence is covered by cited anchors.".to_string(),
@@ -9665,6 +9692,7 @@ mod tests {
     fn packet_ranking_demotes_non_primary_roles_for_production_prompts() {
         let question = "Trace production route dispatch through the handler.";
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "rank-roles".to_string(),
             prompt: question.to_string(),
             summary: "Route evidence is covered by cited anchors.".to_string(),
@@ -9709,6 +9737,7 @@ mod tests {
     fn packet_ranking_keeps_requested_docs_role_eligible() {
         let question = "Trace the docs route dispatch example.";
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "rank-docs".to_string(),
             prompt: question.to_string(),
             summary: "Route evidence is covered by cited anchors.".to_string(),

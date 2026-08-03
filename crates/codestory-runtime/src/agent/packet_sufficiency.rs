@@ -1,5 +1,6 @@
 use crate::agent::packet_budget::next_deeper_packet_argv;
 use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
+use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_degradation::packet_primary_retrieval_truncated;
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::packet_evidence_role;
@@ -309,6 +310,7 @@ fn assemble_packet_sufficiency_with_probe_context(
     // EV-7/EV-8: two facts about how this packet was collected, both of which bound what its
     // evidence can be reported as regardless of how well the claims themselves scored.
     let freshness = PacketFreshnessInput::from_observation(answer.freshness.as_ref());
+    let coverage = PacketCoverageInput::from_observations(&answer.source_coverage);
     let primary_retrieval_truncated = packet_primary_retrieval_truncated(answer);
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
         budget,
@@ -324,6 +326,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         missing_required_probe_queries: &blocking_missing_probe_queries,
         unresolved_sidecar_queries: &blocking_unresolved_sidecar_queries,
         freshness,
+        coverage: &coverage,
         primary_retrieval_truncated,
     });
 
@@ -350,6 +353,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         &missing_required_flow_requirements,
         &blocking_unresolved_sidecar_queries,
         freshness,
+        &coverage,
         primary_retrieval_truncated,
     );
     if let Some(obligations) = obligations {
@@ -438,6 +442,20 @@ fn assemble_packet_sufficiency_with_probe_context(
     }
     for path in &reported_claim_open_next_paths {
         push_unique_term(&mut open_next_paths, path);
+    }
+    // Filtered once, after every source has contributed, because leads arrive
+    // from three of them. Capping on coverage flips `terminally_sufficient`
+    // false, which is exactly what opens follow-up generation — so without
+    // this the cap turns a packet that answered and stopped into one that
+    // re-probes a permanently unindexable file every round. A path the index
+    // can never cover is not a lead.
+    let unprovable_paths = coverage.unprovable_paths();
+    if !unprovable_paths.is_empty() {
+        open_next_paths.retain(|path| {
+            !unprovable_paths
+                .iter()
+                .any(|unprovable| packet_paths_match_exact_probe(project_root, unprovable, path))
+        });
     }
     let blocking_follow_up_probe_queries = packet_interleave_follow_up_queries(
         &open_next_paths,
@@ -606,6 +624,11 @@ struct PacketSufficiencyStatusInput<'a> {
     unresolved_sidecar_queries: &'a [String],
     /// EV-7: how well this packet's publication was known to match the working tree.
     freshness: PacketFreshnessInput,
+    /// CAP-1: whether the index actually covered the files this packet rested on.
+    ///
+    /// Distinct from `has_minimum_coverage`, which is about how many *claims* carry evidence.
+    /// This is about whether the underlying files were indexed at all.
+    coverage: &'a PacketCoverageInput,
     /// EV-8: whether the primary retrieval run lost evidence it planned to collect.
     primary_retrieval_truncated: bool,
 }
@@ -625,10 +648,11 @@ fn packet_sufficiency_status(
         || !input.missing_required_probe_queries.is_empty()
         || !input.unresolved_sidecar_queries.is_empty()
         || input.has_sufficiency_blocking_budget_omission
-        // Both of these are caps, not floors: they can only stop a packet that would otherwise be
+        // These three are caps, not floors: they can only stop a packet that would otherwise be
         // Sufficient from claiming it. A packet with no eligible citation stays Insufficient
         // above, and everything that was already Partial stays Partial.
         || input.freshness.caps_sufficiency()
+        || input.coverage.caps_sufficiency()
         || input.primary_retrieval_truncated
         || packet_budget_exceeded_hard_output_cap(input.budget)
     {
@@ -1290,6 +1314,7 @@ fn packet_sufficiency_gaps(
     missing_required_flow_requirements: &[FlowRequirement],
     unresolved_sidecar_queries: &[String],
     freshness: PacketFreshnessInput,
+    coverage: &PacketCoverageInput,
     primary_retrieval_truncated: bool,
 ) -> Vec<String> {
     let mut gaps = Vec::new();
@@ -1298,6 +1323,7 @@ fn packet_sufficiency_gaps(
     if let Some(gap) = freshness.gap() {
         gaps.push(gap);
     }
+    gaps.extend(coverage.gaps());
     if primary_retrieval_truncated {
         gaps.push(
             "primary retrieval truncated: the primary retrieval run ended before collecting the \
@@ -2558,6 +2584,7 @@ mod tests {
         PacketEvidenceTierDto, PacketProofStatusDto, PacketSidecarQueryDiagnosticDto,
         RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStageTimingDto, SearchHitOrigin,
     };
+    use codestory_contracts::api::{SourceCoverageObservationDto, SourceCoverageStatusDto};
     use std::path::Path;
 
     #[test]
@@ -2668,6 +2695,7 @@ mod tests {
 
     fn answer_fixture(question: &str) -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-sufficiency-test".to_string(),
             prompt: question.to_string(),
             summary: "Covered by cited anchors.".to_string(),
@@ -2958,7 +2986,18 @@ mod tests {
         edges: &[(&str, &str)],
         extra_probes: &[String],
     ) -> (PacketSufficiencyDto, Vec<PacketClaimDto>) {
+        production_route_sufficiency_with_coverage(question, names, edges, extra_probes, Vec::new())
+    }
+
+    fn production_route_sufficiency_with_coverage(
+        question: &str,
+        names: &[&str],
+        edges: &[(&str, &str)],
+        extra_probes: &[String],
+        source_coverage: Vec<SourceCoverageObservationDto>,
+    ) -> (PacketSufficiencyDto, Vec<PacketClaimDto>) {
         let mut answer = route_answer(question, names, edges);
+        answer.source_coverage = source_coverage;
         for citation in &mut answer.citations {
             citation.file_path = Some(format!("src/router/{}.rs", citation.display_name));
         }
@@ -3024,6 +3063,124 @@ mod tests {
             &obligations,
         );
         (sufficiency, claims)
+    }
+
+    /// CAP-1: a packet resting on a file the index refused must not report
+    /// `Sufficient`.
+    ///
+    /// This is the Route B hole. A *required* file-scoped citation is minted
+    /// `eligible_for_sufficiency`, unlike an explicitly probed one, so before
+    /// this cap a packet could carry a proof-bearing claim over a file the
+    /// index deliberately never read and still claim sufficiency. The
+    /// probe-side route already capped, which is exactly why this one was
+    /// invisible.
+    #[test]
+    fn a_packet_resting_on_an_excluded_file_cannot_be_sufficient() {
+        let question = "alpha -> omega";
+        let names = ["alpha", "omega", "RouteSupport"];
+        let edges = [("alpha", "omega")];
+
+        let (baseline, _) = production_route_sufficiency(question, &names, &edges);
+        assert_eq!(
+            baseline.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "the control must be Sufficient or this test proves nothing: {baseline:?}"
+        );
+
+        let (capped, _) = production_route_sufficiency_with_coverage(
+            question,
+            &names,
+            &edges,
+            &[],
+            vec![SourceCoverageObservationDto {
+                path: "src/router/alpha.rs".to_string(),
+                status: SourceCoverageStatusDto::PolicyExcluded,
+                reason: None,
+                not_established_cause: None,
+                observed_size: Some(1_500_000),
+                byte_cap: Some(1_048_576),
+            }],
+        );
+        assert_eq!(
+            capped.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{capped:?}"
+        );
+        assert!(
+            capped
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("source coverage") && gap.contains("alpha.rs")),
+            "the gap must name the file and say it is a coverage problem: {capped:?}"
+        );
+        assert!(
+            capped
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("1500000") && gap.contains("1048576")),
+            "the gap must name the numbers, not just the word: {capped:?}"
+        );
+    }
+
+    /// An empty observation list must cap nothing.
+    ///
+    /// The asymmetry with freshness at the level that matters: freshness treats
+    /// a missing observation as unknown-and-capping, so copying it wholesale
+    /// would turn every packet that cites nothing into `Partial`.
+    #[test]
+    fn a_packet_with_no_coverage_observations_is_unaffected() {
+        let (sufficiency, _) = production_route_sufficiency(
+            "alpha -> omega",
+            &["alpha", "omega", "RouteSupport"],
+            &[("alpha", "omega")],
+        );
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "{sufficiency:?}"
+        );
+        assert!(
+            !sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("source coverage")),
+            "{sufficiency:?}"
+        );
+    }
+
+    /// Step 7 without step 8 turns a packet that answered and stopped into one
+    /// that re-probes a permanently unindexable file forever: capping flips
+    /// `terminally_sufficient` false, which is what opens follow-up generation.
+    #[test]
+    fn an_excluded_file_is_never_offered_as_a_follow_up_lead() {
+        let (capped, _) = production_route_sufficiency_with_coverage(
+            "alpha -> omega",
+            &["alpha", "omega", "RouteSupport"],
+            &[("alpha", "omega")],
+            &[],
+            vec![SourceCoverageObservationDto {
+                path: "src/router/alpha.rs".to_string(),
+                status: SourceCoverageStatusDto::PolicyExcluded,
+                reason: None,
+                not_established_cause: None,
+                observed_size: Some(1_500_000),
+                byte_cap: Some(1_048_576),
+            }],
+        );
+        assert!(
+            !capped
+                .open_next
+                .iter()
+                .any(|lead| lead.contains("src/router/alpha.rs")),
+            "a file the index can never cover is not a lead: {capped:?}"
+        );
+        assert!(
+            !capped
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("src/router/alpha.rs")),
+            "{capped:?}"
+        );
     }
 
     fn assert_unresolved_route_order(sufficiency: &PacketSufficiencyDto) {

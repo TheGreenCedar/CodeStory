@@ -241,6 +241,7 @@ mod golden_tests {
         }];
         let rank_terms = vec!["exec".to_string(), "events".to_string()];
         let mut answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "golden".to_string(),
             prompt: "trace exec flow".to_string(),
             summary: "summary".to_string(),

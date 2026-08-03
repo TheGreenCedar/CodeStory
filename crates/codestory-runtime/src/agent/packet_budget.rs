@@ -1073,6 +1073,7 @@ mod tests {
 
     fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
         let answer = AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-budget-test".to_string(),
             prompt: question.to_string(),
             summary: "Packet budget test answer.".to_string(),

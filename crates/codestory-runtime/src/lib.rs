@@ -89,6 +89,7 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
+mod source_coverage;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{packet_step_trace_json, plan_packet};

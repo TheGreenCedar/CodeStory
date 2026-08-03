@@ -9,6 +9,7 @@ pub(crate) mod packet_claim_profile_registry;
 pub(crate) mod packet_claim_profiles;
 pub(crate) mod packet_claims;
 pub(crate) mod packet_command_profiles;
+pub(crate) mod packet_coverage;
 pub(crate) mod packet_degradation;
 pub(crate) mod packet_evidence;
 pub(crate) mod packet_freshness;

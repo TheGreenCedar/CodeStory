@@ -1304,6 +1304,7 @@ mod tests {
 
     fn answer_fixture(citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
         AgentAnswerDto {
+            source_coverage: Vec::new(),
             answer_id: "packet-capping-test".to_string(),
             prompt: "Trace the generic flow.".to_string(),
             summary: "Covered by cited anchors.".to_string(),
