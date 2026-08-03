@@ -619,6 +619,11 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             "core_promotion_bytes: candidate={} previous_live={} rollback_backup={}",
             promotion.candidate_bytes, previous_live_bytes, rollback_backup_bytes,
         );
+        let _ = writeln!(
+            markdown,
+            "core_promotion_fence: promoted_validation={}",
+            promotion.promoted_validation.as_str(),
+        );
     }
     append_optional_timings_line(
         markdown,

@@ -25,6 +25,35 @@ pub struct DatabaseSnapshotCopyTimings {
     pub target_bytes: u64,
 }
 
+/// How a promotion proved the published core matched the candidate it validated.
+///
+/// Whole-database restore can seal a candidate image and then show the
+/// published file is byte-identical to it, which is what
+/// `ReusedCandidateReceipt` reports. Any publication design that assembles the
+/// live image in place instead of copying a pre-validated file cannot make that
+/// claim, so this field is the observable difference between the two.
+/// `Revalidated` is the default so an absent value never reads as a proven
+/// byte-identical publication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotedValidationDto {
+    /// The published file was proven byte-identical to the validated candidate.
+    ReusedCandidateReceipt,
+    /// The published file could not be proven identical, so it was validated in full.
+    #[default]
+    Revalidated,
+}
+
+impl PromotedValidationDto {
+    /// The wire name, so renderers cannot drift from the serialized value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReusedCandidateReceipt => "reused_candidate_receipt",
+            Self::Revalidated => "revalidated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct CorePromotionTimings {
     pub total_ms: u32,
@@ -48,6 +77,8 @@ pub struct CorePromotionTimings {
     pub previous_live_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_backup_bytes: Option<u64>,
+    #[serde(default)]
+    pub promoted_validation: PromotedValidationDto,
 }
 
 /// Why an incremental refresh did or did not skip its staged republication.
@@ -856,6 +887,7 @@ mod tests {
             candidate_bytes: 2_048,
             previous_live_bytes: Some(1_024),
             rollback_backup_bytes: Some(1_024),
+            promoted_validation: PromotedValidationDto::ReusedCandidateReceipt,
         };
         let timings = IndexingPhaseTimings {
             staged_snapshot_copy: Some(snapshot_copy.clone()),
@@ -866,10 +898,55 @@ mod tests {
         let value = serde_json::to_value(&timings).expect("serialize timings");
         assert_eq!(value["staged_snapshot_copy"]["copy_ms"], 13);
         assert_eq!(value["core_promotion"]["staged_to_live_restore_ms"], 15);
+        assert_eq!(
+            value["core_promotion"]["promoted_validation"],
+            "reused_candidate_receipt"
+        );
         let decoded: IndexingPhaseTimings =
             serde_json::from_value(value).expect("deserialize timings");
         assert_eq!(decoded.staged_snapshot_copy, Some(snapshot_copy));
         assert_eq!(decoded.core_promotion, Some(core_promotion));
+    }
+
+    /// A payload that never carried the fence field must not read as a proven
+    /// byte-identical publication. The absent value is the weaker claim.
+    #[test]
+    fn test_core_promotion_without_a_recorded_fence_decodes_as_revalidated() {
+        let timings = IndexingPhaseTimings {
+            core_promotion: Some(CorePromotionTimings {
+                total_ms: 89,
+                staged_to_live_restore_ms: 15,
+                candidate_bytes: 2_048,
+                promoted_validation: PromotedValidationDto::ReusedCandidateReceipt,
+                ..CorePromotionTimings::default()
+            }),
+            ..IndexingPhaseTimings::default()
+        };
+        let mut value = serde_json::to_value(&timings).expect("serialize timings");
+        // Strip the field to reproduce a payload written before it existed.
+        let removed = value["core_promotion"]
+            .as_object_mut()
+            .expect("promotion object")
+            .remove("promoted_validation");
+        assert_eq!(
+            removed,
+            Some(serde_json::Value::String(
+                "reused_candidate_receipt".to_string()
+            )),
+            "the fixture must actually remove a present field"
+        );
+
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize legacy timings");
+
+        let promotion = decoded
+            .core_promotion
+            .expect("legacy promotion diagnostics carry through");
+        assert_eq!(promotion.staged_to_live_restore_ms, 15);
+        assert_eq!(
+            promotion.promoted_validation,
+            PromotedValidationDto::Revalidated,
+        );
     }
 
     #[test]

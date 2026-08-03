@@ -89,8 +89,8 @@ use codestory_contracts::api::{
     ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
     CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListRootSymbolsRequest,
-    OpenProjectRequest, StartIndexingRequest, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WriteFileTextRequest,
+    OpenProjectRequest, PromotedValidationDto, StartIndexingRequest, UpdateBookmarkCategoryRequest,
+    UpdateBookmarkRequest, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
@@ -6375,6 +6375,14 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert!(full_promotion.backup_validation_ms.is_none());
     assert!(full_promotion.rollback_backup_bytes.is_none());
     assert!(full_promotion.candidate_bytes > 0);
+    // Whole-database restore publishes a file byte-identical to the candidate
+    // it validated, so the post-restore fence is satisfied by that receipt
+    // rather than by re-deriving the verdict. Any publication design that
+    // assembles the live image in place cannot report this.
+    assert_eq!(
+        full_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
+    );
     assert_promotion_reconciles(full_promotion);
     assert_eq!(full_timings.search_projection_rebuild_ms, Some(0));
     assert!(full_timings.search_symbol_stream_ms.is_some());
@@ -6546,6 +6554,10 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     );
     assert!(incremental_promotion.rollback_backup_copy_ms.is_some());
     assert!(incremental_promotion.backup_validation_ms.is_some());
+    assert_eq!(
+        incremental_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
+    );
     assert_promotion_reconciles(incremental_promotion);
     assert_eq!(incremental_timings.search_projection_rebuild_ms, Some(0));
     assert!(incremental_timings.search_symbol_stream_ms.is_some());
@@ -6578,6 +6590,10 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert_eq!(
         second_full_promotion.rollback_backup_bytes,
         second_full_promotion.previous_live_bytes
+    );
+    assert_eq!(
+        second_full_promotion.promoted_validation,
+        PromotedValidationDto::ReusedCandidateReceipt
     );
     assert_promotion_reconciles(second_full_promotion);
     let third = controller

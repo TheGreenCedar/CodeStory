@@ -536,6 +536,144 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
     }
 
+    /// Whole-database restore is what makes the post-restore identity fence
+    /// cheap: the published file is the validated candidate's bytes, so the
+    /// candidate's receipt covers it. This pins the claim against the files
+    /// themselves, so the reported fence cannot drift from what was published.
+    #[test]
+    fn promotion_receipt_is_backed_by_the_published_and_candidate_bytes() {
+        let temp = fresh_temp_root("receipt-bytes");
+        let live_path = temp.join("live.sqlite");
+        let staged_path = SnapshotStore::staged_path(&live_path);
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "receipt-generation".to_string(),
+            run_id: "receipt-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        {
+            let mut staged = Store::open_build(&staged_path).expect("open staged build store");
+            staged
+                .insert_files_batch(&[crate::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("receipt.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                }])
+                .expect("seed staged file");
+            staged
+                .put_index_publication(&publication)
+                .expect("identify staged publication");
+            publish_empty_source_policy(&mut staged, &publication);
+        }
+        let candidate_bytes = fs::read(&staged_path).expect("read staged candidate bytes");
+
+        let stats =
+            SnapshotStore::promote_staged(&staged_path, &live_path).expect("promote candidate");
+
+        assert_eq!(
+            stats.promoted_validation,
+            crate::PromotedValidation::ReusedCandidateReceipt
+        );
+        let published_bytes = fs::read(&live_path).expect("read published bytes");
+        assert_eq!(
+            published_bytes.len(),
+            candidate_bytes.len(),
+            "a claimed receipt must describe a published file of the candidate's size"
+        );
+        // Only SQLite's own header bookkeeping may differ; every content byte
+        // has to match, or the receipt claimed an identity that does not hold.
+        const SQLITE_HEADER_BYTES: usize = 100;
+        assert_eq!(
+            &published_bytes[SQLITE_HEADER_BYTES..],
+            &candidate_bytes[SQLITE_HEADER_BYTES..],
+            "a claimed receipt must describe the candidate's pages"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// The post-restore fence may only claim the candidate receipt when the
+    /// promotion can actually prove the published file byte-identical to the
+    /// validated candidate. A staged image with live content outside the main
+    /// file is unprovable, and the promotion must report the weaker claim
+    /// instead of asserting an identity it never established.
+    #[test]
+    fn promotion_reports_revalidated_when_the_candidate_image_is_unprovable() {
+        let temp = fresh_temp_root("unprovable-candidate-image");
+        let live_path = temp.join("live.sqlite");
+        let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
+        let staged_path = staged.path().to_path_buf();
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("unprovable.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed staged file");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "unprovable-generation".to_string(),
+            run_id: "unprovable-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify staged publication");
+        publish_empty_source_policy(staged.store_mut(), &publication);
+
+        // A second reader pins the staged WAL, so closing the build writer
+        // cannot checkpoint it away and the staged content stays outside the
+        // main database file the promotion would have to digest.
+        let staged_reader = rusqlite::Connection::open(&staged_path).expect("open staged reader");
+        staged_reader
+            .execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM file;")
+            .expect("pin staged reader snapshot");
+        let staged_wal = PathBuf::from(format!("{}-wal", staged_path.display()));
+        assert!(
+            fs::metadata(&staged_wal)
+                .expect("read staged WAL size")
+                .len()
+                > 0,
+            "fixture must leave staged content outside the main database file"
+        );
+
+        let publish_stats = staged
+            .publish_with_stats(&live_path)
+            .expect("promote an unprovable staged candidate");
+
+        assert_eq!(
+            publish_stats.core_promotion.promoted_validation,
+            crate::PromotedValidation::Revalidated,
+            "an unprovable candidate image must not claim the byte-identity receipt"
+        );
+        let live = Store::open(&live_path).expect("open promoted live store");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read promoted publication"),
+            Some(publication),
+            "the weaker fence still has to publish the candidate"
+        );
+
+        drop(live);
+        drop(staged_reader);
+        let _ = Store::discard_staged_snapshot(&staged_path);
+        let _ = fs::remove_dir_all(&temp);
+    }
+
     #[test]
     fn staged_finalize_builds_summary_destination_indexes_in_required_order() {
         const DESTINATION_INDEXES: &[&str] = &[

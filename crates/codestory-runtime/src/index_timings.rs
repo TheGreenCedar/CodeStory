@@ -5,6 +5,7 @@ use codestory_contracts::api::{
     ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
     DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalPlanProbeTimings,
     IndexingPhaseTimings, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
+    PromotedValidationDto,
 };
 use codestory_indexer::{ArtifactCacheFamilyStats, ArtifactCachePolicy, IncrementalIndexingStats};
 #[cfg(test)]
@@ -400,6 +401,12 @@ pub(super) fn core_promotion_timings(
         candidate_bytes: stats.candidate_bytes,
         previous_live_bytes: stats.previous_live_bytes,
         rollback_backup_bytes: stats.rollback_backup_bytes,
+        promoted_validation: match stats.promoted_validation {
+            codestory_store::PromotedValidation::ReusedCandidateReceipt => {
+                PromotedValidationDto::ReusedCandidateReceipt
+            }
+            codestory_store::PromotedValidation::Revalidated => PromotedValidationDto::Revalidated,
+        },
     }
 }
 

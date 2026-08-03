@@ -7,8 +7,8 @@ use codestory_contracts::api::{
     PacketBudgetModeDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto, PacketPlanQueryDto,
     PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
     PacketTaskClassDto, ProjectSummary, ProjectionPersistenceFamilyTimings,
-    ProjectionPersistenceTimings, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-    SemanticModeDto, StorageStatsDto,
+    ProjectionPersistenceTimings, PromotedValidationDto, RetrievalModeDto, RetrievalStateDto,
+    SearchHit, SearchHitOrigin, SemanticModeDto, StorageStatsDto,
 };
 
 pub(super) fn sample_retrieval() -> RetrievalStateDto {
@@ -370,6 +370,7 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             candidate_bytes: 2_048,
             previous_live_bytes: Some(1_024),
             rollback_backup_bytes: Some(1_024),
+            promoted_validation: PromotedValidationDto::ReusedCandidateReceipt,
         }),
         incremental_plan_probe: Some(IncrementalPlanProbeTimings {
             outcome: IncrementalPlanProbeOutcomeDto::PlanNotEmpty,
