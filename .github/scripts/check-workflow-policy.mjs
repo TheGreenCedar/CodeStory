@@ -2344,6 +2344,8 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
       "scripts/tests/fixtures/release-claims/**",
+      ".github/scripts/publish-marketplace-catalog.mjs",
+      ".github/scripts/publish-marketplace-catalog.test.mjs",
       "benchmarks/release-evidence/**",
       ".github/workflows/**",
       ".github/workflows/release.yml",
@@ -2360,7 +2362,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "scripts/prepare-embedded-model.mjs",
       "scripts/tests/prepare-embedded-model.test.mjs",
       "scripts/prove-plugin-pinned-provision.mjs",
+      "scripts/build-release-manifest.mjs",
       "scripts/lib/wait-for-managed-runtime.mjs",
+      "scripts/lib/pinned-archive-digests.mjs",
+      "scripts/lib/provision-proof-lanes.mjs",
+      "scripts/lib/release-manifest.mjs",
       "scripts/tests/prove-plugin-pinned-provision.test.mjs",
       "crates/codestory-llama-sys/model-contract.json",
       "crates/codestory-llama-sys/build.rs",
@@ -2394,6 +2400,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
+      ".github/scripts/publish-marketplace-catalog.test.mjs",
       "scripts/tests/release-evidence-runner-contract.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
@@ -2941,8 +2948,12 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     '[ "$TOKEN_OUTCOME" = "success" ]',
     '[ "$PUBLISH_OUTCOME" = "success" ]',
     `printf '%s' "$PUBLISHED_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
-    'echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"',
-    'echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"',
+    'echo "catalog_published=$catalog_published"',
+    'echo "marketplace_revision=$marketplace_revision"',
+    // The delivery state and the rollback target leave this step through one grouped redirect,
+    // so the redirect itself is pinned: the echoes alone would be satisfied by a step that
+    // computed the state and wrote it nowhere.
+    '} >> "$GITHUB_OUTPUT"',
     "::warning::Catalog publication deferred",
     "recover with $RECOVERY_WORKFLOW",
     // The recovery workflow mints the SAME credential from the SAME environment, so it recovers
@@ -2956,6 +2967,31 @@ function catalogDeliveryOutcomeViolations(file, job, delivery) {
     object(job.outputs).catalog_published === "${{ steps.delivery.outputs.catalog_published }}"
       && object(job.outputs).marketplace_revision === "${{ steps.delivery.outputs.marketplace_revision }}",
     `${file} marketplace publication must publish the recorded delivery state, not the raw push result`,
+  );
+  // The rollback target. A catalog move with no recorded predecessor is a move nobody can undo, so
+  // every name the graph declares has to leave the push step, be written by the delivery step, and
+  // leave the job -- a break anywhere in that chain loses the only record of what to restore.
+  for (const name of list(object(delivery.recovery).previous_pin_outputs)) {
+    add(
+      violations,
+      object(job.outputs)[name] === `\${{ steps.delivery.outputs.${name} }}`,
+      `${file} marketplace publication must publish the recorded ${name}`,
+    );
+    add(
+      violations,
+      executableRunText(String(deliveryOutcome?.run ?? "")).includes(`echo "${name}=`),
+      `${file} catalog delivery outcome must record ${name}`,
+    );
+  }
+  add(
+    violations,
+    object(deliveryOutcome?.env).PREVIOUS_REVISION
+        === "${{ steps.publish.outputs.previous_marketplace_revision }}"
+      && object(deliveryOutcome?.env).PREVIOUS_PLUGIN_SHA
+        === "${{ steps.publish.outputs.previous_plugin_sha }}"
+      && object(deliveryOutcome?.env).PREVIOUS_PLUGIN_VERSION
+        === "${{ steps.publish.outputs.previous_plugin_version }}",
+    `${file} catalog delivery outcome must read the rollback target the catalog move recorded`,
   );
   // A retry would collapse distinguishable failures into one opaque one and could publish on a
   // second attempt after the first was already recorded, so this job gets exactly one attempt.
@@ -3056,10 +3092,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
     ".github/scripts/build-marketplace-fixture.test.mjs",
+    // The catalog publisher records the pin a rollback would restore and refuses to move a
+    // catalog it cannot name a rollback target for. Both are release behaviour, so the suite
+    // runs on the release lane's own policy job.
+    ".github/scripts/publish-marketplace-catalog.test.mjs",
     "scripts/tests/codestory-release-claims.test.mjs",
     "scripts/tests/codestory-release-cell-manifest.test.mjs",
     "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
+    // The publish job generates the release manifest with scripts/build-release-manifest.mjs, so
+    // the suite that proves the generator refuses drifted archives runs before any proof does.
+    "scripts/tests/prove-plugin-pinned-provision.test.mjs",
   ]);
   requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", [
     "node .github/scripts/check-workflow-policy.mjs",
@@ -3452,6 +3495,28 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "node scripts/codestory-release-claims.mjs release-platform-notes",
     "--ledger target/release-closeout/pre_publish/ledger.json",
   ]);
+  // The native lane's archive digests. The frozen source cannot carry them, so they are generated
+  // here from the built archives and shipped with the release. The generation has to happen after
+  // the checksums exist -- it cross-checks against them -- and before the release is created, or
+  // the launcher fetches a manifest that describes bytes nobody published.
+  requireStepRun(violations, releaseFile, publish, "Generate the release manifest", [
+    "node scripts/build-release-manifest.mjs",
+    '--version "$VERSION"',
+    '--tag "$TAG"',
+    '--commit "$GITHUB_SHA"',
+    "--assets target/release-assets",
+    "--output target/release-assets/codestory-release-manifest.json",
+  ]);
+  requireStepEnv(violations, releaseFile, publish, "Generate the release manifest", {
+    TAG: "${{ needs.preflight.outputs.tag }}",
+    VERSION: "${{ needs.preflight.outputs.version }}",
+  });
+  add(
+    violations,
+    stepIndex(publish, "Combine and verify checksums") < stepIndex(publish, "Generate the release manifest")
+      && stepIndex(publish, "Generate the release manifest") < stepIndex(publish, "Create GitHub release"),
+    `${releaseFile} must generate the release manifest from verified checksums before creating the release`,
+  );
   // The ledger the README tells readers to consult has to be reachable from the release itself.
   requireStepRun(violations, releaseFile, publish, "Ship the accepted closeout summary with the release", [
     "target/release-closeout/pre_publish/summary.json",
@@ -10516,8 +10581,12 @@ export function validatePluginRelease(workflows, violations, graph) {
   requireStepRun(violations, file, object(jobs["plugin-proof"]), "Check the pinned provision proof", [
     "node --test scripts/tests/prove-plugin-pinned-provision.test.mjs",
   ]);
+  // The lane is stated, never defaulted. The native lane's pin lawfully carries no archive
+  // digests, so a plugin-lane gate that stopped naming its lane could silently become one that
+  // proves nothing about the source pin it exists to enforce.
   requireStepRun(violations, file, object(jobs["plugin-proof"]), "Provision the pinned CLI end to end", [
     "scripts/prove-plugin-pinned-provision.mjs",
+    "--lane plugin",
   ]);
   requireStepRun(violations, file, object(jobs.publish), "Re-verify main before tagging", [
     "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
@@ -10611,7 +10680,7 @@ export function validatePluginRelease(workflows, violations, graph) {
   );
 }
 
-export function validateMarketplaceSync(workflows, violations) {
+export function validateMarketplaceSync(workflows, violations, graph) {
   const file = "marketplace-sync.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
@@ -10755,6 +10824,52 @@ export function validateMarketplaceSync(workflows, violations) {
     stepIndex(job, checkout) > stepIndex(job, guard),
     `${file} must validate the dispatched commit before checking it out`,
   );
+  // A catalog moved by this workflow is a RECOVERY, not the publication that shipped the plugin.
+  // The two stay distinguishable only if this lane records its own identity, and the rollback it
+  // performs is only undoable if the pin it replaced is recorded with it.
+  const recovery = object(object(graph?.workflow_policy?.catalog_delivery).recovery);
+  const recoveryStep = "Record catalog recovery identity";
+  requireStepRun(violations, file, job, "Point the catalog at the published release", [
+    "publish-marketplace-catalog.mjs",
+    '--github-output "$GITHUB_OUTPUT"',
+  ]);
+  add(
+    violations,
+    namedStep(job, "Point the catalog at the published release")?.id === "publish",
+    `${file} catalog push must publish its recorded pin under the id the identity step reads`,
+  );
+  add(
+    violations,
+    object(namedStep(job, recoveryStep)?.env).CATALOG_DELIVERY === recovery.id,
+    `${file} must record the ${recovery.id} delivery identity the release claim graph declares`,
+  );
+  for (const name of list(recovery.previous_pin_outputs)) {
+    add(
+      violations,
+      scalarStrings(object(namedStep(job, recoveryStep)?.env)).includes(
+        `\${{ steps.publish.outputs.${name} }}`,
+      ),
+      `${file} ${recoveryStep} must carry the recorded ${name}`,
+    );
+  }
+  requireStepRun(violations, file, job, recoveryStep, [
+    // A recovery that cannot name the immutable catalog revision it produced has not recorded a
+    // distinguishable identity, only a claim that one happened.
+    `printf '%s' "$MARKETPLACE_REVISION" | grep -Eq '^[0-9a-f]{40}$'`,
+    'echo "Catalog delivery state: $CATALOG_DELIVERY',
+  ]);
+  add(
+    violations,
+    stepIndex(job, recoveryStep) > stepIndex(job, "Point the catalog at the published release"),
+    `${file} must record the recovery identity from the catalog move it actually performed`,
+  );
+  for (const state of list(object(graph?.workflow_policy?.catalog_delivery).states)) {
+    add(
+      violations,
+      object(state).id !== recovery.id,
+      `${file} recovery identity must not reuse the ${object(state).id} delivery state`,
+    );
+  }
 }
 
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
@@ -10795,7 +10910,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...reusableWorkflowPermissionViolations(workflows));
   validateCargoTestFilters(workflows, violations);
   validatePluginRelease(workflows, violations, graph);
-  validateMarketplaceSync(workflows, violations);
+  validateMarketplaceSync(workflows, violations, graph);
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations, graph);

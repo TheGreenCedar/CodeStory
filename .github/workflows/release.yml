@@ -66,10 +66,12 @@ jobs:
         run: >-
           node --test
           .github/scripts/build-marketplace-fixture.test.mjs
+          .github/scripts/publish-marketplace-catalog.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-cell-manifest.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
+          scripts/tests/prove-plugin-pinned-provision.test.mjs
 
       - name: Enforce workflow policy
         run: |
@@ -688,6 +690,25 @@ jobs:
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
 
+      # The native lane's archive digests. They cannot live in the frozen source tree -- these
+      # archives are built FROM that tree -- so they are generated here, from the bytes this
+      # release actually produced, and shipped as a release asset. Every digest is read off the
+      # archive file and cross-checked against SHA256SUMS.txt, so a checksum file that drifted
+      # from its archives stops the release instead of pinning the wrong bytes. Until the
+      # signature arms this is corruption detection over the release channel, not authentication.
+      - name: Generate the release manifest
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/build-release-manifest.mjs \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --commit "$GITHUB_SHA" \
+            --assets target/release-assets \
+            --output target/release-assets/codestory-release-manifest.json
+
       - name: Ship the accepted closeout summary with the release
         run: |
           set -euo pipefail
@@ -750,7 +771,8 @@ jobs:
           printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
           find target/release-assets -maxdepth 1 -type f \
             \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' \
-               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \) \
+               -o -name 'SHA256SUMS.txt' -o -name 'release-closeout-summary.json' \
+               -o -name 'codestory-release-manifest.json' \) \
             -exec basename {} \; | sort > "$actual_file"
           if ! diff -u "$expected_file" "$actual_file"; then
             echo "::error::Release assets differ from the release claim graph."
@@ -785,6 +807,11 @@ jobs:
     outputs:
       catalog_published: ${{ steps.delivery.outputs.catalog_published }}
       marketplace_revision: ${{ steps.delivery.outputs.marketplace_revision }}
+      # What the catalog served before this run moved it. A catalog move with no recorded
+      # predecessor is a move nobody can undo, so the rollback target travels with the state.
+      previous_marketplace_revision: ${{ steps.delivery.outputs.previous_marketplace_revision }}
+      previous_plugin_sha: ${{ steps.delivery.outputs.previous_plugin_sha }}
+      previous_plugin_version: ${{ steps.delivery.outputs.previous_plugin_version }}
     steps:
       - name: Checkout exact release source
         uses: actions/checkout@v5
@@ -829,6 +856,9 @@ jobs:
           TOKEN_OUTCOME: ${{ steps.token.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           PUBLISHED_REVISION: ${{ steps.publish.outputs.marketplace_revision }}
+          PREVIOUS_REVISION: ${{ steps.publish.outputs.previous_marketplace_revision }}
+          PREVIOUS_PLUGIN_SHA: ${{ steps.publish.outputs.previous_plugin_sha }}
+          PREVIOUS_PLUGIN_VERSION: ${{ steps.publish.outputs.previous_plugin_version }}
           RECOVERY_WORKFLOW: marketplace-sync.yml
         run: |
           set -euo pipefail
@@ -840,10 +870,19 @@ jobs:
             catalog_published=true
             marketplace_revision="$PUBLISHED_REVISION"
           fi
-          echo "catalog_published=$catalog_published" >> "$GITHUB_OUTPUT"
-          echo "marketplace_revision=$marketplace_revision" >> "$GITHUB_OUTPUT"
+          # The rollback target is recorded whatever happened. On a published run it names the
+          # release a restore would return to; on a deferred run it names the release the catalog
+          # is still serving.
+          {
+            echo "catalog_published=$catalog_published"
+            echo "marketplace_revision=$marketplace_revision"
+            echo "previous_marketplace_revision=$PREVIOUS_REVISION"
+            echo "previous_plugin_sha=$PREVIOUS_PLUGIN_SHA"
+            echo "previous_plugin_version=$PREVIOUS_PLUGIN_VERSION"
+          } >> "$GITHUB_OUTPUT"
           if [ "$catalog_published" = "true" ]; then
             echo "Catalog delivery: published at $marketplace_revision." >> "$GITHUB_STEP_SUMMARY"
+            echo "Rollback target: codestory $PREVIOUS_PLUGIN_VERSION at $PREVIOUS_PLUGIN_SHA (catalog $PREVIOUS_REVISION), restorable with $RECOVERY_WORKFLOW." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # $RECOVERY_WORKFLOW mints the SAME credential from the SAME environment, so it recovers a

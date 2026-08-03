@@ -709,6 +709,9 @@ test("public support, assets, and release notes derive from the package and clos
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
       "codestory-cli-v0.16.0-linux-x64.tar.gz",
       "SHA256SUMS.txt",
+      // A native release cannot pin its own archive digests in source, so the release generates
+      // them from the archives it built and ships them as an asset the launcher can fetch.
+      "codestory-release-manifest.json",
       // The README tells a reader to consult the ledger rather than the platform table, so the
       // machine-readable closeout summary has to ship with the release itself.
       "release-closeout-summary.json",
@@ -1067,6 +1070,54 @@ test("catalog delivery declares two distinguishable states and no release gate",
   assert.throws(
     () => validateReleaseClaimGraph(unrecoverable),
     /workflow_policy\.catalog_delivery\.recovery_workflow/u,
+  );
+});
+
+// Publication and recovery are different events. Folding recovery into the published identity is
+// how a catalog restored days later would read as the catalog the release itself delivered, and a
+// rollback with no recorded target is a rollback nobody can perform.
+test("catalog recovery is a distinguishable identity with a recorded rollback target", () => {
+  const recovery = graph.workflow_policy.catalog_delivery.recovery;
+  assert.equal(recovery.id, "recovered");
+  assert.equal(
+    graph.workflow_policy.catalog_delivery.states.some(({ id }) => id === recovery.id),
+    false,
+  );
+  assert.deepEqual(recovery.previous_pin_outputs, [
+    "previous_marketplace_revision",
+    "previous_plugin_sha",
+    "previous_plugin_version",
+  ]);
+  // Stated rather than implied: no job restores the catalog on its own yet, so the graph refuses
+  // to carry a `true` that documentation could quote as an automatic rollback.
+  assert.equal(recovery.automatic_restore, false);
+
+  const missing = structuredClone(graph);
+  delete missing.workflow_policy.catalog_delivery.recovery;
+  assert.throws(
+    () => validateReleaseClaimGraph(missing),
+    /workflow_policy\.catalog_delivery\.recovery must be an object/u,
+  );
+
+  const collided = structuredClone(graph);
+  collided.workflow_policy.catalog_delivery.recovery.id = "published";
+  assert.throws(
+    () => validateReleaseClaimGraph(collided),
+    /recovery\.id published must be distinct from the delivery states/u,
+  );
+
+  const untargeted = structuredClone(graph);
+  untargeted.workflow_policy.catalog_delivery.recovery.previous_pin_outputs = [];
+  assert.throws(
+    () => validateReleaseClaimGraph(untargeted),
+    /previous_pin_outputs must name the recorded rollback target/u,
+  );
+
+  const overclaimed = structuredClone(graph);
+  overclaimed.workflow_policy.catalog_delivery.recovery.automatic_restore = true;
+  assert.throws(
+    () => validateReleaseClaimGraph(overclaimed),
+    /automatic_restore must be false while restore is operator-initiated/u,
   );
 });
 

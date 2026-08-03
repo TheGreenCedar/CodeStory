@@ -5,6 +5,8 @@ on:
     paths:
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
+      - .github/scripts/publish-marketplace-catalog.mjs
+      - .github/scripts/publish-marketplace-catalog.test.mjs
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
@@ -71,7 +73,11 @@ on:
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/build-release-manifest.mjs
       - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/lib/pinned-archive-digests.mjs
+      - scripts/lib/provision-proof-lanes.mjs
+      - scripts/lib/release-manifest.mjs
       - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   push:
@@ -81,6 +87,8 @@ on:
     paths:
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
+      - .github/scripts/publish-marketplace-catalog.mjs
+      - .github/scripts/publish-marketplace-catalog.test.mjs
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-packaged-agent-proof.py
@@ -147,7 +155,11 @@ on:
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
+      - scripts/build-release-manifest.mjs
       - scripts/lib/wait-for-managed-runtime.mjs
+      - scripts/lib/pinned-archive-digests.mjs
+      - scripts/lib/provision-proof-lanes.mjs
+      - scripts/lib/release-manifest.mjs
       - scripts/tests/prove-plugin-pinned-provision.test.mjs
       - .codex/environments/environment.toml
   workflow_dispatch:
@@ -195,6 +207,7 @@ jobs:
       - name: Check release claim and evidence contracts
         run: >-
           node --test
+          .github/scripts/publish-marketplace-catalog.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs

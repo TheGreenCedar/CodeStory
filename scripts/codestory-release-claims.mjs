@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { RELEASE_MANIFEST_ASSET } from "./lib/release-manifest.mjs";
+
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
 const GRAPH_VERSION = 11;
 const KNOWN_PACKAGE_TARGETS = new Set([
@@ -531,6 +533,37 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
     if (!(group[key] ?? []).includes("installer")) {
       fail(`workflow_policy.catalog_delivery.installed_cell_group ${installedCellGroup} must carry installer in ${key}`);
     }
+  }
+  // Publication and recovery are different events and the ledger has to be able to tell them
+  // apart, so recovery gets its own declared identity rather than reusing the published one. The
+  // rollback it performs is only real if something records what to roll back TO, which is what
+  // `previous_pin_outputs` names: the publication job carries them out of the catalog move, and a
+  // catalog that cannot name its previous pin is never moved.
+  const recovery = object(delivery.recovery, "workflow_policy.catalog_delivery.recovery");
+  const recoveryId = nonEmptyText(recovery.id, "workflow_policy.catalog_delivery.recovery.id");
+  if (byId.has(recoveryId)) {
+    fail(`workflow_policy.catalog_delivery.recovery.id ${recoveryId} must be distinct from the delivery states`);
+  }
+  if (!identityMatchesFormat(recoveryId, "identifier")) {
+    fail("workflow_policy.catalog_delivery.recovery.id does not match identifier");
+  }
+  const pinOutputs = recovery.previous_pin_outputs;
+  if (!Array.isArray(pinOutputs) || pinOutputs.length === 0) {
+    fail("workflow_policy.catalog_delivery.recovery.previous_pin_outputs must name the recorded rollback target");
+  }
+  for (const [index, name] of pinOutputs.entries()) {
+    const output = nonEmptyText(
+      name,
+      `workflow_policy.catalog_delivery.recovery.previous_pin_outputs[${index}]`,
+    );
+    if (!identityMatchesFormat(output, "identifier")) {
+      fail(`workflow_policy.catalog_delivery.recovery.previous_pin_outputs[${index}] does not match identifier`);
+    }
+  }
+  // Stated, not implied. Restore is operator-initiated through `recovery_workflow` today; the
+  // graph says so rather than letting documentation claim an automatic rollback that no job runs.
+  if (recovery.automatic_restore !== false) {
+    fail("workflow_policy.catalog_delivery.recovery.automatic_restore must be false while restore is operator-initiated");
   }
   return delivery;
 }
@@ -1986,6 +2019,12 @@ export function releaseAssetNames(graph, version) {
         `codestory-cli-v${version}-${target}.${extension}`,
     ),
     "SHA256SUMS.txt",
+    // The native lane's archive digests. They cannot be pinned in source -- the archives are built
+    // from the tree that would carry them -- so the release generates them from the archives it
+    // just built and ships them here, where the launcher and the pre-publish provision proof can
+    // read them. Digest data over TLS until the signature arms: corruption detection, not
+    // authentication.
+    RELEASE_MANIFEST_ASSET,
     // The one machine-readable statement of what this release did and did not prove. It ships with
     // the release because the README tells readers to consult the ledger rather than the platform
     // table, and an Actions artifact with a 30-day retention is not something a release consumer

@@ -18,8 +18,8 @@ sequenceDiagram
     Launcher->>CLI: use verified matching executable when present
     alt executable is missing or incompatible
         Launcher-->>Host: expose fail-open tool catalog and diagnostics
-        Launcher->>Release: fetch archive and SHA256SUMS
-        Launcher->>Launcher: bounded download, safe extraction, checksum and version checks
+        Launcher->>Release: fetch archive, SHA256SUMS, and release manifest
+        Launcher->>Launcher: bounded download, manifest binding, safe extraction, checksum and version checks
         Launcher->>CLI: validate stdio initialize
     end
     Launcher->>CLI: hand off requests without host restart
@@ -29,6 +29,30 @@ Provisioning is single-flight and bounded. A failed or incomplete download is
 not installed as current. The launcher may download the version-matched
 executable; the executable never downloads an embedding model, accelerator
 backend, helper executable, or retrieval service.
+
+### What the archive digests do and do not prove
+
+Two independent records name the archive the launcher installs, and neither is
+a signature.
+
+- The **source pin** in `plugins/codestory/cli-version.json` carries archive
+  digests only when the plugin fast lane pinned an already published CLI. That
+  pin ships inside the reviewed plugin package, so it is a record from a
+  different channel than the download. A native release cannot carry one: its
+  archives are built from the very tree that would hold the digests.
+- The **release manifest** (`codestory-release-manifest.json`) is generated
+  from the archives a release built, carries the release identity and each
+  target's filename, byte length, and SHA-256, and is attached to the release.
+  The launcher fetches it and holds the downloaded archive against it *before*
+  extracting. A release published before the manifest existed carries none;
+  the launcher records that absence rather than treating it as agreement.
+
+Because the manifest travels over the same channel as the archive it
+describes, it is corruption and drift detection, not authentication. Until the
+manifest is signed, the containment for a native release is: an exact
+repository commit pinned in the marketplace catalog over TLS, plus
+`SHA256SUMS.txt` and manifest digests. Signature verification is not shipped,
+and nothing in this repository claims it is.
 
 The fail-open catalog prevents installation work from looking like a missing
 plugin. It keeps diagnostics and the complete tool schema visible while the

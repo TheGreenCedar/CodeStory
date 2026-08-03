@@ -3,14 +3,24 @@
 //
 // Drives plugins/codestory/scripts/codestory-mcp.cjs the way a host does: spawn it, ask for
 // status, and wait for managed runtime metadata. Then verify what was actually provisioned:
-// the manifest must name the pinned version, a real github_release build source, and the pin's
-// own archive digest, and the provisioned binary must report the pinned version.
+// the manifest must name the pinned version and the build source this lane expects, the archive
+// digest must match the authority THIS LANE OWNS, and the provisioned binary must report the
+// pinned version.
 //
-//   node scripts/prove-plugin-pinned-provision.mjs [--timeout-ms 600000]
+//   plugin lane -- the fast lane pins an already-published CLI, so the source pin carries that
+//   release's archive digests and this proof holds the provision against them:
+//     node scripts/prove-plugin-pinned-provision.mjs [--timeout-ms 600000]
+//
+//   native lane -- the pin names the release about to be built from this very tree, so it lawfully
+//   carries no archive digests and the release manifest owns them instead:
+//     node scripts/prove-plugin-pinned-provision.mjs --lane native \
+//       --expect-build-source explicit_package --release-manifest PATH
+//     node scripts/prove-plugin-pinned-provision.mjs --lane native \
+//       --expect-build-source explicit_package --defer-archive-digest
 //
 // This file is an entry point and nothing else imports it, so its body runs unconditionally.
-// The bounded wait lives in scripts/lib/wait-for-managed-runtime.mjs, which the test imports
-// without running the proof.
+// The bounded wait lives in scripts/lib/wait-for-managed-runtime.mjs and the lane split lives in
+// scripts/lib/provision-proof-lanes.mjs, which the tests import without running the proof.
 
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -19,7 +29,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { waitForManagedRuntime } from "./lib/wait-for-managed-runtime.mjs";
-import { requirePinnedArchiveDigest } from "./lib/pinned-archive-digests.mjs";
+import {
+  assertProvisionedArchiveDigest,
+  parseProvisionProofArguments,
+} from "./lib/provision-proof-lanes.mjs";
+import { parseReleaseManifest } from "./lib/release-manifest.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(repositoryRoot, "plugins/codestory/scripts/codestory-mcp.cjs");
@@ -32,16 +46,26 @@ function fail(message) {
   process.exit(1);
 }
 
-// A missing or non-numeric value used to yield NaN, and every `Date.now() > NaN` comparison is
-// false, so the one flag that declares the bound silently removed it. Refuse the argument
-// instead: an unbounded gate is the failure this timeout exists to prevent.
-const timeoutIndex = process.argv.indexOf("--timeout-ms");
-const timeoutMs = timeoutIndex >= 0 ? Number(process.argv[timeoutIndex + 1]) : 600_000;
-if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-  fail(
-    `--timeout-ms needs a positive number of milliseconds, got ` +
-      `${JSON.stringify(process.argv[timeoutIndex + 1] ?? null)}.`,
-  );
+// A missing or non-numeric --timeout-ms used to yield NaN, and every `Date.now() > NaN` comparison
+// is false, so the one flag that declares the bound silently removed it. Every argument is refused
+// the same way now: an unbounded gate, a misspelled lane, or an unstated native digest authority
+// all stop the proof rather than quietly weakening it.
+let options;
+try {
+  options = parseProvisionProofArguments(process.argv.slice(2));
+} catch (error) {
+  fail(error.message);
+}
+
+let stagedReleaseManifest = null;
+if (options.releaseManifestPath) {
+  try {
+    stagedReleaseManifest = parseReleaseManifest(
+      fs.readFileSync(options.releaseManifestPath, "utf8"),
+    );
+  } catch (error) {
+    fail(`could not use ${options.releaseManifestPath}: ${error.message}`);
+  }
 }
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-pin-proof-"));
@@ -66,7 +90,7 @@ child.stdin.write(
 );
 
 try {
-  await waitForManagedRuntime({ child, runtimeMetadata, timeoutMs });
+  await waitForManagedRuntime({ child, runtimeMetadata, timeoutMs: options.timeoutMs });
 } catch (error) {
   fail(`${error.message}\n${stderr}`);
 }
@@ -83,11 +107,19 @@ const target =
 if (manifest.version !== pin.cli_version) {
   fail(`provisioned ${manifest.version}, pin names ${pin.cli_version}.`);
 }
-if (manifest.build_source !== "github_release") {
-  fail(`expected a github_release provision, observed ${manifest.build_source}.`);
+if (manifest.build_source !== options.expectBuildSource) {
+  fail(`expected a ${options.expectBuildSource} provision, observed ${manifest.build_source}.`);
 }
+let outcome;
 try {
-  requirePinnedArchiveDigest(pin, target, manifest.archive_sha256);
+  outcome = assertProvisionedArchiveDigest({
+    lane: options.lane,
+    pin,
+    target,
+    provisioned: { sha256: manifest.archive_sha256, bytes: manifest.archive_bytes },
+    releaseManifest: stagedReleaseManifest,
+    deferArchiveDigest: options.deferArchiveDigest,
+  });
 } catch (error) {
   fail(`${error.message}.`);
 }
@@ -96,9 +128,14 @@ const reported = execFileSync(binary, ["--version"], { encoding: "utf8" }).trim(
 if (!reported.includes(pin.cli_version)) {
   fail(`provisioned binary reports "${reported}", expected ${pin.cli_version}.`);
 }
+// A deferral is a real gap in what this run proved, so it is announced instead of being folded
+// into the success line. The post-release manifest proof is the step that closes it.
+if (!outcome.asserted) {
+  console.log(`::warning::${outcome.claim}.`);
+}
 console.log(
-  `Pinned provision proven: ${target} ${pin.cli_version} from github_release, ` +
-    `archive ${manifest.archive_sha256.slice(0, 12)}…, binary reports "${reported}".`,
+  `Pinned provision proven (${options.lane} lane): ${target} ${pin.cli_version} from ` +
+    `${manifest.build_source}, ${outcome.claim}, binary reports "${reported}".`,
 );
 fs.rmSync(dataDir, { recursive: true, force: true });
 process.exit(0);
