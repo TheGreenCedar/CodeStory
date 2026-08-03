@@ -12,7 +12,8 @@ use crate::agent::packet_scoring::{
 };
 use crate::{query_mentions_non_primary_source, retrieval_file_role_from_path};
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
+    AgentAnswerDto, AgentCitationDto, NodeKind, PacketBudgetLimitsDto, RetrievalAnnotationDto,
+    SearchHitOrigin,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -631,16 +632,20 @@ pub(crate) fn promote_required_probe_citations(
     }
     prioritize_protected_citations(&mut reordered, &protected_citation_keys);
     answer.citations = reordered;
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_required_probe_citations promoted={} required={}",
-        promoted_index_set.len(),
-        required_probe_queries
-            .iter()
-            .map(|query| query.as_str())
-            .collect::<Vec<_>>()
-            .join("|")
-            .replace('`', "'")
-    ));
+    // Echoes prompt-derived probe queries: promotion telemetry, not an evidence gap.
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "packet_required_probe_citations promoted={} required={}",
+            promoted_index_set.len(),
+            required_probe_queries
+                .iter()
+                .map(|query| query.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+                .replace('`', "'")
+        )));
     protected_citation_keys
 }
 
@@ -883,16 +888,20 @@ pub(crate) fn promote_focus_neighborhood_citations(
     }
     prioritize_protected_citations(&mut reordered, &all_protected_citation_keys);
     answer.citations = reordered;
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_focus_neighborhood_citations promoted={} roots={}",
-        promoted_keys.len(),
-        focus_roots
-            .iter()
-            .map(|root| root.root.as_str())
-            .collect::<Vec<_>>()
-            .join("|")
-            .replace('`', "'")
-    ));
+    // Echoes focus-root symbol names: promotion telemetry, not an evidence gap.
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "packet_focus_neighborhood_citations promoted={} roots={}",
+            promoted_keys.len(),
+            focus_roots
+                .iter()
+                .map(|root| root.root.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+                .replace('`', "'")
+        )));
     promoted_keys
 }
 
@@ -1432,12 +1441,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["selected", "selected helper"]
         );
-        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_required_probe_citations promoted=1")
-        }));
-        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation.starts_with("packet_focus_neighborhood_citations promoted=")
-        }));
+        // EV-6b (#1746): both promotion counters echo prompt-derived probe queries and focus-root
+        // symbol names, so their wording is attacker- and repository-controlled. They report how
+        // ranking ran and must carry the observation kind, never the gap kind.
+        for prefix in [
+            "packet_required_probe_citations promoted=1",
+            "packet_focus_neighborhood_citations promoted=",
+        ] {
+            let annotation = answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .find(|annotation| annotation.text.starts_with(prefix))
+                .unwrap_or_else(|| panic!("citation promotion must record `{prefix}`"));
+            assert_eq!(
+                annotation.kind,
+                codestory_contracts::api::RetrievalAnnotationKindDto::Observation,
+                "citation promotion telemetry is not an evidence gap: {}",
+                annotation.text
+            );
+        }
     }
 
     #[test]
@@ -1694,17 +1717,24 @@ mod tests {
                 .retrieval_trace
                 .annotations
                 .iter()
-                .any(|annotation| annotation.starts_with("packet_required_probe_citations ")),
+                .any(|annotation| annotation
+                    .text
+                    .starts_with("packet_required_probe_citations ")),
             "required-probe promotion should still run on the large synthetic packet"
         );
         let required_probe_annotation = answer
             .retrieval_trace
             .annotations
             .iter()
-            .find(|annotation| annotation.starts_with("packet_required_probe_citations "))
+            .find(|annotation| {
+                annotation
+                    .text
+                    .starts_with("packet_required_probe_citations ")
+            })
             .expect("large guard should record required-probe promotion");
         assert_eq!(
             required_probe_annotation
+                .text
                 .matches("source read buffer")
                 .count(),
             1,

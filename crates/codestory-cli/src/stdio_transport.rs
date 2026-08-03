@@ -4076,11 +4076,13 @@ fn handle_stdio_context(
             hybrid_weights: None,
         })
         .map(|mut result| {
-            result.retrieval_trace.annotations.push(format!(
-                "context_target node={} label=`{}`",
-                focus_node_id.0,
-                target_label.replace('`', "'")
-            ));
+            result.retrieval_trace.annotations.push(
+                codestory_contracts::api::RetrievalAnnotationDto::observation(format!(
+                    "context_target node={} label=`{}`",
+                    focus_node_id.0,
+                    target_label.replace('`', "'")
+                )),
+            );
             serde_json::json!({"result": context_packet_json(&result)})
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
@@ -5842,6 +5844,31 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// What the host declared about the pair it provisioned.
+///
+/// The plugin identities are declared to this file, so this is where they are
+/// read. `runtime.rs` builds the `_meta.codestory_publication` stamp from this
+/// value instead of reading the same three variables with its own copy of
+/// `env_nonempty` — the skew detector and the status surface have to be looking
+/// at the same provisioning, or the stamp reports a pairing status the status
+/// report contradicts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HostProvisioningIdentity {
+    pub(crate) plugin_version: Option<String>,
+    pub(crate) plugin_cli_version: Option<String>,
+    /// `None` when the host declared nothing; callers supply their own label
+    /// for a direct launch.
+    pub(crate) cli_source: Option<String>,
+}
+
+pub(crate) fn host_provisioning_identity() -> HostProvisioningIdentity {
+    HostProvisioningIdentity {
+        plugin_version: env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        plugin_cli_version: env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
+        cli_source: env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE"),
+    }
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

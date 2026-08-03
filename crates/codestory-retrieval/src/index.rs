@@ -204,10 +204,9 @@ struct PublicationQualificationHook {
 impl PublicationQualificationHook {
     #[cfg(not(feature = "test-support"))]
     fn from_environment() -> Result<Option<Self>> {
-        Self::from_environment_values(
-            std::env::var_os(EMBEDDING_QUALIFICATION_DIR_ENV),
-            std::env::var(EMBEDDING_QUALIFICATION_NONCE_ENV).ok(),
-        )
+        let gate = crate::per_user_embedding::qualification_gate_environment();
+        let nonce = gate.nonce_string();
+        Self::from_environment_values(gate.directory, nonce)
     }
 
     fn from_environment_values(
@@ -671,7 +670,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
                 expected_points: sidecar_input.projection_count,
             };
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
-            if status.retrieval_mode == "full" && semantic_point_count.is_some() {
+            if unchanged_generation_is_reusable(&status, semantic_point_count) {
                 let mut manifest = previous.clone();
                 if let Some(generation) = manifest.sidecar_generation.clone() {
                     let scip_dir = layout.scip_project_dir(&generation);
@@ -1261,6 +1260,23 @@ fn sidecar_disk_bytes(
     )
 }
 
+/// Whether an unchanged sidecar generation may be republished as-is.
+///
+/// `status.retrieval_mode` is overridden to `"full"` whenever the stored
+/// manifest classifies full, and every published manifest does, so it can
+/// never refuse reuse — it was a tautology at this decision point.
+/// [`RetrievalStatusReport::is_live_ready`] additionally requires the live
+/// lexical, semantic, and graph verdicts the probe just computed, so a
+/// generation damaged after publication falls through to the in-place rebuild
+/// instead of being reused and then rejected at the publication fence with no
+/// path back to a healthy state.
+fn unchanged_generation_is_reusable(
+    status: &crate::health::RetrievalStatusReport,
+    semantic_point_count: Option<u64>,
+) -> bool {
+    status.is_live_ready() && semantic_point_count.is_some()
+}
+
 fn semantic_ready_point_count(semantic: &SemanticGeneration<'_>) -> Option<u64> {
     let expected = u64::try_from(semantic.expected_points).ok()?;
     let health = EmbeddedVectorIndex::health(
@@ -1827,7 +1843,10 @@ fn prepare_generation_retention(
                     context.embedding_device,
                     context.runtime,
                 );
-                if status.retrieval_mode != "full" {
+                // Same manifest override as the reuse branch: a rollback
+                // pointer must name a generation whose artifacts are live
+                // healthy right now, not one whose manifest says so.
+                if !status.is_live_ready() {
                     bail!(
                         "rollback generation is not full: {} {:?}",
                         status.retrieval_mode,
@@ -3851,6 +3870,204 @@ mod tests {
             "git {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The explicit-CPU device a zero-dense generation is admitted under.
+    fn cpu_explicit_device() -> crate::embeddings::EmbeddingDeviceReadiness {
+        crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "cpu_explicit",
+            observed_state: "cpu_explicit",
+            observation_source: "per_user_server",
+            detected_provider: None,
+            detected_gpu: None,
+            accelerator_requested: false,
+            accelerator_request_provider: None,
+            accelerator_request_device: None,
+            cpu_allowed: true,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        }
+    }
+
+    struct HealthyGeneration {
+        _project: TempDir,
+        _data: TempDir,
+        layout: SidecarLayout,
+        manifest: RetrievalIndexManifest,
+        generation: String,
+        scip_dir: PathBuf,
+        lexical_data_dir: PathBuf,
+    }
+
+    /// Publish one complete, live-healthy zero-dense generation on disk:
+    /// a real lexical shard, real SCIP artifacts, and the manifest a finalize
+    /// pass would have committed for them.
+    fn publish_healthy_generation(project_id: &str) -> HealthyGeneration {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn handler() {}").expect("source");
+        let data = TempDir::new().expect("data");
+        let layout = SidecarLayout {
+            lexical_data_dir: data.path().join("lexical"),
+            semantic_data_dir: data.path().join("semantic"),
+            scip_artifacts_root: data.path().join("scip"),
+            state_file: data.path().join("state.json"),
+        };
+        layout.ensure_data_dirs().expect("data dirs");
+        let manifest = crate::test_support::retrieval_manifest_fixture(project_id, "input-hash");
+        let generation = manifest
+            .sidecar_generation
+            .clone()
+            .expect("fixture generation");
+        let fingerprint =
+            crate::lexical_index::lexical_input_fingerprint(project.path(), None).expect("scan");
+        crate::lexical_index::build_lexical_shard(
+            project.path(),
+            None,
+            &layout.lexical_data_dir,
+            &generation,
+            &fingerprint,
+            "input-hash",
+        )
+        .expect("build lexical shard");
+
+        let revision = manifest.scip_revision.clone().expect("fixture revision");
+        let scip_dir = layout.scip_project_dir(&generation);
+        std::fs::create_dir_all(&scip_dir).expect("scip dir");
+        let scip_symbols = vec![crate::scip_index::ScipSymbolRecord {
+            node_id: Some("1".into()),
+            path: "lib.rs".into(),
+            symbol: "handler".into(),
+            start_line: 1,
+            end_line: 1,
+        }];
+        // A graph-projection artifact is only fresh when it carries proof
+        // records, so the fixture publishes the definition proof for its one
+        // symbol. Without it the generation is stale, not live-healthy, and
+        // the reuse assertions below would prove nothing.
+        let scip_proofs = scip_symbols
+            .iter()
+            .map(|symbol: &crate::scip_index::ScipSymbolRecord| {
+                crate::scip_index::ScipProofRecord {
+                    role: crate::scip_index::SCIP_DEFINITION_ROLE.into(),
+                    path: symbol.path.clone(),
+                    symbol: symbol.symbol.clone(),
+                    start_line: symbol.start_line,
+                    start_character_utf16: 0,
+                    end_line: symbol.end_line,
+                    end_character_utf16: 0,
+                    target_symbol: None,
+                    node_id: symbol.node_id.clone(),
+                    target_node_id: None,
+                }
+            })
+            .collect();
+        let symbols = crate::scip_index::ScipSymbolsIndex {
+            generation: generation.clone(),
+            revision: revision.clone(),
+            contract: crate::scip_index::ScipProofAdapterContract::graph_projection(&revision),
+            symbols: scip_symbols,
+            proofs: scip_proofs,
+        };
+        std::fs::write(
+            scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE),
+            serde_json::to_vec_pretty(&symbols).expect("serialize symbols"),
+        )
+        .expect("write symbols");
+        std::fs::write(scip_dir.join("revision.txt"), format!("{revision}\n")).expect("revision");
+        crate::scip_index::write_scip_index_marker(&scip_dir, &revision).expect("marker");
+
+        let lexical_data_dir = layout.lexical_data_dir.clone();
+        HealthyGeneration {
+            _project: project,
+            _data: data,
+            layout,
+            manifest,
+            generation,
+            scip_dir,
+            lexical_data_dir,
+        }
+    }
+
+    fn probe(
+        fixture: &HealthyGeneration,
+        project_id: &str,
+    ) -> crate::health::RetrievalStatusReport {
+        probe_sidecar_health_for_runtime(
+            &fixture.layout,
+            project_id,
+            Some(fixture.manifest.clone()),
+            &cpu_explicit_device(),
+            &SidecarRuntimeConfig::local(),
+        )
+    }
+
+    #[test]
+    fn reuse_refuses_a_generation_whose_graph_artifact_was_damaged_after_publication() {
+        let fixture = publish_healthy_generation("reuse-scip");
+        // A zero-dense generation renders exactly this semantic count; holding
+        // it fixed leaves the live artifact verdict as the only variable.
+        let semantic_point_count = Some(0);
+
+        let healthy = probe(&fixture, "reuse-scip");
+        assert!(
+            unchanged_generation_is_reusable(&healthy, semantic_point_count),
+            "an intact generation must still be reused: {:?}",
+            healthy.degraded_reason
+        );
+
+        std::fs::write(
+            fixture.scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
+            b"\0\0\0\0",
+        )
+        .expect("damage the graph marker in place");
+
+        let damaged = probe(&fixture, "reuse-scip");
+
+        assert_eq!(
+            damaged.retrieval_mode, "full",
+            "the manifest still classifies full, which is why the old gate could never refuse"
+        );
+        assert_eq!(
+            damaged.degraded_reason.as_deref(),
+            Some("scip_index_marker_header_unrecognized")
+        );
+        assert!(
+            !unchanged_generation_is_reusable(&damaged, semantic_point_count),
+            "a damaged graph lane must fall through to the rebuild"
+        );
+        assert!(
+            !damaged.is_live_ready(),
+            "the rollback verification fence reads the same predicate, so a damaged \
+             generation cannot be recorded as a verified rollback target either"
+        );
+    }
+
+    #[test]
+    fn reuse_refuses_a_generation_whose_lexical_shard_was_damaged_after_publication() {
+        let fixture = publish_healthy_generation("reuse-lexical");
+        let semantic_point_count = Some(0);
+        assert!(unchanged_generation_is_reusable(
+            &probe(&fixture, "reuse-lexical"),
+            semantic_point_count
+        ));
+
+        let shard =
+            crate::lexical_index::shard_dir_for(&fixture.lexical_data_dir, &fixture.generation)
+                .join(crate::lexical_index::LEXICAL_INDEX_FILE);
+        crate::lexical_index::make_test_file_writable(&shard);
+        std::fs::write(&shard, b"not sqlite").expect("damage the lexical shard in place");
+
+        let damaged = probe(&fixture, "reuse-lexical");
+
+        assert_eq!(damaged.retrieval_mode, "full");
+        assert_eq!(
+            damaged.degraded_reason.as_deref(),
+            Some("lexical_shard_unavailable")
+        );
+        assert!(
+            !unchanged_generation_is_reusable(&damaged, semantic_point_count),
+            "a damaged lexical shard must fall through to the rebuild"
         );
     }
 }

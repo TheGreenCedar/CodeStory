@@ -8,7 +8,7 @@ use super::trace::field;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
-    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
+    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, RetrievalAnnotationDto, SearchHit,
 };
 use std::collections::HashSet;
 
@@ -81,15 +81,19 @@ pub(crate) fn merge_packet_fused_subquery_batch(
             message: Some(format!("packet subquery `{}`", query.purpose)),
         });
         let timing_note = packet_query_timing_annotation(diagnostic);
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_fused_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}{}",
-            plan_index,
-            query.query.replace('`', "'"),
-            query.purpose.replace('`', "'"),
-            hits.len(),
-            added,
-            timing_note
-        ));
+        // Echoes prompt-derived subquery text: per-query telemetry, not an evidence gap.
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "packet_fused_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}{}",
+                plan_index,
+                query.query.replace('`', "'"),
+                query.purpose.replace('`', "'"),
+                hits.len(),
+                added,
+                timing_note
+            )));
         answer.sections.push(AgentResponseSectionDto {
             id: format!("packet-subquery-{}", sanitize_section_id(&query.query)),
             title: format!("Planned query: {}", query.query),

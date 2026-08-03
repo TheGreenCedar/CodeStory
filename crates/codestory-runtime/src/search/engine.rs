@@ -29,7 +29,8 @@ pub const EMBEDDING_DIM: usize = codestory_retrieval::RETRIEVAL_EMBEDDING_DIM;
 const SEARCH_WRITER_HEAP_BYTES: usize = 20_000_000;
 const EMBEDDING_PROFILE: &str = "coderank-embed";
 const EMBEDDING_MODEL_ID: &str = "nomic-ai/CodeRankEmbed";
-pub use codestory_contracts::config_registry::STORED_VECTOR_ENCODING_ENV;
+#[cfg(test)]
+use codestory_contracts::config_registry::STORED_VECTOR_ENCODING_ENV;
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 #[cfg(test)]
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
@@ -161,62 +162,37 @@ impl HybridSearchConfig {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StoredVectorEncoding {
-    Float32,
-    Int8,
-    Uint8,
-    Binary,
-    Ubinary,
-}
-
-#[cfg(test)]
-impl StoredVectorEncoding {
-    fn from_env() -> Result<Self> {
-        match std::env::var(STORED_VECTOR_ENCODING_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "" | "float32" | "none" => Ok(Self::Float32),
-            "int8" => Ok(Self::Int8),
-            "uint8" => Ok(Self::Uint8),
-            "binary" => Ok(Self::Binary),
-            "ubinary" => Ok(Self::Ubinary),
-            other => bail!("unsupported stored vector encoding `{other}`"),
-        }
-    }
-
-    fn quantize(self, values: &[f32]) -> Option<QuantizedEmbedding> {
-        match self {
-            Self::Float32 => None,
-            Self::Int8 => Some(QuantizedEmbedding::Int8(
-                values
-                    .iter()
-                    .map(|value| (value * 127.0).round().clamp(-127.0, 127.0) as i8)
-                    .collect(),
-            )),
-            Self::Uint8 => Some(QuantizedEmbedding::Uint8(
-                values
-                    .iter()
-                    .map(|value| ((value + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8)
-                    .collect(),
-            )),
-            Self::Binary => Some(QuantizedEmbedding::Binary(pack_sign_bits(values))),
-            Self::Ubinary => Some(QuantizedEmbedding::Ubinary(pack_sign_bits(values))),
-        }
-    }
-}
-
+/// In-memory mirror of a vector the store persisted quantized.
+///
+/// The prefilter can only model encodings the store can actually write, and the
+/// store writes exactly float32 or compact scaled int8 — so the encoding this
+/// path branches on is [`codestory_store::StoredVectorEncoding`], read once by
+/// its owner, rather than a second interpretation of
+/// `CODESTORY_STORED_VECTOR_ENCODING` here. The interpretation this replaces
+/// accepted `uint8`, `binary` and `ubinary` and rejected anything else, none of
+/// which the store has ever honoured: it would have quantized the prefilter to
+/// a width the persisted blobs were not in, and failed a run for a value the
+/// encoder silently treats as float32.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 enum QuantizedEmbedding {
     Int8(Vec<i8>),
-    Uint8(Vec<u8>),
-    Binary(PackedSignBits),
-    Ubinary(PackedSignBits),
+}
+
+#[cfg(test)]
+fn quantize_for_prefilter(
+    encoding: codestory_store::StoredVectorEncoding,
+    values: &[f32],
+) -> Option<QuantizedEmbedding> {
+    match encoding {
+        codestory_store::StoredVectorEncoding::Float32 => None,
+        codestory_store::StoredVectorEncoding::Int8 => Some(QuantizedEmbedding::Int8(
+            values
+                .iter()
+                .map(|value| (value * 127.0).round().clamp(-127.0, 127.0) as i8)
+                .collect(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -228,83 +204,8 @@ impl QuantizedEmbedding {
                 .zip(values)
                 .map(|(query, doc)| query * (*doc as f32 / 127.0))
                 .sum(),
-            Self::Uint8(values) if values.len() == query.len() => query
-                .iter()
-                .zip(values)
-                .map(|(query, doc)| query * ((*doc as f32 / 127.5) - 1.0))
-                .sum(),
-            Self::Binary(bits) => signed_binary_cosine(query, bits),
-            Self::Ubinary(bits) => unsigned_binary_cosine(query, bits),
-            _ => 0.0,
+            Self::Int8(_) => 0.0,
         }
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct PackedSignBits {
-    bytes: Vec<u8>,
-    len: usize,
-    positives: usize,
-}
-
-#[cfg(test)]
-fn pack_sign_bits(values: &[f32]) -> PackedSignBits {
-    let mut bits = PackedSignBits {
-        bytes: vec![0; values.len().div_ceil(8)],
-        len: values.len(),
-        positives: 0,
-    };
-    for (index, value) in values.iter().enumerate() {
-        if *value >= 0.0 {
-            bits.bytes[index / 8] |= 1 << (index % 8);
-            bits.positives += 1;
-        }
-    }
-    bits
-}
-
-#[cfg(test)]
-fn sign_bit(bits: &PackedSignBits, index: usize) -> bool {
-    bits.bytes
-        .get(index / 8)
-        .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-}
-
-#[cfg(test)]
-fn signed_binary_cosine(query: &[f32], bits: &PackedSignBits) -> f32 {
-    if query.len() != bits.len || bits.len == 0 {
-        return 0.0;
-    }
-    query
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            if (*value >= 0.0) == sign_bit(bits, index) {
-                1_i32
-            } else {
-                -1
-            }
-        })
-        .sum::<i32>() as f32
-        / bits.len as f32
-}
-
-#[cfg(test)]
-fn unsigned_binary_cosine(query: &[f32], bits: &PackedSignBits) -> f32 {
-    if query.len() != bits.len || bits.len == 0 {
-        return 0.0;
-    }
-    let positives = query.iter().filter(|value| **value >= 0.0).count();
-    let intersection = query
-        .iter()
-        .enumerate()
-        .filter(|(index, value)| **value >= 0.0 && sign_bit(bits, *index))
-        .count();
-    if positives == 0 || bits.positives == 0 {
-        0.0
-    } else {
-        intersection as f32 / ((positives * bits.positives) as f32).sqrt()
     }
 }
 
@@ -377,7 +278,7 @@ pub struct SearchEngine {
     quantized_llm_docs: HashMap<NodeId, QuantizedEmbedding>,
     embedding_runtime: Option<EmbeddingRuntime>,
     #[cfg(test)]
-    stored_vector_encoding: StoredVectorEncoding,
+    stored_vector_encoding: codestory_store::StoredVectorEncoding,
     full_text_index_enabled: bool,
     #[cfg(test)]
     query_embedding_cache: HashMap<String, Vec<f32>>,
@@ -646,7 +547,7 @@ impl SearchEngine {
             quantized_llm_docs: HashMap::new(),
             embedding_runtime: None,
             #[cfg(test)]
-            stored_vector_encoding: StoredVectorEncoding::from_env()?,
+            stored_vector_encoding: codestory_store::stored_vector_encoding(),
             full_text_index_enabled: symbol_full_text_index_enabled_from_env(),
             #[cfg(test)]
             query_embedding_cache: HashMap::new(),
@@ -876,7 +777,9 @@ impl SearchEngine {
         let node_id = doc.node_id;
         #[cfg(test)]
         {
-            if let Some(quantized) = self.stored_vector_encoding.quantize(&doc.embedding) {
+            if let Some(quantized) =
+                quantize_for_prefilter(self.stored_vector_encoding, &doc.embedding)
+            {
                 self.quantized_llm_docs.insert(node_id, quantized);
             } else {
                 self.quantized_llm_docs.remove(&node_id);
@@ -1281,7 +1184,7 @@ pub(crate) struct HybridSearchState {
     symbols: Arc<Vec<(Utf32String, NodeId)>>,
     llm_docs: Arc<HashMap<NodeId, LlmSearchDoc>>,
     quantized_llm_docs: Arc<HashMap<NodeId, QuantizedEmbedding>>,
-    stored_vector_encoding: StoredVectorEncoding,
+    stored_vector_encoding: codestory_store::StoredVectorEncoding,
 }
 
 #[cfg(test)]
@@ -1322,7 +1225,9 @@ impl HybridSearchState {
             return Vec::new();
         }
 
-        let mut scored = if self.stored_vector_encoding == StoredVectorEncoding::Float32 {
+        let mut scored = if self.stored_vector_encoding
+            == codestory_store::StoredVectorEncoding::Float32
+        {
             self.llm_docs
                 .par_iter()
                 .map(|(_, doc)| {
@@ -2122,7 +2027,10 @@ mod tests {
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         let mut engine = SearchEngine::new(None)?;
-        assert_eq!(engine.stored_vector_encoding, StoredVectorEncoding::Int8);
+        assert_eq!(
+            engine.stored_vector_encoding,
+            codestory_store::StoredVectorEncoding::Int8
+        );
         engine.index_nodes(vec![
             (NodeId(20), "auth_policy".to_string()),
             (NodeId(21), "theme_tokens".to_string()),
@@ -2165,6 +2073,44 @@ mod tests {
 
         assert!(!hits.is_empty());
         assert_eq!(hits[0].node_id, NodeId(20));
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_prefilter_matches_what_the_store_actually_persisted() -> Result<()> {
+        let _lock = crate::process_env_test_lock();
+        // The store is the declared reader of CODESTORY_STORED_VECTOR_ENCODING
+        // and writes float32 for any value it does not recognise, so the
+        // prefilter must model float32 too. When the runtime read the variable
+        // itself it accepted `uint8` as a fourth encoding and quantized the
+        // in-memory vectors to a width no persisted blob was ever in; the
+        // durable bytes and the prefilter disagreed about the same setting.
+        let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "uint8");
+        assert_eq!(
+            codestory_store::stored_vector_encoding(),
+            codestory_store::StoredVectorEncoding::Float32,
+            "the store writes float32 for an unrecognised encoding"
+        );
+
+        let mut engine = SearchEngine::new(None)?;
+        assert_eq!(
+            engine.stored_vector_encoding,
+            codestory_store::StoredVectorEncoding::Float32
+        );
+        engine.set_embedding_runtime(EmbeddingRuntime::test_runtime());
+        engine.index_llm_symbol_docs(vec![LlmSearchDoc {
+            node_id: NodeId(40),
+            file_role: RetrievalFileRole::Source,
+            doc_text: "authorization policy permission validation".to_string(),
+            embedding: embed_text_with_hash_projection(
+                "authorization policy permission validation",
+                EMBEDDING_DIM,
+            ),
+        }]);
+        assert!(
+            engine.quantized_llm_docs.is_empty(),
+            "float32 storage must leave the prefilter on full-precision vectors"
+        );
         Ok(())
     }
 

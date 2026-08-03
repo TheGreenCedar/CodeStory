@@ -1,14 +1,14 @@
 use codestory_contracts::api::{
     AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
-    AgentRetrievalTraceDto, RetrievalShadowDto,
+    AgentRetrievalTraceDto, RetrievalAnnotationDto, RetrievalShadowDto,
 };
 use std::time::Instant;
 
 pub(crate) struct TraceRecorder {
     started_at: Instant,
     steps: Vec<AgentRetrievalStepDto>,
-    annotations: Vec<String>,
+    annotations: Vec<RetrievalAnnotationDto>,
     sla_target_ms: Option<u32>,
     retrieval_shadow: Option<RetrievalShadowDto>,
 }
@@ -116,8 +116,20 @@ impl TraceRecorder {
         );
     }
 
-    pub(crate) fn annotate(&mut self, message: impl Into<String>) {
-        self.annotations.push(message.into());
+    /// Record an evidence gap: retrieval could not produce evidence the answer needed.
+    ///
+    /// Consumers downgrade reported confidence for every gap annotation. Use
+    /// [`TraceRecorder::observe`] for routine notes about the run.
+    pub(crate) fn annotate_gap(&mut self, message: impl Into<String>) {
+        self.annotations.push(RetrievalAnnotationDto::gap(message));
+    }
+
+    /// Record a routine observation about the retrieval run.
+    ///
+    /// Observations never move reported confidence, whatever words they contain.
+    pub(crate) fn observe(&mut self, message: impl Into<String>) {
+        self.annotations
+            .push(RetrievalAnnotationDto::observation(message));
     }
 
     pub(crate) fn finish(

@@ -16,7 +16,7 @@ use crate::runtime::{RuntimeContext, map_api_error};
 use anyhow::{Result, bail};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentResponseModeDto, AgentRetrievalPresetDto,
-    AgentRetrievalProfileSelectionDto, BookmarkDto, NodeId,
+    AgentRetrievalProfileSelectionDto, BookmarkDto, NodeId, RetrievalAnnotationDto,
 };
 
 #[derive(serde::Serialize)]
@@ -68,7 +68,7 @@ pub(in crate::app) fn run_context(cmd: ContextCommand) -> Result<()> {
         answer
             .retrieval_trace
             .annotations
-            .push("mode=db_first".to_string());
+            .push(RetrievalAnnotationDto::observation("mode=db_first"));
         annotate_answer_with_context_target(&mut answer, &resolved);
         let markdown = render_context_markdown(&runtime.project_root, &answer);
         let output = ContextJsonOutput {
@@ -165,23 +165,31 @@ fn annotate_answer_with_context_target(
     resolved: &ResolvedContextTarget,
 ) {
     let selected = &resolved.target.selected;
-    answer.retrieval_trace.annotations.push(format!(
-        "context_target selector={:?} requested=`{}` node={} label=`{}` kind={:?}",
-        resolved.selector,
-        resolved.requested.replace('`', "'"),
-        selected.node_id.0,
-        selected.display_name.replace('`', "'"),
-        selected.kind
-    ));
+    // These echo caller-supplied selector text, symbol names, and paths. They report what the
+    // command focused on; they never assert anything about evidence completeness.
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "context_target selector={:?} requested=`{}` node={} label=`{}` kind={:?}",
+            resolved.selector,
+            resolved.requested.replace('`', "'"),
+            selected.node_id.0,
+            selected.display_name.replace('`', "'"),
+            selected.kind
+        )));
     if let Some(file_path) = selected.file_path.as_deref() {
-        answer.retrieval_trace.annotations.push(format!(
-            "context_target_location path=`{}` line={}",
-            display::clean_path_string(file_path),
-            selected
-                .line
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(format!(
+                "context_target_location path=`{}` line={}",
+                display::clean_path_string(file_path),
+                selected
+                    .line
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            )));
     }
     if let Some(bookmark) = resolved.bookmark.as_ref() {
         annotate_context_with_bookmark_focus(answer, bookmark);
@@ -206,5 +214,9 @@ fn annotate_context_with_bookmark_focus(answer: &mut AgentAnswerDto, bookmark: &
     if let Some(comment) = bookmark.comment.as_deref() {
         annotation.push_str(&format!(" comment=`{}`", comment.replace('`', "'")));
     }
-    answer.retrieval_trace.annotations.push(annotation);
+    // Carries a free-form user bookmark comment; it is a focus note, never an evidence gap.
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(annotation));
 }

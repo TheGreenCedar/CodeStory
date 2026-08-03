@@ -237,6 +237,10 @@ impl ActivationSnapshot {
     }
 }
 
+/// Test-only handshake a spawned activation worker waits on before starting.
+#[cfg(any(test, feature = "test-support"))]
+type WorkerStartGate = Arc<(Mutex<bool>, Condvar)>;
+
 #[derive(Debug, Clone)]
 pub struct ActivationRun {
     pub snapshot: ActivationSnapshot,
@@ -352,7 +356,7 @@ struct ActivationCoordinator {
     #[cfg(any(test, feature = "test-support"))]
     worker_start_count: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
-    worker_start_gate: Mutex<Option<Arc<(Mutex<bool>, Condvar)>>>,
+    worker_start_gate: Mutex<Option<WorkerStartGate>>,
     #[cfg(any(test, feature = "test-support"))]
     native_preparation_count: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]

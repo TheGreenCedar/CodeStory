@@ -18,7 +18,139 @@ pub const SCIP_GRAPH_PROJECTION_PROVENANCE: &str = "scip_graph_projection";
 pub const SCIP_DEFINITION_ROLE: &str = "definition";
 pub const SCIP_REFERENCE_ROLE: &str = "reference";
 const SCIP_POSITION_ENCODING: &str = "line_one_based_utf16_column_zero_based";
-const STUB_MARKER: &str = "index.scip.stub";
+/// Marker written beside stubbed SCIP artifacts. One spelling, so a probe and a
+/// producer cannot disagree about what "stubbed" looks like on disk.
+pub const SCIP_STUB_MARKER_FILE: &str = "index.scip.stub";
+
+/// Header of the graph-projection `index.scip` marker.
+const SCIP_INDEX_MARKER_HEADER: &str = "codestory-scip-v1";
+/// Header of the imported precise-semantic `index.scip` marker.
+const SCIP_IMPORT_MARKER_HEADER: &str = "codestory-precise-semantic-import-v1";
+/// Every header a readable `index.scip` marker may carry.
+const SCIP_INDEX_MARKER_HEADERS: [&str; 2] = [SCIP_INDEX_MARKER_HEADER, SCIP_IMPORT_MARKER_HEADER];
+/// The marker is a two-line contract. Anything materially larger is not the
+/// artifact this product wrote, and is refused without reading it.
+const SCIP_INDEX_MARKER_MAX_BYTES: u64 = 4_096;
+const SCIP_INDEX_MARKER_REVISION_PREFIX: &str = "revision=";
+
+/// Why a present `index.scip` is not the artifact its generation claims.
+///
+/// Existence used to be the whole check, so a truncated, empty, or
+/// leftover-from-another-generation marker published as a healthy graph lane.
+/// Each variant is a distinct, typed reason a generation is damaged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScipIndexMarkerError {
+    /// No marker file at all.
+    Missing,
+    /// Present but its bytes could not be read as a marker.
+    Unreadable { detail: String },
+    /// Present but far larger than the marker contract allows.
+    Oversized { bytes: u64 },
+    /// Present but its first line is not a marker header this product writes.
+    HeaderUnrecognized,
+    /// Present, headed correctly, but carrying no revision line.
+    RevisionMissing,
+    /// Present and parsable, but describing a different generation.
+    RevisionMismatch { expected: String, found: String },
+}
+
+impl ScipIndexMarkerError {
+    /// Stable machine code for this defect.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Missing => "scip_index_marker_missing",
+            Self::Unreadable { .. } => "scip_index_marker_unreadable",
+            Self::Oversized { .. } => "scip_index_marker_oversized",
+            Self::HeaderUnrecognized => "scip_index_marker_header_unrecognized",
+            Self::RevisionMissing => "scip_index_marker_revision_missing",
+            Self::RevisionMismatch { .. } => "scip_index_marker_revision_mismatch",
+        }
+    }
+}
+
+/// A parsed, revision-matched `index.scip` marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScipIndexMarker {
+    pub(crate) header: &'static str,
+    pub(crate) revision: String,
+}
+
+/// Write the graph-projection marker for `revision`.
+pub(crate) fn write_scip_index_marker(project_dir: &Path, revision: &str) -> Result<()> {
+    std::fs::write(
+        project_dir.join(SCIP_INDEX_FILE),
+        format!("{SCIP_INDEX_MARKER_HEADER}\n{SCIP_INDEX_MARKER_REVISION_PREFIX}{revision}\n"),
+    )
+    .context("write index.scip marker")
+}
+
+/// Write the imported precise-semantic marker for `revision`.
+fn write_scip_import_marker(import_dir: &Path, revision: &str) -> Result<()> {
+    std::fs::write(
+        import_dir.join(SCIP_INDEX_FILE),
+        format!("{SCIP_IMPORT_MARKER_HEADER}\n{SCIP_INDEX_MARKER_REVISION_PREFIX}{revision}\n"),
+    )
+    .context("write precise semantic import marker")
+}
+
+/// Parse `index.scip` and bind it to `expected_revision`.
+///
+/// This replaces the previous `.is_file()` test. A marker that exists but does
+/// not parse, or parses to a different revision, is a damaged generation — the
+/// caller must fall through to a rebuild rather than publish it as healthy.
+pub(crate) fn parse_scip_index_marker(
+    project_dir: &Path,
+    expected_revision: &str,
+) -> Result<ScipIndexMarker, ScipIndexMarkerError> {
+    let path = project_dir.join(SCIP_INDEX_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ScipIndexMarkerError::Missing);
+        }
+        Err(error) => {
+            return Err(ScipIndexMarkerError::Unreadable {
+                detail: error.to_string(),
+            });
+        }
+    };
+    if !metadata.is_file() {
+        return Err(ScipIndexMarkerError::Missing);
+    }
+    if metadata.len() > SCIP_INDEX_MARKER_MAX_BYTES {
+        return Err(ScipIndexMarkerError::Oversized {
+            bytes: metadata.len(),
+        });
+    }
+    let body =
+        std::fs::read_to_string(&path).map_err(|error| ScipIndexMarkerError::Unreadable {
+            detail: error.to_string(),
+        })?;
+    let mut lines = body.lines().map(str::trim);
+    let header = lines
+        .next()
+        .and_then(|line| {
+            SCIP_INDEX_MARKER_HEADERS
+                .into_iter()
+                .find(|header| *header == line)
+        })
+        .ok_or(ScipIndexMarkerError::HeaderUnrecognized)?;
+    let revision = lines
+        .find_map(|line| line.strip_prefix(SCIP_INDEX_MARKER_REVISION_PREFIX))
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+        .ok_or(ScipIndexMarkerError::RevisionMissing)?;
+    if revision != expected_revision {
+        return Err(ScipIndexMarkerError::RevisionMismatch {
+            expected: expected_revision.to_string(),
+            found: revision.to_string(),
+        });
+    }
+    Ok(ScipIndexMarker {
+        header,
+        revision: revision.to_string(),
+    })
+}
 
 /// Graph edge kinds that carry a real reference from one emitted symbol to
 /// another. `MEMBER` is containment rather than a reference and `UNKNOWN` is
@@ -568,14 +700,7 @@ pub fn import_precise_semantic_scip_artifact(
         format!("{}\n", index.revision),
     )
     .context("write precise semantic import revision")?;
-    std::fs::write(
-        import_dir.join(SCIP_INDEX_FILE),
-        format!(
-            "codestory-precise-semantic-import-v1\nrevision={}\n",
-            index.revision
-        ),
-    )
-    .context("write precise semantic import marker")?;
+    write_scip_import_marker(import_dir, &index.revision)?;
     Ok(PreciseSemanticImportStatus {
         status: "fresh".into(),
         reason: None,
@@ -673,13 +798,11 @@ pub fn emit_scip_artifacts_from_store(
         .context("write symbols.index.json")?;
     std::fs::write(project_dir.join("revision.txt"), format!("{revision}\n"))
         .context("write scip revision")?;
-    // Minimal marker so health treats graph lane as backed by a real artifact file.
-    std::fs::write(
-        project_dir.join(SCIP_INDEX_FILE),
-        format!("codestory-scip-v1\nrevision={revision}\n"),
-    )
-    .context("write index.scip marker")?;
-    let stub = project_dir.join(STUB_MARKER);
+    // Minimal marker so health treats graph lane as backed by a real artifact
+    // file. Health parses it and binds it to this revision, so it is evidence
+    // rather than a presence flag.
+    write_scip_index_marker(project_dir, &revision)?;
+    let stub = project_dir.join(SCIP_STUB_MARKER_FILE);
     if stub.is_file() {
         std::fs::remove_file(stub).context("remove scip stub marker")?;
     }

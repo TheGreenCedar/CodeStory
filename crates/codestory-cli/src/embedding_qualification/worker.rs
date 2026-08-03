@@ -1,8 +1,8 @@
 use self::gate::{
     current_process_start_identity, project_identity_sha256, qualification_nonce,
-    read_private_request, required_absolute_directory, sha256_bytes, validate_direct_child,
-    validate_gate_path, validate_private_directory, validate_worker_project, wait_for_gate,
-    worker_error, write_atomic_json,
+    read_private_request, required_absolute_qualification_directory, sha256_bytes,
+    validate_direct_child, validate_gate_path, validate_private_directory, validate_worker_project,
+    wait_for_gate, worker_error, write_atomic_json,
 };
 use self::operations::{
     run_activate_probe, run_cold_race_protocol_exchange, run_dead_client_load,
@@ -23,8 +23,6 @@ use codestory_retrieval::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use codestory_contracts::config_registry::EMBED_QUALIFICATION_DIR_ENV as QUALIFICATION_DIR_ENV;
-
 mod gate;
 mod operations;
 mod protocol;
@@ -38,7 +36,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     if request.schema_version != EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION {
         bail!("embedding_qualification_worker_schema_invalid");
     }
-    let directory = required_absolute_directory(QUALIFICATION_DIR_ENV)?;
+    let directory = required_absolute_qualification_directory()?;
     validate_private_directory(&directory)?;
     validate_direct_child(&command.request, &directory, true)?;
     validate_direct_child(&command.output, &directory, false)?;

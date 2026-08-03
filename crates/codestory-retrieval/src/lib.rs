@@ -59,7 +59,8 @@ pub use codestory_llama_sys::{
 pub use config::{
     DEFAULT_AGENT_RUN_ID, EmbeddingRuntimeConfig, RetrievalRuntimeConfig, SidecarLayout,
     SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults,
-    SidecarRuntimeOverrides, SummaryRuntimeConfig, sidecar_process_defaults, user_cache_root,
+    SidecarRuntimeOverrides, SummaryRuntimeConfig, hybrid_retrieval_enabled_from_process_env,
+    retrieval_runtime_config_from_process_env, sidecar_process_defaults, user_cache_root,
 };
 #[cfg(feature = "test-support")]
 pub use config::{
@@ -134,9 +135,10 @@ pub use per_user_embedding::{
     PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
     PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingClient,
     PerUserEmbeddingError, PerUserEmbeddingResidencyLease, PerUserEmbeddingServerConfig,
-    embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
-    embedding_retry_state, install_embedding_client_transport,
-    install_embedding_client_transport_factory, run_per_user_embedding_qualification,
+    QualificationGateEnvironment, embedding_capacity_pressure,
+    embedding_qualification_watchdog_marker_filename, embedding_retry_state,
+    install_embedding_client_transport, install_embedding_client_transport_factory,
+    qualification_gate_environment, run_per_user_embedding_qualification,
     run_per_user_embedding_server,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};

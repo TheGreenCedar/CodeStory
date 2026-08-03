@@ -1135,6 +1135,345 @@ fn config_registry_owners_name_real_production_files() {
     }
 }
 
+#[test]
+fn registered_settings_are_read_only_by_their_declared_owner() {
+    // CONFIG-B: the sibling contract above stops a *second spelling* of an
+    // identity. It does not stop a second reading, and those are different
+    // failures: a non-owner that imports the registry constant spells the
+    // identity once and still decides for itself what the value means. That is
+    // how CODESTORY_SEMANTIC_DOC_MAX_TOKENS=0 was 16 tokens to retrieval and
+    // 128 to the runtime at the same instant.
+    //
+    // A read is an identity in *expression* position: the registry constant, an
+    // `as` alias of it, or a file-local `const` bound to it, appearing anywhere
+    // outside an import, a comment, or a string. Passing it to a helper counts —
+    // `env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)` reads the setting
+    // just as surely as `std::env::var` does, and the whole point is that no
+    // indirection buys a second interpretation. Naming an identity inside a
+    // message stays legal: it tells an operator which variable to set and reads
+    // nothing.
+    //
+    // `production_sources` strips only the trailing `#[cfg(test)] mod tests`,
+    // so an inline test-only reader inside a production file is in scope on
+    // purpose. Those are the worst kind: the runtime's semantic prefilter read
+    // this setting only under `cfg(test)` and taught its own tests an encoding
+    // vocabulary the store has never written.
+    //
+    // Scope, stated so it is not mistaken for more: the six product crates
+    // `production_sources` walks. A harness outside them that *sets* a variable
+    // for a child process (codestory-bench does, for the qualification gate) is
+    // producing an environment, not interpreting one, and is not governed here.
+    // Should a product crate ever need to write one, the owner should expose the
+    // writer, and this contract will say so by failing.
+    let registry = read("crates/codestory-contracts/src/config_registry.rs");
+    let declared = registry_identity_constants(&registry)
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = Vec::new();
+    for (relative, source) in production_sources() {
+        let masked = mask_comments_and_strings(&source);
+        let bindings = registered_identity_bindings(&declared, &masked);
+        if bindings.is_empty() {
+            continue;
+        }
+        let imports = import_line_numbers(&masked);
+        for (line_number, line) in masked.lines().enumerate() {
+            if imports.contains(&(line_number + 1)) {
+                continue;
+            }
+            for (token, identity) in &bindings {
+                if !contains_word(line, token) {
+                    continue;
+                }
+                let owner = codestory_contracts::config_registry::env_setting_owner(identity)
+                    .expect("binding resolves to a registered identity");
+                if owner == relative {
+                    continue;
+                }
+                violations.push(format!(
+                    "{relative}:{} reads {identity} (as `{token}`); the registry declares \
+                     {owner} as its single reader. Consume that module's typed value instead \
+                     of reading the setting here.",
+                    line_number + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "a registered setting may be read only by its declared owner:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn every_registered_identity_has_exactly_one_registry_constant() {
+    // The read contract resolves identities through the registry's own
+    // constants, so a setting reachable only by a literal would be invisible to
+    // it. Both directions are checked: a constant with no entry, and an entry
+    // with no constant.
+    let registry = read("crates/codestory-contracts/src/config_registry.rs");
+    let declared = registry_identity_constants(&registry);
+    let mut by_identity: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (constant, identity) in &declared {
+        assert!(
+            codestory_contracts::config_registry::env_setting(identity).is_some(),
+            "{constant} declares {identity}, which is not in ENV_SETTINGS"
+        );
+        by_identity
+            .entry(identity.as_str())
+            .or_default()
+            .push(constant.as_str());
+    }
+    for setting in codestory_contracts::config_registry::ENV_SETTINGS {
+        let constants = by_identity.get(setting.name).cloned().unwrap_or_default();
+        assert_eq!(
+            constants.len(),
+            1,
+            "{} needs exactly one registry constant, found {constants:?}",
+            setting.name
+        );
+    }
+}
+
+/// Registry constant name to environment identity, read from the registry
+/// source so the registry stays the one place a knob is declared.
+fn registry_identity_constants(registry_source: &str) -> Vec<(String, String)> {
+    let mut declared = Vec::new();
+    let normalized = registry_source.replace(['\n', '\r'], " ");
+    let mut rest = normalized.as_str();
+    while let Some(index) = rest.find("pub const ") {
+        rest = &rest[index + "pub const ".len()..];
+        let Some((name, tail)) = rest.split_once(':') else {
+            break;
+        };
+        let name = name.trim();
+        if !name.ends_with("_ENV") {
+            continue;
+        }
+        let Some((_, tail)) = tail.split_once('=') else {
+            break;
+        };
+        let tail = tail.trim_start();
+        let Some(value) = tail.strip_prefix('"').and_then(|tail| {
+            tail.split_once('"')
+                .map(|(value, _)| value)
+                .filter(|value| value.starts_with("CODESTORY_"))
+        }) else {
+            continue;
+        };
+        declared.push((name.to_string(), value.to_string()));
+    }
+    declared
+}
+
+/// Names that resolve to a registered identity inside one source file: the
+/// registry constants themselves, `as` aliases of them, and file-local `const`
+/// bindings to them.
+fn registered_identity_bindings(
+    declared: &BTreeMap<String, String>,
+    masked_source: &str,
+) -> BTreeMap<String, String> {
+    let registered = |identity: &String| {
+        codestory_contracts::config_registry::env_setting(identity)
+            .is_some()
+            .then(|| identity.clone())
+    };
+    let mut bindings = BTreeMap::new();
+    for (constant, identity) in declared {
+        if contains_word(masked_source, constant)
+            && let Some(identity) = registered(identity)
+        {
+            bindings.insert(constant.clone(), identity);
+        }
+    }
+    for (alias, constant) in aliased_names(masked_source) {
+        if let Some(identity) = declared.get(&constant).and_then(registered) {
+            bindings.insert(alias, identity);
+        }
+    }
+    bindings
+}
+
+/// `<CONSTANT> as <ALIAS>` in an import, and `const <ALIAS>: &str = ...::<CONSTANT>;`.
+fn aliased_names(masked_source: &str) -> Vec<(String, String)> {
+    let mut aliases = Vec::new();
+    let words = masked_source
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    for window in words.windows(3) {
+        if window[1] == "as" && window[0].ends_with("_ENV") {
+            aliases.push((window[2].to_string(), window[0].to_string()));
+        }
+    }
+    for window in words.windows(6) {
+        // `const NAME : & str = config_registry :: CONSTANT ;` reduces to the
+        // words `const NAME str config_registry CONSTANT`, so match on the
+        // const keyword and the trailing `_ENV` word.
+        if window[0] == "const"
+            && window.contains(&"str")
+            && let Some(constant) = window.iter().rev().find(|word| word.ends_with("_ENV"))
+            && *constant != window[1]
+        {
+            aliases.push((window[1].to_string(), (*constant).to_string()));
+        }
+    }
+    aliases
+}
+
+/// 1-based line numbers occupied by `use` items.
+fn import_line_numbers(masked_source: &str) -> BTreeSet<usize> {
+    let mut lines = BTreeSet::new();
+    let mut inside_import = false;
+    for (index, line) in masked_source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let starts_import = trimmed.starts_with("use ")
+            || trimmed.starts_with("pub use ")
+            || trimmed.starts_with("pub(crate) use ")
+            || trimmed.starts_with("pub(super) use ")
+            || (trimmed.starts_with("pub(in ")
+                && trimmed
+                    .split_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("use ")));
+        if !inside_import && !starts_import {
+            continue;
+        }
+        lines.insert(index + 1);
+        inside_import = !line.trim_end().ends_with(';');
+    }
+    lines
+}
+
+fn contains_word(haystack: &str, word: &str) -> bool {
+    let mut offset = 0;
+    while let Some(index) = haystack[offset..].find(word) {
+        let start = offset + index;
+        let end = start + word.len();
+        let before_is_word = haystack[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        let after_is_word = haystack[end..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        if !before_is_word && !after_is_word {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+/// Blank out comments and string literals, preserving byte offsets and line
+/// breaks so a violation still reports the line it was found on. Prose that
+/// names a variable and messages that tell an operator to set one are not
+/// reads, and must not be mistaken for them.
+fn mask_comments_and_strings(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    // Blanking whole comment and literal spans byte by byte keeps every offset
+    // and line break where it was, and stays valid UTF-8 because the spans
+    // always start and end on character boundaries.
+    let blank = |masked: &mut Vec<u8>, from: usize, to: usize| {
+        for byte in &mut masked[from..to.min(bytes.len())] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let is_word_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                let end = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+                blank(&mut masked, index, end);
+                index = end;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let mut depth = 1_usize;
+                let mut cursor = index + 2;
+                while cursor < bytes.len() && depth > 0 {
+                    if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+                        depth += 1;
+                        cursor += 2;
+                    } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                        depth -= 1;
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                blank(&mut masked, index, cursor);
+                index = cursor;
+            }
+            b'\'' => {
+                // A char or byte literal, or a lifetime. Only the literals hide
+                // a quote that would otherwise open a phantom string.
+                let end = match (bytes.get(index + 1), bytes.get(index + 2)) {
+                    (Some(b'\\'), _) => bytes[index + 2..]
+                        .iter()
+                        .position(|byte| *byte == b'\'')
+                        .map(|offset| index + 3 + offset),
+                    (Some(_), Some(b'\'')) => Some(index + 3),
+                    _ => None,
+                };
+                match end {
+                    Some(end) => {
+                        blank(&mut masked, index, end);
+                        index = end;
+                    }
+                    None => index += 1,
+                }
+            }
+            b'r' | b'b' if index == 0 || !is_word_byte(bytes[index - 1]) => {
+                let mut cursor = index + 1;
+                if bytes.get(cursor) == Some(&b'r') && bytes[index] == b'b' {
+                    cursor += 1;
+                }
+                let mut hashes = 0;
+                while bytes.get(cursor) == Some(&b'#') {
+                    hashes += 1;
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    index += 1;
+                    continue;
+                }
+                let terminator = format!("\"{}", "#".repeat(hashes));
+                let end = source
+                    .get(cursor + 1..)
+                    .and_then(|rest| rest.find(&terminator))
+                    .map_or(bytes.len(), |offset| cursor + 1 + offset + terminator.len());
+                blank(&mut masked, index, end);
+                index = end;
+            }
+            b'"' => {
+                let mut cursor = index + 1;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => cursor += 2,
+                        b'"' => {
+                            cursor += 1;
+                            break;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                blank(&mut masked, index, cursor);
+                index = cursor.min(bytes.len());
+            }
+            _ => index += 1,
+        }
+    }
+    String::from_utf8(masked).expect("blanking whole spans preserves UTF-8")
+}
+
 /// `CODESTORY_*` identities spelled in production, mapped to the files that
 /// spell them.
 fn production_environment_identities() -> BTreeMap<String, BTreeSet<String>> {
@@ -1255,11 +1594,10 @@ fn packet_claim_profile_contracts_are_enforced_at_runtime_not_only_in_debug_buil
 
 #[test]
 fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation_channel() {
-    // `retrieval_trace.annotations` is an evidence channel: `codestory-cli`'s
-    // `is_gap_annotation` substring-matches it for gap markers and downgrades packet
-    // confidence when one hits. Always-on telemetry published there matched on "skipped" and
-    // moved every packet from high/ready to medium/review. The counters must therefore be
-    // structurally separated from evidence text, not merely worded around the heuristic.
+    // `retrieval_trace.annotations` is an evidence channel: `Gap`-kind entries downgrade packet
+    // confidence. Always-on telemetry published there was classified as a gap on every packet and
+    // moved every answer from high/ready to medium/review. The counters must therefore be
+    // structurally separated from evidence text, not merely reclassified as observations.
     let telemetry = read("crates/codestory-runtime/src/agent/packet_profile_telemetry.rs");
     let telemetry_production = production_source_prefix(&telemetry);
     assert!(
@@ -1435,5 +1773,125 @@ fn the_release_model_embedding_gate_keys_on_the_profile_not_debug_info() {
     assert!(
         build_script.contains("profile_requires_embedded_model(profile.as_deref())"),
         "the gate must route the profile through the shared decision this test compiles"
+    );
+}
+
+/// Every word the retired `is_gap_annotation` heuristic substring-matched.
+const RETIRED_ANNOTATION_PROSE_MARKERS: [&str; 10] = [
+    "fallback",
+    "gap",
+    "low confidence",
+    "missing",
+    "no relevant",
+    "skipped",
+    "truncated",
+    "uncertain",
+    "unavailable",
+    "weak",
+];
+
+#[test]
+fn retrieval_annotations_are_classified_by_typed_kind_not_by_prose() {
+    // EV-6b (#1746). `is_gap_annotation` lowercased annotation text and looked for ten English
+    // words to decide whether an annotation was an evidence gap; a match downgraded
+    // `agent_confidence` from high/ready to medium/review. Annotations interpolate prompt text,
+    // file paths, symbol names, error messages, and user bookmark comments, so reported
+    // confidence depended on wording rather than on evidence. Classification now reads only the
+    // typed kind on the DTO.
+    let dto = read("crates/codestory-contracts/src/api/dto.rs");
+    let dto_production = production_source(&dto);
+    assert!(
+        dto_production.contains("pub enum RetrievalAnnotationKindDto"),
+        "retrieval annotations must carry a typed kind enum"
+    );
+    for variant in ["    Gap,", "    Observation,"] {
+        assert!(
+            dto_production.contains(variant),
+            "retrieval annotation kind must be exactly Gap | Observation: missing `{variant}`"
+        );
+    }
+    assert!(
+        dto_production.contains("pub annotations: Vec<RetrievalAnnotationDto>"),
+        "the retrieval trace annotation channel must be typed, not Vec<String>"
+    );
+
+    let output = read("crates/codestory-cli/src/output.rs");
+    let output_production = production_source(&output);
+    assert!(
+        !output_production.contains("is_gap_annotation"),
+        "the prose gap classifier must be gone from confidence rendering"
+    );
+    assert!(
+        output_production.contains("annotation.kind == RetrievalAnnotationKindDto::Gap"),
+        "gap notes must select annotations by typed kind"
+    );
+
+    // The confidence path must not reach for annotation prose at all. `agent_gap_notes` is the
+    // only place annotations feed a confidence decision, so pin the whole function body.
+    let gap_notes = source_between(
+        output_production.as_str(),
+        "fn agent_gap_notes(",
+        "\nfn append_retrieval_gap_notes(",
+    );
+    assert!(
+        !gap_notes.contains("to_ascii_lowercase") && !gap_notes.contains("to_lowercase"),
+        "confidence gap notes must never lowercase annotation prose:\n{gap_notes}"
+    );
+    for marker in RETIRED_ANNOTATION_PROSE_MARKERS {
+        assert!(
+            !gap_notes.contains(&format!("\"{marker}\"")),
+            "confidence gap notes must not substring-match the retired prose marker `{marker}`"
+        );
+    }
+
+    // Every producer states the kind at the push site. Nothing may reach the channel through an
+    // untyped `String`, and no helper may infer the kind for a caller.
+    for path in [
+        "crates/codestory-runtime/src/agent/trace.rs",
+        "crates/codestory-runtime/src/agent/orchestrator.rs",
+        "crates/codestory-runtime/src/agent/packet_batch.rs",
+        "crates/codestory-runtime/src/agent/packet_capping.rs",
+        "crates/codestory-runtime/src/agent/packet_trace.rs",
+        "crates/codestory-cli/src/app/agent_context/context.rs",
+        "crates/codestory-cli/src/stdio_transport.rs",
+    ] {
+        let source = read(path);
+        let dense = production_source(&source)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("");
+        let mut cursor = 0usize;
+        while let Some(offset) = dense[cursor..].find("annotations.push(") {
+            let after = cursor + offset + "annotations.push(".len();
+            let rest = &dense[after..];
+            assert!(
+                rest.starts_with("RetrievalAnnotationDto::gap(")
+                    || rest.starts_with("RetrievalAnnotationDto::observation(")
+                    || rest.starts_with(
+                        "codestory_contracts::api::RetrievalAnnotationDto::observation("
+                    )
+                    || rest.starts_with("codestory_contracts::api::RetrievalAnnotationDto::gap("),
+                "{path} pushes a retrieval annotation without naming its kind: {}",
+                &rest[..rest.len().min(80)]
+            );
+            cursor = after;
+        }
+    }
+
+    // `TraceRecorder` is the runtime's own annotation front door: it must expose one entry point
+    // per kind, not a single `annotate` that leaves the classification to a downstream reader.
+    let recorder = production_source(&read("crates/codestory-runtime/src/agent/trace.rs"));
+    for required in [
+        "fn annotate_gap(&mut self, message: impl Into<String>)",
+        "fn observe(&mut self, message: impl Into<String>)",
+    ] {
+        assert!(
+            recorder.contains(required),
+            "TraceRecorder must expose a per-kind annotation entry point: missing `{required}`"
+        );
+    }
+    assert!(
+        !recorder.contains("fn annotate(&mut self"),
+        "the kind-less TraceRecorder::annotate entry point must stay retired"
     );
 }

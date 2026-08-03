@@ -21,7 +21,7 @@ use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -12281,19 +12281,39 @@ fn kotlin_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>
     false
 }
 
+/// Property bindings declared in a Kotlin class's primary constructor.
+///
+/// The surface used to be the class text up to its first `{`, scanned from the
+/// first `(`. An annotated declaration puts that `(` inside the annotation:
+/// `@Table(name = "users") data class User(val id: Long)` yielded `name =
+/// "users"` and the class lost every primary-constructor binding (CR-009). The
+/// grammar keeps `primary_constructor` as its own child, after `modifiers`.
 fn kotlin_primary_constructor_property_bindings(
     owner_node: TsNode<'_>,
     source: &str,
     context: &KotlinReceiverContext<'_>,
 ) -> Vec<(String, OptionalReceiverOwnerBinding)> {
-    let Some(owner_surface) = trimmed_node_text(owner_node, source) else {
-        return Vec::new();
-    };
-    let head = owner_surface
-        .split('{')
-        .next()
-        .unwrap_or(owner_surface.as_str());
-    let Some(parameters) = signature_parameter_surface_text(head) else {
+    let mut cursor = owner_node.walk();
+    let parameters = owner_node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "primary_constructor")
+        .and_then(callable_parameter_list_node)
+        .and_then(|node| trimmed_node_text(node, source))
+        .map(|text| {
+            text.strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(text.as_str())
+                .to_string()
+        })
+        .or_else(|| {
+            let owner_surface = trimmed_node_text(owner_node, source)?;
+            let head = owner_surface
+                .split('{')
+                .next()
+                .unwrap_or(owner_surface.as_str());
+            signature_parameter_surface_text(head)
+        });
+    let Some(parameters) = parameters else {
         return Vec::new();
     };
     split_top_level_parameters(&parameters)
@@ -14495,17 +14515,65 @@ fn collect_colon_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<
     receiver_types
 }
 
+/// Drop the annotations a parameter declaration carries before its type.
+///
+/// `f(@RequestParam("id") String id)` records the owner type of `id` as
+/// `@RequestParam`, because the leading annotation is just another
+/// whitespace-separated token and `normalize_type_surface` truncates it at the
+/// `(` (CR-009). Token filtering is not enough: `@RequestParam(value = "id")`
+/// spans four tokens. Skip each leading `@Name` and, when it is followed by an
+/// argument list, everything up to that list's matching `)`.
+fn strip_leading_parameter_annotations(parameter: &str) -> &str {
+    let mut rest = parameter.trim_start();
+    while let Some(after_at) = rest.strip_prefix('@') {
+        let name_len = after_at
+            .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.'))
+            .unwrap_or(after_at.len());
+        if name_len == 0 {
+            break;
+        }
+        let after_name = after_at[name_len..].trim_start();
+        let Some(arguments) = after_name.strip_prefix('(') else {
+            rest = after_name;
+            continue;
+        };
+        let mut depth = 1usize;
+        let mut consumed = None;
+        for (index, ch) in arguments.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        consumed = Some(index + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An unbalanced annotation argument list is malformed input; leaving
+        // the text untouched keeps the caller's existing behaviour rather than
+        // inventing a truncation.
+        let Some(consumed) = consumed else {
+            break;
+        };
+        rest = arguments[consumed..].trim_start();
+    }
+    rest
+}
+
 fn collect_prefix_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
     let mut receiver_types = HashMap::new();
     let Some(parameters) = signature_parameter_surface(callable, source) else {
         return receiver_types;
     };
     for parameter in split_top_level_parameters(&parameters) {
-        let parameter = parameter
-            .split('=')
-            .next()
-            .unwrap_or(parameter.as_str())
-            .trim();
+        // Annotations come off before the default-value split: an annotation
+        // argument list can itself contain `=`, as in `@RequestParam(value =
+        // "id")`, and splitting first would cut the declaration in half.
+        let parameter = strip_leading_parameter_annotations(&parameter);
+        let parameter = parameter.split('=').next().unwrap_or(parameter).trim();
         let tokens = parameter
             .split_whitespace()
             .filter(|token| !matches!(*token, "final" | "const" | "var" | "required"))
@@ -14666,7 +14734,48 @@ fn dart_import_alias_name(statement: &str) -> Option<String> {
     None
 }
 
+/// The grammar's own parameter-list node for a callable, when it has one.
+///
+/// Every vendored grammar that models parameters exposes the list either
+/// through a `parameters` field or as a distinctly named child; only the
+/// declarator-nested C family and a few looser grammars leave nothing to find.
+fn callable_parameter_list_node<'tree>(callable: TsNode<'tree>) -> Option<TsNode<'tree>> {
+    if let Some(parameters) = callable.child_by_field_name("parameters") {
+        return Some(parameters);
+    }
+    let mut cursor = callable.walk();
+    callable.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "function_value_parameters"
+                | "formal_parameters"
+                | "parameter_list"
+                | "parameters"
+                | "class_parameters"
+        )
+    })
+}
+
+/// The text between a callable's parameter parentheses.
+///
+/// The scan used to start from the first `(` in the callable's own text, which
+/// for Java `method_declaration` and Kotlin `function_declaration` includes the
+/// leading modifier list: `@GetMapping("/users") String list()` handed back
+/// `"/users"` as the parameter list, and `@Throws(IOException::class)` handed
+/// back a bogus `IOException::class` receiver binding (CR-009). The grammar
+/// already separates modifiers from parameters, so ask it first and keep the
+/// text scan only for grammars that expose no parameter node.
 fn signature_parameter_surface(callable: TsNode<'_>, source: &str) -> Option<String> {
+    if let Some(parameters) = callable_parameter_list_node(callable)
+        && let Some(text) = trimmed_node_text(parameters, source)
+    {
+        return Some(
+            text.strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(text.as_str())
+                .to_string(),
+        );
+    }
     let text = trimmed_node_text(callable, source)?;
     let start = text.find('(')?;
     let mut depth = 0usize;
@@ -14924,27 +15033,41 @@ fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
         .join(".")
 }
 
+/// Receiver and member of one Kotlin member call, read from the grammar.
+///
+/// The text scan this replaces cut the callee at the first `(` and then split
+/// on the last `.` of what remained, which is wrong for the two most idiomatic
+/// Kotlin call shapes (CR-010). A trailing lambda has no parentheses at all, so
+/// `user.apply { this.name = n }` split on the dot inside the lambda body and
+/// produced the receiver `user.apply { this`. A chain such as
+/// `repo.findAll().filter { … }` truncated at the first `(` and reported the
+/// outer `.filter` call as `repo.findAll`, duplicating the inner call and
+/// losing the outer one. `call_expression` keeps its callee as its first child
+/// and a member callee is a `navigation_expression`, so both shapes read
+/// directly off the tree.
 fn kotlin_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call_expression" {
         return None;
     }
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let separator = callable.rfind('.')?;
-    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
-    let method = callable[separator + 1..]
-        .trim()
-        .trim_start_matches('?')
-        .trim();
+    let mut cursor = node.walk();
+    let callee = node.named_children(&mut cursor).next()?;
+    if callee.kind() != "navigation_expression" {
+        return None;
+    }
+    let mut callee_cursor = callee.walk();
+    let callee_children = callee
+        .named_children(&mut callee_cursor)
+        .collect::<Vec<_>>();
+    let receiver = callee_children.first()?;
+    let member = callee_children.last()?;
+    if receiver.id() == member.id() {
+        return None;
+    }
+    let receiver_text = trimmed_node_text(*receiver, source)?;
+    let member_text = trimmed_node_text(*member, source)?;
     Some((
-        normalized_kotlin_receiver_surface(receiver)?,
-        normalize_parameter_name(method)?,
+        normalized_kotlin_receiver_surface(receiver_text.trim_end_matches('?'))?,
+        normalize_parameter_name(member_text.trim_start_matches('?'))?,
     ))
 }
 
@@ -15771,6 +15894,68 @@ fn canonicalize_nodes(
     canonicalize_nodes_with_file_identity(file_name, file_name, final_nodes, canonical_roles)
 }
 
+/// Separator between a qualified name and its declaration ordinal.
+///
+/// A colon would read as the old line-number suffix; `#` makes the ordinal
+/// unmistakable in stored ids, logs, and citations.
+const DECLARATION_ORDINAL_SEPARATOR: char = '#';
+
+fn node_needs_declaration_ordinal(node: &Node) -> bool {
+    !is_type_like_kind(node.kind) && node.kind != NodeKind::FILE
+}
+
+fn preserved_canonical_id(node: &Node) -> Option<&str> {
+    node.canonical_id.as_deref().filter(|value| {
+        value.starts_with("openapi:endpoint:")
+            || value.starts_with("route_endpoint:")
+            || value.starts_with("tauri:command:")
+            || value.starts_with("payload:collection:")
+    })
+}
+
+/// Declaration ordinals for every qualified name that needs a discriminator.
+///
+/// Two callables in one file can share a qualified name — Java and C++
+/// overloads, an unresolved call placeholder beside the function it names, a
+/// local rebound in two sibling scopes. The discriminator used to be the
+/// declaration's own `start_line`, which made every identity in the file a
+/// function of its position: inserting a line above a function renamed it, so
+/// incremental indexing could only replace the whole file (CR-008) and every
+/// annotation anchored to it was destroyed (ARCH-001).
+///
+/// The ordinal is the rank of the declaration's line among the distinct lines
+/// that share its qualified name, so it is invariant under any edit that moves
+/// declarations without reordering them. Declarations that share a line still
+/// share an id, exactly as the line-suffixed form grouped them: this is a
+/// relabelling of the same groups, not a regrouping.
+fn declaration_ordinals(nodes: &[Node]) -> HashMap<String, BTreeMap<u32, usize>> {
+    let mut lines_by_name: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    for node in nodes {
+        if preserved_canonical_id(node).is_some() || !node_needs_declaration_ordinal(node) {
+            continue;
+        }
+        let qualified_name = node
+            .qualified_name
+            .clone()
+            .unwrap_or_else(|| node.serialized_name.clone());
+        lines_by_name
+            .entry(qualified_name)
+            .or_default()
+            .insert(node.start_line.unwrap_or(1));
+    }
+    lines_by_name
+        .into_iter()
+        .map(|(qualified_name, lines)| {
+            let ordinals = lines
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, line)| (line, ordinal))
+                .collect::<BTreeMap<_, _>>();
+            (qualified_name, ordinals)
+        })
+        .collect()
+}
+
 fn canonicalize_nodes_with_file_identity(
     file_name: &str,
     file_identity: &str,
@@ -15779,6 +15964,7 @@ fn canonicalize_nodes_with_file_identity(
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
+    let ordinals_by_name = declaration_ordinals(&final_nodes);
 
     for mut node in final_nodes {
         let qualified_name = node
@@ -15787,15 +15973,7 @@ fn canonicalize_nodes_with_file_identity(
             .unwrap_or_else(|| node.serialized_name.clone());
         node.qualified_name = Some(qualified_name.clone());
 
-        let canonical_id = node
-            .canonical_id
-            .as_deref()
-            .filter(|value| {
-                value.starts_with("openapi:endpoint:")
-                    || value.starts_with("route_endpoint:")
-                    || value.starts_with("tauri:command:")
-                    || value.starts_with("payload:collection:")
-            })
+        let canonical_id = preserved_canonical_id(&node)
             .map(str::to_string)
             .unwrap_or_else(|| {
                 if is_type_like_kind(node.kind) {
@@ -15804,7 +15982,11 @@ fn canonicalize_nodes_with_file_identity(
                     format!("{file_identity}:{file_identity}:1")
                 } else {
                     let start_line = node.start_line.unwrap_or(1);
-                    format!("{}:{}:{}", file_name, qualified_name, start_line)
+                    let ordinal = ordinals_by_name
+                        .get(&qualified_name)
+                        .and_then(|ordinals| ordinals.get(&start_line).copied())
+                        .unwrap_or(0);
+                    format!("{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
                 }
             });
         grouped_nodes.entry(canonical_id).or_default().push(node);
@@ -21108,7 +21290,7 @@ pub(crate) fn build_callable_projection_states(
         ) {
             continue;
         }
-        let (Some(file_id), Some(start_line), Some(start_col), Some(end_line)) = (
+        let (Some(file_id), Some(start_line), Some(_start_col), Some(end_line)) = (
             node.file_node_id,
             node.start_line,
             node.start_col,
@@ -21123,13 +21305,15 @@ pub(crate) fn build_callable_projection_states(
                 .as_deref()
                 .unwrap_or(node.serialized_name.as_str())
         );
-        let signature_hash = hash_parts([
-            symbol_key.as_str(),
-            &start_line.to_string(),
-            &start_col.to_string(),
-        ]);
+        let signature_hash = callable_signature_hash(&symbol_key);
 
-        let mut body_parts = callable_edge_projection_parts(edges_by_source.get(&node.id));
+        let mut body_parts = vec![
+            format!("extent:{start_line}:{end_line}"),
+            format!("identity:{}", node.id.0),
+        ];
+        body_parts.extend(callable_edge_projection_parts(
+            edges_by_source.get(&node.id),
+        ));
         body_parts.extend(callable_occurrence_projection_parts(
             occurrences_by_file.get(&file_id),
             node,
@@ -21158,15 +21342,23 @@ pub(crate) fn build_callable_projection_states(
     }
 
     if let Some(file_node) = nodes.iter().find(|node| node.kind == NodeKind::FILE) {
+        let repaired_callables = CallableProjectionExtents::from_states(&states);
         states.push(CallableProjectionState {
             file_id: file_node.id.0,
             symbol_key: FILE_STRUCTURAL_SYMBOL_KEY.to_string(),
             node_id: file_node.id,
-            signature_hash: hash_parts([FILE_STRUCTURAL_SYMBOL_KEY]),
+            signature_hash: callable_signature_hash(FILE_STRUCTURAL_SYMBOL_KEY),
             // The file structural row is not a callable, so it carries no
             // normalized signature and can never satisfy a rebind probe.
             normalized_signature: None,
-            body_hash: structural_projection_hash(file_node.id, nodes, edges, &node_by_id),
+            body_hash: structural_projection_hash(
+                file_node.id,
+                nodes,
+                edges,
+                occurrences,
+                &node_by_id,
+                &repaired_callables,
+            ),
             start_line: 1,
             end_line: file_node.end_line.unwrap_or(1),
         });
@@ -21293,13 +21485,50 @@ fn callable_relative_occurrence_parts(
     occurrence_parts
 }
 
+/// Stamp distinguishing one callable-projection identity format from the next.
+///
+/// A stored row whose stamp differs was produced by a different definition of
+/// "changed", so it cannot be compared field by field. Bumping the stamp is the
+/// declared way to force exactly one full re-projection wave per file and then
+/// return to incremental updates; it is the only reason `signature_hash` ever
+/// changes for a symbol that kept its key.
+const CALLABLE_PROJECTION_FORMAT_STAMP: &str = "callable-projection-format:2";
+
+/// Identity of one projection row: the state the delta path cannot repair.
+///
+/// `signature_hash` used to bind `start_line` and `start_col`, so inserting a
+/// line above any function flipped it and routed the whole file to
+/// `FullReplace` (CR-008) — which deletes the file's nodes and, with them,
+/// everything anchored to those nodes. Position is not identity: it is
+/// projection *content*, carried in `body_hash` and in the row's own
+/// `start_line`/`end_line` columns, both of which the delta path rewrites.
+/// What remains here is the symbol key and the format stamp.
+fn callable_signature_hash(symbol_key: &str) -> i64 {
+    hash_parts([CALLABLE_PROJECTION_FORMAT_STAMP, symbol_key])
+}
+
+/// The edge kinds the caller-scoped delta cleanup rewrites.
+///
+/// `Store::delete_projection_for_callers` deletes exactly the call and usage
+/// edges a changed caller sources in its own file. Anything else the caller
+/// sources survives that cleanup, so it belongs to the file-structural fence
+/// instead — this predicate is the single definition all three sites read.
+fn edge_is_caller_scoped_repairable(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::CALL | EdgeKind::USAGE)
+}
+
+/// Every edge the delta cleanup would remove for this caller.
+///
+/// A caller whose outgoing edges changed is only safe to repair incrementally
+/// if the cleanup deletes the same edges this hash counted; an edge the hash
+/// counts but the cleanup skips is an edge whose stale row survives the repair.
 fn callable_edge_projection_parts(source_edges: Option<&Vec<&Edge>>) -> Vec<String> {
     let Some(source_edges) = source_edges else {
         return Vec::new();
     };
     let mut edge_parts = source_edges
         .iter()
-        .filter(|edge| !is_structural_projection_edge(edge.kind))
+        .filter(|edge| edge_is_caller_scoped_repairable(edge.kind))
         .map(|edge| {
             format!(
                 "{}:{}:{}:{}",
@@ -21314,6 +21543,15 @@ fn callable_edge_projection_parts(source_edges: Option<&Vec<&Edge>>) -> Vec<Stri
     edge_parts
 }
 
+/// The edge kinds that describe a symbol's place in the file's structure
+/// rather than the work its body does.
+///
+/// Distinct from `edge_is_caller_scoped_repairable`, and the two must not be
+/// collapsed into one another: that predicate names the edges the delta
+/// cleanup rewrites, so it fences incremental repair, while this one excludes
+/// structure from a callable's *shape*, so it feeds the normalized signature
+/// the annotation rebind ladder matches on. They answer different questions
+/// and are free to disagree about a kind that is neither CALL nor USAGE.
 fn is_structural_projection_edge(kind: EdgeKind) -> bool {
     matches!(
         kind,
@@ -21362,11 +21600,92 @@ fn occurrence_belongs_to_callable_body(
         && occurrence.element_id != node.id.0
 }
 
+/// Everything in a file that no callable row owns.
+///
+/// The delta path repairs exactly two things: the rows of the callers it was
+/// given, and the node table (upserted by id, so positions self-heal for any
+/// node whose id is stable). This hash is the fence around the rest, and it is
+/// deliberately built as the complement of what
+/// `Store::delete_projection_for_callers` deletes:
+///
+/// - **node identity** for every node in the file. Some collectors still mint
+///   ids from a line and column, so a shifted declaration becomes a *different*
+///   node; a delta would insert the new row and leave the old one behind.
+///   Hashing the id makes any identity churn a full replacement, which is the
+///   only repair that removes the abandoned rows.
+/// - **unowned edges**, with their line. An edge whose source is not a callable
+///   of this file is never deleted by the caller-scoped cleanup, and edge rows
+///   are insert-or-ignore, so a moved edge would keep its old line forever.
+/// - **unowned occurrences**, with their span. Occurrence rows carry no id at
+///   all, so a moved occurrence that is not deleted becomes a duplicate row
+///   rather than an updated one.
+///
+/// Callables contribute only their identity here: their positions, edges, and
+/// body occurrences live in their own rows, which the delta path rewrites.
+/// The callables that actually have a projection row, and their extents.
+///
+/// Ownership must be read off the rows that exist, not off the node kinds: a
+/// callable the projection skipped (no recorded column, say) repairs nothing,
+/// so everything inside it still belongs to the file fence.
+struct CallableProjectionExtents {
+    node_ids: HashSet<NodeId>,
+    /// Extents sorted by start line, with the running maximum end line, so a
+    /// containment probe can stop before scanning every callable in the file.
+    sorted_extents: Vec<(u32, u32)>,
+    prefix_max_end: Vec<u32>,
+}
+
+impl CallableProjectionExtents {
+    fn from_states(states: &[CallableProjectionState]) -> Self {
+        let node_ids = states.iter().map(|state| state.node_id).collect();
+        let mut sorted_extents = states
+            .iter()
+            .map(|state| (state.start_line, state.end_line))
+            .collect::<Vec<_>>();
+        sorted_extents.sort_unstable();
+        let mut prefix_max_end = Vec::with_capacity(sorted_extents.len());
+        let mut running_max = 0;
+        for (_, end_line) in &sorted_extents {
+            running_max = running_max.max(*end_line);
+            prefix_max_end.push(running_max);
+        }
+        Self {
+            node_ids,
+            sorted_extents,
+            prefix_max_end,
+        }
+    }
+
+    fn owns_node(&self, node_id: NodeId) -> bool {
+        self.node_ids.contains(&node_id)
+    }
+
+    /// Mirror of the occurrence predicate in `delete_projection_for_callers`:
+    /// an occurrence is repairable when it is a callable's own definition or
+    /// falls inside a callable's recorded extent.
+    fn owns_occurrence(&self, occurrence: &Occurrence) -> bool {
+        if self.node_ids.contains(&NodeId(occurrence.element_id)) {
+            return true;
+        }
+        let candidates = self
+            .sorted_extents
+            .partition_point(|(start_line, _)| *start_line <= occurrence.location.start_line);
+        if candidates == 0 || self.prefix_max_end[candidates - 1] < occurrence.location.end_line {
+            return false;
+        }
+        self.sorted_extents[..candidates]
+            .iter()
+            .any(|(_, end_line)| *end_line >= occurrence.location.end_line)
+    }
+}
+
 fn structural_projection_hash(
     file_id: NodeId,
     nodes: &[Node],
     edges: &[Edge],
+    occurrences: &[Occurrence],
     node_by_id: &HashMap<NodeId, &Node>,
+    repaired_callables: &CallableProjectionExtents,
 ) -> i64 {
     let mut parts = Vec::new();
 
@@ -21374,28 +21693,24 @@ fn structural_projection_hash(
         if node.id == file_id {
             continue;
         }
-        if is_callable_kind(node.kind) {
-            parts.push(format!(
-                "callable:{}:{}",
-                node.kind as i32,
-                node.qualified_name
-                    .as_deref()
-                    .unwrap_or(node.serialized_name.as_str())
-            ));
-            continue;
-        }
+        let qualified_name = node
+            .qualified_name
+            .as_deref()
+            .unwrap_or(node.serialized_name.as_str());
+        let role = if is_callable_kind(node.kind) {
+            "callable"
+        } else {
+            "node"
+        };
         parts.push(format!(
-            "node:{}:{}:{}",
-            node.kind as i32,
-            node.qualified_name
-                .as_deref()
-                .unwrap_or(node.serialized_name.as_str()),
-            node.start_line.unwrap_or(0)
+            "{role}:{}:{qualified_name}:{}",
+            node.kind as i32, node.id.0
         ));
     }
 
     for edge in edges {
-        if matches!(edge.kind, EdgeKind::CALL | EdgeKind::USAGE) {
+        if edge_is_caller_scoped_repairable(edge.kind) && repaired_callables.owns_node(edge.source)
+        {
             continue;
         }
         let source_name = node_by_id
@@ -21415,8 +21730,27 @@ fn structural_projection_hash(
             })
             .unwrap_or_default();
         parts.push(format!(
-            "edge:{}:{}:{}",
-            edge.kind as i32, source_name, target_name
+            "edge:{}:{source_name}:{target_name}:{}",
+            edge.kind as i32,
+            edge.line.unwrap_or(0)
+        ));
+    }
+
+    for occurrence in occurrences {
+        if occurrence.location.file_node_id != file_id {
+            continue;
+        }
+        if repaired_callables.owns_occurrence(occurrence) {
+            continue;
+        }
+        parts.push(format!(
+            "occurrence:{}:{}:{}:{}:{}:{}",
+            occurrence.element_id,
+            occurrence.kind as i32,
+            occurrence.location.start_line,
+            occurrence.location.start_col,
+            occurrence.location.end_line,
+            occurrence.location.end_col
         ));
     }
 
@@ -21561,6 +21895,160 @@ mod tests {
     use rusqlite::types::Value;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    /// A file whose only structural node is a position-derived one: a shape
+    /// several collectors produce today, because `structural_node_id` mixes the
+    /// declaration's line and column into the id.
+    fn projection_for_positioned_structural_node(
+        structural_id: i64,
+        structural_line: u32,
+        callable_start: u32,
+    ) -> Vec<CallableProjectionState> {
+        let file_id = NodeId(1);
+        let nodes = vec![
+            Node {
+                id: file_id,
+                kind: NodeKind::FILE,
+                serialized_name: "app.sql".to_string(),
+                qualified_name: Some("app.sql".to_string()),
+                start_line: Some(1),
+                start_col: Some(1),
+                end_line: Some(40),
+                end_col: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "run".to_string(),
+                qualified_name: Some("run".to_string()),
+                file_node_id: Some(file_id),
+                start_line: Some(callable_start),
+                start_col: Some(1),
+                end_line: Some(callable_start + 4),
+                end_col: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(structural_id),
+                kind: NodeKind::CLASS,
+                serialized_name: "public.users".to_string(),
+                qualified_name: Some("public.users".to_string()),
+                file_node_id: Some(file_id),
+                start_line: Some(structural_line),
+                start_col: Some(1),
+                end_line: Some(structural_line),
+                end_col: Some(12),
+                ..Default::default()
+            },
+        ];
+        // The structural node's only occurrence sits inside the callable, so
+        // the occurrence fence cannot see it move; node identity is the sole
+        // remaining signal that the row was replaced rather than repositioned.
+        let occurrences = vec![Occurrence {
+            element_id: structural_id,
+            kind: OccurrenceKind::DEFINITION,
+            location: SourceLocation {
+                file_node_id: file_id,
+                start_line: callable_start + 1,
+                start_col: 1,
+                end_line: callable_start + 1,
+                end_col: 12,
+            },
+        }];
+        build_callable_projection_states(&nodes, &[], &occurrences)
+    }
+
+    #[test]
+    fn a_replaced_node_identity_forces_a_full_replacement() {
+        let before = projection_for_positioned_structural_node(30, 3, 10);
+        let unchanged = projection_for_positioned_structural_node(30, 3, 10);
+        assert!(
+            matches!(
+                classify_projection_update(&before, &unchanged),
+                ProjectionUpdateMode::NoChanges
+            ),
+            "an unchanged file must not be reprojected"
+        );
+
+        // Same kind, same qualified name, same everything a caller-scoped
+        // repair would rewrite — only the id differs, which is what a
+        // position-derived collector emits after a shift. The old row is
+        // keyed by the old id and nothing would ever delete it.
+        let reidentified = projection_for_positioned_structural_node(31, 3, 10);
+        assert!(
+            matches!(
+                classify_projection_update(&before, &reidentified),
+                ProjectionUpdateMode::FullReplace
+            ),
+            "a node that changed identity must not be repaired incrementally: {:?}",
+            classify_projection_update(&before, &reidentified)
+        );
+    }
+
+    /// A callable that projects nothing: no outgoing edges, no body
+    /// occurrences. Only its own extent distinguishes one position from
+    /// another, and the stored row's `start_line`/`end_line` are what the
+    /// occurrence cleanup later reads to decide what a delta may delete.
+    fn projection_for_empty_stub(start_line: u32) -> Vec<CallableProjectionState> {
+        let file_id = NodeId(1);
+        let nodes = vec![
+            Node {
+                id: file_id,
+                kind: NodeKind::FILE,
+                serialized_name: "app.rs".to_string(),
+                qualified_name: Some("app.rs".to_string()),
+                start_line: Some(1),
+                start_col: Some(1),
+                end_line: Some(40),
+                end_col: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "stub".to_string(),
+                qualified_name: Some("stub".to_string()),
+                file_node_id: Some(file_id),
+                start_line: Some(start_line),
+                start_col: Some(1),
+                end_line: Some(start_line + 1),
+                end_col: Some(1),
+                ..Default::default()
+            },
+        ];
+        build_callable_projection_states(&nodes, &[], &[])
+    }
+
+    #[test]
+    fn a_moved_stub_is_still_reprojected() {
+        let before = projection_for_empty_stub(10);
+        assert!(
+            matches!(
+                classify_projection_update(&before, &projection_for_empty_stub(10)),
+                ProjectionUpdateMode::NoChanges
+            ),
+            "an unchanged stub must not be reprojected"
+        );
+        let mode = classify_projection_update(&before, &projection_for_empty_stub(12));
+        assert!(
+            matches!(mode, ProjectionUpdateMode::Delta { ref changed_callers }
+                if changed_callers == &vec![NodeId(2)]),
+            "a stub that moved must still have its stored extent rewritten, got {mode:?}"
+        );
+    }
+
+    #[test]
+    fn a_callable_that_only_moved_is_repaired_in_place() {
+        let before = projection_for_positioned_structural_node(30, 3, 10);
+        let moved = projection_for_positioned_structural_node(30, 3, 12);
+        let mode = classify_projection_update(&before, &moved);
+        assert!(
+            matches!(mode, ProjectionUpdateMode::Delta { ref changed_callers }
+                if changed_callers == &vec![NodeId(2)]),
+            "a callable that only moved must be repaired caller-scoped, got {mode:?}"
+        );
+    }
 
     fn projection_snapshot(storage: &Storage) -> Result<Vec<(String, Vec<Vec<Value>>)>> {
         const QUERIES: [(&str, &str); 8] = [
@@ -23735,7 +24223,10 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             "structural_json_collector",
         )
         .expect("current structural cache key");
-        assert!(current_key.starts_with("v2:"));
+        assert!(current_key.starts_with(&format!(
+            "v{}:",
+            crate::cache::STRUCTURAL_ARTIFACT_CACHE_VERSION
+        )));
 
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
         let symbol_table = Arc::new(SymbolTable::new());
@@ -23753,7 +24244,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             )
         };
         let Ok(PreparedIndexWork::Structural(legacy_input)) = legacy_prepared else {
-            panic!("v1 cache must not satisfy the v2 structural cache lookup");
+            panic!("a superseded cache version must not satisfy the current lookup");
         };
         let legacy_result = indexer.execute_prepared_structural_index(&legacy_input);
         assert_eq!(legacy_stats.artifact_cache_hits, 0);

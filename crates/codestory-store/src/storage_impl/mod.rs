@@ -45,6 +45,8 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
+pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+
 const SCHEMA_VERSION: u32 = 31;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
@@ -7783,6 +7785,11 @@ impl Storage {
             }
         }
 
+        // The caller-scoped repair owns exactly the call and usage edges this
+        // file records for the caller. `callable_edge_projection_parts` in the
+        // indexer counts the same two kinds, and anything else is fenced by the
+        // file-structural row instead; the three definitions have to agree or a
+        // delta leaves a row nothing rewrote.
         let removed_edges = tx.execute(
             &format!(
                 "DELETE FROM edge

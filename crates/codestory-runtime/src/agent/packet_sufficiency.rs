@@ -2863,7 +2863,10 @@ mod tests {
             packet_claim_family(&receipt),
             Some("planned state-write evidence")
         );
-        assert_eq!(packet_supported_claim_family_count(&[receipt.clone()]), 1);
+        assert_eq!(
+            packet_supported_claim_family_count(std::slice::from_ref(&receipt)),
+            1
+        );
         assert!(packet_route_claim_node_ids("RequestedEndpoint", &[], &receipt).is_empty());
         assert!(!packet_route_claim_binds_stage(
             &["RequestedEndpoint".to_string()],

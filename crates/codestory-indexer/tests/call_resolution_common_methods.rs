@@ -13128,3 +13128,204 @@ fn test_comprehensive_polymorphic_call_resolution_fixtures() -> anyhow::Result<(
 
     Ok(())
 }
+
+#[test]
+fn test_java_argument_carrying_method_annotation_keeps_parameter_receiver_types()
+-> anyhow::Result<()> {
+    // The parameter surface used to be scanned from the first `(` in the
+    // method's own text, and a leading annotation with an argument list puts
+    // that `(` inside the annotation (CR-009). `@GetMapping("/dispatch")`
+    // yielded `"/dispatch"` as the parameter list, so the receiver map came out
+    // empty and `listener.handleEvent()` never resolved.
+    let source = r#"
+class Listener {
+    void handleEvent() {}
+}
+
+class AuditListener {
+    void handleEvent() {}
+}
+
+class Bus {
+    @GetMapping("/dispatch")
+    @Transactional(readOnly = true)
+    void dispatchTo(Listener listener) {
+        listener.handleEvent();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.java", source)?;
+    assert_resolved_call_to_method_owner(
+        "java annotated method",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Listener",
+        "handleEvent",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "java annotated method",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "AuditListener",
+        "handleEvent",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_java_parameter_annotation_does_not_become_the_receiver_owner_type() -> anyhow::Result<()> {
+    // `f(@RequestParam("id") Listener listener)` recorded the owner type of
+    // `listener` as `@RequestParam`, because the annotation is just another
+    // whitespace-separated token and the type surface truncates at its `(`.
+    let source = r#"
+class Listener {
+    void handleEvent() {}
+}
+
+class AuditListener {
+    void handleEvent() {}
+}
+
+class Bus {
+    void dispatchTo(@RequestParam(value = "id") final Listener listener) {
+        listener.handleEvent();
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.java", source)?;
+    assert_resolved_call_to_method_owner(
+        "java annotated parameter",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Listener",
+        "handleEvent",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "java annotated parameter",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "AuditListener",
+        "handleEvent",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_kotlin_argument_carrying_annotations_keep_parameter_and_property_bindings()
+-> anyhow::Result<()> {
+    // Two separate CR-009 failures on one path: `@Throws(IOException::class)`
+    // on a function turned `IOException::class` into the parameter surface, and
+    // `@Table(name = "users")` on a data class swallowed the whole primary
+    // constructor, so the class lost every property binding.
+    let source = r#"
+package app
+
+class Repository {
+    fun save() {}
+}
+
+class Audit {
+    fun save() {}
+}
+
+@Table(name = "users")
+data class User(private val repository: Repository) {
+    fun persist() {
+        repository.save()
+    }
+}
+
+class Bus {
+    @Throws(IllegalStateException::class)
+    fun dispatchTo(repository: Repository) {
+        repository.save()
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("App.kt", source)?;
+    assert_resolved_call_to_method_owner(
+        "kotlin annotated data class",
+        &nodes,
+        &edges,
+        "persist",
+        "Repository",
+        "save",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin annotated data class",
+        &nodes,
+        &edges,
+        "persist",
+        "Audit",
+        "save",
+    );
+    assert_resolved_call_to_method_owner(
+        "kotlin annotated function",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Repository",
+        "save",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin annotated function",
+        &nodes,
+        &edges,
+        "dispatchTo",
+        "Audit",
+        "save",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_kotlin_trailing_lambda_call_keeps_its_receiver() -> anyhow::Result<()> {
+    // A trailing lambda has no argument parentheses, so cutting the callee at
+    // the first `(` and splitting on the last `.` reached into the lambda body:
+    // `repository.forEach { it.hashCode() }` produced the receiver
+    // `repository.forEach { it` and the member `hashCode`, and the real call to
+    // `forEach` was lost (CR-010).
+    let source = r#"
+package app
+
+class Repository {
+    fun forEach(block: (Int) -> Unit) {}
+}
+
+class Audit {
+    fun forEach(block: (Int) -> Unit) {}
+}
+
+class Bus {
+    fun run(repository: Repository) {
+        repository.forEach { it.hashCode() }
+    }
+}
+"#;
+
+    let (nodes, edges) = index_single_file("Bus.kt", source)?;
+    assert_resolved_call_to_method_owner(
+        "kotlin trailing lambda",
+        &nodes,
+        &edges,
+        "run",
+        "Repository",
+        "forEach",
+    );
+    assert_no_resolved_call_to_method_owner(
+        "kotlin trailing lambda",
+        &nodes,
+        &edges,
+        "run",
+        "Audit",
+        "forEach",
+    );
+    Ok(())
+}

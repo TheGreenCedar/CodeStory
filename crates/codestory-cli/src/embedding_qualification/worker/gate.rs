@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use codestory_contracts::config_registry::EMBED_QUALIFICATION_NONCE_ENV as QUALIFICATION_NONCE_ENV;
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingQualificationWorkerError as WorkerError, ProcessStartProbe,
     SidecarRuntimeConfig, embedding_retry_state,
@@ -63,8 +62,9 @@ pub(super) fn validate_direct_child(
     Ok(canonical_path)
 }
 
-pub(super) fn required_absolute_directory(name: &str) -> Result<PathBuf> {
-    let value = std::env::var_os(name)
+pub(super) fn required_absolute_qualification_directory() -> Result<PathBuf> {
+    let value = codestory_retrieval::qualification_gate_environment()
+        .directory
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_gate_closed"))?;
@@ -149,8 +149,8 @@ pub(super) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 pub(super) fn qualification_nonce() -> Result<String> {
-    std::env::var(QUALIFICATION_NONCE_ENV)
-        .ok()
+    codestory_retrieval::qualification_gate_environment()
+        .nonce_string()
         .filter(|nonce| {
             !nonce.is_empty()
                 && nonce.len() <= 128
