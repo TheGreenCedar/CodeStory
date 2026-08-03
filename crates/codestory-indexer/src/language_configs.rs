@@ -28,7 +28,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     }
 
     match (profile.language_name, ext.as_str()) {
-        ("rust", _) => Some(rust()),
         // `ts`/`mts`/`cts` are answered by the registry above; `tsx` keeps its
         // own grammar and rule file until #1682 gives it a registry row.
         ("go", _) => Some(go()),
@@ -40,16 +39,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("bash", _) => Some(bash()),
         _ => None,
     }
-}
-
-fn rust() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_rust::LANGUAGE.into(),
-        "rust",
-        RUST_GRAPH_QUERY,
-        Some(RUST_TAGS_QUERY),
-        LanguageRuleset::Rust,
-    )
 }
 
 fn go() -> LanguageConfig {

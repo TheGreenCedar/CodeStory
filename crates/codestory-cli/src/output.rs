@@ -5708,6 +5708,12 @@ mod tests {
         );
         let python = ansi_highlight_snippet("app/main.py", "ok = True  # comment");
         assert!(python.contains("\x1b[90m# comment\x1b[0m"), "{python:?}");
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("rust"),
+            Some("//")
+        );
+        let rust = ansi_highlight_snippet("src/main.rs", "let ok = true; // comment");
+        assert!(rust.contains("\x1b[90m// comment\x1b[0m"), "{rust:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

@@ -512,6 +512,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "python",
         line_comment: "#",
     },
+    LanguageCommentProfile {
+        language_name: "rust",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1294,7 +1298,8 @@ mod tests {
                 "javascript",
                 "typescript",
                 "tsx",
-                "python"
+                "python",
+                "rust"
             ]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
@@ -1319,6 +1324,7 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("rust"), Some("//"));
         assert_eq!(line_comment_for_language("python"), Some("#"));
         assert_eq!(line_comment_for_language("tsx"), Some("//"));
         // The dialect row must not answer for the language it routes to: the
