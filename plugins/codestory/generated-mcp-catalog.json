@@ -1,4 +1,12 @@
 {
+  "wireContract": {
+    "publicationStampSchemaVersion": 2,
+    "minimumCompatiblePublicationStampSchemaVersion": 2,
+    "supportedMcpProtocolVersions": [
+      "2024-11-05"
+    ],
+    "preferredMcpProtocolVersion": "2024-11-05"
+  },
   "tools": [
     {
       "annotations": {

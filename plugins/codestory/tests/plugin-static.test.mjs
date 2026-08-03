@@ -153,6 +153,105 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   );
 });
 
+test("launcher wire contract matches the generated catalog read from the real CLI", async () => {
+  // The launcher must not read the catalog at run time to find its skew
+  // detector, so the constants are mirrored. This is the pin that keeps the
+  // mirror honest: the catalog half is generated from the real binary.
+  const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
+  assert.deepEqual(catalog.wireContract, {
+    publicationStampSchemaVersion: launcherTest.publicationStampSchemaVersion,
+    minimumCompatiblePublicationStampSchemaVersion:
+      launcherTest.minimumCompatiblePublicationStampSchemaVersion,
+    supportedMcpProtocolVersions: [...launcherTest.supportedMcpProtocolVersions],
+    preferredMcpProtocolVersion: launcherTest.managedCliMcpProtocolVersion,
+  });
+  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 2);
+  assert.deepEqual(catalog.wireContract.supportedMcpProtocolVersions, ["2024-11-05"]);
+});
+
+test("launcher negotiates the MCP protocol revision instead of echoing it", () => {
+  // CR-064: echoing an unimplemented revision hands the host a compatibility
+  // claim nothing behind the launcher honours.
+  assert.deepEqual(launcherTest.negotiateMcpProtocolVersion("2024-11-05"), {
+    requested: "2024-11-05",
+    negotiated: "2024-11-05",
+    supported: ["2024-11-05"],
+    status: "agreed",
+    compatible: true,
+  });
+  assert.deepEqual(launcherTest.negotiateMcpProtocolVersion("2025-03-26"), {
+    requested: "2025-03-26",
+    negotiated: "2024-11-05",
+    supported: ["2024-11-05"],
+    status: "unsupported_client_revision",
+    compatible: false,
+  });
+  for (const absent of [undefined, null, "", "   ", 7]) {
+    assert.deepEqual(
+      launcherTest.negotiateMcpProtocolVersion(absent),
+      {
+        requested: null,
+        negotiated: "2024-11-05",
+        supported: ["2024-11-05"],
+        status: "defaulted",
+        compatible: true,
+      },
+      `absent revision ${JSON.stringify(absent)} must default without claiming a client revision`,
+    );
+  }
+});
+
+test("launcher classifies the runtime initialize contract fail-closed", () => {
+  const stamped = (stamp) => ({
+    jsonrpc: "2.0",
+    id: "initialize",
+    result: {
+      protocolVersion: "2024-11-05",
+      _meta: { codestory_publication: stamp },
+    },
+  });
+
+  assert.equal(
+    launcherTest.runtimeWireContractSkew(
+      stamped({ schema_version: 2, minimum_compatible_schema_version: 2 }),
+      "2024-11-05",
+    ),
+    null,
+  );
+  assert.equal(
+    launcherTest.runtimeWireContractSkew(
+      { jsonrpc: "2.0", id: "initialize", result: { protocolVersion: "2024-11-05" } },
+      "2024-11-05",
+    ),
+    "publication_stamp_legacy_v0",
+    "a runtime that predates the stamp is legacy v0, not silently current",
+  );
+  assert.equal(
+    launcherTest.runtimeWireContractSkew(stamped({ schema_version: 1 }), "2024-11-05"),
+    "publication_stamp_producer_too_old",
+  );
+  assert.equal(
+    launcherTest.runtimeWireContractSkew(
+      stamped({ schema_version: 2, minimum_compatible_schema_version: 2 }),
+      "2025-03-26",
+    ),
+    "protocol_version_skew",
+    "the runtime must speak the revision the launcher already promised the host",
+  );
+  assert.equal(
+    launcherTest.runtimeWireContractSkew(
+      { jsonrpc: "2.0", id: "initialize", error: { code: -32600, message: "no" } },
+      "2024-11-05",
+    ),
+    "initialize_rejected",
+  );
+  assert.equal(launcherTest.runtimeWireContractSkew("not-json-rpc", "2024-11-05"), "initialize_response_invalid");
+  assert.equal(
+    launcherTest.runtimeWireContractSkew({ jsonrpc: "2.0", id: "initialize" }, "2024-11-05"),
+    "initialize_result_invalid",
+  );
+});
+
 test("fail-open relay bounds hostile frames and survives null input and a missing catalog", async () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const status = {
@@ -648,7 +747,7 @@ async function waitForPath(pathname, timeoutMs = 10000) {
 async function writeFakeCli(cliPath) {
   const script = [
     "const fs=require('fs');const args=process.argv.slice(1);",
-    "if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n',()=>process.exit(0))})}",
+    "if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'2'),minimum_compatible_schema_version:2}}}})+'\\n',()=>process.exit(0))})}",
     "else if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}",
     "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
   ].join("");
@@ -676,7 +775,7 @@ async function writeLifecycleCli(cliPath) {
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
-    "process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});",
+    "process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'2'),minimum_compatible_schema_version:2}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});",
   ].join("");
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
@@ -2101,16 +2200,49 @@ test("managed cli staging uses direct executables and requires the exact MCP con
   assert.equal(spawnOptions.shell, false);
 });
 
-test("managed cli staging escalates and awaits a stubborn child", async () => {
-  const compatible = {
+function compatibleProbeResult(stamp = { schema_version: 2, minimum_compatible_schema_version: 2 }) {
+  return {
     jsonrpc: "2.0",
     id: "managed-cli-staging",
     result: {
       protocolVersion: "2024-11-05",
       capabilities: {},
       serverInfo: { name: "fixture", version: "1" },
+      ...(stamp === null ? {} : { _meta: { codestory_publication: stamp } }),
     },
   };
+}
+
+test("managed cli staging refuses to stage a runtime whose publication stamp it cannot read", async () => {
+  // ARCH-035: provisioning establishes the pinned pair, so a runtime that
+  // publishes a stamp outside the launcher's window never becomes the staged
+  // CLI. `null` is the legacy v0 producer that predates the stamp entirely.
+  const cases = [
+    [null, "publication_stamp_legacy_v0"],
+    [{ schema_version: 0 }, "publication_stamp_legacy_v0"],
+    [{ schema_version: "2" }, "publication_stamp_malformed"],
+    [{ schema_version: 1 }, "publication_stamp_producer_too_old"],
+    [{ schema_version: 3 }, "publication_stamp_producer_too_new"],
+    [
+      { schema_version: 2, minimum_compatible_schema_version: 3 },
+      "publication_stamp_producer_too_new",
+    ],
+  ];
+  for (const [stamp, expected] of cases) {
+    await assert.rejects(
+      launcherTest.probeManagedCliStdio("fixture", 100, {
+        spawn: () => fakeProbeChild(compatibleProbeResult(stamp)),
+        terminationGraceMs: 5,
+        forceKillGraceMs: 20,
+      }),
+      new RegExp(`managed_cli_stdio_initialize_wire_contract:${expected}$`, "u"),
+      `stamp ${JSON.stringify(stamp)} must be refused as ${expected}`,
+    );
+  }
+});
+
+test("managed cli staging escalates and awaits a stubborn child", async () => {
+  const compatible = compatibleProbeResult();
   const child = fakeProbeChild(compatible);
   await launcherTest.probeManagedCliStdio("fixture", 100, {
     spawn: () => child,
@@ -3287,7 +3419,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
         "      if (!line.trim()) continue;",
         "      const request = JSON.parse(line);",
       "      if (request.method === 'initialize') {",
-      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { serverInfo: { name: 'codestory' } } }) + '\\n');",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2024-11-05', serverInfo: { name: 'codestory' }, _meta: { codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '2'), minimum_compatible_schema_version: 2 } } } }) + '\\n');",
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
       "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
@@ -3685,6 +3817,124 @@ test("mcp launcher owns initialize before handing off to the native runtime", as
   }
 });
 
+test("packaged initialize handshake carries the publication stamp the host reads", async () => {
+  // The launcher answers `initialize` itself and suppresses the runtime's own
+  // answer, so the runtime-side `initialize` stamp is invisible to a host wired
+  // through `plugins/codestory/.mcp.json`. This drives the packaged launcher as
+  // a process — the only path the plugin configures — and pins the claim the
+  // CHANGELOG and the shipped grounding skills make: the version is known at
+  // handshake, before the first tool call.
+  const version = await readPluginVersion();
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const initialize = {
+    jsonrpc: "2.0",
+    id: "initialize",
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "plugin-static", version: "1" },
+    },
+  };
+  const packagedInitializeResult = (env, cwd) => {
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd,
+      env,
+      input: `${JSON.stringify(initialize)}\n`,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim().split(/\r?\n/u)[0]);
+    assert.equal(response.id, "initialize");
+    return response.result;
+  };
+
+  // The documented `CODESTORY_CLI` override: a runtime is available and the
+  // launcher is about to hand the session off, yet the handshake it already
+  // answered is still the only stamp the host will ever see.
+  const overrideDataDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-"));
+  const overrideBinDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-bin-"));
+  try {
+    const cliPath = await writeNodeCli(
+      overrideBinDir,
+      [
+        "const args = process.argv.slice(2);",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] === 'serve') { setInterval(() => {}, 1000); }",
+        "else process.exit(2);",
+      ].join("\n"),
+    );
+    const overrideResult = packagedInitializeResult({
+      ...process.env,
+      CODESTORY_CLI: cliPath,
+      PLUGIN_DATA: overrideDataDir,
+      TEST_CODESTORY_VERSION: version,
+    }, overrideDataDir);
+
+    const stamp = overrideResult._meta?.codestory_publication;
+    assert.ok(
+      stamp,
+      "the packaged handshake must carry _meta.codestory_publication, not only _meta.codestory_protocol",
+    );
+    assert.deepEqual(stamp, {
+      schema_version: 2,
+      minimum_compatible_schema_version: 2,
+      served_from: "contract_only",
+      publication: null,
+      core_publication: null,
+      retrieval_publication: null,
+      contract_runtime: {
+        cli_version: version,
+        plugin_version: version,
+        plugin_cli_version: version,
+        cli_source: "local_dev_override",
+        pinned_pair_matches: true,
+        known_override_skew_channel: true,
+      },
+      operation: { operation_id: null, attempt: null },
+    });
+    // The launcher's own fail-closed reader must accept the launcher's own
+    // handshake: a stamp the pinned reader would refuse is not a stamp.
+    assert.equal(launcherTest.publicationStampSkew(stamp), null);
+    assert.equal(overrideResult._meta.codestory_protocol.negotiated, "2024-11-05");
+  } finally {
+    await rm(overrideDataDir, { recursive: true, force: true });
+    await rm(overrideBinDir, { recursive: true, force: true });
+  }
+
+  // Fail-open, no runtime at all: the host still learns the response contract
+  // it is talking to instead of reading an unstamped legacy v0 handshake.
+  const failOpenDataDir = await mkdtemp(join(tmpdir(), "codestory-handshake-stamp-failopen-"));
+  try {
+    const failOpenResult = packagedInitializeResult({
+      PLUGIN_DATA: "",
+      COPILOT_PLUGIN_DATA: "",
+      CODESTORY_PLUGIN_DATA: failOpenDataDir,
+      CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+      PATH: "",
+      ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+    }, repoRoot);
+
+    const stamp = failOpenResult._meta?.codestory_publication;
+    assert.ok(stamp, "the fail-open handshake must carry the stamp too");
+    assert.equal(stamp.schema_version, 2);
+    assert.equal(stamp.minimum_compatible_schema_version, 2);
+    assert.equal(stamp.served_from, "contract_only");
+    assert.equal(launcherTest.publicationStampSkew(stamp), null);
+    assert.equal(stamp.contract_runtime.cli_source, "managed_unavailable");
+    assert.equal(stamp.contract_runtime.cli_version, null);
+    assert.equal(
+      stamp.contract_runtime.pinned_pair_matches,
+      null,
+      "an unresolved CLI cannot be reported as a failed pin",
+    );
+    assert.equal(stamp.contract_runtime.known_override_skew_channel, false);
+  } finally {
+    await rm(failOpenDataDir, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher starts the multi-project stdio runtime through its bridge", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
@@ -3726,9 +3976,12 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
         "          jsonrpc: '2.0',",
         "          id: request.id,",
         "          result: {",
-        "            protocolVersion: request.params.protocolVersion,",
+        // A v2 runtime negotiates: it answers with the revision it implements,
+        // never the one the client asked for.
+        "            protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2024-11-05',",
         "            capabilities: {},",
         "            serverInfo: { name: 'codestory', version },",
+        "            _meta: { codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '2'), minimum_compatible_schema_version: 2 } },",
         "          },",
         "        }));",
         "      } else if (request.method === 'tools/list') {",
@@ -3806,6 +4059,178 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
       ]);
     }));
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("CODESTORY_CLI override that publishes an unreadable wire contract is refused at session runtime", async () => {
+  // ARCH-035: the launcher answers `initialize` itself and suppresses the
+  // runtime's answer, so the runtime's own compatibility claim reaches nobody
+  // else. Under `CODESTORY_CLI` there is no pinned pair, no archive digest and
+  // no catalog drift check left — this stamp comparison is the whole detector.
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-wire-skew-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "skewed-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "skewed-codestory-cli.cmd" : "skewed-codestory-cli",
+  );
+  const servedFile = join(dataDir, "runtime-served.txt");
+  let child;
+
+  try {
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const args = process.argv.slice(2);",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] !== 'serve') process.exit(2);",
+        "let buffer = '';",
+        "process.stdin.setEncoding('utf8');",
+        // Outlive the launcher closing our stdin so the delayed reply below is
+        // actually produced; the launcher must refuse to relay it.
+        "process.stdin.on('end', () => setTimeout(() => process.exit(0), 400));",
+        "process.stdin.on('data', (chunk) => {",
+        "  buffer += chunk;",
+        "  const lines = buffer.split(/\\r?\\n/u);",
+        "  buffer = lines.pop() || '';",
+        "  for (const line of lines) {",
+        "    if (!line.trim()) continue;",
+        "    const request = JSON.parse(line);",
+        "    if (request.method === 'initialize') {",
+        "      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_publication: { schema_version: 1 } } } }) + '\\n');",
+        "    } else if (request.method === 'tools/list') {",
+        // Answer in a later chunk so the reply lands after the launcher has
+        // already refused this runtime: the relay must stay shut, not just
+        // drop the rest of the chunk that carried the initialize frame.
+        "      setTimeout(() => {",
+        "        fs.writeFileSync(process.env.TEST_SERVED, 'runtime-answered');",
+        "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'skewed-runtime' }] } }) + '\\n');",
+        "      }, 50);",
+        "    }",
+        "  }",
+        "});",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    child = spawn(process.execPath, [launcher], {
+      cwd: dataDir,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_SERVED: servedFile,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const pending = new Map();
+    const received = new Map();
+    const hostFrames = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        if (!line) continue;
+        hostFrames.push(line);
+        const response = JSON.parse(line);
+        if (response.id === undefined) continue;
+        if (pending.has(response.id)) pending.get(response.id)(response);
+        else received.set(response.id, response);
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const sendRequest = async (request) => {
+      const waiter = received.has(request.id)
+        ? Promise.resolve(received.get(request.id))
+        : new Promise((resolve) => pending.set(request.id, resolve));
+      child.stdin.write(`${JSON.stringify(request)}\n`);
+      return Promise.race([
+        waiter,
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error(`timed out waiting for ${request.id}: ${stderr}`)),
+          8000,
+        )),
+      ]);
+    };
+
+    const init = await sendRequest({
+      jsonrpc: "2.0",
+      id: "init",
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+    });
+    assert.equal(
+      init.result.protocolVersion,
+      "2024-11-05",
+      "the launcher must answer with the revision it implements, not the one requested",
+    );
+    assert.deepEqual(init.result._meta.codestory_protocol, {
+      requested: "2025-03-26",
+      negotiated: "2024-11-05",
+      supported: ["2024-11-05"],
+      status: "unsupported_client_revision",
+      compatible: false,
+    });
+
+    const delegated = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
+    assert.equal(
+      delegated.result,
+      undefined,
+      `a skewed runtime must not serve a delegated request: ${JSON.stringify(delegated)}`,
+    );
+    assert.equal(delegated.error.code, -32000);
+    assert.match(delegated.error.message, /reason_code=runtime_wire_contract_skew/u);
+    assert.match(delegated.error.message, /error_code=publication_stamp_producer_too_old/u);
+
+    const diagnostic = await sendRequest({
+      jsonrpc: "2.0",
+      id: "status",
+      method: "resources/read",
+      params: { uri: launcherTest.projectBoundResourceUri("codestory://status", dataDir) },
+    });
+    const status = JSON.parse(diagnostic.result.contents[0].text);
+    assert.equal(status.degraded_reason, "runtime_wire_contract_skew");
+    assert.equal(status.readiness[0].status, "unavailable");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+
+    // The refused runtime did produce a `tools/list` answer — the request was
+    // already in flight when its initialize frame arrived. The contract is that
+    // none of it reaches the host.
+    for (let waited = 0; waited < 2000 && !fs.existsSync(servedFile); waited += 25) {
+      await delay(25);
+    }
+    await delay(100);
+    assert.equal(fs.existsSync(servedFile), true, "the fixture must have produced a reply to suppress");
+    assert.equal(
+      hostFrames.some((frame) => frame.includes("skewed-runtime")),
+      false,
+      `a refused runtime's output must never reach the host: ${hostFrames.join("\n")}`,
+    );
+  } finally {
+    if (child) {
+      child.stdin.end();
+      await Promise.race([once(child, "exit"), delay(2000)]);
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
     await rm(dataDir, { recursive: true, force: true });
   }
 });

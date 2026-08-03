@@ -530,9 +530,16 @@ impl RuntimeContext {
     }
 }
 
-/// Additive public response-envelope contract. Missing remains legacy v0 until W7.7 completes
-/// protocol negotiation and fail-closed defaults around this stamp.
-pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 = 1;
+/// Public response-envelope contract version. `codestory_contracts::wire` owns
+/// the value and documents each revision; a missing stamp stays legacy v0.
+pub(crate) const CODESTORY_PUBLICATION_META_SCHEMA_VERSION: u32 =
+    codestory_contracts::wire::PUBLICATION_STAMP_SCHEMA_VERSION;
+
+/// Oldest reader schema that can still interpret this stamp. Published so a
+/// consumer decides from the payload instead of guessing that every bump is
+/// additive.
+pub(crate) const CODESTORY_PUBLICATION_META_MINIMUM_COMPATIBLE_SCHEMA_VERSION: u32 =
+    codestory_contracts::wire::MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION;
 
 pub(crate) fn codestory_publication_contract_runtime_meta() -> serde_json::Value {
     let active_cli_version = env!("CARGO_PKG_VERSION");
@@ -597,6 +604,8 @@ pub(crate) fn codestory_publication_meta(
     };
     serde_json::json!({
         "schema_version": CODESTORY_PUBLICATION_META_SCHEMA_VERSION,
+        "minimum_compatible_schema_version":
+            CODESTORY_PUBLICATION_META_MINIMUM_COMPATIBLE_SCHEMA_VERSION,
         "served_from": served_from,
         "publication": core_publication,
         "core_publication": core_publication,
@@ -1308,11 +1317,16 @@ mod tests {
             value.pointer("/_meta/codestory_publication/served_from"),
             Some(&serde_json::json!("contract_only"))
         );
+        // Literal, not the constant: the CLI JSON envelope publishes the same
+        // number the stdio and HTTP adapters do, and a consumer pinned to it
+        // must see the bump rather than a self-referential comparison.
         assert_eq!(
             value.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&serde_json::json!(
-                CODESTORY_PUBLICATION_META_SCHEMA_VERSION
-            ))
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+            Some(&serde_json::json!(2))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),

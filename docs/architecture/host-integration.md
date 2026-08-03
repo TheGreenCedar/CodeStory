@@ -44,6 +44,41 @@ override. A declared but invalid receipt, or a receipt combined with the raw
 `CODESTORY_CLI` override, fails closed and cannot fall through to managed
 release provisioning.
 
+## Wire compatibility
+
+`codestory_contracts::wire` owns two identities the launcher and the native
+process must agree on: the `_meta.codestory_publication` schema version and the
+MCP protocol revisions the executable implements. The generated MCP catalog
+records both, read back out of the real binary, so the launcher's mirrored
+constants are pinned to the CLI it ships with.
+
+`initialize` negotiates. The server answers with a revision it implements and
+reports the requested revision, the negotiated revision, the supported set, and
+whether they agree in `_meta.codestory_protocol`. It never echoes an
+unimplemented revision back as supported.
+
+The launcher answers `initialize` for the host and suppresses the native
+process's own answer, so the answer the host reads at handshake is the
+launcher's. It stamps that answer with its own `_meta.codestory_publication`:
+the same schema and minimum-compatible versions the launcher pins, with
+`served_from=contract_only` because no publication identity exists at session
+start, and a `contract_runtime` recording the launcher's half of the pinned pair
+(`pinned_pair_matches` is `null` while no CLI is resolved, which is "cannot
+compare", not "mismatch"). Without that stamp the packaged handshake would read
+as a legacy v0 producer whatever the pinned runtime implements.
+
+Being the only reader of the native answer, the launcher compares the
+negotiated revision and the publication schema version against its pinned
+contract. A stamp that is absent (legacy v0), unreadable, older than the
+launcher's minimum, or newer than it understands refuses the handoff: the
+runtime is shut down, every delegated request already in flight is answered with
+a typed `runtime_wire_contract_skew` failure, nothing that runtime wrote is
+relayed to the host, and the fail-open diagnostic reports the skew as the
+degraded reason. Provisioning applies the same check
+before staging an archive. Released pairs always match; the documented
+`CODESTORY_CLI` override is the one supported way to skew them, and this
+comparison is the only detector that channel leaves available.
+
 ## Request routing
 
 Every tool and resource request includes an absolute `project` root. The

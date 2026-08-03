@@ -74,7 +74,16 @@ const managedCliProbeStdoutMaxBytes = 64 * 1024;
 const managedCliProbeStderrMaxBytes = 4 * 1024;
 const managedCliProbeTerminationGraceMs = 500;
 const managedCliProbeForceKillGraceMs = 1000;
+// Wire compatibility contract. `codestory_contracts::wire` owns these values;
+// the generated MCP catalog records the same three read back out of the real
+// binary, and `launcher wire contract matches the generated catalog` in the
+// plugin test suite pins the launcher copy to that recording. The launcher must
+// not depend on the catalog at run time: a packaging failure that loses the
+// catalog must not also lose the skew detector.
 const managedCliMcpProtocolVersion = '2024-11-05';
+const supportedMcpProtocolVersions = Object.freeze(['2024-11-05']);
+const publicationStampSchemaVersion = 2;
+const minimumCompatiblePublicationStampSchemaVersion = 2;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
 const failOpenMaxFrameBytes = 1024 * 1024;
@@ -2045,6 +2054,109 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+// Mirrors codestory_contracts::wire::negotiate_mcp_protocol_version. The
+// launcher answers `initialize` itself and suppresses the CLI's answer, so an
+// echoed revision here would be a false compatibility claim the host can never
+// see corrected.
+function negotiateMcpProtocolVersion(requested) {
+  const asked = typeof requested === 'string' ? requested.trim() : '';
+  if (!asked) {
+    return {
+      requested: null,
+      negotiated: managedCliMcpProtocolVersion,
+      supported: [...supportedMcpProtocolVersions],
+      status: 'defaulted',
+      compatible: true,
+    };
+  }
+  const agreed = supportedMcpProtocolVersions.includes(asked);
+  return {
+    requested: asked,
+    negotiated: agreed ? asked : managedCliMcpProtocolVersion,
+    supported: [...supportedMcpProtocolVersions],
+    status: agreed ? 'agreed' : 'unsupported_client_revision',
+    compatible: agreed,
+  };
+}
+
+// Mirrors codestory_contracts::wire::classify_publication_stamp. Returns a skew
+// token, or null when the stamp is inside the mutually supported window.
+function publicationStampSkew(stamp) {
+  if (!isPlainObject(stamp)) return 'publication_stamp_legacy_v0';
+  const observed = stamp.schema_version;
+  if (!Number.isSafeInteger(observed) || observed < 0) return 'publication_stamp_malformed';
+  if (observed === 0) return 'publication_stamp_legacy_v0';
+  if (observed > publicationStampSchemaVersion) return 'publication_stamp_producer_too_new';
+  if (observed < minimumCompatiblePublicationStampSchemaVersion) {
+    return 'publication_stamp_producer_too_old';
+  }
+  const producerMinimum = stamp.minimum_compatible_schema_version;
+  if (Number.isSafeInteger(producerMinimum) && producerMinimum > publicationStampSchemaVersion) {
+    return 'publication_stamp_producer_too_new';
+  }
+  return null;
+}
+
+function publicationStampText(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text ? text : null;
+}
+
+// Mirrors `codestory_cli::runtime::codestory_publication_meta` for the one frame
+// the packaged path never delegates. The launcher answers `initialize` itself
+// and suppresses the runtime's own answer, so this is the only stamp a host
+// behind `plugins/codestory/.mcp.json` can read at handshake; without it the
+// packaged handshake is indistinguishable from a legacy v0 producer no matter
+// which contract the pinned runtime implements. The launcher authors the frame,
+// so the stamp describes the launcher's own knowledge: no publication identity
+// exists at session start, hence `served_from=contract_only`.
+function failOpenPublicationStamp(status) {
+  const plugin = isPlainObject(status?.plugin_runtime) ? status.plugin_runtime : {};
+  const cliVersion = publicationStampText(status?.cli_version);
+  // The launcher-provided half of the pinned pair: exactly the value
+  // `stdioRuntimeEnv` hands the runtime as `CODESTORY_PLUGIN_CLI_VERSION`.
+  const pluginCliVersion = publicationStampText(plugin.plugin_cli_version);
+  // `launcher` is the existing source token for "the launcher itself, with no
+  // resolved CLI behind it"; the fallback stays inside that vocabulary rather
+  // than inventing a value a consumer has never been told about.
+  const cliSource = publicationStampText(plugin.cli_source) || 'launcher';
+  return {
+    schema_version: publicationStampSchemaVersion,
+    minimum_compatible_schema_version: minimumCompatiblePublicationStampSchemaVersion,
+    served_from: 'contract_only',
+    publication: null,
+    core_publication: null,
+    retrieval_publication: null,
+    contract_runtime: {
+      cli_version: cliVersion,
+      plugin_version: publicationStampText(plugin.plugin_version),
+      plugin_cli_version: pluginCliVersion,
+      cli_source: cliSource,
+      // `null` is "cannot compare", not "mismatch": the launcher answers
+      // `initialize` before any runtime is required to exist, so an unresolved
+      // CLI must not be reported as a failed pin.
+      pinned_pair_matches: pluginCliVersion === null || cliVersion === null
+        ? null
+        : pluginCliVersion === cliVersion,
+      known_override_skew_channel: Boolean(publicationStampText(process.env.CODESTORY_CLI))
+        || cliSource === 'local_dev_override',
+    },
+    operation: { operation_id: null, attempt: null },
+  };
+}
+
+// The pair check the `CODESTORY_CLI` override otherwise bypasses: the runtime's
+// own `initialize` result must agree with the revision the launcher already
+// promised the host and must stamp a publication schema this launcher can read.
+function runtimeWireContractSkew(response, negotiatedProtocolVersion) {
+  if (!isPlainObject(response)) return 'initialize_response_invalid';
+  if (response.error !== undefined) return 'initialize_rejected';
+  const result = response.result;
+  if (!isPlainObject(result)) return 'initialize_result_invalid';
+  if (result.protocolVersion !== negotiatedProtocolVersion) return 'protocol_version_skew';
+  return publicationStampSkew(result._meta?.codestory_publication);
+}
+
 function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
   return new Promise((resolve, reject) => {
     const spawnChild = options.spawn || spawn;
@@ -2128,6 +2240,14 @@ function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
         typeof response.result.serverInfo.version !== 'string' || !response.result.serverInfo.version.trim()
       ) {
         terminate(new Error('managed_cli_stdio_initialize_incompatible'));
+        return;
+      }
+      // Provisioning is where the pinned pair is established, so an archive
+      // whose runtime publishes a wire contract this launcher cannot read is
+      // never staged.
+      const stampSkew = publicationStampSkew(response.result._meta?.codestory_publication);
+      if (stampSkew) {
+        terminate(new Error(`managed_cli_stdio_initialize_wire_contract:${stampSkew}`));
         return;
       }
       terminate(null);
@@ -3134,6 +3254,10 @@ function pluginRuntimeForResolved(resolved) {
     cli_source: resolved.source,
     cli_path: resolved.path,
     cli_sha256: resolved.sha256,
+    // The launcher-provided half of the pinned pair, identical to the
+    // `CODESTORY_PLUGIN_CLI_VERSION` the runtime stamps back as
+    // `contract_runtime.plugin_cli_version`.
+    plugin_cli_version: resolved.cliVersion || resolved.version || null,
     build_source: resolved.buildSource,
     repo_ref: resolved.repoRef,
     source_package_sha256: resolved.sourcePackageSha256 || null,
@@ -3684,6 +3808,10 @@ const runtimeFailureReasons = new Map([
   ['runtime_stdio_child_exit', 'CodeStory stdio handoff exited before completing the request.'],
   ['runtime_stdio_child_spawn', 'CodeStory stdio handoff failed to start.'],
   ['runtime_stdio_child_stdin', 'CodeStory stdio handoff stdin failed.'],
+  [
+    'runtime_wire_contract_skew',
+    'CodeStory stdio handoff published a wire contract this plugin cannot read.',
+  ],
 ]);
 
 function runtimeFailureCode(value) {
@@ -3818,6 +3946,7 @@ function runFailOpenMcp(status, options = {}) {
   let handoff = null;
   let handoffWrite = null;
   let initializeRequest = null;
+  let negotiatedProtocol = null;
   let initializedNotification = null;
   let runtimeReadyNotified = false;
   let stdinEnded = false;
@@ -3925,6 +4054,9 @@ function runFailOpenMcp(status, options = {}) {
       let suppressInitialize = Boolean(initializeRequest);
       handoff.stdout.setEncoding('utf8');
       handoff.stdout.on('data', (chunk) => {
+        // A failed handoff stops relaying immediately. Chunks that arrive after
+        // the failure carry results from a runtime the launcher already refused.
+        if (handoffFailureHandled) return;
         stdout += chunk;
         const lines = stdout.split(/\r?\n/u);
         stdout = lines.pop() || '';
@@ -3938,6 +4070,18 @@ function runFailOpenMcp(status, options = {}) {
           }
           if (suppressInitialize && parsed?.id === initializeRequest.id) {
             suppressInitialize = false;
+            // The host never sees this frame — the launcher already answered
+            // `initialize`. That makes the launcher the only reader of the
+            // runtime's own compatibility claim, and the only place a
+            // `CODESTORY_CLI` override can be caught at session runtime.
+            const skew = runtimeWireContractSkew(
+              parsed,
+              negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
+            );
+            if (skew) {
+              failHandoff('runtime_wire_contract_skew', { errorCode: skew });
+              return;
+            }
             continue;
           }
           if (parsed?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(parsed.id));
@@ -4018,14 +4162,19 @@ function runFailOpenMcp(status, options = {}) {
     let response;
     if (request.method === 'initialize') {
       const liveStatus = currentStatus();
+      negotiatedProtocol = negotiateMcpProtocolVersion(request.params?.protocolVersion);
       response = jsonrpcResult(request.id, {
-        protocolVersion: request.params?.protocolVersion || '2024-11-05',
+        protocolVersion: negotiatedProtocol.negotiated,
         capabilities: {
           tools: { listChanged: true },
           resources: { subscribe: false, listChanged: true },
           prompts: { listChanged: true },
         },
         serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
+        _meta: {
+          codestory_publication: failOpenPublicationStamp(liveStatus),
+          codestory_protocol: negotiatedProtocol,
+        },
       });
     } else if (request.method === 'tools/list') {
       response = jsonrpcResult(request.id, { tools });
@@ -4245,9 +4394,11 @@ async function main() {
       onRuntimeFailure: (failure) => {
         const failed = ready;
         ready = null;
-        const reason = failure.stdinError
-          ? 'runtime_stdio_child_stdin'
-          : failure.spawnError ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
+        const reason = failure.reasonCode === 'runtime_wire_contract_skew'
+          ? 'runtime_wire_contract_skew'
+          : failure.stdinError
+            ? 'runtime_stdio_child_stdin'
+            : failure.spawnError ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
         status = fallbackDiagnostic(failed, {
           status: failure.code ?? null,
           error: failure.reason,
@@ -4297,9 +4448,11 @@ async function main() {
     startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
     onRuntimeFailure: (failure) => {
       handoffReady = false;
-      const reason = failure.stdinError
-        ? 'runtime_stdio_child_stdin'
-        : failure.spawnError ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
+      const reason = failure.reasonCode === 'runtime_wire_contract_skew'
+        ? 'runtime_wire_contract_skew'
+        : failure.stdinError
+          ? 'runtime_stdio_child_stdin'
+          : failure.spawnError ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
       const error = failure.code != null
         ? `codestory-cli serve --stdio exited with status ${failure.code}`
         : failure.reason;
@@ -4420,6 +4573,14 @@ if (require.main === module) {
       processStartIdentity,
       probeResolvedCli,
       probeManagedCliStdio,
+      negotiateMcpProtocolVersion,
+      failOpenPublicationStamp,
+      publicationStampSkew,
+      runtimeWireContractSkew,
+      supportedMcpProtocolVersions,
+      managedCliMcpProtocolVersion,
+      publicationStampSchemaVersion,
+      minimumCompatiblePublicationStampSchemaVersion,
       provisionManagedCli,
       quarantineManagedCliVersion,
       releaseManagedCliLock,

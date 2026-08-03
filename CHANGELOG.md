@@ -154,6 +154,29 @@
 - If moving bookmarks to their new home is interrupted — a full disk, a closed
   laptop — the bookmarks you already had stay visible instead of appearing to
   have vanished, and the move finishes the next time you make a change.
+- A host is no longer told CodeStory speaks a protocol revision it does not
+  implement. The MCP handshake used to repeat back whichever revision the host
+  asked for, which read as agreement. It now answers with a revision CodeStory
+  actually implements and reports what was asked for, what was agreed, and
+  everything supported.
+- Every CodeStory response now says which response contract produced it, and the
+  handshake says it first, so a tool that reads CodeStory output knows the
+  vocabulary before it reads a single result. The contract is version 2: tool
+  arguments are checked against the published tool list and refused instead of
+  being quietly repaired, so a tool written against version 1 can see requests it
+  believes are valid rejected. A response with no version stamp is the old
+  unversioned one.
+- Pointing `CODESTORY_CLI` at a build that does not match the installed plugin
+  now stops the session with a plain reason instead of mixing two contracts.
+  Nothing that build produces reaches the host, and CodeStory's own diagnostics
+  explain why. This was the one supported way to end up with a mismatched pair
+  and the only place it could be caught.
+- Evidence that arrives without saying whether it was resolvable, where it came
+  from, or whether its retrieval stage finished is now refused instead of being
+  read as resolvable, parser-backed and complete.
+- The same word spelled two ways across CodeStory's own output — `Full` and
+  `full`, `Public` and `public` — is now accepted either way when read back.
+  What CodeStory writes is unchanged.
 
 ## 0.16.3
 

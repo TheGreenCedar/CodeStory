@@ -1912,24 +1912,32 @@ fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) ->
     })
 }
 
+/// Render one `tools/call` outcome.
+///
+/// The publication stamp is not optional: every successful tool payload that an
+/// out-of-repo consumer can read — including the packet vocabulary EV-5 added,
+/// where `proof_status: "reported"` names a carrier lead rather than proof —
+/// must arrive with the schema version that defines that vocabulary.
 fn stdio_jsonrpc_tool_call_from_legacy(
     id: serde_json::Value,
     response: serde_json::Value,
-    publication_meta: Option<serde_json::Value>,
+    publication_meta: serde_json::Value,
     tool_name: &str,
 ) -> serde_json::Value {
     if let Some(result) = response.get("result") {
         let mut success = stdio_tool_call_success(tool_name, result.clone());
-        if let Some(publication_meta) = publication_meta
-            && let Some(success) = success.as_object_mut()
-        {
-            let meta = success
-                .entry("_meta")
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(meta) = meta.as_object_mut() {
-                meta.insert("codestory_publication".to_string(), publication_meta);
-            }
+        let success_object = success
+            .as_object_mut()
+            .expect("tools/call success payload is an object");
+        let meta = success_object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        if !meta.is_object() {
+            *meta = serde_json::json!({});
         }
+        meta.as_object_mut()
+            .expect("tools/call metadata is an object")
+            .insert("codestory_publication".to_string(), publication_meta);
         return stdio_jsonrpc_success(id, success);
     }
     if let Some(error) = response.get("error") {
@@ -1981,7 +1989,7 @@ fn stdio_served_publication_meta(
     retrieval_publication: Option<&serde_json::Value>,
     operation_id: Option<&str>,
     attempt: Option<u32>,
-) -> Option<serde_json::Value> {
+) -> serde_json::Value {
     let status = state.status_cache.as_ref().map(|cached| &cached.value);
     let refreshing = status
         .and_then(|status| status.pointer("/local_refresh/state"))
@@ -2004,7 +2012,7 @@ fn stdio_served_publication_meta(
             "started_at_epoch_ms": status.and_then(|status| status.pointer("/local_refresh/started_at_epoch_ms"))
         });
     }
-    Some(meta)
+    meta
 }
 
 fn stdio_response_retrieval_publication(
@@ -2503,14 +2511,25 @@ fn stdio_json_text(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// Build the `initialize` result.
+///
+/// Two contracts land here. The protocol revision is *negotiated* against the
+/// revisions this build implements instead of echoed, so a client can no longer
+/// read its own request back as a compatibility guarantee. And the result
+/// carries the same `_meta.codestory_publication` stamp every publication-backed
+/// response carries, so a pinned launcher — including one pointed at a
+/// different binary through the documented `CODESTORY_CLI` override — learns the
+/// response-schema version at session start rather than after the first
+/// `tools/call`.
 fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Value {
-    let protocol_version = request
-        .pointer("/params/protocolVersion")
-        .and_then(|value| value.as_str())
-        .unwrap_or("2024-11-05");
+    let negotiation = codestory_contracts::wire::negotiate_mcp_protocol_version(
+        request
+            .pointer("/params/protocolVersion")
+            .and_then(|value| value.as_str()),
+    );
     let version = env!("CARGO_PKG_VERSION");
     serde_json::json!({
-        "protocolVersion": protocol_version,
+        "protocolVersion": negotiation.negotiated,
         "name": "codestory",
         "version": version,
         "serverInfo": {
@@ -2528,6 +2547,16 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
             "prompts": {
                 "listChanged": false
             }
+        },
+        "_meta": {
+            "codestory_publication": crate::runtime::codestory_publication_meta(
+                None,
+                None,
+                None,
+                None,
+                false,
+            ),
+            "codestory_protocol": negotiation,
         }
     })
 }
@@ -8497,9 +8526,7 @@ version = "0.11.20"
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(
-                crate::runtime::CODESTORY_PUBLICATION_META_SCHEMA_VERSION
-            ))
+            Some(&json!(2))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/contract_runtime/cli_version"),
@@ -8540,11 +8567,18 @@ version = "0.11.20"
         )
         .expect("canonical CLI/HTTP envelope");
 
+        // The payload above carries `proof_status: "reported"`, the value EV-5
+        // added. The literal is deliberate: a consumer told "schema 2" is being
+        // told which vocabulary this word belongs to, so the number cannot be
+        // allowed to drift behind a self-referential constant.
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(
-                crate::runtime::CODESTORY_PUBLICATION_META_SCHEMA_VERSION
-            ))
+            Some(&json!(2))
+        );
+        assert_eq!(
+            response
+                .pointer("/result/_meta/codestory_publication/minimum_compatible_schema_version"),
+            Some(&json!(2))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/core_publication"),
@@ -8592,6 +8626,65 @@ version = "0.11.20"
         assert_eq!(direct["pinned_pair_matches"], serde_json::Value::Null);
         assert_eq!(mismatch["pinned_pair_matches"], json!(false));
         assert_eq!(matched["pinned_pair_matches"], json!(true));
+    }
+
+    #[test]
+    fn stdio_initialize_negotiates_instead_of_echoing_and_stamps_the_contract() {
+        let initialize = |params: serde_json::Value| {
+            stdio_initialize_result_json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": params
+            }))
+        };
+
+        let agreed = initialize(json!({"protocolVersion": "2024-11-05"}));
+        assert_eq!(agreed["protocolVersion"], json!("2024-11-05"));
+        assert_eq!(
+            agreed["_meta"]["codestory_protocol"]["status"],
+            json!("agreed")
+        );
+
+        let unsupported = initialize(json!({"protocolVersion": "2025-06-18"}));
+        assert_eq!(
+            unsupported["protocolVersion"],
+            json!("2024-11-05"),
+            "an unimplemented revision must not be echoed as supported"
+        );
+        assert_eq!(
+            unsupported["_meta"]["codestory_protocol"],
+            json!({
+                "requested": "2025-06-18",
+                "negotiated": "2024-11-05",
+                "supported": ["2024-11-05"],
+                "status": "unsupported_client_revision",
+                "compatible": false
+            })
+        );
+
+        let defaulted = initialize(json!({}));
+        assert_eq!(defaulted["protocolVersion"], json!("2024-11-05"));
+        assert_eq!(
+            defaulted["_meta"]["codestory_protocol"]["status"],
+            json!("defaulted")
+        );
+
+        // The launcher reads this stamp out of the frame it suppresses, so it
+        // must be the same contract-only stamp every other adapter publishes.
+        let stamp = &agreed["_meta"]["codestory_publication"];
+        assert_eq!(stamp["schema_version"], json!(2));
+        assert_eq!(stamp["minimum_compatible_schema_version"], json!(2));
+        assert_eq!(stamp["served_from"], json!("contract_only"));
+        assert_eq!(
+            stamp["contract_runtime"]["cli_version"],
+            json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            stamp,
+            &crate::runtime::codestory_publication_meta(None, None, None, None, false),
+            "initialize must not invent a second stamp shape"
+        );
     }
 
     #[test]

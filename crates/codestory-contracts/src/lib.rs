@@ -21,4 +21,6 @@ pub mod owned_artifacts;
 pub mod query;
 pub mod trail;
 pub mod validation_receipts;
+
+pub mod wire;
 pub mod workspace;

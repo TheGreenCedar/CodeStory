@@ -80,12 +80,28 @@ function mcpCatalog() {
       .filter((response) => response.id !== undefined)
       .map((response) => [response.id, response]),
   );
-  for (const id of [2, 3, 4, 5]) {
+  for (const id of [1, 2, 3, 4, 5]) {
     if (responses.get(id)?.error || !responses.get(id)?.result) {
       throw new Error(`Canonical MCP catalog request ${id} failed: ${JSON.stringify(responses.get(id))}`);
     }
   }
+  const initialize = responses.get(1).result;
+  const stamp = initialize._meta?.codestory_publication;
+  const protocol = initialize._meta?.codestory_protocol;
+  if (!stamp || !protocol) {
+    throw new Error(
+      "Canonical MCP initialize result is missing its wire contract stamp: expected _meta.codestory_publication and _meta.codestory_protocol.",
+    );
+  }
   return {
+    // Read out of the real binary so the launcher's mirrored wire constants are
+    // pinned to the CLI they ship with instead of hand-copied.
+    wireContract: {
+      publicationStampSchemaVersion: stamp.schema_version,
+      minimumCompatiblePublicationStampSchemaVersion: stamp.minimum_compatible_schema_version,
+      supportedMcpProtocolVersions: protocol.supported,
+      preferredMcpProtocolVersion: protocol.negotiated,
+    },
     tools: responses.get(2).result.tools,
     resources: responses.get(3).result.resources,
     resourceTemplates: responses.get(4).result.resourceTemplates,
