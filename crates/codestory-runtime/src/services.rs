@@ -383,7 +383,9 @@ enum ActivationPreparationPhase {
 #[derive(Clone)]
 pub struct ActivationService {
     coordinator: Arc<ActivationCoordinator>,
-    controller: AppController,
+    /// Visible to `crate::activation_status`, which hangs the transport-status
+    /// answers off this same service.
+    pub(crate) controller: AppController,
 }
 
 enum CompleteCoreAdmission {

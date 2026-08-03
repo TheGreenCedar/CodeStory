@@ -4346,37 +4346,14 @@ fn read_stdio_static_resource(resource: &ParsedStdioResource) -> serde_json::Val
 }
 
 fn read_stdio_retrieval_engine_diagnostics(runtime: &RuntimeContext) -> Result<serde_json::Value> {
-    let infrastructure = codestory_retrieval::probe_infrastructure_health(&runtime.sidecar);
-    let embedding_server = match codestory_retrieval::PerUserEmbeddingClient::for_runtime(
-        &runtime.sidecar,
-    )
-    .and_then(|client| client.observe())
-    {
-        Ok(Some(snapshot)) => serde_json::to_value(snapshot)
-            .context("serialize observational embedding server snapshot")?,
-        Ok(None) => serde_json::Value::Null,
-        Err(error) => serde_json::json!({
-            "schema_version": codestory_retrieval::PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
-            "lifecycle": "unavailable",
-            "failure": {
-                "code": "embedding_server_observation_failed",
-                "retry_class": "after_server_change",
-                "retry_after_ms": 0,
-                "retry_condition": "the per-user server lifetime authority changes",
-                "message": error.to_string(),
-            }
-        }),
-    };
-    let status = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    )?;
+    let diagnostics = runtime
+        .activation
+        .retrieval_engine_diagnostics(&runtime.project_root, &runtime.storage_path)?;
     Ok(serde_json::json!({
-        "retrieval_mode": status.retrieval_mode,
-        "degraded_reason": status.degraded_reason,
-        "engine": infrastructure,
-        "embedding_server": embedding_server,
+        "retrieval_mode": diagnostics.retrieval_mode,
+        "degraded_reason": diagnostics.degraded_reason,
+        "engine": diagnostics.engine,
+        "embedding_server": diagnostics.embedding_server,
     }))
 }
 
@@ -4740,7 +4717,7 @@ fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication
         ),
         format!(
             "active_embedding_backend:{}",
-            codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar)
+            runtime.activation.active_embedding_backend_id()
         ),
     ]
     .join("|")
@@ -5184,7 +5161,7 @@ fn read_stdio_status_resource(
         "server_executable_sha256": server_executable_sha256,
         "source_checkout_version": source_checkout_version,
         "runtime_update": runtime_update,
-        "retrieval_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
+        "retrieval_contract_version": runtime.activation.retrieval_contract_version(),
         "plugin_runtime": plugin_runtime,
         "runtime_truth": surfaces.runtime_truth,
         "runtime_boundary": {
@@ -5804,14 +5781,7 @@ fn stdio_plugin_runtime_status(executable_sha256: Option<&str>) -> serde_json::V
     let managed_cli_retention = env_nonempty("CODESTORY_PLUGIN_CLI_RETENTION")
         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
         .filter(|value| !value.is_null());
-    let process_start_id =
-        match codestory_retrieval::probe_process_start_identity(std::process::id()) {
-            codestory_retrieval::ProcessStartProbe::Running { start_identity } => {
-                Some(start_identity)
-            }
-            codestory_retrieval::ProcessStartProbe::NotRunning
-            | codestory_retrieval::ProcessStartProbe::Unknown { .. } => None,
-        };
+    let process_start_id = codestory_runtime::ActivationService::host_process_start_identity();
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
         "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
@@ -8669,6 +8639,134 @@ version = "0.11.20"
         );
     }
 
+    /// An inspect-only transport context over a throwaway project and cache.
+    ///
+    /// The returned `TempDir` handles must outlive the context: dropping them
+    /// deletes the roots the runtime resolved.
+    fn stdio_inspect_only_runtime() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::runtime::RuntimeContext,
+    ) {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        let runtime = crate::runtime::RuntimeContext::new_inspect_only_with_startup(
+            &crate::args::ProjectArgs {
+                project: project.path().to_path_buf(),
+                cache_dir: Some(cache.path().to_path_buf()),
+            },
+            &startup,
+        )
+        .expect("inspect runtime");
+        (project, cache, runtime)
+    }
+
+    #[test]
+    fn status_cache_key_carries_the_runtime_owned_embedding_backend_identity() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        // The transport is an adapter: it must publish exactly the backend
+        // identity the retrieval layer reports for this context's runtime
+        // configuration, reached through the runtime rather than probed here.
+        let expected = codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar);
+        assert!(
+            !expected.is_empty(),
+            "the product embedding backend identity must be a real value for this assertion to bite"
+        );
+
+        let key = stdio_status_cache_key_with_publication(&runtime, "2:generation-2:run-2:200");
+
+        assert!(
+            key.contains(&format!("|active_embedding_backend:{expected}")),
+            "status cache key must bind the active embedding backend identity: {key}"
+        );
+    }
+
+    #[test]
+    fn retrieval_engine_diagnostics_forwards_the_runtime_owned_observation_unchanged() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+
+        let observed =
+            read_stdio_retrieval_engine_diagnostics(&runtime).expect("diagnostics resource");
+
+        // Wire shape: exactly the four documented maintainer fields, sorted by
+        // serde_json's ordered map.
+        assert_eq!(
+            observed
+                .as_object()
+                .expect("diagnostics payload is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "degraded_reason",
+                "embedding_server",
+                "engine",
+                "retrieval_mode"
+            ],
+        );
+
+        // Equivalence: the adapter must publish the same observation the
+        // retrieval layer produces for this context's own sidecar runtime
+        // configuration and storage, byte for byte.
+        let expected_engine = serde_json::to_value(
+            codestory_retrieval::probe_infrastructure_health(&runtime.sidecar),
+        )
+        .expect("serialize infrastructure health");
+        let expected_status = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+            runtime.sidecar.clone(),
+        )
+        .expect("strict sidecar status");
+        assert_eq!(observed["engine"], expected_engine);
+        assert_eq!(
+            observed["retrieval_mode"],
+            json!(expected_status.retrieval_mode)
+        );
+        assert_eq!(
+            observed["degraded_reason"],
+            json!(expected_status.degraded_reason)
+        );
+
+        // The embedding-server slot is the pre-move transport policy verbatim.
+        // Recomputing it here and demanding equality is the equivalence proof
+        // for the branch this process happens to take; the deterministic
+        // unavailable-object shape is pinned in
+        // `codestory_runtime::activation_status`.
+        let expected_embedding_server =
+            match codestory_retrieval::PerUserEmbeddingClient::for_runtime(&runtime.sidecar)
+                .and_then(|client| client.observe())
+            {
+                Ok(Some(snapshot)) => {
+                    serde_json::to_value(snapshot).expect("serialize embedding server snapshot")
+                }
+                Ok(None) => serde_json::Value::Null,
+                Err(error) => json!({
+                    "schema_version": codestory_retrieval::PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
+                    "lifecycle": "unavailable",
+                    "failure": {
+                        "code": "embedding_server_observation_failed",
+                        "retry_class": "after_server_change",
+                        "retry_after_ms": 0,
+                        "retry_condition": "the per-user server lifetime authority changes",
+                        "message": error.to_string(),
+                    }
+                }),
+            };
+        assert_eq!(observed["embedding_server"], expected_embedding_server);
+    }
+
     #[test]
     fn invalid_resource_uri_is_rejected_before_project_selection() {
         let project = tempfile::tempdir().expect("project");
@@ -10074,6 +10172,33 @@ version = "0.11.20"
         assert!(
             !cold_cache_root.exists(),
             "cold project resource must not create project cache storage"
+        );
+    }
+
+    #[test]
+    fn status_resource_publishes_the_runtime_owned_retrieval_contract_version() {
+        let project = tempfile::tempdir().expect("project");
+        let cache_parent = tempfile::tempdir().expect("cache parent");
+        let cache = cache_parent.path().join("cold-cache");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache),
+        })
+        .expect("runtime context");
+        let mut state = StdioServerState::default();
+
+        let status =
+            read_stdio_status_resource_cached(&runtime, &mut state).expect("read status resource");
+
+        assert_eq!(
+            status.get("retrieval_contract_version"),
+            Some(&json!(runtime.activation.retrieval_contract_version())),
+            "the status resource must publish the contract version its runtime reports"
+        );
+        assert_eq!(
+            runtime.activation.retrieval_contract_version(),
+            codestory_retrieval::SIDECAR_SCHEMA_VERSION,
+            "the runtime must report the retrieval crate's sidecar schema version"
         );
     }
 

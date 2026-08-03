@@ -198,6 +198,84 @@ fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
     );
 }
 
+/// The CLI's MCP and HTTP transports are adapters (ARCH-017).
+///
+/// Transport status, activation, and engine-health answers belong to
+/// `codestory_runtime::ActivationService`; a transport that probes
+/// `codestory_retrieval` itself has taken ownership of retrieval policy.
+///
+/// The scan matches the crate name rather than the `codestory_retrieval::`
+/// path prefix, so importing the crate and calling it unqualified is caught
+/// too. `#[cfg(test)]` items are stripped by `production_source`: only what a
+/// release build compiles can violate the transport boundary, and the
+/// non-vacuity block below proves the stripping did not empty the scan.
+#[test]
+fn cli_transport_adapters_do_not_probe_retrieval_directly() {
+    let source_root = repo_root().join("crates/codestory-cli/src");
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+    files.sort();
+    // Membership is derived, not listed, so a new transport module or a
+    // `stdio_transport/` submodule directory is covered the day it lands.
+    let adapters: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|path| {
+            path.components().any(|component| {
+                component.as_os_str().to_str().is_some_and(|name| {
+                    name.starts_with("stdio_") || name.starts_with("http_transport")
+                })
+            })
+        })
+        .collect();
+    let adapter_names: BTreeSet<String> = adapters
+        .iter()
+        .filter_map(|path| path.strip_prefix(&source_root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for required in [
+        "stdio_transport.rs",
+        "stdio_arguments.rs",
+        "stdio_catalog.rs",
+        "http_transport.rs",
+    ] {
+        assert!(
+            adapter_names.contains(required),
+            "the transport-boundary scan lost `{required}`; it found {adapter_names:?}"
+        );
+    }
+
+    let mut violations = Vec::new();
+    for path in &adapters {
+        let source = fs::read_to_string(path).expect("read CLI transport source");
+        for line in production_source(&source).lines() {
+            if line.contains("codestory_retrieval") {
+                violations.push(format!("{}: {}", path.display(), line.trim()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "CLI transports must reach retrieval through codestory_runtime::ActivationService:\n{}",
+        violations.join("\n")
+    );
+
+    // Non-vacuity plus the positive direction: the stdio transport still holds
+    // the four moved call sites, so an empty violation list means the transport
+    // asks the service rather than that the scan found nothing to read.
+    let stdio_production = production_source(&read("crates/codestory-cli/src/stdio_transport.rs"));
+    for required in [
+        "retrieval_engine_diagnostics(",
+        "active_embedding_backend_id()",
+        "retrieval_contract_version()",
+        "host_process_start_identity()",
+    ] {
+        assert!(
+            stdio_production.contains(required),
+            "stdio transport must still ask the activation service for `{required}`"
+        );
+    }
+}
+
 #[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
