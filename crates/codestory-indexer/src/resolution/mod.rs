@@ -1333,7 +1333,7 @@ fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<
     callsite_identity.is_some_and(|identity| {
         identity
             .split('|')
-            .any(|part| part == crate::JS_MEMBER_CALLSITE_MARKER)
+            .any(|part| part == crate::languages::javascript::MEMBER_CALLSITE_MARKER)
     })
 }
 

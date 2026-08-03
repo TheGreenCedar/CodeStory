@@ -69,7 +69,6 @@ pub(crate) const GO_SELECTOR_CALLSITE_MARKER: &str = "syntax:go-selector-call";
 pub(crate) const CSHARP_MEMBER_CALLSITE_MARKER: &str = "syntax:csharp-member-call";
 pub(crate) const RUBY_MEMBER_CALLSITE_MARKER: &str = "syntax:ruby-member-call";
 pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
-pub(crate) const JS_MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
 pub(crate) const TS_MEMBER_CALLSITE_MARKER: &str = "syntax:ts-member-call";
 pub(crate) const DART_MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
 pub(crate) const SWIFT_MEMBER_CALLSITE_MARKER: &str = "syntax:swift-member-call";
@@ -135,7 +134,6 @@ fn parser_direct_structural_certainty(kind: EdgeKind) -> Option<ResolutionCertai
 const PYTHON_GRAPH_QUERY: &str = include_str!("../rules/python.scm");
 const RUST_GRAPH_QUERY: &str = include_str!("../rules/rust.graph.scm");
 const RUST_TAGS_QUERY: &str = include_str!("../rules/rust.tags.scm");
-const JAVASCRIPT_GRAPH_QUERY: &str = include_str!("../rules/javascript.scm");
 const TYPESCRIPT_GRAPH_QUERY: &str = include_str!("../rules/typescript.graph.scm");
 const TYPESCRIPT_TAGS_QUERY: &str = include_str!("../rules/typescript.tags.scm");
 const TSX_GRAPH_QUERY: &str = include_str!("../rules/tsx.graph.scm");
@@ -304,9 +302,12 @@ impl LanguageRuleset {
                 Some(RUST_TAGS_QUERY),
                 &RUST_RULES,
             ),
-            LanguageRuleset::JavaScript => {
-                compiled_rules_cache(language, JAVASCRIPT_GRAPH_QUERY, None, &JAVASCRIPT_RULES)
-            }
+            // Answered by the registry above; the arm only exists because the
+            // match must stay exhaustive. Failing closed here rather than
+            // panicking keeps a future registry mistake a typed indexing error.
+            LanguageRuleset::JavaScript => Err(anyhow!(
+                "javascript compiled rules are owned by the language registry"
+            )),
             LanguageRuleset::TypeScript => compiled_rules_cache(
                 language,
                 TYPESCRIPT_GRAPH_QUERY,
@@ -380,7 +381,6 @@ fn compiled_rules_cache(
 
 static PYTHON_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static RUST_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
-static JAVASCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TYPESCRIPT_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static TSX_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
 static GO_RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -6196,93 +6196,6 @@ fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<Manual
     edges
 }
 
-fn collect_javascript_receiver_call_edges(
-    tree: &Tree,
-    source: &str,
-) -> Vec<ManualReceiverCallSpec> {
-    let mut edges = Vec::new();
-    let imported_type_bindings =
-        collect_typescript_imported_type_bindings(tree.root_node(), source);
-    walk_tree_nodes(tree.root_node(), &mut |callable| {
-        if !matches!(
-            callable.kind(),
-            "method_definition" | "function_declaration" | "arrow_function"
-        ) {
-            return;
-        }
-        let Some(source_name) = js_like_callable_source_name(callable, source) else {
-            return;
-        };
-        let call_source = ManualReceiverSource {
-            name: &source_name,
-            span: ts_node_graph_span(callable),
-        };
-        let mut local_receiver_callsites = HashSet::new();
-        collect_javascript_constructor_receiver_call_specs(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            &imported_type_bindings,
-            &mut local_receiver_callsites,
-            &mut edges,
-        );
-        let mut receiver_types = HashMap::new();
-        if let Some(owner_name) = enclosing_node_with_kind(callable, &["class_declaration"])
-            .and_then(|owner| declaration_name(owner, source))
-            && callable.kind() == "method_definition"
-        {
-            receiver_types.insert("this".to_string(), owner_name);
-        }
-        let property_receiver_types = collect_javascript_class_property_receiver_types(
-            callable,
-            source,
-            &imported_type_bindings,
-        );
-        receiver_types.extend(
-            property_receiver_types
-                .iter()
-                .map(|(receiver_name, (owner_name, _))| {
-                    (receiver_name.clone(), owner_name.clone())
-                }),
-        );
-        if receiver_types.is_empty() {
-            return;
-        }
-        let mut receiver_modules = HashMap::new();
-        for (receiver_name, (_, owner_module)) in &property_receiver_types {
-            if let Some(module_name) = owner_module {
-                receiver_modules.insert(receiver_name.clone(), module_name.clone());
-            }
-        }
-        let start = edges.len();
-        collect_receiver_call_specs_in_callable(
-            callable,
-            source,
-            ManualReceiverSource {
-                name: call_source.name,
-                span: call_source.span,
-            },
-            &receiver_types,
-            javascript_member_call,
-            false,
-            &mut edges,
-        );
-        let mut fallback_specs = edges.split_off(start);
-        fallback_specs
-            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
-        for spec in &mut fallback_specs {
-            if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
-                spec.owner_module = Some(module_name.clone());
-            }
-        }
-        edges.extend(fallback_specs);
-    });
-    edges
-}
-
 fn js_like_callable_source_name(node: TsNode<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "function_declaration" | "method_definition" => declaration_name(node, source),
@@ -6291,135 +6204,6 @@ fn js_like_callable_source_name(node: TsNode<'_>, source: &str) -> Option<String
             .and_then(|parent| tsx_callable_binding_name(parent, source)),
         _ => None,
     }
-}
-
-fn collect_javascript_constructor_receiver_call_specs(
-    callable: TsNode<'_>,
-    source: &str,
-    call_source: ManualReceiverSource<'_>,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
-) {
-    walk_tree_nodes(callable, &mut |node| {
-        let Some((receiver_name, method_name)) = javascript_member_call(node, source) else {
-            return;
-        };
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
-        let Some(owner) = javascript_visible_local_constructor_receiver_owner(
-            callable,
-            node,
-            &receiver_name,
-            source,
-            imported_type_bindings,
-        ) else {
-            return;
-        };
-        let method_col = member_call_method_col(node, source, &method_name);
-        local_receiver_callsites.insert(ReceiverCallSiteKey {
-            receiver_name: receiver_name.clone(),
-            method_name: method_name.clone(),
-            line: Some(node.start_position().row as u32 + 1),
-            method_col,
-        });
-        if let Some((owner_name, owner_module)) = owner {
-            edges.push(ManualReceiverCallSpec {
-                source_name: call_source.name.to_string(),
-                source_span: call_source.span,
-                receiver_name,
-                owner_name,
-                owner_module,
-                method_name,
-                method_col,
-                line: Some(node.start_position().row as u32 + 1),
-                allow_global_fallback: false,
-            });
-        }
-    });
-}
-
-fn javascript_visible_local_constructor_receiver_owner(
-    callable: TsNode<'_>,
-    call_node: TsNode<'_>,
-    receiver_name: &str,
-    source: &str,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> Option<OptionalReceiverOwnerBinding> {
-    let mut visible_bindings = Vec::new();
-    walk_tree_nodes(callable, &mut |node| {
-        if node.kind() != "variable_declarator"
-            || !receiver_call_belongs_to_callable(node, callable)
-            || node.end_byte() > call_node.start_byte()
-            || !js_ts_local_binding_visible_at_call(node, call_node)
-        {
-            return;
-        }
-        let Some(binding_name) = node
-            .child_by_field_name("name")
-            .and_then(|name_node| trimmed_node_text(name_node, source))
-            .as_deref()
-            .and_then(normalize_parameter_name)
-        else {
-            return;
-        };
-        if binding_name != receiver_name {
-            return;
-        }
-        visible_bindings.push((
-            node.end_byte(),
-            javascript_constructor_receiver_owner(node, callable, source, imported_type_bindings),
-        ));
-    });
-    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
-    visible_bindings.pop().map(|(_, owner)| owner)
-}
-
-fn javascript_constructor_receiver_owner(
-    node: TsNode<'_>,
-    callable: TsNode<'_>,
-    source: &str,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    let value_node = node.child_by_field_name("value")?;
-    javascript_new_expression_receiver_owner(
-        value_node,
-        callable,
-        node,
-        source,
-        imported_type_bindings,
-    )
-}
-
-fn javascript_new_expression_receiver_owner(
-    value_node: TsNode<'_>,
-    scope_node: TsNode<'_>,
-    before_node: TsNode<'_>,
-    source: &str,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> OptionalReceiverOwnerBinding {
-    if value_node.kind() != "new_expression" {
-        return None;
-    }
-    let owner_name = value_node
-        .child_by_field_name("constructor")
-        .filter(|constructor| constructor.kind() == "identifier")
-        .and_then(|constructor| trimmed_node_text(constructor, source))
-        .as_deref()
-        .and_then(normalize_parameter_name)?;
-    if js_ts_visible_local_type_name(scope_node, before_node, &owner_name, source) {
-        return Some((owner_name, None));
-    }
-    imported_type_bindings
-        .get(&owner_name)
-        .map(|binding| {
-            (
-                binding.owner_name.clone(),
-                Some(binding.module_name.clone()),
-            )
-        })
-        .or(Some((owner_name, None)))
 }
 
 fn js_ts_visible_local_type_name(
@@ -6463,141 +6247,6 @@ fn js_ts_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_
 
 fn js_ts_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
     enclosing_node_with_kind(node, &["statement_block", "block", "program"])
-}
-
-fn collect_javascript_class_property_receiver_types(
-    callable: TsNode<'_>,
-    source: &str,
-    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
-) -> HashMap<String, ReceiverOwnerBinding> {
-    let mut receiver_types = HashMap::new();
-    if callable.kind() != "method_definition" || javascript_method_is_static(callable, source) {
-        return receiver_types;
-    }
-    let Some(class_node) = enclosing_node_with_kind(callable, &["class_declaration"]) else {
-        return receiver_types;
-    };
-    let mut candidates: HashMap<String, Vec<OptionalReceiverOwnerBinding>> = HashMap::new();
-    walk_tree_nodes(class_node, &mut |node| {
-        let Some((receiver_name, scope_node, value_node)) =
-            javascript_property_receiver_candidate(node, class_node, source)
-        else {
-            return;
-        };
-        let owner_name = javascript_new_expression_receiver_owner(
-            value_node,
-            scope_node,
-            node,
-            source,
-            imported_type_bindings,
-        );
-        candidates
-            .entry(receiver_name)
-            .or_default()
-            .push(owner_name);
-    });
-    for (receiver_name, owners) in candidates {
-        let Some(mut concrete_owners) = owners.into_iter().collect::<Option<Vec<_>>>() else {
-            continue;
-        };
-        concrete_owners.sort();
-        concrete_owners.dedup();
-        if concrete_owners.len() == 1 {
-            receiver_types.insert(receiver_name, concrete_owners.remove(0));
-        }
-    }
-    receiver_types
-}
-
-fn javascript_property_receiver_candidate<'tree>(
-    node: TsNode<'tree>,
-    class_node: TsNode<'tree>,
-    source: &str,
-) -> Option<(String, TsNode<'tree>, TsNode<'tree>)> {
-    if node.kind() == "assignment_expression"
-        && javascript_assignment_matches_instance_property_domain(node, class_node, source)
-    {
-        let receiver_name = node
-            .child_by_field_name("left")
-            .and_then(|left| javascript_this_property_receiver_name(left, source))?;
-        let scope_node =
-            enclosing_node_with_kind(node, &["method_definition"]).unwrap_or(class_node);
-        return Some((
-            receiver_name,
-            scope_node,
-            node.child_by_field_name("right")?,
-        ));
-    }
-    if matches!(node.kind(), "field_definition" | "public_field_definition")
-        && typescript_property_belongs_to_owner(node, class_node)
-        && !javascript_surface_starts_with_static(node, source)
-    {
-        let field_name = javascript_class_field_name(node, source)?;
-        return Some((
-            format!("this.{field_name}"),
-            class_node,
-            node.child_by_field_name("value")?,
-        ));
-    }
-    None
-}
-
-fn javascript_class_field_name(node: TsNode<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("name")
-        .and_then(|name| trimmed_node_text(name, source))
-        .or_else(|| {
-            trimmed_node_text(node, source).map(|surface| {
-                surface
-                    .split('=')
-                    .next()
-                    .unwrap_or(surface.as_str())
-                    .trim()
-                    .to_string()
-            })
-        })
-        .as_deref()
-        .and_then(normalize_parameter_name)
-}
-
-fn javascript_assignment_matches_instance_property_domain(
-    assignment: TsNode<'_>,
-    class_node: TsNode<'_>,
-    source: &str,
-) -> bool {
-    if !enclosing_node_with_kind(assignment, &["class_declaration"])
-        .is_some_and(|owner| same_ts_span(owner, class_node))
-    {
-        return false;
-    }
-    let Some(method) = enclosing_node_with_kind(assignment, &["method_definition"]) else {
-        return false;
-    };
-    if javascript_method_is_static(method, source)
-        || !enclosing_node_with_kind(method, &["class_declaration"])
-            .is_some_and(|owner| same_ts_span(owner, class_node))
-    {
-        return false;
-    }
-    receiver_call_belongs_to_callable(assignment, method)
-}
-
-fn javascript_method_is_static(method: TsNode<'_>, source: &str) -> bool {
-    javascript_surface_starts_with_static(method, source)
-}
-
-fn javascript_surface_starts_with_static(node: TsNode<'_>, source: &str) -> bool {
-    trimmed_node_text(node, source).is_some_and(|surface| {
-        surface
-            .trim_start()
-            .strip_prefix("static")
-            .is_some_and(|rest| rest.chars().next().is_none_or(|ch| ch.is_whitespace()))
-    })
-}
-
-fn javascript_this_property_receiver_name(node: TsNode<'_>, source: &str) -> Option<String> {
-    let receiver_name = normalized_receiver_variable(node, source)?;
-    let field_name = receiver_name.strip_prefix("this.")?;
-    Some(format!("this.{}", normalize_parameter_name(field_name)?))
 }
 
 fn rust_macro_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
@@ -7634,7 +7283,6 @@ fn language_receiver_call_specs(
         };
     }
     match language_name {
-        "javascript" => collect_javascript_receiver_call_edges(tree, source),
         "python" => collect_python_receiver_call_edges(tree, source),
         "typescript" | "tsx" => collect_typescript_receiver_call_edges(tree, source),
         "go" => collect_go_receiver_call_edges(tree, source),
@@ -13494,22 +13142,6 @@ fn typescript_member_call(node: TsNode<'_>, source: &str) -> Option<(String, Str
     ))
 }
 
-fn javascript_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if node.kind() != "call_expression" {
-        return None;
-    }
-    let function = node.child_by_field_name("function")?;
-    if function.kind() != "member_expression" {
-        return None;
-    }
-    let receiver = function.child_by_field_name("object")?;
-    let method = function.child_by_field_name("property")?;
-    Some((
-        normalize_js_ts_private_receiver_surface(&normalized_receiver_variable(receiver, source)?),
-        trimmed_node_text(method, source)?,
-    ))
-}
-
 fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
     receiver
         .split('.')
@@ -16049,7 +15681,7 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
     }
     matches!(
         language_name,
-        "javascript" | "typescript" | "rust" | "go" | "php" | "csharp" | "dart" | "vue" | "astro"
+        "typescript" | "rust" | "go" | "php" | "csharp" | "dart" | "vue" | "astro"
     )
 }
 
@@ -19195,7 +18827,6 @@ pub fn index_file(
                                         "go_selector" => Some(GO_SELECTOR_CALLSITE_MARKER),
                                         "csharp_member" => Some(CSHARP_MEMBER_CALLSITE_MARKER),
                                         "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
-                                        "js_member" => Some(JS_MEMBER_CALLSITE_MARKER),
                                         "ts_member" => Some(TS_MEMBER_CALLSITE_MARKER),
                                         "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
                                         "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),

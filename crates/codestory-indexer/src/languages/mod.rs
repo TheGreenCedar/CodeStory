@@ -19,6 +19,7 @@
 pub(crate) mod c;
 pub(crate) mod cpp;
 pub(crate) mod java;
+pub(crate) mod javascript;
 pub(crate) mod kotlin;
 
 use std::sync::OnceLock;
@@ -77,6 +78,7 @@ pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[
     java::EXTRACTION,
     cpp::EXTRACTION,
     c::EXTRACTION,
+    javascript::EXTRACTION,
 ];
 
 /// Look a row up by any of its dispatch names.

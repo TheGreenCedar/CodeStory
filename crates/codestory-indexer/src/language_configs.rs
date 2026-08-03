@@ -30,7 +30,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     match (profile.language_name, ext.as_str()) {
         ("python", _) => Some(python()),
         ("rust", _) => Some(rust()),
-        ("javascript", _) => Some(javascript()),
         ("typescript", "tsx") => Some(tsx()),
         ("typescript", _) => Some(typescript()),
         ("go", _) => Some(go()),
@@ -61,16 +60,6 @@ fn rust() -> LanguageConfig {
         RUST_GRAPH_QUERY,
         Some(RUST_TAGS_QUERY),
         LanguageRuleset::Rust,
-    )
-}
-
-fn javascript() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_javascript::LANGUAGE.into(),
-        "javascript",
-        JAVASCRIPT_GRAPH_QUERY,
-        None,
-        LanguageRuleset::JavaScript,
     )
 }
 

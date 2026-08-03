@@ -487,6 +487,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "cpp",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "javascript",
+        line_comment: "//",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1260,7 +1264,7 @@ mod tests {
             .iter()
             .map(|profile| profile.language_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["kotlin", "java", "cpp"]);
+        assert_eq!(names, vec!["kotlin", "java", "cpp", "javascript"]);
         for profile in LANGUAGE_COMMENT_PROFILES {
             assert!(
                 language_support_profile_for_language_name(profile.language_name).is_some(),
@@ -1276,7 +1280,11 @@ mod tests {
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
         assert_eq!(line_comment_for_language("java"), Some("//"));
         assert_eq!(line_comment_for_language("cpp"), Some("//"));
+        assert_eq!(line_comment_for_language("javascript"), Some("//"));
         assert_eq!(line_comment_for_language("swift"), None);
+        // `jsx` is a CLI highlighter dialect, not a registered language; it
+        // must keep answering from the CLI's own residual roster.
+        assert_eq!(line_comment_for_language("jsx"), None);
     }
 
     #[test]
