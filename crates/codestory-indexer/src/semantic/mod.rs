@@ -596,7 +596,6 @@ fn language_family_bucket(language: &'static str) -> &'static str {
         "python" => "python",
         "rust" => "rust",
         "java" => "java",
-        "go" => "go",
         "ruby" => "ruby",
         "php" => "php",
         "csharp" => "csharp",

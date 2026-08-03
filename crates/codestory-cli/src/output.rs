@@ -3941,8 +3941,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "java" | "csharp" | "cpp"
+            | "dart" | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
@@ -5572,8 +5572,8 @@ mod tests {
         assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
-    /// Kotlin's comment marker now comes from the language registry rather than
-    /// the local roster, and every other language must be unmoved.
+    /// Kotlin's and Go's comment markers now come from the language registry
+    /// rather than the local roster, and every other language must be unmoved.
     ///
     /// Asserting only "Kotlin still dims `//`" would pass with the registry
     /// lookup deleted, because the local roster used to answer for Kotlin too.
@@ -5631,14 +5631,20 @@ mod tests {
             }
         }
 
-        // The registry is the source for Kotlin: it must agree with the marker
-        // the roster used to hold.
+        // The registry is the source for Kotlin and Go: it must agree with the
+        // markers the roster used to hold.
         assert_eq!(
             codestory_contracts::language_support::line_comment_for_language("kotlin"),
             Some("//")
         );
+        assert_eq!(
+            codestory_contracts::language_support::line_comment_for_language("go"),
+            Some("//")
+        );
         let kotlin = ansi_highlight_snippet("app/Main.kt", "val ok = true // comment");
         assert!(kotlin.contains("\x1b[90m// comment\x1b[0m"), "{kotlin:?}");
+        let go = ansi_highlight_snippet("cmd/main.go", "ok := true // comment");
+        assert!(go.contains("\x1b[90m// comment\x1b[0m"), "{go:?}");
     }
 
     /// Component dialects resolve through the companion-extension registry and

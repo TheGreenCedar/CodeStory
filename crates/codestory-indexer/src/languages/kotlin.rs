@@ -55,6 +55,9 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
     graph_query: GRAPH_QUERY,
     tags_query: None,
     compiled_rules: &RULES,
+    // Kotlin's MEMBER edges come from `rules/kotlin.scm`; it never had an arm
+    // in `lib.rs::language_member_specs`.
+    member_edge_specs: None,
     receiver_call_specs: Some(receiver_call_specs),
     member_callsite_marker: Some(MEMBER_CALLSITE_MARKER),
     graph_call_syntax: Some("kotlin_member"),
