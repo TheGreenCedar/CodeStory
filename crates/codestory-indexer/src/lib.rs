@@ -5200,9 +5200,9 @@ fn split_top_level_type_arguments(raw: &str) -> Vec<String> {
     parts
 }
 
-fn walk_tree_nodes<F>(node: TsNode<'_>, visit: &mut F)
+fn walk_tree_nodes<'tree, F>(node: TsNode<'tree>, visit: &mut F)
 where
-    F: FnMut(TsNode<'_>),
+    F: FnMut(TsNode<'tree>),
 {
     visit(node);
     let mut cursor = node.walk();
@@ -5284,6 +5284,7 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
     let field_types = collect_rust_struct_field_types(tree, source, &aliases);
     let method_return_types = collect_rust_method_return_types(tree, source, &aliases);
     let mut hints = Vec::new();
+    let mut scopes: HashMap<usize, RustValueScope<'_>> = HashMap::new();
 
     walk_tree_nodes(tree.root_node(), &mut |node| {
         if node.kind() != "call_expression" {
@@ -5308,21 +5309,33 @@ fn collect_rust_receiver_call_hints(tree: &Tree, source: &str) -> Vec<RustReceiv
             return;
         };
         let impl_owner = rust_enclosing_impl_owner(node, source, &aliases);
-        let value_types = rust_enclosing_value_types(
-            node,
-            source,
-            &aliases,
-            &field_types,
-            &method_return_types,
-            impl_owner.as_deref(),
-        );
+        // One scope per enclosing function, advanced to this call rather than
+        // rebuilt for it. `no_scope` covers a call outside any function, which
+        // previously produced an empty map by finding no `function_item`.
+        let empty_value_types = HashMap::new();
+        let value_types = match rust_enclosing_function_item(node) {
+            Some(function_node) => {
+                let scope = scopes
+                    .entry(function_node.id())
+                    .or_insert_with(|| RustValueScope::new(function_node, impl_owner.clone()));
+                scope.advance_to(
+                    node.start_byte(),
+                    source,
+                    &aliases,
+                    &field_types,
+                    &method_return_types,
+                );
+                &scope.value_types
+            }
+            None => &empty_value_types,
+        };
         let Some(owner_name) = infer_rust_receiver_owner(
             receiver_node,
             source,
             impl_owner.as_deref(),
             &field_types,
             &method_return_types,
-            &value_types,
+            value_types,
             &aliases,
         )
         .filter(|value| is_rust_type_like_name(value)) else {
@@ -5547,69 +5560,106 @@ fn rust_enclosing_impl_owner(
     None
 }
 
-fn rust_enclosing_value_types(
-    call_node: TsNode<'_>,
-    source: &str,
-    aliases: &RustTypeAliases,
-    field_types: &RustStructFieldTypes,
-    method_return_types: &RustMethodReturnTypes,
-    impl_owner: Option<&str>,
-) -> HashMap<String, String> {
-    let mut function_node = None;
+/// One function's value bindings, resolved as call sites are reached.
+///
+/// The old shape rebuilt this map for *every* call by walking the enclosing
+/// function's whole subtree, so a function with K calls and N nodes cost
+/// O(K x N). That is the entire 110x blow-up in #1820: at a fixed ~500 KB,
+/// moving statements from many small functions into one giant one took
+/// `index_file` from ~1.2 s to ~134 s.
+///
+/// Two properties make a single pass equivalent rather than merely similar:
+///
+/// * a binding's inferred type depends only on the bindings *before* it, and
+/// * `walk_tree_nodes` is pre-order, so it visits nodes in non-decreasing
+///   `start_byte` — which makes the old `start_byte <= call_start_byte` filter
+///   a prefix of the walk, not an arbitrary subset of it.
+///
+/// So the insertion sequence is the same for every call in the function, and
+/// each call needs a prefix of it. Calls arrive in non-decreasing byte order
+/// too, so the cursor only ever moves forward and the whole function costs
+/// O(N) instead of O(K x N).
+struct RustValueScope<'tree> {
+    bindings: Vec<TsNode<'tree>>,
+    cursor: usize,
+    value_types: HashMap<String, String>,
+    impl_owner: Option<String>,
+}
+
+impl<'tree> RustValueScope<'tree> {
+    fn new(function_node: TsNode<'tree>, impl_owner: Option<String>) -> Self {
+        let mut bindings = Vec::new();
+        walk_tree_nodes(function_node, &mut |node| {
+            if matches!(node.kind(), "parameter" | "let_declaration") {
+                bindings.push(node);
+            }
+        });
+        Self {
+            bindings,
+            cursor: 0,
+            value_types: HashMap::new(),
+            impl_owner,
+        }
+    }
+
+    /// Fold in every binding that starts at or before `call_start_byte`.
+    fn advance_to(
+        &mut self,
+        call_start_byte: usize,
+        source: &str,
+        aliases: &RustTypeAliases,
+        field_types: &RustStructFieldTypes,
+        method_return_types: &RustMethodReturnTypes,
+    ) {
+        while let Some(binding) = self.bindings.get(self.cursor) {
+            if binding.start_byte() > call_start_byte {
+                break;
+            }
+            self.cursor += 1;
+            let binding = *binding;
+            let Some(pattern_node) = binding.child_by_field_name("pattern") else {
+                continue;
+            };
+            let Some(value_name) = rust_pattern_identifier(pattern_node, source) else {
+                continue;
+            };
+            let type_name = binding
+                .child_by_field_name("type")
+                .and_then(|ty| node_source_text(ty, source))
+                .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases))
+                .or_else(|| {
+                    if binding.kind() != "let_declaration" {
+                        return None;
+                    }
+                    binding.child_by_field_name("value").and_then(|value| {
+                        infer_rust_value_owner_from_expression(
+                            value,
+                            source,
+                            self.impl_owner.as_deref(),
+                            field_types,
+                            method_return_types,
+                            &self.value_types,
+                            aliases,
+                        )
+                    })
+                });
+            let Some(type_name) = type_name else {
+                continue;
+            };
+            self.value_types.insert(value_name, type_name);
+        }
+    }
+}
+
+fn rust_enclosing_function_item(call_node: TsNode<'_>) -> Option<TsNode<'_>> {
     let mut cursor = call_node.parent();
     while let Some(current) = cursor {
         if current.kind() == "function_item" {
-            function_node = Some(current);
-            break;
+            return Some(current);
         }
         cursor = current.parent();
     }
-
-    let Some(function_node) = function_node else {
-        return HashMap::new();
-    };
-
-    let mut value_types = HashMap::new();
-    let call_start_byte = call_node.start_byte();
-    walk_tree_nodes(function_node, &mut |node| {
-        if node.start_byte() > call_start_byte {
-            return;
-        }
-        if !matches!(node.kind(), "parameter" | "let_declaration") {
-            return;
-        }
-        let Some(pattern_node) = node.child_by_field_name("pattern") else {
-            return;
-        };
-        let Some(value_name) = rust_pattern_identifier(pattern_node, source) else {
-            return;
-        };
-        let type_name = node
-            .child_by_field_name("type")
-            .and_then(|ty| node_source_text(ty, source))
-            .and_then(|ty| normalize_rust_type_owner_name(&ty, aliases))
-            .or_else(|| {
-                if node.kind() != "let_declaration" {
-                    return None;
-                }
-                node.child_by_field_name("value").and_then(|value| {
-                    infer_rust_value_owner_from_expression(
-                        value,
-                        source,
-                        impl_owner,
-                        field_types,
-                        method_return_types,
-                        &value_types,
-                        aliases,
-                    )
-                })
-            });
-        let Some(type_name) = type_name else {
-            return;
-        };
-        value_types.insert(value_name, type_name);
-    });
-    value_types
+    None
 }
 
 fn infer_rust_receiver_owner(
