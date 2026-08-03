@@ -520,6 +520,10 @@ pub const LANGUAGE_COMMENT_PROFILES: &[LanguageCommentProfile] = &[
         language_name: "go",
         line_comment: "//",
     },
+    LanguageCommentProfile {
+        language_name: "ruby",
+        line_comment: "#",
+    },
 ];
 
 /// Line-comment marker for a registered language name.
@@ -1304,7 +1308,8 @@ mod tests {
                 "tsx",
                 "python",
                 "rust",
-                "go"
+                "go",
+                "ruby"
             ]
         );
         for profile in LANGUAGE_COMMENT_PROFILES {
@@ -1329,6 +1334,7 @@ mod tests {
             );
         }
         assert_eq!(line_comment_for_language("kotlin"), Some("//"));
+        assert_eq!(line_comment_for_language("ruby"), Some("#"));
         assert_eq!(line_comment_for_language("go"), Some("//"));
         assert_eq!(line_comment_for_language("rust"), Some("//"));
         assert_eq!(line_comment_for_language("python"), Some("#"));
