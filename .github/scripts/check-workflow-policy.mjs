@@ -8,6 +8,8 @@ import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mj
 import {
   LOST_RUNNER_ANNOTATION,
   MAXIMUM_RUN_ATTEMPTS,
+  RERUN_DISPATCH_SCHEMA,
+  RERUN_PLAN_SCHEMA,
 } from "./lost-runner-recovery.mjs";
 import {
   LINK_PHASE as WINDOWS_LINK_PHASE,
@@ -9980,12 +9982,35 @@ export function annotationScopeViolations(workflows) {
 export function lostRunnerRecoveryViolations(workflows, graph) {
   const violations = [];
   const policy = graph.non_claim_policy;
+  const rerunPolicy = object(graph.workflow_policy.lost_runner_rerun);
   const rerunFile = "lost-runner-rerun.yml";
   const rerun = workflows.get(rerunFile);
   add(
     violations,
     MAXIMUM_RUN_ATTEMPTS === policy.maximum_run_attempts,
     `${rerunFile} recovery bound must equal the release claim graph maximum_run_attempts`,
+  );
+  add(
+    violations,
+    rerunPolicy.workflow === rerunFile
+      && rerunPolicy.job === "rerun-lost-jobs"
+      && rerunPolicy.recovery_contract === policy.recovery_contract,
+    "the release claim graph lost_runner_rerun block must name the recovery workflow and contract",
+  );
+  add(
+    violations,
+    rerunPolicy.plan_schema === RERUN_PLAN_SCHEMA
+      && rerunPolicy.dispatch_schema === RERUN_DISPATCH_SCHEMA,
+    "the release claim graph must record the recovery plan and dispatch receipt schemas the contract emits",
+  );
+  // Two facts the recovery cannot be reasoned about without: which execution of a job the plan
+  // reads, and what one refused re-dispatch does to the others.
+  add(
+    violations,
+    rerunPolicy.selection === "latest_execution_per_job_name"
+      && rerunPolicy.dispatch_tolerance === "per_job_id"
+      && rerunPolicy.dispatch_failure === "fail_only_when_no_job_was_accepted",
+    "the release claim graph must declare latest-execution rerun selection and per-id dispatch tolerance",
   );
   add(
     violations,
@@ -10026,16 +10051,25 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
     ]);
     requireStepRun(violations, rerunFile, job, "Plan the bounded rerun", [
       "node .github/scripts/lost-runner-recovery.mjs plan-rerun",
+      `--out ${rerunPolicy.plan_file}`,
     ]);
-    const dispatch = namedStep(job, "Re-dispatch only the lost jobs");
+    const dispatchStep = String(rerunPolicy.dispatch_step ?? "");
+    const dispatch = namedStep(job, dispatchStep);
     add(
       violations,
       dispatch?.if === "steps.plan.outputs.rerun == 'true'",
       `${rerunFile} re-dispatch must be gated on the classified recovery plan`,
     );
-    requireStepRun(violations, rerunFile, job, "Re-dispatch only the lost jobs", [
-      "actions/jobs/$job_id/rerun",
+    requireStepRun(violations, rerunFile, job, dispatchStep, [
+      String(rerunPolicy.dispatch_command ?? ""),
+      `--plan ${rerunPolicy.plan_file}`,
+      `--out ${rerunPolicy.dispatch_file}`,
     ]);
+    // The hosts share one machine, so a single incident loses two of them at once. A shell loop
+    // calling the API directly stops at the first refusal under `set -e` and abandons the recovery
+    // the remaining ids are still owed, so the step must delegate to the contract that records a
+    // per-id outcome and fails only when nothing at all was accepted.
+    forbidStepRun(violations, rerunFile, job, dispatchStep, ["gh api", "for job_id in"]);
     // Re-running every failed job would sweep an assertion failure back into the queue alongside
     // the lost one; the plan names ids, so the API call must be the per-job endpoint.
     add(

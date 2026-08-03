@@ -610,6 +610,25 @@ every attempt of the run to make that count possible, and counts a job Actions
 carried forward unchanged once. Jobs that failed on their own assertions are
 not named in the rerun request and stay red.
 
+Which execution the plan reads, and what one refused re-dispatch does to the
+others, are both declared in `workflow_policy.lost_runner_rerun`:
+
+- `selection: latest_execution_per_job_name`. The plan decides from each job
+  name's **newest** execution and reports the executions it superseded with
+  `retry_decision: superseded_by_later_execution`. A host that was lost and
+  then reported on a later attempt is therefore out of the plan entirely, and
+  its stale, already-consumed job id is never named. Executions are ordered by
+  run attempt and then by job id, because Actions allocates job ids in creation
+  order inside a run and also re-lists a carried-forward job under the newer
+  attempt number -- the attempt alone cannot order the two.
+- `dispatch_tolerance: per_job_id`. The hosts share one machine, so one incident
+  can lose two of them at once. `lost-runner-recovery.mjs dispatch-rerun` asks
+  Actions for every named id separately, records what each one answered in
+  `rerun-dispatch.json` (schema `codestory.lost-runner-rerun-dispatch/v1`), and
+  fails only when **no** id was accepted. A shell loop under `set -e` used to
+  abandon the ids after the first refusal, and workflow policy now refuses a
+  dispatch step that calls the API itself.
+
 If a host is lost twice, `release.yml`'s `accelerator-non-claim` job records a
 **populated non-claim** for that host in place of the cells that host would
 have produced. It mirrors the package manifest's own shape:

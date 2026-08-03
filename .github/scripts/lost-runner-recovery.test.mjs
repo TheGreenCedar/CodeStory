@@ -9,11 +9,18 @@ import {
   JOB_ASSERTION_FAILURE,
   LOST_RUNNER_ANNOTATION,
   MAXIMUM_RUN_ATTEMPTS,
+  NOT_A_RUNNER_COMMUNICATION_LOSS,
+  RECOVERY_BOUND_REACHED,
+  RERUN_DISPATCH_SCHEMA,
+  RERUN_PLAN_SCHEMA,
+  RETRY_REQUESTED,
   RUNNER_COMMUNICATION_LOSS,
+  SUPERSEDED_BY_LATER_EXECUTION,
   classifyJobFailure,
   countLostExecutions,
   planAcceleratorNonClaim,
   planLostRunnerRerun,
+  planRerunDispatch,
 } from "./lost-runner-recovery.mjs";
 
 const script = fileURLToPath(new URL("./lost-runner-recovery.mjs", import.meta.url));
@@ -154,7 +161,9 @@ test("only lost jobs are re-dispatched and the recovery bound counts recoveries"
   assert.equal(assertionOnly.reason, "no_runner_communication_loss");
   assert.deepEqual(assertionOnly.rerun_job_ids, []);
 
-  // The bound is two lost executions of the same job: the second loss gets no third try.
+  // The bound is two lost executions of the same job: the second loss gets no third try. The
+  // decision is reported against the execution that is current -- the attempt-1 execution the
+  // re-dispatch already consumed is reported as superseded, never as a second pending decision.
   const bounded = planLostRunnerRerun({
     runAttempt: MAXIMUM_RUN_ATTEMPTS,
     runConclusion: "failure",
@@ -162,7 +171,14 @@ test("only lost jobs are re-dispatched and the recovery bound counts recoveries"
   });
   assert.equal(bounded.rerun, false);
   assert.equal(bounded.reason, "recovery_bound_reached");
-  assert.deepEqual(bounded.lost_jobs.map(({ lost_executions: spent }) => spent), [2, 2]);
+  assert.deepEqual(bounded.lost_jobs.map(({ id }) => id), [42]);
+  assert.deepEqual(bounded.lost_jobs.map(({ retry_decision: decision }) => decision), [
+    RECOVERY_BOUND_REACHED,
+  ]);
+  assert.deepEqual(bounded.lost_jobs.map(({ lost_executions: spent }) => spent), [2]);
+  assert.deepEqual(bounded.not_retried_jobs.map(({ id, retry_decision: decision }) => [id, decision]), [
+    [41, SUPERSEDED_BY_LATER_EXECUTION],
+  ]);
 
   // A run that reached attempt 2 for an unrelated reason has still never re-dispatched this host,
   // and the first loss of its runner is owed its one automatic recovery. Reading the run-attempt
@@ -194,6 +210,246 @@ test("only lost jobs are re-dispatched and the recovery bound counts recoveries"
   const green = planLostRunnerRerun({ runAttempt: 1, runConclusion: "success", jobs: [lostJob()] });
   assert.equal(green.rerun, false);
   assert.equal(green.reason, "run_did_not_fail");
+});
+
+// The Metal host is a second name in the same run, used wherever the point is that one host's
+// decision must not be read off another host's rows.
+function metalLostJob(overrides = {}) {
+  return lostJob({
+    id: 51,
+    name: "macos-metal-proof / Packaged Apple Silicon Metal engine",
+    ...overrides,
+  });
+}
+
+test("a job a later execution already recovered is out of the plan, and its stale id is never named", () => {
+  // The recovery worked: the host was lost at attempt 1 and reported at attempt 2. Another job
+  // then failed its own assertions, so the run as a whole is red and the planner runs again.
+  const recovered = planLostRunnerRerun({
+    runAttempt: MAXIMUM_RUN_ATTEMPTS,
+    runConclusion: "failure",
+    jobs: [
+      lostJob(),
+      lostJob({
+        id: 43,
+        run_attempt: String(MAXIMUM_RUN_ATTEMPTS),
+        conclusion: "success",
+        annotations: [],
+        log_uploaded: true,
+        steps: [{ name: "Prove offline Linux Vulkan retrieval", conclusion: "success" }],
+      }),
+      assertionJob({ id: 77, name: "windows-vulkan-proof / Packaged Windows Vulkan engine" }),
+    ],
+  });
+  assert.equal(recovered.rerun, false);
+  assert.equal(recovered.reason, "no_runner_communication_loss");
+  assert.deepEqual(recovered.rerun_job_ids, []);
+  assert.deepEqual(recovered.lost_jobs, []);
+  const stale = recovered.not_retried_jobs.find(({ id }) => id === 41);
+  assert.equal(stale.retry_decision, SUPERSEDED_BY_LATER_EXECUTION);
+  assert.deepEqual(stale.superseded_by, { id: 43, run_attempt: "2", conclusion: "success" });
+  // The assertion failure that made the run red is still reported, and still not retried.
+  const refused = recovered.not_retried_jobs.find(({ id }) => id === 77);
+  assert.equal(refused.retry_decision, NOT_A_RUNNER_COMMUNICATION_LOSS);
+  assert.equal(refused.signature, JOB_ASSERTION_FAILURE);
+
+  // Actions also lists a carried-forward job under the newer attempt number, so the attempt alone
+  // cannot order two executions of one name. Job ids are allocated in creation order inside a run,
+  // so the execution the re-dispatch created is the higher id even when both read attempt 2.
+  const sameAttemptListing = planLostRunnerRerun({
+    runAttempt: MAXIMUM_RUN_ATTEMPTS,
+    runConclusion: "failure",
+    jobs: [
+      lostJob({ run_attempt: String(MAXIMUM_RUN_ATTEMPTS) }),
+      lostJob({
+        id: 43,
+        run_attempt: String(MAXIMUM_RUN_ATTEMPTS),
+        conclusion: "success",
+        annotations: [],
+        log_uploaded: true,
+        steps: [{ name: "Prove offline Linux Vulkan retrieval", conclusion: "success" }],
+      }),
+      assertionJob({ id: 77, name: "windows-vulkan-proof / Packaged Windows Vulkan engine" }),
+    ],
+  });
+  assert.equal(sameAttemptListing.rerun, false);
+  assert.deepEqual(sameAttemptListing.rerun_job_ids, []);
+  assert.equal(
+    sameAttemptListing.not_retried_jobs.find(({ id }) => id === 41).retry_decision,
+    SUPERSEDED_BY_LATER_EXECUTION,
+  );
+
+  // The host was lost, re-dispatched, and then disagreed with the product on its own terms. The
+  // stale lost execution must not put the assertion failure back into the queue: a proof that ran
+  // and refused to pass is never re-dispatched, whatever an earlier execution of it looked like.
+  const recoveredIntoAssertionFailure = planLostRunnerRerun({
+    runAttempt: MAXIMUM_RUN_ATTEMPTS,
+    runConclusion: "failure",
+    jobs: [lostJob(), assertionJob({ id: 43, run_attempt: String(MAXIMUM_RUN_ATTEMPTS) })],
+  });
+  assert.equal(recoveredIntoAssertionFailure.rerun, false);
+  assert.equal(recoveredIntoAssertionFailure.reason, "no_runner_communication_loss");
+  assert.deepEqual(recoveredIntoAssertionFailure.rerun_job_ids, []);
+  assert.deepEqual(
+    recoveredIntoAssertionFailure.not_retried_jobs
+      .map(({ id, retry_decision: decision }) => [id, decision]),
+    [[41, SUPERSEDED_BY_LATER_EXECUTION], [43, NOT_A_RUNNER_COMMUNICATION_LOSS]],
+  );
+
+  // Two hosts lost in the same incident are both owed a recovery, and the request names the
+  // execution each of them is actually sitting in.
+  const both = planLostRunnerRerun({
+    runAttempt: 1,
+    runConclusion: "failure",
+    jobs: [lostJob(), metalLostJob()],
+  });
+  assert.equal(both.rerun, true);
+  assert.deepEqual(both.rerun_job_ids, [41, 51]);
+  assert.deepEqual(both.lost_jobs.map(({ retry_decision: decision }) => decision), [
+    RETRY_REQUESTED,
+    RETRY_REQUESTED,
+  ]);
+  assert.equal(both.schema, RERUN_PLAN_SCHEMA);
+});
+
+test("one refused re-dispatch does not consume the recovery the other lost hosts are owed", () => {
+  const attempted = [];
+  const partial = planRerunDispatch({
+    jobIds: [41, 51],
+    dispatch: (jobId) => {
+      attempted.push(jobId);
+      return jobId === 41
+        ? { dispatched: false, detail: "refused_exit_1: HTTP 403" }
+        : { dispatched: true, detail: "accepted" };
+    },
+  });
+  // Every named id got its own request: the refusal of the first did not end the loop.
+  assert.deepEqual(attempted, [41, 51]);
+  assert.equal(partial.schema, RERUN_DISPATCH_SCHEMA);
+  assert.equal(partial.recovered, true);
+  assert.equal(partial.reason, "partially_dispatched");
+  assert.deepEqual(partial.dispatched_job_ids, [51]);
+  assert.deepEqual(partial.refused_job_ids, [41]);
+  assert.equal(partial.results.find(({ job_id: id }) => id === 41).detail, "refused_exit_1: HTTP 403");
+
+  const none = planRerunDispatch({
+    jobIds: [41, 51],
+    dispatch: () => ({ dispatched: false, detail: "refused_exit_1: HTTP 403" }),
+  });
+  assert.equal(none.recovered, false);
+  assert.equal(none.reason, "every_job_refused");
+  assert.deepEqual(none.dispatched_job_ids, []);
+
+  const all = planRerunDispatch({
+    jobIds: [41, 51],
+    dispatch: () => ({ dispatched: true, detail: "accepted" }),
+  });
+  assert.equal(all.recovered, true);
+  assert.equal(all.reason, "every_job_dispatched");
+});
+
+function stubbedGh(script) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-gh-stub-"));
+  const binary = path.join(directory, "gh");
+  writeFileSync(binary, script, { mode: 0o755 });
+  return { directory, log: path.join(directory, "calls.txt") };
+}
+
+function runDispatchCli(plan, ghScript) {
+  const { directory, log } = stubbedGh(ghScript);
+  const planPath = path.join(directory, "rerun-plan.json");
+  const outPath = path.join(directory, "rerun-dispatch.json");
+  const outputsPath = path.join(directory, "outputs.txt");
+  writeFileSync(planPath, JSON.stringify(plan));
+  writeFileSync(outputsPath, "");
+  const result = spawnSync(
+    process.execPath,
+    [
+      script,
+      "dispatch-rerun",
+      "--plan", planPath,
+      "--repository", "TheGreenCedar/CodeStory",
+      "--out", outPath,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+        GITHUB_OUTPUT: outputsPath,
+        CODESTORY_GH_STUB_LOG: log,
+      },
+    },
+  );
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    receipt: existsSync(outPath) ? JSON.parse(readFileSync(outPath, "utf8")) : undefined,
+    outputs: readFileSync(outputsPath, "utf8"),
+    calls: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [],
+  };
+}
+
+test("the dispatch CLI asks Actions for every lost job separately and records what each answered", () => {
+  const plan = {
+    schema: RERUN_PLAN_SCHEMA,
+    rerun: true,
+    reason: RUNNER_COMMUNICATION_LOSS,
+    rerun_job_ids: [41, 51],
+  };
+  // The first id is refused the way Actions refuses a job it will not re-run; the second must
+  // still be asked for, and the recovery as a whole must count as having happened.
+  const partial = runDispatchCli(
+    plan,
+    [
+      "#!/usr/bin/env bash",
+      'printf "%s\\n" "$*" >> "$CODESTORY_GH_STUB_LOG"',
+      'case "$*" in',
+      '  *"/jobs/41/rerun"*) echo "HTTP 403: cannot re-run this job" >&2; exit 1 ;;',
+      '  *) echo "{}" ;;',
+      "esac",
+      "",
+    ].join("\n"),
+  );
+  assert.equal(partial.status, 0);
+  // The per-job endpoint, named id by id: re-running every failed job would sweep an assertion
+  // failure back into the queue alongside the lost one.
+  assert.deepEqual(partial.calls, [
+    "api --method POST repos/TheGreenCedar/CodeStory/actions/jobs/41/rerun",
+    "api --method POST repos/TheGreenCedar/CodeStory/actions/jobs/51/rerun",
+  ]);
+  assert.equal(partial.receipt.recovered, true);
+  assert.deepEqual(partial.receipt.dispatched_job_ids, [51]);
+  assert.match(partial.receipt.results.find(({ job_id: id }) => id === 41).detail, /HTTP 403/u);
+  assert.match(partial.outputs, /recovered=true/u);
+  assert.match(partial.outputs, /dispatched_job_ids=51/u);
+
+  // Nothing was recovered, so the recovery workflow itself has to go red.
+  const refused = runDispatchCli(
+    plan,
+    ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$CODESTORY_GH_STUB_LOG"', "exit 1", ""].join("\n"),
+  );
+  assert.equal(refused.status, 1);
+  assert.equal(refused.calls.length, 2);
+  assert.equal(refused.receipt.recovered, false);
+  assert.equal(refused.receipt.reason, "every_job_refused");
+
+  // A plan that did not ask for a rerun can never be turned into re-dispatch requests.
+  const notPlanned = runDispatchCli(
+    { ...plan, rerun: false, reason: "no_runner_communication_loss", rerun_job_ids: [] },
+    ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$CODESTORY_GH_STUB_LOG"', "echo '{}'", ""].join("\n"),
+  );
+  assert.notEqual(notPlanned.status, 0);
+  assert.deepEqual(notPlanned.calls, []);
+  assert.match(notPlanned.stderr, /did not ask for a rerun/u);
+
+  // A plan written by an older contract is refused rather than reinterpreted.
+  const staleSchema = runDispatchCli(
+    { ...plan, schema: "codestory.lost-runner-rerun-plan/v1" },
+    ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$CODESTORY_GH_STUB_LOG"', "echo '{}'", ""].join("\n"),
+  );
+  assert.notEqual(staleSchema.status, 0);
+  assert.deepEqual(staleSchema.calls, []);
 });
 
 test("a non-claim is reachable only from a spent retry bound on a lost runner", () => {

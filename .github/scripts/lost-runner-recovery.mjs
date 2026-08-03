@@ -13,6 +13,7 @@
 // on every step and a log blob. This module keys on the signature, never on job names, so that a
 // renamed or newly added proof job cannot silently become retryable.
 
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,8 +29,16 @@ export const MAXIMUM_RUN_ATTEMPTS = 2;
 
 export const RUNNER_COMMUNICATION_LOSS = "runner_communication_loss";
 export const JOB_ASSERTION_FAILURE = "job_assertion_failure";
-export const RERUN_PLAN_SCHEMA = "codestory.lost-runner-rerun-plan/v1";
+export const RERUN_PLAN_SCHEMA = "codestory.lost-runner-rerun-plan/v2";
 export const NON_CLAIM_PLAN_SCHEMA = "codestory.accelerator-non-claim-plan/v1";
+export const RERUN_DISPATCH_SCHEMA = "codestory.lost-runner-rerun-dispatch/v1";
+
+/// Why an execution that failed is not in the re-dispatch list. Every failed execution the planner
+/// saw carries exactly one of these, so a reader of the plan never has to infer an omission.
+export const RETRY_REQUESTED = "retry_requested";
+export const RECOVERY_BOUND_REACHED = "recovery_bound_reached";
+export const SUPERSEDED_BY_LATER_EXECUTION = "superseded_by_later_execution";
+export const NOT_A_RUNNER_COMMUNICATION_LOSS = "not_a_runner_communication_loss";
 
 function fail(message) {
   throw new Error(message);
@@ -127,8 +136,40 @@ function distinctExecutions(jobs) {
   return [...byId.values()];
 }
 
-function failedJobs(jobs) {
-  return distinctExecutions(jobs).filter((job) => String(job?.conclusion ?? "") === "failure");
+/// Order two executions of the same job name. Actions allocates job ids in creation order inside a
+/// run, so the execution a re-dispatch created always ranks above the execution it replaced --
+/// whether or not the carried-forward row is re-listed under the newer attempt number. Ranking on
+/// the attempt alone answers wrongly under that second listing shape.
+function ranksAbove(candidate, incumbent, name) {
+  const candidateAttempt = positiveInteger(candidate?.run_attempt, `${name} run attempt`);
+  const incumbentAttempt = positiveInteger(incumbent?.run_attempt, `${name} run attempt`);
+  if (candidateAttempt !== incumbentAttempt) return candidateAttempt > incumbentAttempt;
+  return positiveInteger(candidate?.id, `${name} job id`)
+    > positiveInteger(incumbent?.id, `${name} job id`);
+}
+
+/// The newest execution of every job name, and the executions it superseded.
+///
+/// Recovery decisions are about *what the job is doing now*, so they are made from the newest
+/// execution only. Deciding from every execution ever collected kept a job that a later attempt
+/// already recovered in the plan forever, and named its stale, already-consumed job id.
+function latestExecutionsByName(jobs) {
+  const byName = new Map();
+  for (const job of distinctExecutions(jobs)) {
+    const name = leafJobName(job?.name);
+    const previous = byName.get(name);
+    if (previous === undefined) {
+      byName.set(name, { name, latest: job, superseded: [] });
+      continue;
+    }
+    if (ranksAbove(job, previous.latest, name)) {
+      previous.superseded.push(previous.latest);
+      previous.latest = job;
+    } else {
+      previous.superseded.push(job);
+    }
+  }
+  return [...byName.values()];
 }
 
 /// How many *executions* of one job name were lost to their runner, across every attempt collected.
@@ -147,38 +188,111 @@ export function countLostExecutions(jobs, jobName) {
     .length;
 }
 
+function executionReference(job, name) {
+  return {
+    id: positiveInteger(job?.id, `${name} job id`),
+    run_attempt: String(positiveInteger(job?.run_attempt, `${name} run attempt`)),
+    conclusion: job?.conclusion === null || job?.conclusion === undefined
+      ? null
+      : String(job.conclusion),
+  };
+}
+
 /// Decide which individual jobs to re-dispatch. Only jobs carrying the lost-runner signature are
 /// ever re-dispatched -- the plan names them one by one instead of asking Actions to rerun every
 /// failed job, so a proof that failed its own assertions is left exactly as it is and keeps the run
 /// red. No approval gate is consulted: recovery is a machine decision or it does not happen.
 ///
-/// The bound is per job, not per run: see `countLostExecutions`.
+/// Selection reads each job name's *newest* execution and nothing else. An execution a later
+/// execution superseded is already spent: re-dispatching its id asks Actions to re-run a job the
+/// run has moved past, and when the newest execution succeeded there is nothing to recover at all.
+/// Both of those used to be in the plan, so a run that failed for an unrelated reason re-dispatched
+/// an already-recovered host and led the request with a stale id.
+///
+/// The recovery bound is per job, not per run: see `countLostExecutions`.
 export function planLostRunnerRerun({ runAttempt, runConclusion, jobs }) {
   const attempt = positiveInteger(runAttempt, "run attempt");
-  const classified = failedJobs(jobs).map(classifyJobFailure);
-  const withRecoveries = classified.map((job) => ({
-    ...job,
-    lost_executions: countLostExecutions(jobs, job.name),
-  }));
-  const lost = withRecoveries.filter(({ signature }) => signature === RUNNER_COMMUNICATION_LOSS);
-  const notRetried = withRecoveries.filter(({ signature }) => signature !== RUNNER_COMMUNICATION_LOSS);
-  const retryable = lost.filter(({ lost_executions: spent }) => spent < MAXIMUM_RUN_ATTEMPTS);
+  const rows = [];
+  for (const { name, latest, superseded } of latestExecutionsByName(jobs)) {
+    const spent = countLostExecutions(jobs, name);
+    for (const stale of superseded) {
+      if (String(stale?.conclusion ?? "") !== "failure") continue;
+      rows.push({
+        ...classifyJobFailure(stale),
+        lost_executions: spent,
+        retry_decision: SUPERSEDED_BY_LATER_EXECUTION,
+        superseded_by: executionReference(latest, name),
+      });
+    }
+    if (String(latest?.conclusion ?? "") !== "failure") continue;
+    const classified = classifyJobFailure(latest);
+    const decision = classified.signature !== RUNNER_COMMUNICATION_LOSS
+      ? NOT_A_RUNNER_COMMUNICATION_LOSS
+      : spent < MAXIMUM_RUN_ATTEMPTS
+        ? RETRY_REQUESTED
+        : RECOVERY_BOUND_REACHED;
+    rows.push({ ...classified, lost_executions: spent, retry_decision: decision });
+  }
+  const lost = rows.filter(({ retry_decision: decision }) =>
+    decision === RETRY_REQUESTED || decision === RECOVERY_BOUND_REACHED);
+  const notRetried = rows.filter(({ retry_decision: decision }) =>
+    decision !== RETRY_REQUESTED && decision !== RECOVERY_BOUND_REACHED);
+  const retryable = rows.filter(({ retry_decision: decision }) => decision === RETRY_REQUESTED);
   const reason = String(runConclusion ?? "") !== "failure"
     ? "run_did_not_fail"
     : lost.length === 0
       ? "no_runner_communication_loss"
       : retryable.length === 0
         ? "recovery_bound_reached"
-        : "runner_communication_loss";
+        : RUNNER_COMMUNICATION_LOSS;
   return {
     schema: RERUN_PLAN_SCHEMA,
-    rerun: reason === "runner_communication_loss",
+    rerun: reason === RUNNER_COMMUNICATION_LOSS,
     reason,
     run_attempt: attempt,
     maximum_run_attempts: MAXIMUM_RUN_ATTEMPTS,
-    rerun_job_ids: reason === "runner_communication_loss" ? retryable.map(({ id }) => id) : [],
+    rerun_job_ids: reason === RUNNER_COMMUNICATION_LOSS
+      ? retryable.map(({ id }) => id).sort((left, right) => left - right)
+      : [],
     lost_jobs: lost,
     not_retried_jobs: notRetried,
+  };
+}
+
+/// Ask Actions to re-run each named job, one id at a time, and record what each id answered.
+///
+/// The bound this has to respect is that one refused id may not consume the recovery of the others.
+/// The release owns one host per accelerator and the hosts share a machine, so a run can lose two
+/// of them at once; a sequential loop that stops at the first non-zero exit would then recover the
+/// lowest-numbered job and silently abandon the rest. Every id therefore gets its own attempt and
+/// its own recorded outcome, and the command fails only when the recovery as a whole did not
+/// happen -- no id succeeded even though ids were named.
+export function planRerunDispatch({ jobIds, dispatch }) {
+  const ids = list(jobIds, "rerun job ids").map((id) => positiveInteger(id, "rerun job id"));
+  const results = ids.map((id) => {
+    const outcome = dispatch(id);
+    return {
+      job_id: id,
+      dispatched: outcome.dispatched === true,
+      detail: text(outcome.detail, `job ${id} dispatch detail`),
+    };
+  });
+  const dispatched = results.filter(({ dispatched: ok }) => ok);
+  const refused = results.filter(({ dispatched: ok }) => !ok);
+  return {
+    schema: RERUN_DISPATCH_SCHEMA,
+    requested_job_ids: ids,
+    dispatched_job_ids: dispatched.map(({ job_id: id }) => id),
+    refused_job_ids: refused.map(({ job_id: id }) => id),
+    results,
+    recovered: ids.length > 0 && dispatched.length > 0,
+    reason: ids.length === 0
+      ? "no_job_requested"
+      : dispatched.length === 0
+        ? "every_job_refused"
+        : refused.length === 0
+          ? "every_job_dispatched"
+          : "partially_dispatched",
   };
 }
 
@@ -286,6 +400,26 @@ function emitOutputs(entries) {
   }
 }
 
+/// One re-dispatch request. A refusal is data -- the receipt says which id Actions declined and
+/// what it said -- and never an exception, because the ids after it still have their own recovery
+/// owed to them.
+function rerunJobThroughGh(repository, jobId) {
+  const result = spawnSync(
+    "gh",
+    ["api", "--method", "POST", `repos/${repository}/actions/jobs/${jobId}/rerun`],
+    { encoding: "utf8" },
+  );
+  if (result.error) {
+    return { dispatched: false, detail: `gh_not_invoked: ${result.error.message}` };
+  }
+  if (result.status === 0) return { dispatched: true, detail: "accepted" };
+  const stderr = String(result.stderr ?? "").replace(/\s+/gu, " ").trim().slice(0, 200);
+  return {
+    dispatched: false,
+    detail: `refused_exit_${String(result.status)}: ${stderr === "" ? "no stderr" : stderr}`,
+  };
+}
+
 function parseArgs(argv) {
   const command = argv.shift();
   const values = {};
@@ -310,6 +444,33 @@ function main() {
     writeJson(values.out ?? "target/lost-runner/rerun-plan.json", plan);
     emitOutputs({ rerun: String(plan.rerun), job_ids: plan.rerun_job_ids.join(" ") });
     console.log(JSON.stringify(plan, null, 2));
+    return;
+  }
+  if (command === "dispatch-rerun") {
+    const plan = readJson(values.plan);
+    if (plan.schema !== RERUN_PLAN_SCHEMA) {
+      fail(`rerun plan must carry ${RERUN_PLAN_SCHEMA}`);
+    }
+    if (plan.rerun !== true) fail("dispatch-rerun refuses a plan that did not ask for a rerun");
+    const repository = text(
+      values.repository ?? process.env.GITHUB_REPOSITORY,
+      "repository",
+    );
+    const receipt = planRerunDispatch({
+      jobIds: plan.rerun_job_ids,
+      dispatch: (jobId) => rerunJobThroughGh(repository, jobId),
+    });
+    writeJson(values.out ?? "target/lost-runner/rerun-dispatch.json", receipt);
+    emitOutputs({
+      recovered: String(receipt.recovered),
+      dispatched_job_ids: receipt.dispatched_job_ids.join(" "),
+      refused_job_ids: receipt.refused_job_ids.join(" "),
+    });
+    console.log(JSON.stringify(receipt, null, 2));
+    for (const row of receipt.results.filter(({ dispatched }) => !dispatched)) {
+      console.error(`::error::Actions refused the rerun of job ${row.job_id}: ${row.detail}`);
+    }
+    if (!receipt.recovered) process.exitCode = 1;
     return;
   }
   if (command === "plan-non-claim") {
