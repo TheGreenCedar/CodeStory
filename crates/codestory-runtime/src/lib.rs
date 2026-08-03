@@ -575,10 +575,38 @@ pub struct AppController {
     sidecar_query_cache: Arc<Mutex<SidecarQueryCacheState>>,
     pub(crate) canonical_symbol_names:
         Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
+    source_observer: Arc<Mutex<SourceObserverState>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
     source_index_policy: Arc<SourceIndexPolicy>,
+}
+
+/// The filesystem observer this controller has armed, if any.
+///
+/// One session per project root per process. `refused` records a root the platform declined so
+/// the controller does not re-probe an unsupported filesystem on every serving read; that answer
+/// cannot change while the root stays put.
+#[derive(Default)]
+pub(crate) struct SourceObserverState {
+    root: Option<PathBuf>,
+    session: Option<Arc<codestory_workspace::filesystem_observer::FilesystemObserverSession>>,
+    refused: Option<codestory_workspace::filesystem_observer::FilesystemObserverGap>,
+    #[cfg(any(test, feature = "test-support"))]
+    arm_requests: u64,
+}
+
+/// What one armed observer session said about a root at a single moment.
+///
+/// The session id pins *which* observer made the claim, because a re-armed session knows nothing
+/// about the window before it. The epoch is the part that moves: it counts every mutation the
+/// scope filter admitted, so two readings that agree are a positive statement that no admitted
+/// path changed in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedSourceEpoch {
+    session_id: String,
+    backend: &'static str,
+    epoch: codestory_workspace::filesystem_observer::ObserverEpoch,
 }
 
 #[derive(Debug)]

@@ -13,6 +13,8 @@ use codestory_contracts::api::{
 };
 
 use crate::AppController;
+use crate::ObservedSourceEpoch;
+use crate::index_freshness::FreshnessObservationPolicy;
 use codestory_indexer::CancellationToken;
 use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
@@ -313,6 +315,17 @@ struct ReadyLease {
     core_publication: IndexPublicationDto,
     retrieval: codestory_retrieval::ReadyRetrievalIdentity,
     source: ReadySourceIdentity,
+    /// The observer session and epoch the source snapshot was taken under.
+    ///
+    /// Everything else in this lease is a pointer that a source write does not move: the core
+    /// publication is unchanged because the database is unchanged, the retrieval manifest is
+    /// unchanged for the same reason, and `source` is a DTO frozen at one instant. That is the
+    /// window EV-78 left open and the reason this package exists — so the lease has to carry the
+    /// one value that *does* move when the working tree does.
+    ///
+    /// `None` on a host the observer cannot watch. The lease then means exactly what it meant
+    /// before this package: EV-7's bounded scan, revalidated by the serving reads.
+    source_observer: Option<ObservedSourceEpoch>,
 }
 
 #[derive(Debug, Clone)]
@@ -975,10 +988,39 @@ impl ActivationService {
         ReadyLeaseProbe {
             admissible: configuration_matches
                 && lease.source.is_admissible_snapshot()
+                && self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref())
                 && retrieval_matches
                 && core_matches,
             retained_core_publication,
         }
+    }
+
+    /// Whether the working tree has stood still since the lease recorded its source snapshot.
+    ///
+    /// The lease probe is the one readiness gate that never re-scans: it compares stored
+    /// identities, and a source write moves none of them. Comparing observer epochs is what makes
+    /// the stored snapshot falsifiable at all — the epoch advances the moment an admitted path is
+    /// written, which is precisely the post-scan window the lease used to keep re-admitting.
+    ///
+    /// A lease minted without an observer compares nothing and stays admissible. Refusing those
+    /// would re-activate on every request on WSL drive mounts and network shares, which is the
+    /// availability cost the typed-unknown fallback exists to refuse.
+    fn ready_lease_source_observer_unchanged(
+        &self,
+        recorded: Option<&ObservedSourceEpoch>,
+    ) -> bool {
+        let Some(recorded) = recorded else {
+            return true;
+        };
+        let Ok(project_root) = self.controller.require_project_root() else {
+            return false;
+        };
+        // A re-armed session, or one that has taken a sticky loss, cannot speak for the window
+        // the lease was minted in. Refusing costs one re-activation and then converges: the next
+        // lease is minted without an observer and falls back to the floor.
+        self.controller
+            .observed_source_epoch(&project_root)
+            .is_some_and(|observed| observed == *recorded)
     }
 
     fn begin_activation_locked(
@@ -1254,7 +1296,10 @@ impl ActivationService {
         let mut summary = self
             .controller
             .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
-        summary.freshness = Some(self.controller.index_freshness_uncached()?);
+        summary.freshness = Some(
+            self.controller
+                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
+        );
 
         operation.set_stage(ActivationStage::CoreFreshness);
         let core_stale = summary.publication.is_none()
@@ -1283,7 +1328,10 @@ impl ActivationService {
                 project_root.clone(),
                 storage_path.clone(),
             )?;
-            summary.freshness = Some(self.controller.index_freshness_uncached()?);
+            summary.freshness = Some(
+                self.controller
+                    .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
+            );
         }
         let local_ready = summary.publication.is_some()
             && summary.stats.node_count > 0
@@ -1367,7 +1415,13 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
-        let source_freshness = self.controller.index_freshness_uncached()?;
+        // Read the epoch *before* the scan, not after: a mutation that lands while the scan runs
+        // has to fall outside the lease's recorded epoch, or the lease would vouch for the very
+        // window the observer just proved was contested.
+        let source_observer = self.controller.observed_source_epoch(&project_root);
+        let source_freshness = self
+            .controller
+            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
         if !index_freshness_admits_operation(&source_freshness) {
             return Err(ApiError::new(
                 "publication_changed",
@@ -1414,6 +1468,7 @@ impl ActivationService {
             core_publication: revalidated_core,
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
+            source_observer,
         });
         operation.set_capability(true, ActivationCapabilityState::Ready);
         Ok(())
@@ -1772,7 +1827,9 @@ impl PublicOperationService {
         let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
-                let freshness = self.controller.index_freshness_uncached()?;
+                let freshness = self
+                    .controller
+                    .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
                 if !index_freshness_admits_operation(&freshness)
                     && !self.retained_core_allows(operation, publication)
                 {
@@ -1801,7 +1858,13 @@ impl PublicOperationService {
                     // including a mutation that preserved both mtime and byte
                     // length. Only re-hashing content sees that, so the
                     // operation-scoped verdict memo must not answer here.
-                    let after = self.controller.index_freshness_reverified()?;
+                    // Observed as well, because the re-read is still a scan with
+                    // a window of its own: the memo drop makes the scan see
+                    // drift that landed before it started, and the observer
+                    // makes it refuse drift that lands while it runs.
+                    let after = self.controller.index_freshness_reverified(
+                        FreshnessObservationPolicy::ObserveSourceRoot,
+                    )?;
                     if !index_freshness_admits_operation(&after)
                         && !self.retained_core_allows(operation, publication)
                     {
@@ -2749,9 +2812,13 @@ mod activation_tests {
             .retained_core_publication(&storage_path)
             .expect("read ready core")
             .expect("complete ready core");
+        let source_observer = service
+            .controller
+            .observed_source_epoch(project.path())
+            .expect("a local temporary project must be observable");
         let source_freshness = service
             .controller
-            .index_freshness_uncached()
+            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
             .expect("verify ready source snapshot");
         assert!(index_freshness_admits_operation(&source_freshness));
         let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
@@ -2769,6 +2836,7 @@ mod activation_tests {
             core_publication: core_publication.clone(),
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
+            source_observer: Some(source_observer),
         };
         assert!(lease.source.is_admissible_snapshot());
         {
@@ -2873,7 +2941,7 @@ mod activation_tests {
             .runtime
             .activation_service()
             .controller
-            .index_freshness_uncached()
+            .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)
             .expect("observe indexed inventory")
             .indexed_file_count;
         assert!(
@@ -3198,6 +3266,124 @@ mod activation_tests {
             !service
                 .probe_ready_lease(&fixture.storage_path, &invalid_source_snapshot)
                 .admissible
+        );
+    }
+
+    /// An observer that escalates every window it seals, moving nothing on disk.
+    ///
+    /// The event is directory-scoped, so it names no file to rehash: the scan verdict stays
+    /// `Fresh` on its own and only the escalation can refuse. Anything these tests turn red is
+    /// therefore the consequence of the escalation and not the arming.
+    fn install_escalating_observer(controller: &AppController) -> PathBuf {
+        let root = controller
+            .require_project_root()
+            .expect("the fixture binds a project root");
+        let scoped_root = root.clone();
+        let session = crate::tests::freshness_observer_tests::scripted_session(&root, move |_| {
+            vec![
+                codestory_workspace::filesystem_observer::ObservedFilesystemEvent::Mutated {
+                    path: scoped_root.clone(),
+                    scope: codestory_workspace::filesystem_observer::MutationScope::Directory,
+                },
+            ]
+        });
+        controller.install_source_observer_for_test(&root, Arc::new(session));
+        root
+    }
+
+    #[test]
+    fn an_escalated_verdict_refuses_ready_lease_publication() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        service.use_published_retrieval_fixture_for_test();
+        let project_root = install_escalating_observer(&service.controller);
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id: "activation-observed-source-drift".to_string(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let error = service
+            .activate_once(&operation, project_root, fixture.storage_path.clone())
+            .expect_err("a source tree that moved under the scan must not be leased as ready");
+
+        assert_eq!(
+            error.code, "publication_changed",
+            "ready-lease validation is a serving read; an observed race has to refuse it"
+        );
+        let state = service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator");
+        assert_eq!(
+            state.ready_lease.as_ref(),
+            Some(&fixture.lease),
+            "a refused validation must not replace the lease it refused to renew"
+        );
+    }
+
+    #[test]
+    fn a_source_mutation_after_the_lease_was_minted_refuses_ready_reuse() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let root = service
+            .controller
+            .require_project_root()
+            .expect("the fixture binds a project root");
+        let quiet = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&quiet);
+        let written = root.join("metadata.rs");
+        let session = crate::tests::freshness_observer_tests::scripted_session(&root, move |_| {
+            if gate.load(Ordering::Acquire) {
+                return Vec::new();
+            }
+            vec![
+                codestory_workspace::filesystem_observer::ObservedFilesystemEvent::Mutated {
+                    path: written.clone(),
+                    scope: codestory_workspace::filesystem_observer::MutationScope::File,
+                },
+            ]
+        });
+        service
+            .controller
+            .install_source_observer_for_test(&root, Arc::new(session));
+
+        let mut lease = fixture.lease.clone();
+        lease.source_observer = service.controller.observed_source_epoch(&root);
+        assert!(
+            lease.source_observer.is_some(),
+            "an armed session must be able to stamp the lease it authorises"
+        );
+        assert!(
+            service
+                .probe_ready_lease(&fixture.storage_path, &lease)
+                .admissible,
+            "a still working tree keeps the lease it earned"
+        );
+
+        // The write EV-78 could not see: the database does not move, so every other identity in
+        // the lease still matches and the probe never re-scans.
+        quiet.store(false, Ordering::Release);
+        assert!(
+            !service
+                .probe_ready_lease(&fixture.storage_path, &lease)
+                .admissible,
+            "a source write after the lease was minted must end the reuse window"
+        );
+    }
+
+    #[test]
+    fn a_lease_minted_without_an_observer_keeps_the_unobserved_floor() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.activation_service();
+        let mut unobservable = fixture.lease.clone();
+        unobservable.source_observer = None;
+        assert!(
+            service
+                .probe_ready_lease(&fixture.storage_path, &unobservable)
+                .admissible,
+            "a host the observer cannot watch keeps exactly the EV-7 answer it had before"
         );
     }
 

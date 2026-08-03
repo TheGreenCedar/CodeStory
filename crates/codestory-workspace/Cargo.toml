@@ -13,6 +13,7 @@ fs_at = { workspace = true }
 glob = { workspace = true }
 gix = { workspace = true }
 ignore = { workspace = true }
+notify = { workspace = true }
 remove_dir_all = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

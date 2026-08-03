@@ -2196,12 +2196,14 @@ impl AppController {
         let workspace = runtime_workspace_manifest(root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         let mut path_identities = AffectedOperationIdentityIndex::native();
+        // `affected` reports what an existing publication covers; it never creates observers.
         let freshness = index_freshness_observation_from_storage_with_identities(
             root,
             &workspace,
             &storage,
             &self.source_index_policy,
             &mut path_identities,
+            crate::index_freshness::FreshnessObservation::Unobserved,
         );
         let identity_matches = match_affected_file_identities(
             root,

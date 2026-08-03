@@ -1,9 +1,9 @@
 use crate::index_commit::{IndexWriterGuard, index_publication_dto};
 use crate::index_coverage::indexed_files_from_storage;
 use crate::index_freshness::{
-    CachedIndexFreshness, index_freshness_cache_ttl_secs, index_freshness_from_storage_with_policy,
-    open_storage_for_read, storage_fingerprint, workspace_member_index_summaries,
-    workspace_member_storage_summaries,
+    CachedIndexFreshness, FreshnessObservation, index_freshness_cache_ttl_secs,
+    index_freshness_from_storage_with_policy, open_storage_for_read, storage_fingerprint,
+    workspace_member_index_summaries, workspace_member_storage_summaries,
 };
 use crate::index_full::index_full_for_runtime;
 use crate::index_incremental::{
@@ -1134,6 +1134,7 @@ impl AppController {
                 workspace,
                 storage,
                 &self.source_index_policy,
+                FreshnessObservation::Unobserved,
             );
         }
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
@@ -1150,11 +1151,14 @@ impl AppController {
             }
         }
 
+        // The cached project summary feeds observational surfaces. They read what already
+        // exists and never create observers.
         let freshness = index_freshness_from_storage_with_policy(
             root,
             workspace,
             storage,
             &self.source_index_policy,
+            FreshnessObservation::Unobserved,
         );
         let mut state = self.state.lock();
         state.index_freshness_cache = Some(CachedIndexFreshness {

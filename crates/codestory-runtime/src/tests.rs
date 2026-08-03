@@ -113,6 +113,8 @@ use tempfile::{TempDir, tempdir};
 #[path = "tests/activation_coverage_tests.rs"]
 mod activation_coverage_tests;
 
+#[path = "tests/freshness_observer.rs"]
+pub(crate) mod freshness_observer_tests;
 #[path = "tests/repo_text.rs"]
 mod repo_text_tests;
 #[path = "tests/search_intent.rs"]

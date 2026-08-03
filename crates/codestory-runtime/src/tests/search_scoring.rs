@@ -2340,7 +2340,9 @@ fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         .index_freshness()
         .expect("cached recovery freshness");
     let uncached = controller
-        .index_freshness_uncached()
+        .index_freshness_uncached(
+            crate::index_freshness::FreshnessObservationPolicy::ObserveSourceRoot,
+        )
         .expect("uncached recovery freshness");
     for freshness in [&cached, &uncached] {
         assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
