@@ -3941,8 +3941,8 @@ fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = codestory_contracts::language_support::line_comment_for_language(language)
         .or(match language {
             "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
-            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "csharp"
-            | "cpp" | "dart" | "php" | "swift" => Some("//"),
+            "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "csharp" | "cpp"
+            | "dart" | "php" | "swift" => Some("//"),
             _ => None,
         });
     let Some(marker) = comment_marker else {
