@@ -25,8 +25,11 @@ use codestory_contracts::api::{
 /// Version of the claim-profile contract whose counters this telemetry describes.
 ///
 /// A trace recorded in the field is only comparable against another trace with the same
-/// version, so the number is published beside the counts and pinned by contract tests.
-pub(crate) const PACKET_CLAIM_PROFILE_CONTRACT_VERSION: u32 = 1;
+/// version, so the number is published beside the counts and pinned by contract tests. There
+/// is one number: it is the schema version of the checked-in registry document, so a trace
+/// cannot claim a contract shape the loaded data was not written against.
+pub(crate) const PACKET_CLAIM_PROFILE_CONTRACT_VERSION: u32 =
+    crate::agent::packet_claim_profile_registry::PACKET_CLAIM_PROFILE_SCHEMA_VERSION;
 
 /// Which layer produced a packet claim.
 ///
@@ -168,6 +171,13 @@ impl PacketClaimTelemetry {
             contracted_profiles: saturating_count(registry.contracted),
             pending_profiles: saturating_count(registry.pending),
             pending_ratchet: saturating_count(registry.pending_ratchet),
+            rejected_profiles: saturating_count(registry.rejected),
+            rejected_reasons: registry
+                .rejection_codes
+                .iter()
+                .map(|code| (*code).to_string())
+                .collect(),
+            registry_error: registry.document_rejection.map(str::to_string),
             citations_considered: self.citations_considered,
             profiles_fired: saturating_count(self.profiles_fired()),
             profiles_skipped_invalid: saturating_count(self.profiles_skipped()),
@@ -200,12 +210,22 @@ fn saturating_count(value: usize) -> u32 {
 
 /// Static shape of the claim-profile registry, published beside the counts so a field trace
 /// records how many profiles existed when the counters were taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `rejected` and `document_rejection` describe what the versioned-data loader refused. They
+/// exist because the loader fails closed: a refused row or a refused document removes profiles,
+/// and a packet that quietly answered from a smaller registry would otherwise look identical to
+/// one that answered from the whole registry and found nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PacketClaimProfileRegistrySummary {
     pub(crate) registered: usize,
     pub(crate) contracted: usize,
     pub(crate) pending: usize,
     pub(crate) pending_ratchet: usize,
+    pub(crate) rejected: usize,
+    /// Distinct static codes for the refused rows.
+    pub(crate) rejection_codes: Vec<&'static str>,
+    /// Static code of the whole-document refusal, when the registry loaded empty.
+    pub(crate) document_rejection: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -215,9 +235,12 @@ mod tests {
     fn registry() -> PacketClaimProfileRegistrySummary {
         PacketClaimProfileRegistrySummary {
             registered: 20,
-            contracted: 4,
-            pending: 16,
-            pending_ratchet: 16,
+            contracted: 7,
+            pending: 13,
+            pending_ratchet: 13,
+            rejected: 0,
+            rejection_codes: Vec::new(),
+            document_rejection: None,
         }
     }
 
@@ -284,13 +307,51 @@ mod tests {
         let dto = PacketClaimTelemetry::default().to_dto(registry());
         assert_eq!(dto.contract_version, PACKET_CLAIM_PROFILE_CONTRACT_VERSION);
         assert_eq!(dto.registered_profiles, 20);
-        assert_eq!(dto.contracted_profiles, 4);
-        assert_eq!(dto.pending_profiles, 16);
-        assert_eq!(dto.pending_ratchet, 16);
+        assert_eq!(dto.contracted_profiles, 7);
+        assert_eq!(dto.pending_profiles, 13);
+        assert_eq!(dto.pending_ratchet, 13);
         assert_eq!(dto.citations_considered, 0);
         assert_eq!(dto.profiles_fired, 0);
         assert_eq!(dto.profiles_skipped_invalid, 0);
+        assert_eq!(dto.rejected_profiles, 0);
+        assert_eq!(dto.registry_error, None);
         assert!(dto.profiles.is_empty());
+    }
+
+    #[test]
+    fn a_refused_registry_document_is_reported_as_a_typed_error_beside_empty_counts() {
+        // The loader fails closed, so a refused document leaves the packet answering from
+        // name-derived templates alone. Without these two fields that packet is indistinguishable
+        // in the trace from one whose profiles were offered and simply stayed quiet.
+        let dto = PacketClaimTelemetry::default().to_dto(PacketClaimProfileRegistrySummary {
+            registered: 0,
+            contracted: 0,
+            pending: 0,
+            pending_ratchet: 0,
+            rejected: 0,
+            rejection_codes: Vec::new(),
+            document_rejection: Some("schema_version_mismatch"),
+        });
+        assert_eq!(dto.registered_profiles, 0);
+        assert_eq!(
+            dto.registry_error.as_deref(),
+            Some("schema_version_mismatch")
+        );
+
+        let partial = PacketClaimTelemetry::default().to_dto(PacketClaimProfileRegistrySummary {
+            rejected: 2,
+            rejection_codes: vec!["unknown_profile_id", "missing_owner_issue"],
+            ..registry()
+        });
+        assert_eq!(partial.rejected_profiles, 2);
+        assert_eq!(
+            partial.rejected_reasons,
+            vec![
+                "unknown_profile_id".to_string(),
+                "missing_owner_issue".to_string()
+            ]
+        );
+        assert_eq!(partial.registry_error, None);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(crate) mod packet_batch;
 pub(crate) mod packet_budget;
 pub(crate) mod packet_capping;
 pub(crate) mod packet_citations;
+pub(crate) mod packet_claim_profile_registry;
 pub(crate) mod packet_claim_profiles;
 pub(crate) mod packet_claims;
 pub(crate) mod packet_command_profiles;

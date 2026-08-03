@@ -315,16 +315,31 @@ their counts, so neither the number of surfaces nor the number of production
 lines they occupy can move without a reviewable diff that restates both numbers.
 
 The same file carries the `pending_claim_profiles` ratchet: how many product
-claim profiles still ship without an anti-overfit contract and fixture pair. The
-lint counts the declarations in the registry, so a new uncontracted profile
-cannot land without raising a stated number and migrating one cannot land
-without lowering it and the matching
-`PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. Every packet also
-publishes the contract version, per-profile fire rates, and per-layer claim
-counts on the typed `retrieval_trace.packet_claim_profile_telemetry` field, so
-which profiles fired — and whether the packet fell back to name-derived
-templates — is observable in the field. Those counters carry static profile ids
-and integers only; no citation name, path, or source text enters them.
+claim profiles still ship without an anti-overfit contract and fixture triple.
+The registry itself is checked-in, schema-versioned data
+(`crates/codestory-runtime/src/agent/data/claim_profiles.v2.json`), seeded into
+the lint by name because the directory walk collects Rust only — so the document
+carries the same banned-marker pass as the code beside it. The lint counts the
+pending rows in that document, so a new uncontracted profile cannot land without
+raising a stated number and migrating one cannot land without lowering it and
+the matching `PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET` constant. The
+ratchet is auditable in both directions as well as bounded: `ratchet_ceiling`
+records the high-water the burn-down started from and `burn_down` must name one
+migration, with its issue and its measured evidence, for every profile between
+the ceiling and the count. Leaving the pending set costs a measured fixture
+triple — the profile has to fire on its fitted example, fire on a second example
+of a different file type with a different claim, and measure zero on a helper —
+read from the same fire-rate counters the field trace publishes.
+
+Every packet also publishes the contract version, per-profile fire rates, and
+per-layer claim counts on the typed
+`retrieval_trace.packet_claim_profile_telemetry` field, so which profiles fired
+— and whether the packet fell back to name-derived templates — is observable in
+the field. The loader fails closed, so the same field reports what it refused:
+`rejected_profiles` with its distinct `rejected_reasons`, and `registry_error`
+when a whole document was refused and the registry loaded empty. Those counters
+carry static profile ids, static reason codes, and integers only; no citation
+name, path, or source text enters them.
 
 The telemetry deliberately does not travel in `retrieval_trace.annotations`.
 Annotations are the packet's evidence channel: consumers scan the free text for

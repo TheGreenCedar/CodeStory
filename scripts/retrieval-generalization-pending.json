@@ -3,11 +3,29 @@
   "total_markers": 182,
   "total_marker_occurrences": 257,
   "pending_claim_profiles": {
-    "file": "crates/codestory-runtime/src/agent/packet_claim_profiles.rs",
-    "declaration": "SourceClaimProductProfile::pending(",
-    "count": 16,
+    "file": "crates/codestory-runtime/src/agent/data/claim_profiles.v2.json",
+    "declaration": "\"status\": \"pending_migration\"",
+    "count": 13,
+    "ratchet_ceiling": 16,
     "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1573",
-    "reason": "Product claim profiles that still ship without an anti-overfit contract and fixture pair. The count is a ratchet: a new profile has to arrive contracted, and migrating one of these has to lower this number and PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET in the same change."
+    "reason": "Product claim profiles that still ship without an anti-overfit contract and fixture triple. The registry is versioned data now, so the declaration counted here is the document row, not a Rust constructor. The count is a ratchet: a new profile has to arrive contracted, and migrating one of these has to lower this number and PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET in the same change. ratchet_ceiling is the high-water the burn-down started from, and burn_down has to account for every profile between the ceiling and the count, so the number can only fall through a stated, evidence-backed migration.",
+    "burn_down": [
+      {
+        "profile": "stylesheet-animation",
+        "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1674",
+        "evidence": "Measured fire triple in packet_claim_profiles: a keyframe claim on a plain stylesheet, a different shared-property claim on a preprocessor sheet, and a measured zero on a layout-only sheet."
+      },
+      {
+        "profile": "sql-schema",
+        "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1674",
+        "evidence": "Measured fire triple in packet_claim_profiles: a table claim on a declarative schema file, a different link claim on an embedded schema statement, and a measured zero on a read-only query helper."
+      },
+      {
+        "profile": "form-input-validation",
+        "issue": "https://github.com/TheGreenCedar/CodeStory/issues/1674",
+        "evidence": "Measured fire triple in packet_claim_profiles: a native-constraint claim on a markup page, a different submit-handling claim on a script module, and a measured zero on a markup page without constraints."
+      }
+    ]
   },
   "surfaces": {
     "crates/codestory-runtime/src/agent/orchestrator.rs": {
