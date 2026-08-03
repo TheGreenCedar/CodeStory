@@ -1,11 +1,11 @@
-use crate::agent::packet_scoring::{
+use crate::packet_scoring::{
     normalize_identifier, packet_display_name_is_test_like, packet_display_path,
 };
-use crate::retrieval_file_role_from_path;
+use crate::text::retrieval_file_role_from_path;
 use codestory_contracts::api::{AgentCitationDto, NodeKind, SearchHitOrigin};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PacketEvidenceRole {
+pub enum PacketEvidenceRole {
     SqlTableDefinition,
     SqlRelationshipConstraint,
     SqlSchemaFile,
@@ -37,16 +37,16 @@ pub(crate) enum PacketEvidenceRole {
     SourceEvidence,
 }
 
-pub(crate) fn packet_citation_owns_request_pipeline(citation: &AgentCitationDto) -> bool {
+pub fn packet_citation_owns_request_pipeline(citation: &AgentCitationDto) -> bool {
     matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-        && crate::terminal_symbol_segment(&citation.display_name) == "request"
+        && crate::text::terminal_symbol_segment(&citation.display_name) == "request"
 }
 
-pub(crate) fn packet_citation_owns_interceptor_management(citation: &AgentCitationDto) -> bool {
+pub fn packet_citation_owns_interceptor_management(citation: &AgentCitationDto) -> bool {
     let owner_kind = matches!(citation.kind, NodeKind::STRUCT | NodeKind::CLASS)
         || (citation.kind == NodeKind::METHOD
             && matches!(
-                crate::terminal_symbol_segment(&citation.display_name).as_str(),
+                crate::text::terminal_symbol_segment(&citation.display_name).as_str(),
                 "constructor" | "init" | "new"
             ));
     if !owner_kind {
@@ -59,7 +59,7 @@ pub(crate) fn packet_citation_owns_interceptor_management(citation: &AgentCitati
             .any(|owner| display.contains(owner))
 }
 
-pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto) -> bool {
+pub fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto) -> bool {
     if !matches!(
         citation.kind,
         NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
@@ -70,7 +70,9 @@ pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto
     if !display.contains("adapter") {
         return false;
     }
-    let terminal = normalize_identifier(&crate::terminal_symbol_segment(&citation.display_name));
+    let terminal = normalize_identifier(&crate::text::terminal_symbol_segment(
+        &citation.display_name,
+    ));
     if matches!(citation.kind, NodeKind::CLASS | NodeKind::STRUCT) {
         // A type whose name merely ends in "adapter" is `ArrayAdapter`, `ListAdapter`,
         // `RecyclerViewAdapter` — the most populated class-name suffix in mobile and UI code, and
@@ -101,7 +103,7 @@ pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto
 }
 
 impl PacketEvidenceRole {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SqlTableDefinition => "sql table definition",
             Self::SqlRelationshipConstraint => "sql relationship constraint",
@@ -135,12 +137,12 @@ impl PacketEvidenceRole {
         }
     }
 
-    pub(crate) fn is_low_priority_cap_role(self) -> bool {
+    pub fn is_low_priority_cap_role(self) -> bool {
         matches!(self, Self::TestsAndRegressionCoverage)
     }
 }
 
-pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenceRole> {
+pub fn packet_evidence_role(citation: &AgentCitationDto) -> Option<PacketEvidenceRole> {
     if citation.kind == NodeKind::FILE && citation.origin == SearchHitOrigin::TextMatch {
         return None;
     }
@@ -326,7 +328,7 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
     } else if path.contains("/collections/") {
         Some(PacketEvidenceRole::CollectionConfiguration)
     } else if matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-        && retrieval_file_role_from_path(&path) == crate::RetrievalFileRole::Source
+        && retrieval_file_role_from_path(&path) == crate::text::RetrievalFileRole::Source
     {
         Some(PacketEvidenceRole::SourceEvidence)
     } else {
@@ -334,7 +336,7 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
     }
 }
 
-pub(crate) fn packet_claim_key_for_citation(
+pub fn packet_claim_key_for_citation(
     role: PacketEvidenceRole,
     citation: &AgentCitationDto,
 ) -> String {

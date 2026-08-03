@@ -39,6 +39,11 @@ pages, runbooks, and workflows own detailed mechanics.
   publication.
 - `codestory-retrieval`: lexical, semantic, and SCIP artifacts; immutable
   sidecar generations; manifests; health; and fail-closed query execution.
+- `codestory-agent`: packet planning only -- prompt terms, flow requirements,
+  evidence roles and carriers, citation scoring, and the query plan. It depends
+  on `codestory-contracts` alone and reads pinned runtime state only through the
+  `PinnedReader` trait, so it can never activate, store, execute retrieval,
+  retry a publication, or move readiness.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
   grounding, search, packet construction, and agent flows belong here.
 - `codestory-cli`: command and transport parsing, output rendering, process

@@ -529,10 +529,12 @@ const guardedStructuralScanDirs = readdirSync(
 // ban, so a ranking module added tomorrow is covered on the day it is written
 // rather than on the day someone remembers to list it.
 const requiredScanDirs = [
+  path.join(productionRepoRoot, "crates", "codestory-agent", "src"),
   path.join(productionRepoRoot, "crates", "codestory-runtime", "src"),
   path.join(productionRepoRoot, "crates", "codestory-retrieval", "src"),
 ];
 const guardedRequiredScanDirs = [
+  path.join(repoRoot, "crates", "codestory-agent", "src"),
   path.join(repoRoot, "crates", "codestory-runtime", "src"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
@@ -686,7 +688,7 @@ metadata.structuralScanDirs = structuralScanDirs.map((root) => path.resolve(root
 
 const evalOnlyProductionFiles = new Set(
   (evalOnlyProductionPaths ?? [
-    path.join(productionRepoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
+    path.join(productionRepoRoot, "crates", "codestory-agent", "src", "eval_probes.rs"),
   ]).map((filePath) => path.resolve(filePath)),
 );
 
@@ -721,9 +723,8 @@ const benchmarkEvalProbeManifestPath = path.join(benchmarkTaskRoot, "eval-probes
 const benchmarkEvalProbeSourcePath = path.join(
   repoRoot,
   "crates",
-  "codestory-runtime",
+  "codestory-agent",
   "src",
-  "agent",
   "eval_probes.rs",
 );
 const evalCorpusRoots = [

@@ -16,22 +16,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parsePublishedArchiveDigests } from "./lib/pinned-archive-digests.mjs";
+import { workspaceMemberNames } from "./lib/workspace-members.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 
-/// Every codestory-* crate, in workspace order.
-const WORKSPACE_MEMBERS = [
-  "codestory-llama-sys",
-  "codestory-contracts",
-  "codestory-workspace",
-  "codestory-store",
-  "codestory-indexer",
-  "codestory-retrieval",
-  "codestory-runtime",
-  "codestory-cli",
-  "codestory-bench",
-];
+/// Every codestory-* crate, in workspace order, read from the workspace itself.
+///
+/// Derived rather than listed so that adding a crate cannot leave one version surface behind:
+/// `check-codestory-release.py` and `native-fingerprint.mjs` read the same membership (#1673).
+const WORKSPACE_MEMBERS = workspaceMemberNames(
+  readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8"),
+);
 
 const PLUGIN_MANIFESTS = [
   "plugins/codestory/.codex-plugin/plugin.json",

@@ -1,8 +1,8 @@
-use crate::agent::packet_scoring::normalize_identifier;
-use crate::{is_non_primary_source_term, query_mentions_non_primary_source};
+use crate::packet_scoring::normalize_identifier;
+use crate::text::{is_non_primary_source_term, query_mentions_non_primary_source};
 use std::collections::HashSet;
 
-pub(crate) fn prompt_search_terms(prompt: &str) -> Vec<String> {
+pub fn prompt_search_terms(prompt: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "a",
         "actual",
@@ -80,7 +80,7 @@ pub(crate) fn prompt_search_terms(prompt: &str) -> Vec<String> {
     terms
 }
 
-pub(crate) fn packet_probe_terms(question: &str) -> Vec<String> {
+pub fn packet_probe_terms(question: &str) -> Vec<String> {
     let include_non_primary_terms = query_mentions_non_primary_source(question);
     let brand_terms = brand_phrase_noise_terms(question);
     let mut terms = prompt_search_terms(question)
@@ -185,20 +185,20 @@ fn title_case_brand_token_term(token: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn packet_terms_have(terms: &[String], needle: &str) -> bool {
+pub fn packet_terms_have(terms: &[String], needle: &str) -> bool {
     let normalized_needle = normalize_identifier(needle);
     terms.iter().any(|value| {
         value.eq_ignore_ascii_case(needle) || normalize_identifier(value) == normalized_needle
     })
 }
 
-pub(crate) fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
+pub fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
     needles
         .iter()
         .any(|needle| packet_terms_have(terms, needle))
 }
 
-pub(crate) fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
     has_any(&["index", "indexed", "indexer", "indexing"])
@@ -222,7 +222,7 @@ pub(crate) fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
         ])
 }
 
-pub(crate) fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let explicit_client_transport = has_any(&[
@@ -248,7 +248,7 @@ pub(crate) fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> b
             && has_any(&["adapter", "adapters", "dispatch", "dispatches", "transport"]))
 }
 
-pub(crate) fn packet_terms_indicate_server_request_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_server_request_dispatch_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let server_or_protocol = has_any(&["wsgi", "asgi", "server", "servers"]);
     let request_flow = has_any(&["request", "requests"]) && has_any(&["dispatch", "dispatches"]);
@@ -270,7 +270,7 @@ pub(crate) fn packet_terms_indicate_server_request_dispatch_flow(terms: &[String
             && !packet_terms_indicate_server_route_dispatch_flow(terms))
 }
 
-pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["route", "routes", "router"])
@@ -286,7 +286,7 @@ pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String])
             || has_any(&["engine", "method", "methods"]))
 }
 
-pub(crate) fn packet_terms_indicate_javascript_route_source_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_javascript_route_source_flow(terms: &[String]) -> bool {
     packet_terms_indicate_server_route_dispatch_flow(terms)
         && packet_terms_have_any(
             terms,
@@ -305,7 +305,7 @@ pub(crate) fn packet_terms_indicate_javascript_route_source_flow(terms: &[String
         )
 }
 
-pub(crate) fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool {
     packet_terms_indicate_server_route_dispatch_flow(terms)
         && packet_terms_have_any(
             terms,
@@ -323,7 +323,7 @@ pub(crate) fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -
         )
 }
 
-pub(crate) fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["buffer", "buffers", "buffered"])
         && (has_any(&["source", "sources", "sink", "sinks"])
@@ -331,7 +331,7 @@ pub(crate) fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
                 && has_any(&["byte", "bytes", "stream", "streams", "wrapper", "wrappers"])))
 }
 
-pub(crate) fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let build_intent = has_any(&[
         "build",
@@ -357,7 +357,7 @@ pub(crate) fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> b
     build_intent && site_intent && covered_phases >= 2
 }
 
-pub(crate) fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let logger_or_log_call = has_any(&["log", "logger", "logging", "message", "messages"]);
     let compound_log_record_intent = terms.iter().any(|term| {
@@ -380,7 +380,7 @@ pub(crate) fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) ->
     logger_or_log_call && record_intent && handler_intent
 }
 
-pub(crate) fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let mapper_intent = has_any(&["mapper", "mappers", "mapping", "map", "maps"]);
@@ -420,7 +420,7 @@ pub(crate) fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[Stri
         && (runtime_api_intent || source_destination_intent || plan_intent || has("objects"))
 }
 
-pub(crate) fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     (has("prepared") || has("prepare"))
@@ -429,7 +429,7 @@ pub(crate) fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[Strin
         && has_any(&["adapter", "adapters", "send", "sends", "transport"])
 }
 
-pub(crate) fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has("search")
@@ -445,7 +445,7 @@ pub(crate) fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> b
         ])
 }
 
-pub(crate) fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let css_signal = has("css")
@@ -481,7 +481,7 @@ pub(crate) fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) 
     css_signal && animation_signal && source_shape_signal
 }
 
-pub(crate) fn packet_terms_indicate_html_css_template_structure_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_html_css_template_structure_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let html_signal = has("html") || has_any(&["markup", "document", "shell"]);
@@ -505,7 +505,7 @@ pub(crate) fn packet_terms_indicate_html_css_template_structure_flow(terms: &[St
     html_signal && css_signal && structure_signal
 }
 
-pub(crate) fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["sql", "schema", "schemas", "table", "tables"])
         && has_any(&[
@@ -522,7 +522,7 @@ pub(crate) fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
         && has_any(&["table", "tables", "create", "schema", "schemas"])
 }
 
-pub(crate) fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
     let hook_signal = packet_terms_have_any(terms, &["hook", "hooks"])
         || terms.iter().any(|term| {
             let normalized = normalize_identifier(term);
@@ -549,7 +549,7 @@ pub(crate) fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
     hook_signal && cache_or_public_api_intent
 }
 
-pub(crate) fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
     let explicit_client_or_http_intent =
         packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
     let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
@@ -564,7 +564,7 @@ pub(crate) fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
         || (request_intent && send_or_transport_intent)
 }
 
-pub(crate) fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
@@ -576,14 +576,14 @@ pub(crate) fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bo
             || has_any(&["required", "min", "max"]))
 }
 
-pub(crate) fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) -> bool {
     packet_terms_indicate_command_server_bootstrap_flow(terms)
         || packet_terms_indicate_command_event_loop_flow(terms)
         || packet_terms_indicate_network_command_input_flow(terms)
         || packet_terms_indicate_command_dispatch_flow(terms)
 }
 
-pub(crate) fn packet_terms_indicate_command_server_bootstrap_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_command_server_bootstrap_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["command", "commands"])
@@ -600,18 +600,18 @@ pub(crate) fn packet_terms_indicate_command_server_bootstrap_flow(terms: &[Strin
             || (has("event") && has("loop")))
 }
 
-pub(crate) fn packet_terms_indicate_command_event_loop_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_command_event_loop_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     packet_terms_have_any(terms, &["command", "commands"])
         && (has("eventloop") || (has("event") && has("loop")))
 }
 
-pub(crate) fn packet_terms_indicate_network_command_input_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_network_command_input_flow(terms: &[String]) -> bool {
     packet_terms_have_any(terms, &["network", "socket", "client", "input"])
         && packet_terms_have_any(terms, &["command", "commands"])
 }
 
-pub(crate) fn packet_terms_indicate_command_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_command_dispatch_flow(terms: &[String]) -> bool {
     packet_terms_have_any(terms, &["command", "commands"])
         && packet_terms_have_any(
             terms,
@@ -634,7 +634,7 @@ pub(crate) fn packet_terms_indicate_command_dispatch_flow(terms: &[String]) -> b
         )
 }
 
-pub(crate) fn packet_terms_indicate_url_session_request_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_url_session_request_flow(terms: &[String]) -> bool {
     let explicit_url_session_lifecycle = packet_terms_have_any(
         terms,
         &[
@@ -666,7 +666,7 @@ pub(crate) fn packet_terms_indicate_url_session_request_flow(terms: &[String]) -
         )
 }
 
-pub(crate) fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> bool {
     packet_terms_have_any(
         terms,
         &[
@@ -678,7 +678,7 @@ pub(crate) fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> 
 /// A shell-install prompt needs an actual shell signal. "command"/"function" alone also describe a
 /// command server, and a shell requirement raised over a command-server prompt is unclosable: no
 /// citation in such a repository is a shell script, so the packet would report partial forever.
-pub(crate) fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]) -> bool {
     packet_terms_have_any(terms, &["bash", "shell", "sh", "zsh", "script", "scripts"])
         && packet_terms_have_any(
             terms,
@@ -699,7 +699,7 @@ pub(crate) fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]
         && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
 }
 
-pub(crate) fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
     packet_terms_have_any(
         terms,
         &["string", "strings", "charsequence", "charsequences", "text"],
@@ -717,7 +717,7 @@ pub(crate) fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> b
     )
 }
 
-pub(crate) fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
+pub fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
     packet_terms_have_any(
         terms,
         &["format", "formats", "formatting", "vformat", "format_to"],

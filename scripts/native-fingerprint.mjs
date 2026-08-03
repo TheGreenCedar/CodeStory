@@ -16,6 +16,8 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { workspaceMemberManifests } from "./lib/workspace-members.mjs";
+
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /// Everything that shapes the built native artifacts.
@@ -31,25 +33,30 @@ const NATIVE_PATHS = [
   ".github/scripts/install-windows-vulkan-sdk.ps1",
 ];
 
-/// Files whose version-bump lines are normalized rather than hashed raw.
-const VERSION_STAMPED = new Set([
-  "Cargo.lock",
-  "crates/codestory-llama-sys/model-contract.json",
-  ...[
-    "codestory-llama-sys",
-    "codestory-contracts",
-    "codestory-workspace",
-    "codestory-store",
-    "codestory-indexer",
-    "codestory-retrieval",
-    "codestory-runtime",
-    "codestory-cli",
-    "codestory-bench",
-  ].map((crate) => `crates/${crate}/Cargo.toml`),
-]);
+/// Files the bump rewrites that are not crate manifests.
+const VERSION_STAMPED_FIXED = ["Cargo.lock", "crates/codestory-llama-sys/model-contract.json"];
+
+/// The root manifest, which names the crates whose version lines are normalized.
+const WORKSPACE_MANIFEST = "Cargo.toml";
 
 function git(args) {
   return execFileSync("git", args, { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1 << 28 });
+}
+
+/// Files whose version-bump lines are normalized rather than hashed raw, at one ref.
+///
+/// The crate manifests are derived from that ref's own `[workspace] members` rather than listed
+/// here, because a hand list is the one failure this fingerprint cannot survive: `bump-version.mjs`
+/// rewrites the `[package] version` of every workspace member, so a member missing from this set
+/// gets its version line hashed raw and a pure version bump stops fingerprinting equal. Nothing
+/// fails when that happens -- the release lane just quietly loses the accelerator-evidence reuse
+/// this file exists to justify (#1673). Reading membership at the ref, not from the working tree,
+/// keeps historical refs hashing exactly as they did when they were released.
+function versionStampedPaths(workspaceManifestSource) {
+  return new Set([
+    ...VERSION_STAMPED_FIXED,
+    ...workspaceMemberManifests(workspaceManifestSource),
+  ]);
 }
 
 /// Strip exactly the lines the version bump rewrites; everything else stays byte-exact.
@@ -88,10 +95,23 @@ function main() {
     process.exit(1);
   }
 
+  const workspaceManifest = listing.find(({ relative }) => relative === WORKSPACE_MANIFEST);
+  if (!workspaceManifest) {
+    console.error(`::error::native fingerprint saw no ${WORKSPACE_MANIFEST} at ${ref}`);
+    process.exit(1);
+  }
+  let versionStamped;
+  try {
+    versionStamped = versionStampedPaths(git(["cat-file", "blob", workspaceManifest.objectId]));
+  } catch (error) {
+    console.error(`::error::native fingerprint cannot read the crate set at ${ref}: ${error.message}`);
+    process.exit(1);
+  }
+
   const hash = createHash("sha256");
   hash.update("codestory-native-fingerprint-v1\0");
   for (const { mode, objectId, relative } of listing) {
-    if (VERSION_STAMPED.has(relative)) {
+    if (versionStamped.has(relative)) {
       const content = git(["cat-file", "blob", objectId]);
       hash.update(`${mode} ${relative}\0`);
       hash.update(normalizeVersionStamp(relative, content));

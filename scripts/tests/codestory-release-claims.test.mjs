@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +25,7 @@ import {
   validateReleaseClaimGraph,
   verifyReuseBinding,
 } from "../codestory-release-claims.mjs";
+import { workspaceMemberManifests } from "../lib/workspace-members.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const fixtureRoot = path.join(root, "scripts/tests/fixtures/release-claims");
@@ -1425,6 +1433,192 @@ test("reuse bindings verify tree identity and fingerprint equality against real 
     }),
     /is not an ancestor of the release commit/u,
   );
+});
+
+/// The unstamped native input the fingerprint must keep hashing byte-for-byte.
+const UNSTAMPED_NATIVE_CONTROL = ".cargo/config.toml";
+
+function gitIn(repository, args) {
+  const result = spawnSync("git", args, { cwd: repository, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+/// Materialize this repository's release version surfaces at `ref` into a throwaway git repository.
+///
+/// Built from the real tree rather than a stand-in workspace on purpose: the whole failure mode
+/// under test is a crate the fingerprint's stamped set never heard of, so the crates have to be
+/// whichever crates this commit actually declares. The two scripts are copied in because each
+/// resolves its repository from its own location.
+function versionSurfaceRepository(ref) {
+  const repository = mkdtempSync(path.join(os.tmpdir(), "codestory-fingerprint-"));
+  const show = (relative) =>
+    gitIn(root, ["--no-pager", "show", `${ref}:${relative}`]) + "\n";
+  const surfaces = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "CHANGELOG.md",
+    UNSTAMPED_NATIVE_CONTROL,
+    "crates/codestory-llama-sys/model-contract.json",
+    "plugins/codestory/cli-version.json",
+    "plugins/codestory/.codex-plugin/plugin.json",
+    "plugins/codestory/.claude-plugin/plugin.json",
+    "plugins/codestory/.github/plugin/plugin.json",
+    ...workspaceMemberManifests(show("Cargo.toml")),
+  ];
+  for (const relative of surfaces) {
+    const absolute = path.join(repository, relative);
+    mkdirSync(path.dirname(absolute), { recursive: true });
+    writeFileSync(absolute, show(relative));
+  }
+  mkdirSync(path.join(repository, "scripts/lib"), { recursive: true });
+  for (const script of [
+    "bump-version.mjs",
+    "native-fingerprint.mjs",
+    "lib/pinned-archive-digests.mjs",
+    "lib/workspace-members.mjs",
+  ]) {
+    cpSync(path.join(root, "scripts", script), path.join(repository, "scripts", script));
+  }
+  gitIn(repository, ["init", "--quiet", "--initial-branch", "main"]);
+  gitIn(repository, ["config", "user.email", "fingerprint@codestory.test"]);
+  gitIn(repository, ["config", "user.name", "fingerprint test"]);
+  gitIn(repository, ["config", "commit.gpgsign", "false"]);
+  return repository;
+}
+
+function commitEverything(repository, message) {
+  gitIn(repository, ["add", "--all"]);
+  gitIn(repository, ["commit", "--quiet", "--allow-empty", "--message", message]);
+  return gitIn(repository, ["rev-parse", "HEAD"]);
+}
+
+function nativeFingerprint(repository, ref) {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(repository, "scripts/native-fingerprint.mjs"), "--ref", ref],
+    { cwd: repository, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `native fingerprint failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function runBump(repository, args) {
+  return spawnSync(
+    process.execPath,
+    [path.join(repository, "scripts/bump-version.mjs"), ...args],
+    { cwd: repository, encoding: "utf8" },
+  );
+}
+
+test("a version-only release bump leaves the native fingerprint unchanged", () => {
+  // release-claims.json binds `native_fingerprint` admissibility to this equality, and
+  // `evidence_policy.native_reuse = "version_only_delta"` is the whole justification for
+  // inheriting the previous release's accelerator evidence. Nothing fails loudly when the
+  // equality stops holding -- the reuse claim simply stops matching and the native proof
+  // silently reruns from scratch -- so it is proved here, on the real crate set, in the suite
+  // pull requests run (#1673).
+  const repository = versionSurfaceRepository("HEAD");
+  try {
+    const members = workspaceMemberManifests(
+      readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
+    );
+    assert.ok(members.length > 0, "the workspace must declare crates to prove anything about");
+    const before = commitEverything(repository, "release surfaces before the bump");
+    const beforePrint = nativeFingerprint(repository, before);
+    assert.match(beforePrint, /^[0-9a-f]{64}$/u);
+
+    // The real version owner writes every text surface and then stops at `cargo update`, which
+    // cannot run against a manifest-only checkout. Cargo's own effect on the lock -- the recorded
+    // version of each workspace crate -- is applied here in its place, and the owner's own
+    // `--check` then certifies that the result is a complete release bump and nothing more.
+    runBump(repository, ["--version", "0.17.0"]);
+    const lockPath = path.join(repository, "Cargo.lock");
+    writeFileSync(
+      lockPath,
+      readFileSync(lockPath, "utf8").replace(
+        /(name = "codestory-[a-z-]+"\nversion = ")[^"]+(")/gu,
+        "$10.17.0$2",
+      ),
+    );
+    const certified = runBump(repository, ["--version", "0.17.0", "--check"]);
+    assert.equal(
+      certified.status,
+      0,
+      `the bump left a surface behind: ${certified.stdout}${certified.stderr}`,
+    );
+
+    const after = commitEverything(repository, "version-only release bump");
+    assert.notEqual(
+      gitIn(repository, ["rev-parse", `${after}^{tree}`]),
+      gitIn(repository, ["rev-parse", `${before}^{tree}`]),
+      "the bump must actually have changed the tree",
+    );
+    assert.equal(
+      nativeFingerprint(repository, after),
+      beforePrint,
+      "a version-only bump moved the native fingerprint, voiding accelerator evidence reuse",
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("every workspace crate is version-normalized and content-bound by the fingerprint", () => {
+  // Per crate, so the failure names the crate that drifted: bumping only its `[package] version`
+  // must be invisible to the fingerprint. Two counter-probes keep that from being satisfied by a
+  // fingerprint that had stopped looking -- a manifest's non-version content and an unstamped
+  // native input both still have to move it.
+  const repository = versionSurfaceRepository("HEAD");
+  try {
+    const base = commitEverything(repository, "release surfaces");
+    const basePrint = nativeFingerprint(repository, base);
+    const probe = (relative, edit, message) => {
+      const absolute = path.join(repository, relative);
+      writeFileSync(absolute, edit(readFileSync(absolute, "utf8")));
+      const commit = commitEverything(repository, message);
+      const print = nativeFingerprint(repository, commit);
+      gitIn(repository, ["reset", "--hard", "--quiet", base]);
+      return print;
+    };
+    const members = workspaceMemberManifests(
+      readFileSync(path.join(repository, "Cargo.toml"), "utf8"),
+    );
+
+    for (const manifest of members) {
+      assert.equal(
+        probe(
+          manifest,
+          (source) =>
+            source.replace(/(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/mu, "$10.17.0$2"),
+          `bump ${manifest}`,
+        ),
+        basePrint,
+        `${manifest} is not version-normalized, so a version bump voids accelerator reuse`,
+      );
+    }
+
+    // Normalization is a line, not a licence to stop hashing the file.
+    const counterProbe = members.at(-1);
+    assert.notEqual(
+      probe(
+        counterProbe,
+        (source) => `${source}\n[package.metadata.probe]\nseen = true\n`,
+        `edit ${counterProbe}`,
+      ),
+      basePrint,
+      `${counterProbe} does not bind its own content into the fingerprint`,
+    );
+    assert.notEqual(
+      probe(UNSTAMPED_NATIVE_CONTROL, (source) => `${source}\n# probe\n`, "edit cargo config"),
+      basePrint,
+      `${UNSTAMPED_NATIVE_CONTROL} does not bind its content into the fingerprint`,
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
 });
 
 test("a reuse binding may equate only identities its own construction determines", () => {

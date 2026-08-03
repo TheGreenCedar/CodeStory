@@ -8,19 +8,19 @@ use std::sync::OnceLock;
 use codestory_contracts::api::AgentCitationDto;
 use serde::Deserialize;
 
-#[cfg(test)]
-pub(crate) const EVAL_PROBES_ENV: &str = "CODESTORY_EVAL_PROBES";
+#[cfg(any(test, feature = "test-support"))]
+pub const EVAL_PROBES_ENV: &str = "CODESTORY_EVAL_PROBES";
 const EVAL_PROBE_MANIFEST_ENV: &str = "CODESTORY_EVAL_PROBES_MANIFEST";
 
 thread_local! {
     static EVAL_PROBES_TEST_OVERRIDE_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-pub(crate) fn eval_probes_enabled() -> bool {
+pub fn eval_probes_enabled() -> bool {
     eval_probes_enabled_for_build()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn eval_probes_enabled_for_build() -> bool {
     if EVAL_PROBES_TEST_OVERRIDE_DEPTH.get() > 0 {
         return true;
@@ -33,19 +33,19 @@ fn eval_probes_enabled_for_build() -> bool {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn eval_probes_enabled_for_build() -> bool {
     false
 }
 
-#[cfg(test)]
-pub(crate) fn push_eval_probes_test_override() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn push_eval_probes_test_override() {
     let depth = EVAL_PROBES_TEST_OVERRIDE_DEPTH.get();
     EVAL_PROBES_TEST_OVERRIDE_DEPTH.set(depth.saturating_add(1));
 }
 
-#[cfg(test)]
-pub(crate) fn pop_eval_probes_test_override() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn pop_eval_probes_test_override() {
     let depth = EVAL_PROBES_TEST_OVERRIDE_DEPTH.get();
     debug_assert!(depth > 0, "eval probe test override underflow");
     EVAL_PROBES_TEST_OVERRIDE_DEPTH.set(depth.saturating_sub(1));
@@ -126,7 +126,7 @@ fn term_matches(terms: &[String], expected: &str) -> bool {
         .any(|value| value.eq_ignore_ascii_case(expected))
 }
 
-pub(crate) fn push_eval_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
+pub fn push_eval_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
     }
@@ -139,7 +139,7 @@ pub(crate) fn push_eval_flow_hint_packet_queries(terms: &[String], queries: &mut
     }
 }
 
-pub(crate) fn push_eval_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+pub fn push_eval_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
     }
@@ -152,10 +152,7 @@ pub(crate) fn push_eval_required_probe_queries(terms: &[String], queries: &mut V
     }
 }
 
-pub(crate) fn push_prompt_concept_derived_symbol_probes(
-    terms: &[String],
-    queries: &mut Vec<String>,
-) {
+pub fn push_prompt_concept_derived_symbol_probes(terms: &[String], queries: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
     }
@@ -209,7 +206,7 @@ pub(crate) fn push_prompt_concept_derived_symbol_probes(
     }
 }
 
-pub(crate) fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+pub fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
     }
@@ -292,7 +289,7 @@ pub(crate) fn push_prompt_named_file_probe_queries(terms: &[String], queries: &m
     }
 }
 
-pub(crate) fn source_derived_claims_for_citation(
+pub fn source_derived_claims_for_citation(
     prompt: &str,
     citation: &AgentCitationDto,
     source: &str,
@@ -348,11 +345,7 @@ pub(crate) fn source_derived_claims_for_citation(
     claims
 }
 
-pub(crate) fn eval_citation_rank_adjustment(
-    normalized_display: &str,
-    path: &str,
-    score: f32,
-) -> f32 {
+pub fn eval_citation_rank_adjustment(normalized_display: &str, path: &str, score: f32) -> f32 {
     if !eval_probes_enabled() {
         return score;
     }
@@ -365,7 +358,7 @@ pub(crate) fn eval_citation_rank_adjustment(
     adjusted
 }
 
-pub(crate) fn eval_flow_template_claims(
+pub fn eval_flow_template_claims(
     normalized_prompt: &str,
     citations: &[AgentCitationDto],
 ) -> Vec<(String, AgentCitationDto)> {
@@ -477,7 +470,7 @@ pub(crate) fn eval_flow_template_claims(
     claims
 }
 
-pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms: &mut Vec<String>) {
+pub fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms: &mut Vec<String>) {
     if !eval_probes_enabled() {
         return;
     }
@@ -526,10 +519,7 @@ pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms:
     }
 }
 
-pub(crate) fn eval_supporting_claim_flow_sentence(
-    normalized_prompt: &str,
-    focus: &str,
-) -> Option<String> {
+pub fn eval_supporting_claim_flow_sentence(normalized_prompt: &str, focus: &str) -> Option<String> {
     if !eval_probes_enabled() {
         return None;
     }
@@ -559,7 +549,7 @@ pub(crate) fn eval_supporting_claim_flow_sentence(
     None
 }
 
-pub(crate) fn eval_citation_shaped_claim(
+pub fn eval_citation_shaped_claim(
     citation: &AgentCitationDto,
     prompt: &str,
     display_path: &str,

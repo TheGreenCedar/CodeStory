@@ -9,6 +9,7 @@ test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
+codestory-agent = { workspace = true }
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
 codestory-retrieval = { workspace = true }
@@ -27,6 +28,7 @@ ureq = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+codestory-agent = { workspace = true, features = ["test-support"] }
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-workspace = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }

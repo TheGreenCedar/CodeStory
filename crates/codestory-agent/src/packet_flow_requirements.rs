@@ -1,6 +1,6 @@
 //! Generic packet flow requirements shared by planning, probes, and sufficiency.
 
-use crate::agent::packet_evidence_carriers::{
+use crate::packet_evidence_carriers::{
     citation_owns_buffer_read_write, citation_owns_buffer_storage,
     citation_owns_client_request_finalization, citation_owns_client_request_method,
     citation_owns_client_response_materialization, citation_owns_css_animation_entrypoint,
@@ -19,10 +19,10 @@ use crate::agent::packet_evidence_carriers::{
     flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
     flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
 };
-use crate::agent::packet_evidence_roles::{
+use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
 };
-use crate::agent::packet_terms::{
+use crate::packet_terms::{
     packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_command_dispatch_flow,
     packet_terms_indicate_command_event_loop_flow,
@@ -51,7 +51,7 @@ const BEHAVIORAL_OWNER_NODE_KINDS: &[NodeKind] = &[
 const SQL_SCHEMA_NODE_KINDS: &[NodeKind] = &[NodeKind::FILE, NodeKind::ANNOTATION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum FlowRole {
+pub enum FlowRole {
     Entrypoint,
     Registration,
     Configuration,
@@ -63,8 +63,8 @@ pub(crate) enum FlowRole {
 }
 
 impl FlowRole {
-    #[cfg(test)]
-    pub(crate) const fn role_id(self) -> &'static str {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn role_id(self) -> &'static str {
         match self {
             Self::Entrypoint => "entrypoint",
             Self::Registration => "registration",
@@ -77,7 +77,7 @@ impl FlowRole {
         }
     }
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Entrypoint => "entrypoint",
             Self::Registration => "registration",
@@ -92,7 +92,7 @@ impl FlowRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CoverageMode {
+pub enum CoverageMode {
     RequiresResolvedSourceOrGraph,
     AllowsSourceRange,
     AllowsLexicalSource,
@@ -106,7 +106,7 @@ pub(crate) enum CoverageMode {
 /// close the other. An evidence predicate belongs to a single requirement and reads only the
 /// citation, never the claim's wording.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum EvidencePredicate {
+pub enum EvidencePredicate {
     /// Covered by a citation the evidence-role classifier places in this part of the flow *and*
     /// that belongs to the subsystem this flow is about.
     ///
@@ -127,7 +127,7 @@ pub(crate) enum EvidencePredicate {
 }
 
 impl EvidencePredicate {
-    pub(crate) fn citation_proves(self, citation: &AgentCitationDto) -> bool {
+    pub fn citation_proves(self, citation: &AgentCitationDto) -> bool {
         match self {
             Self::CitedRoles { subsystem, roles } => {
                 subsystem(citation)
@@ -140,7 +140,7 @@ impl EvidencePredicate {
 
     /// Secondary node-kind policy for role-based predicates. Carrier predicates already encode
     /// their own structural contract and return an empty list to mean "predicate-owned".
-    pub(crate) fn allowed_node_kinds(self) -> &'static [NodeKind] {
+    pub fn allowed_node_kinds(self) -> &'static [NodeKind] {
         let Self::CitedRoles { roles, .. } = self else {
             return &[];
         };
@@ -207,7 +207,7 @@ fn role_survives_without_its_path(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FlowRequirement {
+pub struct FlowRequirement {
     pub id: &'static str,
     pub role: FlowRole,
     pub query_seeds: &'static [&'static str],
@@ -216,13 +216,13 @@ pub(crate) struct FlowRequirement {
 }
 
 impl FlowRequirement {
-    #[cfg(test)]
-    pub(crate) const fn role_id(&self) -> &'static str {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn role_id(&self) -> &'static str {
         self.role.role_id()
     }
 }
 
-pub(crate) fn packet_flow_requirements_for_terms(
+pub fn packet_flow_requirements_for_terms(
     terms: &[String],
     task_class: PacketTaskClassDto,
 ) -> Vec<FlowRequirement> {
@@ -299,7 +299,7 @@ pub(crate) fn packet_flow_requirements_for_terms(
     dedupe_requirements(requirements)
 }
 
-pub(crate) fn packet_flow_requirement_queries_for_terms(
+pub fn packet_flow_requirement_queries_for_terms(
     terms: &[String],
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
@@ -961,7 +961,7 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
 /// a group and a `FlowRole` are the ones that must stay separable by evidence, so tests need the
 /// grouping and not just a flat list.
 #[cfg(test)]
-pub(crate) fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)> {
+pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)> {
     let mut client_dispatch = CLIENT_REQUEST_DISPATCH_FLOW.to_vec();
     client_dispatch.push(REQUEST_INTERCEPTOR_REQUIREMENT);
     vec![
@@ -1015,7 +1015,7 @@ pub(crate) fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequir
 }
 
 #[cfg(test)]
-pub(crate) fn all_flow_requirements() -> Vec<FlowRequirement> {
+pub fn all_flow_requirements() -> Vec<FlowRequirement> {
     all_flow_requirement_groups()
         .into_iter()
         .flat_map(|(_, requirements)| requirements)
@@ -1025,7 +1025,7 @@ pub(crate) fn all_flow_requirements() -> Vec<FlowRequirement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::packet_terms::packet_probe_terms;
+    use crate::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
     use std::collections::BTreeMap;
 

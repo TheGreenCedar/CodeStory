@@ -1,8 +1,8 @@
 //! Packet citation scoring helpers for batch retrieval ranking.
 
-#[cfg(test)]
-use super::eval_probes::eval_citation_rank_adjustment;
-use crate::agent::packet_terms::{
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::eval_citation_rank_adjustment;
+use crate::packet_terms::{
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
     packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow,
@@ -16,7 +16,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use crate::retrieval_file_role_from_path;
+use crate::text::retrieval_file_role_from_path;
 use codestory_contracts::api::{
     AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
 };
@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 /// ranking term, so they are decorated before the sort rather than recomputed
 /// inside the comparator. The comparator itself is unchanged — a NaN rank still
 /// compares equal, and the stable sort keeps input order for equal ranks.
-pub(crate) fn sort_by_cached_rank_desc<T>(values: &mut Vec<T>, mut rank: impl FnMut(&T) -> f32) {
+pub fn sort_by_cached_rank_desc<T>(values: &mut Vec<T>, mut rank: impl FnMut(&T) -> f32) {
     let mut decorated = std::mem::take(values)
         .into_iter()
         .map(|value| {
@@ -41,16 +41,16 @@ pub(crate) fn sort_by_cached_rank_desc<T>(values: &mut Vec<T>, mut rank: impl Fn
 }
 
 /// Citations merged from each packet retrieval stage before the final budget cap.
-pub(crate) fn packet_stage_citation_carry_limit(limits: &PacketBudgetLimitsDto) -> usize {
+pub fn packet_stage_citation_carry_limit(limits: &PacketBudgetLimitsDto) -> usize {
     limits.max_anchors.clamp(8, 16) as usize
 }
 
 /// Candidate hits fetched per planned subquery or anchor-probe batch query.
-pub(crate) fn packet_subquery_hit_limit(limits: &PacketBudgetLimitsDto) -> usize {
+pub fn packet_subquery_hit_limit(limits: &PacketBudgetLimitsDto) -> usize {
     limits.max_anchors.clamp(8, 20) as usize
 }
 
-pub(crate) fn packet_citation_key(citation: &AgentCitationDto) -> String {
+pub fn packet_citation_key(citation: &AgentCitationDto) -> String {
     format!(
         "{}\t{}\t{}",
         citation.node_id.0,
@@ -58,7 +58,7 @@ pub(crate) fn packet_citation_key(citation: &AgentCitationDto) -> String {
         citation.line.unwrap_or_default()
     )
 }
-pub(crate) fn packet_citation_rank(
+pub fn packet_citation_rank(
     citation: &AgentCitationDto,
     terms: &[String],
     prefer_primary_sources: bool,
@@ -200,7 +200,7 @@ pub(crate) fn packet_citation_rank(
         score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         score = eval_citation_rank_adjustment(&normalized_display, &path, score);
     }
@@ -267,7 +267,7 @@ fn packet_concrete_module_file_citation(
 }
 
 /// Rank citations for role-backed claim carry: prefer primary-source flow evidence over tests.
-pub(crate) fn packet_claim_carry_rank(
+pub fn packet_claim_carry_rank(
     citation: &AgentCitationDto,
     terms: &[String],
     prefer_primary_sources: bool,
@@ -291,11 +291,11 @@ pub(crate) fn packet_claim_carry_rank(
     score
 }
 
-pub(crate) fn packet_low_signal_display_name(normalized_display: &str) -> bool {
+pub fn packet_low_signal_display_name(normalized_display: &str) -> bool {
     matches!(normalized_display, "current" | "actual" | "existing")
 }
 
-pub(crate) fn packet_display_name_is_import_literal(display: &str) -> bool {
+pub fn packet_display_name_is_import_literal(display: &str) -> bool {
     let trimmed = display.trim();
     (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || (trimmed.starts_with('"') && trimmed.ends_with('"'))
@@ -304,7 +304,7 @@ pub(crate) fn packet_display_name_is_import_literal(display: &str) -> bool {
         || trimmed.starts_with("\\\\?\\")
 }
 
-pub(crate) fn packet_display_name_is_test_like(display: &str) -> bool {
+pub fn packet_display_name_is_test_like(display: &str) -> bool {
     let trimmed = display.trim();
     let display = trimmed.to_ascii_lowercase();
     let local_name = display.rsplit("::").next().unwrap_or(display.as_str());
@@ -422,7 +422,7 @@ fn packet_request_dispatch_anchor_rank_bonus(
     } else if role.is_non_primary() {
         bonus -= 10.0;
     }
-    if role == crate::RetrievalFileRole::Source
+    if role == crate::text::RetrievalFileRole::Source
         && packet_application_router_response_source_anchor(display, normalized_display, path)
     {
         bonus += 8.0;
@@ -1178,12 +1178,12 @@ const PACKET_QUERY_STOP_TERMS: &[&str] = &[
     "support",
 ];
 
-pub(crate) fn packet_query_stop_term(term: &str) -> bool {
+pub fn packet_query_stop_term(term: &str) -> bool {
     let lower = term.to_ascii_lowercase();
     PACKET_QUERY_STOP_TERMS.contains(&lower.as_str())
 }
 
-pub(crate) fn packet_adjacent_query_stop_term(term: &str) -> bool {
+pub fn packet_adjacent_query_stop_term(term: &str) -> bool {
     matches!(
         term.to_ascii_lowercase().as_str(),
         "actual"
@@ -1208,13 +1208,13 @@ pub(crate) fn packet_adjacent_query_stop_term(term: &str) -> bool {
     )
 }
 
-pub(crate) fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
+pub fn packet_terms_contain(terms: &[String], needle: &str) -> bool {
     terms
         .iter()
         .any(|term| term.eq_ignore_ascii_case(needle) || normalize_identifier(term) == needle)
 }
 
-pub(crate) fn normalize_identifier(value: &str) -> String {
+pub fn normalize_identifier(value: &str) -> String {
     value
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -1222,7 +1222,7 @@ pub(crate) fn normalize_identifier(value: &str) -> String {
         .collect()
 }
 
-pub(crate) fn packet_display_path(path: &str) -> String {
+pub fn packet_display_path(path: &str) -> String {
     let normalized = path.trim_start_matches("\\\\?\\").replace('\\', "/");
     if let Some(path) = path_after_named_repo_root(&normalized) {
         return path;
