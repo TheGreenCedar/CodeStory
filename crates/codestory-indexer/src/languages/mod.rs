@@ -16,6 +16,7 @@
 //! `registry_rows_do_not_shadow_unmigrated_languages` proves it — and the last
 //! package to land deletes the residual arms entirely.
 
+pub(crate) mod c;
 pub(crate) mod kotlin;
 
 use std::sync::OnceLock;
@@ -69,7 +70,7 @@ pub(crate) struct LanguageExtraction {
 }
 
 /// Every language whose extraction rules have moved into this module tree.
-pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION];
+pub(crate) const EXTRACTIONS: &[LanguageExtraction] = &[kotlin::EXTRACTION, c::EXTRACTION];
 
 /// Look a row up by any of its dispatch names.
 pub(crate) fn extraction_for_language(language_name: &str) -> Option<&'static LanguageExtraction> {
@@ -235,6 +236,40 @@ mod tests {
         assert_eq!(
             extraction_for_ext("kts").map(|row| row.language_name),
             Some("kotlin")
+        );
+    }
+
+    /// The C row must keep the exact projection facts it had while it was
+    /// spread across `lib.rs`, `language_configs.rs` and `semantic/mod.rs`.
+    ///
+    /// C's rosters were mostly *absences* — no receiver-call engine, no
+    /// member-call marker, no promotion of type members to methods, and
+    /// deliberately no entry in the route scanner's C-style-comment list. An
+    /// absence is exactly what a "fill in the obvious value" mistake turns into
+    /// a silent behaviour change, and `promotes_type_member_functions_to_methods`
+    /// is invisible to the C snapshots (no C fixture projects a FUNCTION under a
+    /// type-like owner), so it is pinned here instead.
+    #[test]
+    fn c_row_keeps_the_projection_facts_it_had_in_the_god_file() {
+        let c = extraction_for_language("c").expect("c row");
+        assert!(!c.promotes_type_member_functions_to_methods);
+        assert_eq!(c.qualified_name_delimiter, "::");
+        assert!(!c.route_comments_are_c_style);
+        assert_eq!(c.semantic_family, "native");
+        assert!(!c.uses_generic_semantic_resolver);
+        assert_eq!(c.member_callsite_marker, None);
+        assert_eq!(c.graph_call_syntax, None);
+        assert!(c.receiver_call_specs.is_none());
+        assert!(c.tags_query.is_none());
+        assert_eq!(
+            extraction_for_ext("c").map(|row| row.language_name),
+            Some("c")
+        );
+        // `h` resolved to the C parser through `get_language_for_ext` before
+        // the move; the C/C++ header inference is a separate, path-based seam.
+        assert_eq!(
+            extraction_for_ext("h").map(|row| row.language_name),
+            Some("c")
         );
     }
 }

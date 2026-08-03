@@ -1,9 +1,9 @@
 use super::{
-    BASH_GRAPH_QUERY, C_GRAPH_QUERY, CPP_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY,
-    GO_GRAPH_QUERY, JAVA_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset,
-    PHP_GRAPH_QUERY, PYTHON_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY,
-    SWIFT_GRAPH_QUERY, TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY,
-    TYPESCRIPT_TAGS_QUERY, languages, make_language_config,
+    BASH_GRAPH_QUERY, CPP_GRAPH_QUERY, CSHARP_GRAPH_QUERY, DART_GRAPH_QUERY, GO_GRAPH_QUERY,
+    JAVA_GRAPH_QUERY, JAVASCRIPT_GRAPH_QUERY, LanguageConfig, LanguageRuleset, PHP_GRAPH_QUERY,
+    PYTHON_GRAPH_QUERY, RUBY_GRAPH_QUERY, RUST_GRAPH_QUERY, RUST_TAGS_QUERY, SWIFT_GRAPH_QUERY,
+    TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY, TYPESCRIPT_TAGS_QUERY, languages,
+    make_language_config,
 };
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext, normalize_extension,
@@ -36,7 +36,6 @@ pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
         ("typescript", "tsx") => Some(tsx()),
         ("typescript", _) => Some(typescript()),
         ("cpp", _) => Some(cpp()),
-        ("c", _) => Some(c()),
         ("go", _) => Some(go()),
         ("ruby", _) => Some(ruby()),
         ("php", _) => Some(php()),
@@ -115,16 +114,6 @@ fn cpp() -> LanguageConfig {
         CPP_GRAPH_QUERY,
         None,
         LanguageRuleset::Cpp,
-    )
-}
-
-fn c() -> LanguageConfig {
-    make_language_config(
-        tree_sitter_c::LANGUAGE.into(),
-        "c",
-        C_GRAPH_QUERY,
-        None,
-        LanguageRuleset::C,
     )
 }
 
