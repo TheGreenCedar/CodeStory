@@ -5,6 +5,9 @@ edition = "2024"
 
 [features]
 test-support = []
+# Measurement-only surface for the offline vector-backend bake-off. No product
+# binary enables this.
+benchmark-support = []
 
 [dependencies]
 anyhow = { workspace = true }

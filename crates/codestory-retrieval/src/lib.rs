@@ -43,6 +43,201 @@ mod sidecar_search;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+/// Narrow measurement surface for the offline vector-backend bake-off.
+///
+/// The bake-off has to compare candidate backends against *the shipped dense
+/// lane*, not against a second copy of it. Everything here therefore forwards
+/// into the same publication and scan functions product queries use, so a
+/// measured incumbent number cannot drift from what the product actually runs.
+/// The module is feature-gated because it is measurement infrastructure: no
+/// product binary enables `benchmark-support`.
+#[cfg(feature = "benchmark-support")]
+pub mod benchmark_support {
+    use crate::config::SidecarLayout;
+    use crate::embedded_vector::{
+        AttestedSemanticPoint, AttestedVectorPublication, EmbeddedVectorIndex,
+        ExpectedVectorAnchor, SemanticPoint, VectorEvidenceContract,
+    };
+    use anyhow::{Context, Result};
+    use std::path::{Path, PathBuf};
+
+    /// One vector the bake-off publishes and later scores against.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct BenchmarkVector {
+        pub node_id: String,
+        pub vector: Vec<f32>,
+    }
+
+    /// A published generation the bake-off can query.
+    #[derive(Debug, Clone)]
+    pub struct PublishedVectorGeneration {
+        layout: SidecarLayout,
+        collection: String,
+        generation: String,
+        input_hash: String,
+        point_count: u64,
+    }
+
+    impl PublishedVectorGeneration {
+        pub fn point_count(&self) -> u64 {
+            self.point_count
+        }
+
+        /// Bytes the published SQLite database occupies on disk.
+        pub fn database_bytes(&self) -> Result<u64> {
+            Ok(std::fs::metadata(self.database_path())?.len())
+        }
+
+        pub fn database_path(&self) -> PathBuf {
+            crate::embedded_vector::index_path(&self.layout, &self.collection)
+        }
+    }
+
+    fn layout_for_root(root: &Path) -> SidecarLayout {
+        SidecarLayout {
+            lexical_data_dir: root.join("lexical"),
+            semantic_data_dir: root.join("semantic"),
+            scip_artifacts_root: root.join("scip"),
+            state_file: root.join("state.json"),
+        }
+    }
+
+    /// Publish `vectors` through the product's attested publication path.
+    ///
+    /// This is the real `build_attested_with_points_with_cancel`: anchor
+    /// coverage, per-vector validation, the canonical digest, and the atomic
+    /// old-or-new publication all run exactly as they do in a product refresh.
+    pub fn publish_vector_generation(
+        root: &Path,
+        collection: &str,
+        generation: &str,
+        input_hash: &str,
+        embedding_dim: usize,
+        vectors: &[BenchmarkVector],
+    ) -> Result<PublishedVectorGeneration> {
+        let layout = layout_for_root(root);
+        layout.ensure_data_dirs()?;
+        let contract = VectorEvidenceContract::new(
+            "bakeoff-embedding-backend",
+            embedding_dim,
+            "bakeoff-producer-identity",
+            "bakeoff-evidence-contract-v1",
+        );
+        let anchors = vectors
+            .iter()
+            .map(|vector| ExpectedVectorAnchor {
+                node_id: vector.node_id.clone(),
+                document_hash: document_hash_for(&vector.node_id),
+            })
+            .collect::<Vec<_>>();
+        let attestation = EmbeddedVectorIndex::build_attested_with_points_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection,
+                generation,
+                input_hash,
+                contract: &contract,
+                expected_anchors: &anchors,
+            },
+            || Ok(()),
+            |visit| {
+                for vector in vectors {
+                    visit(AttestedSemanticPoint {
+                        point: SemanticPoint {
+                            display_name: vector.node_id.clone(),
+                            node_id: vector.node_id.clone(),
+                            file_path: Some(format!("{}.rs", vector.node_id)),
+                            file_role: None,
+                            dense_reason: None,
+                            vector: vector.vector.clone(),
+                        },
+                        document_hash: document_hash_for(&vector.node_id),
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .context("publish bake-off vector generation")?;
+        Ok(PublishedVectorGeneration {
+            layout,
+            collection: collection.to_string(),
+            generation: generation.to_string(),
+            input_hash: input_hash.to_string(),
+            point_count: attestation.point_count,
+        })
+    }
+
+    fn document_hash_for(node_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(node_id.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Run the product dense scan against a published generation.
+    ///
+    /// Returns `(node_id, score)` in the order the product lane reports them,
+    /// after the product's own dense-abstention filter.
+    pub fn scan_published_vectors(
+        published: &PublishedVectorGeneration,
+        query: &[f32],
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<(String, f32)>> {
+        let hits = crate::embedded_vector::search_database(
+            &published.database_path(),
+            &published.generation,
+            &published.input_hash,
+            query,
+            limit,
+            cancelled,
+        )?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| {
+                (
+                    hit.node_id.clone().unwrap_or_else(|| hit.file_path.clone()),
+                    hit.score,
+                )
+            })
+            .collect())
+    }
+
+    /// Read every published vector back out, so a candidate backend builds
+    /// from the same bytes the incumbent scans.
+    pub fn read_published_vectors(
+        published: &PublishedVectorGeneration,
+        embedding_dim: usize,
+    ) -> Result<Vec<BenchmarkVector>> {
+        crate::embedded_vector::read_published_vectors_for_benchmark(
+            &published.database_path(),
+            embedding_dim,
+        )
+        .map(|vectors| {
+            vectors
+                .into_iter()
+                .map(|(node_id, vector)| BenchmarkVector { node_id, vector })
+                .collect()
+        })
+    }
+
+    /// The product's own semantic-stage budget for `query`, in milliseconds.
+    ///
+    /// Read out of `plan_query` rather than restated, so the bake-off gate
+    /// moves when the shipped budget moves instead of measuring a number the
+    /// product no longer uses.
+    pub fn semantic_stage_budget_ms(query: &str) -> Option<u64> {
+        crate::planner::plan_query(
+            &crate::query_features::classify_query(query),
+            crate::mode::RetrievalDegradedMode::Full,
+        )
+        .stages
+        .into_iter()
+        .find(|stage| stage.kind == crate::planner::RetrievalStageKind::Stage1bSemantic)
+        .map(|stage| stage.budget_ms)
+    }
+}
+
 pub use cache::{RetrievalCache, RetrievalCacheKey};
 pub use cache_clean::{
     CACHE_CLEAN_SCHEMA_VERSION, CacheCleanCandidate, CacheCleanKind, CacheCleanPlan,

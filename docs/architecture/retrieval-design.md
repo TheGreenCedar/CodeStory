@@ -169,6 +169,39 @@ candidate resolution. Higher-level graph, source, packet, agent, CLI, and MCP
 assembly is not yet part of that proof boundary and must not describe the
 session identity as a complete-operation pin.
 
+## Vector index backend
+
+The dense lane scans the published `vectors` table exactly: every row is
+scored, a bounded top-`k` window is kept, and neighbours below half the
+window's own best similarity are dropped so a query with no dense evidence
+emits nothing rather than a full window of weak anchors. There is no
+approximate index.
+
+The W6.8 bake-off compared this incumbent against an exact resident matrix,
+sqlite-vec, and USearch. Its gates, inputs, host identity, per-candidate
+outcome, and limitations are recorded under
+`benchmarks/release-evidence/vector-backend-bakeoff/`; the candidate set,
+workload ladder, thresholds, and the fail-closed rule that reads them live in
+`codestory_bench::vector_backend_bakeoff`.
+
+**The bake-off selected no backend, and the incumbent is retained.** No recall,
+latency, or memory improvement is claimed from it. The bake-off is a softened
+gate: a run that produces no qualifying candidate does not block a release, and
+it must not change the backend or any quality claim. Adoption requires a
+complete pass over every declared threshold, at every rung of the ladder, on
+every shipped platform, over a corpus of real embeddings — anything short of
+that resolves to "retain the incumbent" with the reasons recorded per
+candidate.
+
+Retained is not the same as unquestioned. The one recorded run measured the
+incumbent past its own semantic stage budget on a minority of queries at the
+75,000-vector target, on synthetic vectors and a non-proof host. That is a
+reason to measure properly, not a reason to swap; see
+[embedding-backend-benchmarks.md](../testing/embedding-backend-benchmarks.md).
+
+The signal for reconsidering the question is the field rate of the semantic
+stage degradation counters, not a new microbenchmark.
+
 ## Readiness
 
 `retrieval_mode=full` means the persisted retrieval artifacts form a complete
