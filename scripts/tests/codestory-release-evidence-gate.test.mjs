@@ -18,7 +18,7 @@ function run(command, extra = []) {
   return spawnSync(process.execPath, [script, command, "--baseline", baseline, "--expected-sha", candidateSha, "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root, ...extra], { encoding: "utf8" });
 }
 function workspace() {
-  const dir = mkdtempSync(path.join(tmpdir(), "codestory-release-evidence-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-evidence-gate-"));
   copyFileSync(path.join(fixture, "candidate-stats.json"), path.join(dir, "stats.json"));
   copyFileSync(path.join(fixture, "candidate-packet.json"), path.join(dir, "packet.json"));
   return dir;
@@ -117,6 +117,30 @@ function ripgrepV2CorpusFixture(mutate) {
   return { dir, paths, contractRelative };
 }
 
+function holdoutV1CorpusFixture(mutate) {
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-holdout-v1-corpus-"));
+  const contractRelative = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json";
+  const relativePaths = [
+    "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json",
+    "benchmarks/tasks/holdout-retrieval/ripgrep-search-pipeline.task.json",
+    "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+    contractRelative,
+  ];
+  for (const relative of relativePaths) {
+    mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+    copyFileSync(path.join(root, relative), path.join(dir, relative));
+  }
+  const paths = {
+    task: path.join(
+      dir,
+      "benchmarks/tasks/holdout-retrieval/ripgrep-search-pipeline.task.json",
+    ),
+    contract: path.join(dir, contractRelative),
+  };
+  mutate?.(paths);
+  return { dir, paths, contractRelative };
+}
+
 function rewriteJson(filePath, mutate) {
   const document = JSON.parse(readFileSync(filePath));
   mutate(document);
@@ -134,8 +158,10 @@ function rebindTaskHash(paths) {
 function validateAxiosV2Fixture(dir, paths, contractRelative) {
   const contractBytes = readFileSync(paths.contract);
   const contract = JSON.parse(contractBytes);
-  const taskId = contract.task_ids[0];
-  const task = JSON.parse(readFileSync(path.join(dir, contract.task_manifests[taskId].path)));
+  const tasks = new Map(contract.task_ids.map(taskId => [
+    taskId,
+    JSON.parse(readFileSync(path.join(dir, contract.task_manifests[taskId].path))),
+  ]));
   const identity = {
     corpus_id: contract.corpus_id,
     cache_id: "cold-inprocess-v1",
@@ -149,15 +175,18 @@ function validateAxiosV2Fixture(dir, paths, contractRelative) {
     runtime_modes: contract.runtime_modes,
     repeats: contract.repeats,
     task_manifests: contract.task_manifests,
-    task_repositories: { [taskId]: task.repo.name },
+    task_repositories: Object.fromEntries(
+      [...tasks].map(([taskId, task]) => [taskId, task.repo.name]),
+    ),
     project_manifests: contract.project_manifests,
   };
-  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
-    repo: task.repo.name,
-    task_id: taskId,
-    mode: "cold_cli_packet",
-    repeat: index + 1,
-  }));
+  const rows = [...tasks].flatMap(([taskId, task]) =>
+    Array.from({ length: contract.repeats }, (_, index) => ({
+      repo: task.repo.name,
+      task_id: taskId,
+      mode: "cold_cli_packet",
+      repeat: index + 1,
+    })));
   return () => validatePacketCorpusContract(
     { corpus_contract: corpusContract },
     rows,
@@ -235,6 +264,19 @@ test("Ripgrep v2 corpus binds retained 0.60 floors and fails closed on changed t
       /release corpus task manifest hash does not match for ripgrep-search-pipeline-v2/,
     );
   });
+});
+
+test("frozen holdout corpus rejects changed Ripgrep task bytes by name", () => {
+  const exact = holdoutV1CorpusFixture();
+  assert.doesNotThrow(validateAxiosV2Fixture(exact.dir, exact.paths, exact.contractRelative));
+
+  const changed = holdoutV1CorpusFixture(paths => {
+    writeFileSync(paths.task, Buffer.concat([readFileSync(paths.task), Buffer.from("\n")]));
+  });
+  assert.throws(
+    validateAxiosV2Fixture(changed.dir, changed.paths, changed.contractRelative),
+    /release corpus task manifest hash does not match for ripgrep-search-pipeline/,
+  );
 });
 
 test("fingerprint prefers a validated provisioned machine identity", () => {

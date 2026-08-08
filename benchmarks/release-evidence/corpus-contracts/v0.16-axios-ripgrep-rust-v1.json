@@ -5,6 +5,10 @@
     "axios-request-dispatch",
     "ripgrep-search-pipeline"
   ],
+  "runtime_modes": [
+    "cold_cli_packet"
+  ],
+  "repeats": 3,
   "task_manifests": {
     "axios-request-dispatch": {
       "path": "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json",

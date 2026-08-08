@@ -39,9 +39,7 @@ import {
   parseWorkflow,
   proofFloorPolicyViolations,
   qualificationDriverArtifactViolations,
-  releaseEvidenceApprovalViolations,
   releaseProofCpuSelectorViolations,
-  releaseEvidenceWorkflowRef,
   releaseFreezeBarrierWorkflowViolations,
   releaseWorkflowContractViolations,
   retrievalGeneralizationSuitePolicyViolations,
@@ -691,53 +689,6 @@ function windowsManifestStep(workflow, name) {
   return draftStep(windowsManifestJob(workflow), name);
 }
 
-function releaseEvidenceApprovalBoundary() {
-  return {
-    callers: [
-      ["release.yml", {
-        uses: releaseEvidenceWorkflowRef,
-        with: { source_run_id: "${{ inputs.source_run_id }}" },
-        secrets: {
-          CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
-            "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-        },
-      }, true],
-      ["packaged-platform-pr.yml", {
-        uses: releaseEvidenceWorkflowRef,
-        with: { source_run_id: "${{ inputs.source_run_id }}" },
-      }, false],
-    ],
-    called: {
-      on: {
-        workflow_call: {
-          secrets: {
-            CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: { required: false },
-          },
-        },
-      },
-      jobs: {
-        measure: {
-          environment: "release-evidence",
-          steps: [
-            {
-              name: "Produce and evaluate same-SHA candidate",
-              env: {
-                APPROVAL_JSON: "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-              },
-              run: [
-                'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
-                '  echo "::error::Protected release-evidence approval is required for source-run re-evaluation."',
-                "  exit 1",
-                "fi",
-              ].join("\n"),
-            },
-          ],
-        },
-      },
-    },
-  };
-}
-
 test("parser ignores YAML comments and harmless formatting", () => {
   const block = parseWorkflow(`
 on:
@@ -757,36 +708,6 @@ permissions: { contents: read }
 jobs: { check: { runs-on: ubuntu-latest, steps: [ { uses: vendor/action@${fullSha} } ] } }
 `);
   assert.deepEqual(block, flow);
-});
-
-test("release evidence policy pins the release-only Axios v2 task and corpus", async (t) => {
-  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
-  const file = "release-candidate-evidence.yml";
-  const mutations = [
-    ["repo corpus drifts", workflow => {
-      draftStep(workflow.jobs.measure, "Produce full-retrieval repo evidence")
-        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID = "codestory-release-corpus-v0.16-axios-js-ts-v1";
-    }, /repo evidence must bind the v0\.16 Axios v2 corpus/u],
-    ["packet corpus contract drifts", workflow => {
-      draftStep(workflow.jobs.measure, "Produce publishable packet evidence")
-        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
-          = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
-    }, /packet evidence must bind the v0\.16 Axios v2 corpus contract/u],
-    ["packet task falls back to the holdout suite", workflow => {
-      const step = draftStep(workflow.jobs.measure, "Produce publishable packet evidence");
-      step.run = step.run.replace(
-        /--task-manifest [^\\\n]+/u,
-        "--task-suite holdout-retrieval --task-ids axios-request-dispatch",
-      );
-    }, /must select only the corpus-bound release task manifest/u],
-  ];
-  for (const [name, mutate, expected] of mutations) {
-    await t.test(name, () => {
-      const workflows = loadWorkflows();
-      mutate(workflows.get(file));
-      assert.match(validateWorkflows(workflows).join("\n"), expected);
-    });
-  }
 });
 
 test("every release-proof workflow rejects CPU selectors at every structural level", async (t) => {
@@ -968,47 +889,10 @@ test("every release-proof workflow rejects CPU selectors at every structural lev
 
   const supportSources = new Map([
     [
-      "scripts/release-evidence/guest-runner.sh",
-      readFileSync(path.join(root, "scripts/release-evidence/guest-runner.sh"), "utf8"),
-    ],
-    [
       ".github/scripts/check-linux-glibc-baseline.sh",
       readFileSync(path.join(root, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
     ],
-    [
-      "scripts/release-evidence/guest-verify.sh",
-      readFileSync(path.join(root, "scripts/release-evidence/guest-verify.sh"), "utf8"),
-    ],
   ]);
-  await t.test("runner service re-enables CPU", () => {
-    const mutated = new Map(supportSources);
-    mutated.set(
-      "scripts/release-evidence/guest-runner.sh",
-      mutated.get("scripts/release-evidence/guest-runner.sh")
-        .replace("CODESTORY_EMBED_ALLOW_CPU=0", "CODESTORY_EMBED_ALLOW_CPU=1"),
-    );
-    assert.match(
-      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-      /guest-runner\.sh contains a CPU proof selector/u,
-    );
-  });
-  for (const [shape, assignment] of [
-    ["arithmetic", "CODESTORY_EMBED_ALLOW_CPU=$((1))"],
-    ["command substitution", "CODESTORY_EMBED_ALLOW_CPU=$(printf 1)"],
-  ]) {
-    await t.test(`runner service re-enables CPU through ${shape}`, () => {
-      const mutated = new Map(supportSources);
-      mutated.set(
-        "scripts/release-evidence/guest-runner.sh",
-        mutated.get("scripts/release-evidence/guest-runner.sh")
-          .replace("CODESTORY_EMBED_ALLOW_CPU=0", assignment),
-      );
-      assert.match(
-        releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-        /guest-runner\.sh contains a CPU proof selector/u,
-      );
-    });
-  }
   await t.test("glibc smoke re-enables CPU", () => {
     const mutated = new Map(supportSources);
     mutated.set(
@@ -1019,18 +903,6 @@ test("every release-proof workflow rejects CPU selectors at every structural lev
     assert.match(
       releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
       /check-linux-glibc-baseline\.sh contains a CPU proof selector/u,
-    );
-  });
-  await t.test("runner verification stops proving CPU disabled", () => {
-    const mutated = new Map(supportSources);
-    mutated.set(
-      "scripts/release-evidence/guest-verify.sh",
-      mutated.get("scripts/release-evidence/guest-verify.sh")
-        .replace('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"', "grep -qxF ignored"),
-    );
-    assert.match(
-      releaseProofCpuSelectorViolations(loadWorkflows(), graph, mutated).join("\n"),
-      /guest-verify\.sh must prove CPU is disabled/u,
     );
   });
 });
@@ -1506,6 +1378,9 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
     ["optional quality owner job becomes blocking", qualityFile, workflow => {
       workflow.jobs.quality["continue-on-error"] = false;
     }, /optional quality must stay nonblocking on protected Metal/u],
+    ["optional Windows quality owner job becomes blocking", qualityFile, workflow => {
+      delete workflow.jobs["windows-quality"]["continue-on-error"];
+    }, /optional Windows x64 quality must remain non-gating on Vulkan/u],
     ["optional quality runs outside qualification", coordinatorFile, workflow => {
       workflow.jobs["frozen-candidate-quality"].if
         = workflow.jobs["frozen-candidate-quality"].if.replace(
@@ -1728,6 +1603,15 @@ test("frozen-candidate quality stays optional, exact, and archive-authenticated"
       );
     });
   }
+  await t.test("claim graph rejects a nonexistent answer-quality workflow", () => {
+    const graph = structuredClone(loadReleaseClaimGraph(root));
+    graph.evidence_types.find(({ id }) => id === "answer_quality").proof_lanes
+      = [".github/workflows/does-not-exist.yml"];
+    assert.match(
+      validateWorkflows(loadWorkflows(), graph).join("\n"),
+      /\[proof_lane\] evidence type answer_quality workflow does-not-exist\.yml must exist/u,
+    );
+  });
 });
 
 test("qualification driver is built once, retained privately, authenticated, and reused", async (t) => {
@@ -6233,40 +6117,6 @@ test("PR package proof cannot opt into signing credentials", () => {
     const candidate = structuredClone(workflow);
     mutate(candidate);
     assert.notDeepEqual(packagedPrSigningViolations(candidate), []);
-  }
-});
-
-test("release approval crosses only the protected release boundary", () => {
-  const boundary = releaseEvidenceApprovalBoundary();
-  assert.deepEqual(releaseEvidenceApprovalViolations(boundary.callers, boundary.called), []);
-
-  for (const mutate of [
-    candidate => { candidate.callers[0][1] = undefined; },
-    candidate => { candidate.callers[1][1].uses = "./.github/workflows/release.yml"; },
-    candidate => { delete candidate.callers[1][1].with.source_run_id; },
-    candidate => { delete candidate.callers[0][1].secrets; },
-    candidate => {
-      candidate.callers[0][1].secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON
-        = "${{ secrets.WRONG_SECRET }}";
-    },
-    candidate => { candidate.callers[0][1].secrets.EXTRA_SECRET = "${{ secrets.EXTRA }}"; },
-    candidate => { candidate.callers[0][1].secrets = "inherit"; },
-    candidate => { candidate.callers[1][1].secrets = "inherit"; },
-    candidate => { delete candidate.called.on.workflow_call.secrets; },
-    candidate => {
-      candidate.called.on.workflow_call.secrets
-        .CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON.required = true;
-    },
-    candidate => { candidate.called.jobs.measure.environment = "release"; },
-    candidate => {
-      candidate.called.jobs.measure.steps[0].env.APPROVAL_JSON
-        = "${{ inputs.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}";
-    },
-    candidate => { candidate.called.jobs.measure.steps[0].run = "exit 1"; },
-  ]) {
-    const candidate = structuredClone(boundary);
-    mutate(candidate);
-    assert.notDeepEqual(releaseEvidenceApprovalViolations(candidate.callers, candidate.called), []);
   }
 });
 

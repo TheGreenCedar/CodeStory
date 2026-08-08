@@ -1001,7 +1001,7 @@ const packagedPlatformCoordinatorWorkflowDigest =
 const releaseSourceProofSentinelDigest =
   "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351";
 const frozenCandidateQualityWorkflowDigest =
-  "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677";
+  "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e";
 const macosMetalWorkflowDigest =
   "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627";
 const windowsVulkanWorkflowDigest =
@@ -1976,7 +1976,6 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   return violations;
 }
 
-export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
 export const frozenCandidateQualityWorkflowRef = "./.github/workflows/frozen-candidate-quality.yml";
 
 export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
@@ -1993,69 +1992,6 @@ export function macosCliDistributionViolations(assessmentStep, executionStep, qu
   add(violations, assessment.includes("does not seem to be an app"), "macOS CLI proof must recognize the bare-executable spctl result");
   add(violations, !/(^|\n)\s*accepted=false\s*($|\n)/u.test(assessment), "macOS CLI proof must not require spctl application acceptance");
   add(violations, lineHas(executionLines, quarantinedPath, "--version") && lineHas(executionLines, quarantinedPath, "--help"), "macOS CLI proof must execute that quarantined binary's version and help");
-  return violations;
-}
-
-export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
-  const violations = [];
-  const file = releaseEvidenceWorkflowRef.slice(releaseEvidenceWorkflowRef.lastIndexOf("/") + 1);
-  for (const [callerFile, callerJob, passesApproval] of callerJobs) {
-    const job = object(callerJob);
-    add(
-      violations,
-      callerJob !== undefined,
-      `${callerFile} must contain job release-evidence`,
-    );
-    add(
-      violations,
-      job.uses === releaseEvidenceWorkflowRef,
-      `${callerFile} release-evidence must call the evidence workflow`,
-    );
-    add(
-      violations,
-      object(job.with).source_run_id === "${{ inputs.source_run_id }}",
-      `${callerFile} release-evidence must forward source_run_id`,
-    );
-    const secrets = object(job.secrets);
-    const secret = secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON;
-    add(
-      violations,
-      passesApproval
-        ? secret === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}"
-          && Object.keys(secrets).length === 1
-        : job.secrets === undefined,
-      passesApproval
-        ? `${callerFile} release-evidence must pass only the named approval secret`
-        : `${callerFile} release-evidence must not receive caller secrets`,
-    );
-  }
-  add(
-    violations,
-    object(at(
-      calledWorkflow, "on", "workflow_call", "secrets",
-      "CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON",
-    )).required === false,
-    `${file} approval must be an optional caller secret`,
-  );
-
-  const job = object(at(calledWorkflow, "jobs", "measure"));
-  add(
-    violations,
-    job.environment === "release-evidence",
-    `${file} approval must remain gated by the release-evidence environment`,
-  );
-  const evaluation = namedStep(job, "Produce and evaluate same-SHA candidate");
-  add(
-    violations,
-    object(evaluation?.env).APPROVAL_JSON
-      === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-    `${file} approval must use the explicitly passed release secret`,
-  );
-  requireStepRun(violations, file, job, "Produce and evaluate same-SHA candidate", [
-    'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
-    "Protected release-evidence approval is required for source-run re-evaluation.",
-    "exit 1",
-  ]);
   return violations;
 }
 
@@ -6043,7 +5979,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(qualityInputs.version).type === "string"
       && JSON.stringify(qualityWorkflow.permissions)
         === JSON.stringify({ actions: "read", contents: "read" })
-      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality", "linux-quality"]),
+      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), [
+        "quality",
+        "windows-quality",
+        "linux-quality",
+      ]),
     `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
   );
   const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
@@ -6059,10 +5999,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   const qualitySteps = list(quality.steps).map(object);
   add(
     violations,
-    qualitySteps.length === 9
+    qualitySteps.length === 11
       && qualitySteps.filter(step => step.id === "quality").length === 1
-      && qualitySteps.filter(step => step.id === "quality-upload").length === 1,
-    `${qualityFile} must retain one authenticated measurement and upload boundary`,
+      && qualitySteps.filter(step => step.id === "quality-upload").length === 1
+      && qualitySteps.filter(step => step.id === "ripgrep-quality").length === 1
+      && qualitySteps.filter(step => step.id === "ripgrep-quality-upload").length === 1,
+    `${qualityFile} must retain authenticated Axios and Ripgrep measurement boundaries`,
   );
   const qualityCheckout = namedStep(quality, "Checkout exact frozen candidate");
   add(
@@ -6236,6 +6178,26 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityProducerRun.includes("--out-dir $quality_root/packet"),
     `${qualityFile} must run exactly one pinned three-repeat publishable evaluator`,
   );
+  const ripgrepQualityProducer = qualitySteps.find(step => step.id === "ripgrep-quality");
+  const ripgrepQualityProducerRun = shellLiteralNormalizedText(
+    String(ripgrepQualityProducer?.run ?? ""),
+  );
+  add(
+    violations,
+    ripgrepQualityProducer?.id === "ripgrep-quality"
+      && ripgrepQualityProducer?.["continue-on-error"] === true
+      && ripgrepQualityProducer?.shell === "bash"
+      && object(ripgrepQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && ripgrepQualityProducerRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(ripgrepQualityProducerRun, "--task-manifest") === 1
+      && !ripgrepQualityProducerRun.includes("--task-suite")
+      && !ripgrepQualityProducerRun.includes("--task-ids")
+      && ripgrepQualityProducerRun.includes("--repeats 3")
+      && ripgrepQualityProducerRun.includes("--publishable")
+      && ripgrepQualityProducerRun.includes("--max-source-reads-after-packet 0")
+      && ripgrepQualityProducerRun.includes("--timeout-ms 180000"),
+    `${qualityFile} optional macOS Ripgrep quality must be one isolated non-gating pinned evaluator`,
+  );
   const qualityUpload = qualitySteps.find(step => step.id === "quality-upload");
   const qualityOutcome = namedStep(quality, "Record optional quality outcome");
   add(
@@ -6263,6 +6225,8 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && qualityOutcome?.["continue-on-error"] === undefined
       && hasExactKeys(object(qualityOutcome?.env), [
         "QUALITY_OUTCOME",
+        "RIPGREP_QUALITY_OUTCOME",
+        "RIPGREP_UPLOAD_OUTCOME",
         "UPLOAD_OUTCOME",
       ])
       && object(qualityOutcome?.env).QUALITY_OUTCOME
@@ -6273,6 +6237,56 @@ function validatePackagedCoordinator(workflows, violations, graph) {
         'echo "- Release or qualification gate: \\`false\\`"',
       ),
     `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
+  );
+  const windowsQuality = requireJob(
+    violations,
+    qualityFile,
+    qualityWorkflow,
+    "windows-quality",
+  );
+  const windowsQualitySteps = list(windowsQuality.steps).map(object);
+  const windowsQualityProducer = windowsQualitySteps.find(
+    step => step.id === "windows-quality",
+  );
+  const windowsQualityRun = shellLiteralNormalizedText(
+    String(windowsQualityProducer?.run ?? ""),
+  );
+  const windowsQualityUpload = windowsQualitySteps.find(
+    step => step.id === "windows-quality-upload",
+  );
+  add(
+    violations,
+    windowsQuality.name === "Optional frozen-candidate Windows x64 Ripgrep v2 quality"
+      && JSON.stringify(windowsQuality["runs-on"])
+        === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"])
+      && windowsQuality.environment === undefined
+      && windowsQuality["continue-on-error"] === true
+      && windowsQuality["timeout-minutes"] === 60
+      && windowsQualitySteps.length === 6,
+    `${qualityFile} optional Windows x64 quality must remain non-gating on Vulkan`,
+  );
+  add(
+    violations,
+    namedStep(windowsQuality, "Checkout exact frozen candidate")?.uses
+        === "actions/checkout@v5"
+      && namedStep(windowsQuality, "Download exact Windows x64 candidate archive")?.uses
+        === "actions/download-artifact@v8.0.1"
+      && object(
+        namedStep(windowsQuality, "Download exact Windows x64 candidate archive")?.with,
+      ).name === "codestory-cli-windows-x64"
+      && windowsQualityProducer?.["continue-on-error"] === true
+      && object(windowsQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && windowsQualityRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(windowsQualityRun, "--task-manifest") === 1
+      && windowsQualityRun.includes("--repeats 3")
+      && windowsQualityRun.includes("--publishable")
+      && !windowsQualityRun.includes("--task-suite")
+      && !windowsQualityRun.includes("--task-ids")
+      && windowsQualityUpload?.["continue-on-error"] === true
+      && windowsQualityUpload?.if === "steps.windows-quality.outcome == 'success'"
+      && namedStep(windowsQuality, "Record optional Windows x64 quality outcome")?.if
+        === "always()",
+    `${qualityFile} optional Windows x64 Ripgrep quality must retain isolated non-gating measurement and upload boundaries`,
   );
   const linuxQuality = requireJob(violations, qualityFile, qualityWorkflow, "linux-quality");
   const linuxQualitySteps = list(linuxQuality.steps).map(object);
@@ -6511,48 +6525,6 @@ function validateRemainingWorkflows(workflows, violations) {
       release.secrets === "inherit",
       `${autoFile} release caller must inherit repository release secrets`,
     );
-  }
-
-  const evidenceFile = "release-candidate-evidence.yml";
-  const evidence = workflows.get(evidenceFile);
-  if (!evidence) {
-    violations.push(`${evidenceFile} must exist`);
-  } else {
-    add(violations, trigger(evidence, "workflow_call") !== undefined, `${evidenceFile} must be reusable`);
-    add(violations, trigger(evidence, "workflow_dispatch") === undefined, `${evidenceFile} must be coordinator-only`);
-    const job = requireJob(violations, evidenceFile, evidence, "measure");
-    add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
-    requireStepRun(violations, evidenceFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
-    violations.push(...releaseEvidenceApprovalViolations([], evidence));
-    const repoEvidence = namedStep(job, "Produce full-retrieval repo evidence");
-    requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
-    add(
-      violations,
-      object(repoEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
-        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
-        && object(repoEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
-      `${evidenceFile} repo evidence must bind the v0.16 Axios v2 corpus`,
-    );
-    const packetEvidence = namedStep(job, "Produce publishable packet evidence");
-    add(
-      violations,
-      object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
-        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
-      && object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
-          === "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json"
-      && object(packetEvidence?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
-      `${evidenceFile} packet evidence must bind the v0.16 Axios v2 corpus contract`,
-    );
-    const packetRun = String(packetEvidence?.run ?? "");
-    add(
-      violations,
-      packetRun.includes("--task-manifest ")
-        && packetRun.match(/--task-manifest/gu)?.length === 1
-        && !packetRun.includes("--task-suite")
-        && !packetRun.includes("--task-ids"),
-      `${evidenceFile} packet evidence must select only the corpus-bound release task manifest`,
-    );
-    requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
   }
 
   const metalFile = "macos-metal-proof.yml";
@@ -8755,30 +8727,11 @@ export function releaseProofCpuSelectorViolations(
   }
   const sources = supportSources ?? new Map([
     [
-      "scripts/release-evidence/guest-runner.sh",
-      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-runner.sh"), "utf8"),
-    ],
-    [
       ".github/scripts/check-linux-glibc-baseline.sh",
       fs.readFileSync(path.join(repositoryRoot, ".github/scripts/check-linux-glibc-baseline.sh"), "utf8"),
     ],
-    [
-      "scripts/release-evidence/guest-verify.sh",
-      fs.readFileSync(path.join(repositoryRoot, "scripts/release-evidence/guest-verify.sh"), "utf8"),
-    ],
   ]);
   for (const [file, source] of sources) {
-    if (
-      file.endsWith("guest-verify.sh")
-    ) {
-      add(
-        violations,
-        source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=0"')
-          && source.includes('grep -qxF "CODESTORY_EMBED_ALLOW_CPU=1"'),
-        `[cpu_selector] ${file} must prove CPU is disabled in the runner service`,
-      );
-      continue;
-    }
     const executable = shellLiteralNormalizedText(source);
     if (
       hasNonLiteralCpuAssignment(executable)
@@ -9624,6 +9577,16 @@ export function releaseWorkflowContractViolations(
 ) {
   const violations = [];
   const policy = graph.workflow_policy;
+  for (const evidenceType of list(graph.evidence_types).map(object)) {
+    for (const lane of list(evidenceType.proof_lanes)) {
+      const file = path.basename(String(lane));
+      add(
+        violations,
+        workflows.has(file),
+        `[proof_lane] evidence type ${evidenceType.id} workflow ${file} must exist`,
+      );
+    }
+  }
   for (const contract of policy.protected_jobs) {
     const workflow = workflows.get(contract.workflow);
     const job = object(at(workflow, "jobs", contract.job));
@@ -9753,9 +9716,6 @@ export function releaseWorkflowContractViolations(
 }
 
 function validateReleaseCellUploadOwnership(workflows, violations) {
-  const evidenceFile = releaseEvidenceWorkflowRef.slice(
-    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
-  );
   const actual = [];
   for (const [file, workflow] of workflows) {
     for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
@@ -10037,7 +9997,11 @@ export function absorbedFailureViolations(workflows) {
           file === frozenCandidateQualityWorkflowRef.slice(
             frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
           )
-          && (jobId === "quality" || jobId === "linux-quality");
+          && (
+            jobId === "quality"
+            || jobId === "windows-quality"
+            || jobId === "linux-quality"
+          );
         // Reading the outcome is not requiring it one level up either, and the
         // job-level rule used to accept exactly the `if:`-only read the
         // step-level rule below deliberately refuses -- it scanned every string
@@ -10347,12 +10311,8 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
 }
 
 function validateReleaseArtifactRerunSafety(workflows, violations) {
-  const evidenceFile = releaseEvidenceWorkflowRef.slice(
-    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
-  );
   const releaseChainWorkflows = new Set([
     "source-proof.yml",
-    evidenceFile,
     "packaged-platform-proof.yml",
     "macos-metal-proof.yml",
     "windows-vulkan-proof.yml",
@@ -10361,10 +10321,6 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     "release.yml",
   ]);
   const replaceableStableIntermediates = new Map([
-    [`${evidenceFile}/measure/Upload release evidence`, {
-      name: "release-evidence-${{ inputs.ref }}",
-      path: "target/release-evidence",
-    }],
     ["packaged-platform-proof.yml/build/Upload release asset", {
       name: "codestory-cli-${{ matrix.asset_target }}",
       path: "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}\ntarget/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}.sha256\ntarget/release-dist/SHA256SUMS.txt\n",

@@ -799,7 +799,7 @@ function validateQualificationPolicy(value) {
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677",
+      "b7a17c66c4cc4275b369f39fdc1fcdb375b334ba908d31577b910ea10e7eb54e",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
