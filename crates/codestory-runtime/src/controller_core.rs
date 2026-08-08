@@ -45,7 +45,7 @@ impl AppController {
     }
 
     pub(crate) fn new_with_process_config(config: RuntimeProcessConfig) -> Self {
-        Self::new_with_source_index_policy(config.sidecar, config.source_index_policy)
+        Self::new_with_source_index_policy(config.sidecar.into_inner(), config.source_index_policy)
     }
 
     pub(crate) fn new_with_source_index_policy(
