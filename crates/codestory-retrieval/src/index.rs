@@ -3086,6 +3086,63 @@ mod tests {
     }
 
     #[test]
+    fn lease_memoized_sidecar_input_recomputes_when_project_identity_changes() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn stable() {}\n").expect("source");
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("storage");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation".into(),
+            run_id: "core-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &publication,
+        )
+        .expect("complete core fixture");
+
+        let _lease_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            codestory_workspace::SourceFreshnessMemo::default(),
+        );
+        let first = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            &storage_path,
+            "project-identity-a",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("fingerprint for identity A");
+        let second = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            &storage_path,
+            "project-identity-b",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("fingerprint for identity B");
+
+        assert_ne!(
+            first, second,
+            "a lease memo may not return identity A's fingerprint for identity B"
+        );
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("lease scope publishes readiness passes")
+                .readiness_fingerprint_passes,
+            2,
+            "a distinct fingerprint identity must perform its own readiness pass"
+        );
+    }
+
+    #[test]
     fn canonical_sidecar_generation_is_stable_across_clean_roots_with_same_input() {
         let Some(first_project) = git_project() else {
             return;
