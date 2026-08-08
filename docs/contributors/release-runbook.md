@@ -249,6 +249,21 @@ risk was eliminated.
 
 ## Failure recovery
 
+A protected host that is offline when the release would dispatch its proof is
+typed before dispatch, not discovered a day later: the scheduled
+`protected-runner-heartbeat.yml` jobs run on the three protected hosts every
+~15 minutes, and `reserve-protected-runners` reads that evidence into a
+per-attempt reservation receipt typing each host `alive` (proof dispatched),
+`held_by_active_run` (another run is executing there -- the release fails red,
+naming the holder, because a busy host is provably alive), or `unproven` (no
+fresh heartbeat after one recorded recheck -- the proof is not dispatched and
+the non-claim producer records the typed
+`accelerator_host_offline_pre_assignment` withhold, vouched by this run's own
+receipt and re-confirmed independently by the closeout). Pre-assignment
+withholds count against the same `maximum_withheld_hosts` cap as mid-job
+lost-runner withholds; a proof job that actually ran and failed can never be
+converted into either.
+
 After a platform-specific package, link, filesystem, cache, or identity failure,
 run a native probe that reproduces the failing seam in under 90 seconds before
 requesting another full build.

@@ -19,7 +19,9 @@ import {
   validateReleaseCellManifest,
 } from "./codestory-release-closeout.mjs";
 import {
+  RESERVATION_RECEIPT_SCHEMA,
   RUNNER_COMMUNICATION_LOSS,
+  RUNNER_UNPROVEN,
   classifyJobFailure,
   countLostExecutions,
 } from "../.github/scripts/lost-runner-recovery.mjs";
@@ -297,8 +299,10 @@ function produceOne(values) {
 /// Record the populated non-claim for one protected host that never reported.
 ///
 /// This is the only writer of a withheld release cell. It refuses to invent one for a host the
-/// graph does not declare, and it stamps the recovery bound into every manifest it writes, so a
-/// withheld cell always carries the evidence that the automatic reruns were spent first.
+/// graph does not declare, and it stamps the spent recovery bound into every manifest it writes --
+/// the run-attempt rerun bound for a host lost mid-job, or the reservation receipt's recorded
+/// recheck bound for a host that was typed `unproven` before its job was ever assigned -- so a
+/// withheld cell always carries the evidence that the automatic recovery was spent first.
 function withholdHost(values) {
   const { graph, gitIdentity } = common(values);
   const version = text(values.version, "--version").replace(/^v/u, "");
@@ -307,8 +311,39 @@ function withholdHost(values) {
   const host = (policy?.hosts ?? []).find(({ id }) => id === hostId);
   if (!host) fail(`release claim graph declares no non-claim host ${hostId}`);
   const attempt = positiveInteger(values["producer-run-attempt"], "--producer-run-attempt");
-  if (Number(attempt) < policy.maximum_run_attempts) {
+  const reason = values.reason === undefined ? policy.reason : text(values.reason, "--reason");
+  if (reason !== policy.reason && reason !== policy.pre_assignment_reason) {
+    fail(`--reason must be ${policy.reason} or ${policy.pre_assignment_reason}`);
+  }
+  const preAssignment = reason === policy.pre_assignment_reason;
+  if (!preAssignment && values.reservation !== undefined) {
+    fail(`--reservation is scoped to the ${policy.pre_assignment_reason} reason`);
+  }
+  if (!preAssignment && Number(attempt) < policy.maximum_run_attempts) {
     fail(`a non-claim may be recorded only after ${policy.maximum_run_attempts} run attempts`);
+  }
+  let reservationFacts = null;
+  if (preAssignment) {
+    // The pre-assignment bound is the receipt's recorded recheck: the proof job never existed, so
+    // no rerun could be spent on it, and the receipt is what proves the recovery that WAS owed --
+    // one bounded re-observation -- actually happened before anything is withheld.
+    const receipt = JSON.parse(readFileSync(
+      text(values.reservation, "--reservation"),
+      "utf8",
+    ));
+    confirmsPreAssignmentWithholding({
+      graph,
+      reservationReceipt: receipt,
+      hostId,
+      cellId: `non-claim host ${hostId}`,
+    });
+    const row = receipt.hosts.find(({ host: id }) => id === hostId);
+    reservationFacts = {
+      schema: receipt.schema,
+      state: row.state,
+      observation_attempts: Number(row.observation_attempts),
+      maximum_observation_attempts: receipt.maximum_observation_attempts,
+    };
   }
   const identity = values.identity ? JSON.parse(readFileSync(values.identity, "utf8")) : {};
   const candidateRecord = readCandidateArchiveRecord(
@@ -356,8 +391,12 @@ function withholdHost(values) {
       nonClaim: {
         host: host.id,
         runtime_execution: policy.runtime_execution,
-        non_claim_reason: policy.reason,
-        annotation: policy.annotation,
+        non_claim_reason: reason,
+        // The annotation is what Actions wrote on the lost job; a never-assigned job has none,
+        // so the pre-assignment non-claim carries the receipt facts in its place.
+        ...(preAssignment
+          ? { reservation: reservationFacts }
+          : { annotation: policy.annotation }),
         unavailable_producer_workflow: host.unavailable_producer_workflow,
         unavailable_producer_job_name: host.unavailable_producer_job_name,
         withheld_claims: releaseCellWithheldClaims(graph, cell),
@@ -533,6 +572,52 @@ function confirmsWithholding({ graph, jobEvidence, jobName, cellId }) {
   return true;
 }
 
+/// The closeout's own reading of the pre-assignment route: the second withholdable fact.
+///
+/// The proof job is ABSENT from the run -- the closeout already sees that in the job listing it
+/// queried itself -- and the reservation receipt, downloaded from this run's artifacts by the
+/// closeout job rather than handed over by the non-claim producer, must type this exact host
+/// `unproven` with the recorded recheck bound spent. Anything else -- no receipt, another schema,
+/// another state, an unspent bound, a host the receipt never typed -- refuses the routing, so an
+/// absent proof with an unvouched absence keeps the run red instead of quietly withholding.
+function confirmsPreAssignmentWithholding({ graph, reservationReceipt, hostId, cellId }) {
+  if (reservationReceipt === null) {
+    fail(
+      `closeout cannot route ${cellId} to a pre-assignment non-claim without its own `
+      + "reservation receipt",
+    );
+  }
+  const reservation = graph.non_claim_policy.reservation ?? {};
+  if (reservationReceipt.schema !== reservation.schema
+      || reservationReceipt.schema !== RESERVATION_RECEIPT_SCHEMA) {
+    fail(`reservation receipt for ${cellId} must carry ${RESERVATION_RECEIPT_SCHEMA}`);
+  }
+  const bound = reservation.maximum_observation_attempts;
+  if (reservationReceipt.maximum_observation_attempts !== bound) {
+    fail(`reservation receipt for ${cellId} must record the ${bound}-observation recheck bound`);
+  }
+  const rows = (Array.isArray(reservationReceipt.hosts) ? reservationReceipt.hosts : [])
+    .filter((row) => row?.host === hostId);
+  if (rows.length !== 1) {
+    fail(`reservation receipt does not type host ${hostId}, so ${cellId} may not be withheld`);
+  }
+  const row = rows[0];
+  if (row.state !== RUNNER_UNPROVEN) {
+    fail(
+      `reservation receipt types ${hostId} ${String(row.state)}, so ${cellId} may not be `
+      + "withheld pre-assignment",
+    );
+  }
+  const attempts = String(row.observation_attempts ?? "");
+  if (!/^[1-9]\d*$/u.test(attempts) || Number(attempts) < bound) {
+    fail(
+      `${hostId} was observed ${attempts || "0"} time(s); ${cellId} may not be withheld before `
+      + `the ${bound}-observation recheck bound is spent`,
+    );
+  }
+  return true;
+}
+
 export function buildTrustedProducerMap({
   graph,
   gitIdentity,
@@ -544,6 +629,9 @@ export function buildTrustedProducerMap({
   // The closeout's own collected Actions job evidence -- annotations, step conclusions and the log
   // blob probe -- for confirming a withheld routing without asking the non-claim producer.
   jobEvidence = null,
+  // This run's reservation receipt, downloaded by the closeout job itself, for confirming the
+  // pre-assignment route the same producer-independent way.
+  reservationReceipt = null,
   // Cross-run evidence, keyed by cell-group id. Admissible only for groups that declare a
   // reuse_binding in the claim graph; the caller is responsible for having verified the binding
   // (tree equality and ancestry, or native-fingerprint equality) before supplying an entry.
@@ -588,8 +676,23 @@ export function buildTrustedProducerMap({
     const notGreen = cell.non_claim !== undefined
       && primaryLatest.state === "resolved"
       && (primaryLatest.job.status !== "completed" || primaryLatest.job.conclusion !== "success");
-    const withheld = notGreen
-      && confirmsWithholding({ graph, jobEvidence, jobName: primaryJobName, cellId: cell.id });
+    // Two withholdable routes, each confirmed from evidence this closeout collected itself, and
+    // each scoped to its own shape of absence-of-proof. A PRESENT job that did not succeed can
+    // only be the lost-runner route: the reservation receipt is never consulted for it, so a
+    // hostile receipt cannot mask a proof that ran and refused. An ABSENT job can only be the
+    // pre-assignment route, and only when this run's own receipt vouches the host `unproven`.
+    const withheldPreAssignment = cell.non_claim !== undefined
+      && primaryLatest.state === "absent"
+      && reservationReceipt !== null
+      && confirmsPreAssignmentWithholding({
+        graph,
+        reservationReceipt,
+        hostId: cell.non_claim.host,
+        cellId: cell.id,
+      });
+    const withheld = (notGreen
+      && confirmsWithholding({ graph, jobEvidence, jobName: primaryJobName, cellId: cell.id }))
+      || withheldPreAssignment;
     const jobName = withheld ? cell.non_claim.producer_job_name : primaryJobName;
     const artifactTemplate = withheld
       ? cell.non_claim.producer_artifact
@@ -669,11 +772,19 @@ export function buildTrustedProducerMap({
         },
       };
       selected.non_claim = withheld;
+      // Only the pre-assignment route is tagged; an untagged withheld row IS the mid-job
+      // lost-runner route, which keeps every existing producer map byte-identical.
+      if (withheldPreAssignment) {
+        selected.non_claim_reason = graph.non_claim_policy.pre_assignment_reason;
+      }
       selectionCache.set(cacheKey, selected);
     }
     return {
       cell_id: cell.id,
       ...(selected.non_claim ? { non_claim: true } : {}),
+      ...(selected.non_claim_reason !== undefined
+        ? { non_claim_reason: selected.non_claim_reason }
+        : {}),
       producer_workflow: selected.constraints.producer_workflow,
       producer_job: selected.constraints.producer_job,
       producer_job_name: selected.constraints.producer_job_name,
@@ -773,6 +884,11 @@ async function produceMap(values) {
   const jobEvidence = values["job-evidence"]
     ? JSON.parse(readFileSync(text(values["job-evidence"], "--job-evidence"), "utf8"))
     : null;
+  // Same trust boundary for the pre-assignment route: the receipt path names an artifact the
+  // closeout job downloaded from this run itself.
+  const reservationReceipt = values["reservation-receipt"]
+    ? JSON.parse(readFileSync(text(values["reservation-receipt"], "--reservation-receipt"), "utf8"))
+    : null;
   const map = buildTrustedProducerMap({
     graph,
     gitIdentity,
@@ -782,6 +898,7 @@ async function produceMap(values) {
     artifacts,
     jobsByAttempt,
     jobEvidence,
+    reservationReceipt,
     reuse,
   });
   writeJson(text(values.out, "--out"), map);

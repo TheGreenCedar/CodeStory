@@ -149,9 +149,17 @@ export function deriveReleaseCells(graph, phase) {
     cell.non_claim = {
       host: host.id,
       reason: nonClaimPolicy.reason,
+      // The second typed reason: the proof job was never assigned because this run's own
+      // reservation receipt typed the host `unproven` before dispatch. The annotation is scoped
+      // to the mid-job reason -- a job that never existed carries no Actions annotation -- and
+      // the pre-assignment route is bounded by the receipt's recorded recheck instead of the
+      // run-attempt recovery bound.
+      pre_assignment_reason: nonClaimPolicy.pre_assignment_reason,
       runtime_execution: nonClaimPolicy.runtime_execution,
       annotation: nonClaimPolicy.annotation,
       maximum_run_attempts: nonClaimPolicy.maximum_run_attempts,
+      reservation_schema: nonClaimPolicy.reservation?.schema,
+      maximum_observation_attempts: nonClaimPolicy.reservation?.maximum_observation_attempts,
       unavailable_producer_workflow: host.unavailable_producer_workflow,
       unavailable_producer_job_name: host.unavailable_producer_job_name,
       producer_workflow: nonClaimPolicy.producer_workflow,
@@ -270,16 +278,59 @@ function nonClaimProblems({ manifest, cell, graph, withheld }) {
     problems.push(error.message);
     return problems;
   }
+  // Two typed reasons, each with its own scoped evidence. The mid-job reason quotes the Actions
+  // annotation and must have spent the run-attempt recovery bound; the pre-assignment reason has
+  // no annotation to quote -- the job never existed -- and must instead carry the reservation
+  // receipt facts with the recorded recheck bound spent. A manifest mixing the two shapes is
+  // refused in both directions rather than read charitably.
+  const reason = String(nonClaim.non_claim_reason ?? "");
+  const preAssignment = reason === cell.non_claim.pre_assignment_reason;
+  if (!preAssignment && reason !== cell.non_claim.reason) {
+    problems.push(
+      `non-claim non_claim_reason must equal ${cell.non_claim.reason}`
+      + ` or ${cell.non_claim.pre_assignment_reason}`,
+    );
+  }
   const expected = {
     host: cell.non_claim.host,
     runtime_execution: cell.non_claim.runtime_execution,
-    non_claim_reason: cell.non_claim.reason,
-    annotation: cell.non_claim.annotation,
     unavailable_producer_workflow: cell.non_claim.unavailable_producer_workflow,
     unavailable_producer_job_name: cell.non_claim.unavailable_producer_job_name,
+    ...(preAssignment ? {} : { annotation: cell.non_claim.annotation }),
   };
   for (const [key, value] of Object.entries(expected)) {
     if (nonClaim[key] !== value) problems.push(`non-claim ${key} must equal ${String(value)}`);
+  }
+  if (preAssignment) {
+    if (nonClaim.annotation !== undefined) {
+      problems.push(
+        `non-claim annotation is scoped to ${cell.non_claim.reason}: a never-assigned job has none`,
+      );
+    }
+    const reservation = nonClaim.reservation;
+    if (reservation === null || typeof reservation !== "object" || Array.isArray(reservation)) {
+      problems.push("pre-assignment non-claim must carry its reservation receipt facts");
+    } else {
+      if (reservation.schema !== cell.non_claim.reservation_schema) {
+        problems.push(`non-claim reservation schema must be ${cell.non_claim.reservation_schema}`);
+      }
+      if (reservation.state !== "unproven") {
+        problems.push("non-claim reservation state must be unproven");
+      }
+      // The pre-assignment bound is the receipt's recorded recheck, not the run attempt: the job
+      // was never created, so there is no rerun to spend, and the recheck is what was spent.
+      const attempts = String(reservation.observation_attempts ?? "");
+      if (reservation.maximum_observation_attempts !== cell.non_claim.maximum_observation_attempts
+          || !/^[1-9]\d*$/u.test(attempts)
+          || Number(attempts) < cell.non_claim.maximum_observation_attempts) {
+        problems.push(
+          "non-claim reservation must reach the "
+          + `${cell.non_claim.maximum_observation_attempts} observation recheck bound`,
+        );
+      }
+    }
+  } else if (nonClaim.reservation !== undefined) {
+    problems.push(`non-claim reservation facts are scoped to ${cell.non_claim.pre_assignment_reason}`);
   }
   let withheldClaims = [];
   try {
@@ -293,10 +344,13 @@ function nonClaimProblems({ manifest, cell, graph, withheld }) {
   if (declared === null || JSON.stringify(declared) !== JSON.stringify(withheldClaims)) {
     problems.push(`non-claim withheld_claims must name ${withheldClaims.join(", ")}`);
   }
-  // Withholding is the end of the bounded recovery path, never a shortcut around it: a non-claim
-  // recorded before the automatic reruns are spent would let one flaky minute drop a claim.
+  // Withholding is the end of a bounded recovery path, never a shortcut around it: a mid-job
+  // non-claim recorded before the automatic reruns are spent would let one flaky minute drop a
+  // claim. The pre-assignment route spent its bound in the receipt's recorded recheck instead, so
+  // its run_attempt only has to be the real producing attempt.
   const attempt = String(nonClaim.run_attempt ?? "");
-  if (!/^[1-9]\d*$/u.test(attempt) || Number(attempt) < cell.non_claim.maximum_run_attempts) {
+  if (!/^[1-9]\d*$/u.test(attempt)
+      || (!preAssignment && Number(attempt) < cell.non_claim.maximum_run_attempts)) {
     problems.push(
       `non-claim run_attempt must reach the ${cell.non_claim.maximum_run_attempts} attempt recovery bound`,
     );
@@ -648,6 +702,18 @@ function trustedProducerIndex({
     if (nonClaimRow && !cell.non_claim) {
       errors.push(`trusted producer map ${cell.id} does not admit a withheld non-claim`);
     }
+    // A row is tagged with a reason only for the pre-assignment route; the untagged withheld row
+    // stays the mid-job lost-runner route. Any other tag is an invented reason and is refused.
+    if (row.non_claim_reason !== undefined) {
+      if (!nonClaimRow) {
+        errors.push(`trusted producer map ${cell.id} non_claim_reason requires a withheld row`);
+      }
+      if (row.non_claim_reason !== graph.non_claim_policy?.pre_assignment_reason) {
+        errors.push(
+          `trusted producer map ${cell.id} non_claim_reason must be the declared pre-assignment reason`,
+        );
+      }
+    }
     for (const key of [
       "producer_workflow",
       "producer_job",
@@ -767,7 +833,7 @@ function trustedProducerIndex({
   return { byCell, reusedByCell, errors };
 }
 
-function producerAuthenticationProblems(manifest, trustedProducer, reuse) {
+function producerAuthenticationProblems(manifest, trustedProducer, reuse, graph) {
   if (!trustedProducer) return ["manifest producer is absent from the trusted producer map"];
   const identity = manifest.evidence?.identity ?? {};
   const problems = [];
@@ -775,6 +841,18 @@ function producerAuthenticationProblems(manifest, trustedProducer, reuse) {
   // Disagreement is how a real proof's producer could otherwise be paired with a withheld manifest.
   if ((trustedProducer.non_claim === true) !== isWithheldManifest(manifest)) {
     problems.push("manifest withheld state does not match the trusted producer map");
+  }
+  // And they have to agree on WHICH typed reason. The closeout confirmed one route from evidence
+  // it collected itself -- the lost-runner signature, or its own reading of the reservation
+  // receipt -- and a manifest recorded under the other reason is describing a different fact, so
+  // the mismatch is refused in both directions rather than reconciled.
+  if (trustedProducer.non_claim === true && isWithheldManifest(manifest)) {
+    const confirmedReason = trustedProducer.non_claim_reason ?? graph?.non_claim_policy?.reason;
+    if (manifest.non_claim?.non_claim_reason !== confirmedReason) {
+      problems.push(
+        `manifest non_claim_reason must be the ${String(confirmedReason)} route the closeout confirmed`,
+      );
+    }
   }
   for (const key of [
     "producer_workflow",
@@ -1296,6 +1374,7 @@ export function evaluateReleaseCloseout({
       manifest,
       trusted.byCell.get(cell.id),
       trusted.reusedByCell.get(cell.id),
+      graph,
     ));
     problems.push(...artifactBindingProblems(
       manifest,

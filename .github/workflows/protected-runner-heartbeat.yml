@@ -1,0 +1,60 @@
+name: Protected runner heartbeat
+
+# A protected runner that is offline at dispatch produces a proof job that queues invisibly for
+# ~24 hours and then terminally classifies as an ordinary blocked failure -- indistinguishable
+# from a proof that ran and refused. GITHUB_TOKEN cannot list self-hosted runners (the Actions
+# runner-administration endpoints need an `administration` scope that workflow `permissions:`
+# blocks cannot grant, and the repository keeps new credentials out), so liveness is proven the
+# only way the existing token can: by tiny jobs that run ON the three protected hosts. The
+# release's reserve-protected-runners gate reads the completed jobs of this workflow through the
+# reservation contract in .github/scripts/lost-runner-recovery.mjs and types each host before any
+# proof is dispatched.
+#
+# The jobs deliberately check nothing out and download nothing: the ONLY fact a heartbeat proves
+# is that the runner accepted and completed a job, and the Actions job record already carries
+# that. Cancel-in-progress keeps queued heartbeats from piling up behind a busy or dead host --
+# each scheduled run supersedes the one before it.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: protected-runner-heartbeat
+  cancel-in-progress: true
+
+jobs:
+  heartbeat-macos-arm64-metal:
+    name: Heartbeat macos-arm64-metal
+    runs-on: [self-hosted, macOS, ARM64, codestory-metal]
+    timeout-minutes: 5
+    steps:
+      - name: Prove the host holds a live runner
+        shell: bash
+        run: |
+          echo "protected-runner-heartbeat macos-arm64-metal $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  heartbeat-windows-x64-vulkan:
+    name: Heartbeat windows-x64-vulkan
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    timeout-minutes: 5
+    steps:
+      # The self-hosted Windows service account runs under the default Restricted execution
+      # policy, so the step declares bash rather than dying in the default shell.
+      - name: Prove the host holds a live runner
+        shell: bash
+        run: |
+          echo "protected-runner-heartbeat windows-x64-vulkan $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  heartbeat-linux-x64-vulkan:
+    name: Heartbeat linux-x64-vulkan
+    runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
+    timeout-minutes: 5
+    steps:
+      - name: Prove the host holds a live runner
+        shell: bash
+        run: |
+          echo "protected-runner-heartbeat linux-x64-vulkan $(date -u +%Y-%m-%dT%H:%M:%SZ)"
