@@ -879,6 +879,12 @@ impl WorkspaceDiscovery {
         let mut issues = inventory.issues;
         let warnings = inventory.warnings;
         for path in inventory.files {
+            // Synthetic discovery walks mixed-language repositories without a
+            // source-group filter. Classify the path before its size so an
+            // unsupported binary cannot become an oversized-source record.
+            if !has_supported_source_route(&path) {
+                continue;
+            }
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -2087,6 +2093,15 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
         || compatibility_extension_matches_source_group(&extension, language)
 }
 
+fn has_supported_source_route(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    let extension = codestory_contracts::language_support::normalize_extension(extension);
+    codestory_contracts::language_support::language_support_profile_for_ext(&extension).is_some()
+        || codestory_contracts::language_support::companion_extension_profile(&extension).is_some()
+}
+
 fn registry_extension_matches_source_group(extension: &str, language: &Language) -> bool {
     codestory_contracts::language_support::language_support_profile_for_ext(extension).is_some_and(
         |profile| source_group_accepts_registry_language(language, profile.language_name),
@@ -2618,6 +2633,93 @@ mod tests {
                 && entry.policy_version == "test-policy-v1"
         }));
         Ok(())
+    }
+
+    #[test]
+    fn filters_unsupported_paths_before_oversized_source_classification() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized_source = root.join("src/large.rs");
+        let oversized_binary = root.join("large.png");
+        let small_binary = root.join("small.png");
+        let companion_source = root.join("App.svelte");
+        fs::write(&oversized_source, vec![b's'; 65])?;
+        fs::write(&oversized_binary, vec![0; 96])?;
+        fs::write(&small_binary, vec![0; 8])?;
+        fs::write(&companion_source, b"<script>let value = 1;</script>\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, vec![companion_source]);
+        assert_eq!(inventory.policy_exclusions.len(), 1);
+        assert_eq!(
+            inventory.policy_exclusions[0].normalized_path,
+            "src/large.rs"
+        );
+        assert_eq!(inventory.policy_exclusions[0].observed_size, 65);
+        assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_inventory_keeps_supported_source_beneath_non_utf8_ancestor() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let source_dir = root.join(std::ffi::OsString::from_vec(b"source-\xff".to_vec()));
+        let source = source_dir.join("main.rs");
+        assert!(has_supported_source_route(&source));
+
+        // Apple filesystems reject invalid-UTF-8 names with EILSEQ. The pure
+        // classifier assertion above still covers the defect there; Unix
+        // filesystems that admit the name exercise inventory and refresh too.
+        #[cfg(target_vendor = "apple")]
+        return Ok(());
+
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            fs::create_dir_all(&source_dir)?;
+            fs::write(&source, "fn main() {}\n")?;
+
+            let manifest = WorkspaceManifest::open(root)?;
+            let policy = SourceIndexPolicy::oversized(64);
+            let inventory = manifest.source_inventory_with_policy(&policy)?;
+
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert_eq!(inventory.files, vec![source.clone()]);
+            assert!(inventory.policy_exclusions.is_empty());
+
+            let outcome = manifest.build_execution_outcome_with_policy(
+                &RefreshInputs {
+                    stored_files: vec![StoredFileState {
+                        id: 7,
+                        path: source.clone(),
+                        modification_time: modification_time_millis(&source)?,
+                        content_hash: Some(current_content_hash(&source)?),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    }],
+                    policy_exclusions: Vec::new(),
+                    inventory: WorkspaceInventory::default(),
+                },
+                &policy,
+            )?;
+
+            assert!(outcome.refresh.plan.files_to_index.is_empty());
+            assert!(outcome.refresh.plan.files_to_remove.is_empty());
+            assert_eq!(
+                outcome.refresh.plan.existing_file_ids.get(&source),
+                Some(&7)
+            );
+            Ok(())
+        }
     }
 
     #[test]
