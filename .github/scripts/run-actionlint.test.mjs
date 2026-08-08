@@ -13,7 +13,6 @@ test("platform selection covers every checksum-pinned actionlint asset", () => {
   const supported = [
     ["darwin", "arm64"],
     ["darwin", "x64"],
-    ["linux", "arm64"],
     ["linux", "x64"],
     ["win32", "arm64"],
     ["win32", "x64"],
@@ -22,6 +21,9 @@ test("platform selection covers every checksum-pinned actionlint asset", () => {
     assert.equal(platformKey(platform, arch), `${platform}-${arch}`);
   }
   assert.throws(() => platformKey("freebsd", "x64"), /does not have a declared asset/u);
+  // No ARM64 Linux host exists in the fleet; the lane is retired and must not
+  // silently return through a re-declared actionlint asset.
+  assert.throws(() => platformKey("linux", "arm64"), /does not have a declared asset/u);
 });
 
 test("archive verification rejects any checksum mismatch", () => {

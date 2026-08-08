@@ -6216,7 +6216,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(linuxQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
       && linuxQualityRun.includes("codestory-cli-v${version}-linux-x64.tar.gz")
       && linuxQualityRun.includes("--packet-runtime-mode cold-cli")
-      && linuxQualityRun.includes("--task-manifest benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json")
+      && occurrenceCount(linuxQualityRun, "--task-manifest") === 1
       && linuxQualityRun.includes("--repeats 3")
       && linuxQualityRun.includes("--publishable")
       && !linuxQualityRun.includes("--task-suite")

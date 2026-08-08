@@ -3249,8 +3249,8 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["platform resolver backslash continuation blank line", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace(
-          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n    ||',
-          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n\n    ||',
+          'if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \\\n    ||',
+          'if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \\\n\n    ||',
         );
     }, /exact normalized trusted resolver script contract/u],
     ["platform route becomes conditional", packagedCoordinatorFile, workflow => {
