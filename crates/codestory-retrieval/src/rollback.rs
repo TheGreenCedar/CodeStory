@@ -463,16 +463,20 @@ mod tests {
         let cache = TempDir::new().expect("cache");
         let storage_path = storage_dir.path().join("codestory.db");
         std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}\n").expect("seed source");
-        let store = Store::open(&storage_path).expect("open storage");
-        store
-            .put_index_publication(&IndexPublicationRecord {
-                generation: 1,
-                generation_id: "11111111-1111-4111-8111-111111111111".into(),
-                run_id: "run-one".into(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
-            .expect("publish core identity");
+        let mut store = Store::open(&storage_path).expect("open storage");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
         drop(store);
         let runtime = crate::config::with_test_cache_root(cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(

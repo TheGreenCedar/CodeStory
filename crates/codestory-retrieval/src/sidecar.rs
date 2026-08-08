@@ -523,7 +523,20 @@ mod tests {
         let storage_path = project.path().join("cache").join("custom-core.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
             .expect("storage parent");
-        let storage = Store::open(&storage_path).expect("store");
+        let mut storage = Store::open(&storage_path).expect("store");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation".into(),
+            run_id: "core-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        crate::test_support::publish_complete_core_fixture(
+            &mut storage,
+            project.path(),
+            &publication,
+        )
+        .expect("complete core fixture");
         let runtime = SidecarRuntimeConfig::local();
         let project_id =
             sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");

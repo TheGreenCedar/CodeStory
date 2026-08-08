@@ -732,10 +732,9 @@ mod tests {
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 2,
         };
-        let store = Store::open(&storage_path).expect("open storage");
-        store
-            .put_index_publication(&first_core)
-            .expect("publish first core identity");
+        let mut store = Store::open(&storage_path).expect("open storage");
+        crate::test_support::publish_complete_core_fixture(&mut store, project.path(), &first_core)
+            .expect("publish first complete core fixture");
         drop(store);
         let runtime = crate::config::with_test_cache_root(cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(
@@ -756,9 +755,12 @@ mod tests {
         drop(first_session);
 
         let mut store = Store::open(&storage_path).expect("open identity-only writer");
-        store
-            .put_index_publication(&second_core)
-            .expect("publish second core identity");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &second_core,
+        )
+        .expect("publish second complete core fixture");
         store
             .publish_dense_anchor_generation(
                 &second_core,

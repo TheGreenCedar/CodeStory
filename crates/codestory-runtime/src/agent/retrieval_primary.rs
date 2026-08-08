@@ -2130,26 +2130,12 @@ mod tests {
         project_root: &Path,
         publication: &codestory_store::IndexPublicationRecord,
     ) {
-        use codestory_store::SourcePolicyExclusionPolicyIdentity;
-
-        let identity = codestory_workspace::project_identity_v3(project_root);
-        let source_policy = codestory_contracts::workspace::SourceIndexPolicy::default();
-        store
-            .publish_source_policy_exclusion_generation(
-                publication,
-                &identity.project_id,
-                &identity.workspace_id,
-                SourcePolicyExclusionPolicyIdentity::new(
-                    &source_policy.policy_version,
-                    source_policy.byte_cap,
-                    source_policy.structural_unit_cap,
-                ),
-                &[],
-            )
-            .expect("publish empty source policy exclusion generation");
-        store
-            .put_index_publication(publication)
-            .expect("publish complete core generation");
+        codestory_retrieval::test_support::publish_complete_core_fixture(
+            store,
+            project_root,
+            publication,
+        )
+        .expect("publish complete core generation");
     }
 
     fn pinned_operation_fixture() -> PinnedOperationFixture {
