@@ -167,11 +167,29 @@ impl From<codestory_retrieval::SidecarRuntimeConfig> for RuntimeRetrievalConfig 
     }
 }
 
+/// Plan process-wide cache cleanup without mutating the cache tree.
+pub fn plan_cache_clean() -> anyhow::Result<CacheCleanPlan> {
+    codestory_retrieval::plan_cache_clean()
+}
+
+/// Apply process-wide cache cleanup under the retrieval owner's global lock.
+pub fn apply_cache_clean() -> anyhow::Result<CacheCleanReport> {
+    codestory_retrieval::apply_cache_clean()
+}
+
+/// Initialize and validate the embedding backend selected by this runtime.
+pub fn ensure_product_embedding_backend_for_runtime(
+    config: &RuntimeRetrievalConfig,
+) -> anyhow::Result<()> {
+    codestory_retrieval::ensure_product_embedding_backend_for_runtime(config.as_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RuntimeProcessConfig;
     use codestory_contracts::workspace::SourceIndexPolicy;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn assert_structurally_equal(
@@ -401,5 +419,152 @@ mod tests {
             assert_eq!(RuntimeRetrievalProfile::from(direct), wrapped);
             assert_eq!(wrapped.as_str(), label);
         }
+    }
+
+    fn runtime_config_for_cache(
+        project_root: &Path,
+        cache_root: &Path,
+        profile: RuntimeRetrievalProfile,
+        run_id: Option<&str>,
+    ) -> RuntimeRetrievalConfig {
+        let defaults = RetrievalProcessDefaults::new(
+            cache_root.to_path_buf(),
+            RetrievalRuntimeDefaults::default(),
+        );
+        RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
+            Some(project_root),
+            profile,
+            run_id,
+            &defaults,
+            &RetrievalRuntimeOverrides::default(),
+        )
+    }
+
+    fn error_chain(error: &anyhow::Error) -> Vec<String> {
+        error.chain().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn embedding_preflight_preserves_selected_configuration_and_error_chain() {
+        let fixture = tempdir().expect("runtime embedding preflight fixture");
+        let available_root = fixture.path().join("available");
+        let unavailable_root = fixture.path().join("unavailable");
+        std::fs::create_dir_all(&available_root).expect("create available embedding root");
+        std::fs::create_dir_all(&unavailable_root).expect("create unavailable embedding root");
+        std::fs::write(
+            unavailable_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER),
+            b"unavailable",
+        )
+        .expect("write embedding unavailable marker");
+
+        for (profile, run_id) in [
+            (RuntimeRetrievalProfile::Local, None),
+            (RuntimeRetrievalProfile::Agent, Some("selected-agent-run")),
+        ] {
+            let available =
+                runtime_config_for_cache(fixture.path(), &available_root, profile, run_id);
+            codestory_retrieval::with_test_cache_root(&unavailable_root, || {
+                codestory_retrieval::ensure_product_embedding_backend_for_runtime(
+                    available.as_inner(),
+                )
+                .expect("owner preflight must use the selected available root");
+                ensure_product_embedding_backend_for_runtime(&available)
+                    .expect("runtime preflight must use the selected available root");
+            });
+
+            let unavailable =
+                runtime_config_for_cache(fixture.path(), &unavailable_root, profile, run_id);
+            codestory_retrieval::with_test_cache_root(&available_root, || {
+                let direct = codestory_retrieval::ensure_product_embedding_backend_for_runtime(
+                    unavailable.as_inner(),
+                )
+                .expect_err("owner preflight must use the selected unavailable root");
+                let facade = ensure_product_embedding_backend_for_runtime(&unavailable)
+                    .expect_err("runtime preflight must use the selected unavailable root");
+                assert_eq!(error_chain(&facade), error_chain(&direct));
+                assert_eq!(facade.to_string(), direct.to_string());
+                assert!(
+                    facade
+                        .to_string()
+                        .contains(&unavailable_root.display().to_string())
+                );
+            });
+        }
+    }
+
+    fn directory_listing(root: &Path) -> BTreeMap<String, String> {
+        fn collect(root: &Path, current: &Path, entries: &mut BTreeMap<String, String>) {
+            let mut paths = std::fs::read_dir(current)
+                .expect("read cleanup listing")
+                .map(|entry| entry.expect("read cleanup entry").path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("cleanup entry below root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let metadata = std::fs::symlink_metadata(&path).expect("cleanup metadata");
+                if metadata.is_dir() {
+                    entries.insert(format!("{relative}/"), "directory".into());
+                    collect(root, &path, entries);
+                } else {
+                    entries.insert(relative, format!("file: {} bytes", metadata.len()));
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        collect(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    fn cache_clean_functions_preserve_owner_plan_report_and_post_state() {
+        let fixture = tempdir().expect("runtime cache-clean fixture");
+        let cache_root = fixture.path().join("cache");
+        let worktrees_root = fixture.path().join("worktrees");
+        codestory_retrieval::test_support::populate_cache_clean_fixture(
+            &cache_root,
+            &worktrees_root,
+        )
+        .expect("populate direct cache-clean fixture");
+
+        let (direct_plan, facade_plan, direct_report) =
+            codestory_retrieval::with_test_cache_root(&cache_root, || {
+                let direct_plan =
+                    codestory_retrieval::plan_cache_clean().expect("owner cleanup plan");
+                let facade_plan = plan_cache_clean().expect("runtime cleanup plan");
+                let direct_report =
+                    codestory_retrieval::apply_cache_clean().expect("owner cleanup apply");
+                (direct_plan, facade_plan, direct_report)
+            });
+        assert_eq!(facade_plan, direct_plan);
+        assert_eq!(
+            direct_plan.candidates.len(),
+            2,
+            "both proof classes must fire"
+        );
+        assert_eq!(
+            direct_report.removals.len(),
+            2,
+            "both proof classes must apply"
+        );
+        let direct_post_state = directory_listing(&cache_root);
+
+        std::fs::remove_dir_all(&cache_root).expect("reset cache-clean fixture root");
+        std::fs::remove_dir_all(&worktrees_root).expect("reset cache-clean worktrees root");
+        codestory_retrieval::test_support::populate_cache_clean_fixture(
+            &cache_root,
+            &worktrees_root,
+        )
+        .expect("repopulate runtime cache-clean fixture");
+        let facade_report = codestory_retrieval::with_test_cache_root(&cache_root, || {
+            apply_cache_clean().expect("runtime cleanup apply")
+        });
+
+        assert_eq!(facade_report, direct_report);
+        assert_eq!(directory_listing(&cache_root), direct_post_state);
     }
 }

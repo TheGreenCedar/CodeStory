@@ -332,7 +332,8 @@ pub use repository_identity::{
 pub use retrieval_boundary::{
     CacheCleanPlan, CacheCleanReport, ProcessOwnerState, ProcessStartProbe,
     RetrievalProcessDefaults, RetrievalRuntimeDefaults, RetrievalRuntimeOverrides,
-    RetrievalStatusReport, RuntimeRetrievalConfig, RuntimeRetrievalProfile,
+    RetrievalStatusReport, RuntimeRetrievalConfig, RuntimeRetrievalProfile, apply_cache_clean,
+    ensure_product_embedding_backend_for_runtime, plan_cache_clean,
 };
 pub(crate) use search_runtime::SearchEngine;
 

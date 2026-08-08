@@ -235,7 +235,8 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
 }
 
 fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Result<()> {
-    codestory_retrieval::ensure_product_embedding_backend_for_runtime(sidecar)
+    let retrieval_config = codestory_runtime::RuntimeRetrievalConfig::from(sidecar.clone());
+    codestory_runtime::ensure_product_embedding_backend_for_runtime(&retrieval_config)
         .context("retrieval index embedding device policy")
 }
 
