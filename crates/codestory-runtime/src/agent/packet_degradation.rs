@@ -18,8 +18,14 @@
 //! repository with no dense anchors is correct behavior, and its rate is the reconsideration
 //! trigger recorded against the retrieval backend non-claim.
 
-use codestory_contracts::api::{AgentAnswerDto, RetrievalShadowDto, RetrievalStageTimingDto};
-use codestory_retrieval::RetrievalStageKind;
+#[cfg(test)]
+use codestory_contracts::wire::{
+    RETRIEVAL_STAGE1_LEXICAL_LABEL, RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
+};
+use codestory_contracts::{
+    api::{AgentAnswerDto, RetrievalShadowDto, RetrievalStageTimingDto},
+    wire::RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
+};
 
 /// Query-level stop reason the planner takes deliberately once marginal gain flattens.
 ///
@@ -54,7 +60,7 @@ fn stage_lost_to_deadline(stage: &RetrievalStageTimingDto) -> bool {
 }
 
 fn is_semantic_stage(stage: &RetrievalStageTimingDto) -> bool {
-    stage.stage == RetrievalStageKind::Stage1bSemantic.label()
+    stage.stage == RETRIEVAL_STAGE1B_SEMANTIC_LABEL
 }
 
 /// Read one query's stage record for semantic degradation.
@@ -177,7 +183,7 @@ mod tests {
     #[test]
     fn semantic_deadline_loss_with_no_candidates_is_a_timeout() {
         let degradation = semantic_stage_degradation(&[stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
+            RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
             "pending_after_deadline",
             0,
         )]);
@@ -189,7 +195,7 @@ mod tests {
     #[test]
     fn semantic_deadline_loss_that_still_merged_candidates_is_not_a_zero_hit_timeout() {
         let degradation = semantic_stage_degradation(&[stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
+            RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
             "completed_late",
             3,
         )]);
@@ -200,7 +206,7 @@ mod tests {
     #[test]
     fn a_lexical_stage_timeout_is_not_a_semantic_timeout() {
         let degradation = semantic_stage_degradation(&[stage(
-            RetrievalStageKind::Stage1Lexical.label(),
+            RETRIEVAL_STAGE1_LEXICAL_LABEL,
             "pending_after_deadline",
             0,
         )]);
@@ -210,11 +216,8 @@ mod tests {
 
     #[test]
     fn a_skipped_semantic_stage_abstains_without_timing_out() {
-        let degradation = semantic_stage_degradation(&[stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
-            "skipped",
-            0,
-        )]);
+        let degradation =
+            semantic_stage_degradation(&[stage(RETRIEVAL_STAGE1B_SEMANTIC_LABEL, "skipped", 0)]);
 
         assert!(degradation.abstained);
         assert!(!degradation.timed_out_zero_hits);
@@ -222,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_stub_only_semantic_stage_abstains() {
-        let mut degraded = stage(RetrievalStageKind::Stage1bSemantic.label(), "completed", 2);
+        let mut degraded = stage(RETRIEVAL_STAGE1B_SEMANTIC_LABEL, "completed", 2);
         degraded.degraded = true;
         degraded.stub_reason = Some("phantom_stub_hits".to_string());
 
@@ -231,22 +234,14 @@ mod tests {
 
     #[test]
     fn a_complete_primary_run_is_not_truncated() {
-        let shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage1Lexical.label(),
-            "completed",
-            5,
-        )]);
+        let shadow = shadow(vec![stage(RETRIEVAL_STAGE1_LEXICAL_LABEL, "completed", 5)]);
 
         assert!(!primary_retrieval_truncated(&shadow));
     }
 
     #[test]
     fn the_planned_marginal_gain_stop_is_not_truncation() {
-        let mut shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage1Lexical.label(),
-            "completed",
-            5,
-        )]);
+        let mut shadow = shadow(vec![stage(RETRIEVAL_STAGE1_LEXICAL_LABEL, "completed", 5)]);
         shadow.cancel_reason = Some("marginal_gain".to_string());
 
         assert!(!primary_retrieval_truncated(&shadow));
@@ -254,11 +249,7 @@ mod tests {
 
     #[test]
     fn a_deadline_cancel_truncates_the_primary_run() {
-        let mut shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage1Lexical.label(),
-            "completed",
-            5,
-        )]);
+        let mut shadow = shadow(vec![stage(RETRIEVAL_STAGE1_LEXICAL_LABEL, "completed", 5)]);
         shadow.cancel_reason = Some("deadline".to_string());
 
         assert!(primary_retrieval_truncated(&shadow));
@@ -266,11 +257,7 @@ mod tests {
 
     #[test]
     fn a_skipped_stage_alone_does_not_truncate_the_primary_run() {
-        let shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
-            "skipped",
-            0,
-        )]);
+        let shadow = shadow(vec![stage(RETRIEVAL_STAGE1B_SEMANTIC_LABEL, "skipped", 0)]);
 
         assert!(!primary_retrieval_truncated(&shadow));
     }
@@ -278,7 +265,7 @@ mod tests {
     #[test]
     fn a_stage_lost_to_its_deadline_truncates_the_primary_run() {
         let shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage2ScipExpand.label(),
+            RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
             "pending_after_deadline",
             0,
         )]);
@@ -298,7 +285,7 @@ mod tests {
             "completed_late",
         ] {
             let shadow = shadow(vec![stage(
-                RetrievalStageKind::Stage2ScipExpand.label(),
+                RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
                 completion_status,
                 0,
             )]);
@@ -320,7 +307,7 @@ mod tests {
             "completed_late",
         ] {
             let degradation = semantic_stage_degradation(&[stage(
-                RetrievalStageKind::Stage1bSemantic.label(),
+                RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
                 completion_status,
                 0,
             )]);
@@ -337,18 +324,16 @@ mod tests {
     #[test]
     fn a_completed_stage_is_not_a_deadline_loss() {
         let shadow = shadow(vec![stage(
-            RetrievalStageKind::Stage2ScipExpand.label(),
+            RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
             "completed",
             0,
         )]);
 
         assert!(!primary_retrieval_truncated(&shadow));
         assert!(
-            !semantic_stage_degradation(&[stage(
-                RetrievalStageKind::Stage1bSemantic.label(),
-                "completed",
-                0,
-            )])
+            !semantic_stage_degradation(&[
+                stage(RETRIEVAL_STAGE1B_SEMANTIC_LABEL, "completed", 0,)
+            ])
             .timed_out_zero_hits
         );
     }
@@ -416,7 +401,7 @@ mod tests {
     fn counters_sum_the_primary_run_and_every_sidecar_query() {
         let mut answer = counter_answer();
         answer.retrieval_trace.retrieval_shadow = Some(shadow(vec![stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
+            RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
             "pending_after_deadline",
             0,
         )]));
@@ -439,7 +424,7 @@ mod tests {
     fn counters_stay_zero_for_a_run_with_no_semantic_degradation() {
         let mut answer = counter_answer();
         answer.retrieval_trace.retrieval_shadow = Some(shadow(vec![stage(
-            RetrievalStageKind::Stage1bSemantic.label(),
+            RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
             "completed",
             6,
         )]));

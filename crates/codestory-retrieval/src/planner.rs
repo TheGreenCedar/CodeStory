@@ -1,5 +1,10 @@
 use crate::mode::RetrievalDegradedMode;
 use crate::query_features::{QueryFeatures, QueryShape};
+use codestory_contracts::wire::{
+    RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL, RETRIEVAL_STAGE1_LEXICAL_LABEL,
+    RETRIEVAL_STAGE1B_SEMANTIC_LABEL, RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
+    RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL,
+};
 use serde::{Deserialize, Serialize};
 
 /// Staged retrieval lane.
@@ -21,11 +26,11 @@ pub enum RetrievalStageKind {
 impl RetrievalStageKind {
     pub fn label(self) -> &'static str {
         match self {
-            RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
-            RetrievalStageKind::Stage1Lexical => "stage1_lexical",
-            RetrievalStageKind::Stage1bSemantic => "stage1b_semantic",
-            RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
-            RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
+            RetrievalStageKind::Stage0ScipAnchor => RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL,
+            RetrievalStageKind::Stage1Lexical => RETRIEVAL_STAGE1_LEXICAL_LABEL,
+            RetrievalStageKind::Stage1bSemantic => RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
+            RetrievalStageKind::Stage2ScipExpand => RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
+            RetrievalStageKind::Stage3RepoTextFallback => RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL,
         }
     }
 
@@ -268,6 +273,29 @@ mod tests {
                 has_sidecar_latency.then_some(u32::MAX)
             );
             assert_eq!(kind.sidecar_latency_ms(u64::from(u32::MAX) + 1), None);
+        }
+    }
+
+    #[test]
+    fn every_stage_kind_label_matches_the_wire_contract() {
+        for kind in [
+            RetrievalStageKind::Stage0ScipAnchor,
+            RetrievalStageKind::Stage1Lexical,
+            RetrievalStageKind::Stage1bSemantic,
+            RetrievalStageKind::Stage2ScipExpand,
+            RetrievalStageKind::Stage3RepoTextFallback,
+        ] {
+            let expected = match kind {
+                RetrievalStageKind::Stage0ScipAnchor => RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL,
+                RetrievalStageKind::Stage1Lexical => RETRIEVAL_STAGE1_LEXICAL_LABEL,
+                RetrievalStageKind::Stage1bSemantic => RETRIEVAL_STAGE1B_SEMANTIC_LABEL,
+                RetrievalStageKind::Stage2ScipExpand => RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL,
+                RetrievalStageKind::Stage3RepoTextFallback => {
+                    RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL
+                }
+            };
+
+            assert_eq!(kind.label(), expected);
         }
     }
 
