@@ -1,6 +1,5 @@
 //! Versioned packet obligations planned before retrieval and finalized from carried evidence.
 
-use super::packet_claims::packet_supported_claims_with_telemetry;
 use super::packet_evidence::citation_sufficiency_eligible;
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
@@ -13,8 +12,8 @@ use super::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_display_path,
     packet_query_stop_term,
 };
-use super::packet_sufficiency::packet_execution_graphs;
 use super::packet_terms::packet_probe_terms;
+use codestory_agent::packet_execution_graphs::packet_execution_graphs;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     EdgeKind, NodeKind, PACKET_OBLIGATION_PLAN_VERSION, PacketBudgetDto, PacketClaimDto,
@@ -1265,15 +1264,21 @@ fn packet_unproven_claim_status(
 pub(crate) fn packet_claims_with_obligation_receipts(
     answer: &AgentAnswerDto,
     plan: &PacketObligationPlanDto,
+    supported_claims_with_telemetry: (Vec<PacketClaimDto>, PacketClaimTelemetry),
 ) -> Vec<PacketClaimDto> {
-    packet_claims_with_obligation_receipts_and_telemetry(answer, plan).0
+    packet_claims_with_obligation_receipts_and_telemetry(
+        answer,
+        plan,
+        supported_claims_with_telemetry,
+    )
+    .0
 }
 
 pub(crate) fn packet_claims_with_obligation_receipts_and_telemetry(
     answer: &AgentAnswerDto,
     plan: &PacketObligationPlanDto,
+    (mut claims, telemetry): (Vec<PacketClaimDto>, PacketClaimTelemetry),
 ) -> (Vec<PacketClaimDto>, PacketClaimTelemetry) {
-    let (mut claims, telemetry) = packet_supported_claims_with_telemetry(answer);
     append_packet_obligation_receipt_claims(answer, plan, &mut claims);
     (claims, telemetry)
 }
@@ -1549,6 +1554,7 @@ fn packet_discovery_subject_has_negator(tokens: &[String], subject_index: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
     use crate::agent::packet_sufficiency::build_packet_sufficiency_with_obligation_context;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, EdgeId,
@@ -2461,7 +2467,9 @@ mod tests {
             Some("required_carrier_missing")
         );
 
-        let mut claims = packet_claims_with_obligation_receipts(&answer, &plan);
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
+        let mut claims =
+            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
         bind_claims_to_packet_obligations(&plan, &mut claims);
         let storage_claim = claims
             .iter()
@@ -2512,7 +2520,9 @@ mod tests {
             query_obligations: Vec::new(),
         };
 
-        let mut claims = packet_claims_with_obligation_receipts(&answer, &plan);
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
+        let mut claims =
+            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
         bind_claims_to_packet_obligations(&plan, &mut claims);
         let receipts = claims
             .iter()
@@ -2584,7 +2594,9 @@ mod tests {
             query_obligations: Vec::new(),
         };
         let answer = answer(vec![reported_carrier]);
-        let mut claims = packet_claims_with_obligation_receipts(&answer, &plan);
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
+        let mut claims =
+            packet_claims_with_obligation_receipts(&answer, &plan, supported_claims_with_telemetry);
         bind_claims_to_packet_obligations(&plan, &mut claims);
         let receipts = claims
             .iter()

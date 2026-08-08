@@ -16,8 +16,10 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
 pub mod packet_citations;
+pub mod packet_command;
 pub mod packet_evidence_carriers;
 pub mod packet_evidence_roles;
+pub mod packet_execution_graphs;
 pub mod packet_flow_requirements;
 pub mod packet_probes;
 pub mod packet_scoring;

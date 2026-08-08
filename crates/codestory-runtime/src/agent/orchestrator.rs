@@ -922,7 +922,12 @@ fn append_packet_evidence_sections(
     );
 
     let (mut claims, claim_telemetry) = if let Some(obligations) = obligations {
-        packet_claims_with_obligation_receipts_and_telemetry(answer, obligations)
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
+        packet_claims_with_obligation_receipts_and_telemetry(
+            answer,
+            obligations,
+            supported_claims_with_telemetry,
+        )
     } else {
         packet_supported_claims_with_telemetry(answer)
     };

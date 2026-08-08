@@ -1,5 +1,7 @@
-use crate::agent::packet_budget::next_deeper_packet_argv;
-use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
+use crate::agent::packet_claims::{
+    decorate_packet_claims_proof_metadata, packet_supported_claims,
+    packet_supported_claims_with_telemetry,
+};
 use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_degradation::packet_primary_retrieval_truncated;
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
@@ -22,13 +24,20 @@ use crate::agent::packet_scoring::{
     packet_display_path,
 };
 use crate::agent::packet_terms::packet_probe_terms;
+use codestory_agent::packet_command::next_deeper_packet_argv;
+#[allow(unused_imports)]
+pub(crate) use codestory_agent::packet_command::quote_packet_command_value;
+pub(crate) use codestory_agent::packet_command::{
+    packet_argv, packet_display_project_arg, packet_follow_up_invocation, render_packet_command,
+};
+pub(crate) use codestory_agent::packet_execution_graphs::packet_execution_graphs;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphArtifactDto,
-    GraphResponse, NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
-    PacketClaimObligationDto, PacketCoverageReportDto, PacketEvidenceTierDto,
-    PacketFollowUpInvocationDto, PacketObligationPlanDto, PacketObligationProofStatusDto,
-    PacketProbeDto, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, EdgeKind, GraphResponse,
+    NodeKind, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketClaimObligationDto,
+    PacketCoverageReportDto, PacketEvidenceTierDto, PacketObligationPlanDto,
+    PacketObligationProofStatusDto, PacketProbeDto, PacketQueryCompletionDto,
+    PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
+    PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
@@ -134,9 +143,12 @@ fn build_packet_sufficiency_with_optional_obligation_context(
     exact_probe_paths: &[String],
     obligations: Option<&PacketObligationPlanDto>,
 ) -> PacketSufficiencyDto {
-    let supported_claims = obligations
-        .map(|plan| packet_claims_with_obligation_receipts(answer, plan))
-        .unwrap_or_else(|| packet_supported_claims(answer));
+    let supported_claims = if let Some(plan) = obligations {
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(answer);
+        packet_claims_with_obligation_receipts(answer, plan, supported_claims_with_telemetry)
+    } else {
+        packet_supported_claims(answer)
+    };
     let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
         question,
         task_class,
@@ -1210,24 +1222,6 @@ fn packet_route_citation_is_endpoint(citation: &AgentCitationDto) -> bool {
             terminal.as_str(),
             "helper" | "helpers" | "util" | "utils" | "utility" | "generichelper"
         )
-}
-
-pub(crate) fn packet_execution_graphs(answer: &AgentAnswerDto) -> Vec<&GraphResponse> {
-    answer
-        .graphs
-        .iter()
-        .filter_map(|artifact| match artifact {
-            GraphArtifactDto::Uml { graph, .. } => Some(graph),
-            GraphArtifactDto::Mermaid { .. } => None,
-        })
-        .filter(|graph| {
-            graph.edges.iter().any(|edge| {
-                edge.kind == EdgeKind::CALL
-                    && edge.source != edge.target
-                    && !crate::graph_builders::is_speculative_trail_edge(edge)
-            })
-        })
-        .collect()
 }
 
 fn packet_graph_contains_route(graph: &GraphResponse, stages: &[RouteStageEvidence]) -> bool {
@@ -2587,8 +2581,8 @@ fn packet_blocking_follow_up_probe_queries(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
+    use super::super::packet_budget::{apply_packet_budget, packet_budget_limits};
     use super::*;
-    use crate::agent::packet_budget::{apply_packet_budget, packet_budget_limits};
     use crate::agent::packet_obligations::{
         build_packet_obligation_plan, finalize_packet_obligation_plan,
     };
@@ -3068,7 +3062,12 @@ mod tests {
             &answer,
             &budget,
         );
-        let claims = packet_claims_with_obligation_receipts(&answer, &obligations);
+        let supported_claims_with_telemetry = packet_supported_claims_with_telemetry(&answer);
+        let claims = packet_claims_with_obligation_receipts(
+            &answer,
+            &obligations,
+            supported_claims_with_telemetry,
+        );
         let sufficiency = build_packet_sufficiency_with_obligation_context(
             Path::new("C:/workspace/project"),
             question,
@@ -8487,48 +8486,8 @@ fn packet_follow_up_argv(
     }
 }
 
-pub(crate) fn packet_argv(arguments: &[&str]) -> Vec<String> {
-    std::iter::once("codestory-cli".to_string())
-        .chain(arguments.iter().map(|argument| (*argument).to_string()))
-        .collect()
-}
-
 fn packet_search_argv(project: &str, query: &str) -> Vec<String> {
     packet_argv(&["search", "--project", project, "--query", query, "--why"])
-}
-
-/// Split argv into the published `{program, args}` invocation.
-pub(crate) fn packet_follow_up_invocation(argv: &[String]) -> PacketFollowUpInvocationDto {
-    let (program, args) = argv.split_first().expect("packet argv carries a program");
-    PacketFollowUpInvocationDto {
-        program: program.clone(),
-        args: args.to_vec(),
-    }
-}
-
-/// Render argv as one copy-pasteable POSIX shell command.
-///
-/// Arguments made only of characters a shell passes through untouched stay
-/// bare so the suggestion reads like something a person would type; everything
-/// else is single-quoted.
-pub(crate) fn render_packet_command(argv: &[String]) -> String {
-    argv.iter()
-        .map(|argument| {
-            if packet_command_argument_is_shell_safe(argument) {
-                argument.clone()
-            } else {
-                quote_packet_command_value(argument)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn packet_command_argument_is_shell_safe(argument: &str) -> bool {
-    !argument.is_empty()
-        && argument
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character))
 }
 
 fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
@@ -8603,20 +8562,6 @@ fn packet_follow_up_search_argv(project: &str, queries: &[String]) -> Vec<Vec<St
         push_unique_argv(&mut commands, packet_search_argv(project, query));
     }
     commands
-}
-
-/// The project argument as the caller would type it, before any quoting.
-pub(crate) fn packet_display_project_arg(project_root: &Path) -> String {
-    project_root.to_string_lossy().into_owned()
-}
-
-/// Quote one argv element for a POSIX shell.
-///
-/// Doubling the apostrophe is the PowerShell/SQL convention; `sh` concatenates
-/// the adjacent quoted runs and drops the character, so an argument has to end
-/// the quoted run, escape the apostrophe, and reopen it.
-pub(crate) fn quote_packet_command_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
