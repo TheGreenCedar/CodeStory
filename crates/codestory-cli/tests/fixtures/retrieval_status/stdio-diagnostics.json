@@ -1,0 +1,13 @@
+{
+  "id": 17,
+  "jsonrpc": "2.0",
+  "result": {
+    "contents": [
+      {
+        "mimeType": "application/json",
+        "text": "{\"degraded_reason\":\"retrieval_manifest_missing\",\"embedding_server\":{\"failure\":{\"code\":\"embedding_server_observation_failed\",\"message\":\"embedding_server_transport_unavailable\",\"retry_after_ms\":0,\"retry_class\":\"after_server_change\",\"retry_condition\":\"the per-user server lifetime authority changes\"},\"lifecycle\":\"unavailable\",\"schema_version\":1},\"engine\":{\"embed_detail\":\"retrieval embeddings ready\",\"embed_reachable\":true,\"embedding_accelerator_request_device\":\"test-accelerator\",\"embedding_accelerator_request_provider\":\"test-accelerator\",\"embedding_accelerator_requested\":true,\"embedding_cpu_allowed\":false,\"embedding_detected_gpu\":\"test-accelerator\",\"embedding_detected_provider\":\"test-accelerator\",\"embedding_device_observation_source\":\"test_support\",\"embedding_device_policy\":\"accelerator_required\",\"embedding_device_state\":\"accelerated\"},\"retrieval_mode\":\"unavailable\"}",
+        "uri": "<PROJECT_URI>"
+      }
+    ]
+  }
+}

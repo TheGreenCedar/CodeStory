@@ -8860,6 +8860,96 @@ version = "0.11.20"
         assert_eq!(observed["embedding_server"], expected_embedding_server);
     }
 
+    const STATUS_WIRE_CHILD_OUTPUT: &str = "CODESTORY_STATUS_WIRE_CHILD_OUTPUT";
+
+    #[test]
+    #[ignore = "invoked in an isolated test process by the status wire golden"]
+    fn write_pre_change_status_wire_retrieval_engine_resource_fixture() {
+        let output = std::env::var_os(STATUS_WIRE_CHILD_OUTPUT)
+            .map(std::path::PathBuf::from)
+            .expect("status wire child output path");
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        let mut session = StdioServerSession {
+            active_project: None,
+            retained_projects: VecDeque::new(),
+            project_required: true,
+            startup,
+            tainted_project: None,
+        };
+        let mut response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 17,
+                "method": "resources/read",
+                "params": {
+                    "uri": "codestory://diagnostics/retrieval-engine",
+                    "project": project.path(),
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("retrieval-engine resource response");
+        response["result"]["contents"][0]["uri"] = json!("<PROJECT_URI>");
+        std::fs::write(
+            output,
+            serde_json::to_string_pretty(&response).expect("serialize status wire fixture"),
+        )
+        .expect("write status wire fixture");
+    }
+
+    #[test]
+    fn pre_change_status_wire_retrieval_engine_resource_is_non_vacuous() {
+        let output = tempfile::NamedTempFile::new().expect("status wire output");
+        let child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "stdio_transport::tests::write_pre_change_status_wire_retrieval_engine_resource_fixture",
+            ])
+            .env(STATUS_WIRE_CHILD_OUTPUT, output.path())
+            .output()
+            .expect("run isolated status wire fixture");
+        assert!(
+            child.status.success(),
+            "isolated status wire fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        let response: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.path()).expect("read status wire fixture"),
+        )
+        .expect("parse status wire fixture");
+        let text = response
+            .pointer("/result/contents/0/text")
+            .and_then(serde_json::Value::as_str)
+            .expect("retrieval-engine resource text");
+        let diagnostics: serde_json::Value =
+            serde_json::from_str(text).expect("parse retrieval-engine resource text");
+        crate::status_wire_test_support::assert_exact_fields(
+            &diagnostics,
+            &crate::status_wire_test_support::DIAGNOSTIC_FIELDS,
+            "retrieval-engine diagnostics",
+        );
+        crate::status_wire_test_support::assert_json_golden(
+            &response,
+            crate::status_wire_test_support::STDIO_GOLDEN,
+            "retrieval-engine resources/read",
+        );
+    }
+
     #[test]
     fn invalid_resource_uri_is_rejected_before_project_selection() {
         let project = tempfile::tempdir().expect("project");

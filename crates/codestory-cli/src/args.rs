@@ -922,6 +922,15 @@ impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
     }
 }
 
+impl From<CliSidecarProfile> for codestory_runtime::RuntimeRetrievalProfile {
+    fn from(value: CliSidecarProfile) -> Self {
+        match value {
+            CliSidecarProfile::Local => Self::Local,
+            CliSidecarProfile::Agent => Self::Agent,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct RetrievalQueryCommand {
     /// Natural-language, symbol, or path query string.

@@ -314,6 +314,7 @@ mod trail_story;
 
 pub use activation_status::{
     RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError, RetrievalEngineDiagnosticsStage,
+    RetrievalStatusObservation, RetrievalStatusObservationError, RetrievalStatusSelection,
 };
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};

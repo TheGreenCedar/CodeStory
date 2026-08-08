@@ -46,26 +46,53 @@ pub(in crate::app::diagnostics) fn readiness_sidecar_input(
 }
 
 pub(crate) fn doctor_sidecar_status(runtime: &RuntimeContext) -> RetrievalStatusOutput {
-    doctor_sidecar_status_for_runtime(runtime, runtime.sidecar.clone())
+    doctor_sidecar_status_from_observation(
+        runtime
+            .activation
+            .retrieval_status(&runtime.project_root, &runtime.storage_path),
+    )
 }
 
-pub(in crate::app::diagnostics) fn doctor_sidecar_status_for_runtime(
+pub(in crate::app::diagnostics) fn doctor_sidecar_status_for_profile(
     runtime: &RuntimeContext,
-    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    profile: codestory_runtime::RuntimeRetrievalProfile,
+    run_id: Option<&str>,
 ) -> RetrievalStatusOutput {
-    match codestory_retrieval::strict_sidecar_status_for_runtime(
+    doctor_sidecar_status_from_observation(runtime.activation.retrieval_status_for_profile(
         &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar.clone(),
-    ) {
-        Ok(report) => doctor_sidecar_status_from_report(report, Some(&sidecar)),
-        Err(error) => doctor_sidecar_status_error(error, Some(&sidecar)),
+        &runtime.storage_path,
+        profile,
+        run_id,
+    ))
+}
+
+fn doctor_sidecar_status_from_observation(
+    observation: Result<
+        codestory_runtime::RetrievalStatusObservation,
+        codestory_runtime::RetrievalStatusObservationError,
+    >,
+) -> RetrievalStatusOutput {
+    match observation {
+        Ok(observation) => {
+            let (selection, report) = observation.into_parts();
+            doctor_sidecar_status_from_report(
+                report,
+                Some(selection.profile().as_str()),
+                selection.run_id(),
+            )
+        }
+        Err(error) => {
+            let profile = error.selection().profile().as_str();
+            let run_id = error.selection().run_id().map(str::to_string);
+            doctor_sidecar_status_error(error, Some(profile), run_id.as_deref())
+        }
     }
 }
 
 pub(in crate::app::diagnostics) fn doctor_sidecar_status_from_report(
-    report: codestory_retrieval::RetrievalStatusReport,
-    runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
+    report: codestory_runtime::RetrievalStatusReport,
+    profile: Option<&str>,
+    run_id: Option<&str>,
 ) -> RetrievalStatusOutput {
     let manifest_generation = report
         .manifest
@@ -92,8 +119,8 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_from_report(
         .as_ref()
         .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
     RetrievalStatusOutput {
-        profile: runtime.map(|runtime| runtime.profile.as_str().to_string()),
-        run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
+        profile: profile.map(str::to_string),
+        run_id: run_id.map(str::to_string),
         retrieval_mode: report.retrieval_mode,
         degraded_reason: report.degraded_reason,
         embedding_device_policy: report.embedding_device_policy,
@@ -115,12 +142,13 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_from_report(
 }
 
 pub(in crate::app::diagnostics) fn doctor_sidecar_status_error(
-    error: anyhow::Error,
-    runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
+    error: impl std::fmt::Display,
+    profile: Option<&str>,
+    run_id: Option<&str>,
 ) -> RetrievalStatusOutput {
     RetrievalStatusOutput {
-        profile: runtime.map(|runtime| runtime.profile.as_str().to_string()),
-        run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
+        profile: profile.map(str::to_string),
+        run_id: run_id.map(str::to_string),
         retrieval_mode: "unavailable".to_string(),
         degraded_reason: Some(format!("retrieval_status_error: {error}")),
         embedding_device_policy: "accelerator_required".to_string(),
@@ -138,5 +166,63 @@ pub(in crate::app::diagnostics) fn doctor_sidecar_status_error(
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status_wire_test_support as wire;
+    use serde_json::{Value, json};
+
+    fn observed_status_cases() -> Value {
+        json!({
+            "healthy": doctor_sidecar_status_from_report(
+                wire::healthy_status_report(),
+                Some("agent"),
+                Some("golden-run"),
+            ),
+            "degraded": doctor_sidecar_status_from_report(
+                wire::degraded_status_report(),
+                Some("agent"),
+                Some("golden-run"),
+            ),
+            "unavailable": doctor_sidecar_status_from_report(
+                wire::unavailable_status_report(),
+                Some("agent"),
+                Some("golden-run"),
+            ),
+            "probe_error": doctor_sidecar_status_error(
+                wire::probe_error(),
+                Some("agent"),
+                Some("golden-run"),
+            ),
+        })
+    }
+
+    #[test]
+    fn pre_change_status_wire_doctor_surface_is_non_vacuous() {
+        let cases = observed_status_cases();
+        let cases = cases.as_object().expect("doctor cases");
+        let union = cases
+            .values()
+            .flat_map(|case| case.as_object().expect("doctor status object").keys())
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            union,
+            wire::DOCTOR_STATUS_FIELDS.into_iter().collect(),
+            "doctor status field set drifted"
+        );
+        wire::assert_non_null_coverage(
+            &cases.values().cloned().collect::<Vec<_>>(),
+            &wire::DOCTOR_STATUS_FIELDS,
+            "doctor status",
+        );
+        wire::assert_json_golden(
+            &Value::Object(cases.clone()),
+            wire::DOCTOR_GOLDEN,
+            "doctor status",
+        );
     }
 }

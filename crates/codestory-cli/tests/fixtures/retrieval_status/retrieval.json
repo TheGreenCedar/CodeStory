@@ -1,0 +1,241 @@
+{
+  "degraded": {
+    "json": {
+      "degraded_reason": "semantic_store_degraded",
+      "embedding_accelerator_request_device": "gpu:0",
+      "embedding_accelerator_request_provider": "metal",
+      "embedding_accelerator_requested": true,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": "golden-gpu",
+      "embedding_detected_provider": "metal",
+      "embedding_device_observation_source": "per_user_server",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "degraded",
+      "lexical": {
+        "capabilities": {
+          "graph": false,
+          "lexical": true,
+          "semantic": false
+        },
+        "detail": "lexical ready",
+        "latency_ms": 2,
+        "name": "lexical",
+        "status": "healthy"
+      },
+      "manifest": {
+        "built_at_epoch_ms": 1725000000000,
+        "degraded_modes_json": "[]",
+        "dense_projection_count": 5,
+        "dense_reason_counts_json": "{\"public_api\":5}",
+        "disk_bytes": 4096,
+        "embedding_backend": "manifest-backend",
+        "embedding_dim": 768,
+        "graph_artifact_hash": "golden-graph-hash",
+        "lexical_version": "sqlite-fts5-v1",
+        "precise_semantic_import_producer": "golden-import-producer",
+        "precise_semantic_import_reason": "golden-import-reason",
+        "precise_semantic_import_revision": "golden-import-revision",
+        "precise_semantic_import_status": "fresh",
+        "project_id": "golden-project",
+        "projection_count": 13,
+        "scip_revision": "graph-test",
+        "semantic_generation": "codestory_golden-project_golden-input",
+        "semantic_policy_version": "graph_first_v2",
+        "sidecar_generation": "golden-generation",
+        "sidecar_input_hash": "golden-input",
+        "sidecar_schema_version": 6,
+        "symbol_doc_count": 8
+      },
+      "manifest_contract": {
+        "degraded_modes": [],
+        "degraded_reason": null,
+        "dense_anchor_count": 5,
+        "generation": "golden-generation",
+        "graph_hash": "golden-graph-hash",
+        "input_hash": "golden-input",
+        "lanes": [
+          {
+            "count": 5,
+            "lane": "semantic",
+            "producer": "golden-producer",
+            "provenance": "golden-provenance",
+            "status": "ready"
+          }
+        ],
+        "project_id": "golden-project",
+        "retrieval_mode": "full",
+        "schema_version": 7,
+        "source_root": "/golden/project",
+        "symbol_doc_count": 8
+      },
+      "manifest_vector_embedding_backend": "manifest-backend",
+      "manifest_vector_embedding_dim": 768,
+      "query_embedding_backend": "query-backend",
+      "retrieval_mode": "full",
+      "scip": {
+        "capabilities": {
+          "graph": true,
+          "lexical": false,
+          "semantic": false
+        },
+        "detail": "scip ready",
+        "latency_ms": 4,
+        "name": "scip",
+        "status": "healthy"
+      },
+      "semantic": {
+        "capabilities": {
+          "graph": false,
+          "lexical": false,
+          "semantic": true
+        },
+        "degraded_reason": "semantic_store_degraded",
+        "detail": "semantic degraded",
+        "latency_ms": 3,
+        "name": "semantic",
+        "status": "degraded"
+      },
+      "stored_doc_vector_dim": 768,
+      "stored_doc_vector_mixed_backends": false,
+      "stored_doc_vector_producer_backend": "stored-backend"
+    },
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: Some(\"semantic_store_degraded\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`degraded` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Degraded (\"semantic degraded\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n"
+  },
+  "healthy": {
+    "json": {
+      "embedding_accelerator_request_device": "gpu:0",
+      "embedding_accelerator_request_provider": "metal",
+      "embedding_accelerator_requested": true,
+      "embedding_cpu_allowed": false,
+      "embedding_detected_gpu": "golden-gpu",
+      "embedding_detected_provider": "metal",
+      "embedding_device_observation_source": "per_user_server",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "accelerated",
+      "lexical": {
+        "capabilities": {
+          "graph": false,
+          "lexical": true,
+          "semantic": false
+        },
+        "detail": "lexical ready",
+        "latency_ms": 2,
+        "name": "lexical",
+        "status": "healthy"
+      },
+      "manifest": {
+        "built_at_epoch_ms": 1725000000000,
+        "degraded_modes_json": "[]",
+        "dense_projection_count": 5,
+        "dense_reason_counts_json": "{\"public_api\":5}",
+        "disk_bytes": 4096,
+        "embedding_backend": "manifest-backend",
+        "embedding_dim": 768,
+        "graph_artifact_hash": "golden-graph-hash",
+        "lexical_version": "sqlite-fts5-v1",
+        "precise_semantic_import_producer": "golden-import-producer",
+        "precise_semantic_import_reason": "golden-import-reason",
+        "precise_semantic_import_revision": "golden-import-revision",
+        "precise_semantic_import_status": "fresh",
+        "project_id": "golden-project",
+        "projection_count": 13,
+        "scip_revision": "graph-test",
+        "semantic_generation": "codestory_golden-project_golden-input",
+        "semantic_policy_version": "graph_first_v2",
+        "sidecar_generation": "golden-generation",
+        "sidecar_input_hash": "golden-input",
+        "sidecar_schema_version": 6,
+        "symbol_doc_count": 8
+      },
+      "manifest_contract": {
+        "degraded_modes": [],
+        "degraded_reason": null,
+        "dense_anchor_count": 5,
+        "generation": "golden-generation",
+        "graph_hash": "golden-graph-hash",
+        "input_hash": "golden-input",
+        "lanes": [
+          {
+            "count": 5,
+            "lane": "semantic",
+            "producer": "golden-producer",
+            "provenance": "golden-provenance",
+            "status": "ready"
+          }
+        ],
+        "project_id": "golden-project",
+        "retrieval_mode": "full",
+        "schema_version": 7,
+        "source_root": "/golden/project",
+        "symbol_doc_count": 8
+      },
+      "manifest_vector_embedding_backend": "manifest-backend",
+      "manifest_vector_embedding_dim": 768,
+      "query_embedding_backend": "query-backend",
+      "retrieval_mode": "full",
+      "scip": {
+        "capabilities": {
+          "graph": true,
+          "lexical": false,
+          "semantic": false
+        },
+        "detail": "scip ready",
+        "latency_ms": 4,
+        "name": "scip",
+        "status": "healthy"
+      },
+      "semantic": {
+        "capabilities": {
+          "graph": false,
+          "lexical": false,
+          "semantic": true
+        },
+        "detail": "semantic ready",
+        "latency_ms": 3,
+        "name": "semantic",
+        "status": "healthy"
+      },
+      "stored_doc_vector_dim": 768,
+      "stored_doc_vector_mixed_backends": false,
+      "stored_doc_vector_producer_backend": "stored-backend"
+    },
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `full`\n- degraded_reason: None\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`accelerated` observation_source=`per_user_server` detected_provider=Some(\"metal\") detected_gpu=Some(\"golden-gpu\") accelerator_requested=true accelerator_request_provider=Some(\"metal\") accelerator_request_device=Some(\"gpu:0\") cpu_allowed=false\n- manifest_vector_embedding_backend: `manifest-backend` dim=Some(768)\n- stored_doc_vector_producer: `stored-backend` dim=Some(768) mixed_backends=Some(false)\n- manifest_contract: generation=Some(\"golden-generation\") input_hash=Some(\"golden-input\") lanes=`semantic:golden-producer:ready`\n- lexical: Healthy (\"lexical ready\") capabilities: lexical=true\n- semantic: Healthy (\"semantic ready\") capabilities: semantic=true\n- scip: Healthy (\"scip ready\") capabilities: graph=true\n"
+  },
+  "probe_error": {
+    "error": [
+      "retrieval status",
+      "golden retrieval probe failed"
+    ]
+  },
+  "unavailable": {
+    "json": {
+      "degraded_reason": "retrieval_manifest_missing",
+      "embedding_accelerator_requested": false,
+      "embedding_cpu_allowed": false,
+      "embedding_device_observation_source": "retrieval_unobserved",
+      "embedding_device_policy": "accelerator_required",
+      "embedding_device_state": "unknown",
+      "lexical": {
+        "degraded_reason": "retrieval_manifest_missing",
+        "detail": "lexical unavailable",
+        "name": "lexical",
+        "status": "unavailable"
+      },
+      "query_embedding_backend": "query-backend",
+      "retrieval_mode": "unavailable",
+      "scip": {
+        "degraded_reason": "retrieval_manifest_missing",
+        "detail": "scip unavailable",
+        "name": "scip",
+        "status": "unavailable"
+      },
+      "semantic": {
+        "degraded_reason": "retrieval_manifest_missing",
+        "detail": "semantic unavailable",
+        "name": "semantic",
+        "status": "unavailable"
+      }
+    },
+    "markdown": "# Retrieval status\n\n- retrieval_mode: `unavailable`\n- degraded_reason: Some(\"retrieval_manifest_missing\")\n- query_embedding_backend: `query-backend`\n- embedding_device_policy: `accelerator_required` observed_device=`unknown` observation_source=`retrieval_unobserved` detected_provider=None detected_gpu=None accelerator_requested=false accelerator_request_provider=None accelerator_request_device=None cpu_allowed=false\n- manifest_vector_embedding_backend: `<none>` dim=None\n- stored_doc_vector_producer: `<none>` dim=None mixed_backends=None\n- lexical: Unavailable (\"lexical unavailable\") capabilities: lexical=false\n- semantic: Unavailable (\"semantic unavailable\") capabilities: semantic=false\n- scip: Unavailable (\"scip unavailable\") capabilities: graph=false\n"
+  }
+}

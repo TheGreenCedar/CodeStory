@@ -14,12 +14,106 @@ use std::fmt;
 use std::path::Path;
 
 use crate::services::ActivationService;
+use crate::{RetrievalStatusReport, RuntimeRetrievalProfile};
+
+/// Effective retrieval namespace selected for one status observation.
+///
+/// The run ID is the retrieval-owned effective value, not merely the adapter's
+/// request. In particular, an Agent observation without an explicit run ID
+/// carries the shared Agent run ID selected by retrieval configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalStatusSelection {
+    profile: RuntimeRetrievalProfile,
+    run_id: Option<String>,
+}
+
+impl RetrievalStatusSelection {
+    fn from_runtime(runtime: &codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        Self {
+            profile: runtime.profile.into(),
+            run_id: runtime.run_id.clone(),
+        }
+    }
+
+    /// Effective Local or Agent profile.
+    #[must_use]
+    pub fn profile(&self) -> RuntimeRetrievalProfile {
+        self.profile
+    }
+
+    /// Effective run ID, including retrieval's default Agent run ID.
+    #[must_use]
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+}
+
+/// Strict retrieval status paired with its effective namespace selection.
+#[derive(Debug, Clone)]
+pub struct RetrievalStatusObservation {
+    selection: RetrievalStatusSelection,
+    report: RetrievalStatusReport,
+}
+
+impl RetrievalStatusObservation {
+    /// Effective selection used by the strict probe.
+    #[must_use]
+    pub fn selection(&self) -> &RetrievalStatusSelection {
+        &self.selection
+    }
+
+    /// Strict retrieval report.
+    #[must_use]
+    pub fn report(&self) -> &RetrievalStatusReport {
+        &self.report
+    }
+
+    /// Consume the observation without losing its effective selection.
+    #[must_use]
+    pub fn into_parts(self) -> (RetrievalStatusSelection, RetrievalStatusReport) {
+        (self.selection, self.report)
+    }
+}
+
+/// Strict retrieval observation failure with the selection that was probed.
+#[derive(Debug)]
+pub struct RetrievalStatusObservationError {
+    selection: RetrievalStatusSelection,
+    source: anyhow::Error,
+}
+
+impl RetrievalStatusObservationError {
+    /// Effective selection used by the failed strict probe.
+    #[must_use]
+    pub fn selection(&self) -> &RetrievalStatusSelection {
+        &self.selection
+    }
+
+    /// Recover the original retrieval error and its complete context chain.
+    #[must_use]
+    pub fn into_parts(self) -> (RetrievalStatusSelection, anyhow::Error) {
+        (self.selection, self.source)
+    }
+}
+
+impl fmt::Display for RetrievalStatusObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for RetrievalStatusObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let source: &(dyn std::error::Error + 'static) = self.source.as_ref();
+        Some(source)
+    }
+}
 
 /// Observational retrieval diagnostics for one project's storage.
 ///
 /// `engine` and `embedding_server` stay serialized: the retrieval crate owns
-/// their shapes and the adapter only forwards them, so no retrieval type
-/// crosses the runtime boundary.
+/// their shapes and the adapter only forwards them without consuming their
+/// concrete types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalEngineDiagnostics {
     /// Strict sidecar retrieval mode for this project.
@@ -122,6 +216,58 @@ impl ActivationService {
         }
     }
 
+    /// Observe strict retrieval status using this service's pinned runtime
+    /// configuration. This starts no server, loads no model, and mutates no
+    /// retrieval state.
+    pub fn retrieval_status(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Result<RetrievalStatusObservation, RetrievalStatusObservationError> {
+        self.retrieval_status_with_runtime(
+            project_root,
+            storage_path,
+            self.controller.runtime_config.as_ref().clone(),
+        )
+    }
+
+    /// Observe strict retrieval status for an explicit Local or Agent lane.
+    ///
+    /// Profile and run-ID selection happens inside runtime so adapters never
+    /// reproduce retrieval namespace defaults. The observation remains
+    /// read-only.
+    pub fn retrieval_status_for_profile(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        profile: RuntimeRetrievalProfile,
+        run_id: Option<&str>,
+    ) -> Result<RetrievalStatusObservation, RetrievalStatusObservationError> {
+        let runtime = self.controller.runtime_config.with_profile_and_run_id(
+            Some(project_root),
+            profile.into(),
+            run_id,
+        );
+        self.retrieval_status_with_runtime(project_root, storage_path, runtime)
+    }
+
+    fn retrieval_status_with_runtime(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: codestory_retrieval::SidecarRuntimeConfig,
+    ) -> Result<RetrievalStatusObservation, RetrievalStatusObservationError> {
+        let selection = RetrievalStatusSelection::from_runtime(&runtime);
+        match codestory_retrieval::strict_sidecar_status_for_runtime(
+            project_root,
+            Some(storage_path),
+            runtime,
+        ) {
+            Ok(report) => Ok(RetrievalStatusObservation { selection, report }),
+            Err(source) => Err(RetrievalStatusObservationError { selection, source }),
+        }
+    }
+
     /// Observe engine health, the per-user embedding server, and the strict
     /// sidecar retrieval status for one project.
     ///
@@ -164,20 +310,17 @@ impl ActivationService {
                 }
             }),
         };
-        let status = codestory_retrieval::strict_sidecar_status_for_runtime(
-            project_root,
-            Some(storage_path),
-            runtime_config.clone(),
-        )
-        .map_err(|error| {
-            RetrievalEngineDiagnosticsError::new(
-                RetrievalEngineDiagnosticsStage::RetrievalStatus,
-                error.to_string(),
-            )
-        })?;
+        let status = self
+            .retrieval_status(project_root, storage_path)
+            .map_err(|error| {
+                RetrievalEngineDiagnosticsError::new(
+                    RetrievalEngineDiagnosticsStage::RetrievalStatus,
+                    error.to_string(),
+                )
+            })?;
         Ok(RetrievalEngineDiagnostics {
-            retrieval_mode: status.retrieval_mode,
-            degraded_reason: status.degraded_reason,
+            retrieval_mode: status.report.retrieval_mode,
+            degraded_reason: status.report.degraded_reason,
             engine,
             embedding_server,
         })
@@ -252,6 +395,129 @@ mod tests {
         assert_eq!(diagnostics.engine, expected_engine);
         assert_eq!(diagnostics.retrieval_mode, expected_status.retrieval_mode);
         assert_eq!(diagnostics.degraded_reason, expected_status.degraded_reason);
+    }
+
+    #[test]
+    fn status_observation_preserves_default_and_profile_selected_runtime_identity() {
+        let fixture = diagnostics_fixture();
+        let service = fixture.runtime.activation_service();
+
+        let default = service
+            .retrieval_status(&fixture.project_root, &fixture.storage_path)
+            .expect("default status observation");
+        assert_eq!(
+            default.selection(),
+            &RetrievalStatusSelection::from_runtime(&fixture.sidecar)
+        );
+        assert_eq!(
+            default.selection().run_id(),
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            "an omitted Agent run ID must retain retrieval's effective shared run ID"
+        );
+        let direct_default = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &fixture.project_root,
+            Some(&fixture.storage_path),
+            fixture.sidecar.clone(),
+        )
+        .expect("direct default status");
+        assert_eq!(
+            serde_json::to_value(default.report()).expect("serialize default service status"),
+            serde_json::to_value(direct_default).expect("serialize default direct status")
+        );
+
+        for (profile, run_id) in [
+            (RuntimeRetrievalProfile::Local, None),
+            (RuntimeRetrievalProfile::Local, Some("ignored-local-run")),
+            (RuntimeRetrievalProfile::Agent, None),
+            (RuntimeRetrievalProfile::Agent, Some("explicit-agent-run")),
+        ] {
+            let selected = fixture.sidecar.with_profile_and_run_id(
+                Some(&fixture.project_root),
+                profile.into(),
+                run_id,
+            );
+            let observed = service
+                .retrieval_status_for_profile(
+                    &fixture.project_root,
+                    &fixture.storage_path,
+                    profile,
+                    run_id,
+                )
+                .expect("profile status observation");
+            assert_eq!(
+                observed.selection(),
+                &RetrievalStatusSelection::from_runtime(&selected),
+                "profile={profile:?} run_id={run_id:?} selected the wrong namespace"
+            );
+            let expected_run_id = match (profile, run_id) {
+                (RuntimeRetrievalProfile::Local, _) => None,
+                (RuntimeRetrievalProfile::Agent, None) => {
+                    Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                }
+                (RuntimeRetrievalProfile::Agent, Some(run_id)) => Some(run_id),
+            };
+            assert_eq!(
+                observed.selection().run_id(),
+                expected_run_id,
+                "profile={profile:?} run_id={run_id:?} changed the effective run ID"
+            );
+            let direct = codestory_retrieval::strict_sidecar_status_for_runtime(
+                &fixture.project_root,
+                Some(&fixture.storage_path),
+                selected,
+            )
+            .expect("direct profile status");
+            assert_eq!(
+                serde_json::to_value(observed.report()).expect("serialize service status"),
+                serde_json::to_value(direct).expect("serialize direct status"),
+                "profile={profile:?} run_id={run_id:?} changed the strict report"
+            );
+        }
+    }
+
+    #[test]
+    fn status_observation_failure_preserves_effective_selection_and_error_chain() {
+        let fixture = diagnostics_fixture();
+        fs::write(&fixture.storage_path, b"not a sqlite database").expect("write hostile storage");
+        let profile = RuntimeRetrievalProfile::Agent;
+        let selected = fixture.sidecar.with_profile_and_run_id(
+            Some(&fixture.project_root),
+            profile.into(),
+            None,
+        );
+        let direct = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &fixture.project_root,
+            Some(&fixture.storage_path),
+            selected.clone(),
+        )
+        .expect_err("hostile storage must refuse the direct probe");
+        let error = fixture
+            .runtime
+            .activation_service()
+            .retrieval_status_for_profile(
+                &fixture.project_root,
+                &fixture.storage_path,
+                profile,
+                None,
+            )
+            .expect_err("hostile storage must refuse the service probe");
+
+        assert_eq!(
+            error.selection(),
+            &RetrievalStatusSelection::from_runtime(&selected)
+        );
+        assert_eq!(error.to_string(), direct.to_string());
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some(direct.to_string()),
+            "the standard Error chain must start with the underlying retrieval failure"
+        );
+        let (_, source) = error.into_parts();
+        assert_eq!(
+            source.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            direct.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            "runtime must preserve the retrieval error chain byte for byte"
+        );
     }
 
     #[test]

@@ -3,9 +3,10 @@ use codestory_contracts::api::IndexMode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use codestory_retrieval::{
-    FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest, RetrievalStatusReport,
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarRuntimeConfig, strict_sidecar_status_for_runtime,
+    FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarRuntimeConfig,
 };
+use codestory_runtime::RetrievalStatusReport;
 
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction,
@@ -136,26 +137,36 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     let profile = cmd
         .profile
         .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
-    let report = if let Some(profile) = profile {
-        let sidecar = runtime.sidecar.with_profile_and_run_id(
-            Some(&runtime.project_root),
+    let observation = if let Some(profile) = profile {
+        runtime.activation.retrieval_status_for_profile(
+            &runtime.project_root,
+            &runtime.storage_path,
             profile.into(),
             cmd.run_id.as_deref(),
-        );
-        codestory_retrieval::strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            sidecar,
         )
     } else {
-        strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            runtime.sidecar.clone(),
-        )
-    }
-    .context("retrieval status")?;
+        runtime
+            .activation
+            .retrieval_status(&runtime.project_root, &runtime.storage_path)
+    };
+    let report = retrieval_status_result(observation)?;
     emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+}
+
+fn retrieval_status_result(
+    result: std::result::Result<
+        codestory_runtime::RetrievalStatusObservation,
+        codestory_runtime::RetrievalStatusObservationError,
+    >,
+) -> anyhow::Result<RetrievalStatusReport> {
+    match result {
+        Ok(observation) => Ok(observation.into_parts().1),
+        Err(error) => retrieval_status_error(error.into_parts().1),
+    }
+}
+
+fn retrieval_status_error(error: anyhow::Error) -> anyhow::Result<RetrievalStatusReport> {
+    Err(error).context("retrieval status")
 }
 
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
@@ -501,11 +512,75 @@ mod tests {
     use super::*;
     #[cfg(not(windows))]
     use crate::args::ProjectArgs;
+    use crate::status_wire_test_support as wire;
     use anyhow::anyhow;
     #[cfg(not(windows))]
     use std::fs;
     #[cfg(not(windows))]
     use tempfile::tempdir;
+
+    fn rendered_status_case(report: &RetrievalStatusReport) -> serde_json::Value {
+        let output = tempfile::tempdir().expect("status output");
+        let json_path = output.path().join("status.json");
+        let markdown_path = output.path().join("status.md");
+        emit_retrieval_status(OutputFormat::Json, report, Some(&json_path))
+            .expect("emit status json");
+        emit_retrieval_status(OutputFormat::Markdown, report, Some(&markdown_path))
+            .expect("emit status markdown");
+        let json_text = std::fs::read_to_string(json_path).expect("read status json");
+        let markdown = std::fs::read_to_string(markdown_path).expect("read status markdown");
+        serde_json::json!({
+            "json": serde_json::from_str::<serde_json::Value>(&json_text)
+                .expect("parse status json"),
+            "markdown": markdown,
+        })
+    }
+
+    #[test]
+    fn pre_change_status_wire_retrieval_json_and_markdown_are_non_vacuous() {
+        let healthy = wire::healthy_status_report();
+        let degraded = wire::degraded_status_report();
+        let unavailable = wire::unavailable_status_report();
+        assert!(healthy.is_live_ready());
+        assert!(
+            !degraded.is_live_ready(),
+            "full plus a degraded reason must not be live-ready"
+        );
+        let cases = serde_json::json!({
+            "healthy": rendered_status_case(&healthy),
+            "degraded": rendered_status_case(&degraded),
+            "unavailable": rendered_status_case(&unavailable),
+            "probe_error": {
+                "error": retrieval_status_error(wire::probe_error())
+                    .expect_err("probe error must remain an error")
+                    .chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            },
+        });
+        let raw_cases = cases
+            .as_object()
+            .expect("retrieval cases")
+            .values()
+            .filter_map(|case| case.get("json").cloned())
+            .collect::<Vec<_>>();
+        wire::assert_non_null_coverage(
+            &raw_cases,
+            &wire::RAW_STATUS_FIELDS,
+            "raw retrieval status",
+        );
+        let union = raw_cases
+            .iter()
+            .flat_map(|case| case.as_object().expect("raw status object").keys())
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            union,
+            wire::RAW_STATUS_FIELDS.into_iter().collect(),
+            "raw retrieval status field set drifted"
+        );
+        wire::assert_json_golden(&cases, wire::RETRIEVAL_GOLDEN, "retrieval status");
+    }
 
     #[cfg(not(windows))]
     #[test]
