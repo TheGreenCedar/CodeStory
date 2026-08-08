@@ -99,6 +99,24 @@ function axiosV2CorpusFixture(mutate) {
   return { dir, paths, contractRelative };
 }
 
+function ripgrepV2CorpusFixture(mutate) {
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-ripgrep-v2-corpus-"));
+  const taskRelative = "benchmarks/tasks/release-evidence/ripgrep-search-pipeline-v2.task.json";
+  const projectRelative = "benchmarks/tasks/release-evidence/ripgrep-rust-codestory-project-v2.json";
+  const contractRelative = "benchmarks/release-evidence/corpus-contracts/v0.17-ripgrep-rust-v2.json";
+  for (const relative of [taskRelative, projectRelative, contractRelative]) {
+    mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+    copyFileSync(path.join(root, relative), path.join(dir, relative));
+  }
+  const paths = {
+    task: path.join(dir, taskRelative),
+    project: path.join(dir, projectRelative),
+    contract: path.join(dir, contractRelative),
+  };
+  mutate?.(paths);
+  return { dir, paths, contractRelative };
+}
+
 function rewriteJson(filePath, mutate) {
   const document = JSON.parse(readFileSync(filePath));
   mutate(document);
@@ -116,6 +134,8 @@ function rebindTaskHash(paths) {
 function validateAxiosV2Fixture(dir, paths, contractRelative) {
   const contractBytes = readFileSync(paths.contract);
   const contract = JSON.parse(contractBytes);
+  const taskId = contract.task_ids[0];
+  const task = JSON.parse(readFileSync(path.join(dir, contract.task_manifests[taskId].path)));
   const identity = {
     corpus_id: contract.corpus_id,
     cache_id: "cold-inprocess-v1",
@@ -129,12 +149,12 @@ function validateAxiosV2Fixture(dir, paths, contractRelative) {
     runtime_modes: contract.runtime_modes,
     repeats: contract.repeats,
     task_manifests: contract.task_manifests,
-    task_repositories: { "axios-request-dispatch-v2": "axios" },
+    task_repositories: { [taskId]: task.repo.name },
     project_manifests: contract.project_manifests,
   };
   const rows = Array.from({ length: contract.repeats }, (_, index) => ({
-    repo: "axios",
-    task_id: "axios-request-dispatch-v2",
+    repo: task.repo.name,
+    task_id: taskId,
     mode: "cold_cli_packet",
     repeat: index + 1,
   }));
@@ -190,9 +210,36 @@ test("Axios v2 project manifest binding fails closed", async (t) => {
   }
 });
 
+test("Ripgrep v2 corpus binds retained 0.60 floors and fails closed on changed task bytes", async (t) => {
+  const fixture = ripgrepV2CorpusFixture();
+  const task = JSON.parse(readFileSync(fixture.paths.task));
+  assert.deepEqual(task.quality_thresholds, {
+    min_expected_anchor_recall: 0.7,
+    min_expected_file_recall: 0.6,
+    min_expected_symbol_recall: 0.65,
+    min_expected_claim_recall: 0.75,
+    min_citation_coverage: 0.6,
+    max_forbidden_claims: 0,
+  });
+
+  assert.doesNotThrow(validateAxiosV2Fixture(fixture.dir, fixture.paths, fixture.contractRelative));
+
+  await t.test("corrupt task-manifest binding is rejected", () => {
+    const changed = ripgrepV2CorpusFixture(paths => {
+      rewriteJson(paths.contract, contract => {
+        contract.task_manifests["ripgrep-search-pipeline-v2"].sha256 = "0".repeat(64);
+      });
+    });
+    assert.throws(
+      validateAxiosV2Fixture(changed.dir, changed.paths, changed.contractRelative),
+      /release corpus task manifest hash does not match for ripgrep-search-pipeline-v2/,
+    );
+  });
+});
+
 test("fingerprint prefers a validated provisioned machine identity", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-provisioning-"));
-  const profile = "codestory-release-evidence-linux-arm64-v1";
+  const profile = "release-evidence-fixture-profile-v1";
   const contractSha = "1".repeat(64);
   const observed = { guest: { arch: "aarch64" }, host: { model: "Mac17,4" } };
   const observedSha = createHash("sha256").update(`${JSON.stringify(observed)}\n`).digest("hex");

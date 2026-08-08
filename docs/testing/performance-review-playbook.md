@@ -198,10 +198,12 @@ Protected run `29623187686` stopped before measurement after detecting a stale
 retrieval namespace in the harness. Run `29624645979` at
 `dd14e2d0e29b9e09438a0aa4f9a6ea6250e69738` then completed the source and Serde
 gates plus all six cold packet rows. Axios passed all three repeats. Ripgrep
-failed all three at 0.60 file recall and 0.60 citation coverage against the
-fixed 0.70 thresholds, and a later status process could not report the packet
-process's local engine identity. Those failures are retained; they do not
-define a baseline.
+measured 0.60 file recall and 0.60 citation coverage on all three repeats,
+with 0.80 symbol and anchor recall, 1.0 claim recall, and zero forbidden
+claims. Those retained rows define the v0.17 release-only Ripgrep contract's
+D2-corrected 0.60 floors; v0.16 remains Axios-only. A later status process
+could not report the packet process's local engine identity, so the retained
+run does not replace current-host quality-lane proof.
 
 Before another protected measurement, v0.16 is narrowed to the new hash-bound
 `codestory-release-corpus-v0.16-axios-js-ts-v1` contract: exactly the Axios task

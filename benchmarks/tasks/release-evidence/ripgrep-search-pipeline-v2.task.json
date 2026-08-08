@@ -1,0 +1,107 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "ripgrep-search-pipeline-v2",
+  "version": 2,
+  "suite": "release-evidence",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "ripgrep",
+    "url": "https://github.com/BurntSushi/ripgrep.git",
+    "ref": "e50df40a1967708b9781486b1c017e48040bceb0",
+    "workspace_root": ".",
+    "languages": [
+      "Rust"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ],
+    "codestory_project_manifest": {
+      "path": "ripgrep-rust-codestory-project-v2.json",
+      "sha256": "58ddc0a740af06f99e00c51beb1b7331445a1c63f432251a7b0fb7d753db8962"
+    }
+  },
+  "prompt": "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files that support the path.",
+  "expected_files": [
+    "crates/core/main.rs",
+    "crates/core/flags/mod.rs",
+    "crates/core/flags/hiargs.rs",
+    "crates/core/haystack.rs",
+    "crates/core/search.rs"
+  ],
+  "expected_symbols": [
+    {
+      "name": "main",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "CLI entry point that delegates into the search driver."
+    },
+    {
+      "name": "run",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "Selects search, files, types, or generate modes after flag parsing."
+    },
+    {
+      "name": "search",
+      "path": "crates/core/main.rs",
+      "kind": "function",
+      "why": "Single-threaded directory walk and per-file search loop."
+    },
+    {
+      "name": "SearchWorker",
+      "path": "crates/core/search.rs",
+      "kind": "struct",
+      "why": "Coordinates matcher, searcher, and printer for each haystack."
+    },
+    {
+      "name": "SearchWorker::search",
+      "path": "crates/core/search.rs",
+      "kind": "method",
+      "why": "Executes one haystack search including preprocessors and decompression."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "main calls run after flags::parse and routes into search or parallel search modes."
+    },
+    {
+      "text": "HiArgs builds walkers, matchers, searchers, and printers used by the search driver."
+    },
+    {
+      "text": "search walks haystacks from the ignore crate and invokes SearchWorker per file."
+    },
+    {
+      "text": "SearchWorker connects a PatternMatcher, grep searcher, and Printer for each haystack."
+    },
+    {
+      "text": "search_parallel uses walk_builder().build_parallel() to search files concurrently."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "ripgrep searches files without building haystacks from the directory walker.",
+      "severity": "critical"
+    },
+    {
+      "text": "Flag parsing happens inside SearchWorker instead of before run selects a mode.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.7,
+    "min_expected_file_recall": 0.6,
+    "min_expected_symbol_recall": 0.65,
+    "min_expected_claim_recall": 0.75,
+    "min_citation_coverage": 0.6,
+    "max_forbidden_claims": 0
+  },
+  "tags": [
+    "release-evidence",
+    "rust",
+    "search",
+    "generalization"
+  ],
+  "notes": [
+    "Versioned v0.17 release-only evidence task. Do not add it to the general holdout suite or tune product behavior against it."
+  ]
+}
