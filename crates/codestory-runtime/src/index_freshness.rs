@@ -26,6 +26,8 @@ pub(super) const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 thread_local! {
     static AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
+    static INDEX_FRESHNESS_CAPS_TEST_OVERRIDE: RefCell<Option<(usize, usize)>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -39,6 +41,37 @@ fn run_after_index_freshness_fence_test_hook() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+fn index_freshness_caps() -> (usize, usize) {
+    #[cfg(test)]
+    if let Some(caps) = INDEX_FRESHNESS_CAPS_TEST_OVERRIDE.with(|slot| *slot.borrow()) {
+        return caps;
+    }
+    (
+        INDEX_FRESHNESS_INDEXED_FILE_CAP,
+        INDEX_FRESHNESS_CURRENT_FILE_CAP,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn with_index_freshness_caps_for_test<T>(
+    indexed_file_cap: usize,
+    current_file_cap: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct ResetCaps(Option<(usize, usize)>);
+
+    impl Drop for ResetCaps {
+        fn drop(&mut self) {
+            INDEX_FRESHNESS_CAPS_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0);
+        }
+    }
+
+    let previous = INDEX_FRESHNESS_CAPS_TEST_OVERRIDE
+        .with(|slot| slot.replace(Some((indexed_file_cap, current_file_cap))));
+    let _reset = ResetCaps(previous);
+    run()
 }
 
 /// Whether a freshness read may arm a filesystem observer around its discovery scan.
@@ -184,6 +217,13 @@ struct IndexFreshnessInventory {
 struct IndexFreshnessPlan {
     plan: codestory_contracts::workspace::RefreshPlan,
     current_policy_exclusions: Vec<codestory_workspace::OversizedSourceExclusionCandidate>,
+    admitted_file_count: usize,
+}
+
+#[derive(Clone, Copy)]
+enum IndexFreshnessInventoryBound {
+    Bounded,
+    Complete,
 }
 
 struct IndexFreshnessChanges {
@@ -239,6 +279,7 @@ fn validate_index_freshness_publication(
 
 fn load_index_freshness_inventory(
     storage: &Storage,
+    bound: IndexFreshnessInventoryBound,
 ) -> Result<IndexFreshnessInventory, (NotCheckedReason, u32)> {
     let files = storage.get_files().map_err(|error| {
         (
@@ -255,12 +296,13 @@ fn load_index_freshness_inventory(
             indexed_file_count,
         ));
     }
-    if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
+    let (indexed_file_cap, _) = index_freshness_caps();
+    if matches!(bound, IndexFreshnessInventoryBound::Bounded) && files.len() > indexed_file_cap {
         return Err((
             NotCheckedReason::bounded(format!(
                 "indexed file inventory exceeds bounded freshness cap ({} > {})",
                 files.len(),
-                INDEX_FRESHNESS_INDEXED_FILE_CAP,
+                indexed_file_cap,
             )),
             indexed_file_count,
         ));
@@ -305,16 +347,23 @@ fn plan_index_freshness(
     workspace: &WorkspaceManifest,
     inventory: &IndexFreshnessInventory,
     policy: &SourceIndexPolicy,
+    bound: IndexFreshnessInventoryBound,
 ) -> Result<IndexFreshnessPlan, NotCheckedReason> {
-    let refresh = workspace
-        .build_execution_outcome_bounded_with_policy(
-            &inventory.refresh_inputs,
-            INDEX_FRESHNESS_CURRENT_FILE_CAP,
-            policy,
-        )
-        .map_err(|error| {
-            NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
-        })?;
+    let (_, current_file_cap) = index_freshness_caps();
+    let refresh = match bound {
+        IndexFreshnessInventoryBound::Bounded => workspace
+            .build_execution_outcome_bounded_with_policy(
+                &inventory.refresh_inputs,
+                current_file_cap,
+                policy,
+            ),
+        IndexFreshnessInventoryBound::Complete => {
+            workspace.build_execution_outcome_with_policy(&inventory.refresh_inputs, policy)
+        }
+    }
+    .map_err(|error| {
+        NotCheckedReason::unavailable(format!("failed to check workspace inventory: {error}"))
+    })?;
     if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         let detail = refresh
             .refresh
@@ -329,7 +378,7 @@ fn plan_index_freshness(
             )),
             None => NotCheckedReason::bounded(format!(
                 "current workspace inventory is {:?} (>{})",
-                refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
+                refresh.refresh.inventory_outcome, current_file_cap
             )),
         });
     }
@@ -337,7 +386,29 @@ fn plan_index_freshness(
     Ok(IndexFreshnessPlan {
         plan: refresh.refresh.plan,
         current_policy_exclusions: refresh.policy_exclusions,
+        admitted_file_count: refresh.admitted_file_count,
     })
+}
+
+fn complete_scan_within_bounded_caps(
+    inventory: &IndexFreshnessInventory,
+    planned: &IndexFreshnessPlan,
+) -> Result<(), NotCheckedReason> {
+    let (indexed_file_cap, current_file_cap) = index_freshness_caps();
+    let indexed_file_count = inventory.removed_paths.len();
+    if indexed_file_count > indexed_file_cap {
+        return Err(NotCheckedReason::bounded(format!(
+            "indexed file inventory exceeds bounded freshness cap ({indexed_file_count} > {indexed_file_cap})"
+        )));
+    }
+    if planned.admitted_file_count > current_file_cap {
+        return Err(NotCheckedReason::bounded(format!(
+            "current workspace inventory is {:?} (>{})",
+            WorkspaceInventoryOutcome::Bounded,
+            current_file_cap
+        )));
+    }
+    Ok(())
 }
 
 fn classify_index_freshness_changes(
@@ -532,34 +603,56 @@ where
     #[cfg(test)]
     run_after_index_freshness_fence_test_hook();
 
-    let inventory = match load_index_freshness_inventory(storage) {
-        Ok(inventory) => inventory,
+    // The observer is armed before the scan and sealed after it, so its window is exactly the
+    // stretch during which the scan's answer could go out of date underneath it.
+    let (scan, coverage) = match observation {
+        FreshnessObservation::Unobserved => (
+            load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Bounded)
+                .and_then(|inventory| {
+                    let indexed_file_count = inventory.indexed_file_count;
+                    match plan_index_freshness(
+                        workspace,
+                        &inventory,
+                        policy,
+                        IndexFreshnessInventoryBound::Bounded,
+                    ) {
+                        Ok(planned) => Ok((inventory, planned)),
+                        Err(reason) => Err((reason, indexed_file_count)),
+                    }
+                }),
+            None,
+        ),
+        FreshnessObservation::Observed(session) => {
+            let (mut scan, coverage) = session.observe_window(|| {
+                load_index_freshness_inventory(storage, IndexFreshnessInventoryBound::Complete)
+                    .and_then(|inventory| {
+                        let indexed_file_count = inventory.indexed_file_count;
+                        match plan_index_freshness(
+                            workspace,
+                            &inventory,
+                            policy,
+                            IndexFreshnessInventoryBound::Complete,
+                        ) {
+                            Ok(planned) => Ok((inventory, planned)),
+                            Err(reason) => Err((reason, indexed_file_count)),
+                        }
+                    })
+            });
+            if coverage.proven().is_none()
+                && let Ok((inventory, planned)) = &scan
+                && let Err(reason) = complete_scan_within_bounded_caps(inventory, planned)
+            {
+                scan = Err((reason, inventory.indexed_file_count));
+            }
+            (scan, Some(coverage))
+        }
+    };
+    let (inventory, planned) = match scan {
+        Ok(scan) => scan,
         Err((reason, indexed_file_count)) => {
             return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 reason,
                 indexed_file_count,
-                started_at,
-            ));
-        }
-    };
-    // The observer is armed before the scan and sealed after it, so its window is exactly the
-    // stretch during which the scan's answer could go out of date underneath it.
-    let (planned, coverage) = match observation {
-        FreshnessObservation::Unobserved => {
-            (plan_index_freshness(workspace, &inventory, policy), None)
-        }
-        FreshnessObservation::Observed(session) => {
-            let (planned, coverage) =
-                session.observe_window(|| plan_index_freshness(workspace, &inventory, policy));
-            (planned, Some(coverage))
-        }
-    };
-    let planned = match planned {
-        Ok(planned) => planned,
-        Err(reason) => {
-            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-                reason,
-                inventory.indexed_file_count,
                 started_at,
             ));
         }

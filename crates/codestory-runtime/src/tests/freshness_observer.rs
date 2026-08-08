@@ -8,10 +8,12 @@
 use super::{hybrid_test_env, test_sidecar_runtime_from_env};
 use crate::index_freshness::{
     FreshnessObservation, FreshnessObservationPolicy, index_freshness_from_storage_with_policy,
+    with_index_freshness_caps_for_test,
 };
 use crate::{AppController, SourceIndexPolicy, Storage, WorkspaceManifest};
 use codestory_contracts::api::{
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
+    IndexFreshnessStatusDto, IndexMode,
 };
 use codestory_workspace::filesystem_observer::{
     FilesystemObserverSession, MutationScope, ObservedFilesystemEvent, ObserverEventSource,
@@ -63,11 +65,23 @@ struct ObservedProject {
 
 impl ObservedProject {
     fn publish() -> Self {
+        Self::publish_with_source_count(1)
+    }
+
+    fn publish_with_source_count(source_count: usize) -> Self {
+        assert!(source_count > 0);
         let workspace = tempdir().expect("workspace");
         let source_directory = workspace.path().join("src");
         std::fs::create_dir(&source_directory).expect("source directory");
         let source = source_directory.join("lib.rs");
         std::fs::write(&source, "pub fn published() {}\n").expect("published source");
+        for index in 1..source_count {
+            std::fs::write(
+                source_directory.join(format!("published_{index}.rs")),
+                format!("pub fn published_{index}() {{}}\n"),
+            )
+            .expect("additional published source");
+        }
         let storage_path = workspace.path().join(".cache/codestory.db");
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
@@ -122,6 +136,147 @@ fn an_unobserved_scan_reports_the_published_tree_as_fresh() {
     let freshness = project.freshness(FreshnessObservation::Unobserved);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
     assert_eq!(freshness.reason, None);
+}
+
+#[test]
+fn proven_observer_coverage_lifts_both_freshness_inventory_caps() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish_with_source_count(2);
+    std::fs::write(
+        project.root().join("src/new_beyond_cap.rs"),
+        "pub fn discovered_only_by_a_complete_scan() {}\n",
+    )
+    .expect("source beyond the synthetic current-file cap");
+    std::fs::write(
+        project.root().join("src/new_furthest_beyond_cap.rs"),
+        "pub fn also_requires_a_complete_scan() {}\n",
+    )
+    .expect("second source beyond the synthetic current-file cap");
+    let session = scripted_session(project.root(), |_| Vec::new());
+
+    let freshness = with_index_freshness_caps_for_test(1, 1, || {
+        project.freshness(FreshnessObservation::Observed(&session))
+    });
+
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Stale,
+        "a complete scan sealed by proven coverage must retain its complete verdict"
+    );
+    assert_eq!(freshness.not_checked_cause, None);
+    assert_eq!(freshness.indexed_file_count, 2);
+    assert_eq!(freshness.new_file_count, 2);
+    assert_eq!(
+        freshness.checked_file_count, 4,
+        "a complete claim must include the source beyond the synthetic cap"
+    );
+}
+
+#[test]
+fn an_unobserved_inventory_over_the_cap_keeps_the_bounded_verdict() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish_with_source_count(2);
+    std::fs::write(
+        project.root().join("src/new_beyond_cap.rs"),
+        "pub fn discovered_only_by_a_complete_scan() {}\n",
+    )
+    .expect("source beyond the synthetic current-file cap");
+    std::fs::write(
+        project.root().join("src/new_furthest_beyond_cap.rs"),
+        "pub fn also_requires_a_complete_scan() {}\n",
+    )
+    .expect("second source beyond the synthetic current-file cap");
+
+    let freshness = with_index_freshness_caps_for_test(1, 1, || {
+        project.freshness(FreshnessObservation::Unobserved)
+    });
+
+    assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+    assert_eq!(
+        freshness.not_checked_cause,
+        Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+    );
+    assert_eq!(
+        freshness.reason.as_deref(),
+        Some("indexed file inventory exceeds bounded freshness cap (2 > 1)")
+    );
+}
+
+#[test]
+fn an_observer_coverage_error_falls_back_to_the_bounded_verdict() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish_with_source_count(2);
+    std::fs::write(
+        project.root().join("src/new_beyond_cap.rs"),
+        "pub fn discovered_only_by_a_complete_scan() {}\n",
+    )
+    .expect("source beyond the synthetic current-file cap");
+    std::fs::write(
+        project.root().join("src/new_furthest_beyond_cap.rs"),
+        "pub fn also_requires_a_complete_scan() {}\n",
+    )
+    .expect("second source beyond the synthetic current-file cap");
+    let session = scripted_session(project.root(), |drain| {
+        (drain > 0)
+            .then(|| ObservedFilesystemEvent::CoverageLost {
+                detail: "injected coverage failure".to_string(),
+            })
+            .into_iter()
+            .collect()
+    });
+
+    let freshness = with_index_freshness_caps_for_test(1, 1, || {
+        project.freshness(FreshnessObservation::Observed(&session))
+    });
+
+    assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+    assert_eq!(
+        freshness.not_checked_cause,
+        Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+    );
+    assert_eq!(
+        freshness.reason.as_deref(),
+        Some("indexed file inventory exceeds bounded freshness cap (2 > 1)")
+    );
+}
+
+#[test]
+fn lost_observer_coverage_counts_route_unsupported_files_like_the_bounded_walk() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish_with_source_count(2);
+    std::fs::write(project.root().join("src/NOTICE"), "post-publish notice\n")
+        .expect("route-unsupported file beyond the synthetic current-file cap");
+    let session = scripted_session(project.root(), |drain| {
+        (drain > 0)
+            .then(|| ObservedFilesystemEvent::CoverageLost {
+                detail: "injected coverage failure".to_string(),
+            })
+            .into_iter()
+            .collect()
+    });
+
+    let (unobserved, observed) = with_index_freshness_caps_for_test(10, 2, || {
+        (
+            project.freshness(FreshnessObservation::Unobserved),
+            project.freshness(FreshnessObservation::Observed(&session)),
+        )
+    });
+
+    for freshness in [&unobserved, &observed] {
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+        assert_eq!(
+            freshness.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+        );
+        assert_eq!(
+            freshness.reason.as_deref(),
+            Some("current workspace inventory is Bounded (>2)")
+        );
+    }
+    assert_eq!(observed.status, unobserved.status);
+    assert_eq!(observed.not_checked_cause, unobserved.not_checked_cause);
+    assert_eq!(observed.reason, unobserved.reason);
+    assert_eq!(observed.checked_file_count, unobserved.checked_file_count);
 }
 
 #[test]
