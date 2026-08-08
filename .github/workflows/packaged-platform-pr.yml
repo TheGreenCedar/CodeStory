@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, run release evidence, or prove current dev.
+        description: Build exact packages, prove platforms, run one frozen-candidate qualification, collect calibration, or prove current dev.
         required: true
         default: platform
         type: choice
-        options: [package, platform, qualification, calibration, release-evidence, integration]
+        options: [package, platform, qualification, calibration, integration]
       pr_number:
         description: Same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>.
         required: false
@@ -23,10 +23,6 @@ on:
         default: auto
         type: choice
         options: [auto, none, linux, windows, macos, full]
-      source_run_id:
-        description: Optional prior rejected release-evidence run to re-evaluate.
-        required: false
-        type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
         required: false
@@ -73,7 +69,6 @@ jobs:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INPUT_CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
           INPUT_CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
@@ -103,7 +98,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
+          test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
           test -n "$pr_number"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
@@ -137,7 +132,7 @@ jobs:
               exit 1
             }
           fi
-          if [ "$mode" = "release-evidence" ] || [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
+          if [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
             test "$base_ref" = "dev/codestory-next" || {
               echo "::error::$mode requires a PR into dev/codestory-next, not $base_ref."
@@ -149,14 +144,12 @@ jobs:
             }
           fi
           if [ "$mode" = "calibration" ]; then
-            if [ -n "$INPUT_SOURCE_RUN_ID" ] \
-              || [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
+            if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
               || [ -n "$INPUT_CALIBRATION_RUN_ID" ]; then
               echo "::error::Calibration collection does not consume prior proof artifacts."
               exit 1
             fi
           elif [ "$mode" = "qualification" ]; then
-            test -z "$INPUT_SOURCE_RUN_ID"
             test -n "$INPUT_CALIBRATION_ARTIFACT"
             test -n "$INPUT_CALIBRATION_RUN_ID"
           fi
@@ -294,8 +287,6 @@ jobs:
             scope=full
           elif [ "$RESOLVED_MODE" = "calibration" ]; then
             scope=none
-          elif [ "$RESOLVED_MODE" = "release-evidence" ]; then
-            scope=none
           else
             scope="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" | node .github/scripts/route-ci-proof.mjs --stdin --requested "$REQUESTED_SCOPE")"
           fi
@@ -303,7 +294,6 @@ jobs:
           echo "Selected $scope platform proof."
 
       - name: Verify package version surfaces
-        if: steps.resolve.outputs.mode != 'release-evidence'
         id: version
         shell: bash
         run: |
@@ -405,17 +395,6 @@ jobs:
           path: target/calibration-freeze
           if-no-files-found: error
           retention-days: 30
-
-  release-evidence:
-    if: needs.route.outputs.mode == 'release-evidence'
-    needs: route
-    uses: ./.github/workflows/release-candidate-evidence.yml
-    with:
-      ref: ${{ needs.route.outputs.head_sha }}
-      proof_key: ${{ needs.route.outputs.proof_key }}
-      profile: codestory-release-evidence-linux-arm64-v2
-      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-      source_run_id: ${{ inputs.source_run_id }}
 
   source-proof:
     if: needs.route.outputs.mode == 'integration'
@@ -542,7 +521,6 @@ jobs:
     if: >-
       always() &&
       needs.route.result != 'skipped' &&
-      needs.route.outputs.mode != 'release-evidence' &&
       needs.route.outputs.mode != 'calibration'
     needs:
       - route

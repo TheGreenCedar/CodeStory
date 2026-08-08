@@ -975,7 +975,7 @@ const draftCachePaths = [
   "target",
 ];
 const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
-const platformResolverContractDigest = "cb8eb03393f8e24bf9e083004be658c5d2f22fa118d3c43b8bc6b388f19ecddd";
+const platformResolverContractDigest = "14015fd938e7dc2bafd50bef2d85d6934ee4658bd86b5560729edb4be7c14679";
 // check-workflow-policy.test.mjs runs this exact script against hostile dispatch values and proves
 // it exits non-zero, so the digest stands for a rejection that was measured, not merely read.
 const marketplaceGuardDigest = "6380c916a1b3566b4b9d6545b63fbc9c7db12b54fb328b5c89316daae0162d84";
@@ -997,11 +997,11 @@ const packagedPlatformWorkflowDigest =
 // made advisory, parked in dead code, or followed by a payload substitution
 // while leaving the expected tokens in place.
 const packagedPlatformCoordinatorWorkflowDigest =
-  "797fa9e2be359f83eacd45b78722829d1f277efd2e721de1c9bf8b590b73dc58";
+  "ca70707ba924b57848d92e8b7a3490e8e18623dce4d1afec393212a78bce110a";
 const releaseSourceProofSentinelDigest =
   "91ee8bc1a6a055e9297e81747c37d167b123d0a2e5dc60d5c6e2bdcfbef9c351";
 const frozenCandidateQualityWorkflowDigest =
-  "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173";
+  "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677";
 const macosMetalWorkflowDigest =
   "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627";
 const windowsVulkanWorkflowDigest =
@@ -5469,7 +5469,6 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       "route",
       "calibration-macos",
       "calibration-assemble",
-      "release-evidence",
       "source-proof",
       "packaged-proof",
       "macos-metal-proof",
@@ -5608,7 +5607,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(
       at(workflow, "on", "workflow_dispatch", "inputs", "mode", "options"),
-      ["package", "platform", "qualification", "calibration", "release-evidence", "integration"],
+      ["package", "platform", "qualification", "calibration", "integration"],
     ),
     `${file} dispatch modes changed`,
   );
@@ -5644,13 +5643,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
     'test "$GITHUB_SHA" = "$dev_head"',
     'elif [ "$mode" = "qualification" ]; then',
-    'test -z "$INPUT_SOURCE_RUN_ID"',
     'test -n "$INPUT_CALIBRATION_ARTIFACT"',
     'test -n "$INPUT_CALIBRATION_RUN_ID"',
     "--ref $head_ref",
   ]);
   requireStepEnv(violations, file, route, "Resolve trusted exact head", {
-    INPUT_SOURCE_RUN_ID: "${{ inputs.source_run_id }}",
     INPUT_CALIBRATION_ARTIFACT: "${{ inputs.calibration_bundle_artifact }}",
     INPUT_CALIBRATION_RUN_ID: "${{ inputs.calibration_bundle_run_id }}",
   });
@@ -5962,7 +5959,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(qualityInputs.version).type === "string"
       && JSON.stringify(qualityWorkflow.permissions)
         === JSON.stringify({ actions: "read", contents: "read" })
-      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality"]),
+      && sameMembers(Object.keys(object(qualityWorkflow.jobs)), ["quality", "linux-quality"]),
     `${qualityFile} must remain a reusable-only, read-only evaluation owner`,
   );
   const quality = requireJob(violations, qualityFile, qualityWorkflow, "quality");
@@ -6193,6 +6190,39 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       ),
     `${qualityFile} must report both outcomes without becoming a qualification or release gate`,
   );
+  const linuxQuality = requireJob(violations, qualityFile, qualityWorkflow, "linux-quality");
+  const linuxQualitySteps = list(linuxQuality.steps).map(object);
+  const linuxQualityProducer = linuxQualitySteps.find(step => step.id === "linux-quality");
+  const linuxQualityRun = shellLiteralNormalizedText(String(linuxQualityProducer?.run ?? ""));
+  add(
+    violations,
+    linuxQuality.name === "Optional frozen-candidate Linux x64 Axios v2 quality"
+      && JSON.stringify(linuxQuality["runs-on"])
+        === JSON.stringify(["self-hosted", "Linux", "X64", "codestory-linux-vulkan"])
+      && linuxQuality.environment === undefined
+      && linuxQuality["continue-on-error"] === true
+      && linuxQuality["timeout-minutes"] === 60
+      && linuxQualitySteps.length === 6,
+    `${qualityFile} optional Linux x64 quality must remain a non-gating unpinned smoke`,
+  );
+  add(
+    violations,
+    namedStep(linuxQuality, "Checkout exact frozen candidate")?.uses === "actions/checkout@v5"
+      && namedStep(linuxQuality, "Download exact Linux x64 candidate archive")?.uses
+        === "actions/download-artifact@v8.0.1"
+      && object(namedStep(linuxQuality, "Download exact Linux x64 candidate archive")?.with).name
+        === "codestory-cli-linux-x64"
+      && linuxQualityProducer?.["continue-on-error"] === true
+      && object(linuxQualityProducer?.env).CODESTORY_EMBED_ALLOW_CPU === "0"
+      && linuxQualityRun.includes("codestory-cli-v${version}-linux-x64.tar.gz")
+      && linuxQualityRun.includes("--packet-runtime-mode cold-cli")
+      && occurrenceCount(linuxQualityRun, "--task-manifest") === 1
+      && linuxQualityRun.includes("--repeats 3")
+      && linuxQualityRun.includes("--publishable")
+      && !linuxQualityRun.includes("--task-suite")
+      && !linuxQualityRun.includes("--task-ids"),
+    `${qualityFile} optional Linux x64 quality must run the same isolated Axios v2 smoke entrypoint`,
+  );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
@@ -6266,28 +6296,20 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(
     violations,
     closeout.if
-      === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence' && needs.route.outputs.mode != 'calibration'"
+      === "always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'calibration'"
       && closeout["runs-on"] === "ubuntu-latest"
       && closeout["timeout-minutes"] === 20
       && closeout["continue-on-error"] === undefined,
     `${file} closeout job must retain its reviewed unconditional result-checking activation`,
   );
-  const evidence = requireJob(violations, file, workflow, "release-evidence");
   add(
     violations,
-    evidence.if === "needs.route.outputs.mode == 'release-evidence'",
-    `${file} optional release evidence must run only in explicit release-evidence mode`,
-  );
-  add(
-    violations,
-    !needs(closeout).includes("release-evidence")
-      && !needs(closeout).includes("frozen-candidate-quality")
+    !needs(closeout).includes("frozen-candidate-quality")
       && !scalarStrings(closeout).some(value =>
-        value.includes("EVIDENCE_RESULT")
-          || value.includes("QUALITY_RESULT")
+        value.includes("QUALITY_RESULT")
           || value.includes("frozen-candidate-quality")
       ),
-    `${file} normal closeout must not depend on optional release or quality evidence`,
+    `${file} normal closeout must not depend on optional quality evidence`,
   );
   const closeoutProofName = "Require one coherent accepted proof";
   const closeoutProof = namedStep(closeout, closeoutProofName);
@@ -6417,12 +6439,7 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, evidenceFile, evidence, "measure");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
     requireStepRun(violations, evidenceFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
-    violations.push(...releaseEvidenceApprovalViolations(
-      [
-        ["packaged-platform-pr.yml", at(workflows.get("packaged-platform-pr.yml"), "jobs", "release-evidence"), false],
-      ],
-      evidence,
-    ));
+    violations.push(...releaseEvidenceApprovalViolations([], evidence));
     const repoEvidence = namedStep(job, "Produce full-retrieval repo evidence");
     requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
     add(
@@ -9936,7 +9953,7 @@ export function absorbedFailureViolations(workflows) {
           file === frozenCandidateQualityWorkflowRef.slice(
             frozenCandidateQualityWorkflowRef.lastIndexOf("/") + 1,
           )
-          && jobId === "quality";
+          && (jobId === "quality" || jobId === "linux-quality");
         // Reading the outcome is not requiring it one level up either, and the
         // job-level rule used to accept exactly the `if:`-only read the
         // step-level rule below deliberately refuses -- it scanned every string

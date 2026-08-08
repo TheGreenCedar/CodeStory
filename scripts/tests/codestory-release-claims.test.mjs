@@ -566,7 +566,7 @@ test("claim graph freezes one GPU-only qualification run per available platform"
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+      "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,

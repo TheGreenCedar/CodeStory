@@ -11,7 +11,6 @@ import { RELEASE_MANIFEST_ASSET } from "./lib/release-manifest.mjs";
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
 const GRAPH_VERSION = 11;
 const KNOWN_PACKAGE_TARGETS = new Set([
-  "linux-arm64",
   "linux-x64",
   "macos-arm64",
   "macos-x64",
@@ -790,7 +789,7 @@ function validateQualificationPolicy(value) {
     archive_transfer: "authenticated_miss_only",
     evaluation_owner: "isolated_reusable_workflow",
     evaluation_owner_sha256:
-      "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+      "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677",
     evaluation_contract: "publishable-three-repeat-packet/v1",
     task_count: 1,
     repeats_per_task: 3,
@@ -1897,7 +1896,7 @@ export function validateReleaseClaimGraph(graph) {
   if (actionlint.version !== "1.7.12") fail("workflow_policy.actionlint.version must be 1.7.12");
   nonEmptyText(actionlint.config, "workflow_policy.actionlint.config");
   const assets = object(actionlint.assets, "workflow_policy.actionlint.assets");
-  const requiredAssets = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64"];
+  const requiredAssets = ["darwin-arm64", "darwin-x64", "linux-x64", "win32-arm64", "win32-x64"];
   if (JSON.stringify(Object.keys(assets).sort()) !== JSON.stringify(requiredAssets)) {
     fail(`workflow_policy.actionlint.assets must define exactly ${requiredAssets.join(", ")}`);
   }
