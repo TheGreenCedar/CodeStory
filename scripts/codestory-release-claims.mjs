@@ -940,6 +940,7 @@ function validateProofFloor(value) {
       "crates/codestory-indexer/**",
       "crates/codestory-workspace/**",
       "crates/codestory-contracts/**",
+      "crates/codestory-agent/**",
       ".github/workflows/crate-durability.yml",
       ".github/scripts/check-workflow-policy.mjs",
       ".github/scripts/check-workflow-policy.test.mjs",
@@ -956,6 +957,7 @@ function validateProofFloor(value) {
       "cargo test --locked -p codestory-store",
       "cargo test --locked -p codestory-indexer --test fidelity_regression",
       "cargo test --locked -p codestory-indexer --test tictactoe_language_coverage",
+      "cargo test --locked -p codestory-agent",
     ],
     "workflow_policy.proof_floor.crate_durability.commands",
   );
@@ -986,6 +988,7 @@ function validateProofFloor(value) {
       "cargo test --locked -p codestory-runtime --lib services::",
       "cargo test --locked -p codestory-cli --lib",
       "cargo test --locked -p codestory-workspace",
+      "cargo test --locked -p codestory-agent",
     ],
     "workflow_policy.proof_floor.merged_suite_lanes.commands",
   );
