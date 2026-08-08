@@ -49,9 +49,9 @@
     {
       "id": "artifact-retention",
       "class_prefix": "[artifact_retention]",
-      "workflow": "release-candidate-evidence.yml",
-      "job": "measure",
-      "step": "Upload release evidence",
+      "workflow": "frozen-candidate-quality.yml",
+      "job": "windows-quality",
+      "step": "Upload optional Windows x64 Ripgrep v2 quality evidence",
       "field": [
         "with",
         "retention-days"

@@ -1,10 +1,11 @@
 # Release-evidence quality contract
 
-The v0.17 release-evidence packet-quality contract targets the protected macOS
-Metal and Windows quality lanes. The current workflow still selects the v0.16
-Axios contract; EV-4c owns moving that producer to this contract. The Linux
-ARM64 Colima guest host was retired from live lanes in H-1 (PR #1849), so it is
-no longer a measurement authority. Its in-tree harness remains until EV-4c.
+The v0.17 release-evidence packet-quality contract runs as a non-gating adjunct
+on the protected macOS Metal and Windows Vulkan quality lanes. The macOS lane
+retains the frozen Axios v2 measurement and adds Ripgrep v2 as a separately
+isolated row. The Windows x64 lane measures Ripgrep v2 from the exact candidate
+archive with its own cache and stdio roots. CPU fallback is disabled in both
+Ripgrep measurements.
 
 ## v0.17 Ripgrep corpus boundary
 
@@ -21,25 +22,22 @@ and citation coverage of `0.60`, symbol recall `0.80`, claim recall `1.0`,
 anchor recall `0.80`, and zero forbidden claims. The v0.17 contract therefore
 pins the D2-corrected `0.60` file-recall and citation-coverage floors; it keeps
 the existing `0.65` symbol, `0.75` claim, `0.70` anchor, and zero-forbidden
-claim floors. The protected macOS Metal and Windows quality lanes will supply
-the current-host proof when EV-4c wires this contract. It makes a scoped
-Ripgrep packet-quality claim only; it does not establish a general Rust,
-parser-completeness, or answer-accuracy claim.
+claim floors. The protected macOS Metal and Windows Vulkan quality lanes supply
+current-host measurements without becoming qualification or release gates. The
+contract makes a scoped Ripgrep packet-quality claim only; it does not establish
+a general Rust, parser-completeness, or answer-accuracy claim.
 
 The v0.16 Axios contracts and their approved baselines remain frozen. The
 holdout `ripgrep-search-pipeline.task.json` is separate and must remain
 byte-identical; release-only work uses the v2 manifest.
 
-## Retired Linux ARM64 host and retained harness
+## Quality-lane ownership
 
-The `codestory-release-evidence-linux-arm64-v2` machine contract, guest
-provisioning scripts, and Colima runner lifecycle remain in tree so the workflow
-policy checker and its mutation tests continue to exercise their contract. The
-host itself was retired from live lanes in H-1 (PR #1849); do not use it as
-measurement authority or recreate it for new evidence. EV-4c retires the
-harness and policy layer together, alongside the claims-graph and producer
-re-pointing. Until then, the retained profile is historical contract coverage,
-not a runnable release-evidence lane.
+`.github/workflows/frozen-candidate-quality.yml` owns optional performance and
+answer-quality evaluation. macOS Metal measures Axios v2 and Ripgrep v2;
+Windows Vulkan measures Ripgrep v2; Linux Vulkan retains the non-gating Axios v2
+smoke. The former Linux ARM64 guest runner and its provisioning harness are
+retired and are not measurement authorities.
 
 ## Evidence boundary
 
