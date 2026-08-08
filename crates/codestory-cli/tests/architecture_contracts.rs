@@ -57,6 +57,107 @@ fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Returns source files reached from a column-zero `#[cfg(test)]` module
+/// declaration, including ungated declarations nested below that test-only
+/// module. A directory module brings along all of its Rust files: they are
+/// reachable only through that module boundary.
+fn test_gated_module_files(source_root: &Path) -> BTreeSet<PathBuf> {
+    let mut files = Vec::new();
+    collect_rs_files(source_root, &mut files);
+    files.sort();
+
+    let mut test_gated = BTreeSet::new();
+    let mut pending = Vec::new();
+    for path in &files {
+        let source = fs::read_to_string(path).expect("read Rust source");
+        for name in test_gated_module_declarations(&source) {
+            add_module_files(source_root, path, &name, &mut test_gated, &mut pending);
+        }
+    }
+
+    while let Some(path) = pending.pop() {
+        let source = fs::read_to_string(&path).expect("read test-gated Rust source");
+        for name in module_declarations(&source) {
+            add_module_files(source_root, &path, &name, &mut test_gated, &mut pending);
+        }
+    }
+
+    test_gated
+}
+
+fn test_gated_module_declarations(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    lines
+        .windows(2)
+        .filter_map(|lines| {
+            (lines[0] == "#[cfg(test)]")
+                .then(|| module_declaration(lines[1]))
+                .flatten()
+        })
+        .collect()
+}
+
+fn module_declarations(source: &str) -> Vec<String> {
+    source.lines().filter_map(module_declaration).collect()
+}
+
+fn module_declaration(line: &str) -> Option<String> {
+    let name = line.strip_prefix("mod ")?.strip_suffix(';')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'))
+    .then(|| name.to_owned())
+}
+
+fn add_module_files(
+    source_root: &Path,
+    parent_module: &Path,
+    name: &str,
+    test_gated: &mut BTreeSet<PathBuf>,
+    pending: &mut Vec<PathBuf>,
+) {
+    let module_dir = module_directory(parent_module);
+    let file_module = module_dir.join(format!("{name}.rs"));
+    if file_module.is_file() {
+        add_test_gated_file(source_root, file_module, test_gated, pending);
+    }
+
+    let directory = module_dir.join(name);
+    let directory_module = directory.join("mod.rs");
+    if directory_module.is_file() {
+        let mut files = Vec::new();
+        collect_rs_files(&directory, &mut files);
+        for file in files {
+            add_test_gated_file(source_root, file, test_gated, pending);
+        }
+    }
+}
+
+fn module_directory(module_file: &Path) -> PathBuf {
+    let parent = module_file.parent().expect("module file has a parent");
+    match module_file.file_name().and_then(|name| name.to_str()) {
+        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        Some(_) => parent.join(module_file.file_stem().expect("module file has a stem")),
+        None => panic!("module file has a name"),
+    }
+}
+
+fn add_test_gated_file(
+    source_root: &Path,
+    path: PathBuf,
+    test_gated: &mut BTreeSet<PathBuf>,
+    pending: &mut Vec<PathBuf>,
+) {
+    let relative = path
+        .strip_prefix(source_root)
+        .expect("module file lives below source root")
+        .to_path_buf();
+    if test_gated.insert(relative) {
+        pending.push(path);
+    }
+}
+
 fn source_tree_contains(dir: &str, needle: &str) -> bool {
     let mut files = Vec::new();
     collect_rs_files(&repo_root().join(dir), &mut files);
@@ -320,9 +421,6 @@ fn cli_transport_adapters_do_not_probe_retrieval_directly() {
 /// providers implement retrieval-owned traits or supply qualification-proof
 /// operations. Routing providers through `ActivationService` would invert that
 /// dependency.
-///
-/// The fixture list is temporary: S2-7 deletes it by teaching classification
-/// to honor module-level `#[cfg(test)]` gates.
 #[test]
 fn cli_owns_no_direct_retrieval_consumers_outside_providers() {
     let source_root = repo_root().join("crates/codestory-cli/src");
@@ -339,7 +437,7 @@ fn cli_owns_no_direct_retrieval_consumers_outside_providers() {
         "embedding_qualification/worker/operations/queue.rs",
         "sidecar_runtime.rs",
     ]);
-    let module_gated_fixture_exemptions = BTreeSet::from(["status_wire_test_support.rs"]);
+    let test_gated_modules = test_gated_module_files(&source_root);
 
     let transport = production_source(&read(
         "crates/codestory-cli/src/embedding_server_transport.rs",
@@ -364,17 +462,6 @@ fn cli_owns_no_direct_retrieval_consumers_outside_providers() {
         "embedding qualification provider must retain run_per_user_embedding_qualification"
     );
 
-    let app = read("crates/codestory-cli/src/app.rs");
-    assert!(
-        app.contains("#[cfg(test)]\nmod tests;"),
-        "app/tests/ is exempt only while app.rs keeps its module-level #[cfg(test)] gate"
-    );
-    let lib = read("crates/codestory-cli/src/lib.rs");
-    assert!(
-        lib.contains("#[cfg(test)]\nmod status_wire_test_support;"),
-        "status_wire_test_support.rs is exempt only while lib.rs keeps its module-level #[cfg(test)] gate"
-    );
-
     let mut files = Vec::new();
     collect_rs_files(&source_root, &mut files);
     files.sort();
@@ -387,9 +474,7 @@ fn cli_owns_no_direct_retrieval_consumers_outside_providers() {
             .expect("CLI source lives below source root")
             .to_string_lossy()
             .replace('\\', "/");
-        if relative.starts_with("app/tests/")
-            || module_gated_fixture_exemptions.contains(relative.as_str())
-        {
+        if test_gated_modules.contains(Path::new(&relative)) {
             continue;
         }
 
@@ -1131,6 +1216,37 @@ fn production() {
     let production = production_source(multiline_gated_use);
     assert!(!production.contains("first, second"));
     assert!(production.contains("real_call()"));
+}
+
+#[test]
+fn test_gated_module_files_follow_gated_module_trees_only() {
+    let tempdir = tempfile::tempdir().expect("create fixture source root");
+    let source_root = tempdir.path();
+    fs::write(
+        source_root.join("lib.rs"),
+        "#[cfg(test)]\nmod x;\nmod y;\n#[cfg(test)]\nmod directory;\n",
+    )
+    .expect("write root module");
+    fs::write(source_root.join("x.rs"), "mod nested;\n").expect("write gated module");
+    fs::create_dir(source_root.join("x")).expect("create nested module directory");
+    fs::write(source_root.join("x/nested.rs"), "").expect("write nested module");
+    fs::write(source_root.join("y.rs"), "").expect("write production module");
+    fs::create_dir(source_root.join("directory")).expect("create directory module");
+    fs::write(source_root.join("directory/mod.rs"), "mod child;\n")
+        .expect("write directory module root");
+    fs::write(source_root.join("directory/child.rs"), "").expect("write directory child");
+    fs::write(source_root.join("directory/fixture.rs"), "").expect("write directory fixture");
+
+    let test_gated = test_gated_module_files(source_root);
+    assert!(test_gated.contains(Path::new("x.rs")));
+    assert!(test_gated.contains(Path::new("x/nested.rs")));
+    assert!(test_gated.contains(Path::new("directory/mod.rs")));
+    assert!(test_gated.contains(Path::new("directory/child.rs")));
+    assert!(test_gated.contains(Path::new("directory/fixture.rs")));
+    assert!(
+        !test_gated.contains(Path::new("y.rs")),
+        "ungated modules remain release-compiled"
+    );
 }
 
 /// Every lock a peer holds for a whole publication must be waited on with the
