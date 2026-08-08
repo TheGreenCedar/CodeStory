@@ -20,6 +20,8 @@ import {
   DEFERRED_MARKETPLACE_REPOSITORY,
   LIVE_INSTALLATION_SOURCE,
   LIVE_MARKETPLACE_REPOSITORY,
+  RESTORED_INSTALLATION_SOURCE,
+  RESTORED_MARKETPLACE_REPOSITORY,
 } from "./marketplace-delivery-identity.mjs";
 
 function fail(message) {
@@ -148,18 +150,27 @@ function prepareInstallation(rawArgs) {
     fail(`--local-fixture must be true or false, not ${JSON.stringify(localFixtureRaw ?? null)}`);
   }
   const localFixture = localFixtureRaw === "true";
-  const installationSource = localFixture
-    ? DEFERRED_INSTALLATION_SOURCE
-    : LIVE_INSTALLATION_SOURCE;
+  const requestedInstallationSource = args.installation_source;
+  const allowedInstallationSources = localFixture
+    ? new Map([
+      [DEFERRED_INSTALLATION_SOURCE, DEFERRED_MARKETPLACE_REPOSITORY],
+      [RESTORED_INSTALLATION_SOURCE, RESTORED_MARKETPLACE_REPOSITORY],
+    ])
+    : new Map([[LIVE_INSTALLATION_SOURCE, LIVE_MARKETPLACE_REPOSITORY]]);
+  const installationSource = requestedInstallationSource
+    ?? (localFixture ? DEFERRED_INSTALLATION_SOURCE : LIVE_INSTALLATION_SOURCE);
+  if (!allowedInstallationSources.has(installationSource)) {
+    fail(
+      `--installation-source ${JSON.stringify(installationSource)} is incompatible with local-fixture=${localFixtureRaw}`,
+    );
+  }
   const marketplaceSource = required(args, "marketplace_source");
   if (!localFixture && marketplaceSource !== LIVE_MARKETPLACE_REPOSITORY) {
     fail(
       `a live marketplace install must resolve ${LIVE_MARKETPLACE_REPOSITORY}, not ${marketplaceSource}`,
     );
   }
-  const marketplaceRepository = localFixture
-    ? DEFERRED_MARKETPLACE_REPOSITORY
-    : marketplaceSource;
+  const marketplaceRepository = allowedInstallationSources.get(installationSource);
 
   const codexPackageRoot = path.resolve(required(args, "codex_package_root"));
   const codexExecutable = path.join(

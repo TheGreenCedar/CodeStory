@@ -30,12 +30,14 @@ from .installed_identity import installed_plugin_identity
 from .marketplace_installation import (
     DEFERRED_INSTALLATION_SOURCE,
     LIVE_INSTALLATION_SOURCE,
+    RESTORED_INSTALLATION_SOURCE,
 )
 
 _MARKETPLACE_NAME = "TheGreenCedar"
 _LIVE_REPOSITORY = "TheGreenCedar/AgentPluginMarketplace"
 _LIVE_URL = f"https://github.com/{_LIVE_REPOSITORY}.git"
 _DEFERRED_REPOSITORY = "local:candidate-pinned-marketplace-fixture"
+_RESTORED_REPOSITORY = "local:candidate-pinned-marketplace-restored-fixture"
 _MARKER_FILENAME = ".codestory-marketplace-fixture.json"
 _MARKER_PURPOSE = "codestory-candidate-pinned-marketplace-fixture"
 _PLUGIN_ID = f"codestory@{_MARKETPLACE_NAME}"
@@ -477,6 +479,28 @@ def _run_live_self_tests(root: Path, manifest: dict) -> None:
     )
 
 
+def _run_restored_self_tests(root: Path, manifest: dict) -> None:
+    world = _build_world(root / "restored", deferred=True, manifest=manifest)
+    attestation = world["attestation"]
+    attestation["installation_source"] = RESTORED_INSTALLATION_SOURCE
+    attestation["marketplace"]["repository"] = _RESTORED_REPOSITORY
+    identity = _verify(world, attestation, root, manifest)
+    require(
+        identity["installation_source"] == RESTORED_INSTALLATION_SOURCE
+        and identity["marketplace_repository"] == _RESTORED_REPOSITORY,
+        "an automatically restored catalog did not record its own installer identity",
+    )
+    _reject(
+        world,
+        root,
+        manifest,
+        "a restored resolve relabelled as a deferred publication",
+        lambda candidate: candidate.update(
+            installation_source=DEFERRED_INSTALLATION_SOURCE
+        ),
+    )
+
+
 def _run_retained_provenance_self_tests() -> None:
     """The retained evidence verifier must bind each installer identity to its own repository.
 
@@ -507,6 +531,7 @@ def _run_retained_provenance_self_tests() -> None:
     for source, repository in (
         (LIVE_INSTALLATION_SOURCE, _LIVE_REPOSITORY),
         (DEFERRED_INSTALLATION_SOURCE, _DEFERRED_REPOSITORY),
+        (RESTORED_INSTALLATION_SOURCE, _RESTORED_REPOSITORY),
     ):
         retained._verify_marketplace_provenance(contract, plugin(source, repository), runtime)
 
@@ -517,6 +542,8 @@ def _run_retained_provenance_self_tests() -> None:
          DEFERRED_INSTALLATION_SOURCE, _LIVE_REPOSITORY),
         ("a live install claiming the fixture repository",
          LIVE_INSTALLATION_SOURCE, _DEFERRED_REPOSITORY),
+        ("a restored install claiming the deferred fixture repository",
+         RESTORED_INSTALLATION_SOURCE, _DEFERRED_REPOSITORY),
         ("an installer identity no delivery state declares",
          "codex_marketplace_install_v3", _LIVE_REPOSITORY),
     ):
@@ -544,8 +571,10 @@ def _run_shared_identity_self_tests() -> None:
     for name, value in (
         ("LIVE_INSTALLATION_SOURCE", LIVE_INSTALLATION_SOURCE),
         ("DEFERRED_INSTALLATION_SOURCE", DEFERRED_INSTALLATION_SOURCE),
+        ("RESTORED_INSTALLATION_SOURCE", RESTORED_INSTALLATION_SOURCE),
         ("LIVE_MARKETPLACE_REPOSITORY", _LIVE_REPOSITORY),
         ("DEFERRED_MARKETPLACE_REPOSITORY", _DEFERRED_REPOSITORY),
+        ("RESTORED_MARKETPLACE_REPOSITORY", _RESTORED_REPOSITORY),
         ("FIXTURE_MARKER_FILENAME", _MARKER_FILENAME),
         ("FIXTURE_MARKER_PURPOSE", _MARKER_PURPOSE),
     ):
@@ -560,6 +589,7 @@ def run_marketplace_delivery_self_tests() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-marketplace-delivery-") as raw:
         root = Path(raw).resolve()
         _run_deferred_self_tests(root, manifest)
+        _run_restored_self_tests(root, manifest)
         _run_live_self_tests(root, manifest)
     _run_retained_provenance_self_tests()
     _run_shared_identity_self_tests()

@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "76c3cef3f59d64b5520002a68cf92105801583cf948dca3c49f3470e1d29cabc",
+  "candidate_sha256": "25f3a1c08dfdb3f5194c518b2cd405258dda39a6fe0190ba7f85adc649b44d2f",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -26,7 +26,7 @@
       "type": "performance",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "6e87790d68f648467d695b554ee1638279d11e664a631e5b90b51411adfaabf5",
+        "graph_sha256": "392d9f9097f79f1c39eba779ae52cd1bcce76ddbbcbc3d219ac1f06b2d1a1ce7",
       "observed_at": "2026-07-21T02:13:20.738Z",
       "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
@@ -47,7 +47,7 @@
       "type": "answer_quality",
       "tier": "answer_quality",
       "status": "pass",
-      "graph_sha256": "6e87790d68f648467d695b554ee1638279d11e664a631e5b90b51411adfaabf5",
+      "graph_sha256": "392d9f9097f79f1c39eba779ae52cd1bcce76ddbbcbc3d219ac1f06b2d1a1ce7",
       "observed_at": "2026-07-21T02:13:20.738Z",
       "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
@@ -69,7 +69,7 @@
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "6e87790d68f648467d695b554ee1638279d11e664a631e5b90b51411adfaabf5",
+    "graph_sha256": "392d9f9097f79f1c39eba779ae52cd1bcce76ddbbcbc3d219ac1f06b2d1a1ce7",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-07-21T02:13:20.738Z",

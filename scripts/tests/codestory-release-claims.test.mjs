@@ -1006,11 +1006,11 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
 // deleting it, reinstating the gate, or collapsing the two installer identities onto one -- which
 // is exactly how a deferred run would come to read as a published one -- must be refusals here,
 // not merely in the workflow policy that consumes them.
-test("catalog delivery declares two distinguishable states and no release gate", () => {
+test("catalog delivery declares three distinguishable states and no release gate", () => {
   const delivery = graph.workflow_policy.catalog_delivery;
   assert.equal(delivery.release_gate, false);
-  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published"]);
-  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 2);
+  assert.deepEqual(delivery.states.map(({ id }) => id).sort(), ["deferred", "published", "restored"]);
+  assert.equal(new Set(delivery.states.map(({ installer }) => installer)).size, 3);
 
   const missing = structuredClone(graph);
   delete missing.workflow_policy.catalog_delivery;
@@ -1088,9 +1088,8 @@ test("catalog recovery is a distinguishable identity with a recorded rollback ta
     "previous_plugin_sha",
     "previous_plugin_version",
   ]);
-  // Stated rather than implied: no job restores the catalog on its own yet, so the graph refuses
-  // to carry a `true` that documentation could quote as an automatic rollback.
-  assert.equal(recovery.automatic_restore, false);
+  assert.equal(recovery.automatic_restore, true);
+  assert.equal(recovery.restored_state, "restored");
 
   const missing = structuredClone(graph);
   delete missing.workflow_policy.catalog_delivery.recovery;
@@ -1113,11 +1112,18 @@ test("catalog recovery is a distinguishable identity with a recorded rollback ta
     /previous_pin_outputs must name the recorded rollback target/u,
   );
 
-  const overclaimed = structuredClone(graph);
-  overclaimed.workflow_policy.catalog_delivery.recovery.automatic_restore = true;
+  const disabled = structuredClone(graph);
+  disabled.workflow_policy.catalog_delivery.recovery.automatic_restore = false;
   assert.throws(
-    () => validateReleaseClaimGraph(overclaimed),
-    /automatic_restore must be false while restore is operator-initiated/u,
+    () => validateReleaseClaimGraph(disabled),
+    /automatic_restore must be true with executable prior-pin restore/u,
+  );
+
+  const unrecorded = structuredClone(graph);
+  unrecorded.workflow_policy.catalog_delivery.recovery.restored_state = "deferred";
+  assert.throws(
+    () => validateReleaseClaimGraph(unrecorded),
+    /restored_state must name the declared restored state/u,
   );
 });
 

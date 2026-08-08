@@ -207,11 +207,27 @@ After two equivalent failures, stop. Record the evidence, change the approach,
 and only then retry.
 
 Catalog publication happens after the irreversible release and is not a release
-gate. Record either `published` or `deferred` from the authenticated
-installed-runtime cells. Recover a deferred catalog with
-`marketplace-sync.yml`; do not hand-edit the marketplace repository. Missing
-marketplace credentials require repository settings work before a sync retry
-can succeed.
+gate. Before publication, W8.4 runs the real Codex marketplace resolver against
+the candidate-pinned fixture; the live catalog is allowed to keep naming the
+previous release until the release exists.
+
+After the catalog push, the release probes the exact live catalog revision
+before it may record `published`. If that probe fails, the marketplace-publish
+credential automatically restores the recorded previous plugin SHA and version.
+The restore is fenced by the just-pushed catalog revision, SHA, and version, so
+it is idempotent and refuses to overwrite a catalog that moved independently.
+A successful restore records `restored` and
+`codex_marketplace_restored_fixture`; downstream installed-runtime proof uses a
+candidate-pinned fixture and cannot retain the provisional `published` state.
+If restore does not complete, delivery is `unresolved` and closeout rejects the
+catalog claim, but the already-published release remains standing.
+
+Record `published`, `deferred`, or `restored` from the authenticated
+installed-runtime cells. Recover a catalog whose original push was deferred
+with `marketplace-sync.yml`; that manual move records the distinct `recovered`
+event. Do not hand-edit the marketplace repository. Missing marketplace
+credentials require repository settings work before either automatic restore
+or a sync retry can succeed.
 
 ## Promotion and closeout
 
@@ -246,8 +262,8 @@ After publication:
   machine policy declares it;
 - run the graph-declared post-publish proof against downloaded bytes and fresh
   installed runtimes;
-- record the catalog-delivery state without upgrading `deferred` to
-  `published`;
+- record the catalog-delivery state without upgrading `deferred` or `restored`
+  to `published`;
 - fast-forward `dev/codestory-next` from `F` to the published promotion `P`, or
   recreate the branch at `P` if it was deleted; this is a tree-preserving
   branch reconciliation, not a new commit;

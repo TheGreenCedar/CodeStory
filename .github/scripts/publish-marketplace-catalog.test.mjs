@@ -83,7 +83,7 @@ function scratch() {
   return { root, configPath };
 }
 
-function runPublisher({ root, configPath }, repo, { commit, version }) {
+function runPublisher({ root, configPath }, repo, { commit, version, ...extra }) {
   const outputPath = path.join(root, `output-${Math.random().toString(36).slice(2)}.txt`);
   fs.writeFileSync(outputPath, "");
   const result = spawnSync(
@@ -96,6 +96,10 @@ function runPublisher({ root, configPath }, repo, { commit, version }) {
       commit,
       "--version",
       version,
+      ...Object.entries(extra).flatMap(([key, value]) => [
+        `--${key.replaceAll("_", "-")}`,
+        value,
+      ]),
       "--github-output",
       outputPath,
     ],
@@ -149,11 +153,27 @@ test("the catalog move records the pin it replaced, and that pin is a working ro
     const back = runPublisher(env, repo, {
       commit: forward.outputs.previous_plugin_sha,
       version: forward.outputs.previous_plugin_version,
+      expected_current_revision: forward.outputs.marketplace_revision,
+      expected_current_plugin_sha: commits["0.2.0"],
+      expected_current_plugin_version: "0.2.0",
     });
     assert.equal(back.status, 0, `${back.stdout}${back.stderr}`);
     assert.equal(readCatalog(bare).plugins[0].source.sha, commits["0.1.0"]);
     assert.equal(readCatalog(bare).plugins[0].version, "0.1.0");
     assert.equal(back.outputs.previous_plugin_version, "0.2.0");
+    assert.equal(back.outputs.catalog_operation, "restore");
+    assert.equal(back.outputs.catalog_changed, "true");
+
+    const idempotent = runPublisher(env, repo, {
+      commit: forward.outputs.previous_plugin_sha,
+      version: forward.outputs.previous_plugin_version,
+      expected_current_revision: forward.outputs.marketplace_revision,
+      expected_current_plugin_sha: commits["0.2.0"],
+      expected_current_plugin_version: "0.2.0",
+    });
+    assert.equal(idempotent.status, 0, `${idempotent.stdout}${idempotent.stderr}`);
+    assert.equal(idempotent.outputs.catalog_operation, "restore");
+    assert.equal(idempotent.outputs.catalog_changed, "false");
   } finally {
     fs.rmSync(env.root, { recursive: true, force: true });
   }
@@ -191,7 +211,13 @@ test("a catalog whose current pin is not a rollback target is never moved", () =
       const { repo, commits } = sourceRepository(env.root, ["0.2.0"]);
       const bare = marketplaceRepository(env.root, entry);
       const seeded = git(bare, "rev-parse", "main");
-      const result = runPublisher(env, repo, { commit: commits["0.2.0"], version: "0.2.0" });
+      const result = runPublisher(env, repo, {
+        commit: commits["0.2.0"],
+        version: "0.2.0",
+        expected_current_revision: seeded,
+        expected_current_plugin_sha: String(entry.source?.sha ?? "0".repeat(40)),
+        expected_current_plugin_version: String(entry.version ?? "0.1.0"),
+      });
       assert.equal(result.status, 1, `${label}: ${result.stdout}${result.stderr}`);
       assert.match(result.stderr, /::error::.*is not a rollback target/u, label);
       assert.equal(git(bare, "rev-parse", "main"), seeded, `${label} moved the catalog`);

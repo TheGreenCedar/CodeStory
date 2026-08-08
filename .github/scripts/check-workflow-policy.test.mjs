@@ -8123,6 +8123,9 @@ function runCatalogDeliveryOutcome(environment, [file, jobName] = catalogOutcome
     PREVIOUS_REVISION: "",
     PREVIOUS_PLUGIN_SHA: "",
     PREVIOUS_PLUGIN_VERSION: "",
+    LIVE_SMOKE_OUTCOME: "skipped",
+    RESTORE_OUTCOME: "skipped",
+    RESTORED_REVISION: "",
     ...environment,
   });
 }
@@ -8167,12 +8170,14 @@ test("a release records catalog publication only when the catalog push actually 
     const published = runCatalogDeliveryOutcome({
       TOKEN_OUTCOME: "success",
       PUBLISH_OUTCOME: "success",
+      LIVE_SMOKE_OUTCOME: "success",
       PUBLISHED_REVISION: revision,
       ...previousPin,
     }, lane);
     assert.equal(published.status, 0, published.stderr);
     assert.deepEqual(published.outputs, {
       catalog_published: "true",
+      catalog_delivery_state: "published",
       marketplace_revision: revision,
       ...recordedPin,
     }, lane.join("/"));
@@ -8186,21 +8191,6 @@ test("a release records catalog publication only when the catalog push actually 
     ["missing credential", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "", PUBLISHED_REVISION: "" }],
     ["push rejected", { TOKEN_OUTCOME: "success", PUBLISH_OUTCOME: "failure", PUBLISHED_REVISION: "" }],
     ["push skipped", { TOKEN_OUTCOME: "failure", PUBLISH_OUTCOME: "skipped", PUBLISHED_REVISION: "" }],
-    ["push reported success without a revision", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "",
-    }],
-    ["push reported a mutable ref", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "main",
-    }],
-    ["push reported a truncated revision", {
-      TOKEN_OUTCOME: "success",
-      PUBLISH_OUTCOME: "success",
-      PUBLISHED_REVISION: "a".repeat(39),
-    }],
   ];
   for (const lane of catalogOutcomeLanes) {
     for (const [label, environment] of deferrals) {
@@ -8209,6 +8199,7 @@ test("a release records catalog publication only when the catalog push actually 
       assert.equal(deferred.status, 0, `${where}: ${deferred.stderr}`);
       assert.deepEqual(deferred.outputs, {
         catalog_published: "false",
+        catalog_delivery_state: "deferred",
         marketplace_revision: "",
         ...recordedPin,
       }, where);
@@ -8218,6 +8209,42 @@ test("a release records catalog publication only when the catalog push actually 
       // A deferred run never announces a rollback target: the catalog did not move, so there is
       // nothing to restore and nothing may read as if there were.
       assert.doesNotMatch(deferred.summary, /Rollback target/u, where);
+    }
+
+    const restored = runCatalogDeliveryOutcome({
+      TOKEN_OUTCOME: "success",
+      PUBLISH_OUTCOME: "success",
+      LIVE_SMOKE_OUTCOME: "failure",
+      RESTORE_OUTCOME: "success",
+      PUBLISHED_REVISION: revision,
+      RESTORED_REVISION: "d".repeat(40),
+      ...previousPin,
+    }, lane);
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.deepEqual(restored.outputs, {
+      catalog_published: "false",
+      catalog_delivery_state: "restored",
+      marketplace_revision: "",
+      ...recordedPin,
+    });
+    assert.match(restored.summary, /RESTORED/u);
+    assert.doesNotMatch(restored.summary, /Catalog delivery: published/u);
+
+    for (const [label, publishedRevision] of [
+      ["missing", ""],
+      ["mutable", "main"],
+      ["truncated", "a".repeat(39)],
+    ]) {
+      const unresolved = runCatalogDeliveryOutcome({
+        TOKEN_OUTCOME: "success",
+        PUBLISH_OUTCOME: "success",
+        PUBLISHED_REVISION: publishedRevision,
+        ...previousPin,
+      }, lane);
+      assert.equal(unresolved.status, 0, `${label}: ${unresolved.stderr}`);
+      assert.equal(unresolved.outputs.catalog_delivery_state, "unresolved", label);
+      assert.equal(unresolved.outputs.catalog_published, "false", label);
+      assert.match(unresolved.summary, /UNRESOLVED/u, label);
     }
 
     // The credential never minted, so the push step was skipped and recorded no pin at all. The
@@ -8230,6 +8257,7 @@ test("a release records catalog publication only when the catalog push actually 
     assert.equal(unrecorded.status, 0, unrecorded.stderr);
     assert.deepEqual(unrecorded.outputs, {
       catalog_published: "false",
+      catalog_delivery_state: "deferred",
       marketplace_revision: "",
       previous_marketplace_revision: "",
       previous_plugin_sha: "",
@@ -8243,6 +8271,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
   const { states } = graph.workflow_policy.catalog_delivery;
   const publishedInstaller = states.find(({ id }) => id === "published").installer;
   const deferredInstaller = states.find(({ id }) => id === "deferred").installer;
+  const restoredInstaller = states.find(({ id }) => id === "restored").installer;
   const liveRevision = "b".repeat(40);
   const head = repositoryHead();
 
@@ -8250,6 +8279,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     const where = lane.join("/");
     const published = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "true",
+      CATALOG_DELIVERY_STATE: "published",
       INPUT_MARKETPLACE_REVISION: liveRevision,
     }, lane);
     assert.equal(published.status, 0, published.stderr);
@@ -8264,6 +8294,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     // for the public one.
     const deferred = runCatalogDeliveryStateBound({
       CATALOG_PUBLISHED: "false",
+      CATALOG_DELIVERY_STATE: "deferred",
       INPUT_MARKETPLACE_REVISION: "",
     }, lane);
     assert.equal(deferred.status, 0, deferred.stderr);
@@ -8280,32 +8311,47 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     ));
     assert.equal(catalog.plugins[0].source.sha, head, `${where}: fixture must pin the released commit`);
 
+    const restored = runCatalogDeliveryStateBound({
+      CATALOG_PUBLISHED: "false",
+      CATALOG_DELIVERY_STATE: "restored",
+      INPUT_MARKETPLACE_REVISION: "",
+    }, lane);
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.equal(restored.outputs.state, "restored", where);
+    assert.equal(restored.outputs.installer, restoredInstaller, where);
+    assert.notEqual(restored.outputs.installer, publishedInstaller, where);
+    assert.equal(restored.outputs.local_fixture, "true", where);
+
     // Refusals. A handoff that is inconsistent, absent, or merely truthy-looking must stop the
     // smoke rather than fall through into the published identity.
     for (const [label, environment] of [
-      ["deferred with a live revision", { CATALOG_PUBLISHED: "false", INPUT_MARKETPLACE_REVISION: liveRevision }],
-      ["absent handoff", { CATALOG_PUBLISHED: "", INPUT_MARKETPLACE_REVISION: "" }],
-      ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", INPUT_MARKETPLACE_REVISION: liveRevision }],
-      ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["deferred with a live revision", { CATALOG_PUBLISHED: "false", CATALOG_DELIVERY_STATE: "deferred", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["absent handoff", { CATALOG_PUBLISHED: "", CATALOG_DELIVERY_STATE: "", INPUT_MARKETPLACE_REVISION: "" }],
+      ["truthy handoff", { CATALOG_PUBLISHED: "TRUE", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: liveRevision }],
+      ["handoff spelled yes", { CATALOG_PUBLISHED: "yes", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: liveRevision }],
       // Published demands an IMMUTABLE revision. "main" is refused by any length test at all, so
       // it never exercised immutability; the 40-character non-hex cases below do, and they are
       // reachable in practice because this workflow is dispatchable with an arbitrary string.
-      ["published without a revision", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "" }],
-      ["published with a mutable ref", { CATALOG_PUBLISHED: "true", INPUT_MARKETPLACE_REVISION: "main" }],
+      ["published without a revision", { CATALOG_PUBLISHED: "true", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: "" }],
+      ["published with a mutable ref", { CATALOG_PUBLISHED: "true", CATALOG_DELIVERY_STATE: "published", INPUT_MARKETPLACE_REVISION: "main" }],
       ["published with a truncated revision", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "b".repeat(39),
       }],
       ["published with forty non-hex characters", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "z".repeat(40),
       }],
       ["published with a forty-character branch name", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "refs/heads/some-quite-long-branch-name-xy",
       }],
       ["published with an uppercase revision", {
         CATALOG_PUBLISHED: "true",
+        CATALOG_DELIVERY_STATE: "published",
         INPUT_MARKETPLACE_REVISION: "B".repeat(40),
       }],
     ]) {
@@ -8323,6 +8369,7 @@ test("the post-publish smoke cannot record a public catalog install it did not p
     ]) {
       const refused = runCatalogDeliveryState({
         CATALOG_PUBLISHED: "false",
+        CATALOG_DELIVERY_STATE: "deferred",
         INPUT_MARKETPLACE_REVISION: "",
         PUBLISHED_COMMIT: publishedCommit,
       }, lane);
@@ -8364,8 +8411,8 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     }, /must derive catalog_published from the recorded marketplace-publish outcome/u],
     ["delivery outcome ignores whether the push ran", workflows => {
       const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
-      step.run = step.run.replace('&& [ "$PUBLISH_OUTCOME" = "success" ] \\\n', "");
-    }, /must run \[ "\$PUBLISH_OUTCOME" = "success" \]/u],
+      step.env.PUBLISH_OUTCOME = "${{ steps.token.outcome }}";
+    }, /catalog delivery outcome must read the real token, push, and revision results/u],
     ["delivery outcome accepts any revision the push printed", workflows => {
       const step = draftStep(publishJob(workflows), "Record catalog delivery outcome");
       step.run = step.run.replace(
@@ -8408,8 +8455,8 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     }, /must run if \[ -n "\$INPUT_MARKETPLACE_REVISION" \]/u],
     ["unknown delivery states fall through instead of failing", workflows => {
       const step = draftStep(smokeJob(workflows), "Record catalog delivery state");
-      step.run = step.run.replace("catalog_published must be true or false", "unreachable");
-    }, /must run catalog_published must be true or false/u],
+      step.run = step.run.replace("catalog delivery handoff is inconsistent", "unreachable");
+    }, /must run catalog delivery handoff is inconsistent/u],
     ["delivery state becomes conditional", workflows => {
       draftStep(smokeJob(workflows), "Record catalog delivery state").if = "inputs.catalog_published";
     }, /catalog delivery state must be unconditional and fail closed/u],
@@ -8447,6 +8494,21 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["catalog push runs without a minted token", workflows => {
       delete draftStep(publishJob(workflows), "Point the catalog at the published release").if;
     }, /catalog push must run only with a minted token and must not fail the release/u],
+    ["failed live-catalog smoke no longer restores the prior pin", workflows => {
+      const job = publishJob(workflows);
+      job.steps = job.steps.filter(({ name }) => name !== "Restore the previous catalog pin");
+    }, /must contain named step Restore the previous catalog pin/u],
+    ["automatic restore targets something other than the replaced pin", workflows => {
+      const step = draftStep(publishJob(workflows), "Restore the previous catalog pin");
+      step.run = step.run.replace('--commit "$PREVIOUS_PLUGIN_SHA"', '--commit "$GITHUB_SHA"');
+    }, /must run --commit "\$PREVIOUS_PLUGIN_SHA"/u],
+    ["automatic restore drops the expected-current fence", workflows => {
+      const step = draftStep(publishJob(workflows), "Restore the previous catalog pin");
+      step.run = step.run.replace('--expected-current-revision "$PUBLISHED_REVISION"', "");
+    }, /must run --expected-current-revision "\$PUBLISHED_REVISION"/u],
+    ["restore failure gates the irreversible release", workflows => {
+      delete draftStep(publishJob(workflows), "Restore the previous catalog pin")["continue-on-error"];
+    }, /must automatically restore after a failed smoke without failing the irreversible release/u],
     ["smoke waits for the catalog job to succeed", workflows => {
       smokeCall(workflows).if
         = "inputs.publish_release && needs.marketplace-publish.result == 'success'";
@@ -8473,6 +8535,10 @@ test("catalog publication cannot be reinstated as a gate or claimed without happ
     ["plugin lane catalog push failure fails its tagged release again", workflows => {
       delete draftStep(pluginPublishJob(workflows), "Point the catalog at the published release")["continue-on-error"];
     }, /plugin-release\.yml catalog push must run only with a minted token/u],
+    ["plugin W8.4 candidate-pinned proof is removed", workflows => {
+      const job = workflows.get(pluginFile).jobs.preflight;
+      job.steps = job.steps.filter(({ name }) => name !== "Prove the candidate-pinned marketplace install path");
+    }, /must contain named step Prove the candidate-pinned marketplace install path/u],
     ["plugin lane stops recording its delivery outcome", workflows => {
       const job = pluginPublishJob(workflows);
       job.steps = job.steps.filter(({ name }) => name !== "Record catalog delivery outcome");

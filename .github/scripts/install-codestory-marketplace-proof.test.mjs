@@ -238,6 +238,34 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     assert.match(config, /\[plugins\."codestory@Fixture"\]/u);
     assert.match(config, /enabled = true/u);
 
+    const restoredRoot = path.join(root, "restored-proof");
+    const restoredArgs = proofArgs({
+      packageRoot,
+      proofRoot: restoredRoot,
+      marketplaceRoot,
+      marketplaceRevision,
+      expectedVersion: pluginManifest.version,
+      sourceRepository: pluginSourceRoot,
+    });
+    restoredArgs.push(
+      "--installation-source",
+      "codex_marketplace_restored_fixture",
+    );
+    run(process.execPath, restoredArgs, {
+      env: { ...process.env, HOME: personalHome },
+    });
+    const restoredAttestation = JSON.parse(
+      readFileSync(path.join(restoredRoot, "attestation.json")),
+    );
+    assert.equal(
+      restoredAttestation.installation_source,
+      "codex_marketplace_restored_fixture",
+    );
+    assert.equal(
+      restoredAttestation.marketplace.repository,
+      "local:candidate-pinned-marketplace-restored-fixture",
+    );
+
     writeFileSync(
       path.join(pluginSourceRoot, "plugins", "codestory", "mismatched.txt"),
       "different package bytes\n",

@@ -467,7 +467,7 @@ function validateNonClaimPolicy(graph, cellGroups) {
 // Marketplace catalog publication is delivery, not a release gate: it happens after the tag and
 // the GitHub release already exist, so failing the release on it would only convert a recoverable
 // delivery gap into an unrecoverable one. The price of that is that the release must say which of
-// the two states it is in, so the graph names both and pins a distinct installer identity to each.
+// the state it is in, so the graph names each and pins a distinct installer identity to each.
 // A run that could not publish records the deferred identity in its post-publish cells; nothing in
 // the pipeline is allowed to record the published identity without the catalog push succeeding.
 function validateCatalogDelivery(policy, dependencies, cellGroups) {
@@ -480,8 +480,8 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
   if (delivery.release_gate !== false) {
     fail("workflow_policy.catalog_delivery.release_gate must be false: catalog publication is delivery, not a release gate");
   }
-  if (!Array.isArray(delivery.states) || delivery.states.length !== 2) {
-    fail("workflow_policy.catalog_delivery.states must name exactly the published and deferred states");
+  if (!Array.isArray(delivery.states) || delivery.states.length !== 3) {
+    fail("workflow_policy.catalog_delivery.states must name exactly the published, deferred, and restored states");
   }
   const installers = new Set();
   const byId = new Map();
@@ -504,7 +504,7 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
     installers.add(installer);
     byId.set(id, state);
   }
-  for (const id of ["published", "deferred"]) {
+  for (const id of ["published", "deferred", "restored"]) {
     if (!byId.has(id)) fail(`workflow_policy.catalog_delivery.states must declare the ${id} state`);
   }
   if (byId.get("published").live_catalog_revision !== true) {
@@ -513,7 +513,10 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
   if (byId.get("deferred").live_catalog_revision !== false) {
     fail("workflow_policy.catalog_delivery deferred state must not consume a live catalog revision");
   }
-  // Naming the two states is not enough on its own: something has to read the mark, or a
+  if (byId.get("restored").live_catalog_revision !== false) {
+    fail("workflow_policy.catalog_delivery restored state must not consume the failed live catalog revision");
+  }
+  // Naming the states is not enough on its own: something has to read the mark, or a
   // deferred release's closeout verdict stays indistinguishable from a published one. This
   // names the post-publish cell family whose signed `installer` identity the closeout resolves
   // the delivery state from, so the graph cannot declare the states without a reader.
@@ -559,10 +562,17 @@ function validateCatalogDelivery(policy, dependencies, cellGroups) {
       fail(`workflow_policy.catalog_delivery.recovery.previous_pin_outputs[${index}] does not match identifier`);
     }
   }
-  // Stated, not implied. Restore is operator-initiated through `recovery_workflow` today; the
-  // graph says so rather than letting documentation claim an automatic rollback that no job runs.
-  if (recovery.automatic_restore !== false) {
-    fail("workflow_policy.catalog_delivery.recovery.automatic_restore must be false while restore is operator-initiated");
+  const restoredState = nonEmptyText(
+    recovery.restored_state,
+    "workflow_policy.catalog_delivery.recovery.restored_state",
+  );
+  if (restoredState !== "restored" || !byId.has(restoredState)) {
+    fail("workflow_policy.catalog_delivery.recovery.restored_state must name the declared restored state");
+  }
+  // Stated, not implied. This may be true only with a distinct closeout-readable restored state;
+  // workflow policy separately proves the release lane executes the prior-pin restore.
+  if (recovery.automatic_restore !== true) {
+    fail("workflow_policy.catalog_delivery.recovery.automatic_restore must be true with executable prior-pin restore");
   }
   return delivery;
 }
