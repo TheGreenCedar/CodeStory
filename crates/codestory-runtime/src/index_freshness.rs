@@ -217,7 +217,7 @@ struct IndexFreshnessInventory {
 struct IndexFreshnessPlan {
     plan: codestory_contracts::workspace::RefreshPlan,
     current_policy_exclusions: Vec<codestory_workspace::OversizedSourceExclusionCandidate>,
-    current_file_count: usize,
+    admitted_file_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -383,25 +383,10 @@ fn plan_index_freshness(
         });
     }
 
-    let new_file_count = refresh
-        .refresh
-        .plan
-        .files_to_index
-        .iter()
-        .filter(|path| !refresh.refresh.plan.existing_file_ids.contains_key(*path))
-        .count();
-    let current_file_count = refresh
-        .refresh
-        .plan
-        .existing_file_ids
-        .len()
-        .saturating_add(new_file_count)
-        .saturating_add(refresh.policy_exclusions.len());
-
     Ok(IndexFreshnessPlan {
         plan: refresh.refresh.plan,
         current_policy_exclusions: refresh.policy_exclusions,
-        current_file_count,
+        admitted_file_count: refresh.admitted_file_count,
     })
 }
 
@@ -416,7 +401,7 @@ fn complete_scan_within_bounded_caps(
             "indexed file inventory exceeds bounded freshness cap ({indexed_file_count} > {indexed_file_cap})"
         )));
     }
-    if planned.current_file_count > current_file_cap {
+    if planned.admitted_file_count > current_file_cap {
         return Err(NotCheckedReason::bounded(format!(
             "current workspace inventory is {:?} (>{})",
             WorkspaceInventoryOutcome::Bounded,

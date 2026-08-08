@@ -241,6 +241,45 @@ fn an_observer_coverage_error_falls_back_to_the_bounded_verdict() {
 }
 
 #[test]
+fn lost_observer_coverage_counts_route_unsupported_files_like_the_bounded_walk() {
+    let _env = hybrid_test_env();
+    let project = ObservedProject::publish_with_source_count(2);
+    std::fs::write(project.root().join("src/NOTICE"), "post-publish notice\n")
+        .expect("route-unsupported file beyond the synthetic current-file cap");
+    let session = scripted_session(project.root(), |drain| {
+        (drain > 0)
+            .then(|| ObservedFilesystemEvent::CoverageLost {
+                detail: "injected coverage failure".to_string(),
+            })
+            .into_iter()
+            .collect()
+    });
+
+    let (unobserved, observed) = with_index_freshness_caps_for_test(10, 2, || {
+        (
+            project.freshness(FreshnessObservation::Unobserved),
+            project.freshness(FreshnessObservation::Observed(&session)),
+        )
+    });
+
+    for freshness in [&unobserved, &observed] {
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+        assert_eq!(
+            freshness.not_checked_cause,
+            Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+        );
+        assert_eq!(
+            freshness.reason.as_deref(),
+            Some("current workspace inventory is Bounded (>2)")
+        );
+    }
+    assert_eq!(observed.status, unobserved.status);
+    assert_eq!(observed.not_checked_cause, unobserved.not_checked_cause);
+    assert_eq!(observed.reason, unobserved.reason);
+    assert_eq!(observed.checked_file_count, unobserved.checked_file_count);
+}
+
+#[test]
 fn a_write_that_races_the_scan_is_reported_stale_instead_of_fresh() {
     let _env = hybrid_test_env();
     let project = ObservedProject::publish();

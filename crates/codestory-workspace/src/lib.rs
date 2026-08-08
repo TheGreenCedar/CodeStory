@@ -337,6 +337,8 @@ pub struct WorkspaceRefreshOutcome {
 pub struct WorkspacePolicyRefreshOutcome {
     pub refresh: WorkspaceRefreshOutcome,
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    /// Files admitted by discovery before source-route and policy classification.
+    pub admitted_file_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -608,7 +610,9 @@ impl WorkspaceManifest {
         &self,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyFileInventory> {
-        WorkspaceDiscovery.source_inventory_with_policy_inner(self, policy, None)
+        WorkspaceDiscovery
+            .source_inventory_with_policy_inner(self, policy, None)
+            .map(|(inventory, _)| inventory)
     }
 
     /// Re-read every classified exclusion at the publication fence.
@@ -791,6 +795,7 @@ impl WorkspaceDiscovery {
             &legacy_positional_policy(byte_cap, policy_version),
             None,
         )
+        .map(|(inventory, _)| inventory)
     }
 
     /// Verify that classified exclusions still name the same stable bytes at publication time.
@@ -856,7 +861,7 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         policy: &SourceIndexPolicy,
         max_files: Option<usize>,
-    ) -> Result<WorkspacePolicyFileInventory> {
+    ) -> Result<(WorkspacePolicyFileInventory, usize)> {
         if policy.byte_cap == 0
             || policy.structural_byte_cap == 0
             || policy.structural_unit_cap == 0
@@ -865,14 +870,18 @@ impl WorkspaceDiscovery {
             bail!("bounded source policy requires non-zero caps and a non-empty version");
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
+        let admitted_file_count = inventory.files.len();
         if !inventory.outcome.is_complete() {
-            return Ok(WorkspacePolicyFileInventory {
-                files: inventory.files,
-                policy_exclusions: Vec::new(),
-                outcome: inventory.outcome,
-                issues: inventory.issues,
-                warnings: inventory.warnings,
-            });
+            return Ok((
+                WorkspacePolicyFileInventory {
+                    files: inventory.files,
+                    policy_exclusions: Vec::new(),
+                    outcome: inventory.outcome,
+                    issues: inventory.issues,
+                    warnings: inventory.warnings,
+                },
+                admitted_file_count,
+            ));
         }
 
         let root = workspace_root(manifest);
@@ -955,13 +964,16 @@ impl WorkspaceDiscovery {
         } else {
             WorkspaceInventoryOutcome::Partial
         };
-        Ok(WorkspacePolicyFileInventory {
-            files,
-            policy_exclusions,
-            outcome,
-            issues,
-            warnings,
-        })
+        Ok((
+            WorkspacePolicyFileInventory {
+                files,
+                policy_exclusions,
+                outcome,
+                issues,
+                warnings,
+            },
+            admitted_file_count,
+        ))
     }
 
     fn source_inventory_inner(
@@ -1244,7 +1256,11 @@ impl WorkspaceDiscovery {
         byte_cap: u64,
         policy_version: &str,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy(manifest, byte_cap, policy_version)?;
+        let (inventory, admitted_file_count) = self.source_inventory_with_policy_inner(
+            manifest,
+            &legacy_positional_policy(byte_cap, policy_version),
+            None,
+        )?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1256,6 +1272,7 @@ impl WorkspaceDiscovery {
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1266,7 +1283,8 @@ impl WorkspaceDiscovery {
         inputs: &RefreshInputs,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory = self.source_inventory_with_policy_inner(manifest, policy, None)?;
+        let (mut inventory, admitted_file_count) =
+            self.source_inventory_with_policy_inner(manifest, policy, None)?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
@@ -1279,6 +1297,7 @@ impl WorkspaceDiscovery {
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1291,7 +1310,7 @@ impl WorkspaceDiscovery {
         byte_cap: u64,
         policy_version: &str,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy_inner(
+        let (inventory, admitted_file_count) = self.source_inventory_with_policy_inner(
             manifest,
             &legacy_positional_policy(byte_cap, policy_version),
             Some(max_current_files),
@@ -1307,6 +1326,7 @@ impl WorkspaceDiscovery {
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
@@ -1318,7 +1338,7 @@ impl WorkspaceDiscovery {
         max_current_files: usize,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let mut inventory =
+        let (mut inventory, admitted_file_count) =
             self.source_inventory_with_policy_inner(manifest, policy, Some(max_current_files))?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
@@ -1332,6 +1352,7 @@ impl WorkspaceDiscovery {
         Ok(WorkspacePolicyRefreshOutcome {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
+            admitted_file_count,
         })
     }
 
