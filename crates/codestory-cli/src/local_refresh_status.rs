@@ -12,7 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use codestory_retrieval::{ProcessOwnerState, ProcessStartProbe};
+use codestory_runtime::{
+    ProcessOwnerState, ProcessStartProbe, process_owner_state, process_start_identity,
+};
 
 use codestory_contracts::owned_artifacts::{
     LOCAL_REFRESH_LOCK_FILE, LOCAL_REFRESH_STATE_GUARD_FILE, LOCAL_REFRESH_STATUS_FILE,
@@ -696,15 +698,10 @@ fn path_fingerprint(path: &Path) -> String {
 }
 
 fn recorded_process_start_identity(pid: u32) -> Option<String> {
-    match codestory_retrieval::probe_process_start_identity(pid) {
+    match process_start_identity(pid) {
         ProcessStartProbe::Running { start_identity } => Some(start_identity),
         ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
     }
-}
-
-fn process_owner_state(pid: u32, expected_start_identity: Option<&str>) -> ProcessOwnerState {
-    let probe = codestory_retrieval::probe_process_start_identity(pid);
-    codestory_retrieval::process_owner_state(&probe, expected_start_identity)
 }
 
 #[cfg(test)]

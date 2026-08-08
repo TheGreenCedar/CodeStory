@@ -14,7 +14,34 @@ use std::fmt;
 use std::path::Path;
 
 use crate::services::ActivationService;
-use crate::{RetrievalStatusReport, RuntimeRetrievalProfile};
+use crate::{ProcessOwnerState, ProcessStartProbe, RetrievalStatusReport, RuntimeRetrievalProfile};
+
+/// Observe one PID's platform start identity without collapsing uncertainty.
+#[must_use]
+pub fn process_start_identity(pid: u32) -> ProcessStartProbe {
+    codestory_retrieval::probe_process_start_identity(pid)
+}
+
+/// Decide whether one PID still owns a persisted optional start identity.
+#[must_use]
+pub fn process_owner_state(pid: u32, expected_start_identity: Option<&str>) -> ProcessOwnerState {
+    let probe = process_start_identity(pid);
+    process_owner_state_for_probe(&probe, expected_start_identity)
+}
+
+fn process_owner_state_for_probe(
+    probe: &ProcessStartProbe,
+    expected_start_identity: Option<&str>,
+) -> ProcessOwnerState {
+    codestory_retrieval::process_owner_state(probe, expected_start_identity)
+}
+
+fn collapsed_process_start_identity(probe: ProcessStartProbe) -> Option<String> {
+    match probe {
+        ProcessStartProbe::Running { start_identity } => Some(start_identity),
+        ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
+    }
+}
 
 /// Effective retrieval namespace selected for one status observation.
 ///
@@ -207,13 +234,7 @@ impl ActivationService {
     /// identity.
     #[must_use]
     pub fn host_process_start_identity() -> Option<String> {
-        match codestory_retrieval::probe_process_start_identity(std::process::id()) {
-            codestory_retrieval::ProcessStartProbe::Running { start_identity } => {
-                Some(start_identity)
-            }
-            codestory_retrieval::ProcessStartProbe::NotRunning
-            | codestory_retrieval::ProcessStartProbe::Unknown { .. } => None,
-        }
+        collapsed_process_start_identity(process_start_identity(std::process::id()))
     }
 
     /// Observe strict retrieval status using this service's pinned runtime
@@ -333,6 +354,90 @@ mod tests {
     use crate::Runtime;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn process_owner_state_matches_retrieval_for_every_probe_and_expected_identity() {
+        let probes = [
+            (
+                "running",
+                ProcessStartProbe::Running {
+                    start_identity: "start-a".to_string(),
+                },
+                [
+                    ProcessOwnerState::Matching,
+                    ProcessOwnerState::GoneOrReused,
+                    ProcessOwnerState::Matching,
+                ],
+            ),
+            (
+                "unknown",
+                ProcessStartProbe::Unknown {
+                    reason: "probe failed".to_string(),
+                },
+                [
+                    ProcessOwnerState::Unknown,
+                    ProcessOwnerState::Unknown,
+                    ProcessOwnerState::Unknown,
+                ],
+            ),
+            (
+                "not_running",
+                ProcessStartProbe::NotRunning,
+                [
+                    ProcessOwnerState::GoneOrReused,
+                    ProcessOwnerState::GoneOrReused,
+                    ProcessOwnerState::GoneOrReused,
+                ],
+            ),
+        ];
+        let expected_identities = [
+            ("matching", Some("start-a")),
+            ("different", Some("start-b")),
+            ("absent", None),
+        ];
+        let mut compared_cells = 0;
+
+        for (probe_name, probe, expected_states) in &probes {
+            for ((identity_name, expected_identity), expected_state) in
+                expected_identities.iter().zip(expected_states)
+            {
+                let runtime_state = process_owner_state_for_probe(probe, *expected_identity);
+                let retrieval_state =
+                    codestory_retrieval::process_owner_state(probe, *expected_identity);
+                assert_eq!(
+                    runtime_state, retrieval_state,
+                    "probe={probe_name} expected={identity_name}"
+                );
+                assert_eq!(
+                    runtime_state, *expected_state,
+                    "probe={probe_name} expected={identity_name}"
+                );
+                compared_cells += 1;
+            }
+        }
+
+        assert_eq!(compared_cells, 9, "the differential table must stay 3x3");
+    }
+
+    #[test]
+    fn host_process_start_identity_keeps_collapsed_diagnostic_behavior() {
+        assert_eq!(
+            collapsed_process_start_identity(ProcessStartProbe::Running {
+                start_identity: "start-a".to_string(),
+            }),
+            Some("start-a".to_string())
+        );
+        assert_eq!(
+            collapsed_process_start_identity(ProcessStartProbe::NotRunning),
+            None
+        );
+        assert_eq!(
+            collapsed_process_start_identity(ProcessStartProbe::Unknown {
+                reason: "probe failed".to_string(),
+            }),
+            None
+        );
+    }
 
     struct DiagnosticsFixture {
         _project: tempfile::TempDir,

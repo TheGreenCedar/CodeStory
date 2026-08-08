@@ -1,7 +1,7 @@
 use std::path::Path;
 
 pub use codestory_retrieval::{
-    CacheCleanPlan, CacheCleanReport, ProcessStartProbe, RetrievalStatusReport,
+    CacheCleanPlan, CacheCleanReport, ProcessOwnerState, ProcessStartProbe, RetrievalStatusReport,
     SidecarProcessDefaults as RetrievalProcessDefaults,
     SidecarRuntimeDefaults as RetrievalRuntimeDefaults,
     SidecarRuntimeOverrides as RetrievalRuntimeOverrides,
