@@ -419,6 +419,9 @@ fn shadow_env_enabled() -> Option<bool> {
 /// - Unset: retrieval is available when the manifest exists and the shared
 ///   per-user embedding server is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
+    if active_pinned_retrieval_read(controller).is_some() {
+        return true;
+    }
     match retrieval_env_override() {
         Some(false) => {
             tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
@@ -2452,10 +2455,6 @@ mod tests {
     /// retrieval is primary — a second `PinnedRetrievalRead::begin`. The
     /// end-to-end count is proved on the real packet path in
     /// `services::activation_tests`.
-    ///
-    /// This asserts a difference, not an absolute: the absolute count of
-    /// readiness passes a warm operation pays is larger than one and is not
-    /// what this branch changes.
     #[test]
     fn the_value_helper_borrows_an_active_pin_instead_of_paying_for_a_second() {
         let fixture = pinned_operation_fixture();

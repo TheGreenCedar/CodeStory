@@ -315,6 +315,7 @@ struct ReadyLease {
     core_publication: IndexPublicationDto,
     retrieval: codestory_retrieval::ReadyRetrievalIdentity,
     source: ReadySourceIdentity,
+    source_freshness_memo: codestory_workspace::SourceFreshnessMemo,
     /// The observer session and epoch the source snapshot was taken under.
     ///
     /// Everything else in this lease is a pointer that a source write does not move: the core
@@ -563,6 +564,34 @@ impl ActivationService {
             .is_some_and(|current| current.matches(&requested))
             .then(|| state.current.clone())
             .flatten()
+    }
+
+    fn source_freshness_memo_for_target(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Option<codestory_workspace::SourceFreshnessMemo> {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        (state
+            .target
+            .as_ref()
+            .is_some_and(|current| current.matches(&requested))
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == ActivationState::Ready))
+        .then(|| {
+            state
+                .ready_lease
+                .as_ref()
+                .map(|lease| lease.source_freshness_memo.clone())
+        })
+        .flatten()
     }
 
     fn target_for_request(&self, project_root: &Path, storage_path: &Path) -> ActivationTarget {
@@ -1468,6 +1497,7 @@ impl ActivationService {
             core_publication: revalidated_core,
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
+            source_freshness_memo: codestory_workspace::SourceFreshnessMemo::default(),
             source_observer,
         });
         operation.set_capability(true, ActivationCapabilityState::Ready);
@@ -1745,6 +1775,18 @@ impl PublicOperationService {
         }
     }
 
+    fn source_freshness_scope(&self) -> codestory_workspace::SourceFreshnessScope {
+        let memo = self.activation.as_ref().and_then(|activation| {
+            let project_root = self.controller.require_project_root().ok()?;
+            let storage_path = self.controller.require_storage_path().ok()?;
+            activation.source_freshness_memo_for_target(&project_root, &storage_path)
+        });
+        memo.map_or_else(
+            codestory_workspace::SourceFreshnessScope::enter,
+            codestory_workspace::SourceFreshnessScope::enter_with_memo,
+        )
+    }
+
     fn retained_core_allows(&self, operation: &str, publication: &IndexPublicationRecord) -> bool {
         !operation_requires_retrieval(operation)
             && self.activation.as_ref().is_some_and(|activation| {
@@ -1814,29 +1856,24 @@ impl PublicOperationService {
             "public-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
-        // One public operation derives source freshness at least twice (before
-        // and after the build) and the MCP transport wraps the same request in
-        // a second public operation. Scoping the freshness verdict memo to the
-        // operation makes the derivations that ask the same question at the
-        // same instant — this pre-build check, a nested wrapper's pre-build
-        // check, strict retrieval readiness — share one content pass instead of
-        // re-hashing every unchanged file. The post-build check below is not
-        // one of those: it asks whether the source drifted *since*, so it
-        // re-derives from content. Nested scopes share the outer memo; the memo
-        // never outlives the outermost operation.
-        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
+        // The ready lease owns reusable freshness and readiness observations;
+        // this scope owns only the operation's counters. The post-build check
+        // below still drops stored-file verdicts and re-derives them from
+        // content, so same-mtime drift and torn reads win over reuse.
+        let _source_freshness_scope = self.source_freshness_scope();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self
                     .controller
                     .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
-                if !index_freshness_admits_operation(&freshness)
-                    && !self.retained_core_allows(operation, publication)
-                {
-                    return Err(ApiError::new(
-                        "project_unavailable",
-                        index_freshness_block_message(operation, &freshness),
-                    ));
+                if !index_freshness_admits_operation(&freshness) {
+                    codestory_workspace::invalidate_lease_memoized_values();
+                    if !self.retained_core_allows(operation, publication) {
+                        return Err(ApiError::new(
+                            "project_unavailable",
+                            index_freshness_block_message(operation, &freshness),
+                        ));
+                    }
                 }
                 let mut run = || {
                     if cancelled.load(Ordering::Acquire) {
@@ -1865,13 +1902,14 @@ impl PublicOperationService {
                     let after = self.controller.index_freshness_reverified(
                         FreshnessObservationPolicy::ObserveSourceRoot,
                     )?;
-                    if !index_freshness_admits_operation(&after)
-                        && !self.retained_core_allows(operation, publication)
-                    {
-                        return Err(ApiError::new(
-                            "publication_changed",
-                            format!("source inputs changed while running {operation}"),
-                        ));
+                    if !index_freshness_admits_operation(&after) {
+                        codestory_workspace::invalidate_lease_memoized_values();
+                        if !self.retained_core_allows(operation, publication) {
+                            return Err(ApiError::new(
+                                "publication_changed",
+                                format!("source inputs changed while running {operation}"),
+                            ));
+                        }
                     }
                     Ok(value)
                 };
@@ -1930,10 +1968,9 @@ impl PublicOperationService {
             "resource-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
-        // Observational operations derive freshness through the same helpers;
-        // scope them the same way so an observational wrapper around a public
-        // one cannot reintroduce a second content pass.
-        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter();
+        // Observational operations borrow the same ready-lease memo so a nested
+        // wrapper cannot reintroduce a content or readiness pass.
+        let _source_freshness_scope = self.source_freshness_scope();
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 if cancelled.load(Ordering::Acquire) {
@@ -2836,6 +2873,7 @@ mod activation_tests {
             core_publication: core_publication.clone(),
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
+            source_freshness_memo: codestory_workspace::SourceFreshnessMemo::default(),
             source_observer: Some(source_observer),
         };
         assert!(lease.source.is_admissible_snapshot());
@@ -3051,10 +3089,10 @@ mod activation_tests {
         );
     }
 
-    /// The memo is scoped to the operation, never to the process: the next
-    /// operation re-reads content rather than trusting the previous verdict.
+    /// A second operation on one ready lease begins from the clean verdicts
+    /// re-established by the first operation's post-build guard.
     #[test]
-    fn the_next_public_operation_reverifies_source_content() {
+    fn the_next_public_operation_reuses_the_ready_lease_verdicts() {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.public_operation_service();
         let mut first = None;
@@ -3075,11 +3113,11 @@ mod activation_tests {
         let first = first.expect("first scope");
         let second = second.expect("second scope");
         assert!(first.content_hash_reads > 0);
+        assert_eq!(second.content_hash_reads, 0);
         assert_eq!(
-            second.content_hash_reads, first.content_hash_reads,
-            "a new operation must hash the same files again instead of inheriting verdicts"
+            second.verdict_reuses, first.content_hash_reads,
+            "the second operation must reuse the verdicts left by the first post-build guard"
         );
-        assert_eq!(second.verdict_reuses, 0);
         assert_eq!(
             codestory_workspace::source_freshness_counts(),
             None,
@@ -3105,13 +3143,11 @@ mod activation_tests {
     /// runs a public operation, pins retrieval, and builds a packet through the
     /// orchestrator — and then reads the wire field the orchestrator populated,
     /// instead of asserting on a hand-built DTO or on the counter helper. It
-    /// also pins what the pin short-circuit buys: the MCP transport wraps a
-    /// packet request in a *second* public operation, and that wrapper must
-    /// borrow the operation's existing retrieval pin rather than begin a new
-    /// one. Beginning a second pin would re-run strict readiness, so the
-    /// wrapped packet's published pass count must equal the unwrapped one's.
+    /// The first packet on a ready lease performs exactly one fingerprint pass.
+    /// A later wrapper on that same lease reuses the opaque fingerprint, while
+    /// replacing the lease memo forces exactly one new pass.
     #[test]
-    fn a_warm_packet_publishes_its_readiness_cost_and_a_wrapper_adds_no_pass() {
+    fn a_warm_packet_performs_one_fingerprint_pass_per_ready_lease() {
         let fixture = ready_activation_fixture();
         let browser = fixture.runtime.browser_service();
 
@@ -3123,9 +3159,9 @@ mod activation_tests {
             .retrieval_trace
             .source_freshness_telemetry
             .expect("a packet built inside a public operation publishes its pass counters");
-        assert!(
-            flat_telemetry.readiness_fingerprint_passes > 0,
-            "a strict retrieval packet pays at least one whole-repository readiness pass"
+        assert_eq!(
+            flat_telemetry.readiness_fingerprint_passes, 1,
+            "the first strict packet on a ready lease must perform exactly one fingerprint pass"
         );
         assert!(
             flat_telemetry.content_hash_reads > 0,
@@ -3149,11 +3185,35 @@ mod activation_tests {
             .expect("the wrapped packet publishes its pass counters too");
 
         assert_eq!(
-            wrapped_telemetry.readiness_fingerprint_passes,
-            flat_telemetry.readiness_fingerprint_passes,
-            "wrapping a packet request in a second public operation must borrow \
-             the outer retrieval pin; beginning a second pin would buy another \
-             whole-repository readiness pass"
+            wrapped_telemetry.readiness_fingerprint_passes, 0,
+            "a later operation on the same ready lease must reuse its fingerprint"
+        );
+
+        {
+            let activation = fixture.runtime.activation_service();
+            let mut state = activation
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state
+                .ready_lease
+                .as_mut()
+                .expect("ready lease")
+                .source_freshness_memo = codestory_workspace::SourceFreshnessMemo::default();
+        }
+        let next_lease = browser
+            .packet(warm_packet_request())
+            .expect("a warm packet on the replacement lease memo");
+        assert_eq!(
+            next_lease
+                .answer
+                .retrieval_trace
+                .source_freshness_telemetry
+                .expect("the replacement lease packet publishes counters")
+                .readiness_fingerprint_passes,
+            1,
+            "a new ready lease must compute its own fingerprint"
         );
     }
 

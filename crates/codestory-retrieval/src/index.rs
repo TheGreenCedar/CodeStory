@@ -39,9 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 #[cfg(any(not(feature = "test-support"), test))]
 use std::io::{Read, Write};
-use std::path::Path;
-#[cfg(any(not(feature = "test-support"), test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(not(feature = "test-support"), test))]
 use std::time::{Duration, Instant};
@@ -107,6 +105,19 @@ pub(crate) struct SidecarInputFingerprint {
     pub(crate) lexical_hash: String,
     pub(crate) lexical_coverage: crate::lexical_index::LexicalCoverage,
 }
+
+#[derive(Clone)]
+struct LeaseMemoizedSidecarInputFingerprint {
+    project_root: PathBuf,
+    storage_path: PathBuf,
+    project_id: String,
+    embedding_backend: String,
+    embedding_dim: i32,
+    producer_compatibility_identity: String,
+    fingerprint: SidecarInputFingerprint,
+}
+
+const LEASE_SIDECAR_INPUT_FINGERPRINT_KEY: &str = "sidecar-input-fingerprint-v1";
 
 struct SidecarEmbeddingContract<'a> {
     backend: &'a str,
@@ -1905,6 +1916,69 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     embedding_dim: i32,
     producer_compatibility_identity: &str,
 ) -> Result<SidecarInputFingerprint> {
+    if let Some(memoized) = codestory_workspace::with_lease_memoized_value(
+        LEASE_SIDECAR_INPUT_FINGERPRINT_KEY,
+        |memoized: Option<&LeaseMemoizedSidecarInputFingerprint>| {
+            let precomputed = memoized
+                .filter(|memoized| {
+                    memoized.project_root == project_root
+                        && memoized.storage_path == storage_path
+                        && memoized.project_id == project_id
+                        && memoized.embedding_backend == embedding_backend
+                        && memoized.embedding_dim == embedding_dim
+                        && memoized.producer_compatibility_identity
+                            == producer_compatibility_identity
+                })
+                .map(|memoized| &memoized.fingerprint);
+            let fingerprint = compute_sidecar_input_fingerprint_with_precomputed(
+                storage,
+                project_root,
+                storage_path,
+                project_id,
+                embedding_backend,
+                embedding_dim,
+                producer_compatibility_identity,
+                precomputed,
+            )?;
+            Ok::<_, anyhow::Error>(LeaseMemoizedSidecarInputFingerprint {
+                project_root: project_root.to_path_buf(),
+                storage_path: storage_path.to_path_buf(),
+                project_id: project_id.to_string(),
+                embedding_backend: embedding_backend.to_string(),
+                embedding_dim,
+                producer_compatibility_identity: producer_compatibility_identity.to_string(),
+                fingerprint,
+            })
+        },
+    ) {
+        return memoized.map(|memoized| memoized.fingerprint);
+    }
+    compute_sidecar_input_fingerprint_with_precomputed(
+        storage,
+        project_root,
+        storage_path,
+        project_id,
+        embedding_backend,
+        embedding_dim,
+        producer_compatibility_identity,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_sidecar_input_fingerprint_with_precomputed(
+    storage: &Store,
+    project_root: &Path,
+    storage_path: &Path,
+    project_id: &str,
+    embedding_backend: &str,
+    embedding_dim: i32,
+    producer_compatibility_identity: &str,
+    precomputed: Option<&SidecarInputFingerprint>,
+) -> Result<SidecarInputFingerprint> {
+    if let Some(precomputed) = precomputed {
+        return Ok(precomputed.clone());
+    }
     // This pass reads the repository's lexical source live off disk and
     // streams both projection tables. Record it against the operation scope so
     // a caller can see how many whole-repository readiness passes one request
