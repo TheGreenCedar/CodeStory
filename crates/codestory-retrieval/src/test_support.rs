@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 use codestory_contracts::owned_artifacts::embedded_model_digest_root;
-use codestory_store::{RetrievalIndexManifest, SourcePolicyExclusionPolicyIdentity, Store};
+use codestory_store::{
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SourcePolicyExclusionPolicyIdentity,
+    Store,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -42,6 +45,19 @@ pub fn publish_complete_core_fixture(
         .put_index_publication(publication)
         .context("publish complete core fixture")?;
     Ok(())
+}
+
+/// Create the empty complete core used by cross-crate retrieval fixtures.
+pub fn publish_empty_complete_core_fixture(project_root: &Path, storage_path: &Path) -> Result<()> {
+    let mut storage = Store::open(storage_path).context("open empty complete core fixture")?;
+    let publication = codestory_store::IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "operation-oracle-run".into(),
+        mode: codestory_store::IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    publish_complete_core_fixture(&mut storage, project_root, &publication)
 }
 
 pub fn retrieval_manifest_fixture(
@@ -270,6 +286,73 @@ pub fn publish_zero_dense_pinned_query_fixture(
 
     publish_zero_dense_vector_evidence(runtime, &manifest, &publication)?;
     Ok(manifest)
+}
+
+/// Publish two live-ready generations and retain the older one for rollback.
+///
+/// Cross-crate boundary tests use this to exercise the public observation and
+/// activation operations without recreating private vector-evidence details.
+pub fn publish_retained_rollback_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+) -> Result<(RetrievalIndexManifest, RetrievalIndexRollbackRecord)> {
+    std::fs::write(
+        project_root.join("rollback_old.rs"),
+        "pub fn rollback_old() {}\n",
+    )
+    .context("write retained rollback source")?;
+    let older = publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
+        .context("publish retained rollback generation")?;
+    std::fs::write(
+        project_root.join("rollback_current.rs"),
+        "pub fn rollback_current() {}\n",
+    )
+    .context("write current rollback source")?;
+    let current = publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
+        .context("publish current rollback generation")?;
+    if older.sidecar_generation == current.sidecar_generation {
+        bail!("retained rollback fixture requires distinct generations");
+    }
+    let rollback = RetrievalIndexRollbackRecord {
+        manifest: older,
+        verified_at_epoch_ms: 4_242,
+    };
+    let mut storage =
+        Store::open(storage_path).context("open retained rollback fixture storage")?;
+    storage
+        .publish_retrieval_index_publication(&current, Some(&rollback))
+        .context("arm retained rollback fixture")?;
+    Ok((current, rollback))
+}
+
+/// Add one unprotected generation bundle to an otherwise valid fixture.
+pub fn write_reclaimable_generation_fixture(
+    runtime: &crate::SidecarRuntimeConfig,
+    project_id: &str,
+    suffix: &str,
+) -> Result<Vec<PathBuf>> {
+    let generation = format!("{project_id}-{suffix}");
+    let paths = vec![
+        runtime
+            .layout
+            .lexical_data_dir
+            .join("shards")
+            .join(&generation),
+        runtime.layout.scip_artifacts_root.join(&generation),
+        runtime
+            .layout
+            .semantic_data_dir
+            .join("collections")
+            .join(format!("codestory_{project_id}_{suffix}")),
+    ];
+    for (path, bytes) in paths.iter().zip([7_usize, 8, 9]) {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create reclaimable fixture {}", path.display()))?;
+        std::fs::write(path.join("data"), vec![b'x'; bytes])
+            .with_context(|| format!("write reclaimable fixture {}", path.display()))?;
+    }
+    Ok(paths)
 }
 
 /// Publish a replacement core identity and its strict zero-dense retrieval
