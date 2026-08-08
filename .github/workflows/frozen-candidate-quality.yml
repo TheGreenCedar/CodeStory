@@ -312,3 +312,111 @@ jobs:
             echo "- Artifact upload: \`$upload_outcome\`"
             echo "- Release or qualification gate: \`false\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  linux-quality:
+    name: Optional frozen-candidate Linux x64 Axios v2 quality
+    continue-on-error: true
+    runs-on: [self-hosted, Linux, X64, codestory-linux-vulkan]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact frozen candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Capture optional Linux x64 quality host evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/frozen-candidate-linux-quality
+          {
+            uname -a
+            uname -m
+            node --version
+          } > target/frozen-candidate-linux-quality/host.txt 2>&1
+          test "$(uname -m)" = x86_64
+
+      - name: Download exact Linux x64 candidate archive
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-cli-linux-x64
+          path: target/release-dist
+
+      - name: Produce optional Linux x64 Axios v2 quality evidence
+        id: linux-quality
+        continue-on-error: true
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          set -euo pipefail
+          started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          version="${VERSION#v}"
+          archive="target/release-dist/codestory-cli-v${version}-linux-x64.tar.gz"
+          quality_root=target/frozen-candidate-linux-quality/evidence
+          packaged_root="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-cli.XXXXXX")"
+          export CODESTORY_CACHE_ROOT
+          CODESTORY_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-cache.XXXXXX")"
+          export CODESTORY_STDIO_CACHE_ROOT
+          CODESTORY_STDIO_CACHE_ROOT="$(mktemp -d "$RUNNER_TEMP/codestory-linux-quality-stdio.XXXXXX")"
+          rm -rf "$quality_root"
+          mkdir -p "$quality_root"
+          tar -xzf "$archive" -C "$packaged_root"
+          packaged_cli="$(
+            find "$packaged_root" -type f -name codestory-cli -print
+          )"
+          test "$(printf '%s\n' "$packaged_cli" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test -x "$packaged_cli"
+          export CODESTORY_RELEASE_EVIDENCE_COMMIT
+          CODESTORY_RELEASE_EVIDENCE_COMMIT="$(git rev-parse HEAD)"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_PROFILE=optional-linux-x64-quality
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_ID=codestory-release-corpus-v0.16-axios-js-ts-v2
+          export CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT=benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json
+          export CODESTORY_RELEASE_EVIDENCE_CACHE_ID=frozen-candidate-linux-x64-axios-js-ts-v2
+          export CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT
+          CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT="$(
+            sha256sum target/frozen-candidate-linux-quality/host.txt | awk '{print $1}'
+          )"
+          node scripts/codestory-agent-ab-benchmark.mjs \
+            --packet-runtime \
+            --packet-runtime-mode cold-cli \
+            --task-manifest benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json \
+            --materialize-repos \
+            --repeats 3 \
+            --publishable \
+            --max-source-reads-after-packet 0 \
+            --codestory-cli "$packaged_cli" \
+            --timeout-ms 180000 \
+            --out-dir "$quality_root/packet"
+          finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "- Optional Linux x64 Axios v2 measurement: $(((finished_ns - started_ns) / 1000000)) ms" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload optional Linux x64 Axios v2 quality evidence
+        if: steps.linux-quality.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frozen-candidate-linux-x64-quality-${{ inputs.ref }}
+          path: target/frozen-candidate-linux-quality/evidence
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Record optional Linux x64 quality outcome
+        if: always()
+        shell: bash
+        env:
+          QUALITY_OUTCOME: ${{ steps.linux-quality.outcome }}
+        run: |
+          set -euo pipefail
+          case "${QUALITY_OUTCOME:-skipped}" in
+            success | failure | cancelled | skipped) ;;
+            *) exit 1 ;;
+          esac
+          echo "- Optional Linux x64 quality measurement: \`${QUALITY_OUTCOME:-skipped}\`" \
+            >> "$GITHUB_STEP_SUMMARY"

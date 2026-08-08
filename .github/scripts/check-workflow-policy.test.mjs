@@ -3269,12 +3269,6 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
       step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
     }, /integration must preserve explicit no-op and Linux scopes/u],
-    ["release evidence runs implicitly", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if = "needs.route.outputs.mode != 'calibration'";
-    }, /optional release evidence must run only in explicit release-evidence mode/u],
-    ["package waits for release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs["packaged-proof"].needs.push("release-evidence");
-    }, /package proof must not depend on optional release evidence/u],
     ["protected Linux proof removed", packagedCoordinatorFile, workflow => {
       workflow.jobs["linux-vulkan-proof"].uses = "./.github/workflows/packaged-platform-proof.yml";
     }, /Linux proof must use the protected Vulkan workflow/u],
@@ -3288,9 +3282,9 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
       workflow.jobs.closeout.needs = workflow.jobs.closeout.needs
         .filter(name => name !== "linux-vulkan-proof");
     }, /closeout must wait for every selected platform proof/u],
-    ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs.closeout.needs.push("release-evidence");
-    }, /normal closeout must not depend on optional release or quality evidence/u],
+    ["closeout waits for optional quality", packagedCoordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("frozen-candidate-quality");
+    }, /normal closeout must not depend on optional quality evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
@@ -3330,7 +3324,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
     ["lineage proof moved onto a package cell the matrix never builds", packagedProofFile, workflow => {
       const step = draftStep(workflow.jobs.build, "Prove frozen calibration source lineage");
-      step.if = step.if.replace("linux-x64", "linux-arm64");
+      step.if = step.if.replace("linux-x64", "linux-s390x");
     }, /Prove frozen calibration source lineage must be reachable from a packaged-platform-pr\.yml frozen-candidate dispatch/u],
     ["frozen-candidate coordinator stops forwarding the calibration bundle", packagedCoordinatorFile, workflow => {
       workflow.jobs["packaged-proof"].with.calibration_bundle_artifact = "";

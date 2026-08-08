@@ -40,7 +40,6 @@
       }
     ],
     "unshipped_targets": [
-      "linux-arm64",
       "macos-x64",
       "windows-arm64"
     ],
@@ -1329,7 +1328,7 @@
         "archive_cache_contract": "candidate_archive_cache",
         "archive_transfer": "authenticated_miss_only",
         "evaluation_owner": "isolated_reusable_workflow",
-        "evaluation_owner_sha256": "92d0a7ab0e0df63dacd5cc3ef0b58500a6578036494c329aa35279048734f173",
+          "evaluation_owner_sha256": "44c937d0215c5337afcf73e2bbe37ff56bf97200d81f5dc08b7b900742cdc677",
         "evaluation_contract": "publishable-three-repeat-packet/v1",
         "task_count": 1,
         "repeats_per_task": 3,
@@ -1653,10 +1652,6 @@
         "linux-x64": {
           "archive": "actionlint_1.7.12_linux_amd64.tar.gz",
           "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-        },
-        "linux-arm64": {
-          "archive": "actionlint_1.7.12_linux_arm64.tar.gz",
-          "sha256": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
         },
         "darwin-x64": {
           "archive": "actionlint_1.7.12_darwin_amd64.tar.gz",
