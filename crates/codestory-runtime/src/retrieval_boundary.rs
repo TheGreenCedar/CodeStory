@@ -1,7 +1,11 @@
 use std::path::Path;
 
 pub use codestory_retrieval::{
-    CacheCleanPlan, CacheCleanReport, ProcessOwnerState, ProcessStartProbe, RetrievalStatusReport,
+    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
+    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
+    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalStatusReport,
+    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport, SidecarInventoryReport,
     SidecarProcessDefaults as RetrievalProcessDefaults,
     SidecarRuntimeDefaults as RetrievalRuntimeDefaults,
     SidecarRuntimeOverrides as RetrievalRuntimeOverrides,
@@ -159,6 +163,12 @@ impl RuntimeRetrievalConfig {
     pub(crate) fn into_inner(self) -> codestory_retrieval::SidecarRuntimeConfig {
         self.0
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn as_raw_config_for_test(&self) -> &codestory_retrieval::SidecarRuntimeConfig {
+        &self.0
+    }
 }
 
 impl From<codestory_retrieval::SidecarRuntimeConfig> for RuntimeRetrievalConfig {
@@ -175,6 +185,11 @@ pub fn plan_cache_clean() -> anyhow::Result<CacheCleanPlan> {
 /// Apply process-wide cache cleanup under the retrieval owner's global lock.
 pub fn apply_cache_clean() -> anyhow::Result<CacheCleanReport> {
     codestory_retrieval::apply_cache_clean()
+}
+
+/// Capture retrieval-owned process defaults for an adapter process.
+pub fn retrieval_process_defaults() -> RetrievalProcessDefaults {
+    codestory_retrieval::sidecar_process_defaults()
 }
 
 /// Initialize and validate the embedding backend selected by this runtime.
