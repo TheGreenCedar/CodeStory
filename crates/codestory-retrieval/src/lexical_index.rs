@@ -4,11 +4,13 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
 use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
 use codestory_contracts::validation_receipts::SealedReceiptCache;
-use codestory_store::{FileRole, Store, SymbolSearchDoc};
+use codestory_store::{FileRole, SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,9 +19,8 @@ pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
 const LEGACY_INDEX_FILE: &str = "lexical-index.jsonl";
 const LEGACY_META_FILE: &str = "shard-meta.json";
 const LEGACY_STUB_MARKER: &str = ".zoekt-stub";
-/// Derived from the source cap. A file the indexer admits but this lane drops
-/// is indexed-but-unfindable: no error row, no `retry_required`, and strict
-/// readiness still reports Full.
+/// Default lexical source-file cap for scans without a pinned core publication.
+/// Product scans use the active cap recorded with that publication.
 pub(crate) const MAX_FILE_BYTES: u64 = codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 const MAX_CANDIDATES: usize = 4_096;
 const COVERAGE_PATH_SAMPLE: usize = 32;
@@ -940,6 +941,7 @@ fn scan_lexical_documents(
     symbol_storage_path: Option<&Path>,
     visit: &mut dyn FnMut(&LexicalDocument) -> Result<()>,
 ) -> Result<LexicalCoverage> {
+    let source_policy = lexical_source_policy(project_root, source_storage_path)?;
     let workspace = match source_storage_path {
         Some(storage_path) => {
             codestory_workspace::WorkspaceManifest::open_with_storage_owned_exclusions(
@@ -953,12 +955,13 @@ fn scan_lexical_documents(
     let discovered = workspace
         .source_files()
         .context("discover canonical workspace files for lexical index")?;
-    let mut coverage = LexicalCoverage {
-        discovered_files: discovered.len().min(u32::MAX as usize) as u32,
-        ..Default::default()
-    };
+    let mut coverage = LexicalCoverage::default();
     for path in discovered {
         let relative = lexical_relative_path(project_root, &path);
+        if source_policy.excluded_paths.contains(&relative) {
+            continue;
+        }
+        coverage.discovered_files = coverage.discovered_files.saturating_add(1);
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -967,13 +970,18 @@ fn scan_lexical_documents(
                 continue;
             }
         };
-        if metadata.len() > MAX_FILE_BYTES {
+        if metadata.len() > source_policy.max_file_bytes {
             coverage.omitted_oversized = coverage.omitted_oversized.saturating_add(1);
             push_coverage_sample(&mut coverage.omitted_path_sample, relative);
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+        let content = match read_lexical_file_text_limited(&path, source_policy.max_file_bytes) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                coverage.omitted_oversized = coverage.omitted_oversized.saturating_add(1);
+                push_coverage_sample(&mut coverage.omitted_path_sample, relative);
+                continue;
+            }
             Err(_) => {
                 coverage.unreadable_files = coverage.unreadable_files.saturating_add(1);
                 push_coverage_sample(&mut coverage.unreadable_path_sample, relative);
@@ -992,6 +1000,96 @@ fn scan_lexical_documents(
     }
     scan_symbol_documents(project_root, symbol_storage_path, visit)?;
     Ok(coverage)
+}
+
+fn read_lexical_file_text_limited(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    read_lexical_text_limited(file, max_bytes)
+}
+
+fn read_lexical_text_limited(reader: impl Read, max_bytes: u64) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut reader = reader.take(max_bytes.saturating_add(1));
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+struct LexicalSourcePolicy {
+    max_file_bytes: u64,
+    excluded_paths: HashSet<String>,
+}
+
+fn lexical_source_policy(
+    project_root: &Path,
+    source_storage_path: Option<&Path>,
+) -> Result<LexicalSourcePolicy> {
+    let Some(storage_path) = source_storage_path else {
+        return Ok(LexicalSourcePolicy {
+            max_file_bytes: MAX_FILE_BYTES,
+            excluded_paths: HashSet::new(),
+        });
+    };
+    if !storage_path.is_file() {
+        bail!(
+            "pinned core storage for lexical source policy is missing: {}",
+            storage_path.display()
+        );
+    }
+    let storage =
+        Store::open_read_only(storage_path).context("open storage for lexical source policy")?;
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for lexical source policy")?
+        .context("complete core publication for lexical source policy is missing")?;
+    let manifest = storage
+        .get_source_policy_exclusion_manifest()
+        .context("load lexical source policy manifest")?
+        .context("lexical source policy manifest is missing")?;
+    let records = storage
+        .get_source_policy_exclusions()
+        .context("load lexical source policy exclusions")?;
+    let project_identity = codestory_workspace::project_identity_v3(project_root);
+    let validated = storage
+        .validate_source_policy_exclusion_publication(
+            &publication,
+            &project_identity.project_id,
+            &project_identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &manifest.policy_version,
+                manifest.byte_cap,
+                manifest.structural_unit_cap,
+            ),
+        )
+        .context("validate lexical source policy publication")?;
+    let confirmed_publication = storage
+        .get_complete_index_publication()
+        .context("confirm complete core publication for lexical source policy")?;
+    let confirmed_manifest = storage
+        .get_source_policy_exclusion_manifest()
+        .context("confirm lexical source policy manifest")?;
+    let confirmed_records = storage
+        .get_source_policy_exclusions()
+        .context("confirm lexical source policy exclusions")?;
+    if validated != manifest
+        || confirmed_publication.as_ref() != Some(&publication)
+        || confirmed_manifest.as_ref() != Some(&manifest)
+        || confirmed_records != records
+    {
+        bail!("lexical source policy publication changed while it was being pinned");
+    }
+
+    Ok(LexicalSourcePolicy {
+        max_file_bytes: validated.byte_cap,
+        excluded_paths: records
+            .into_iter()
+            .map(|record| record.normalized_path)
+            .collect(),
+    })
 }
 
 fn scan_symbol_documents(
@@ -1448,15 +1546,8 @@ pub(crate) fn make_test_file_writable(path: &Path) {
     std::fs::set_permissions(path, permissions).expect("make test file writable");
 }
 
-/// A file the indexer admits but this lane drops is indexed-but-unfindable: it
-/// lands in the graph with symbols, is absent from the FTS shard, and nothing
-/// reports an error — strict readiness still says Full.
-///
-/// The assertion below compares two compile-time constants, so it catches a
-/// future *default* bump that forgets this lane. It cannot see the runtime
-/// override: the indexer gates on `SourceIndexPolicy.byte_cap`, which
-/// `CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP` raises without an upper clamp, and
-/// closing that needs the policy plumbed here (#1823).
+/// Keep the fallback aligned if the default source policy changes. Product
+/// scans resolve the active cap from the pinned core publication instead.
 const _: () = assert!(
     MAX_FILE_BYTES >= codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
     "the lexical lane must admit every file the indexer does"
@@ -1465,14 +1556,76 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct CountingReader {
+        remaining: usize,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(b'x');
+            self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
 
     fn build(project: &Path, data: &Path, generation: &str, input: &str) -> PathBuf {
         let fingerprint = lexical_input_fingerprint(project, None).expect("fingerprint");
         build_lexical_shard(project, None, data, generation, &fingerprint, input)
             .expect("build lexical shard");
         shard_dir_for(data, generation)
+    }
+
+    fn publish_test_source_policy(
+        storage: &mut Store,
+        project_root: &Path,
+        byte_cap: u64,
+        candidates: &[codestory_workspace::OversizedSourceExclusionCandidate],
+    ) {
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "test-generation".to_string(),
+            run_id: "test-run".to_string(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        storage
+            .put_index_publication(&publication)
+            .expect("publish test core identity");
+        let identity = codestory_workspace::project_identity_v3(project_root);
+        storage
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION,
+                    byte_cap,
+                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                ),
+                candidates,
+            )
+            .expect("publish test source policy");
+    }
+
+    #[test]
+    fn lexical_text_reader_stops_after_cap_overflow_sentinel() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            remaining: 4_096,
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let contents = read_lexical_text_limited(reader, 64).expect("bounded read");
+
+        assert!(contents.is_none());
+        assert_eq!(bytes_read.load(Ordering::SeqCst), 65);
     }
 
     #[test]
@@ -1896,7 +2049,9 @@ mod tests {
         let storage_path = project.path().join("cache").join("custom-core.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
             .expect("storage parent");
-        let _storage = Store::open(&storage_path).expect("custom in-worktree store");
+        let mut storage = Store::open(&storage_path).expect("custom in-worktree store");
+        publish_test_source_policy(&mut storage, project.path(), MAX_FILE_BYTES, &[]);
+        drop(storage);
         let sibling = project
             .path()
             .join("cache")
@@ -1956,6 +2111,136 @@ mod tests {
                 .map(|hit| hit.path.as_str()),
             Some("cache/custom-core.search-generations-user/user-config.json")
         );
+    }
+
+    #[test]
+    fn pinned_policy_exclusions_filter_structural_files_without_narrowing_parser_recall() {
+        let project = TempDir::new().expect("project");
+        let src = project.path().join("src");
+        let data = project.path().join("data");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&data).expect("data");
+
+        let widened_cap = MAX_FILE_BYTES + 1_024;
+        let parser_path = src.join("widened.rs");
+        let mut parser_source = b"fn widened_parser_token() {}\n".to_vec();
+        parser_source.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        std::fs::write(&parser_path, &parser_source).expect("widened parser source");
+
+        let json_path = data.join("config.json");
+        let mut json_source = br#"{"excluded_structural_token":"x"}"#.to_vec();
+        json_source.resize(
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP as usize + 1,
+            b' ',
+        );
+        std::fs::write(&json_path, &json_source).expect("excluded structural source");
+
+        let storage_root = TempDir::new().expect("storage root");
+        let storage_path = storage_root.path().join("core.db");
+        let mut storage = Store::open(&storage_path).expect("core storage");
+        publish_test_source_policy(
+            &mut storage,
+            project.path(),
+            widened_cap,
+            &[codestory_workspace::OversizedSourceExclusionCandidate {
+                normalized_path: "data/config.json".to_string(),
+                content_hash: format!("{:x}", Sha256::digest(&json_source)),
+                observed_size: json_source.len() as u64,
+                observed_unit_count: 0,
+                policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                    .to_string(),
+                byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            }],
+        );
+        drop(storage);
+
+        let mut source_paths = std::collections::BTreeSet::new();
+        let coverage =
+            scan_lexical_documents(project.path(), Some(&storage_path), None, &mut |document| {
+                if document.source == LexicalDocumentSource::LexicalSource {
+                    source_paths.insert(document.path.clone());
+                }
+                Ok(())
+            })
+            .expect("scan pinned lexical sources");
+
+        assert_eq!(
+            source_paths,
+            std::collections::BTreeSet::from(["src/widened.rs".to_string()])
+        );
+        assert_eq!(coverage.discovered_files, 1);
+        assert_eq!(coverage.indexed_files, 1);
+        assert!(coverage.complete());
+    }
+
+    #[test]
+    fn pinned_lexical_scan_fails_closed_without_source_policy_publication() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "fn source() {}\n").expect("source");
+        let storage_root = TempDir::new().expect("storage root");
+        let storage_path = storage_root.path().join("core.db");
+        drop(Store::open(&storage_path).expect("bare core storage"));
+
+        let error = lexical_input_fingerprint(project.path(), Some(&storage_path))
+            .expect_err("missing publication must fail closed");
+
+        assert!(
+            format!("{error:#}")
+                .contains("complete core publication for lexical source policy is missing")
+        );
+    }
+
+    #[test]
+    fn pinned_lexical_scan_rejects_a_foreign_project_policy() {
+        let project_a = TempDir::new().expect("project a");
+        let project_b = TempDir::new().expect("project b");
+        std::fs::create_dir_all(project_a.path().join("data")).expect("project a data");
+        std::fs::create_dir_all(project_b.path().join("data")).expect("project b data");
+        std::fs::write(
+            project_a.path().join("data/config.json"),
+            br#"{"selected_project_token":"a"}"#,
+        )
+        .expect("project a source");
+
+        let mut excluded_source = br#"{"foreign_project_token":"b"}"#.to_vec();
+        excluded_source.resize(
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP as usize + 1,
+            b' ',
+        );
+        std::fs::write(project_b.path().join("data/config.json"), &excluded_source)
+            .expect("project b source");
+
+        let identity_a = codestory_workspace::project_identity_v3(project_a.path());
+        let identity_b = codestory_workspace::project_identity_v3(project_b.path());
+        assert_ne!(identity_a.workspace_id, identity_b.workspace_id);
+
+        let storage_root = TempDir::new().expect("foreign storage root");
+        let storage_path = storage_root.path().join("core.db");
+        let mut storage = Store::open(&storage_path).expect("foreign core storage");
+        publish_test_source_policy(
+            &mut storage,
+            project_b.path(),
+            MAX_FILE_BYTES,
+            &[codestory_workspace::OversizedSourceExclusionCandidate {
+                normalized_path: "data/config.json".to_string(),
+                content_hash: format!("{:x}", Sha256::digest(&excluded_source)),
+                observed_size: excluded_source.len() as u64,
+                observed_unit_count: 0,
+                policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                    .to_string(),
+                byte_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_SOURCE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            }],
+        );
+        drop(storage);
+
+        let error = lexical_input_fingerprint(project_a.path(), Some(&storage_path))
+            .expect_err("foreign core policy must fail closed");
+
+        assert!(format!("{error:#}").contains(
+            "source policy exclusion manifest does not match the complete core publication"
+        ));
     }
 
     #[test]

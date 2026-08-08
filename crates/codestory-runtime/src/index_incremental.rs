@@ -806,7 +806,9 @@ fn prepare_incremental_refresh(
         &source_identity,
         cancel_token,
         runtime,
-        SemanticProjectionDocumentSource::SourceFiles,
+        SemanticProjectionDocumentSource::SourceFiles {
+            max_file_bytes: source_index_policy.byte_cap,
+        },
     )?;
     ensure_indexing_active(cancel_token)?;
     let finalize_stats = preparation

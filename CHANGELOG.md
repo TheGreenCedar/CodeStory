@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Raising the source-file size limit no longer leaves newly admitted files
+  missing from lexical, repository-text, or semantic search. Unsupported binary
+  images are now classified by file type instead of being reported as oversized
+  source.
 - A packet no longer reports a step of a flow as covered because a different
   step was. Coverage was decided by the kind of position a step occupies —
   entrypoint, dispatch, terminal boundary — so when a question asked about two

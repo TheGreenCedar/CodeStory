@@ -1286,6 +1286,7 @@ impl AppController {
                 let scan = Self::collect_repo_text_hits(
                     storage,
                     project_root.as_deref(),
+                    &self.source_index_policy,
                     &subquery.query,
                     repo_text_limit,
                     &seen_repo_text_ids,

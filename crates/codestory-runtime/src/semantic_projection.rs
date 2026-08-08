@@ -1,10 +1,10 @@
 use super::{
-    AccessKind, ApiError, BTreeMap, BTreeSet, BUILD_EDGE_SEED_BATCH_SIZE, CancellationToken,
-    DenseAnchorInput, DenseAnchorInputReuseMetadata, EmbeddingProfileContractDto, FileInfo,
-    GraphEdge, GraphNode, GraphNodeId, HashMap, HashSet, IndexPublicationRecord,
-    IndexingPhaseTimings, Instant, LlmSymbolDoc, LlmSymbolDocStats, Path, RetrievalFileRole,
-    SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES, SearchEngine,
-    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, StoreFileRole,
+    AccessKind, ApiError, BTreeMap, BTreeSet, BUILD_EDGE_SEED_BATCH_SIZE, BoundedTextRead,
+    CancellationToken, DenseAnchorInput, DenseAnchorInputReuseMetadata,
+    EmbeddingProfileContractDto, FileInfo, GraphEdge, GraphNode, GraphNodeId, HashMap, HashSet,
+    IndexPublicationRecord, IndexingPhaseTimings, Instant, LlmSymbolDoc, LlmSymbolDocStats, Path,
+    RetrievalFileRole, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES,
+    SearchEngine, SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, StoreFileRole,
     SymbolSearchDoc, clamp_u128_to_u32, clamp_usize_to_u32, current_epoch_ms,
     indexing_cancelled_error, is_indexing_cancelled, node_display_name, read_file_text_limited,
     retrieval_file_role_from_path, semantic_doc_language_from_path, semantic_path_aliases,
@@ -360,7 +360,11 @@ pub(super) fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 6;
+/// Version 7 binds source-backed semantic documents to the active source-file
+/// admission cap. A version-6 document cannot prove an over-default file body
+/// was available when it was built, so retained cores must repair it from
+/// source instead of restamping it through `StoredCore` republish.
+pub(super) const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 7;
 pub(super) const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 #[cfg(test)]
 pub(super) const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
@@ -1320,11 +1324,12 @@ pub(super) fn semantic_graph_dependent_file_ids_by_seed(
 pub(super) fn build_semantic_file_text_cache(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
+    max_file_bytes: u64,
 ) -> HashMap<String, Option<String>> {
     build_semantic_file_text_cache_with_limits(
         graph_context,
         semantic_nodes,
-        SEMANTIC_FILE_TEXT_MAX_BYTES,
+        max_file_bytes,
         SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
     )
 }
@@ -1355,10 +1360,11 @@ pub(super) fn build_semantic_file_text_cache_with_limits(
 
 pub(super) fn build_semantic_file_text_cache_from_paths(
     file_paths: &HashMap<String, String>,
+    max_file_bytes: u64,
 ) -> HashMap<String, Option<String>> {
     build_semantic_file_text_cache_from_paths_with_limits(
         file_paths,
-        SEMANTIC_FILE_TEXT_MAX_BYTES,
+        max_file_bytes,
         SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
     )
 }
@@ -1368,12 +1374,29 @@ pub(super) fn build_semantic_file_text_cache_from_paths_with_limits(
     max_file_bytes: u64,
     max_cache_bytes: usize,
 ) -> HashMap<String, Option<String>> {
+    build_semantic_file_text_cache_from_paths_with_limits_and_reader(
+        file_paths,
+        max_file_bytes,
+        max_cache_bytes,
+        |read_path, read_limit| read_file_text_limited(Path::new(read_path), read_limit),
+    )
+    .0
+}
+
+fn build_semantic_file_text_cache_from_paths_with_limits_and_reader(
+    file_paths: &HashMap<String, String>,
+    max_file_bytes: u64,
+    max_cache_bytes: usize,
+    mut read_file: impl FnMut(&str, u64) -> BoundedTextRead,
+) -> (HashMap<String, Option<String>>, u64) {
     let mut file_paths = file_paths
         .iter()
         .map(|(display_path, read_path)| (display_path.clone(), read_path.clone()))
         .collect::<Vec<_>>();
     file_paths.sort_by(|left, right| left.0.cmp(&right.0));
 
+    let aggregate_byte_cap = u64::try_from(max_cache_bytes).unwrap_or(u64::MAX);
+    let mut bytes_read = 0_u64;
     let mut cached_bytes = 0usize;
     let mut cache_exhausted = false;
     let mut cache = HashMap::with_capacity(file_paths.len());
@@ -1383,12 +1406,32 @@ pub(super) fn build_semantic_file_text_cache_from_paths_with_limits(
             continue;
         }
 
-        let contents = read_file_text_limited(Path::new(&read_path), max_file_bytes)
-            .ok()
-            .flatten();
-        let Some(contents) = contents else {
+        let remaining_bytes = aggregate_byte_cap.saturating_sub(bytes_read.min(aggregate_byte_cap));
+        if remaining_bytes == 0 {
+            cache_exhausted = true;
             cache.insert(display_path, None);
             continue;
+        }
+        let read_limit = max_file_bytes.min(remaining_bytes);
+        let read = read_file(&read_path, read_limit);
+        bytes_read = bytes_read.saturating_add(read.bytes_read());
+        if bytes_read >= aggregate_byte_cap {
+            cache_exhausted = true;
+        }
+
+        let contents = match read {
+            BoundedTextRead::Contents { contents, .. } => contents,
+            BoundedTextRead::LimitExceeded { .. } => {
+                if read_limit < max_file_bytes {
+                    cache_exhausted = true;
+                }
+                cache.insert(display_path, None);
+                continue;
+            }
+            BoundedTextRead::Unreadable { .. } => {
+                cache.insert(display_path, None);
+                continue;
+            }
         };
 
         let body_bytes = contents.len();
@@ -1401,7 +1444,75 @@ pub(super) fn build_semantic_file_text_cache_from_paths_with_limits(
         cached_bytes = cached_bytes.saturating_add(body_bytes);
         cache.insert(display_path, Some(contents));
     }
-    cache
+    // A bounded read uses one byte past its limit to distinguish an exact fit
+    // from growth. Every such byte is charged here, so only the read that
+    // exhausts the aggregate allowance can cross it, and then by one byte.
+    (cache, bytes_read)
+}
+
+#[cfg(test)]
+mod bounded_file_text_cache_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingReader {
+        remaining: usize,
+        byte: u8,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(self.byte);
+            self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn semantic_cache_charges_invalid_text_before_aggregate_overflow() {
+        let file_paths = HashMap::from([
+            ("a.rs".to_string(), "invalid".to_string()),
+            ("b.rs".to_string(), "oversized".to_string()),
+            ("c.rs".to_string(), "unreached".to_string()),
+        ]);
+        let aggregate_cap = 7usize;
+        let actual_bytes_read = Arc::new(AtomicUsize::new(0));
+        let observed_bytes_read = Arc::clone(&actual_bytes_read);
+
+        let (cache, charged_bytes) =
+            build_semantic_file_text_cache_from_paths_with_limits_and_reader(
+                &file_paths,
+                64,
+                aggregate_cap,
+                |read_path, read_limit| {
+                    let (remaining, byte) = match read_path {
+                        "invalid" => (4, 0xff),
+                        "oversized" => (64, b'x'),
+                        "unreached" => panic!("aggregate exhaustion must stop later reads"),
+                        _ => panic!("unexpected read path: {read_path}"),
+                    };
+                    crate::support::read_text_limited(
+                        CountingReader {
+                            remaining,
+                            byte,
+                            bytes_read: Arc::clone(&observed_bytes_read),
+                        },
+                        read_limit,
+                    )
+                },
+            );
+
+        assert_eq!(actual_bytes_read.load(Ordering::SeqCst), aggregate_cap + 1);
+        assert_eq!(charged_bytes, (aggregate_cap + 1) as u64);
+        assert!(cache.values().all(Option::is_none));
+    }
 }
 
 pub(super) fn edge_digest_for_edges(edges: &[GraphEdge], limit: usize) -> Vec<String> {
@@ -2674,10 +2785,14 @@ struct SemanticRuntimePolicy {
     max_tokens: usize,
     stream_sort_window_size: usize,
     scope: SemanticDocScope,
+    max_file_bytes: u64,
 }
 
 impl SemanticRuntimePolicy {
-    fn from_runtime(runtime: &codestory_retrieval::SidecarRuntimeConfig) -> Self {
+    fn from_runtime(
+        runtime: &codestory_retrieval::SidecarRuntimeConfig,
+        max_file_bytes: u64,
+    ) -> Self {
         let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
         Self {
             updated_at_epoch_ms: current_epoch_ms(),
@@ -2690,6 +2805,7 @@ impl SemanticRuntimePolicy {
                 .saturating_mul(runtime.retrieval.stream_sort_window_batches)
                 .max(1),
             scope: semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
+            max_file_bytes,
         }
     }
 }
@@ -2888,7 +3004,11 @@ fn prepare_incremental_semantic_context(
     );
     stats.node_lookup_entries = clamp_usize_to_u32(nodes.len());
     let file_cache_started = Instant::now();
-    let file_text_cache = build_semantic_file_text_cache(&graph_context, &inputs.semantic_nodes);
+    let file_text_cache = build_semantic_file_text_cache(
+        &graph_context,
+        &inputs.semantic_nodes,
+        policy.max_file_bytes,
+    );
     Ok(PreparedIncrementalSemanticContext {
         graph: graph_context,
         file_text_cache,
@@ -3070,11 +3190,12 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    max_file_bytes: u64,
 ) -> Result<SemanticProjectionStats, ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    let policy = SemanticRuntimePolicy::from_runtime(runtime);
+    let policy = SemanticRuntimePolicy::from_runtime(runtime, max_file_bytes);
     tracing::debug!(
         anchor_batch_size = policy.anchor_batch_size,
         "Using dense anchor input publication batch size"
@@ -3151,8 +3272,17 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SemanticProjectionDocumentSource {
-    SourceFiles,
+    SourceFiles { max_file_bytes: u64 },
     StoredCore,
+}
+
+impl SemanticProjectionDocumentSource {
+    fn max_file_bytes(self) -> u64 {
+        match self {
+            Self::SourceFiles { max_file_bytes } => max_file_bytes,
+            Self::StoredCore => SEMANTIC_FILE_TEXT_MAX_BYTES,
+        }
+    }
 }
 
 struct PreparedFullSemanticStream {
@@ -3227,22 +3357,25 @@ fn prepare_full_semantic_stream(
             .map(String::len)
             .sum(),
     );
-    let (file_text_cache, file_cache_build_ns) =
-        if document_source == SemanticProjectionDocumentSource::SourceFiles {
-            let mut file_text_paths = HashMap::new();
-            for file_id in &semantic_file_ids {
-                let Some(display_path) = file_paths.get(file_id) else {
-                    continue;
-                };
-                let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
-                file_text_paths.insert(display_path.clone(), read_path);
-            }
-            let file_cache_started = Instant::now();
-            let cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
-            (cache, file_cache_started.elapsed().as_nanos())
-        } else {
-            (HashMap::new(), 0)
-        };
+    let (file_text_cache, file_cache_build_ns) = if matches!(
+        document_source,
+        SemanticProjectionDocumentSource::SourceFiles { .. }
+    ) {
+        let mut file_text_paths = HashMap::new();
+        for file_id in &semantic_file_ids {
+            let Some(display_path) = file_paths.get(file_id) else {
+                continue;
+            };
+            let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
+            file_text_paths.insert(display_path.clone(), read_path);
+        }
+        let file_cache_started = Instant::now();
+        let cache =
+            build_semantic_file_text_cache_from_paths(&file_text_paths, policy.max_file_bytes);
+        (cache, file_cache_started.elapsed().as_nanos())
+    } else {
+        (HashMap::new(), 0)
+    };
     Ok((
         PreparedFullSemanticStream {
             semantic_kinds,
@@ -3473,7 +3606,7 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    let policy = SemanticRuntimePolicy::from_runtime(runtime);
+    let policy = SemanticRuntimePolicy::from_runtime(runtime, document_source.max_file_bytes());
     let existing_docs = storage
         .get_dense_anchor_input_reuse_metadata()
         .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
@@ -3529,7 +3662,9 @@ pub(super) fn finalize_staged_semantic_docs(
         "core:test-publication",
         cancel_token,
         &test_sidecar_runtime_from_env(),
-        SemanticProjectionDocumentSource::SourceFiles,
+        SemanticProjectionDocumentSource::SourceFiles {
+            max_file_bytes: SourceIndexPolicy::default().byte_cap,
+        },
     )
 }
 
@@ -3596,6 +3731,7 @@ pub(super) fn finalize_staged_semantic_docs_for_runtime(
             source_identity,
             cancel_token,
             runtime,
+            document_source.max_file_bytes(),
         )?;
         stats.node_load_ms = node_load_ms;
         stats.node_load_rows = node_load_rows;
