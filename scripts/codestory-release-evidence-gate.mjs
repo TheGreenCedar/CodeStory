@@ -49,6 +49,10 @@ const RELEASE_CORPUS_CONTRACTS = new Map([
     "codestory-release-corpus-v0.16-axios-js-ts-v2",
     "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json",
   ],
+  [
+    "codestory-release-corpus-v0.17-ripgrep-rust-v2",
+    "benchmarks/release-evidence/corpus-contracts/v0.17-ripgrep-rust-v2.json",
+  ],
 ]);
 
 function fail(message) { throw new Error(message); }

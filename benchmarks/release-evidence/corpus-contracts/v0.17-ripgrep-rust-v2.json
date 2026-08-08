@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "corpus_id": "codestory-release-corpus-v0.17-ripgrep-rust-v2",
+  "task_ids": [
+    "ripgrep-search-pipeline-v2"
+  ],
+  "runtime_modes": [
+    "cold_cli_packet"
+  ],
+  "repeats": 3,
+  "task_manifests": {
+    "ripgrep-search-pipeline-v2": {
+      "path": "benchmarks/tasks/release-evidence/ripgrep-search-pipeline-v2.task.json",
+      "sha256": "91005e5380edcbf18fc93aa78a79bcba9bd470ad8edfbcbffe9579e3b490bc4e"
+    }
+  },
+  "project_manifests": {
+    "ripgrep-search-pipeline-v2": {
+      "path": "benchmarks/tasks/release-evidence/ripgrep-rust-codestory-project-v2.json",
+      "sha256": "58ddc0a740af06f99e00c51beb1b7331445a1c63f432251a7b0fb7d753db8962"
+    }
+  }
+}

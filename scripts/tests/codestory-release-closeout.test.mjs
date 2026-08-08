@@ -86,7 +86,7 @@ function identityFor(cell, producerRunAttempt = "1") {
           ? "codex_marketplace_install"
           : "managed_plugin";
         break;
-      case "profile": identity[key] = "codestory-release-evidence-linux-arm64-v2"; break;
+      case "profile": identity[key] = "release-evidence-fixture-profile-v1"; break;
       case "corpus_id": identity[key] = "v0.16-axios-js-ts-v1"; break;
       case "cache_id": identity[key] = "cold-full-retrieval-v1"; break;
       case "machine_fingerprint": identity[key] = "fixture/machine"; break;
