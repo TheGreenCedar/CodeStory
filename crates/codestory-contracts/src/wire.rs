@@ -54,6 +54,17 @@ pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05"];
 /// Revision the server answers with when the client offers nothing usable.
 pub const PREFERRED_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Stable labels emitted for the retrieval planner's stage timing records.
+///
+/// These values cross the retrieval/runtime boundary in diagnostics and packet
+/// traces. Consumers compare the labels directly, so their spelling is a wire
+/// compatibility surface.
+pub const RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL: &str = "stage0_scip_anchor";
+pub const RETRIEVAL_STAGE1_LEXICAL_LABEL: &str = "stage1_lexical";
+pub const RETRIEVAL_STAGE1B_SEMANTIC_LABEL: &str = "stage1b_semantic";
+pub const RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL: &str = "stage2_scip_expand";
+pub const RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL: &str = "stage3_repo_text_fallback";
+
 /// Outcome of one `initialize` protocol-revision negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,5 +296,17 @@ mod tests {
         assert_eq!(LEGACY_PUBLICATION_STAMP_SCHEMA_VERSION, 0);
         assert_eq!(SUPPORTED_MCP_PROTOCOL_VERSIONS, &["2024-11-05"]);
         assert_eq!(PREFERRED_MCP_PROTOCOL_VERSION, "2024-11-05");
+    }
+
+    #[test]
+    fn retrieval_stage_labels_are_the_published_wire_values() {
+        assert_eq!(RETRIEVAL_STAGE0_SCIP_ANCHOR_LABEL, "stage0_scip_anchor");
+        assert_eq!(RETRIEVAL_STAGE1_LEXICAL_LABEL, "stage1_lexical");
+        assert_eq!(RETRIEVAL_STAGE1B_SEMANTIC_LABEL, "stage1b_semantic");
+        assert_eq!(RETRIEVAL_STAGE2_SCIP_EXPAND_LABEL, "stage2_scip_expand");
+        assert_eq!(
+            RETRIEVAL_STAGE3_REPO_TEXT_FALLBACK_LABEL,
+            "stage3_repo_text_fallback"
+        );
     }
 }
