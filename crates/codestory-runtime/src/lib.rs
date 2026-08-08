@@ -315,6 +315,7 @@ mod trail_story;
 pub use activation_status::{
     RetrievalEngineDiagnostics, RetrievalEngineDiagnosticsError, RetrievalEngineDiagnosticsStage,
     RetrievalStatusObservation, RetrievalStatusObservationError, RetrievalStatusSelection,
+    process_owner_state, process_start_identity,
 };
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
@@ -329,9 +330,9 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, ProcessStartProbe, RetrievalProcessDefaults,
-    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
-    RuntimeRetrievalConfig, RuntimeRetrievalProfile,
+    CacheCleanPlan, CacheCleanReport, ProcessOwnerState, ProcessStartProbe,
+    RetrievalProcessDefaults, RetrievalRuntimeDefaults, RetrievalRuntimeOverrides,
+    RetrievalStatusReport, RuntimeRetrievalConfig, RuntimeRetrievalProfile,
 };
 pub(crate) use search_runtime::SearchEngine;
 

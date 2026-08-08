@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingQualificationWorkerError as WorkerError, ProcessStartProbe,
-    SidecarRuntimeConfig, embedding_retry_state,
+    AwakeMonotonicClock, EmbeddingQualificationWorkerError as WorkerError, SidecarRuntimeConfig,
+    embedding_retry_state,
 };
+use codestory_runtime::ProcessStartProbe;
 use codestory_workspace::atomic_file::{PublishNewFileError, publish_new_private_file_atomic};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -207,7 +208,13 @@ pub(super) fn wait_for_gate(
 }
 
 pub(super) fn current_process_start_identity() -> Result<String> {
-    match codestory_retrieval::probe_process_start_identity(std::process::id()) {
+    current_process_start_identity_from_probe(codestory_runtime::process_start_identity(
+        std::process::id(),
+    ))
+}
+
+fn current_process_start_identity_from_probe(probe: ProcessStartProbe) -> Result<String> {
+    match probe {
         ProcessStartProbe::Running { start_identity } => Ok(start_identity),
         ProcessStartProbe::NotRunning => bail!("embedding_qualification_worker_not_running"),
         ProcessStartProbe::Unknown { reason } => {
@@ -268,8 +275,33 @@ pub(super) fn elapsed(clock: &dyn AwakeMonotonicClock, started_ns: u64) -> Durat
 
 #[cfg(test)]
 mod tests {
-    use super::write_atomic_json;
+    use super::{ProcessStartProbe, current_process_start_identity_from_probe, write_atomic_json};
     use serde_json::{Value, json};
+
+    #[test]
+    fn worker_process_start_identity_preserves_all_probe_outcomes() {
+        assert_eq!(
+            current_process_start_identity_from_probe(ProcessStartProbe::Running {
+                start_identity: "start-a".to_string(),
+            })
+            .expect("running worker identity"),
+            "start-a"
+        );
+        assert_eq!(
+            current_process_start_identity_from_probe(ProcessStartProbe::NotRunning)
+                .expect_err("missing worker must fail")
+                .to_string(),
+            "embedding_qualification_worker_not_running"
+        );
+        assert_eq!(
+            current_process_start_identity_from_probe(ProcessStartProbe::Unknown {
+                reason: "permission denied".to_string(),
+            })
+            .expect_err("unknown worker identity must fail")
+            .to_string(),
+            "embedding_qualification_worker_identity_unknown:permission denied"
+        );
+    }
 
     #[test]
     fn publishing_an_output_succeeds_and_leaves_only_the_complete_file() {
