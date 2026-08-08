@@ -4,7 +4,7 @@ use crate::root_rank::{CallDegrees, EntryEvidence, degree_tier};
 // so `crate::retrieval_file_role_from_path` and friends still resolve.
 use codestory_agent::text::terms_contain_phrase;
 pub use codestory_agent::text::{
-    RetrievalFileRole, normalize_symbol_query, retrieval_file_role_from_path,
+    RetrievalFileRole, normalize_symbol_query, retrieval_file_role_from_path, symbol_query_tokens,
     terminal_symbol_segment,
 };
 pub(crate) use codestory_agent::text::{
@@ -157,59 +157,6 @@ pub fn leading_symbol_segment(value: &str) -> String {
         .next()
         .map(normalize_symbol_query)
         .unwrap_or_default()
-}
-
-pub fn symbol_query_tokens(value: &str) -> Vec<String> {
-    let normalized = value.replace("::", " ").replace("->", " ").replace(
-        [
-            '.', '#', '/', '\\', '_', '-', ':', '<', '>', '(', ')', '[', ']', '{', '}',
-        ],
-        " ",
-    );
-    normalized
-        .split_whitespace()
-        .flat_map(split_identifier_segment)
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn split_identifier_segment(segment: &str) -> Vec<String> {
-    let chars = segment.chars().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for (idx, ch) in chars.iter().copied().enumerate() {
-        if !ch.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                tokens.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            continue;
-        }
-
-        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
-        let next = chars.get(idx + 1).copied();
-        let starts_new_token = !current.is_empty()
-            && prev.is_some_and(|prev| {
-                (prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
-                    || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
-                    || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
-                    || (prev.is_ascii_uppercase()
-                        && ch.is_ascii_uppercase()
-                        && next.is_some_and(|next| next.is_ascii_lowercase()))
-            });
-        if starts_new_token {
-            tokens.push(current.to_ascii_lowercase());
-            current.clear();
-        }
-        current.push(ch);
-    }
-
-    if !current.is_empty() {
-        tokens.push(current.to_ascii_lowercase());
-    }
-
-    tokens
 }
 
 fn symbol_name_match_rank_single(query: &str, display_name: &str) -> SymbolNameMatchRank {

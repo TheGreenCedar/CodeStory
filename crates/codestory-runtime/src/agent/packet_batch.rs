@@ -14,6 +14,7 @@ use super::packet_trace::{
 };
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal};
+pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto,
@@ -713,33 +714,6 @@ pub(crate) fn packet_anchor_hit_is_relevant(query: &str, hit: &SearchHit) -> boo
 
 fn is_packet_path_like_query(query: &str) -> bool {
     query.contains('/') || query.contains('\\') || query.contains('.')
-}
-
-pub(crate) fn packet_file_stem_matches_query(query: &str, path: Option<&str>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    let query_path = query.replace('\\', "/");
-    let query_file_name = query_path.rsplit('/').next().unwrap_or(query).trim();
-    let query_stem = query_file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(query_file_name);
-    let normalized_query = normalize_identifier(query_stem);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    let normalized_path = path.replace('\\', "/");
-    let file_name = normalized_path
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim();
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name);
-    normalize_identifier(stem) == normalized_query
 }
 
 #[cfg(test)]

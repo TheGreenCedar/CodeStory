@@ -34,6 +34,59 @@ pub fn terminal_symbol_segment(value: &str) -> String {
         .unwrap_or_default()
 }
 
+pub fn symbol_query_tokens(value: &str) -> Vec<String> {
+    let normalized = value.replace("::", " ").replace("->", " ").replace(
+        [
+            '.', '#', '/', '\\', '_', '-', ':', '<', '>', '(', ')', '[', ']', '{', '}',
+        ],
+        " ",
+    );
+    normalized
+        .split_whitespace()
+        .flat_map(split_identifier_segment)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn split_identifier_segment(segment: &str) -> Vec<String> {
+    let chars = segment.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            continue;
+        }
+
+        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
+        let next = chars.get(idx + 1).copied();
+        let starts_new_token = !current.is_empty()
+            && prev.is_some_and(|prev| {
+                (prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
+                    || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
+                    || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
+                    || (prev.is_ascii_uppercase()
+                        && ch.is_ascii_uppercase()
+                        && next.is_some_and(|next| next.is_ascii_lowercase()))
+            });
+        if starts_new_token {
+            tokens.push(current.to_ascii_lowercase());
+            current.clear();
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current.to_ascii_lowercase());
+    }
+
+    tokens
+}
+
 pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
     let normalized_raw = normalize_retrieval_path(path);
     let normalized = strip_materialized_repo_cache_prefix(&normalized_raw).to_string();

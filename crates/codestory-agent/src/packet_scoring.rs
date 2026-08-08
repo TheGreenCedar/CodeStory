@@ -1222,6 +1222,33 @@ pub fn normalize_identifier(value: &str) -> String {
         .collect()
 }
 
+pub fn packet_file_stem_matches_query(query: &str, path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let query_path = query.replace('\\', "/");
+    let query_file_name = query_path.rsplit('/').next().unwrap_or(query).trim();
+    let query_stem = query_file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(query_file_name);
+    let normalized_query = normalize_identifier(query_stem);
+    if normalized_query.is_empty() {
+        return false;
+    }
+    let normalized_path = path.replace('\\', "/");
+    let file_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    normalize_identifier(stem) == normalized_query
+}
+
 pub fn packet_display_path(path: &str) -> String {
     let normalized = path.trim_start_matches("\\\\?\\").replace('\\', "/");
     if let Some(path) = path_after_named_repo_root(&normalized) {

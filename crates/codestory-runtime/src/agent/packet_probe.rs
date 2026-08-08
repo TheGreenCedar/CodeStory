@@ -2,6 +2,7 @@ use crate::AppController;
 use crate::agent::citation::to_citation_from_hit;
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
 use crate::target_resolution::{TargetResolution, TargetSelection, search_hit_matches_exact_file};
+pub(crate) use codestory_agent::packet_probes::exact_packet_probe_paths;
 use codestory_agent::{PinnedReader, admit_continuation_probe};
 use codestory_contracts::api::{
     AgentCitationDto, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
@@ -81,25 +82,6 @@ pub(crate) fn resolved_packet_probe_queries(
                     && resolution.symbol_id.is_none())
         })
         .filter_map(|resolution| resolution.normalized_query.clone())
-        .collect()
-}
-
-pub(crate) fn exact_packet_probe_paths(resolutions: &[PacketProbeResolutionDto]) -> Vec<String> {
-    resolutions
-        .iter()
-        .filter(|resolution| {
-            matches!(
-                resolution.status,
-                PacketProbeResolutionStatusDto::ExactPath
-                    | PacketProbeResolutionStatusDto::ValidUncoveredPath
-            )
-        })
-        .filter_map(|resolution| match &resolution.probe {
-            PacketProbeDto::ExactPath { path } => {
-                Some(resolution.path.clone().unwrap_or_else(|| path.clone()))
-            }
-            _ => None,
-        })
         .collect()
 }
 
