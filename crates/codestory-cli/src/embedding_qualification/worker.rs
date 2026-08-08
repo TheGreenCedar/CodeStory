@@ -85,7 +85,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     let inclusive_started_ns = crate::embedding_server_transport::inclusive_now_ns()?;
     let started_ns = clock.now_ns();
     let defaults = crate::sidecar_runtime::process_defaults();
-    let runtime = crate::sidecar_runtime::for_project_auto_with_process_defaults(
+    let runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_process_defaults(
         &request.project,
         &defaults,
         &SidecarRuntimeOverrides::default(),

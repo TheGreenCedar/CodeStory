@@ -47,7 +47,7 @@ pub(crate) struct CliStartupConfig {
     pub(crate) user_home: Option<PathBuf>,
     pub(crate) project_network_config_allowed: bool,
     pub(crate) stdio_cache_root: Option<PathBuf>,
-    pub(crate) sidecar_defaults: codestory_retrieval::SidecarProcessDefaults,
+    pub(crate) sidecar_defaults: codestory_runtime::RetrievalProcessDefaults,
     pub(crate) source_index_policy: SourceIndexPolicy,
 }
 
@@ -297,8 +297,8 @@ fn validate_config_trust_boundary(
 }
 
 impl CliConfig {
-    pub(crate) fn runtime_overrides(&self) -> codestory_retrieval::SidecarRuntimeOverrides {
-        codestory_retrieval::SidecarRuntimeOverrides {
+    pub(crate) fn runtime_overrides(&self) -> codestory_runtime::RetrievalRuntimeOverrides {
+        codestory_runtime::RetrievalRuntimeOverrides {
             hybrid_retrieval_enabled: self.hybrid_retrieval_enabled,
             semantic_doc_scope: self.semantic_doc_scope.clone(),
             semantic_doc_alias_mode: self.semantic_doc_alias_mode.clone(),

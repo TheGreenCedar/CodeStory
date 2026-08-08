@@ -5,11 +5,12 @@
 //! isolation before the constructor (or startup configuration) can fall back
 //! to the platform `ProjectDirs` cache.
 
+use codestory_runtime::{
+    RetrievalProcessDefaults, RetrievalRuntimeOverrides, RuntimeRetrievalConfig,
+};
 #[cfg(test)]
-use codestory_retrieval::SidecarProfile;
+use codestory_runtime::{RetrievalRuntimeDefaults, RuntimeRetrievalProfile};
 #[cfg(test)]
-use codestory_retrieval::SidecarRuntimeDefaults;
-use codestory_retrieval::{SidecarProcessDefaults, SidecarRuntimeConfig, SidecarRuntimeOverrides};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -19,6 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Prepare process cache access before any CLI startup or sidecar lookup.
 pub(crate) fn prepare_cache_access() {
     #[cfg(test)]
+    prepare_test_cache_access();
+}
+
+#[cfg(test)]
+fn prepare_test_cache_access() {
     codestory_retrieval::enable_automatic_test_cache_root_for_process();
 }
 
@@ -45,17 +51,17 @@ fn with_default_test_cache_root<T>(task: impl FnOnce() -> T) -> T {
     codestory_retrieval::with_test_cache_root(&root, task)
 }
 
-pub(crate) fn process_defaults() -> SidecarProcessDefaults {
+pub(crate) fn process_defaults() -> RetrievalProcessDefaults {
     prepare_cache_access();
     #[cfg(test)]
     return with_default_test_cache_root(|| {
-        SidecarProcessDefaults::new(
+        RetrievalProcessDefaults::new(
             codestory_retrieval::user_cache_root(),
-            SidecarRuntimeDefaults::from_process_env(),
+            RetrievalRuntimeDefaults::from_process_env(),
         )
     });
     #[cfg(not(test))]
-    codestory_retrieval::sidecar_process_defaults()
+    codestory_runtime::retrieval_process_defaults()
 }
 
 #[cfg(test)]
@@ -64,49 +70,40 @@ pub(crate) fn user_cache_root() -> PathBuf {
 }
 
 #[cfg(test)]
-pub(crate) fn local() -> SidecarRuntimeConfig {
+pub(crate) fn local() -> RuntimeRetrievalConfig {
     let defaults = process_defaults();
-    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+    RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
         None,
-        SidecarProfile::Local,
+        RuntimeRetrievalProfile::Local,
         None,
         &defaults,
-        &SidecarRuntimeOverrides::default(),
+        &RetrievalRuntimeOverrides::default(),
     )
 }
 
 #[cfg(test)]
 pub(crate) fn for_project_with_run_id(
     project_root: &Path,
-    profile: SidecarProfile,
+    profile: RuntimeRetrievalProfile,
     run_id: Option<&str>,
-) -> SidecarRuntimeConfig {
+) -> RuntimeRetrievalConfig {
     let defaults = process_defaults();
-    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+    RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
         Some(project_root),
         profile,
         run_id,
         &defaults,
-        &SidecarRuntimeOverrides::default(),
+        &RetrievalRuntimeOverrides::default(),
     )
-}
-
-pub(crate) fn for_project_auto_with_process_defaults(
-    project_root: &Path,
-    defaults: &SidecarProcessDefaults,
-    overrides: &SidecarRuntimeOverrides,
-) -> SidecarRuntimeConfig {
-    prepare_cache_access();
-    SidecarRuntimeConfig::for_project_auto_with_process_defaults(project_root, defaults, overrides)
 }
 
 pub(crate) fn for_project_auto_with_process_defaults_and_identity(
     project_identity: &codestory_workspace::ProjectIdentityV3,
-    defaults: &SidecarProcessDefaults,
-    overrides: &SidecarRuntimeOverrides,
-) -> SidecarRuntimeConfig {
+    defaults: &RetrievalProcessDefaults,
+    overrides: &RetrievalRuntimeOverrides,
+) -> RuntimeRetrievalConfig {
     prepare_cache_access();
-    SidecarRuntimeConfig::for_project_auto_with_process_defaults_and_identity(
+    RuntimeRetrievalConfig::for_project_auto_with_process_defaults_and_identity(
         project_identity,
         defaults,
         overrides,
@@ -132,7 +129,7 @@ mod tests {
             .expect("gateway should activate a process-unique test cache root");
 
         assert_eq!(cache_root, active_root);
-        assert!(local().layout.state_file.starts_with(&cache_root));
+        assert!(local().status_cache_state_path().starts_with(&cache_root));
     }
 
     #[test]
@@ -147,7 +144,7 @@ mod tests {
                     let first = user_cache_root();
                     let second = user_cache_root();
                     assert_eq!(first, second);
-                    assert!(local().layout.state_file.starts_with(&first));
+                    assert!(local().status_cache_state_path().starts_with(&first));
                     first
                 })
                 .expect("spawn named cache test thread")
@@ -164,7 +161,7 @@ mod tests {
         }
         let (root, state_file) = std::thread::spawn(|| {
             let root = user_cache_root();
-            let state_file = local().layout.state_file;
+            let state_file = local().status_cache_state_path().to_path_buf();
             (root, state_file)
         })
         .join()

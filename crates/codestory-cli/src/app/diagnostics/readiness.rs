@@ -66,9 +66,11 @@ pub(in crate::app) fn agent_readiness_sidecar_runtime(
 ) -> codestory_retrieval::SidecarRuntimeConfig {
     crate::sidecar_runtime::for_project_with_run_id(
         project_root,
-        codestory_retrieval::SidecarProfile::Agent,
+        codestory_runtime::RuntimeRetrievalProfile::Agent,
         run_id,
     )
+    .as_raw_config_for_test()
+    .clone()
 }
 
 pub(in crate::app) fn readiness_lane_output(

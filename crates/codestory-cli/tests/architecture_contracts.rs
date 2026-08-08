@@ -144,6 +144,7 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
     let source_root = repo_root().join("crates/codestory-cli/src");
     let gateway_path = source_root.join("sidecar_runtime.rs");
+    let qualification_provider = source_root.join("embedding_qualification/worker.rs");
     let gateway = fs::read_to_string(&gateway_path).expect("read sidecar runtime gateway");
     let activation = gateway
         .find("enable_automatic_test_cache_root_for_process")
@@ -186,6 +187,9 @@ fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
         }
         let source = fs::read_to_string(&path).expect("read CLI source");
         for needle in forbidden {
+            if path == qualification_provider && needle == "SidecarRuntimeConfig::for_project_" {
+                continue;
+            }
             if source.contains(needle) {
                 violations.push(format!("{}: {needle}", path.display()));
             }
@@ -195,6 +199,42 @@ fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
         violations.is_empty(),
         "CLI sidecar constructors must remain behind sidecar_runtime.rs:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn ordinary_cli_retrieval_operations_route_through_runtime() {
+    let source_root = repo_root().join("crates/codestory-cli/src");
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+    let forbidden = [
+        "codestory_retrieval::activate_retained_rollback_generation(",
+        "codestory_retrieval::observe_retained_rollback_generation(",
+        "codestory_retrieval::sidecar_inventory_with_storage(",
+        "codestory_retrieval::sidecar_gc_apply_with_storage(",
+        "codestory_retrieval::execute_retrieval_query_with_cache_for_runtime(",
+        "codestory_retrieval::finalize_index_for_runtime_with_cancel(",
+    ];
+    let mut violations = Vec::new();
+    let mut scanned = 0_usize;
+    for path in files {
+        let source = fs::read_to_string(&path).expect("read CLI source");
+        let source = production_source(&source);
+        scanned += 1;
+        for needle in forbidden {
+            if source.contains(needle) {
+                violations.push(format!("{}: {needle}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "ordinary CLI retrieval operations must route through codestory_runtime:\n{}",
+        violations.join("\n")
+    );
+    assert!(
+        scanned > 20,
+        "CLI retrieval-operation gate scanned only {scanned} files"
     );
 }
 

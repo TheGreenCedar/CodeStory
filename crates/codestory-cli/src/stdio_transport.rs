@@ -4713,7 +4713,7 @@ fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication
         ),
         format!(
             "sidecar_state:{}",
-            stdio_path_fingerprint(&runtime.sidecar.layout.state_file)
+            stdio_path_fingerprint(runtime.sidecar.status_cache_state_path())
         ),
         format!(
             "local_refresh_state:{}",
@@ -8770,7 +8770,9 @@ version = "0.11.20"
         // The transport is an adapter: it must publish exactly the backend
         // identity the retrieval layer reports for this context's runtime
         // configuration, reached through the runtime rather than probed here.
-        let expected = codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar);
+        let expected = codestory_retrieval::embedding_runtime_id_for_runtime(
+            runtime.sidecar.as_raw_config_for_test(),
+        );
         assert!(
             !expected.is_empty(),
             "the product embedding backend identity must be a real value for this assertion to bite"
@@ -8812,14 +8814,15 @@ version = "0.11.20"
         // Equivalence: the adapter must publish the same observation the
         // retrieval layer produces for this context's own sidecar runtime
         // configuration and storage, byte for byte.
-        let expected_engine = serde_json::to_value(
-            codestory_retrieval::probe_infrastructure_health(&runtime.sidecar),
-        )
-        .expect("serialize infrastructure health");
+        let expected_engine =
+            serde_json::to_value(codestory_retrieval::probe_infrastructure_health(
+                runtime.sidecar.as_raw_config_for_test(),
+            ))
+            .expect("serialize infrastructure health");
         let expected_status = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
-            runtime.sidecar.clone(),
+            runtime.sidecar.as_raw_config_for_test().clone(),
         )
         .expect("strict sidecar status");
         assert_eq!(observed["engine"], expected_engine);
@@ -8838,8 +8841,10 @@ version = "0.11.20"
         // unavailable-object shape is pinned in
         // `codestory_runtime::activation_status`.
         let expected_embedding_server =
-            match codestory_retrieval::PerUserEmbeddingClient::for_runtime(&runtime.sidecar)
-                .and_then(|client| client.observe())
+            match codestory_retrieval::PerUserEmbeddingClient::for_runtime(
+                runtime.sidecar.as_raw_config_for_test(),
+            )
+            .and_then(|client| client.observe())
             {
                 Ok(Some(snapshot)) => {
                     serde_json::to_value(snapshot).expect("serialize embedding server snapshot")
@@ -10030,7 +10035,7 @@ version = "0.11.20"
         codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
             &active.runtime.project_root,
             &active.runtime.storage_path,
-            &active.runtime.sidecar,
+            active.runtime.sidecar.as_raw_config_for_test(),
         )
         .expect("publish strict zero-dense retrieval fixture");
         active

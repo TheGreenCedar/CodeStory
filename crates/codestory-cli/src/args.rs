@@ -903,7 +903,7 @@ pub(crate) struct RetrievalActivateRollbackCommand {
 /// JSON contract for `retrieval activate-rollback`.
 pub(crate) struct RetrievalActivateRollbackOutput {
     pub(crate) project: String,
-    pub(crate) outcome: codestory_retrieval::RollbackActivationOutcome,
+    pub(crate) outcome: codestory_runtime::RollbackActivationOutcome,
     pub(crate) next_commands: Vec<String>,
 }
 
@@ -911,15 +911,6 @@ pub(crate) struct RetrievalActivateRollbackOutput {
 pub(crate) enum CliSidecarProfile {
     Local,
     Agent,
-}
-
-impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
-    fn from(value: CliSidecarProfile) -> Self {
-        match value {
-            CliSidecarProfile::Local => Self::Local,
-            CliSidecarProfile::Agent => Self::Agent,
-        }
-    }
 }
 
 impl From<CliSidecarProfile> for codestory_runtime::RuntimeRetrievalProfile {

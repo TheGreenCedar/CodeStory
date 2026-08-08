@@ -159,7 +159,7 @@ fn agent_surface_embedding_preflight_preserves_cli_error_text() {
     ]);
     let (_temp, project_args, _storage_path, _current_schema) = agent_surface_refresh_fixture();
     let runtime = RuntimeContext::new_inspect_only(&project_args).expect("create runtime");
-    let embedding_cache_root = runtime.sidecar.cache_root.clone();
+    let embedding_cache_root = runtime.sidecar.as_raw_config_for_test().cache_root.clone();
     fs::create_dir_all(&embedding_cache_root).expect("create embedding cache root");
     let marker = embedding_cache_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER);
     fs::write(&marker, b"unavailable").expect("write embedding unavailable marker");

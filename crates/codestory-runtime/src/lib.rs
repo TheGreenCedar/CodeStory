@@ -38,8 +38,6 @@ use codestory_contracts::language_support::{
     language_support_profile_for_language_name,
 };
 use codestory_indexer::CancellationToken;
-#[cfg(test)]
-use codestory_store::RetrievalIndexManifest;
 use codestory_store::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
@@ -289,6 +287,7 @@ mod path_resolution;
 pub use path_resolution::resolve_project_file_path_from_root;
 mod process_config;
 pub use process_config::RuntimeProcessConfig;
+mod activation_retrieval;
 mod query_language;
 mod repository_identity;
 mod retrieval_boundary;
@@ -330,10 +329,14 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, ProcessOwnerState, ProcessStartProbe,
-    RetrievalProcessDefaults, RetrievalRuntimeDefaults, RetrievalRuntimeOverrides,
-    RetrievalStatusReport, RuntimeRetrievalConfig, RuntimeRetrievalProfile, apply_cache_clean,
-    ensure_product_embedding_backend_for_runtime, plan_cache_clean,
+    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
+    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
+    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
+    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
+    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    SidecarGcReport, SidecarInventoryReport, apply_cache_clean,
+    ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
 

@@ -33,7 +33,8 @@ fn ground_and_retrieval_status_retain_the_native_live_probe() -> Result<()> {
         embedding_server_transport::ClientTransportMode::ObserveOnly,
     )?;
     let runtime = sidecar_runtime::local();
-    let client = codestory_retrieval::PerUserEmbeddingClient::for_runtime(&runtime)?;
+    let client =
+        codestory_retrieval::PerUserEmbeddingClient::for_runtime(runtime.as_raw_config_for_test())?;
     if let Err(error) = client.observe() {
         let message = format!("{error:#}");
         assert!(
