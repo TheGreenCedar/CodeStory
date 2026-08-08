@@ -352,10 +352,157 @@ jobs:
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
-  macos-metal-proof:
+  # A protected host that is offline at dispatch produces a proof job that queues invisibly for
+  # ~24h and then classifies as an ordinary blocked failure. This gate types each protected host
+  # BEFORE any proof is dispatched, from the scheduled heartbeat jobs that run ON the hosts:
+  # `alive` hosts get their proof dispatched, a host `held_by_active_run` fails the release red
+  # (a busy host is provably alive, so withholding it would overstate unavailability), and a host
+  # still `unproven` after the one recorded recheck has its proof withheld from dispatch so the
+  # non-claim producer can record the typed pre-assignment non-claim. The heartbeat shape exists
+  # because GITHUB_TOKEN cannot list self-hosted runners: the runner-administration endpoints
+  # need an `administration` scope that workflow `permissions:` blocks cannot grant.
+  reserve-protected-runners:
+    name: Reserve protected accelerator runners
     needs:
       - preflight
       - packaged-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      dispatch_macos_arm64_metal: ${{ steps.reserve.outputs.dispatch_macos_arm64_metal }}
+      dispatch_windows_x64_vulkan: ${{ steps.reserve.outputs.dispatch_windows_x64_vulkan }}
+      dispatch_linux_x64_vulkan: ${{ steps.reserve.outputs.dispatch_linux_x64_vulkan }}
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Type each protected host from its heartbeat evidence
+        id: reserve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/runner-reservation
+          heartbeat_workflow="$(jq -r '.non_claim_policy.reservation.heartbeat.workflow' release-claims.json)"
+          heartbeat_file="${heartbeat_workflow##*/}"
+          tolerance_minutes="$(jq -r '.non_claim_policy.reservation.heartbeat.tolerance_minutes' release-claims.json)"
+          jq -c '[.non_claim_policy.hosts[] | {id, heartbeat_job_name, runner_labels}]' \
+            release-claims.json > target/runner-reservation/hosts.json
+
+          # The newest completed heartbeat jobs, host-tagged by the graph-declared job names.
+          collect_heartbeats() {
+            : > target/runner-reservation/heartbeat-jobs.ndjson
+            while IFS= read -r heartbeat_run_id; do
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$heartbeat_run_id/jobs?per_page=100" \
+                --jq '.jobs[] | {name, status, conclusion, completed_at}' \
+                >> target/runner-reservation/heartbeat-jobs.ndjson
+            done < <(
+              gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$heartbeat_file/runs?status=completed&per_page=5" \
+                --jq '.workflow_runs[].id'
+            )
+            jq -s '.' target/runner-reservation/heartbeat-jobs.ndjson \
+              > target/runner-reservation/heartbeat-jobs.json
+            jq -n \
+              --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              --slurpfile jobs target/runner-reservation/heartbeat-jobs.json \
+              '{observed_at: $observed_at,
+                jobs: [$jobs[0][] as $job
+                  | ($hosts[0][] | select(.heartbeat_job_name == ($job.name | split(" / ") | last))) as $host
+                  | {host: $host.id, status: $job.status, conclusion: $job.conclusion,
+                     completed_at: $job.completed_at}]}'
+          }
+
+          # Which protected host is executing someone else's job right now. Runner labels come
+          # from the in-progress jobs themselves, matched against the graph-declared label sets.
+          collect_holders() {
+            : > target/runner-reservation/active-jobs.ndjson
+            while IFS= read -r active_run_id; do
+              if [ "$active_run_id" = "$GITHUB_RUN_ID" ]; then continue; fi
+              gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$active_run_id/jobs?per_page=100" \
+                --jq '.jobs[] | select(.status == "in_progress")
+                  | {run_id, workflow_name, name, labels}' \
+                >> target/runner-reservation/active-jobs.ndjson
+            done < <(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?status=in_progress&per_page=100" \
+                --jq '.workflow_runs[].id'
+            )
+            jq -s \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              '[.[] as $job
+                | ($hosts[0][] | select((.runner_labels | sort) == (($job.labels // []) | sort))) as $host
+                | {host: $host.id, run_id: ($job.run_id | tostring),
+                   workflow: $job.workflow_name, job_name: $job.name}]' \
+              target/runner-reservation/active-jobs.ndjson \
+              > target/runner-reservation/holders.json
+          }
+
+          build_input() {
+            jq -s \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg now "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+              --arg tolerance "$tolerance_minutes" \
+              --slurpfile hosts target/runner-reservation/hosts.json \
+              --slurpfile holders target/runner-reservation/holders.json \
+              '{run_id: $run_id, run_attempt: $run_attempt, now: $now,
+                tolerance_minutes: $tolerance,
+                hosts: [$hosts[0][] | {id}],
+                observations: .,
+                active_holders: $holders[0]}' "$@"
+          }
+
+          collect_heartbeats > target/runner-reservation/observation-1.json
+          collect_holders
+          build_input target/runner-reservation/observation-1.json \
+            > target/runner-reservation/input.json
+          node .github/scripts/lost-runner-recovery.mjs plan-reservation \
+            --input target/runner-reservation/input.json \
+            --out target/runner-reservation/receipt.json
+
+          if [ "$(jq -r '.recheck' target/runner-reservation/receipt.json)" = true ]; then
+            # The one bounded recheck, mirroring the one automatic rerun a lost runner is owed:
+            # dispatch a fresh heartbeat and give it a bounded window. A host that stays silent
+            # simply produces no completed job, so the second observation records that fact; the
+            # heartbeat's cancel-in-progress concurrency keeps a stuck dispatch from piling up.
+            dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            gh workflow run "$heartbeat_file" --ref "$GITHUB_REF_NAME"
+            for _ in $(seq 1 24); do
+              sleep 10
+              recheck_status="$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$heartbeat_file/runs?event=workflow_dispatch&per_page=5" \
+                --jq "[.workflow_runs[] | select(.created_at >= \"$dispatched_at\") | .status] | first // \"absent\"")"
+              if [ "$recheck_status" = completed ]; then break; fi
+            done
+            collect_heartbeats > target/runner-reservation/observation-2.json
+            collect_holders
+            build_input \
+              target/runner-reservation/observation-1.json \
+              target/runner-reservation/observation-2.json \
+              > target/runner-reservation/input.json
+            node .github/scripts/lost-runner-recovery.mjs plan-reservation \
+              --input target/runner-reservation/input.json \
+              --out target/runner-reservation/receipt.json
+          fi
+
+      - name: Upload the reservation receipt
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: protected-runner-reservation-attempt-${{ github.run_attempt }}
+          path: target/runner-reservation/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-metal-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_macos_arm64_metal == 'true'
+    needs:
+      - preflight
+      - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -368,9 +515,11 @@ jobs:
       emit_release_cells: true
 
   windows-vulkan-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_windows_x64_vulkan == 'true'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -383,9 +532,11 @@ jobs:
       emit_release_cells: true
 
   linux-vulkan-proof:
+    if: needs.reserve-protected-runners.outputs.dispatch_linux_x64_vulkan == 'true'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
     uses: ./.github/workflows/linux-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -399,14 +550,18 @@ jobs:
   # The repository owns one host per accelerator. When a host drops its connection instead of
   # reporting, .github/scripts/lost-runner-rerun.yml re-dispatches it once; if the second attempt is
   # lost the same way, this job records a populated non-claim for that host so the closeout has a
-  # visible withheld claim to accept instead of an unexplained gap. It refuses -- and fails the run
-  # -- for every other shape of failure, so a proof that ran and disagreed can never be withheld.
+  # visible withheld claim to accept instead of an unexplained gap. A host whose proof was never
+  # dispatched -- reserve-protected-runners typed it `unproven` before assignment -- is withheld
+  # the same way under its own typed reason, vouched for by this run's reservation receipt. It
+  # refuses -- and fails the run -- for every other shape of failure, so a proof that ran and
+  # disagreed can never be withheld.
   accelerator-non-claim:
     name: Withhold unproven accelerator claims
     if: always() && needs.preflight.result == 'success' && needs.packaged-proof.result == 'success'
     needs:
       - preflight
       - packaged-proof
+      - reserve-protected-runners
       - macos-metal-proof
       - windows-vulkan-proof
       - linux-vulkan-proof
@@ -418,6 +573,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - name: Download this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-non-claim/reservation
+          merge-multiple: false
 
       - name: Collect protected accelerator job evidence
         env:
@@ -443,9 +605,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # This run's own receipt, at the newest attempt at or below the current one: a re-run of
+          # failed jobs does not re-run the succeeded reservation gate, so its receipt stays the
+          # attempt-1 artifact.
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-non-claim/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          reservation_args=()
+          if [ -n "$receipt" ]; then
+            reservation_args+=(--reservation "$receipt")
+          fi
+          echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
           node .github/scripts/lost-runner-recovery.mjs plan-non-claim \
             --input target/release-non-claim/plan-input.json \
-            --out target/release-non-claim/plan.json
+            --out target/release-non-claim/plan.json \
+            "${reservation_args[@]}"
 
       - name: Download authenticated candidate records for withheld identity
         if: steps.non-claim.outputs.withheld_hosts != ''
@@ -459,6 +635,7 @@ jobs:
         if: steps.non-claim.outputs.withheld_hosts != ''
         env:
           WITHHELD_HOSTS: ${{ steps.non-claim.outputs.withheld_hosts }}
+          RESERVATION_RECEIPT: ${{ steps.non-claim.outputs.receipt }}
           VERSION: ${{ needs.preflight.outputs.version }}
         shell: bash
         run: |
@@ -476,6 +653,17 @@ jobs:
               linux-x64-vulkan) target=linux-x64 ;;
               *) echo "::error::unknown non-claim host $host"; exit 1 ;;
             esac
+            # The classifier's own plan says WHICH typed reason withheld the host; the recorded
+            # manifest carries that reason, with the reservation receipt vouching the
+            # pre-assignment route.
+            detail="$(jq -r --arg host "$host" \
+              '.hosts[] | select(.host == $host) | .detail' \
+              target/release-non-claim/plan.json)"
+            reason_args=()
+            if [ "$detail" = runner_unproven_pre_assignment ]; then
+              reason_args+=(--reason accelerator_host_offline_pre_assignment)
+              reason_args+=(--reservation "$RESERVATION_RECEIPT")
+            fi
             node scripts/codestory-release-cell-manifest.mjs withhold \
               --repo "$GITHUB_WORKSPACE" \
               --expected-sha "$GITHUB_SHA" \
@@ -485,7 +673,8 @@ jobs:
               --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
               --identity target/release-non-claim/identity.json \
               --candidate-record "target/release-non-claim/candidate-records/codestory-candidate-archive-record-$target/candidate-archive-record.json" \
-              --out-dir "target/release-non-claim/cells/$host"
+              --out-dir "target/release-non-claim/cells/$host" \
+              "${reason_args[@]}"
           done
 
       - name: Upload withheld pre-publish macOS accelerator cells
@@ -562,6 +751,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Collect this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-closeout/reservation
+          merge-multiple: false
+
       - name: Authenticate pre-publish Actions provenance
         env:
           GH_TOKEN: ${{ github.token }}
@@ -570,9 +766,21 @@ jobs:
         run: |
           set -euo pipefail
           # The closeout reads the lost-runner signature itself rather than trusting the non-claim
-          # producer's verdict, so it collects the same Actions evidence independently.
+          # producer's verdict, so it collects the same Actions evidence independently. The
+          # reservation receipt is collected the same way -- downloaded from this run's artifacts
+          # by this job, never handed over by the non-claim producer -- so the pre-assignment
+          # route is re-confirmed from evidence the closeout gathered itself.
           bash .github/scripts/collect-actions-job-evidence.sh \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-closeout/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          receipt_args=()
+          if [ -n "$receipt" ]; then
+            receipt_args+=(--reservation-receipt "$receipt")
+          fi
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
@@ -581,6 +789,7 @@ jobs:
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --reuse "$REUSE_SELECTION" \
             --job-evidence target/release-closeout/job-evidence.json \
+            "${receipt_args[@]}" \
             --out target/release-closeout/trusted-pre-publish-producers.json
 
       - name: Download and verify selected pre-publish release cells
@@ -1009,6 +1218,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Collect this run's reservation receipt
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: protected-runner-reservation-attempt-*
+          path: target/release-closeout/reservation
+          merge-multiple: false
+
       - name: Authenticate post-publish Actions provenance
         id: post-publish-provenance
         env:
@@ -1018,6 +1234,15 @@ jobs:
           set -euo pipefail
           bash .github/scripts/collect-actions-job-evidence.sh \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" target/release-closeout/job-evidence.json
+          receipt=""
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT" -1 1); do
+            candidate="target/release-closeout/reservation/protected-runner-reservation-attempt-$attempt/receipt.json"
+            if [ -f "$candidate" ]; then receipt="$candidate"; break; fi
+          done
+          receipt_args=()
+          if [ -n "$receipt" ]; then
+            receipt_args+=(--reservation-receipt "$receipt")
+          fi
           node scripts/codestory-release-cell-manifest.mjs producer-map \
             --repo "$GITHUB_WORKSPACE" \
             --expected-sha "$GITHUB_SHA" \
@@ -1025,6 +1250,7 @@ jobs:
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --job-evidence target/release-closeout/job-evidence.json \
+            "${receipt_args[@]}" \
             --out target/release-closeout/trusted-post-publish-producers.json
           artifact_ids="$(jq -r '[.artifacts[].id] | join(",")' target/release-closeout/trusted-post-publish-producers.json)"
           test -n "$artifact_ids"

@@ -10,6 +10,7 @@ import {
   MAXIMUM_RUN_ATTEMPTS,
   RERUN_DISPATCH_SCHEMA,
   RERUN_PLAN_SCHEMA,
+  RESERVATION_RECEIPT_SCHEMA,
 } from "./lost-runner-recovery.mjs";
 import {
   LINK_PHASE as WINDOWS_LINK_PHASE,
@@ -10310,6 +10311,231 @@ export function lostRunnerRecoveryViolations(workflows, graph) {
   return violations;
 }
 
+/// The pre-dispatch reservation contract: the heartbeat workflow whose tiny jobs run ON the three
+/// protected hosts, the release gate that types each host before any proof is dispatched, the
+/// per-host dispatch conditions on the proof calls, the receipt feed into the non-claim producer,
+/// and the closeouts' own receipt collection.
+///
+/// Every pin here is a place where a gate is being relaxed -- an absent proof may now be withheld
+/// instead of blocking -- so the shapes that keep the relaxation honest are pinned: the gate never
+/// waits on a human, the receipt has exactly one producer, the proof jobs dispatch only for hosts
+/// the receipt typed alive, and the closeouts download the receipt themselves rather than
+/// inheriting the non-claim producer's verdict.
+export function protectedRunnerReservationViolations(workflows, graph) {
+  const violations = [];
+  const policy = graph.non_claim_policy;
+  const reservation = object(policy.reservation ?? {});
+  const heartbeat = object(reservation.heartbeat ?? {});
+  const heartbeatFile = String(heartbeat.workflow ?? "").split("/").at(-1);
+  const hostFlag = host => `dispatch_${host.id.replaceAll(/[^A-Za-z0-9_]/gu, "_")}`;
+
+  // The receipt schema and the recheck bound are the same facts the recovery contract exports,
+  // so a graph that drifts from the code is a violation even with the workflows untouched.
+  add(
+    violations,
+    reservation.schema === RESERVATION_RECEIPT_SCHEMA,
+    "the release claim graph reservation schema must match the recovery contract",
+  );
+  add(
+    violations,
+    reservation.maximum_observation_attempts === MAXIMUM_RUN_ATTEMPTS,
+    "the release claim graph reservation recheck bound must mirror MAXIMUM_RUN_ATTEMPTS",
+  );
+
+  const heartbeatWorkflow = workflows.get(heartbeatFile);
+  if (!heartbeatWorkflow) {
+    violations.push(`${heartbeatFile} must exist`);
+  } else {
+    const schedule = list(at(heartbeatWorkflow, "on", "schedule") ?? []);
+    add(
+      violations,
+      schedule.length === 1 && object(schedule[0]).cron === heartbeat.cron,
+      `${heartbeatFile} must run on the graph-declared ${String(heartbeat.cron)} schedule`,
+    );
+    add(
+      violations,
+      trigger(heartbeatWorkflow, "workflow_dispatch") !== undefined,
+      `${heartbeatFile} must accept the bounded recheck dispatch`,
+    );
+    // Queued heartbeats behind a busy or dead host must never pile up: each run supersedes the
+    // one before it.
+    add(
+      violations,
+      concurrencyCancels(heartbeatWorkflow),
+      `${heartbeatFile} must cancel superseded heartbeats`,
+    );
+    add(
+      violations,
+      JSON.stringify(object(heartbeatWorkflow.permissions)) === "{}",
+      `${heartbeatFile} must hold no token scopes at all`,
+    );
+    add(
+      violations,
+      !scalarStrings(heartbeatWorkflow).some(value => value.includes("secrets.")),
+      `${heartbeatFile} must reference no secrets`,
+    );
+    const jobs = Object.entries(object(heartbeatWorkflow.jobs));
+    add(
+      violations,
+      jobs.length === list(policy.hosts).length,
+      `${heartbeatFile} must define exactly one heartbeat job per protected host`,
+    );
+    for (const host of policy.hosts) {
+      const matches = jobs.filter(([, job]) => object(job).name === host.heartbeat_job_name);
+      if (matches.length !== 1) {
+        violations.push(`${heartbeatFile} must define one job named ${host.heartbeat_job_name}`);
+        continue;
+      }
+      const [jobId, job] = matches[0];
+      add(
+        violations,
+        JSON.stringify(job["runs-on"]) === JSON.stringify(host.runner_labels),
+        `${heartbeatFile} jobs.${jobId} must run on ${JSON.stringify(host.runner_labels)}`,
+      );
+      add(
+        violations,
+        job["timeout-minutes"] === 5,
+        `${heartbeatFile} jobs.${jobId} must keep the tiny 5-minute heartbeat budget`,
+      );
+      add(
+        violations,
+        job.environment === undefined,
+        `${heartbeatFile} jobs.${jobId} must not wait on an approval environment`,
+      );
+      // The only fact a heartbeat proves is that the runner completed a job; checking anything
+      // out or downloading anything onto the protected host proves nothing more and widens the
+      // host's exposure.
+      add(
+        violations,
+        list(job.steps).every(step => object(step).uses === undefined),
+        `${heartbeatFile} jobs.${jobId} must run no actions on the protected host`,
+      );
+    }
+  }
+
+  const releaseFile = "release.yml";
+  const release = workflows.get(releaseFile);
+  if (!release) return violations;
+  const gateJobId = String(reservation.producer_job ?? "");
+  const gate = requireJob(violations, releaseFile, release, gateJobId);
+  // The gate sits between the packaged proof and every protected dispatch. A human approval here
+  // would put a click between a finished build and its proofs on every release; an `if:` here
+  // would make "the hosts were never typed" reachable, which is the invisible-queue state this
+  // gate exists to remove.
+  add(
+    violations,
+    object(gate).environment === undefined,
+    `${releaseFile} ${gateJobId} must not wait on an approval environment`,
+  );
+  add(
+    violations,
+    object(gate).if === undefined,
+    `${releaseFile} ${gateJobId} must type the hosts unconditionally`,
+  );
+  const reserveStepName = "Type each protected host from its heartbeat evidence";
+  requireStepRun(violations, releaseFile, gate, reserveStepName, [
+    "node .github/scripts/lost-runner-recovery.mjs plan-reservation",
+    "--out target/runner-reservation/receipt.json",
+    ".non_claim_policy.reservation.heartbeat.workflow",
+    ".non_claim_policy.reservation.heartbeat.tolerance_minutes",
+    // The bounded recheck is a fresh heartbeat dispatch, not a longer wait on stale evidence.
+    "gh workflow run",
+  ]);
+  for (const host of policy.hosts) {
+    add(
+      violations,
+      object(gate.outputs)[hostFlag(host)]
+        === `\${{ steps.reserve.outputs.${hostFlag(host)} }}`,
+      `${releaseFile} ${gateJobId} must publish the ${hostFlag(host)} receipt flag`,
+    );
+  }
+  const receiptArtifactName = String(reservation.receipt_artifact ?? "")
+    .replaceAll("{attempt}", "${{ github.run_attempt }}");
+  const receiptUpload = list(object(gate).steps ?? []).find(step =>
+    object(object(step).with).name === receiptArtifactName);
+  add(
+    violations,
+    receiptUpload !== undefined
+      && receiptUpload.if === "always()"
+      && String(object(receiptUpload?.with).path ?? "").endsWith("receipt.json"),
+    `${releaseFile} ${gateJobId} must upload the ${receiptArtifactName} receipt even when it fails red`,
+  );
+  // Exactly one producer for the receipt artifact, anywhere in the repository: a second uploader
+  // could hand the closeouts a receipt no reservation ever wrote.
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
+      for (const step of Array.isArray(object(jobValue).steps) ? jobValue.steps : []) {
+        const uploadName = String(object(object(step).with).name ?? "");
+        if (!uploadName.startsWith("protected-runner-reservation-")) continue;
+        if (typeof object(step).uses !== "string" || !object(step).uses.startsWith("actions/upload-artifact")) continue;
+        add(
+          violations,
+          file === releaseFile && jobId === gateJobId,
+          `${file} job ${jobId} must not upload the reservation receipt ${uploadName}`,
+        );
+      }
+    }
+  }
+
+  // Proof jobs dispatch only for hosts the receipt typed alive, host by host, derived from the
+  // graph rather than listed here.
+  for (const host of policy.hosts) {
+    const proofRef = `./${host.unavailable_producer_workflow}`;
+    const entry = Object.entries(object(release.jobs))
+      .find(([, jobValue]) => object(jobValue).uses === proofRef);
+    add(
+      violations,
+      entry !== undefined
+        && object(entry[1]).if
+          === `needs.${gateJobId}.outputs.${hostFlag(host)} == 'true'`
+        && needs(object(entry[1])).includes(gateJobId),
+      `${releaseFile} proof calling ${host.unavailable_producer_workflow} must dispatch only on ${hostFlag(host)}`,
+    );
+  }
+
+  // The non-claim producer feeds the receipt into the shared classifier and records the
+  // pre-assignment reason only for hosts the classifier withheld under it.
+  const nonClaim = requireJob(violations, releaseFile, release, "accelerator-non-claim");
+  const nonClaimDownload = namedStep(nonClaim, "Download this run's reservation receipt");
+  add(
+    violations,
+    nonClaimDownload?.uses === "actions/download-artifact@v8.0.1"
+      && object(nonClaimDownload?.with).pattern === "protected-runner-reservation-attempt-*"
+      && object(nonClaimDownload?.with)["merge-multiple"] === false,
+    `${releaseFile} non-claim producer must download this run's reservation receipt`,
+  );
+  requireStepRun(violations, releaseFile, nonClaim, "Decide withheld accelerator hosts", [
+    "protected-runner-reservation-attempt-",
+    "--reservation",
+  ]);
+  requireStepRun(violations, releaseFile, nonClaim, "Record populated accelerator non-claims", [
+    "runner_unproven_pre_assignment",
+    "--reason accelerator_host_offline_pre_assignment",
+  ]);
+
+  // The closeouts re-confirm the pre-assignment route from a receipt they downloaded themselves:
+  // the trust boundary that already refuses to inherit the lost-runner verdict refuses to
+  // inherit this one the same way.
+  for (const [jobId, stepName] of [
+    ["pre-publish-closeout", "Authenticate pre-publish Actions provenance"],
+    ["post-publish-closeout", "Authenticate post-publish Actions provenance"],
+  ]) {
+    const job = requireJob(violations, releaseFile, release, jobId);
+    const download = namedStep(job, "Collect this run's reservation receipt");
+    add(
+      violations,
+      download?.uses === "actions/download-artifact@v8.0.1"
+        && object(download?.with).pattern === "protected-runner-reservation-attempt-*"
+        && object(download?.with)["merge-multiple"] === false,
+      `${releaseFile} ${jobId} must collect this run's reservation receipt itself`,
+    );
+    requireStepRun(violations, releaseFile, job, stepName, [
+      "--reservation-receipt",
+    ]);
+  }
+  return violations;
+}
+
 function validateReleaseArtifactRerunSafety(workflows, violations) {
   const releaseChainWorkflows = new Set([
     "source-proof.yml",
@@ -11009,6 +11235,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   violations.push(...absorbedFailureViolations(workflows));
   violations.push(...annotationScopeViolations(workflows));
   violations.push(...lostRunnerRecoveryViolations(workflows, graph));
+  violations.push(...protectedRunnerReservationViolations(workflows, graph));
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }

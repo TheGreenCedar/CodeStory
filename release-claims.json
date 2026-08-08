@@ -971,12 +971,26 @@
     "schema": "codestory.release-non-claim/v1",
     "runtime_execution": "not_proven_by_package",
     "reason": "accelerator_host_unavailable",
+    "pre_assignment_reason": "accelerator_host_offline_pre_assignment",
     "annotation": "The self-hosted runner lost communication with the server. Verify the machine is running and has a healthy network connection.",
+    "annotation_reason": "accelerator_host_unavailable",
     "maximum_run_attempts": 2,
     "recovery_contract": ".github/scripts/lost-runner-recovery.mjs",
     "producer_workflow": ".github/workflows/release.yml",
     "producer_job": "accelerator-non-claim",
     "producer_job_name": "Withhold unproven accelerator claims",
+    "reservation": {
+      "schema": "codestory.protected-runner-reservation/v1",
+      "producer_workflow": ".github/workflows/release.yml",
+      "producer_job": "reserve-protected-runners",
+      "receipt_artifact": "protected-runner-reservation-attempt-{attempt}",
+      "maximum_observation_attempts": 2,
+      "heartbeat": {
+        "workflow": ".github/workflows/protected-runner-heartbeat.yml",
+        "cron": "*/15 * * * *",
+        "tolerance_minutes": 30
+      }
+    },
     "withhold_policy": {
       "maximum_withheld_hosts": 1,
       "archive_identity_source": "candidate_archive_record",
@@ -990,6 +1004,13 @@
     "hosts": [
       {
         "id": "macos-arm64-metal",
+        "runner_labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "codestory-metal"
+        ],
+        "heartbeat_job_name": "Heartbeat macos-arm64-metal",
         "unavailable_producer_workflow": ".github/workflows/macos-metal-proof.yml",
         "unavailable_producer_job_name": "Packaged Apple Silicon Metal engine",
         "producer_artifacts": {
@@ -1004,6 +1025,13 @@
       },
       {
         "id": "windows-x64-vulkan",
+        "runner_labels": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "heartbeat_job_name": "Heartbeat windows-x64-vulkan",
         "unavailable_producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
         "unavailable_producer_job_name": "Packaged Windows Vulkan engine",
         "producer_artifacts": {
@@ -1018,6 +1046,13 @@
       },
       {
         "id": "linux-x64-vulkan",
+        "runner_labels": [
+          "self-hosted",
+          "Linux",
+          "X64",
+          "codestory-linux-vulkan"
+        ],
+        "heartbeat_job_name": "Heartbeat linux-x64-vulkan",
         "unavailable_producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
         "unavailable_producer_job_name": "Packaged Linux Vulkan engine",
         "producer_artifacts": {
@@ -1432,21 +1467,29 @@
         "packaged-proof": [
           "preflight"
         ],
-        "macos-metal-proof": [
+        "reserve-protected-runners": [
           "preflight",
           "packaged-proof"
+        ],
+        "macos-metal-proof": [
+          "preflight",
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "windows-vulkan-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "linux-vulkan-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "reserve-protected-runners"
         ],
         "accelerator-non-claim": [
           "preflight",
           "packaged-proof",
+          "reserve-protected-runners",
           "macos-metal-proof",
           "windows-vulkan-proof",
           "linux-vulkan-proof"

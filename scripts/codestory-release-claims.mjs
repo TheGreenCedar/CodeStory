@@ -401,6 +401,57 @@ function validateWithholdPolicy(policy, hosts, cellGroups) {
   }
 }
 
+/// The pre-dispatch reservation contract: a scheduled heartbeat whose tiny jobs run ON the three
+/// protected hosts, and a receipt the release writes before it dispatches any proof. The heartbeat
+/// shape exists because GITHUB_TOKEN cannot list self-hosted runners -- the runner-administration
+/// endpoints need an `administration` scope that workflow `permissions:` blocks cannot grant, and
+/// the program keeps new credentials out -- so liveness is proven by jobs the hosts themselves ran.
+function validateRunnerReservation(policy) {
+  const reservation = object(
+    policy.reservation,
+    "release claim graph.non_claim_policy.reservation",
+  );
+  if (reservation.schema !== "codestory.protected-runner-reservation/v1") {
+    fail(
+      "release claim graph.non_claim_policy.reservation.schema must be "
+      + "codestory.protected-runner-reservation/v1",
+    );
+  }
+  if (reservation.producer_workflow !== policy.producer_workflow) {
+    fail(
+      "non_claim_policy.reservation.producer_workflow must be the release workflow that "
+      + "dispatches the proofs the receipt gates",
+    );
+  }
+  nonEmptyText(reservation.producer_job, "non_claim_policy.reservation.producer_job");
+  const receiptArtifact = nonEmptyText(
+    reservation.receipt_artifact,
+    "non_claim_policy.reservation.receipt_artifact",
+  );
+  if (!receiptArtifact.includes("{attempt}")) {
+    fail("non_claim_policy.reservation.receipt_artifact must be attempt-qualified");
+  }
+  // One bounded recheck, mirroring the one automatic rerun a lost runner is owed: the same shape
+  // of bound in both routes keeps "the recovery was spent first" one idea, not two.
+  if (reservation.maximum_observation_attempts !== policy.maximum_run_attempts) {
+    fail(
+      "non_claim_policy.reservation.maximum_observation_attempts must mirror maximum_run_attempts",
+    );
+  }
+  const heartbeat = object(reservation.heartbeat, "non_claim_policy.reservation.heartbeat");
+  const heartbeatWorkflow = nonEmptyText(
+    heartbeat.workflow,
+    "non_claim_policy.reservation.heartbeat.workflow",
+  );
+  if (!heartbeatWorkflow.startsWith(".github/workflows/") || !heartbeatWorkflow.endsWith(".yml")) {
+    fail("non_claim_policy.reservation.heartbeat.workflow must be a repository workflow path");
+  }
+  nonEmptyText(heartbeat.cron, "non_claim_policy.reservation.heartbeat.cron");
+  if (!Number.isInteger(heartbeat.tolerance_minutes) || heartbeat.tolerance_minutes <= 0) {
+    fail("non_claim_policy.reservation.heartbeat.tolerance_minutes must be a positive integer");
+  }
+}
+
 function validateNonClaimPolicy(graph, cellGroups) {
   const policy = object(graph.non_claim_policy, "release claim graph.non_claim_policy");
   if (policy.schema !== "codestory.release-non-claim/v1") {
@@ -412,7 +463,26 @@ function validateNonClaimPolicy(graph, cellGroups) {
     fail("release claim graph.non_claim_policy.runtime_execution must be not_proven_by_package");
   }
   nonEmptyText(policy.reason, "release claim graph.non_claim_policy.reason");
+  nonEmptyText(
+    policy.pre_assignment_reason,
+    "release claim graph.non_claim_policy.pre_assignment_reason",
+  );
+  if (policy.pre_assignment_reason === policy.reason) {
+    fail(
+      "release claim graph.non_claim_policy.pre_assignment_reason must be a distinct typed reason: "
+      + "a host that was never assigned its job and a host lost mid-job are different facts",
+    );
+  }
   nonEmptyText(policy.annotation, "release claim graph.non_claim_policy.annotation");
+  // The annotation is what Actions writes on a job whose runner died mid-execution. A job that was
+  // never assigned has no annotation, so the field is scoped to the lost-runner reason and a
+  // pre-assignment non-claim must not quote it.
+  if (policy.annotation_reason !== policy.reason) {
+    fail(
+      "release claim graph.non_claim_policy.annotation_reason must scope the annotation to the "
+      + "mid-job lost-runner reason; a never-assigned job carries no Actions annotation",
+    );
+  }
   nonEmptyText(policy.recovery_contract, "release claim graph.non_claim_policy.recovery_contract");
   if (policy.maximum_run_attempts !== 2) {
     fail("release claim graph.non_claim_policy.maximum_run_attempts must be 2");
@@ -420,6 +490,7 @@ function validateNonClaimPolicy(graph, cellGroups) {
   for (const key of ["producer_workflow", "producer_job", "producer_job_name"]) {
     nonEmptyText(policy[key], `release claim graph.non_claim_policy.${key}`);
   }
+  validateRunnerReservation(policy);
   const producedCells = cellsByProducerJobName(cellGroups);
   const hosts = uniqueById(policy.hosts, "release claim graph.non_claim_policy.hosts");
   validateWithholdPolicy(policy, hosts, cellGroups);
@@ -429,12 +500,41 @@ function validateNonClaimPolicy(graph, cellGroups) {
   if (JSON.stringify([...hosts.keys()].sort()) !== JSON.stringify(acceleratorInstances)) {
     fail("non_claim_policy.hosts must name exactly the protected accelerator instances");
   }
+  const protectedRunnersByWorkflow = new Map(
+    (graph.workflow_policy?.protected_jobs ?? []).map((row) => [row.workflow, row.runner]),
+  );
+  const heartbeatJobNames = new Set();
   for (const [hostId, host] of hosts) {
     nonEmptyText(host.unavailable_producer_workflow, `non_claim_policy.hosts ${hostId}.unavailable_producer_workflow`);
     const jobName = nonEmptyText(
       host.unavailable_producer_job_name,
       `non_claim_policy.hosts ${hostId}.unavailable_producer_job_name`,
     );
+    // The labels the heartbeat has to run on are the labels the proof runs on: a heartbeat that
+    // proves some other machine alive vouches for nothing. The protected_jobs contract already
+    // pins the proof's labels, so the host's copy is held to that same row rather than trusted.
+    const runnerLabels = stringArray(
+      host.runner_labels,
+      `non_claim_policy.hosts ${hostId}.runner_labels`,
+      { nonEmpty: true },
+    );
+    const protectedRunner = protectedRunnersByWorkflow.get(
+      host.unavailable_producer_workflow.split("/").at(-1),
+    );
+    if (JSON.stringify(runnerLabels) !== JSON.stringify(protectedRunner ?? null)) {
+      fail(
+        `non_claim_policy.hosts ${hostId}.runner_labels must equal the protected_jobs runner `
+        + "labels of the proof the heartbeat vouches for",
+      );
+    }
+    const heartbeatJobName = nonEmptyText(
+      host.heartbeat_job_name,
+      `non_claim_policy.hosts ${hostId}.heartbeat_job_name`,
+    );
+    if (heartbeatJobNames.has(heartbeatJobName)) {
+      fail(`non_claim_policy.hosts duplicates heartbeat job name ${heartbeatJobName}`);
+    }
+    heartbeatJobNames.add(heartbeatJobName);
     // One artifact container may only hold cells of a single closeout phase, because the phase's
     // trusted producer map is what authorizes every manifest inside the container it downloads.
     const hostArtifacts = object(
@@ -2071,14 +2171,22 @@ export function renderReleasePlatformNotes(graph, ledger) {
   const withheldCells = new Set(stringArray(closeout.withheld_cells, "closeout ledger.withheld_cells"));
   const hostByTarget = acceleratorHostByTarget(graph);
   const reason = graph.non_claim_policy.reason;
+  // The ledger records WHICH typed reason withheld a cell -- lost mid-job and never assigned are
+  // different facts -- so the published wording quotes the recorded reason, not the graph default.
+  const recordedReasons = new Map(
+    (Array.isArray(closeout.cells) ? closeout.cells : [])
+      .filter((row) => typeof row?.non_claim?.non_claim_reason === "string")
+      .map((row) => [row.id, row.non_claim.non_claim_reason]),
+  );
   const packages = graph.public_support.packages.map(({ label, target, accelerator_claim: claim }) => {
     const accelerator = claim === "metal" ? "Metal" : "Vulkan";
     const host = hostByTarget.get(target);
-    const withheld = host !== undefined
-      && host.withheld_cells.some((cellId) =>
+    const withheldCellId = host === undefined
+      ? undefined
+      : host.withheld_cells.find((cellId) =>
         cellId.startsWith("accelerator_execution:") && withheldCells.has(cellId));
-    return withheld
-      ? `- ${label}: ${accelerator} not proven for this release (${reason})`
+    return withheldCellId !== undefined
+      ? `- ${label}: ${accelerator} not proven for this release (${recordedReasons.get(withheldCellId) ?? reason})`
       : `- ${label}: supported with ${accelerator}`;
   });
   const unsupported = graph.public_support.unsupported.map(

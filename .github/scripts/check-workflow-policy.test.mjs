@@ -38,6 +38,7 @@ import {
   packagedPrSigningViolations,
   parseWorkflow,
   proofFloorPolicyViolations,
+  protectedRunnerReservationViolations,
   qualificationDriverArtifactViolations,
   releaseProofCpuSelectorViolations,
   releaseFreezeBarrierWorkflowViolations,
@@ -7913,6 +7914,120 @@ test("lost-runner recovery stays automatic, bounded, and blind to job names", ()
     drift(mutated);
     assert.notDeepEqual(lostRunnerRecoveryViolations(loadWorkflows(), mutated), []);
   }
+});
+
+test("the protected-runner reservation stays machine-decided, single-producer, and self-confirmed", () => {
+  const graph = loadReleaseClaimGraph(root);
+  const reservation = graph.non_claim_policy.reservation;
+  const heartbeatFile = reservation.heartbeat.workflow.split("/").at(-1);
+
+  // The live repository satisfies the whole contract.
+  assert.deepEqual(protectedRunnerReservationViolations(loadWorkflows(), graph), []);
+
+  const mutations = [
+    // The gate is what stands between an offline host and a proof queueing invisibly for a day.
+    ["the gate is removed from release.yml", workflows => {
+      delete workflows.get("release.yml").jobs["reserve-protected-runners"];
+    }, /release\.yml must contain job reserve-protected-runners/u],
+    // An approval environment would put a human click between every finished build and its
+    // proofs -- the same failure the lost-runner recovery refuses.
+    ["an approval environment on the gate", workflows => {
+      workflows.get("release.yml").jobs["reserve-protected-runners"].environment =
+        "release-recovery";
+    }, /reserve-protected-runners must not wait on an approval environment/u],
+    ["a conditional gate", workflows => {
+      workflows.get("release.yml").jobs["reserve-protected-runners"].if = "inputs.publish_release";
+    }, /must type the hosts unconditionally/u],
+    // Without the per-host condition an unproven host's proof is dispatched anyway, and the
+    // invisible queue this contract removes is back.
+    ["a proof dispatch condition is dropped", workflows => {
+      delete workflows.get("release.yml").jobs["macos-metal-proof"].if;
+    }, /must dispatch only on dispatch_macos_arm64_metal/u],
+    ["a proof dispatch condition is rewired to a literal", workflows => {
+      workflows.get("release.yml").jobs["linux-vulkan-proof"].if = "true";
+    }, /must dispatch only on dispatch_linux_x64_vulkan/u],
+    ["the heartbeat workflow is removed", workflows => {
+      workflows.delete(heartbeatFile);
+    }, /protected-runner-heartbeat\.yml must exist/u],
+    ["a heartbeat job moves off its protected labels", workflows => {
+      workflows.get(heartbeatFile).jobs["heartbeat-linux-x64-vulkan"]["runs-on"] = "ubuntu-latest";
+    }, /heartbeat-linux-x64-vulkan must run on/u],
+    // Queued heartbeats piling up behind a dead host is exactly the state being removed.
+    ["the heartbeat stops cancelling superseded runs", workflows => {
+      workflows.get(heartbeatFile).concurrency["cancel-in-progress"] = false;
+    }, /must cancel superseded heartbeats/u],
+    ["the heartbeat gains token scopes", workflows => {
+      workflows.get(heartbeatFile).permissions = { contents: "read" };
+    }, /must hold no token scopes/u],
+    ["the heartbeat runs an action on the protected host", workflows => {
+      workflows.get(heartbeatFile).jobs["heartbeat-linux-x64-vulkan"].steps.unshift({
+        name: "Checkout",
+        uses: "actions/checkout@v5",
+      });
+    }, /must run no actions on the protected host/u],
+    // Exactly one producer for the receipt: a second uploader could hand the closeouts a receipt
+    // no reservation ever wrote.
+    ["a second receipt uploader", workflows => {
+      workflows.get("release.yml").jobs.publish.steps.push({
+        name: "Upload forged reservation receipt",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "protected-runner-reservation-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+          "retention-days": 30,
+        },
+      });
+    }, /publish must not upload the reservation receipt/u],
+    ["the receipt upload becomes conditional on success", workflows => {
+      const gate = workflows.get("release.yml").jobs["reserve-protected-runners"];
+      delete gate.steps.find(({ name }) => name === "Upload the reservation receipt").if;
+    }, /even when it fails red/u],
+    // The non-claim producer and both closeouts each read the receipt themselves; dropping any
+    // one of those reads reopens a single-verdict trust boundary.
+    ["the non-claim producer stops feeding the receipt", workflows => {
+      const step = workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ name }) => name === "Decide withheld accelerator hosts");
+      step.run = step.run.replaceAll("--reservation", "--nothing");
+    }, /must run --reservation/u],
+    ["the record step loses its reason routing", workflows => {
+      const step = workflows.get("release.yml").jobs["accelerator-non-claim"].steps
+        .find(({ name }) => name === "Record populated accelerator non-claims");
+      step.run = step.run.replaceAll(
+        "--reason accelerator_host_offline_pre_assignment",
+        "",
+      );
+    }, /must run --reason accelerator_host_offline_pre_assignment/u],
+    ["the pre-publish closeout stops collecting the receipt", workflows => {
+      const job = workflows.get("release.yml").jobs["pre-publish-closeout"];
+      job.steps = job.steps.filter(({ name }) => name !== "Collect this run's reservation receipt");
+    }, /pre-publish-closeout must collect this run's reservation receipt itself/u],
+    ["the post-publish closeout stops passing the receipt", workflows => {
+      const step = workflows.get("release.yml").jobs["post-publish-closeout"].steps
+        .find(({ name }) => name === "Authenticate post-publish Actions provenance");
+      step.run = step.run.replaceAll("--reservation-receipt", "--nothing");
+    }, /must run --reservation-receipt/u],
+    ["the recheck dispatch is dropped", workflows => {
+      const step = workflows.get("release.yml").jobs["reserve-protected-runners"].steps
+        .find(({ name }) => name === "Type each protected host from its heartbeat evidence");
+      step.run = step.run.replaceAll("gh workflow run", "true #");
+    }, /must run gh workflow run/u],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const workflows = loadWorkflows();
+    mutate(workflows);
+    const violations = validateWorkflows(workflows);
+    assert.notDeepEqual(violations, [], label);
+    assert.match(violations.join("\n"), expected, label);
+  }
+
+  // The receipt schema and the recheck bound are code facts; a graph that drifts from them is a
+  // violation even with the workflows untouched.
+  const driftedSchema = structuredClone(graph);
+  driftedSchema.non_claim_policy.reservation.schema = "codestory.protected-runner-reservation/v0";
+  assert.notDeepEqual(protectedRunnerReservationViolations(loadWorkflows(), driftedSchema), []);
+  const driftedBound = structuredClone(graph);
+  driftedBound.non_claim_policy.reservation.maximum_observation_attempts = 5;
+  assert.notDeepEqual(protectedRunnerReservationViolations(loadWorkflows(), driftedBound), []);
 });
 
 // Catalog publication is delivery, not a release gate. Relaxing a gate is exactly where a vacuous

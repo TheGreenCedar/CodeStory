@@ -32,6 +32,27 @@ export const JOB_ASSERTION_FAILURE = "job_assertion_failure";
 export const RERUN_PLAN_SCHEMA = "codestory.lost-runner-rerun-plan/v2";
 export const NON_CLAIM_PLAN_SCHEMA = "codestory.accelerator-non-claim-plan/v1";
 export const RERUN_DISPATCH_SCHEMA = "codestory.lost-runner-rerun-dispatch/v1";
+export const RESERVATION_RECEIPT_SCHEMA = "codestory.protected-runner-reservation/v1";
+
+/// Reservation states, typed per protected host BEFORE any proof is dispatched.
+///
+///   * `alive`: a heartbeat job completed successfully on the host within the freshness tolerance,
+///     so the release may dispatch its proof.
+///   * `held_by_active_run`: another workflow run is executing a job on the host right now. A busy
+///     host is provably alive, so this BLOCKS (fail-red) rather than withholds -- withholding it
+///     would overstate unavailability.
+///   * `recheck_pending`: no fresh heartbeat yet, but the bounded recheck has not been recorded.
+///     Never a final verdict: a receipt left in this state vouches for nothing.
+///   * `unproven`: no fresh heartbeat after the recorded recheck spent the observation bound. The
+///     proof is not dispatched, and this is the only state a pre-assignment withhold may cite.
+export const RUNNER_ALIVE = "alive";
+export const RUNNER_HELD_BY_ACTIVE_RUN = "held_by_active_run";
+export const RUNNER_RECHECK_PENDING = "recheck_pending";
+export const RUNNER_UNPROVEN = "unproven";
+
+/// The one new typed non-claim detail: the proof job is ABSENT from the run because this run's own
+/// reservation receipt typed the host `unproven` before dispatch.
+export const RUNNER_UNPROVEN_PRE_ASSIGNMENT = "runner_unproven_pre_assignment";
 
 /// Why an execution that failed is not in the re-dispatch list. Every failed execution the planner
 /// saw carries exactly one of these, so a reader of the plan never has to infer an omission.
@@ -296,6 +317,172 @@ export function planRerunDispatch({ jobIds, dispatch }) {
   };
 }
 
+function canonicalEpoch(value, label) {
+  const parsed = Date.parse(text(value, label));
+  if (!Number.isFinite(parsed)) fail(`${label} must be a parseable timestamp`);
+  return parsed;
+}
+
+/// One heartbeat evidence row, validated fail-closed: a row that exists but cannot be read is an
+/// error, never a verdict. Rows that are still queued or in progress are real evidence of "no
+/// completed heartbeat yet" and simply never count as fresh.
+function heartbeatEvidenceRow(row, label) {
+  const host = text(row?.host, `${label} host`);
+  const status = text(row?.status, `${label} status`);
+  if (status !== "completed") {
+    return { host, status, conclusion: null, completed_at: null };
+  }
+  const conclusion = text(row?.conclusion, `${label} conclusion`);
+  const completedAt = canonicalEpoch(row?.completed_at, `${label} completed_at`);
+  return { host, status, conclusion, completed_at: String(row.completed_at), completed_epoch: completedAt };
+}
+
+/// Type each protected host BEFORE the release dispatches any proof to it.
+///
+/// A protected runner that is offline at dispatch produces a job that queues invisibly (~24h) and
+/// terminally classifies as an ordinary blocked failure -- indistinguishable from a proof that ran
+/// and refused. GITHUB_TOKEN cannot list self-hosted runners (the runner-administration endpoints
+/// need an `administration` scope workflow `permissions:` cannot grant), so liveness is proven by
+/// scheduled heartbeat jobs that run ON the hosts, and this planner reads that evidence.
+///
+/// `heartbeatJobs` is the list of recorded observation rounds -- each `{observed_at, jobs}` with
+/// per-host heartbeat job rows. `unproven` is reachable only when EVERY recorded round is stale and
+/// the number of rounds has spent the observation bound, which mirrors `MAXIMUM_RUN_ATTEMPTS`: one
+/// automatic recheck, then the verdict. Fewer rounds leave the host `recheck_pending`, which is
+/// deliberately not a verdict at all. Unreadable evidence anywhere is an error, never a state.
+export function planProtectedRunnerReservation({ now, tolerance, hosts, heartbeatJobs, activeHolders }) {
+  const nowEpoch = canonicalEpoch(now, "reservation now");
+  const toleranceMinutes = positiveInteger(tolerance, "reservation tolerance minutes");
+  const declaredHosts = list(hosts, "protected hosts").map((host) =>
+    text(host?.id, "protected host id"));
+  if (declaredHosts.length === 0) fail("reservation requires at least one protected host");
+  if (new Set(declaredHosts).size !== declaredHosts.length) {
+    fail("reservation hosts must be distinct");
+  }
+  const rounds = list(heartbeatJobs, "heartbeat observations");
+  if (rounds.length === 0) fail("reservation requires at least one recorded heartbeat observation");
+  if (rounds.length > MAXIMUM_RUN_ATTEMPTS) {
+    fail(`reservation records at most ${MAXIMUM_RUN_ATTEMPTS} heartbeat observations`);
+  }
+  const observedRows = rounds.flatMap((round, index) => {
+    canonicalEpoch(round?.observed_at, `heartbeat observation ${index + 1} observed_at`);
+    return list(round?.jobs, `heartbeat observation ${index + 1} jobs`)
+      .map((row, rowIndex) =>
+        heartbeatEvidenceRow(row, `heartbeat observation ${index + 1} job ${rowIndex + 1}`));
+  });
+  for (const row of observedRows) {
+    if (!declaredHosts.includes(row.host)) {
+      fail(`heartbeat evidence names undeclared host ${row.host}`);
+    }
+  }
+  const holders = list(activeHolders ?? [], "active holders").map((holder, index) => ({
+    host: text(holder?.host, `active holder ${index + 1} host`),
+    run_id: positiveInteger(holder?.run_id, `active holder ${index + 1} run id`),
+    workflow: text(holder?.workflow, `active holder ${index + 1} workflow`),
+    job_name: text(holder?.job_name, `active holder ${index + 1} job name`),
+  }));
+  for (const holder of holders) {
+    if (!declaredHosts.includes(holder.host)) {
+      fail(`active holder names undeclared host ${holder.host}`);
+    }
+  }
+  const toleranceMs = toleranceMinutes * 60 * 1000;
+  const rows = declaredHosts.map((hostId) => {
+    const holder = holders.find(({ host }) => host === hostId);
+    if (holder !== undefined) {
+      // A busy host is provably alive -- something is executing on it right now -- but it cannot
+      // take this release's proof, and recording it "unproven" would overstate unavailability.
+      // The receipt names the holder and the reservation fails red.
+      return {
+        host: hostId,
+        state: RUNNER_HELD_BY_ACTIVE_RUN,
+        detail: "another_run_is_executing_on_this_host",
+        observation_attempts: rounds.length,
+        holder: { run_id: holder.run_id, workflow: holder.workflow, job_name: holder.job_name },
+      };
+    }
+    const fresh = observedRows
+      .filter((row) => row.host === hostId
+        && row.status === "completed"
+        && row.conclusion === "success"
+        && nowEpoch - row.completed_epoch <= toleranceMs)
+      .sort((left, right) => right.completed_epoch - left.completed_epoch);
+    if (fresh.length > 0) {
+      return {
+        host: hostId,
+        state: RUNNER_ALIVE,
+        detail: "fresh_heartbeat",
+        observation_attempts: rounds.length,
+        heartbeat_completed_at: fresh[0].completed_at,
+      };
+    }
+    if (rounds.length < MAXIMUM_RUN_ATTEMPTS) {
+      return {
+        host: hostId,
+        state: RUNNER_RECHECK_PENDING,
+        detail: "no_fresh_heartbeat_before_recorded_recheck",
+        observation_attempts: rounds.length,
+      };
+    }
+    return {
+      host: hostId,
+      state: RUNNER_UNPROVEN,
+      detail: "no_fresh_heartbeat_after_recorded_recheck",
+      observation_attempts: rounds.length,
+    };
+  });
+  const byState = (state) => rows.filter((row) => row.state === state).map(({ host }) => host);
+  return {
+    schema: RESERVATION_RECEIPT_SCHEMA,
+    now: text(now, "reservation now"),
+    tolerance_minutes: toleranceMinutes,
+    observation_attempts: rounds.length,
+    maximum_observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+    hosts: rows,
+    dispatch_hosts: byState(RUNNER_ALIVE),
+    held_hosts: byState(RUNNER_HELD_BY_ACTIVE_RUN),
+    unproven_hosts: byState(RUNNER_UNPROVEN),
+    recheck: byState(RUNNER_RECHECK_PENDING).length > 0,
+    recheck_hosts: byState(RUNNER_RECHECK_PENDING),
+  };
+}
+
+/// Read this run's own reservation receipt, fail-closed. A receipt that exists but cannot be read,
+/// carries another schema, or records a different observation bound is an error and never a
+/// verdict: reinterpreting it permissively is exactly how a stale contract would leak a withhold.
+function validatedReservationReceipt(receipt) {
+  if (receipt === null || receipt === undefined) return null;
+  if (typeof receipt !== "object" || Array.isArray(receipt)) {
+    fail("reservation receipt must be an object");
+  }
+  if (receipt.schema !== RESERVATION_RECEIPT_SCHEMA) {
+    fail(`reservation receipt must carry ${RESERVATION_RECEIPT_SCHEMA}`);
+  }
+  if (receipt.maximum_observation_attempts !== MAXIMUM_RUN_ATTEMPTS) {
+    fail(`reservation receipt must record the ${MAXIMUM_RUN_ATTEMPTS}-observation recheck bound`);
+  }
+  const rows = list(receipt.hosts, "reservation receipt hosts").map((row) => ({
+    host: text(row?.host, "reservation receipt host"),
+    state: text(row?.state, "reservation receipt host state"),
+    observation_attempts: positiveInteger(
+      row?.observation_attempts,
+      "reservation receipt host observation attempts",
+    ),
+  }));
+  return { rows };
+}
+
+/// Whether this run's own receipt vouches `unproven` for the host, with the recheck bound spent.
+/// Any other state -- alive, held, recheck still pending, or the host missing from the receipt --
+/// vouches for nothing, so the absent job stays `blocked`.
+function receiptVouchesUnproven(receipt, hostId) {
+  if (receipt === null) return false;
+  const rows = receipt.rows.filter(({ host }) => host === hostId);
+  if (rows.length !== 1) return false;
+  return rows[0].state === RUNNER_UNPROVEN
+    && rows[0].observation_attempts >= MAXIMUM_RUN_ATTEMPTS;
+}
+
 export const HOST_PROVEN = "proven";
 export const HOST_WITHHELD = "withheld";
 export const HOST_RETRY_PENDING = "retry_pending";
@@ -303,19 +490,41 @@ export const HOST_BLOCKED = "blocked";
 
 /// Decide, per protected accelerator host, whether this run may record a populated non-claim.
 ///
-/// `withheld` is reachable only from the lost-runner signature *after* the retry bound is spent.
-/// Every other shape -- a proof that failed its own assertions, a cancelled job, a job that never
-/// appeared in the run -- is `blocked`, which the CLI turns into a non-zero exit. Withholding is
-/// therefore never the fallback for "something went wrong": it is the fallback for exactly one
-/// machine-checkable fact.
-export function planAcceleratorNonClaim({ runAttempt, hosts, jobs }) {
+/// `withheld` is reachable from exactly two machine-checkable facts, one per typed reason:
+///
+///   * the lost-runner signature on a *present* job, *after* the retry bound is spent, and
+///   * a job ABSENT from the run whose absence this run's own reservation receipt explains by
+///     typing the host `unproven` with the recorded recheck bound spent.
+///
+/// Every other shape -- a proof that failed its own assertions, a cancelled job, an absent job
+/// with no vouching receipt -- is `blocked`, which the CLI turns into a non-zero exit. A present
+/// job that failed is decided from its own evidence and never from the receipt, so a receipt can
+/// never mask a proof that ran and refused. Withholding is therefore never the fallback for
+/// "something went wrong": it is the fallback for exactly one machine-checkable fact per reason.
+export function planAcceleratorNonClaim({ runAttempt, hosts, jobs, reservation = null }) {
   const attempt = positiveInteger(runAttempt, "run attempt");
+  const receipt = validatedReservationReceipt(reservation);
   const inspected = distinctExecutions(jobs);
   const rows = list(hosts, "protected hosts").map((host) => {
     const hostId = text(host?.id, "protected host id");
     const jobName = text(host?.job_name, `${hostId} producer job name`);
     const occurrences = inspected.filter((job) => leafJobName(job?.name) === jobName);
     if (occurrences.length === 0) {
+      if (receiptVouchesUnproven(receipt, hostId)) {
+        return {
+          host: hostId,
+          job_name: jobName,
+          state: HOST_WITHHELD,
+          detail: RUNNER_UNPROVEN_PRE_ASSIGNMENT,
+          reservation: {
+            schema: RESERVATION_RECEIPT_SCHEMA,
+            state: RUNNER_UNPROVEN,
+            observation_attempts: receipt.rows.find(({ host: id }) => id === hostId)
+              .observation_attempts,
+            maximum_observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+          },
+        };
+      }
       return { host: hostId, job_name: jobName, state: HOST_BLOCKED, detail: "job_absent_from_run" };
     }
     const latestAttempt = Math.max(
@@ -473,12 +682,54 @@ function main() {
     if (!receipt.recovered) process.exitCode = 1;
     return;
   }
+  if (command === "plan-reservation") {
+    const input = readJson(values.input);
+    const receipt = planProtectedRunnerReservation({
+      now: input.now,
+      tolerance: input.tolerance_minutes,
+      hosts: input.hosts,
+      heartbeatJobs: input.observations,
+      activeHolders: input.active_holders,
+    });
+    const stamped = {
+      ...receipt,
+      run_id: positiveInteger(input.run_id, "reservation run id"),
+      run_attempt: positiveInteger(input.run_attempt, "reservation run attempt"),
+    };
+    writeJson(values.out ?? "target/runner-reservation/receipt.json", stamped);
+    const outputs = {
+      recheck: String(receipt.recheck),
+      dispatch_hosts: receipt.dispatch_hosts.join(" "),
+      held_hosts: receipt.held_hosts.join(" "),
+      unproven_hosts: receipt.unproven_hosts.join(" "),
+    };
+    for (const row of receipt.hosts) {
+      outputs[`dispatch_${row.host.replaceAll(/[^A-Za-z0-9_]/gu, "_")}`] =
+        String(row.state === RUNNER_ALIVE);
+    }
+    emitOutputs(outputs);
+    console.log(JSON.stringify(stamped, null, 2));
+    // A held host is a final fail-red verdict: a busy host is provably alive, so the release
+    // stops instead of overstating unavailability. While a recheck is still pending nothing is
+    // final yet -- the caller performs the one bounded recheck and plans again.
+    if (!receipt.recheck && receipt.held_hosts.length > 0) {
+      for (const row of receipt.hosts.filter(({ state }) => state === RUNNER_HELD_BY_ACTIVE_RUN)) {
+        console.error(
+          `::error::${row.host} is held by active run ${row.holder.run_id} `
+          + `(${row.holder.workflow} / ${row.holder.job_name}); a busy host blocks the release.`,
+        );
+      }
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (command === "plan-non-claim") {
     const input = readJson(values.input);
     const plan = planAcceleratorNonClaim({
       runAttempt: input.run_attempt,
       hosts: input.hosts,
       jobs: input.jobs,
+      reservation: values.reservation === undefined ? null : readJson(values.reservation),
     });
     writeJson(values.out ?? "target/lost-runner/non-claim-plan.json", plan);
     emitOutputs({ withheld_hosts: plan.withheld_hosts.join(" ") });

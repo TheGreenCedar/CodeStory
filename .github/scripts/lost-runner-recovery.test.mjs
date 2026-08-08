@@ -13,13 +13,20 @@ import {
   RECOVERY_BOUND_REACHED,
   RERUN_DISPATCH_SCHEMA,
   RERUN_PLAN_SCHEMA,
+  RESERVATION_RECEIPT_SCHEMA,
   RETRY_REQUESTED,
+  RUNNER_ALIVE,
   RUNNER_COMMUNICATION_LOSS,
+  RUNNER_HELD_BY_ACTIVE_RUN,
+  RUNNER_RECHECK_PENDING,
+  RUNNER_UNPROVEN,
+  RUNNER_UNPROVEN_PRE_ASSIGNMENT,
   SUPERSEDED_BY_LATER_EXECUTION,
   classifyJobFailure,
   countLostExecutions,
   planAcceleratorNonClaim,
   planLostRunnerRerun,
+  planProtectedRunnerReservation,
   planRerunDispatch,
 } from "./lost-runner-recovery.mjs";
 
@@ -62,7 +69,7 @@ function assertionJob(overrides = {}) {
 
 const linuxHost = { id: "linux-x64-vulkan", job_name: "Packaged Linux Vulkan engine" };
 
-function runCli(command, input) {
+function runCli(command, input, extraArguments = []) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-lost-runner-"));
   const inputPath = path.join(directory, "input.json");
   const outPath = path.join(directory, "plan.json");
@@ -71,7 +78,7 @@ function runCli(command, input) {
   writeFileSync(outputsPath, "");
   const result = spawnSync(
     process.execPath,
-    [script, command, "--input", inputPath, "--out", outPath],
+    [script, command, "--input", inputPath, "--out", outPath, ...extraArguments],
     { encoding: "utf8", env: { ...process.env, GITHUB_OUTPUT: outputsPath } },
   );
   return {
@@ -523,6 +530,375 @@ test("a non-claim is reachable only from a spent retry bound on a lost runner", 
     assert.deepEqual(blocked.withheld_hosts, []);
     assert.deepEqual(blocked.blocked_hosts, ["linux-x64-vulkan"]);
   }
+});
+
+// ── The pre-dispatch reservation receipt ────────────────────────────────────────────────────
+
+const reservationNow = "2026-08-08T12:00:00.000Z";
+const reservationHosts = [
+  { id: "macos-arm64-metal" },
+  { id: "windows-x64-vulkan" },
+  { id: "linux-x64-vulkan" },
+];
+
+function heartbeatRow(host, { minutesAgo = 5, conclusion = "success", status = "completed" } = {}) {
+  return {
+    host,
+    status,
+    conclusion,
+    completed_at: new Date(Date.parse(reservationNow) - minutesAgo * 60 * 1000).toISOString(),
+  };
+}
+
+function observation(jobs, observedAt = reservationNow) {
+  return { observed_at: observedAt, jobs };
+}
+
+function reserve({ observations, holders = [] }) {
+  return planProtectedRunnerReservation({
+    now: reservationNow,
+    tolerance: 30,
+    hosts: reservationHosts,
+    heartbeatJobs: observations,
+    activeHolders: holders,
+  });
+}
+
+test("a host with a fresh heartbeat is alive and is the only host offered a dispatch", () => {
+  const receipt = reserve({
+    observations: [observation([
+      heartbeatRow("macos-arm64-metal"),
+      heartbeatRow("windows-x64-vulkan"),
+      heartbeatRow("linux-x64-vulkan", { minutesAgo: 45 }),
+      heartbeatRow("linux-x64-vulkan", { minutesAgo: 20, conclusion: "failure" }),
+    ]), observation([])],
+  });
+  assert.equal(receipt.schema, RESERVATION_RECEIPT_SCHEMA);
+  assert.deepEqual(receipt.dispatch_hosts, ["macos-arm64-metal", "windows-x64-vulkan"]);
+  // Stale and failed heartbeats are both "no fresh heartbeat": only a completed success inside
+  // the tolerance proves the host alive.
+  assert.deepEqual(receipt.unproven_hosts, ["linux-x64-vulkan"]);
+  assert.equal(receipt.maximum_observation_attempts, MAXIMUM_RUN_ATTEMPTS);
+  assert.equal(receipt.recheck, false);
+});
+
+test("a stale host becomes unproven only after the recorded recheck spends the bound", () => {
+  // One recorded observation: not a verdict. The plan says a recheck is owed and types nothing.
+  const first = reserve({ observations: [observation([])] });
+  assert.deepEqual(first.hosts.map(({ state }) => state), [
+    RUNNER_RECHECK_PENDING,
+    RUNNER_RECHECK_PENDING,
+    RUNNER_RECHECK_PENDING,
+  ]);
+  assert.equal(first.recheck, true);
+  assert.deepEqual(first.unproven_hosts, []);
+  assert.deepEqual(first.dispatch_hosts, []);
+
+  // The recorded recheck spends the bound, and only then does the receipt say unproven.
+  const second = reserve({ observations: [observation([]), observation([])] });
+  assert.deepEqual(second.hosts.map(({ state }) => state), [
+    RUNNER_UNPROVEN,
+    RUNNER_UNPROVEN,
+    RUNNER_UNPROVEN,
+  ]);
+  assert.equal(second.recheck, false);
+  assert.deepEqual(second.hosts.map(({ observation_attempts: attempts }) => attempts), [2, 2, 2]);
+
+  // The bound is a bound: a third recorded observation is refused, mirroring the rerun bound.
+  assert.throws(
+    () => reserve({ observations: [observation([]), observation([]), observation([])] }),
+    /at most 2 heartbeat observations/u,
+  );
+
+  // A heartbeat that arrives in the recheck round proves the host alive.
+  const recovered = reserve({
+    observations: [observation([]), observation([heartbeatRow("linux-x64-vulkan")])],
+  });
+  assert.equal(recovered.hosts.find(({ host }) => host === "linux-x64-vulkan").state, RUNNER_ALIVE);
+  assert.deepEqual(recovered.unproven_hosts, ["macos-arm64-metal", "windows-x64-vulkan"]);
+});
+
+test("unreadable reservation evidence is an error, never a verdict", () => {
+  // A completed row with no conclusion, a completed row with no timestamp, and a row with no
+  // status are all unreadable: each must stop the reservation rather than type a host.
+  const completedWithoutConclusion = { ...heartbeatRow("linux-x64-vulkan"), conclusion: null };
+  assert.throws(
+    () => reserve({ observations: [observation([completedWithoutConclusion])] }),
+    /conclusion must be non-empty text/u,
+  );
+  const completedWithoutTimestamp = { ...heartbeatRow("linux-x64-vulkan"), completed_at: undefined };
+  assert.throws(
+    () => reserve({ observations: [observation([completedWithoutTimestamp])] }),
+    /completed_at must be non-empty text/u,
+  );
+  assert.throws(
+    () => reserve({ observations: [observation([{ host: "linux-x64-vulkan" }])] }),
+    /status must be non-empty text/u,
+  );
+  assert.throws(() => reserve({ observations: [] }), /at least one recorded heartbeat observation/u);
+  assert.throws(
+    () => reserve({ observations: [observation([heartbeatRow("some-other-host")])] }),
+    /undeclared host some-other-host/u,
+  );
+  // A heartbeat still queued or executing is readable evidence of "no completed heartbeat yet".
+  const inProgress = reserve({
+    observations: [
+      observation([{ host: "linux-x64-vulkan", status: "in_progress" }]),
+      observation([]),
+    ],
+  });
+  assert.equal(
+    inProgress.hosts.find(({ host }) => host === "linux-x64-vulkan").state,
+    RUNNER_UNPROVEN,
+  );
+});
+
+test("a busy host is held by its active run, naming the holder, and never withholds", () => {
+  const receipt = reserve({
+    observations: [observation([
+      heartbeatRow("macos-arm64-metal"),
+      heartbeatRow("windows-x64-vulkan"),
+      heartbeatRow("linux-x64-vulkan"),
+    ]), observation([])],
+    holders: [{
+      host: "linux-x64-vulkan",
+      run_id: 555,
+      workflow: "Release",
+      job_name: "Packaged Linux Vulkan engine",
+    }],
+  });
+  const held = receipt.hosts.find(({ host }) => host === "linux-x64-vulkan");
+  // The holder wins even over a fresh heartbeat: a busy host is provably alive, and the receipt
+  // says exactly which run holds it so the operator can find the collision.
+  assert.equal(held.state, RUNNER_HELD_BY_ACTIVE_RUN);
+  assert.deepEqual(held.holder, {
+    run_id: 555,
+    workflow: "Release",
+    job_name: "Packaged Linux Vulkan engine",
+  });
+  assert.deepEqual(receipt.held_hosts, ["linux-x64-vulkan"]);
+  assert.deepEqual(receipt.dispatch_hosts, ["macos-arm64-metal", "windows-x64-vulkan"]);
+  assert.equal(receipt.recheck, false);
+
+  // A holder row that cannot be read is an error, never a verdict.
+  assert.throws(
+    () => reserve({
+      observations: [observation([])],
+      holders: [{ host: "linux-x64-vulkan", run_id: 555 }],
+    }),
+    /active holder 1 workflow must be non-empty text/u,
+  );
+});
+
+test("the reservation CLI emits per-host dispatch flags and fails red only on a final held host", () => {
+  const aliveInput = {
+    run_id: "12345",
+    run_attempt: "1",
+    now: reservationNow,
+    tolerance_minutes: "30",
+    hosts: reservationHosts,
+    observations: [observation([
+      heartbeatRow("macos-arm64-metal"),
+      heartbeatRow("windows-x64-vulkan"),
+      heartbeatRow("linux-x64-vulkan", { minutesAgo: 45 }),
+    ]), observation([])],
+    active_holders: [],
+  };
+  const typed = runCli("plan-reservation", aliveInput);
+  assert.equal(typed.status, 0, typed.stderr);
+  assert.equal(typed.plan.schema, RESERVATION_RECEIPT_SCHEMA);
+  assert.equal(typed.plan.run_id, 12345);
+  assert.match(typed.outputs, /^dispatch_macos_arm64_metal=true$/mu);
+  assert.match(typed.outputs, /^dispatch_windows_x64_vulkan=true$/mu);
+  assert.match(typed.outputs, /^dispatch_linux_x64_vulkan=false$/mu);
+  assert.match(typed.outputs, /^recheck=false$/mu);
+  assert.match(typed.outputs, /^unproven_hosts=linux-x64-vulkan$/mu);
+
+  const held = runCli("plan-reservation", {
+    ...aliveInput,
+    active_holders: [{
+      host: "linux-x64-vulkan",
+      run_id: 555,
+      workflow: "Release",
+      job_name: "Packaged Linux Vulkan engine",
+    }],
+  });
+  assert.equal(held.status, 1);
+  assert.match(held.stderr, /held by active run 555/u);
+  assert.match(held.outputs, /^dispatch_linux_x64_vulkan=false$/mu);
+
+  // While the recheck is still pending nothing is final, so the CLI exits 0 and asks for it.
+  const pending = runCli("plan-reservation", {
+    ...aliveInput,
+    observations: [observation([])],
+    active_holders: aliveInput.active_holders,
+  });
+  assert.equal(pending.status, 0, pending.stderr);
+  assert.match(pending.outputs, /^recheck=true$/mu);
+  assert.match(pending.outputs, /^dispatch_macos_arm64_metal=false$/mu);
+});
+
+// ── The typed pre-assignment non-claim ──────────────────────────────────────────────────────
+
+/// This run's own receipt, in the exact shape `plan-reservation` writes it, vouching `unproven`
+/// for the Linux host after the recorded recheck.
+function unprovenReceipt(overrides = {}) {
+  return {
+    schema: RESERVATION_RECEIPT_SCHEMA,
+    now: reservationNow,
+    tolerance_minutes: 30,
+    observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+    maximum_observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+    hosts: [
+      {
+        host: "macos-arm64-metal",
+        state: RUNNER_ALIVE,
+        detail: "fresh_heartbeat",
+        observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+      },
+      {
+        host: "windows-x64-vulkan",
+        state: RUNNER_ALIVE,
+        detail: "fresh_heartbeat",
+        observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+      },
+      {
+        host: "linux-x64-vulkan",
+        state: RUNNER_UNPROVEN,
+        detail: "no_fresh_heartbeat_after_recorded_recheck",
+        observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+      },
+    ],
+    dispatch_hosts: ["macos-arm64-metal", "windows-x64-vulkan"],
+    held_hosts: [],
+    unproven_hosts: ["linux-x64-vulkan"],
+    recheck: false,
+    recheck_hosts: [],
+    ...overrides,
+  };
+}
+
+test("an absent job is withheld only under this run's own receipt vouching unproven", () => {
+  // Absent job + vouching receipt: the one new typed reason.
+  const withheld = planAcceleratorNonClaim({
+    runAttempt: 1,
+    hosts: [linuxHost],
+    jobs: [],
+    reservation: unprovenReceipt(),
+  });
+  assert.deepEqual(withheld.hosts.map(({ state }) => state), ["withheld"]);
+  assert.equal(withheld.hosts[0].detail, RUNNER_UNPROVEN_PRE_ASSIGNMENT);
+  assert.deepEqual(withheld.hosts[0].reservation, {
+    schema: RESERVATION_RECEIPT_SCHEMA,
+    state: RUNNER_UNPROVEN,
+    observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+    maximum_observation_attempts: MAXIMUM_RUN_ATTEMPTS,
+  });
+  assert.deepEqual(withheld.withheld_hosts, ["linux-x64-vulkan"]);
+  assert.deepEqual(withheld.blocked_hosts, []);
+
+  // Absent job + no receipt: blocked, exactly as before this contract existed.
+  const noReceipt = planAcceleratorNonClaim({ runAttempt: 1, hosts: [linuxHost], jobs: [] });
+  assert.deepEqual(noReceipt.hosts.map(({ state }) => state), ["blocked"]);
+  assert.equal(noReceipt.hosts[0].detail, "job_absent_from_run");
+
+  // Absent job + a receipt that types the host anything but unproven: blocked. Alive-but-absent
+  // and held-but-absent are contradictions, not evidence of an offline host.
+  for (const state of [RUNNER_ALIVE, RUNNER_HELD_BY_ACTIVE_RUN, RUNNER_RECHECK_PENDING]) {
+    const receipt = unprovenReceipt();
+    receipt.hosts.find(({ host }) => host === "linux-x64-vulkan").state = state;
+    const blocked = planAcceleratorNonClaim({
+      runAttempt: 1,
+      hosts: [linuxHost],
+      jobs: [],
+      reservation: receipt,
+    });
+    assert.deepEqual(blocked.hosts.map(({ state: hostState }) => hostState), ["blocked"], state);
+    assert.equal(blocked.hosts[0].detail, "job_absent_from_run", state);
+  }
+
+  // A receipt whose recheck bound was not spent vouches for nothing either.
+  const unspent = unprovenReceipt();
+  unspent.hosts.find(({ host }) => host === "linux-x64-vulkan").observation_attempts = 1;
+  assert.deepEqual(
+    planAcceleratorNonClaim({ runAttempt: 1, hosts: [linuxHost], jobs: [], reservation: unspent })
+      .hosts.map(({ state }) => state),
+    ["blocked"],
+  );
+
+  // An unreadable receipt is an error, never a verdict.
+  assert.throws(
+    () => planAcceleratorNonClaim({
+      runAttempt: 1,
+      hosts: [linuxHost],
+      jobs: [],
+      reservation: { schema: "codestory.protected-runner-reservation/v0" },
+    }),
+    /reservation receipt must carry/u,
+  );
+  assert.throws(
+    () => planAcceleratorNonClaim({
+      runAttempt: 1,
+      hosts: [linuxHost],
+      jobs: [],
+      reservation: unprovenReceipt({ maximum_observation_attempts: 5 }),
+    }),
+    /recheck bound/u,
+  );
+});
+
+test("a present job that failed its own assertions stays blocked whatever the receipt says", () => {
+  // THE masking test. A hostile receipt claiming the host was never proven alive must not be able
+  // to convert a proof that ran and refused into a withheld claim: a present job is decided from
+  // its own evidence and the receipt is never consulted for it.
+  const masked = planAcceleratorNonClaim({
+    runAttempt: MAXIMUM_RUN_ATTEMPTS,
+    hosts: [linuxHost],
+    jobs: [assertionJob({ run_attempt: String(MAXIMUM_RUN_ATTEMPTS) })],
+    reservation: unprovenReceipt(),
+  });
+  assert.deepEqual(masked.hosts.map(({ state }) => state), ["blocked"]);
+  assert.equal(masked.hosts[0].detail, JOB_ASSERTION_FAILURE);
+  assert.deepEqual(masked.withheld_hosts, []);
+  assert.deepEqual(masked.blocked_hosts, ["linux-x64-vulkan"]);
+
+  // The receipt changes nothing about the lost-runner route either: a present lost job still
+  // follows its own bounded recovery.
+  const lostWithReceipt = planAcceleratorNonClaim({
+    runAttempt: 1,
+    hosts: [linuxHost],
+    jobs: [lostJob()],
+    reservation: unprovenReceipt(),
+  });
+  assert.deepEqual(lostWithReceipt.hosts.map(({ state }) => state), ["retry_pending"]);
+  const lostBoundSpent = planAcceleratorNonClaim({
+    runAttempt: MAXIMUM_RUN_ATTEMPTS,
+    hosts: [linuxHost],
+    jobs: [lostJob(), lostAgain()],
+    reservation: unprovenReceipt(),
+  });
+  assert.deepEqual(lostBoundSpent.hosts.map(({ state }) => state), ["withheld"]);
+  assert.equal(lostBoundSpent.hosts[0].detail, RUNNER_COMMUNICATION_LOSS);
+  assert.equal(lostBoundSpent.hosts[0].reservation, undefined);
+});
+
+test("the non-claim CLI reads the receipt through --reservation and stays fail-closed without it", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-reservation-"));
+  const receiptPath = path.join(directory, "receipt.json");
+  writeFileSync(receiptPath, JSON.stringify(unprovenReceipt()));
+  const withheld = runCli(
+    "plan-non-claim",
+    { run_attempt: 1, hosts: [linuxHost], jobs: [] },
+    ["--reservation", receiptPath],
+  );
+  assert.equal(withheld.status, 0, withheld.stderr);
+  assert.match(withheld.outputs, /^withheld_hosts=linux-x64-vulkan$/mu);
+  assert.equal(withheld.plan.hosts[0].detail, RUNNER_UNPROVEN_PRE_ASSIGNMENT);
+
+  const blocked = runCli("plan-non-claim", { run_attempt: 1, hosts: [linuxHost], jobs: [] });
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, /job_absent_from_run/u);
+  assert.match(blocked.outputs, /^withheld_hosts=$/mu);
 });
 
 // ── The shell collector ─────────────────────────────────────────────────────────────────────

@@ -632,6 +632,278 @@ test("withheld manifests carry the populated non-claim and refuse an unspent ret
   assert.throws(() => build("1"), /recovery bound/u);
 });
 
+// ── The typed pre-assignment withhold ───────────────────────────────────────────────────────
+
+const reservationPolicy = nonClaimPolicy.reservation;
+
+/// This run's reservation receipt, as the closeout itself downloads it, typing the Linux host
+/// `unproven` after the recorded recheck.
+function unprovenReceipt(overrides = {}) {
+  return {
+    schema: reservationPolicy.schema,
+    now: "2026-07-19T12:00:00.000Z",
+    tolerance_minutes: reservationPolicy.heartbeat.tolerance_minutes,
+    observation_attempts: reservationPolicy.maximum_observation_attempts,
+    maximum_observation_attempts: reservationPolicy.maximum_observation_attempts,
+    hosts: nonClaimPolicy.hosts.map(({ id }) => id === linuxHost.id
+      ? {
+        host: id,
+        state: "unproven",
+        detail: "no_fresh_heartbeat_after_recorded_recheck",
+        observation_attempts: reservationPolicy.maximum_observation_attempts,
+      }
+      : {
+        host: id,
+        state: "alive",
+        detail: "fresh_heartbeat",
+        observation_attempts: reservationPolicy.maximum_observation_attempts,
+      }),
+    dispatch_hosts: nonClaimPolicy.hosts.map(({ id }) => id).filter((id) => id !== linuxHost.id),
+    held_hosts: [],
+    unproven_hosts: [linuxHost.id],
+    recheck: false,
+    recheck_hosts: [],
+    run_id: 12345,
+    run_attempt: 1,
+    ...overrides,
+  };
+}
+
+/// Actions metadata for a run whose Linux proof was never dispatched: the reservation receipt
+/// typed the host unproven, so the proof job is ABSENT from the run and the hosted non-claim job
+/// recorded the withheld cells at attempt 1.
+function preAssignmentRunMetadata(phase) {
+  const metadata = actionsMetadata(phase);
+  for (const [attempt, jobs] of Object.entries(metadata.jobsByAttempt)) {
+    metadata.jobsByAttempt[attempt] = jobs.filter(
+      (job) => !job.name.endsWith(linuxHost.unavailable_producer_job_name),
+    );
+  }
+  const lostArtifacts = new Set(linuxHost.withheld_cells.map((id) =>
+    resolveReleaseCellConstraints(cell(id), "1").producer_artifact));
+  metadata.artifacts = metadata.artifacts.filter(({ name }) => !lostArtifacts.has(name));
+  metadata.jobsByAttempt["1"].push({
+    id: 9001,
+    run_id: 12345,
+    run_attempt: "1",
+    head_sha: gitIdentity.commit,
+    name: `Release / ${nonClaimPolicy.producer_job_name}`,
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-07-19T13:00:00.000Z",
+    completed_at: "2026-07-19T13:10:00.000Z",
+  });
+  metadata.artifacts.push({
+    id: 9002,
+    name: linuxHost.producer_artifacts.pre_publish.replaceAll("{attempt}", "1"),
+    digest: `sha256:${"9".repeat(64)}`,
+    size_in_bytes: 1024,
+    expired: false,
+    created_at: "2026-07-19T13:05:00.000Z",
+    expires_at: "2026-08-18T12:05:00.000Z",
+    workflow_run: { id: 12345, head_sha: gitIdentity.commit },
+  });
+  return { ...metadata, jobEvidence: [] };
+}
+
+test("an absent proof routes to the non-claim producer only under the closeout's own receipt", () => {
+  const withReceipt = (reservationReceipt) => () => buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase: "pre_publish",
+    runId: "12345",
+    currentRunAttempt: "1",
+    ...preAssignmentRunMetadata("pre_publish"),
+    reservationReceipt,
+  });
+
+  // The vouched route: the rows are tagged with the pre-assignment reason, so the closeout can
+  // refuse a manifest recorded under the other reason.
+  const routed = withReceipt(unprovenReceipt())();
+  const withheldRows = routed.producers.filter(({ non_claim: withheld }) => withheld === true);
+  assert.deepEqual(
+    withheldRows.map(({ cell_id: id }) => id).sort(),
+    ["accelerator_execution:linux-x64-vulkan", "candidate_installed_behavior:linux-x64"],
+  );
+  for (const row of withheldRows) {
+    assert.equal(row.non_claim_reason, nonClaimPolicy.pre_assignment_reason);
+    assert.equal(row.producer_job, nonClaimPolicy.producer_job);
+    assert.equal(row.producer_run_attempt, "1");
+  }
+  // Hosts that reported keep their untagged real proof producers.
+  assert.equal(
+    routed.producers.find(({ cell_id: id }) => id === "accelerator_execution:windows-x64-vulkan")
+      .non_claim_reason,
+    undefined,
+  );
+
+  // No receipt: the absent proof stays what it always was, a run with no execution of the job.
+  assert.throws(withReceipt(null), /no execution of Packaged Linux Vulkan engine/u);
+  // A receipt that types the host anything but unproven vouches for nothing.
+  const alive = unprovenReceipt();
+  alive.hosts.find(({ host }) => host === linuxHost.id).state = "alive";
+  assert.throws(withReceipt(alive), /types linux-x64-vulkan alive/u);
+  // An unspent recheck bound vouches for nothing.
+  const unspent = unprovenReceipt();
+  unspent.hosts.find(({ host }) => host === linuxHost.id).observation_attempts = 1;
+  assert.throws(withReceipt(unspent), /recheck bound is spent/u);
+  // A receipt that never typed the host, or was written under another contract, is refused.
+  const untyped = unprovenReceipt();
+  untyped.hosts = untyped.hosts.filter(({ host }) => host !== linuxHost.id);
+  assert.throws(withReceipt(untyped), /does not type host linux-x64-vulkan/u);
+  assert.throws(
+    withReceipt(unprovenReceipt({ schema: "codestory.protected-runner-reservation/v0" })),
+    /must carry codestory\.protected-runner-reservation\/v1/u,
+  );
+});
+
+test("a hostile receipt cannot mask a proof that ran and refused", () => {
+  // The proof job is PRESENT and failed its own assertions; the receipt claims the host was
+  // never proven alive. The present job is decided from its own evidence -- the receipt is not
+  // consulted for it -- so the routing is refused and the run stays red.
+  assert.throws(
+    () => buildTrustedProducerMap({
+      graph,
+      gitIdentity,
+      phase: "pre_publish",
+      runId: "12345",
+      currentRunAttempt: withheldAttempt,
+      ...withheldRunMetadata("pre_publish", {
+        jobEvidence: lostHostEvidence({ signature: "assertion" }),
+      }),
+      reservationReceipt: unprovenReceipt(),
+    }),
+    /failed its own assertions, so accelerator_execution:linux-x64-vulkan may not be withheld/u,
+  );
+});
+
+test("pre-assignment withheld manifests carry the receipt facts and skip no other check", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-preassign-"));
+  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  writeFileSync(archive, "release archive bytes");
+  const selected = cell("accelerator_execution:linux-x64-vulkan");
+  const build = (nonClaim) => produceReleaseCellManifest({
+    graph,
+    gitIdentity,
+    version,
+    cell: selected,
+    identity: { native_engine: "coderank_q8_embedded" },
+    producer: {
+      producer_workflow: nonClaimPolicy.producer_workflow,
+      producer_job: nonClaimPolicy.producer_job,
+      producer_job_name: nonClaimPolicy.producer_job_name,
+      producer_run_id: "12345",
+      producer_run_attempt: "1",
+      producer_artifact: linuxHost.producer_artifacts.pre_publish.replaceAll("{attempt}", "1"),
+    },
+    observedAt,
+    archivePath: archive,
+    nonClaim,
+  });
+  const preAssignmentNonClaim = (overrides = {}) => ({
+    host: linuxHost.id,
+    runtime_execution: nonClaimPolicy.runtime_execution,
+    non_claim_reason: nonClaimPolicy.pre_assignment_reason,
+    reservation: {
+      schema: reservationPolicy.schema,
+      state: "unproven",
+      observation_attempts: reservationPolicy.maximum_observation_attempts,
+      maximum_observation_attempts: reservationPolicy.maximum_observation_attempts,
+    },
+    unavailable_producer_workflow: linuxHost.unavailable_producer_workflow,
+    unavailable_producer_job_name: linuxHost.unavailable_producer_job_name,
+    withheld_claims: ["accelerator_execution", "package_identity", "source_behavior"],
+    run_attempt: "1",
+    ...overrides,
+  });
+
+  // Attempt 1 is the whole point: the job was never created, so no rerun could be spent, and the
+  // receipt's recorded recheck is the bound that was.
+  const manifest = build(preAssignmentNonClaim());
+  assert.equal(manifest.evidence.status, "withheld");
+  assert.equal(manifest.non_claim.non_claim_reason, nonClaimPolicy.pre_assignment_reason);
+  assert.equal(manifest.non_claim.annotation, undefined);
+  assert.equal(manifest.non_claim.reservation.state, "unproven");
+  assert.equal(manifest.evidence.identity.backend, "Vulkan");
+
+  // The annotation is scoped to the mid-job reason; quoting it here is refused.
+  assert.throws(
+    () => build(preAssignmentNonClaim({ annotation: nonClaimPolicy.annotation })),
+    /annotation is scoped to accelerator_host_unavailable/u,
+  );
+  // No receipt facts, no withhold.
+  const { reservation: _dropped, ...withoutReservation } = preAssignmentNonClaim();
+  assert.throws(() => build(withoutReservation), /reservation receipt facts/u);
+  // An unspent recheck bound is refused, mirroring the unspent rerun bound on the other route.
+  assert.throws(
+    () => build(preAssignmentNonClaim({
+      reservation: {
+        schema: reservationPolicy.schema,
+        state: "unproven",
+        observation_attempts: 1,
+        maximum_observation_attempts: reservationPolicy.maximum_observation_attempts,
+      },
+    })),
+    /observation recheck bound/u,
+  );
+  // And the mid-job reason still demands its own bound: the two scopes do not leak.
+  assert.throws(
+    () => build(preAssignmentNonClaim({
+      non_claim_reason: nonClaimPolicy.reason,
+      annotation: nonClaimPolicy.annotation,
+      reservation: undefined,
+    })),
+    /recovery bound/u,
+  );
+});
+
+test("the existing mid-job withheld manifest shape is byte-identical under the new contract", () => {
+  // The pre-assignment route must not have moved a single byte of the lost-runner route: same
+  // non_claim keys, same values, no new fields.
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-midjob-"));
+  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  writeFileSync(archive, "release archive bytes");
+  const selected = cell("accelerator_execution:linux-x64-vulkan");
+  const manifest = produceReleaseCellManifest({
+    graph,
+    gitIdentity,
+    version,
+    cell: selected,
+    identity: { native_engine: "coderank_q8_embedded" },
+    producer: {
+      producer_workflow: nonClaimPolicy.producer_workflow,
+      producer_job: nonClaimPolicy.producer_job,
+      producer_job_name: nonClaimPolicy.producer_job_name,
+      producer_run_id: "12345",
+      producer_run_attempt: withheldAttempt,
+      producer_artifact: linuxHost.producer_artifacts.pre_publish
+        .replaceAll("{attempt}", withheldAttempt),
+    },
+    observedAt,
+    archivePath: archive,
+    nonClaim: {
+      host: linuxHost.id,
+      runtime_execution: nonClaimPolicy.runtime_execution,
+      non_claim_reason: nonClaimPolicy.reason,
+      annotation: nonClaimPolicy.annotation,
+      unavailable_producer_workflow: linuxHost.unavailable_producer_workflow,
+      unavailable_producer_job_name: linuxHost.unavailable_producer_job_name,
+      withheld_claims: ["accelerator_execution", "package_identity", "source_behavior"],
+      run_attempt: withheldAttempt,
+    },
+  });
+  assert.deepEqual(manifest.non_claim, {
+    host: "linux-x64-vulkan",
+    runtime_execution: "not_proven_by_package",
+    non_claim_reason: "accelerator_host_unavailable",
+    annotation: nonClaimPolicy.annotation,
+    unavailable_producer_workflow: ".github/workflows/linux-vulkan-proof.yml",
+    unavailable_producer_job_name: "Packaged Linux Vulkan engine",
+    withheld_claims: ["accelerator_execution", "package_identity", "source_behavior"],
+    run_attempt: withheldAttempt,
+  });
+});
+
 test("withhold writes one container per closeout phase, never a phase-mixed one", () => {
   // Each phase's trusted producer map authorizes only the manifests it selected, so a container
   // holding another phase's cell is rejected at download time and the release is lost anyway.
@@ -750,4 +1022,135 @@ test("withhold writes one container per closeout phase, never a phase-mixed one"
       );
     }
   }
+});
+
+test("the withhold CLI records the pre-assignment reason only under a vouching receipt", () => {
+  const directory = mkdtempSync(
+    path.join(realpathSync.native(os.tmpdir()), "codestory-release-preassign-cli-"),
+  );
+  const archiveName = "codestory-cli-v0.16.0-linux-x64.tar.gz";
+  const archiveBytes = Buffer.from("release archive bytes");
+  const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
+  const checksumBytes = Buffer.from(`${archiveSha256}  ${archiveName}\n`);
+  const checksumSha256 = createHash("sha256").update(checksumBytes).digest("hex");
+  const candidateRecord = path.join(directory, "candidate-archive-record.json");
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  const sourceTree = execFileSync(
+    "git",
+    ["rev-parse", "HEAD^{tree}"],
+    { cwd: root, encoding: "utf8" },
+  ).trim();
+  writeFileSync(
+    candidateRecord,
+    `${JSON.stringify(buildCandidateArchiveRecord({
+      repository: gitIdentity.repository,
+      sourceSha: head,
+      sourceTree,
+      target: "linux-x64",
+      archive: {
+        name: archiveName,
+        relative_path: archiveName,
+        bytes: archiveBytes.length,
+        sha256: archiveSha256,
+      },
+      companions: [
+        {
+          role: "archive_checksum",
+          relative_path: `${archiveName}.sha256`,
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+        {
+          role: "checksum_manifest",
+          relative_path: "SHA256SUMS.txt",
+          bytes: checksumBytes.length,
+          sha256: checksumSha256,
+        },
+      ],
+    }), null, 2)}\n`,
+  );
+  const identityPath = path.join(directory, "identity.json");
+  writeFileSync(identityPath, JSON.stringify({
+    installer: "candidate_managed_plugin",
+    native_engine: "coderank_q8_embedded",
+  }));
+  const receiptPath = path.join(directory, "receipt.json");
+  writeFileSync(receiptPath, JSON.stringify(unprovenReceipt()));
+  const outDir = path.join(directory, "cells");
+  const withholdArgs = (extra) => [
+    path.join(root, "scripts/codestory-release-cell-manifest.mjs"), "withhold",
+    "--repo", root,
+    "--expected-sha", head,
+    "--version", version,
+    "--host", "linux-x64-vulkan",
+    "--producer-run-id", "12345",
+    "--producer-run-attempt", "1",
+    "--identity", identityPath,
+    "--candidate-record", candidateRecord,
+    "--out-dir", outDir,
+    ...extra,
+  ];
+
+  // Attempt 1 with the pre-assignment reason and a vouching receipt: recorded.
+  const recorded = spawnSync(
+    process.execPath,
+    withholdArgs([
+      "--reason", nonClaimPolicy.pre_assignment_reason,
+      "--reservation", receiptPath,
+    ]),
+    { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "1" }) },
+  );
+  assert.equal(recorded.status, 0, recorded.stderr);
+  const written = readdirSync(path.join(outDir, "pre_publish"))
+    .map((name) => JSON.parse(readFileSync(path.join(outDir, "pre_publish", name), "utf8")));
+  for (const manifest of written) {
+    assert.equal(manifest.non_claim.non_claim_reason, nonClaimPolicy.pre_assignment_reason);
+    assert.equal(manifest.non_claim.annotation, undefined);
+    assert.equal(
+      manifest.non_claim.reservation.observation_attempts,
+      reservationPolicy.maximum_observation_attempts,
+    );
+    assert.equal(manifest.non_claim.run_attempt, "1");
+  }
+
+  // Attempt 1 with the default mid-job reason is still refused: the reason gates the bound.
+  const midJob = spawnSync(
+    process.execPath,
+    withholdArgs([]),
+    { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "1" }) },
+  );
+  assert.notEqual(midJob.status, 0);
+  assert.match(midJob.stderr, /only after 2 run attempts/u);
+
+  // The pre-assignment reason without a receipt, or with a non-vouching one, is refused.
+  const withoutReceipt = spawnSync(
+    process.execPath,
+    withholdArgs(["--reason", nonClaimPolicy.pre_assignment_reason]),
+    { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "1" }) },
+  );
+  assert.notEqual(withoutReceipt.status, 0);
+  assert.match(withoutReceipt.stderr, /--reservation/u);
+  const alivePath = path.join(directory, "alive-receipt.json");
+  const alive = unprovenReceipt();
+  alive.hosts.find(({ host }) => host === linuxHost.id).state = "alive";
+  writeFileSync(alivePath, JSON.stringify(alive));
+  const notVouched = spawnSync(
+    process.execPath,
+    withholdArgs([
+      "--reason", nonClaimPolicy.pre_assignment_reason,
+      "--reservation", alivePath,
+    ]),
+    { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "1" }) },
+  );
+  assert.notEqual(notVouched.status, 0);
+  assert.match(notVouched.stderr, /types linux-x64-vulkan alive/u);
+
+  // The receipt flag is scoped to the pre-assignment reason.
+  const leaked = spawnSync(
+    process.execPath,
+    withholdArgs(["--reservation", receiptPath]),
+    { encoding: "utf8", env: producerEnv({ GITHUB_RUN_ID: "12345" }) },
+  );
+  assert.notEqual(leaked.status, 0);
+  assert.match(leaked.stderr, /scoped to the accelerator_host_offline_pre_assignment reason/u);
 });

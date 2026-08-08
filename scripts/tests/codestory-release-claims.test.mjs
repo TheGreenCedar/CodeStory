@@ -957,6 +957,74 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /must name exactly the protected accelerator instances/u,
   );
 
+  // The pre-assignment reason is a second TYPED reason, not a synonym: collapsing it into the
+  // mid-job reason would let one route borrow the other's evidence rules.
+  const collapsedReason = structuredClone(graph);
+  collapsedReason.non_claim_policy.pre_assignment_reason =
+    collapsedReason.non_claim_policy.reason;
+  assert.throws(
+    () => validateReleaseClaimGraph(collapsedReason),
+    /pre_assignment_reason must be a distinct typed reason/u,
+  );
+
+  const unscopedAnnotation = structuredClone(graph);
+  unscopedAnnotation.non_claim_policy.annotation_reason =
+    unscopedAnnotation.non_claim_policy.pre_assignment_reason;
+  assert.throws(
+    () => validateReleaseClaimGraph(unscopedAnnotation),
+    /annotation_reason must scope the annotation/u,
+  );
+
+  // The reservation recheck bound mirrors the rerun bound: two observations, one automatic
+  // recheck. A drifted bound would let the receipt vouch on cheaper evidence than the contract.
+  const driftedRecheckBound = structuredClone(graph);
+  driftedRecheckBound.non_claim_policy.reservation.maximum_observation_attempts = 5;
+  assert.throws(
+    () => validateReleaseClaimGraph(driftedRecheckBound),
+    /maximum_observation_attempts must mirror maximum_run_attempts/u,
+  );
+
+  const unqualifiedReceipt = structuredClone(graph);
+  unqualifiedReceipt.non_claim_policy.reservation.receipt_artifact =
+    "protected-runner-reservation";
+  assert.throws(
+    () => validateReleaseClaimGraph(unqualifiedReceipt),
+    /receipt_artifact must be attempt-qualified/u,
+  );
+
+  const staleReceiptSchema = structuredClone(graph);
+  staleReceiptSchema.non_claim_policy.reservation.schema =
+    "codestory.protected-runner-reservation/v0";
+  assert.throws(
+    () => validateReleaseClaimGraph(staleReceiptSchema),
+    /reservation\.schema must be/u,
+  );
+
+  // The heartbeat's labels are the proof's labels: a heartbeat proving some other machine alive
+  // vouches for nothing, so the host copy is held to the protected_jobs row.
+  const driftedLabels = structuredClone(graph);
+  driftedLabels.non_claim_policy.hosts
+    .find(({ id }) => id === "linux-x64-vulkan").runner_labels = [
+      "self-hosted",
+      "Linux",
+      "X64",
+      "some-other-runner",
+    ];
+  assert.throws(
+    () => validateReleaseClaimGraph(driftedLabels),
+    /runner_labels must equal the protected_jobs runner labels/u,
+  );
+
+  const duplicateHeartbeatJobs = structuredClone(graph);
+  duplicateHeartbeatJobs.non_claim_policy.hosts
+    .find(({ id }) => id === "linux-x64-vulkan").heartbeat_job_name =
+    duplicateHeartbeatJobs.non_claim_policy.hosts
+      .find(({ id }) => id === "macos-arm64-metal").heartbeat_job_name;
+  assert.throws(
+    () => validateReleaseClaimGraph(duplicateHeartbeatJobs),
+    /duplicates heartbeat job name/u,
+  );
+
   const mismatchedSupport = structuredClone(graph);
   mismatchedSupport.public_support.packages[0].target = "macos-x64";
   assert.throws(
